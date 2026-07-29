@@ -1,0 +1,505 @@
+# System Requirements Document — Alexandria
+
+## 1. Introduction
+
+### 1.1 Purpose
+
+This document specifies the functional and non-functional requirements for
+**Alexandria**.
+
+The concrete technology stack — platform and language versions, libraries,
+database, and tooling — is defined in the
+[Technology Stack Document](Technology%20Stack%20Document.md). This document
+states requirements and refers to that one for specific technologies and versions
+rather than restating them.
+
+### 1.2 Scope
+
+The requirements cover seven capability areas: file catalog and indexing (FC),
+collections (CO), bookmarks (BM), watchlists (WL), reading lists (RL), text file
+content editing (TX), and authentication and authorization (AU). Non-functional
+requirements apply across all areas. Operational platform concerns (logging,
+health, configuration, deployment) are specified in the
+[Operations & Infrastructure Document](Operations%20%26%20Infrastructure%20Document.md).
+
+### 1.3 Definitions
+
+| Term | Definition |
+| --- | --- |
+| **File** | An indexed on-disk resource. One of seven subtypes: AudioFile, VideoFile, HtmlPage, TextFile, Document, ComicBook, Image. |
+| **Path** | The absolute on-disk location of a File. Unique across the catalog. |
+| **Content hash** | SHA-256 hash of a File's bytes, computed at index time and refreshed on re-index. |
+| **State** | A File or Bookmark lifecycle state: `active`, `deleted` (soft), or purged. |
+| **mediaKind** | VideoFile discriminator: `movie` or `series`. |
+| **formatKind** | Document discriminator: `book` or `ebook`. |
+| **Watch/Read state** | Progress state: `Pending`, `Watching`/`Reading`, `Watched`/`Read`. |
+| **Active auth mode** | The single authentication mode (external JWT or local login) selected at startup; the other mode is inactive and its credentials are rejected. |
+
+---
+
+## 2. System Overview
+
+```mermaid
+graph LR
+    subgraph Clients
+        FL["Flutter Front-end<br/>HTTP + FFI"]
+        OT["Other Clients<br/>HTTP"]
+    end
+
+    subgraph Alexandria
+        HTTP["alexandria-http<br/>REST-JSON server"]
+        FFI["alexandria-ffi<br/>FFI surface"]
+        CORE["alexandria-core<br/>Command/Query + repos + auth"]
+    end
+
+    subgraph Infrastructure
+        DB[("SQLite<br/>catalog + credentials")]
+        FS["Local Filesystem"]
+        AUTH["External Auth Service<br/>(external mode)"]
+    end
+
+    FL --> HTTP
+    FL --> FFI
+    OT --> HTTP
+    HTTP --> CORE
+    FFI --> CORE
+    CORE --> DB
+    CORE --> FS
+    CORE --> AUTH
+```
+
+---
+
+## 3. Functional Requirements
+
+### 3.1 File Catalog & Indexing (FC)
+
+| ID | Requirement |
+| --- | --- |
+| FR-FC-01 | The system shall index audio files from a specified root path, creating a File record with path, content hash, and parsed music metadata. |
+| FR-FC-02 | The system shall index video files (movies and series), recording `mediaKind`. |
+| FR-FC-03 | The system shall index saved HTML pages. |
+| FR-FC-04 | The system shall index Markdown and plain-text files as TextFiles. |
+| FR-FC-05 | The system shall index PDF and e-book files as Documents, recording `formatKind`. |
+| FR-FC-06 | The system shall index comic-book files (CBR/CBZ/PDF comics) as ComicBooks, recording series and issue metadata when present. |
+| FR-FC-07 | The system shall index image files. |
+| FR-FC-08 | The system shall run indexing asynchronously and shall not block read/query operations while indexing is in progress. |
+| FR-FC-09 | The system shall compute a SHA-256 content hash for each indexed file and store it on the File record. |
+| FR-FC-10 | The system shall, on re-index, detect a content-hash change for an existing path and refresh that File's metadata. |
+| FR-FC-11 | The system shall, on re-index, detect a path that no longer exists on disk and mark the File's state accordingly without deleting the record. |
+| FR-FC-12 | The system shall list and query files filtered by type, containing collection, and lifecycle state. |
+| FR-FC-13 | The system shall return a single file's metadata by its public UUID. |
+| FR-FC-14 | The system shall allow editing audio metadata (title, artist, album, year, genre, track). |
+| FR-FC-15 | The system shall allow editing video metadata (title, year, resolution; `mediaKind` movie/series). |
+| FR-FC-16 | The system shall allow editing document metadata (title, author, year; `formatKind` book/ebook). |
+| FR-FC-17 | The system shall allow editing comic-book metadata (title, series, issueNumber). |
+| FR-FC-18 | The system shall allow editing image metadata (title, caption). |
+| FR-FC-19 | The system shall allow renaming a File, which renames the underlying file on disk. |
+| FR-FC-20 | The system shall soft-delete a File record by marking it `deleted`, hiding it from active views, and keeping it restorable. |
+| FR-FC-21 | The system shall restore a soft-deleted File to `active`. |
+| FR-FC-22 | The system shall hard-purge a File record permanently only after its soft-delete retention window has elapsed. |
+| FR-FC-23 | The system shall, on an explicit purge-on-disk operation, remove the File record and delete the underlying file on disk. |
+| FR-FC-24 | The system shall expose every catalog operation via both the HTTP/REST-JSON surface and the FFI surface with identical results. |
+
+### 3.2 Collections (CO)
+
+| ID | Requirement |
+| --- | --- |
+| FR-CO-01 | The system shall create a file collection (name, `kind` = file). |
+| FR-CO-02 | The system shall create a bookmark collection (name, `kind` = bookmark). |
+| FR-CO-03 | The system shall rename a collection. |
+| FR-CO-04 | The system shall delete a collection by unlinking (preserving) its contained items, not deleting them. |
+| FR-CO-05 | The system shall add items of the matching `kind` to a collection. |
+| FR-CO-06 | The system shall remove items from a collection. |
+| FR-CO-07 | The system shall list the items in a collection. |
+
+### 3.3 Bookmarks (BM)
+
+| ID | Requirement |
+| --- | --- |
+| FR-BM-01 | The system shall create a bookmark (url, title) in a bookmark collection. |
+| FR-BM-02 | The system shall update a bookmark's url, title, and containing collection. |
+| FR-BM-03 | The system shall soft-delete a bookmark (mark `deleted`, restorable). |
+| FR-BM-04 | The system shall hard-purge a bookmark after its retention window elapses. |
+| FR-BM-05 | The system shall restore a soft-deleted bookmark. |
+| FR-BM-06 | The system shall list and query bookmarks by containing collection. |
+
+### 3.4 Watchlists (WL)
+
+| ID | Requirement |
+| --- | --- |
+| FR-WL-01 | The system shall create a watchlist (name). |
+| FR-WL-02 | The system shall add a VideoFile to a watchlist, creating a WatchProgress in the `Pending` state. |
+| FR-WL-03 | The system shall reject adding a non-VideoFile to a watchlist. |
+| FR-WL-04 | The system shall update a WatchProgress state (`Pending` → `Watching` → `Watched`). |
+| FR-WL-05 | The system shall track watch progress per episode for a series VideoFile. |
+| FR-WL-06 | The system shall remove a video from a watchlist, deleting its WatchProgress. |
+| FR-WL-07 | The system shall delete a watchlist, removing its WatchProgress entries only and preserving its VideoFiles. |
+| FR-WL-08 | The system shall list watchlists and the watch progress of their items. |
+
+### 3.5 Reading Lists (RL)
+
+| ID | Requirement |
+| --- | --- |
+| FR-RL-01 | The system shall create a reading list (name). |
+| FR-RL-02 | The system shall add a Document or ComicBook to a reading list, creating a ReadingProgress in the `Pending` state. |
+| FR-RL-03 | The system shall reject adding a non-read-eligible file (any type other than Document or ComicBook) to a reading list. |
+| FR-RL-04 | The system shall update a ReadingProgress state (`Pending` → `Reading` → `Read`). |
+| FR-RL-05 | The system shall track reading progress per issue for a comic-book series. |
+| FR-RL-06 | The system shall remove an item from a reading list, deleting its ReadingProgress. |
+| FR-RL-07 | The system shall delete a reading list, removing its ReadingProgress entries only and preserving its files. |
+| FR-RL-08 | The system shall list reading lists and the reading progress of their items. |
+
+### 3.6 Text File Editing (TX)
+
+| ID | Requirement |
+| --- | --- |
+| FR-TX-01 | The system shall read the content of a TextFile from disk. |
+| FR-TX-02 | The system shall write edited content back to the TextFile on disk. |
+| FR-TX-03 | The system shall recompute and update the TextFile's content hash after a successful content write. |
+
+### 3.7 Authentication & Authorization (AU)
+
+| ID | Requirement |
+| --- | --- |
+| FR-AU-01 | The system shall read the active authentication mode from startup configuration; exactly one mode (external JWT or local login) shall be active at runtime. |
+| FR-AU-02 | In external mode, the system shall validate each caller's JWT against the external authentication service. |
+| FR-AU-03 | The system shall accept only the active auth mode and shall reject credentials presented via the inactive mode. |
+| FR-AU-04 | In local mode, the system shall verify the caller's email and salted/hashed password against the encrypted credential row in SQLite. |
+| FR-AU-05 | The system shall provide a local setup operation to set or change local-login credentials (email and password). |
+| FR-AU-06 | The system shall never store plaintext passwords and shall never log credentials. |
+| FR-AU-07 | The system shall authorize the single owner for every catalog operation and shall reject unauthenticated calls. |
+| FR-AU-08 | The system shall expose authentication operations via both the HTTP and FFI surfaces consistently. |
+
+---
+
+## 4. Data Model
+
+### 4.0 Identifier Strategy
+
+Every entity has an **internal integer primary key** used inside the database for
+joins and foreign keys, plus a **public UUID** (v4) that is the stable external
+identifier exposed to clients over HTTP and FFI. The `{id}` path parameters and
+request/response bodies used throughout the
+[Use Case Specification Document](Use%20Case%20Specification%20Document.md) refer
+to this public UUID. Local-login credentials use a single-row table keyed by the
+owner; it has no public UUID surface beyond the set/change operation.
+
+### 4.1 Entity Relationship Diagram
+
+```mermaid
+erDiagram
+    File ||--o{ AudioFile : "subtype"
+    File ||--o{ VideoFile : "subtype"
+    File ||--o{ HtmlPage : "subtype"
+    File ||--o{ TextFile : "subtype"
+    File ||--o{ Document : "subtype"
+    File ||--o{ ComicBook : "subtype"
+    File ||--o{ Image : "subtype"
+    Collection ||--o{ File : "kind=file"
+    Collection ||--o{ Bookmark : "kind=bookmark"
+    Watchlist ||--o{ WatchProgress : "contains"
+    WatchProgress }o--|| VideoFile : "tracks"
+    ReadingList ||--o{ ReadingProgress : "contains"
+    ReadingProgress }o--|| Document : "tracks (book)"
+    ReadingProgress }o--|| ComicBook : "tracks (comic)"
+```
+
+### 4.2 File Fields
+
+| Field | Type | Constraints | Description |
+| --- | --- | --- | --- |
+| id | integer | PK, autoincrement | Internal primary key. |
+| uuid | UUID | required, unique | Public identifier. |
+| path | text | required, unique | Absolute on-disk path. |
+| name | text | required | Editable file name. |
+| type | enum | required; one of `audio`, `video`, `html`, `text`, `document`, `comic`, `image` | Subtype discriminator. |
+| contentHash | text | required | SHA-256 of the file bytes. |
+| state | enum | required; one of `active`, `deleted` | Lifecycle state. |
+| deletedAt | timestamp | nullable | Set when soft-deleted; drives the retention window. |
+| indexedAt | timestamp | required | Last index/re-index time. |
+| collectionId | integer | nullable, FK → Collection | Containing collection, if any. |
+
+Type-specific subtype tables (AudioFile, VideoFile, HtmlPage, TextFile, Document,
+ComicBook, Image) share the File's `id` as a foreign key and carry only their
+type-specific metadata. Representative subtype fields:
+
+| Subtype | Extra Fields |
+| --- | --- |
+| AudioFile | title, artist, album, year, genre, track |
+| VideoFile | title, year, resolution, mediaKind (movie/series), episodeCount (series) |
+| HtmlPage | title, sourceUrl, savedAt |
+| TextFile | (content is read/written on disk, not stored) |
+| Document | title, author, year, formatKind (book/ebook), pageCount |
+| ComicBook | title, series, issueNumber, pageCount |
+| Image | title, caption, width, height |
+
+### 4.3 Collection Fields
+
+| Field | Type | Constraints | Description |
+| --- | --- | --- | --- |
+| id | integer | PK | Internal primary key. |
+| uuid | UUID | required, unique | Public identifier. |
+| name | text | required, non-empty | Collection name. |
+| kind | enum | required; one of `file`, `bookmark` | Discriminator. |
+
+### 4.4 Bookmark Fields
+
+| Field | Type | Constraints | Description |
+| --- | --- | --- | --- |
+| id | integer | PK | Internal primary key. |
+| uuid | UUID | required, unique | Public identifier. |
+| url | text | required, valid URL | The bookmarked URL. |
+| title | text | required, non-empty | Bookmark title. |
+| state | enum | required; `active` or `deleted` | Lifecycle state. |
+| deletedAt | timestamp | nullable | Set when soft-deleted. |
+| collectionId | integer | nullable, FK → Collection (kind=bookmark) | Containing bookmark collection. |
+
+### 4.5 Watchlist Fields
+
+| Field | Type | Constraints | Description |
+| --- | --- | --- | --- |
+| id | integer | PK | Internal primary key. |
+| uuid | UUID | required, unique | Public identifier. |
+| name | text | required, non-empty | Watchlist name. |
+
+### 4.6 WatchProgress Fields
+
+| Field | Type | Constraints | Description |
+| --- | --- | --- | --- |
+| id | integer | PK | Internal primary key. |
+| watchlistId | integer | required, FK → Watchlist | Parent watchlist. |
+| videoFileId | integer | required, FK → VideoFile | Tracked video. |
+| state | enum | required; `Pending`, `Watching`, `Watched` | Watch state. |
+| currentEpisode | integer | nullable | For series: last watched episode. |
+| totalEpisodes | integer | nullable | For series: total episodes. |
+
+### 4.7 ReadingList Fields
+
+| Field | Type | Constraints | Description |
+| --- | --- | --- | --- |
+| id | integer | PK | Internal primary key. |
+| uuid | UUID | required, unique | Public identifier. |
+| name | text | required, non-empty | Reading-list name. |
+
+### 4.8 ReadingProgress Fields
+
+| Field | Type | Constraints | Description |
+| --- | --- | --- | --- |
+| id | integer | PK | Internal primary key. |
+| readingListId | integer | required, FK → ReadingList | Parent reading list. |
+| targetFileId | integer | required, FK → Document or ComicBook | Tracked item. |
+| targetKind | enum | required; `Document` or `ComicBook` | Which subtype is tracked. |
+| state | enum | required; `Pending`, `Reading`, `Read` | Read state. |
+| currentIssue | integer | nullable | For comic series: last read issue. |
+| totalIssues | integer | nullable | For comic series: total issues. |
+
+### 4.9 LocalLoginCredential Fields
+
+Single-row table (the owner).
+
+| Field | Type | Constraints | Description |
+| --- | --- | --- | --- |
+| id | integer | PK, fixed to 1 | Singleton row. |
+| email | text | required, unique, valid email | Owner email. |
+| passwordHash | text | required | Argon2 salted hash; never plaintext. |
+| updatedAt | timestamp | required | Last credential change. |
+
+---
+
+## 5. API Endpoints Overview
+
+The HTTP surface is REST/JSON, versioned under `/v1`. The FFI surface exposes
+the same operations as C functions; the table below notes the HTTP form. Every
+endpoint requires authentication from the active mode (see §7).
+
+### 5.1 Indexing
+
+| Method | Path | Description | Requirement |
+| --- | --- | --- | --- |
+| POST | /v1/index | Start an asynchronous indexing scan of a root path. | FR-FC-01..08 |
+| POST | /v1/index/refresh | Re-index existing records (refresh hashes/metadata). | FR-FC-10, FR-FC-11 |
+
+### 5.2 Files
+
+| Method | Path | Description | Requirement |
+| --- | --- | --- | --- |
+| GET | /v1/files | List/query files by type, collection, state. | FR-FC-12 |
+| GET | /v1/files/{uuid} | Get one file's metadata. | FR-FC-13 |
+| PATCH | /v1/files/{uuid}/metadata | Edit type-specific metadata. | FR-FC-14..18 |
+| POST | /v1/files/{uuid}/rename | Rename the file (and on-disk file). | FR-FC-19 |
+| DELETE | /v1/files/{uuid} | Soft-delete the record. | FR-FC-20 |
+| POST | /v1/files/{uuid}/restore | Restore a soft-deleted record. | FR-FC-21 |
+| DELETE | /v1/files/{uuid}?purge=true | Hard-purge the record (after retention). | FR-FC-22 |
+| DELETE | /v1/files/{uuid}?purge-on-disk=true | Remove the record and the on-disk file. | FR-FC-23 |
+
+### 5.3 Text File Content
+
+| Method | Path | Description | Requirement |
+| --- | --- | --- | --- |
+| GET | /v1/files/{uuid}/content | Read a TextFile's content from disk. | FR-TX-01 |
+| PUT | /v1/files/{uuid}/content | Write edited content back to disk. | FR-TX-02, FR-TX-03 |
+
+### 5.4 Collections
+
+| Method | Path | Description | Requirement |
+| --- | --- | --- | --- |
+| POST | /v1/collections | Create a collection (file or bookmark). | FR-CO-01, FR-CO-02 |
+| PATCH | /v1/collections/{uuid} | Rename a collection. | FR-CO-03 |
+| DELETE | /v1/collections/{uuid} | Delete a collection (preserves items). | FR-CO-04 |
+| POST | /v1/collections/{uuid}/items | Add items to a collection. | FR-CO-05 |
+| DELETE | /v1/collections/{uuid}/items/{itemUuid} | Remove an item. | FR-CO-06 |
+| GET | /v1/collections/{uuid}/items | List items in a collection. | FR-CO-07 |
+
+### 5.5 Bookmarks
+
+| Method | Path | Description | Requirement |
+| --- | --- | --- | --- |
+| POST | /v1/bookmarks | Create a bookmark. | FR-BM-01 |
+| PATCH | /v1/bookmarks/{uuid} | Update a bookmark. | FR-BM-02 |
+| GET | /v1/bookmarks | List bookmarks by collection. | FR-BM-06 |
+| DELETE | /v1/bookmarks/{uuid} | Soft-delete a bookmark. | FR-BM-03 |
+| POST | /v1/bookmarks/{uuid}/restore | Restore a soft-deleted bookmark. | FR-BM-05 |
+| DELETE | /v1/bookmarks/{uuid}?purge=true | Hard-purge a bookmark. | FR-BM-04 |
+
+### 5.6 Watchlists
+
+| Method | Path | Description | Requirement |
+| --- | --- | --- | --- |
+| POST | /v1/watchlists | Create a watchlist. | FR-WL-01 |
+| GET | /v1/watchlists | List watchlists with progress. | FR-WL-08 |
+| DELETE | /v1/watchlists/{uuid} | Delete a watchlist (preserves videos). | FR-WL-07 |
+| POST | /v1/watchlists/{uuid}/items | Add a video (rejects non-video). | FR-WL-02, FR-WL-03 |
+| PATCH | /v1/watchlists/{uuid}/items/{videoUuid} | Update watch progress. | FR-WL-04, FR-WL-05 |
+| DELETE | /v1/watchlists/{uuid}/items/{videoUuid} | Remove a video. | FR-WL-06 |
+
+### 5.7 Reading Lists
+
+| Method | Path | Description | Requirement |
+| --- | --- | --- | --- |
+| POST | /v1/reading-lists | Create a reading list. | FR-RL-01 |
+| GET | /v1/reading-lists | List reading lists with progress. | FR-RL-08 |
+| DELETE | /v1/reading-lists/{uuid} | Delete a reading list (preserves items). | FR-RL-07 |
+| POST | /v1/reading-lists/{uuid}/items | Add a book/comic (rejects ineligible). | FR-RL-02, FR-RL-03 |
+| PATCH | /v1/reading-lists/{uuid}/items/{itemUuid} | Update read progress. | FR-RL-04, FR-RL-05 |
+| DELETE | /v1/reading-lists/{uuid}/items/{itemUuid} | Remove an item. | FR-RL-06 |
+
+### 5.8 Authentication
+
+| Method | Path | Description | Requirement |
+| --- | --- | --- | --- |
+| POST | /v1/auth/local/login | Verify email + password (local mode). | FR-AU-04 |
+| POST | /v1/auth/local/credentials | Set or change local credentials (local mode). | FR-AU-05, FR-AU-06 |
+
+External JWT validation (FR-AU-02) is enforced by HTTP middleware on every
+request, not by an endpoint.
+
+---
+
+## 6. Non-Functional Requirements
+
+| ID | Category | Requirement |
+| --- | --- | --- |
+| NFR-01 | Performance | The system shall answer catalog read queries with p95 latency under 200 ms for a library of tens of thousands of files. |
+| NFR-02 | Performance | The system shall index at least 500 files per second on a personal machine without blocking read/query operations. |
+| NFR-03 | Maintainability | The core library shall be organized by Command/Query (CQRS-style) handlers depending on repository traits, following SOLID principles. |
+| NFR-04 | Maintainability | The core library shall contain no `unsafe` code; `#![deny(unsafe_code)]` is enforced workspace-wide. |
+| NFR-05 | Security | The system shall never store plaintext passwords and shall never log credentials or tokens. |
+| NFR-06 | Security | The system shall reject every operation that lacks valid authentication from the active auth mode. |
+| NFR-07 | Reliability | The system shall keep soft-deleted records restorable until their retention window elapses; a hard purge shall not remove the on-disk file. |
+| NFR-08 | Functional suitability | The system shall not perform audio re-encoding, video re-encoding, or image manipulation. |
+| NFR-09 | Compatibility | The HTTP/REST-JSON surface and the FFI surface shall return identical results for the same operation (parity). |
+| NFR-10 | Configurability | The soft-delete retention window shall be configurable; its default shall be 30 days. |
+
+---
+
+## 7. Authorization Matrix
+
+| Operation | Owner (authenticated) | Unauthenticated |
+| --- | --- | --- |
+| Index files / re-index | ✅ | ❌ |
+| Browse and view file metadata | ✅ | ❌ |
+| Edit file metadata / rename / content | ✅ | ❌ |
+| Soft-delete / restore / hard-purge / purge-on-disk | ✅ | ❌ |
+| Create / rename / delete collection; manage items | ✅ | ❌ |
+| Create / update / delete / restore bookmark | ✅ | ❌ |
+| Create / update / delete watchlist and progress | ✅ | ❌ |
+| Create / update / delete reading list and progress | ✅ | ❌ |
+| Local login (local mode) | ✅ (open to verify) | ⚠️ only the login verification endpoint; all other operations denied |
+| Set or change local credentials (local mode) | ✅ | ❌ |
+| External JWT validation | ✅ | ⚠️ only as the bearer of a valid JWT; invalid tokens denied |
+
+Legend: ✅ allowed · ⚠️ allowed under a stated condition · ❌ denied.
+
+Note: local-login verification is the one operation that accepts unauthenticated
+input (the credentials being verified); success is what grants owner status for
+every subsequent operation.
+
+---
+
+## 8. Lifecycle Strategy
+
+```mermaid
+flowchart TD
+    A["Index / create record<br/>(state = active)"] --> B{Soft delete?}
+    B -->|yes| C["state = deleted<br/>deletedAt set<br/>(restorable)"]
+    C -->|restore| A
+    C -->|retention elapses| D["Hard purge record<br/>(on-disk file untouched)"]
+    B -->|no| E["stay active"]
+    D --> F{Purge-on-disk<br/>explicitly requested?}
+    F -->|yes, at any time on a deleted record| G["Remove record AND<br/>delete on-disk file"]
+    A -->|explicit purge-on-disk| G
+```
+
+Cascade notes:
+
+- **File soft-delete** sets `state = deleted`; filtered out of active views, kept restorable.
+- **Hard purge** removes the record permanently only after the configured retention window (default 30 days, NFR-10); the on-disk file is untouched.
+- **Purge-on-disk** is a separate explicit operation that removes the record and deletes the physical file; it may be invoked on an active or deleted record.
+- **Bookmark** follows the same two-phase model (soft-delete → restore → hard-purge); no disk file is associated.
+- **Collection deletion** unlinks (preserves) its items; it is a hard delete of the grouping only.
+- **Watchlist / ReadingList deletion** deletes their progress entries only and preserves the referenced files.
+- **WatchProgress / ReadingProgress** are deleted when their item is removed from the list or the list is deleted.
+
+---
+
+## 9. Traceability
+
+### 9.1 Feature → Requirements
+
+| Feature | Requirements |
+| --- | --- |
+| F-01 File indexing | FR-FC-01 through FR-FC-09 |
+| F-02 Catalog browsing and metadata editing | FR-FC-12 through FR-FC-18 |
+| F-03 Renaming and lifecycle management | FR-FC-19 through FR-FC-23 |
+| F-04 Text file content editing | FR-TX-01 through FR-TX-03 |
+| F-05 Collections | FR-CO-01 through FR-CO-07 |
+| F-06 Bookmark management | FR-BM-01 through FR-BM-06 |
+| F-07 Watchlists | FR-WL-01 through FR-WL-08 |
+| F-08 Reading lists | FR-RL-01 through FR-RL-08 |
+| F-09 Pluggable authentication | FR-AU-01 through FR-AU-08 |
+| F-10 Dual-transport parity | FR-FC-24, FR-AU-08, NFR-09 |
+
+### 9.2 Business Rule → Requirements
+
+| Business Rule | Realized by |
+| --- | --- |
+| BR-01 single owner | FR-AU-07, NFR-06 (all operations require owner auth) |
+| BR-02 metadata + path/hash only | FR-FC-09, FR-FC-23, FR-TX-02 (writes to disk, not stored) |
+| BR-03 text edits write back to disk | FR-TX-02 |
+| BR-04 no complex media editing | NFR-08 |
+| BR-05 watchlists only videos | FR-WL-03 |
+| BR-06 per-episode series tracking | FR-WL-05 |
+| BR-07 dual transport parity | FR-FC-24, FR-AU-08, NFR-09 |
+| BR-08 pluggable auth, external + local | FR-AU-01, FR-AU-02, FR-AU-04, FR-AU-06 |
+| BR-09 async non-blocking indexing | FR-FC-08, NFR-02 |
+| BR-10 two-phase deletion | FR-FC-20, FR-FC-21, FR-FC-22, NFR-07, NFR-10 |
+| BR-11 hard purge no disk touch; separate purge-on-disk | FR-FC-22, FR-FC-23 |
+| BR-12 delete collection preserves items | FR-CO-04 |
+| BR-13 delete watchlist preserves videos | FR-WL-07 |
+| BR-14 SOLID / Command-Query baseline | NFR-03, NFR-04 |
+| BR-15 reading lists only books/comics | FR-RL-03 |
+| BR-16 per-issue comic tracking | FR-RL-05 |
+| BR-17 exactly one active auth mode | FR-AU-01, FR-AU-03 |
+| BR-18 local credential storage | FR-AU-04, FR-AU-05, FR-AU-06, NFR-05 |
+| BR-19 delete reading list preserves items | FR-RL-07 |
