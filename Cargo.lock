@@ -35,11 +35,14 @@ name = "alexandria-ffi"
 version = "0.1.0"
 dependencies = [
  "alexandria-core",
+ "alexandria-http",
+ "axum",
  "cbindgen",
  "serde_json",
  "sqlx",
  "tempfile",
  "tokio",
+ "tower",
 ]
 
 [[package]]
