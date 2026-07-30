@@ -2,7 +2,7 @@ use chrono::{DateTime, Utc};
 use sqlx::sqlite::SqlitePool;
 use uuid::Uuid;
 
-use crate::catalog::model::{File, FileState, FileType, NewFile};
+use crate::catalog::model::{File, FileState, FileType, NewFile, SubtypeMetadata};
 use crate::errors::DomainError;
 
 /// Catalog repository port. The indexer depends on this trait so its decision
@@ -12,6 +12,8 @@ use crate::errors::DomainError;
 #[allow(async_fn_in_trait)]
 pub trait CatalogRepository: Send + Sync {
     async fn find_by_path(&self, path: &str) -> Result<Option<File>, DomainError>;
+    /// Look up a file by its public UUID (UC-04 AF-02 relies on this).
+    async fn find_by_uuid(&self, uuid: Uuid) -> Result<Option<File>, DomainError>;
     async fn insert_file(&self, new_file: NewFile) -> Result<File, DomainError>;
     /// Every cataloged record (UC-02 re-index iterates these).
     async fn list_all(&self) -> Result<Vec<File>, DomainError>;
@@ -27,6 +29,19 @@ pub trait CatalogRepository: Send + Sync {
     /// `missing_at`; leaves `state` (soft-delete is UC-06) and `deleted_at`.
     async fn mark_missing(&self, path: &str, missing_at: DateTime<Utc>)
         -> Result<(), DomainError>;
+    /// Replace the editable subtype columns of the file identified by `uuid`
+    /// (UC-04 / FR-FC-14..18). Full replace: every editable column listed in
+    /// `SubtypeMetadata` is written, `None` writes `NULL`. Non-editable
+    /// columns (`episodeCount`, `pageCount`, `width`, `height`, `sourceUrl`,
+    /// `savedAt`) are left untouched. Returns `NotFound` when no file row
+    /// carries the UUID and `InvalidInput` when the metadata variant does not
+    /// match the file's `type` (the handler validates the latter first, but
+    /// the repository defends the invariant too).
+    async fn update_metadata(
+        &self,
+        uuid: Uuid,
+        metadata: &SubtypeMetadata,
+    ) -> Result<(), DomainError>;
 }
 
 #[derive(Clone)]
@@ -52,6 +67,19 @@ impl SqliteCatalogRepository {
     }
 }
 
+fn parse_type_str(s: &str) -> FileType {
+    match s {
+        "audio" => FileType::Audio,
+        "video" => FileType::Video,
+        "html" => FileType::Html,
+        "text" => FileType::Text,
+        "document" => FileType::Document,
+        "comic" => FileType::Comic,
+        "image" => FileType::Image,
+        _ => FileType::Text,
+    }
+}
+
 impl CatalogRepository for SqliteCatalogRepository {
     async fn find_by_path(&self, path: &str) -> Result<Option<File>, DomainError> {
         let row: Option<(
@@ -69,6 +97,27 @@ impl CatalogRepository for SqliteCatalogRepository {
              missing_at FROM files WHERE path = ?",
         )
         .bind(path)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(parse_file_row))
+    }
+
+    async fn find_by_uuid(&self, uuid: Uuid) -> Result<Option<File>, DomainError> {
+        let row: Option<(
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            Option<String>,
+            String,
+            Option<String>,
+        )> = sqlx::query_as(
+            "SELECT uuid, path, name, type, content_hash, state, deleted_at, indexed_at, \
+             missing_at FROM files WHERE uuid = ?",
+        )
+        .bind(uuid.to_string())
         .fetch_optional(&self.pool)
         .await?;
         Ok(row.map(parse_file_row))
@@ -159,6 +208,123 @@ impl CatalogRepository for SqliteCatalogRepository {
             .bind(path)
             .execute(&self.pool)
             .await?;
+        Ok(())
+    }
+
+    async fn update_metadata(
+        &self,
+        uuid: Uuid,
+        metadata: &SubtypeMetadata,
+    ) -> Result<(), DomainError> {
+        let mut tx = self.pool.begin().await?;
+
+        // Resolve the file's internal id and its type in one transaction so a
+        // race with a concurrent delete can't produce a subtype write against a
+        // different file.
+        let (id, type_str): (i64, String) =
+            sqlx::query_as("SELECT id, type FROM files WHERE uuid = ?")
+                .bind(uuid.to_string())
+                .fetch_optional(&mut *tx)
+                .await?
+                .ok_or(DomainError::NotFound)?;
+
+        let actual_type = parse_type_str(&type_str);
+        if actual_type != metadata.file_type() {
+            return Err(DomainError::InvalidInput(
+                "metadata does not match file subtype".into(),
+            ));
+        }
+
+        match metadata {
+            SubtypeMetadata::Audio {
+                title,
+                artist,
+                album,
+                year,
+                genre,
+                track,
+            } => {
+                sqlx::query(
+                    "UPDATE audio_files \
+                     SET title = ?, artist = ?, album = ?, year = ?, genre = ?, track = ? \
+                     WHERE file_id = ?",
+                )
+                .bind(title)
+                .bind(artist)
+                .bind(album)
+                .bind(*year)
+                .bind(genre)
+                .bind(*track)
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+            }
+            SubtypeMetadata::Video {
+                title,
+                year,
+                resolution,
+                media_kind,
+            } => {
+                sqlx::query(
+                    "UPDATE video_files \
+                     SET title = ?, year = ?, resolution = ?, media_kind = ? \
+                     WHERE file_id = ?",
+                )
+                .bind(title)
+                .bind(*year)
+                .bind(resolution)
+                .bind(media_kind.map(|m| m.as_str()))
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+            }
+            SubtypeMetadata::Document {
+                title,
+                author,
+                year,
+                format_kind,
+            } => {
+                sqlx::query(
+                    "UPDATE documents \
+                     SET title = ?, author = ?, year = ?, format_kind = ? \
+                     WHERE file_id = ?",
+                )
+                .bind(title)
+                .bind(author)
+                .bind(*year)
+                .bind(format_kind.map(|f| f.as_str()))
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+            }
+            SubtypeMetadata::Comic {
+                title,
+                series,
+                issue_number,
+            } => {
+                sqlx::query(
+                    "UPDATE comic_books \
+                     SET title = ?, series = ?, issue_number = ? \
+                     WHERE file_id = ?",
+                )
+                .bind(title)
+                .bind(series)
+                .bind(*issue_number)
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+            }
+            SubtypeMetadata::Image { title, caption } => {
+                sqlx::query("UPDATE images SET title = ?, caption = ? WHERE file_id = ?")
+                    .bind(title)
+                    .bind(caption)
+                    .bind(id)
+                    .execute(&mut *tx)
+                    .await?;
+            }
+        }
+
+        tx.commit().await?;
         Ok(())
     }
 }
