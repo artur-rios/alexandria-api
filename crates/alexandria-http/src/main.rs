@@ -6,6 +6,7 @@ use anyhow::Result;
 
 use alexandria_core::config::Settings;
 use alexandria_core::migrate::migrate_database;
+use alexandria_core::services::build_services;
 
 use alexandria_http::app;
 use alexandria_http::middleware::logging::init_tracing;
@@ -22,12 +23,14 @@ async fn main() -> Result<()> {
     let bind_addr = settings.http.socket_addr();
     let auth_mode = settings.auth.mode;
 
-    migrate_database(&settings.database.path).await?;
+    let pool = migrate_database(&settings.database.path).await?;
     tracing::info!("database migrations applied");
+
+    let services = std::sync::Arc::new(build_services(&settings, pool).await);
 
     tracing::info!(%bind_addr, auth_mode = auth_mode.as_str(), "starting alexandria-http");
 
-    let router = app(settings);
+    let router = app(settings, services);
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
     axum::serve(listener, router).await?;
 

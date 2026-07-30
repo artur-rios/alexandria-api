@@ -36,6 +36,9 @@ version = "0.1.0"
 dependencies = [
  "alexandria-core",
  "cbindgen",
+ "serde_json",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]
@@ -47,6 +50,8 @@ dependencies = [
  "axum",
  "serde",
  "serde_json",
+ "sqlx",
+ "tempfile",
  "tokio",
  "tower",
  "tower-http",

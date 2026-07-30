@@ -12,6 +12,12 @@ crate-type = ["cdylib", "staticlib", "rlib"]
 
 [dependencies]
 alexandria-core.workspace = true
+tokio.workspace = true
 
 [build-dependencies]
 cbindgen.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
