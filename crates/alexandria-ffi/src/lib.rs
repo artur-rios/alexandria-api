@@ -166,6 +166,38 @@ pub extern "C" fn alexandria_index_start(
     }
 }
 
+/// Start an asynchronous re-index/refresh of every cataloged path (UC-02).
+/// Takes only a token (no root — refresh touches everything cataloged) and
+/// returns a `IndexStartResult` with a `run_id` and `status` (parity with the
+/// HTTP `POST /v1/index/refresh` 202 body). The refresh runs in the background
+/// on the FFI runtime; read results via the accessor functions.
+#[allow(unsafe_code)]
+#[no_mangle]
+pub extern "C" fn alexandria_index_refresh_start(token: *const c_char) -> IndexStartResult {
+    let services = match services_slot().lock().unwrap().clone() {
+        Some(s) => s,
+        None => return IndexStartResult::err(INDEX_ERR_NOT_INITIALIZED),
+    };
+    let token = cstr_lossy(token).unwrap_or_default();
+    let rt = runtime();
+
+    let started = rt
+        .block_on(async { services.refresh_handler.start(&token).await });
+
+    match started {
+        Ok(s) => {
+            let run_id = s.run_id;
+            let handler = services.refresh_handler.clone();
+            rt.spawn(async move {
+                let _ = handler.execute(run_id).await;
+            });
+            IndexStartResult::ok(&s.run_id.to_string())
+        }
+        Err(DomainError::Unauthorized) => IndexStartResult::err(INDEX_ERR_UNAUTHORIZED),
+        Err(_) => IndexStartResult::err(INDEX_ERR_OTHER),
+    }
+}
+
 /// Count of indexed files. For tests waiting for the background scan.
 #[allow(unsafe_code)]
 #[no_mangle]
@@ -181,6 +213,23 @@ pub extern "C" fn alexandria_index_count_files() -> i64 {
     })
 }
 
+/// Count of cataloged files currently marked missing on disk (UC-02 AF-01).
+#[allow(unsafe_code)]
+#[no_mangle]
+pub extern "C" fn alexandria_index_count_missing() -> i64 {
+    let services = match services_slot().lock().unwrap().clone() {
+        Some(s) => s,
+        None => return -1,
+    };
+    runtime().block_on(async {
+        let row: Result<(i64,), _> =
+            sqlx::query_as("SELECT COUNT(*) FROM files WHERE missing_at IS NOT NULL")
+                .fetch_one(&services.pool)
+                .await;
+        row.map(|(c,)| c).unwrap_or(-1)
+    })
+}
+
 /// JSON array of `{"path","name","type","hash"}` for every indexed file, or a
 /// NUL pointer on error. Caller must free it with `alexandria_free_string`.
 #[allow(unsafe_code)]
@@ -190,18 +239,27 @@ pub extern "C" fn alexandria_index_files_json() -> *mut c_char {
         Some(s) => s,
         None => return std::ptr::null_mut(),
     };
-    let rows: Vec<(String, String, String, String)> = runtime()
+    let rows: Vec<(String, String, String, String, Option<String>)> = runtime()
         .block_on(async {
-            sqlx::query_as("SELECT path, name, type, content_hash FROM files ORDER BY path")
-                .fetch_all(&services.pool)
-                .await
+            sqlx::query_as(
+                "SELECT path, name, type, content_hash, missing_at \
+                 FROM files ORDER BY path",
+            )
+            .fetch_all(&services.pool)
+            .await
         })
         .unwrap_or_default();
 
     let arr: Vec<_> = rows
         .iter()
-        .map(|(p, n, t, h)| {
-            serde_json::json!({ "path": p, "name": n, "type": t, "hash": h })
+        .map(|(p, n, t, h, m)| {
+            serde_json::json!({
+                "path": p,
+                "name": n,
+                "type": t,
+                "hash": h,
+                "missingAt": m,
+            })
         })
         .collect();
     let json = serde_json::Value::Array(arr).to_string();
