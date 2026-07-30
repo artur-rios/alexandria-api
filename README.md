@@ -22,7 +22,7 @@ Legend:  **&#9744;** open  ·  **&#9745;** done
 
 | Issue | Use case | Status | Title | Area | Requirements |
 | --- | --- | :---: | --- | --- | --- |
-| [#1](https://github.com/artur-rios/alexandria-api/issues/1) | — | &#9744; | Scaffold and initial infrastructure | ops | IR-01 … IR-06 |
+| [#1](https://github.com/artur-rios/alexandria-api/issues/1) | — | &#9745; | Scaffold and initial infrastructure | ops | IR-01 … IR-06 |
 | [#2](https://github.com/artur-rios/alexandria-api/issues/2) | UC-01 | &#9744; | Index library files | catalog | FR-FC-01 … FR-FC-09, FR-FC-24 |
 | [#3](https://github.com/artur-rios/alexandria-api/issues/3) | UC-02 | &#9744; | Re-index and refresh the catalog | catalog | FR-FC-08, FR-FC-10, FR-FC-11, FR-FC-24 |
 | [#4](https://github.com/artur-rios/alexandria-api/issues/4) | UC-03 | &#9744; | Browse and view file metadata | catalog | FR-FC-12, FR-FC-13, FR-FC-24 |
