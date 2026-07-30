@@ -1,0 +1,169 @@
+use chrono::{DateTime, Utc};
+use uuid::Uuid;
+
+use alexandria_core::auth::{AuthService, Principal};
+use alexandria_core::catalog::classify::classify_by_extension;
+use alexandria_core::catalog::clock::Clock;
+use alexandria_core::catalog::commands::index::{IndexHandler, IndexRequest};
+use alexandria_core::catalog::fs::Filesystem;
+use alexandria_core::catalog::model::FileType;
+use alexandria_core::catalog::repos::CatalogRepository;
+use alexandria_core::errors::DomainError;
+
+use crate::common::{
+    existing_file, fixed_clock, now, FakeAuth, FakeCatalogRepository, FakeFilesystem,
+};
+
+const ROOT: &str = "/library";
+const TOKEN: &str = "bearer-token";
+
+fn handler<A, R, F, C>(auth: A, repo: R, fs: F, clock: C) -> IndexHandler<A, R, F, C>
+where
+    A: AuthService,
+    R: CatalogRepository,
+    F: Filesystem,
+    C: Clock,
+{
+    IndexHandler::new(auth, repo, fs, clock)
+}
+
+#[test]
+fn given_supported_extensions_when_classify_then_returns_correct_type() {
+    assert_eq!(classify_by_extension("song.mp3"), Some(FileType::Audio));
+    assert_eq!(classify_by_extension("clip.mkv"), Some(FileType::Video));
+    assert_eq!(classify_by_extension("page.html"), Some(FileType::Html));
+    assert_eq!(classify_by_extension("notes.md"), Some(FileType::Text));
+    assert_eq!(classify_by_extension("book.epub"), Some(FileType::Document));
+    assert_eq!(classify_by_extension("comic.cbz"), Some(FileType::Comic));
+    assert_eq!(classify_by_extension("pic.png"), Some(FileType::Image));
+}
+
+#[tokio::test]
+async fn given_valid_root_and_authenticated_when_start_then_returns_run_id() {
+    let fs = FakeFilesystem::builder().with_root(ROOT).build();
+    let handler = handler(FakeAuth::Allowing, FakeCatalogRepository::new(), fs, fixed_clock(now()));
+
+    let started = handler
+        .start(IndexRequest { root: ROOT.to_string() }, TOKEN)
+        .await
+        .expect("start");
+
+    assert_ne!(started.run_id, Uuid::nil());
+}
+
+#[tokio::test]
+async fn given_missing_root_when_start_then_invalid_input() {
+    let fs = FakeFilesystem::builder().build();
+    let handler = handler(FakeAuth::Allowing, FakeCatalogRepository::new(), fs, fixed_clock(now()));
+
+    let result = handler
+        .start(IndexRequest { root: "/nope".to_string() }, TOKEN)
+        .await;
+
+    assert!(matches!(result, Err(DomainError::InvalidInput(_))));
+}
+
+#[tokio::test]
+async fn given_unauthenticated_when_start_then_unauthorized() {
+    let fs = FakeFilesystem::builder().with_root(ROOT).build();
+    let handler = handler(FakeAuth::Denying, FakeCatalogRepository::new(), fs, fixed_clock(now()));
+
+    let result = handler
+        .start(IndexRequest { root: ROOT.to_string() }, "")
+        .await;
+
+    assert!(matches!(result, Err(DomainError::Unauthorized)));
+}
+
+#[tokio::test]
+async fn given_already_cataloged_path_when_execute_then_skipped_no_duplicate() {
+    let existing_path = "/library/a.mp3";
+    let fs = FakeFilesystem::builder()
+        .with_file(ROOT, existing_path, "a.mp3", "h-a")
+        .with_file(ROOT, "/library/b.mp3", "b.mp3", "h-b")
+        .build();
+
+    // Clone the repo so we can inspect shared state after the handler owns its
+    // own move of the original clone.
+    let repo = FakeCatalogRepository::with_existing(existing_file(existing_path, FileType::Audio));
+    let repo_handle = repo.clone();
+    let handler = handler(FakeAuth::Allowing, repo, fs, fixed_clock(now()));
+
+    let outcome = handler.execute(ROOT, Uuid::new_v4()).await.expect("execute");
+
+    assert_eq!(outcome.scanned, 2);
+    assert_eq!(outcome.indexed, 1, "the already-cataloged path must be skipped");
+    assert_eq!(outcome.skipped, 1);
+    assert_eq!(repo_handle.count(), 2, "exactly the existing + one new record");
+    assert!(repo_handle.has_path(existing_path));
+    assert!(repo_handle.has_path("/library/b.mp3"));
+}
+
+#[tokio::test]
+async fn given_supported_files_when_execute_then_indexed_with_hash_and_indexedat() {
+    let fs = FakeFilesystem::builder()
+        .with_file(ROOT, "/library/a.mp3", "a.mp3", "h-a")
+        .with_file(ROOT, "/library/b.md", "b.md", "h-b")
+        .build();
+    let repo = FakeCatalogRepository::new();
+    let repo_handle = repo.clone();
+    let handler = handler(FakeAuth::Allowing, repo, fs, fixed_clock(now()));
+
+    let outcome = handler.execute(ROOT, Uuid::new_v4()).await.expect("execute");
+
+    assert_eq!(outcome.scanned, 2);
+    assert_eq!(outcome.indexed, 2);
+    assert_eq!(outcome.skipped, 0);
+
+    let a = repo_handle.file_for("/library/a.mp3").expect("a indexed");
+    let b = repo_handle.file_for("/library/b.md").expect("b indexed");
+    assert_eq!(a.content_hash, "h-a");
+    assert_eq!(b.content_hash, "h-b");
+    assert_eq!(a.indexed_at, now());
+    assert_eq!(b.indexed_at, now());
+    assert_eq!(a.file_type, FileType::Audio);
+    assert_eq!(b.file_type, FileType::Text);
+}
+
+#[tokio::test]
+async fn given_unsupported_extension_when_execute_then_skipped() {
+    let fs = FakeFilesystem::builder()
+        .with_file(ROOT, "/library/readme", "readme", "h-1")
+        .with_file(ROOT, "/library/archive.zip", "archive.zip", "h-2")
+        .build();
+    let repo = FakeCatalogRepository::new();
+    let handler = handler(FakeAuth::Allowing, repo, fs, fixed_clock(now()));
+
+    let outcome = handler.execute(ROOT, Uuid::new_v4()).await.expect("execute");
+
+    assert_eq!(outcome.scanned, 2);
+    assert_eq!(outcome.indexed, 0);
+    assert_eq!(outcome.skipped, 2);
+}
+
+#[tokio::test]
+async fn given_bearer_auth_when_authenticated_then_principal_owner() {
+    let principal = alexandria_core::auth::BearerAuthService
+        .authenticate("some-bearer")
+        .await
+        .expect("auth");
+    assert_eq!(principal.user_id, "owner");
+}
+
+#[tokio::test]
+async fn given_bearer_auth_when_empty_token_then_unauthorized() {
+    let result = alexandria_core::auth::BearerAuthService.authenticate("  ").await;
+    assert!(matches!(result, Err(DomainError::Unauthorized)));
+}
+
+#[test]
+fn given_fixed_clock_when_now_then_returns_seeded_time() {
+    let clock = fixed_clock(now());
+    assert_eq!(clock.now(), now());
+}
+
+#[allow(dead_code)]
+fn _unused_import() {
+    let _ = DateTime::<Utc>::from_timestamp(0, 0).unwrap();
+    let _: Principal;
+}
