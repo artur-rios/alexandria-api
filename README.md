@@ -24,7 +24,7 @@ Legend:  **&#9744;** open  ·  **&#9745;** done
 | --- | --- | :---: | --- | --- | --- |
 | [#1](https://github.com/artur-rios/alexandria-api/issues/1) | — | &#9745; | Scaffold and initial infrastructure | ops | IR-01 … IR-06 |
 | [#2](https://github.com/artur-rios/alexandria-api/issues/2) | UC-01 | &#9745; | Index library files | catalog | FR-FC-01 … FR-FC-09, FR-FC-24 |
-| [#3](https://github.com/artur-rios/alexandria-api/issues/3) | UC-02 | &#9744; | Re-index and refresh the catalog | catalog | FR-FC-08, FR-FC-10, FR-FC-11, FR-FC-24 |
+| [#3](https://github.com/artur-rios/alexandria-api/issues/3) | UC-02 | &#9745; | Re-index and refresh the catalog | catalog | FR-FC-08, FR-FC-10, FR-FC-11, FR-FC-24 |
 | [#4](https://github.com/artur-rios/alexandria-api/issues/4) | UC-03 | &#9744; | Browse and view file metadata | catalog | FR-FC-12, FR-FC-13, FR-FC-24 |
 | [#5](https://github.com/artur-rios/alexandria-api/issues/5) | UC-04 | &#9744; | Edit file metadata | catalog | FR-FC-14 … FR-FC-18, FR-FC-24 |
 | [#6](https://github.com/artur-rios/alexandria-api/issues/6) | UC-05 | &#9744; | Rename a file | catalog | FR-FC-19, FR-FC-24 |
