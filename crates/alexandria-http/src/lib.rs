@@ -28,6 +28,7 @@ pub fn app(settings: Settings, services: Arc<Services>) -> Router {
     Router::new()
         .route("/health", get(routes::health::health))
         .route("/v1/index", post(routes::index::index))
+        .route("/v1/index/refresh", post(routes::refresh::refresh))
         .layer(from_fn(middleware::auth::auth_stub))
         .layer(from_fn(middleware::error::error_stub))
         .layer(TraceLayer::new_for_http())
