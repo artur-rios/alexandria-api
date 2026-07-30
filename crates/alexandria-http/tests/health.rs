@@ -1,4 +1,8 @@
+use std::sync::Arc;
+
 use alexandria_core::config::Settings;
+use alexandria_core::migrate::migrate_database;
+use alexandria_core::services::build_services;
 use alexandria_http::app;
 use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
@@ -7,8 +11,15 @@ use tower::ServiceExt;
 
 #[tokio::test]
 async fn given_running_app_when_health_requested_then_returns_ok_contract() {
+    let db_dir = tempfile::tempdir().expect("tempdir");
+    let db_path = db_dir.path().join("alexandria.sqlite");
+    let pool = migrate_database(db_path.to_str().expect("path"))
+        .await
+        .expect("migrate");
+    let services = Arc::new(build_services(&Settings::default(), pool).await);
+
     let settings = Settings::default();
-    let router = app(settings);
+    let router = app(settings, services);
 
     let response = router
         .oneshot(
