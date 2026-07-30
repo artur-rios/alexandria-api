@@ -13,8 +13,23 @@ use crate::errors::DomainError;
 pub trait CatalogRepository: Send + Sync {
     async fn find_by_path(&self, path: &str) -> Result<Option<File>, DomainError>;
     async fn insert_file(&self, new_file: NewFile) -> Result<File, DomainError>;
+    /// Every cataloged record (UC-02 re-index iterates these).
+    async fn list_all(&self) -> Result<Vec<File>, DomainError>;
+    /// Refresh a file's content hash + `indexed_at` and clear the missing marker
+    /// (the on-disk file returned / is present). `state`/`deleted_at` untouched.
+    async fn refresh_hash(
+        &self,
+        path: &str,
+        content_hash: &str,
+        indexed_at: DateTime<Utc>,
+    ) -> Result<(), DomainError>;
+    /// Mark a cataloged path's disk file as gone (UC-02 AF-01). Sets
+    /// `missing_at`; leaves `state` (soft-delete is UC-06) and `deleted_at`.
+    async fn mark_missing(&self, path: &str, missing_at: DateTime<Utc>)
+        -> Result<(), DomainError>;
 }
 
+#[derive(Clone)]
 pub struct SqliteCatalogRepository {
     pool: SqlitePool,
 }
@@ -39,14 +54,23 @@ impl SqliteCatalogRepository {
 
 impl CatalogRepository for SqliteCatalogRepository {
     async fn find_by_path(&self, path: &str) -> Result<Option<File>, DomainError> {
-        let row: Option<(String, String, String, String, String, String, Option<String>, String)> =
-            sqlx::query_as(
-                "SELECT uuid, path, name, type, content_hash, state, deleted_at, indexed_at \
-                 FROM files WHERE path = ?",
-            )
-            .bind(path)
-            .fetch_optional(&self.pool)
-            .await?;
+        let row: Option<(
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            Option<String>,
+            String,
+            Option<String>,
+        )> = sqlx::query_as(
+            "SELECT uuid, path, name, type, content_hash, state, deleted_at, indexed_at, \
+             missing_at FROM files WHERE path = ?",
+        )
+        .bind(path)
+        .fetch_optional(&self.pool)
+        .await?;
         Ok(row.map(parse_file_row))
     }
 
@@ -55,8 +79,8 @@ impl CatalogRepository for SqliteCatalogRepository {
 
         sqlx::query(
             "INSERT INTO files \
-             (uuid, path, name, type, content_hash, state, deleted_at, indexed_at) \
-             VALUES (?, ?, ?, ?, ?, 'active', NULL, ?)",
+             (uuid, path, name, type, content_hash, state, deleted_at, indexed_at, missing_at) \
+             VALUES (?, ?, ?, ?, ?, 'active', NULL, ?, NULL)",
         )
         .bind(new_file.uuid.to_string())
         .bind(&new_file.path)
@@ -87,15 +111,82 @@ impl CatalogRepository for SqliteCatalogRepository {
             state: FileState::Active,
             deleted_at: None,
             indexed_at: new_file.indexed_at,
+            missing_at: None,
         })
+    }
+
+    async fn list_all(&self) -> Result<Vec<File>, DomainError> {
+        let rows: Vec<(
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            Option<String>,
+            String,
+            Option<String>,
+        )> = sqlx::query_as(
+            "SELECT uuid, path, name, type, content_hash, state, deleted_at, indexed_at, \
+             missing_at FROM files ORDER BY path",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(parse_file_row).collect())
+    }
+
+    async fn refresh_hash(
+        &self,
+        path: &str,
+        content_hash: &str,
+        indexed_at: DateTime<Utc>,
+    ) -> Result<(), DomainError> {
+        sqlx::query(
+            "UPDATE files SET content_hash = ?, indexed_at = ?, missing_at = NULL \
+             WHERE path = ?",
+        )
+        .bind(content_hash)
+        .bind(indexed_at.to_rfc3339())
+        .bind(path)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn mark_missing(&self, path: &str, missing_at: DateTime<Utc>) -> Result<(), DomainError> {
+        sqlx::query("UPDATE files SET missing_at = ? WHERE path = ?")
+            .bind(missing_at.to_rfc3339())
+            .bind(path)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 }
 
 fn parse_file_row(
-    row: (String, String, String, String, String, String, Option<String>, String),
+    row: (
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        Option<String>,
+        String,
+        Option<String>,
+    ),
 ) -> File {
-    let (uuid_str, path, name, type_str, content_hash, state_str, deleted_at_str, indexed_at_str) =
-        row;
+    let (
+        uuid_str,
+        path,
+        name,
+        type_str,
+        content_hash,
+        state_str,
+        deleted_at_str,
+        indexed_at_str,
+        missing_at_str,
+    ) = row;
 
     let uuid = Uuid::parse_str(&uuid_str).unwrap_or_default();
     let file_type = match type_str.as_str() {
@@ -121,6 +212,11 @@ fn parse_file_row(
             .map(|dt| dt.with_timezone(&Utc))
             .ok()
     });
+    let missing_at = missing_at_str.and_then(|s| {
+        DateTime::parse_from_rfc3339(&s)
+            .map(|dt| dt.with_timezone(&Utc))
+            .ok()
+    });
 
     File {
         uuid,
@@ -131,5 +227,6 @@ fn parse_file_row(
         state,
         deleted_at,
         indexed_at,
+        missing_at,
     }
 }

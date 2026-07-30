@@ -98,9 +98,43 @@ impl CatalogRepository for FakeCatalogRepository {
             state: alexandria_core::catalog::model::FileState::Active,
             deleted_at: None,
             indexed_at: new_file.indexed_at,
+            missing_at: None,
         };
         self.files.lock().unwrap().insert(new_file.path, file.clone());
         Ok(file)
+    }
+
+    async fn list_all(&self) -> Result<Vec<File>, DomainError> {
+        let mut files: Vec<File> = self.files.lock().unwrap().values().cloned().collect();
+        files.sort_by(|a, b| a.path.cmp(&b.path));
+        Ok(files)
+    }
+
+    async fn refresh_hash(
+        &self,
+        path: &str,
+        content_hash: &str,
+        indexed_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), DomainError> {
+        let mut files = self.files.lock().unwrap();
+        if let Some(file) = files.get_mut(path) {
+            file.content_hash = content_hash.to_string();
+            file.indexed_at = indexed_at;
+            file.missing_at = None;
+        }
+        Ok(())
+    }
+
+    async fn mark_missing(
+        &self,
+        path: &str,
+        missing_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), DomainError> {
+        let mut files = self.files.lock().unwrap();
+        if let Some(file) = files.get_mut(path) {
+            file.missing_at = Some(missing_at);
+        }
+        Ok(())
     }
 }
 
@@ -149,7 +183,9 @@ impl FakeFilesystemBuilder {
 
 impl Filesystem for FakeFilesystem {
     async fn path_exists(&self, root: &str) -> bool {
-        self.roots.contains(root)
+        // UC-01 calls with a root dir; UC-02 calls with a file path. A path is
+        // "present" if it is either a registered root or a registered file.
+        self.roots.contains(root) || self.hash_by_path.contains_key(root)
     }
 
     async fn list_files(&self, root: &str) -> Result<Vec<FileEntry>, DomainError> {
@@ -191,5 +227,51 @@ pub fn existing_file(path: &str, file_type: FileType) -> File {
         state: alexandria_core::catalog::model::FileState::Active,
         deleted_at: None,
         indexed_at: now(),
+        missing_at: None,
     }
+}
+
+/// Existing cataloged file with a known hash (for UC-02 refresh tests).
+#[allow(dead_code)]
+pub fn existing_file_with_hash(path: &str, name: &str, file_type: FileType, hash: &str) -> File {
+    File {
+        uuid: uuid::Uuid::new_v4(),
+        path: path.to_string(),
+        name: name.to_string(),
+        file_type,
+        content_hash: hash.to_string(),
+        state: alexandria_core::catalog::model::FileState::Active,
+        deleted_at: None,
+        indexed_at: earlier(),
+        missing_at: None,
+    }
+}
+
+/// A cataloged file already marked missing (the on-disk file was gone at a
+/// prior re-index). Used to test the "file came back" path of UC-02.
+#[allow(dead_code)]
+pub fn existing_missing_file(path: &str, name: &str, file_type: FileType, hash: &str) -> File {
+    File {
+        uuid: uuid::Uuid::new_v4(),
+        path: path.to_string(),
+        name: name.to_string(),
+        file_type,
+        content_hash: hash.to_string(),
+        state: alexandria_core::catalog::model::FileState::Active,
+        deleted_at: None,
+        indexed_at: earlier(),
+        missing_at: Some(earlier()),
+    }
+}
+
+/// Seed an arbitrary file directly into a fake repo (bypassing `insert_file`).
+impl FakeCatalogRepository {
+    pub fn seed(&self, file: File) {
+        self.files.lock().unwrap().insert(file.path.clone(), file);
+    }
+}
+
+/// An "earlier" timestamp than `now()` so re-index refreshes `indexed_at`.
+fn earlier() -> DateTime<Utc> {
+    DateTime::<Utc>::from_timestamp(1_699_000_000, 0).unwrap()
 }
