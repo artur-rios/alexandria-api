@@ -1,0 +1,40 @@
+# Alexandria example configuration.
+# Copy this file to config.toml and adjust as needed. Any key can be overridden
+# by an environment variable named ALEXANDRIA_<SECTION>_<KEY> (e.g.
+# ALEXANDRIA_HTTP_PORT, ALEXANDRIA_AUTH_MODE). Unknown keys are ignored.
+
+[auth]
+# The single active authentication mode. One of: "external", "local".
+mode = "external"
+
+# External mode only: the JWKS endpoint of the external auth service used to
+# validate JWTs. Ignored when mode = "local".
+jwks_url = ""
+
+# Local mode only: indicates local-login credentials are managed in the SQLite
+# database. Set credentials once via the local credential setup operation (UC-35)
+# before callers can authenticate. Ignored when mode = "external".
+local_db = false
+
+[http]
+# Bind address. Loopback by default so the API is reachable only from the local
+# machine unless explicitly reconfigured (see IR-03).
+bind_addr = "127.0.0.1"
+port = 8080
+
+[database]
+# SQLite file path. Bundled beside the desktop app's data directory by default.
+path = "alexandria.sqlite"
+
+[indexing]
+# Maximum number of concurrent async indexing workers.
+concurrency = 4
+
+[deletion]
+# Soft-delete retention window in days. After this many days have elapsed, a
+# soft-deleted record becomes eligible for hard purge (default 30, see NFR-10).
+retention_days = 30
+
+[logging]
+# One of: "error", "warn", "info", "debug", "trace".
+level = "info"

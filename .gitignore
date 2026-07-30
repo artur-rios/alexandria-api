@@ -1,0 +1,58 @@
+# Rust build artifacts
+/target
+**/*.rs.bk
+*.pdb
+
+# Cargo lockfile policy:
+# Keep Cargo.lock for the application workspace; the file is committed and tracked.
+# (binaries/application repos keep the lockfile checked in)
+
+# Generated output
+/alexandria-http/dist
+/alexandria-ffi/build
+**/*.o
+**/*.so
+**/*.dylib
+**/*.dll
+**/*.a
+**/*.lib
+
+# cbindgen-generated headers (regenerated at build time)
+# Keep tracked headers under version control only if checked explicitly.
+crates/alexandria-ffi/src/*.h.bak
+
+# Logs and local runtime data
+*.log
+/logs
+/data
+*.sqlite
+*.sqlite-journal
+*.sqlite-shm
+*.sqlite-wal
+
+# Local configuration (overrides examples)
+config.toml
+!.env.example
+!.toml.example
+config.local.toml
+
+# IDE / editor
+/.idea
+/.vscode
+!.vscode/extensions.json
+!.vscode/settings.json
+*.code-workspace
+.fleet
+/.helix
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Test artifacts
+/tarpaulin-report*
+/.coverage
+/coverage
+*.profraw
+*.profdata
