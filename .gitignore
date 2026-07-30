@@ -17,8 +17,9 @@
 **/*.a
 **/*.lib
 
-# cbindgen-generated headers (regenerated at build time)
+# cbindgen-generated headers (regenerated at build time by alexandria-ffi/build.rs)
 # Keep tracked headers under version control only if checked explicitly.
+crates/alexandria-ffi/src/header.h
 crates/alexandria-ffi/src/*.h.bak
 
 # Logs and local runtime data

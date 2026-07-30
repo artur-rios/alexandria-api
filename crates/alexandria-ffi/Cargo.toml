@@ -1,0 +1,17 @@
+[package]
+name = "alexandria-ffi"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license-file = "../../LICENSE"
+repository.workspace = true
+
+[lib]
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[dependencies]
+alexandria-core.workspace = true
+
+[build-dependencies]
+cbindgen.workspace = true

@@ -1,0 +1,35 @@
+#![deny(unsafe_code)]
+
+use std::path::PathBuf;
+
+use anyhow::Result;
+
+use alexandria_core::config::Settings;
+use alexandria_core::migrate::migrate_database;
+
+use alexandria_http::app;
+use alexandria_http::middleware::logging::init_tracing;
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let config_path = std::env::var("ALEXANDRIA_CONFIG")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("config.toml"));
+    let settings = Settings::load_or_default(&config_path);
+
+    init_tracing(&settings.logging.level);
+
+    let bind_addr = settings.http.socket_addr();
+    let auth_mode = settings.auth.mode;
+
+    migrate_database(&settings.database.path).await?;
+    tracing::info!("database migrations applied");
+
+    tracing::info!(%bind_addr, auth_mode = auth_mode.as_str(), "starting alexandria-http");
+
+    let router = app(settings);
+    let listener = tokio::net::TcpListener::bind(bind_addr).await?;
+    axum::serve(listener, router).await?;
+
+    Ok(())
+}
