@@ -12,9 +12,9 @@ use alexandria_core::migrate::migrate_database;
 use alexandria_core::services::build_services;
 use alexandria_http::app;
 use alexandria_ffi::{
-    alexandria_free_string, alexandria_index_count_files, alexandria_index_count_missing,
-    alexandria_index_files_json, alexandria_index_init, alexandria_index_refresh_start,
-    alexandria_index_start, IndexStartResult,
+    alexandria_file_edit_metadata, alexandria_free_string, alexandria_index_count_files,
+    alexandria_index_count_missing, alexandria_index_files_json, alexandria_index_init,
+    alexandria_index_refresh_start, alexandria_index_start, IndexStartResult,
 };
 use axum::body::{to_bytes, Body};
 use axum::http::Request;
@@ -322,4 +322,220 @@ fn wait_for_ffi_missing(expected: i64) {
         if std::time::Instant::now() > dl { panic!("ffi never had {expected} missing"); }
         std::thread::sleep(std::time::Duration::from_millis(25));
     }
+}
+
+/// UC-04 parity — edit metadata over both transports with identical patch
+/// JSON and assert the returned `FileMetadata` bodies agree (modulo the
+/// file's UUID, which is per-database) and the persisted `audio_files` rows
+/// match across both databases (Testing Specification §7.3, FR-FC-24).
+#[tokio::test]
+async fn given_same_audio_file_when_metadata_edited_via_http_and_ffi_then_responses_and_rows_identical() {
+    let _g = SERIAL.lock().unwrap();
+
+    let patch_json = r#"{"type":"audio","title":"Parity Title","artist":"Artist","album":"Album","year":2001,"genre":"Rock","track":3}"#;
+    let patch_value: serde_json::Value = serde_json::from_str(patch_json).unwrap();
+
+    // ---- HTTP leg ----
+    let http_lib = tempdir().unwrap();
+    std::fs::write(http_lib.path().join("song.mp3"), b"parity-audio").unwrap();
+
+    let http_dir = tempdir().unwrap();
+    let http_db = db_path(&http_dir, "http.sqlite");
+    let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    let http_services = std::sync::Arc::new(
+        build_services(&Settings::default(), http_pool.clone()).await,
+    );
+
+    let index_req = Request::builder()
+        .method("POST")
+        .uri("/v1/index")
+        .header("authorization", "Bearer parity")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({ "root": http_lib.path().to_str().unwrap() }).to_string(),
+        ))
+        .unwrap();
+    let _ = app(Settings::default(), http_services.clone())
+        .oneshot(index_req)
+        .await
+        .expect("http index");
+    wait_for_http_files(&http_pool, 1).await;
+
+    let (http_uuid,): (String,) = sqlx::query_as("SELECT uuid FROM files WHERE name = ?")
+        .bind("song.mp3")
+        .fetch_one(&http_pool)
+        .await
+        .unwrap();
+
+    let patch_req = Request::builder()
+        .method("PATCH")
+        .uri(format!("/v1/files/{http_uuid}/metadata"))
+        .header("authorization", "Bearer parity")
+        .header("content-type", "application/json")
+        .body(Body::from(patch_json.to_string()))
+        .unwrap();
+    let http_resp = app(Settings::default(), http_services.clone())
+        .oneshot(patch_req)
+        .await
+        .expect("http patch");
+    assert_eq!(http_resp.status(), axum::http::StatusCode::OK);
+    let http_body: serde_json::Value = serde_json::from_slice(
+        &to_bytes(http_resp.into_body(), usize::MAX).await.unwrap(),
+    )
+    .unwrap();
+
+    let http_audio_row: (
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<i64>,
+        Option<String>,
+        Option<i64>,
+    ) = sqlx::query_as(
+        "SELECT title, artist, album, year, genre, track FROM audio_files \
+         JOIN files ON files.id = audio_files.file_id WHERE files.uuid = ?",
+    )
+    .bind(&http_uuid)
+    .fetch_one(&http_pool)
+    .await
+    .unwrap();
+
+    // ---- FFI leg (own identical lib + db) ----
+    let ffi_lib = tempdir().unwrap();
+    std::fs::write(ffi_lib.path().join("song.mp3"), b"parity-audio").unwrap();
+    let ffi_dir = tempdir().unwrap();
+    let ffi_db = db_path(&ffi_dir, "ffi.sqlite");
+    let ffi_lib_path = ffi_lib.path().to_str().unwrap().to_string();
+    let patch_for_ffi = patch_json.to_string();
+    let ffi_payload: (String, serde_json::Value, (Option<String>, Option<String>, Option<String>, Option<i64>, Option<String>, Option<i64>)) =
+        tokio::task::spawn_blocking(move || {
+            let cdb = CString::new(ffi_db).unwrap();
+            assert_eq!(alexandria_index_init(cdb.as_ptr()), alexandria_ffi::INDEX_OK);
+
+            let root = CString::new(ffi_lib_path).unwrap();
+            let token = CString::new("parity").unwrap();
+            let started = alexandria_index_start(root.as_ptr(), token.as_ptr());
+            assert_eq!(started.status, alexandria_ffi::INDEX_OK);
+            wait_for_ffi_files(1);
+
+            // Resolve the file's uuid via a read connection to the FFI db file.
+            let ffi_uuid = std::thread::spawn({
+                let ffi_dir = ffi_dir.path().to_path_buf();
+                move || -> String {
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .unwrap();
+                    rt.block_on(async move {
+                        let path = ffi_dir.join("ffi.sqlite");
+                        let url = format!("sqlite://{}", path.to_str().unwrap());
+                        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+                            .max_connections(1)
+                            .connect(&format!("{url}?mode=rw"))
+                            .await
+                            .unwrap();
+                        let (uuid,): (String,) =
+                            sqlx::query_as("SELECT uuid FROM files WHERE name = ?")
+                                .bind("song.mp3")
+                                .fetch_one(&pool)
+                                .await
+                                .unwrap();
+                        uuid
+                    })
+                }
+            })
+            .join()
+            .unwrap();
+
+            let patch_c = CString::new(patch_for_ffi).unwrap();
+            let result = alexandria_file_edit_metadata(
+                CString::new(ffi_uuid.clone()).unwrap().as_ptr(),
+                patch_c.as_ptr(),
+                token.as_ptr(),
+            );
+            assert_eq!(result.status, alexandria_ffi::FILE_OK, "ffi edit failed");
+            assert!(!result.json.is_null());
+            // SAFETY: FFI returned a NUL-terminated string via CString::into_raw.
+            let json_str = unsafe { CStr::from_ptr(result.json) }
+                .to_str()
+                .unwrap()
+                .to_string();
+            alexandria_free_string(result.json);
+            let ffi_value: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+
+            // Persisted audio row from the FFI db.
+            let ffi_audio_row = std::thread::spawn({
+                let ffi_dir = ffi_dir.path().to_path_buf();
+                let ffi_uuid = ffi_uuid.clone();
+                move || -> (Option<String>, Option<String>, Option<String>, Option<i64>, Option<String>, Option<i64>) {
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .unwrap();
+                    rt.block_on(async move {
+                        let path = ffi_dir.join("ffi.sqlite");
+                        let url = format!("sqlite://{}", path.to_str().unwrap());
+                        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+                            .max_connections(1)
+                            .connect(&format!("{url}?mode=rw"))
+                            .await
+                            .unwrap();
+                        let row: (Option<String>, Option<String>, Option<String>, Option<i64>, Option<String>, Option<i64>) =
+                            sqlx::query_as(
+                                "SELECT title, artist, album, year, genre, track FROM audio_files \
+                                 JOIN files ON files.id = audio_files.file_id WHERE files.uuid = ?",
+                            )
+                            .bind(ffi_uuid)
+                            .fetch_one(&pool)
+                            .await
+                            .unwrap();
+                        row
+                    })
+                }
+            })
+            .join()
+            .unwrap();
+
+            (ffi_uuid, ffi_value, ffi_audio_row)
+        })
+        .await
+        .unwrap();
+
+    let (_ffi_uuid, ffi_body, ffi_audio_row) = ffi_payload;
+
+    // ---- compare ----
+    // The `metadata` sub-object is fully server-derived from the patch and
+    // must be byte-value identical across surfaces.
+    assert_eq!(
+        http_body["metadata"], ffi_body["metadata"],
+        "metadata body diverges across surfaces"
+    );
+
+    // The `file` sub-object matches field-for-field except the per-database
+    // values: `uuid` (random v4), `path` (each leg indexes its own temp dir),
+    // and `indexedAt` (wall-clock stamp). The remaining fields — `name`,
+    // `fileType`, `contentHash`, `state`, `deletedAt`, `missingAt` — are
+    // deterministic and must agree across surfaces (parity, FR-FC-24).
+    let norm_file = |v: &serde_json::Value| -> serde_json::Value {
+        let mut f = v["file"].clone();
+        if let Some(obj) = f.as_object_mut() {
+            obj.remove("uuid");
+            obj.remove("path");
+            obj.remove("indexedAt");
+        }
+        f
+    };
+    let http_file_norm = norm_file(&http_body);
+    let ffi_file_norm = norm_file(&ffi_body);
+    assert_eq!(
+        http_file_norm, ffi_file_norm,
+        "file body (minus uuid/path/indexedAt) diverges across surfaces"
+    );
+
+    // Persisted subtype rows must agree across databases.
+    assert_eq!(http_audio_row, ffi_audio_row, "audio_files row diverges");
+
+    // Also confirm the patch we sent equals the metadata we got back (the
+    // handler echoes the written metadata).
+    assert_eq!(http_body["metadata"], patch_value, "metadata must echo patch");
 }
