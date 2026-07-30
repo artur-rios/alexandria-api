@@ -94,7 +94,7 @@ over the same handlers.
 
 ## Repository layout
 
-```
+```txt
 alexandria-api/
 ├── Cargo.toml                 # workspace
 ├── crates/
@@ -207,12 +207,3 @@ The full license terms are in the [LICENSE](LICENSE) file.
 
 For licensing inquiries, contact the repository owner via the GitHub repository's
 contact channels.
-
-## contributing
-
-This is a private repository. Development follows the pause-gated workflow
-defined in the [Development Workflow Document](docs/requirements/Development%20Workflow%20Document.md):
-one use case = one branch (`feature/uc-##-name`) = one issue = one pull request,
-with human review required before each stage transition and before merge. An
-agent may prepare and push pull requests, but may not self-approve, merge, or
-delete branches.
