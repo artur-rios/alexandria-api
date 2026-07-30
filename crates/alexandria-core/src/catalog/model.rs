@@ -218,6 +218,7 @@ pub struct FileMetadata {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct File {
     pub uuid: Uuid,
     pub path: String,
