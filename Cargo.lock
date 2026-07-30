@@ -37,6 +37,7 @@ dependencies = [
  "alexandria-core",
  "cbindgen",
  "serde_json",
+ "sqlx",
  "tempfile",
  "tokio",
 ]
