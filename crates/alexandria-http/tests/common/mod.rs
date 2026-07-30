@@ -59,6 +59,20 @@ pub async fn file_rows(pool: &SqlitePool) -> Vec<(String, String, String, String
         .expect("rows")
 }
 
+/// `(path, name, type, content_hash, missing_at)` — `missing_at` is NULL when
+/// the on-disk file was present at last refresh.
+pub async fn file_rows_with_missing(
+    pool: &SqlitePool,
+) -> Vec<(String, String, String, String, Option<String>)> {
+    sqlx::query_as(
+        "SELECT path, name, type, content_hash, missing_at \
+         FROM files ORDER BY path",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("rows")
+}
+
 pub fn write_file(dir: &tempfile::TempDir, name: &str, contents: &[u8]) -> std::path::PathBuf {
     let path = dir.path().join(name);
     std::fs::write(&path, contents).expect("write");

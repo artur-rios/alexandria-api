@@ -10,7 +10,7 @@ use serde_json::{json, Value};
 use tempfile::tempdir;
 use tower::ServiceExt;
 
-use crate::common::{file_rows, test_app, wait_for_files};
+use crate::common::{file_rows, file_rows_with_missing, test_app, wait_for_files};
 
 fn index_request(root: &str) -> Request<Body> {
     Request::builder()
@@ -19,6 +19,15 @@ fn index_request(root: &str) -> Request<Body> {
         .header("authorization", "Bearer test-token")
         .header("content-type", "application/json")
         .body(Body::from(json!({ "root": root }).to_string()))
+        .unwrap()
+}
+
+fn refresh_request() -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri("/v1/index/refresh")
+        .header("authorization", "Bearer test-token")
+        .body(Body::empty())
         .unwrap()
 }
 
@@ -148,4 +157,81 @@ async fn given_subtype_rows_when_indexed_then_each_file_has_subtype_row() {
     assert_eq!(document.0, 1);
 
     let _: &BTreeMap<(), ()> = &BTreeMap::new(); // silence unused import if any
+}
+
+#[tokio::test]
+async fn given_changed_and_deleted_files_when_refresh_posted_then_refreshes_and_marks_missing() {
+    let lib = tempdir().unwrap();
+    let a = common::write_file(&lib, "a.mp3", b"audio-v1");
+    let _b = common::write_file(&lib, "b.md", b"text-v1");
+
+    let test = test_app().await;
+    let router = app(Settings::default(), test.services.clone());
+    let _ = router
+        .oneshot(index_request(lib.path().to_str().unwrap()))
+        .await
+        .expect("index one-shot");
+    wait_for_files(&test.pool, 2).await;
+
+    let before = file_rows(&test.pool).await;
+    assert_eq!(before.len(), 2);
+    let old_a_hash = before
+        .iter()
+        .find(|r| r.1 == "a.mp3")
+        .map(|r| r.3.clone())
+        .expect("a indexed");
+    let old_b_hash = before
+        .iter()
+        .find(|r| r.1 == "b.md")
+        .map(|r| r.3.clone())
+        .expect("b indexed");
+
+    // Mutate: change a's bytes on disk, delete b from disk.
+    std::fs::write(&a, b"audio-v2-CHANGED").unwrap();
+    std::fs::remove_file(lib.path().join("b.md")).unwrap();
+
+    let router2 = app(Settings::default(), test.services.clone());
+    let response = router2.oneshot(refresh_request()).await.expect("refresh one-shot");
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert!(body["runId"].as_str().unwrap().is_empty() == false);
+
+    // Wait for the refresh to settle: a's hash must differ from the old one,
+    // and b must have a missing_at set.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let rows = file_rows_with_missing(&test.pool).await;
+        let a_row = rows.iter().find(|r| r.1 == "a.mp3").expect("a");
+        let b_row = rows.iter().find(|r| r.1 == "b.md").expect("b");
+        let a_refreshed = a_row.3 != old_a_hash;
+        let b_marked = b_row.4.is_some();
+        if a_refreshed && b_marked {
+            assert_ne!(a_row.3, old_a_hash, "a hash refreshed");
+            assert_eq!(a_row.4, None, "a missing marker cleared");
+            assert_eq!(b_row.3, old_b_hash, "b hash untouched when missing");
+            assert!(b_row.4.is_some(), "b marked missing");
+            break;
+        }
+        if std::time::Instant::now() > deadline {
+            panic!(
+                "refresh never settled; a refreshed={a_refreshed}, b marked={b_marked}"
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+}
+
+#[tokio::test]
+async fn given_no_bearer_when_refresh_posted_then_returns_401() {
+    let test = test_app().await;
+    let router = app(Settings::default(), test.services);
+
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/index/refresh")
+        .body(Body::empty())
+        .unwrap();
+    let response = router.oneshot(request).await.expect("one-shot");
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 }

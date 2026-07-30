@@ -82,4 +82,9 @@ pub struct File {
     pub state: FileState,
     pub deleted_at: Option<DateTime<Utc>>,
     pub indexed_at: DateTime<Utc>,
+    /// When re-index found the on-disk file gone (FR-FC-11 / UC-02 AF-01).
+    /// `None` means the file was present at last refresh. The `state` enum is
+    /// unchanged (still `active`/`deleted`); `missing_at` is orthogonal to the
+    /// soft-delete lifecycle owned by UC-06/07.
+    pub missing_at: Option<DateTime<Utc>>,
 }

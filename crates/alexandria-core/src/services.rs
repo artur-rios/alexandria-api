@@ -5,6 +5,7 @@ use sqlx::sqlite::SqlitePool;
 use crate::auth::BearerAuthService;
 use crate::catalog::clock::SystemClock;
 use crate::catalog::commands::index::IndexHandler;
+use crate::catalog::commands::refresh::RefreshHandler;
 use crate::catalog::fs::StdFilesystem;
 use crate::catalog::repos::SqliteCatalogRepository;
 use crate::config::Settings;
@@ -16,9 +17,13 @@ use crate::config::Settings;
 pub type DefaultIndexHandler =
     IndexHandler<BearerAuthService, SqliteCatalogRepository, StdFilesystem, SystemClock>;
 
+pub type DefaultRefreshHandler =
+    RefreshHandler<BearerAuthService, SqliteCatalogRepository, StdFilesystem, SystemClock>;
+
 #[derive(Clone)]
 pub struct Services {
     pub index_handler: Arc<DefaultIndexHandler>,
+    pub refresh_handler: Arc<DefaultRefreshHandler>,
     pub pool: SqlitePool,
 }
 
@@ -31,9 +36,11 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
     let auth = BearerAuthService;
     let fs = StdFilesystem;
     let clock = SystemClock;
-    let index_handler = Arc::new(IndexHandler::new(auth, repo, fs, clock));
+    let index_handler = Arc::new(IndexHandler::new(auth, repo.clone(), fs, clock));
+    let refresh_handler = Arc::new(RefreshHandler::new(auth, repo, fs, clock));
     Services {
         index_handler,
+        refresh_handler,
         pool,
     }
 }
