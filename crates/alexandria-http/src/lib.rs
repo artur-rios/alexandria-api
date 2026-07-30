@@ -30,7 +30,7 @@ pub fn app(settings: Settings, services: Arc<Services>) -> Router {
         .route("/v1/index", post(routes::index::index))
         .route("/v1/index/refresh", post(routes::refresh::refresh))
         .route(
-            "/v1/files/{uuid}/metadata",
+            "/v1/files/:uuid/metadata",
             patch(routes::edit_metadata::edit_metadata),
         )
         .layer(from_fn(middleware::auth::auth_stub))
