@@ -33,6 +33,8 @@ pub fn app(settings: Settings, services: Arc<Services>) -> Router {
             "/v1/files/:uuid/metadata",
             patch(routes::edit_metadata::edit_metadata),
         )
+        .route("/v1/files", get(routes::browse::list_files))
+        .route("/v1/files/:uuid", get(routes::browse::get_file))
         .layer(from_fn(middleware::auth::auth_stub))
         .layer(from_fn(middleware::error::error_stub))
         .layer(TraceLayer::new_for_http())
