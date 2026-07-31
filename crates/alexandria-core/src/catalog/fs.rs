@@ -20,6 +20,12 @@ pub trait Filesystem: Send + Sync {
     async fn path_exists(&self, root: &str) -> bool;
     async fn list_files(&self, root: &str) -> Result<Vec<FileEntry>, DomainError>;
     async fn content_hash(&self, path: &str) -> Result<String, DomainError>;
+    /// Rename `from` to `to` on disk (UC-05 / FR-FC-19). Atomic on a single
+    /// volume; fails with `Disk` when the source is missing, the parent
+    /// directory is not writable, or the target already exists (the latter is
+    /// OS-dependent, so callers also pre-check it). Used by the rename
+    /// handler, which leaves the catalog untouched if this fails (AF-02).
+    async fn rename(&self, from: &str, to: &str) -> Result<(), DomainError>;
 }
 
 /// Real on-disk filesystem backed by `walkdir` and `sha2`.
@@ -81,6 +87,11 @@ impl Filesystem for StdFilesystem {
             let _ = write!(hex, "{byte:02x}");
         }
         Ok(hex)
+    }
+
+    async fn rename(&self, from: &str, to: &str) -> Result<(), DomainError> {
+        std::fs::rename(from, to)
+            .map_err(|e| DomainError::disk(format!("rename {from:?} -> {to:?}: {e}")))
     }
 }
 

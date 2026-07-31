@@ -12,3 +12,6 @@ mod index;
 
 #[path = "catalog/refresh.rs"]
 mod refresh;
+
+#[path = "catalog/rename.rs"]
+mod rename;

@@ -7,6 +7,7 @@ use crate::catalog::clock::SystemClock;
 use crate::catalog::commands::edit_metadata::EditMetadataHandler;
 use crate::catalog::commands::index::IndexHandler;
 use crate::catalog::commands::refresh::RefreshHandler;
+use crate::catalog::commands::rename::RenameFileHandler;
 use crate::catalog::fs::StdFilesystem;
 use crate::catalog::queries::browse::BrowseFilesHandler;
 use crate::catalog::repos::SqliteCatalogRepository;
@@ -25,6 +26,9 @@ pub type DefaultRefreshHandler =
 pub type DefaultEditMetadataHandler =
     EditMetadataHandler<BearerAuthService, SqliteCatalogRepository>;
 
+pub type DefaultRenameFileHandler =
+    RenameFileHandler<BearerAuthService, SqliteCatalogRepository, StdFilesystem>;
+
 pub type DefaultBrowseFilesHandler =
     BrowseFilesHandler<BearerAuthService, SqliteCatalogRepository>;
 
@@ -33,6 +37,7 @@ pub struct Services {
     pub index_handler: Arc<DefaultIndexHandler>,
     pub refresh_handler: Arc<DefaultRefreshHandler>,
     pub edit_metadata_handler: Arc<DefaultEditMetadataHandler>,
+    pub rename_file_handler: Arc<DefaultRenameFileHandler>,
     pub browse_files_handler: Arc<DefaultBrowseFilesHandler>,
     /// The same auth service the handlers hold, exposed so a transport can
     /// reject an unauthenticated caller *before* it parses a request body or
@@ -54,11 +59,13 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
     let index_handler = Arc::new(IndexHandler::new(auth, repo.clone(), fs, clock));
     let refresh_handler = Arc::new(RefreshHandler::new(auth, repo.clone(), fs, clock));
     let edit_metadata_handler = Arc::new(EditMetadataHandler::new(auth, repo.clone()));
+    let rename_file_handler = Arc::new(RenameFileHandler::new(auth, repo.clone(), fs));
     let browse_files_handler = Arc::new(BrowseFilesHandler::new(auth, repo));
     Services {
         index_handler,
         refresh_handler,
         edit_metadata_handler,
+        rename_file_handler,
         browse_files_handler,
         auth,
         pool,

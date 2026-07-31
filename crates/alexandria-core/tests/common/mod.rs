@@ -59,6 +59,9 @@ pub struct FakeCatalogRepository {
     /// simulating a per-file repository error mid-run (UC-01 / UC-02: the run
     /// counts the failure and continues rather than aborting).
     failing_paths: Arc<Mutex<std::collections::HashSet<String>>>,
+    /// UUIDs whose `rename_file` must fail with a Database error, simulating
+    /// the post-rename catalog-failure branch of UC-05.
+    failing_rename_file_uuids: Arc<Mutex<std::collections::HashSet<Uuid>>>,
 }
 
 impl FakeCatalogRepository {
@@ -115,6 +118,13 @@ impl FakeCatalogRepository {
 
     fn fails(&self, path: &str) -> bool {
         self.failing_paths.lock().unwrap().contains(path)
+    }
+
+    /// Make `rename_file` return a `Database` error for `uuid`, simulating the
+    /// post-rename catalog-failure branch of UC-05 (the handler must roll the
+    /// on-disk rename back). Used by the rename rollback unit test.
+    pub fn fail_rename_file(&self, uuid: Uuid) {
+        self.failing_rename_file_uuids.lock().unwrap().insert(uuid);
     }
 }
 
@@ -233,11 +243,48 @@ impl CatalogRepository for FakeCatalogRepository {
     ) -> Result<Option<SubtypeMetadata>, DomainError> {
         Ok(self.metadata.lock().unwrap().get(&uuid).cloned())
     }
+
+    async fn rename_file(
+        &self,
+        uuid: Uuid,
+        new_name: &str,
+        new_path: &str,
+    ) -> Result<File, DomainError> {
+        // Resolve the file by uuid, defending the unique-path invariant the
+        // Sqlite impl relies on (a different file already owns `new_path`).
+        let mut files = self.files.lock().unwrap();
+        let file = files
+            .values()
+            .find(|f| f.uuid == uuid)
+            .cloned()
+            .ok_or(DomainError::NotFound)?;
+        if self
+            .failing_rename_file_uuids
+            .lock()
+            .unwrap()
+            .contains(&uuid)
+        {
+            return Err(DomainError::internal("fake rename_file failure"));
+        }
+        if files.values().any(|f| f.path == new_path && f.uuid != uuid) {
+            return Err(DomainError::InvalidInput(
+                "target path already cataloged for a different file".into(),
+            ));
+        }
+        let entry = files.get_mut(&file.path).expect("seeded file present");
+        entry.name = new_name.to_string();
+        entry.path = new_path.to_string();
+        let renamed = entry.clone();
+        // Re-key the map by path so subsequent find_by_path sees the new name.
+        files.remove(&file.path);
+        files.insert(new_path.to_string(), renamed.clone());
+        Ok(renamed)
+    }
 }
 
 /// In-memory filesystem. Stores which roots "exist" and a map of root -> the
 /// entries `list_files` returns, plus a map of path -> content hash.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct FakeFilesystem {
     roots: std::collections::HashSet<String>,
     entries_by_root: HashMap<String, Vec<FileEntry>>,
@@ -246,11 +293,61 @@ pub struct FakeFilesystem {
     /// denied). `content_hash` fails for these, simulating the single bad file
     /// that must not abort a whole index or refresh run.
     unreadable: std::collections::HashSet<String>,
+    /// Interior-mutable post-construction state for the `rename` port
+    /// (UC-05): the trait takes `&self`, so a rename that would move the
+    /// recorded hash and update `path_exists` must do so through a lock.
+    state: Arc<Mutex<FakeFsState>>,
+}
+
+#[derive(Debug, Default)]
+struct FakeFsState {
+    /// Paths where `rename` must fail, simulating UC-05 AF-02.
+    failing_renames_from: std::collections::HashSet<String>,
+    /// Paths recorded as "exists on disk" — simulates an on-disk entry not in
+    /// the catalog so the rename handler's target-exists guard fires.
+    disk_paths: std::collections::HashSet<String>,
+    /// Completed renames `from -> to`, in order. `path_exists` reports the
+    /// `to` path as present (and the `from` path as gone) after a rename.
+    renames: Vec<(String, String)>,
 }
 
 impl FakeFilesystem {
     pub fn builder() -> FakeFilesystemBuilder {
         FakeFilesystemBuilder::default()
+    }
+
+    /// Make `rename` from `path` fail with a disk error (UC-05 AF-02).
+    pub fn fail_rename_from(&mut self, path: &str) {
+        self.state
+            .lock()
+            .unwrap()
+            .failing_renames_from
+            .insert(path.to_string());
+    }
+
+    /// Record an on-disk entry at `path` (not cataloged) so the rename
+    /// handler's target-exists-on-disk guard fires (UC-05 AF-02).
+    pub fn place_disk_file(&mut self, path: &str) {
+        self.state
+            .lock()
+            .unwrap()
+            .disk_paths
+            .insert(path.to_string());
+    }
+
+    /// `true` once a rename `from -> to` has been recorded by the fake.
+    pub fn renamed_to(&self, from: &str, to: &str) -> bool {
+        self.state
+            .lock()
+            .unwrap()
+            .renames
+            .iter()
+            .any(|(f, t)| f == from && t == to)
+    }
+
+    /// Count of renames the fake has performed so far.
+    pub fn rename_count(&self) -> usize {
+        self.state.lock().unwrap().renames.len()
     }
 }
 
@@ -300,9 +397,24 @@ impl Filesystem for FakeFilesystem {
         // UC-01 calls with a root dir; UC-02 calls with a file path. A path is
         // "present" if it is either a registered root or a registered file.
         // An unreadable file is still present — it just cannot be hashed.
+        // After a rename, the `to` path is present and the `from` path is gone.
+        let state = self.state.lock().unwrap();
+        let moved_from = state
+            .renames
+            .iter()
+            .any(|(f, _)| f == root)
+            && !state
+                .renames
+                .iter()
+                .any(|(_, t)| t == root);
+        let moved_to = state.renames.iter().any(|(_, t)| t == root);
+        let disk = state.disk_paths.contains(root);
+        drop(state);
         self.roots.contains(root)
             || self.hash_by_path.contains_key(root)
             || self.unreadable.contains(root)
+            || disk
+            || (moved_to && !moved_from)
     }
 
     async fn list_files(&self, root: &str) -> Result<Vec<FileEntry>, DomainError> {
@@ -322,6 +434,17 @@ impl Filesystem for FakeFilesystem {
             .get(path)
             .cloned()
             .unwrap_or_else(|| format!("hash-of-{path}")))
+    }
+
+    async fn rename(&self, from: &str, to: &str) -> Result<(), DomainError> {
+        let mut state = self.state.lock().unwrap();
+        if state.failing_renames_from.contains(from) {
+            return Err(DomainError::disk(format!(
+                "fake rename failure: {from:?} -> {to:?}"
+            )));
+        }
+        state.renames.push((from.to_string(), to.to_string()));
+        Ok(())
     }
 }
 

@@ -34,6 +34,7 @@ pub const FILE_ERR_UNAUTHORIZED: c_int = 2;
 pub const FILE_ERR_NOT_INITIALIZED: c_int = 3;
 pub const FILE_ERR_NOT_FOUND: c_int = 4;
 pub const FILE_ERR_INVALID_STATE: c_int = 5;
+pub const FILE_ERR_DISK: c_int = 6;
 pub const FILE_ERR_OTHER: c_int = 9;
 
 fn runtime() -> &'static Runtime {
@@ -542,6 +543,63 @@ pub extern "C" fn alexandria_file_get_by_uuid(
     }
 }
 
+/// Rename a file (and its on-disk file) (UC-05 / FR-FC-19).
+///
+/// `uuid` is the file's public UUID string; `name` is the new file name. The
+/// function calls the same `RenameFileHandler` the HTTP route uses and on
+/// success serializes the returned `File` back to JSON — the same shape HTTP
+/// returns from `POST /v1/files/{uuid}/rename`, so the FFI and HTTP surfaces
+/// agree byte-for-byte modulo key ordering (parity, FR-FC-24 / NFR-09).
+/// `token` is the bearer auth token. A disk failure (AF-02) maps to
+/// `FILE_ERR_DISK`; the catalog is left untouched in that case.
+#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
+#[no_mangle]
+pub extern "C" fn alexandria_file_rename(
+    uuid: *const c_char,
+    name: *const c_char,
+    token: *const c_char,
+) -> FileJsonResult {
+    let services = match services_slot().lock().unwrap().clone() {
+        Some(s) => s,
+        None => return FileJsonResult::err(FILE_ERR_NOT_INITIALIZED),
+    };
+
+    // Deny before touching the payload — an unauthenticated caller must
+    // not learn whether its uuid or name would have parsed.
+    let token = cstr_lossy(token).unwrap_or_default();
+    if !authenticated(&services, &token) {
+        return FileJsonResult::err(FILE_ERR_UNAUTHORIZED);
+    }
+
+    let uuid_str = match cstr_lossy(uuid) {
+        Some(s) => s,
+        None => return FileJsonResult::err(FILE_ERR_INVALID_INPUT),
+    };
+    let uuid = match uuid::Uuid::parse_str(&uuid_str) {
+        Ok(u) => u,
+        Err(_) => return FileJsonResult::err(FILE_ERR_INVALID_INPUT),
+    };
+
+    let name = match cstr_lossy(name) {
+        Some(s) => s,
+        None => return FileJsonResult::err(FILE_ERR_INVALID_INPUT),
+    };
+    // An empty/whitespace name is rejected by the handler's validator, so it
+    // surfaces as `FILE_ERR_INVALID_INPUT` — consistent with the HTTP `400`.
+
+    let result = runtime().block_on(async {
+        services.rename_file_handler.rename(uuid, name, &token).await
+    });
+
+    match result {
+        Ok(file) => {
+            let json = serde_json::to_string(&file).unwrap_or_default();
+            FileJsonResult::ok(json)
+        }
+        Err(err) => map_file_err(err),
+    }
+}
+
 fn parse_file_type(s: &str) -> Option<alexandria_core::catalog::model::FileType> {
     use alexandria_core::catalog::model::FileType;
     match s {
@@ -562,6 +620,7 @@ fn map_file_err(err: DomainError) -> FileJsonResult {
         DomainError::Unauthorized => FileJsonResult::err(FILE_ERR_UNAUTHORIZED),
         DomainError::InvalidInput(_) => FileJsonResult::err(FILE_ERR_INVALID_INPUT),
         DomainError::InvalidState => FileJsonResult::err(FILE_ERR_INVALID_STATE),
+        DomainError::Disk(_) => FileJsonResult::err(FILE_ERR_DISK),
         _ => FileJsonResult::err(FILE_ERR_OTHER),
     }
 }

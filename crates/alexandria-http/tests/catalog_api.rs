@@ -927,3 +927,187 @@ async fn given_corrupt_uuid_row_when_get_files_then_error_not_nil_uuid() {
         "a corrupt row must surface as an error, not a nil-uuid record"
     );
 }
+
+// ---------------------------------------------------------------------------
+// UC-05: POST /v1/files/{uuid}/rename (FR-FC-19, FR-FC-24)
+// ---------------------------------------------------------------------------
+
+fn rename_request(uuid: &str, body: Value) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri(format!("/v1/files/{uuid}/rename"))
+        .header("authorization", "Bearer test-token")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap()
+}
+
+#[tokio::test]
+async fn given_indexed_file_when_post_rename_then_200_and_on_disk_and_catalog_updated() {
+    let lib = tempdir().unwrap();
+    let a_path = common::write_file(&lib, "song.mp3", b"audio bytes");
+    let test = test_app().await;
+    index_library(&lib, &test.pool, &[("song.mp3", b"audio bytes")]).await;
+
+    let uuid = uuid_for_name(&test.pool, "song.mp3").await;
+
+    let response = app(Settings::default(), test.services)
+        .oneshot(rename_request(&uuid, json!({ "name": "renamed.mp3" })))
+        .await
+        .expect("rename one-shot");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body: Value = serde_json::from_slice(
+        &to_bytes(response.into_body(), usize::MAX).await.unwrap(),
+    )
+    .unwrap();
+    assert_eq!(body["uuid"], uuid);
+    assert_eq!(body["name"], "renamed.mp3");
+    assert_eq!(body["state"], "active");
+    let new_path = body["path"].as_str().expect("path string");
+    assert!(new_path.ends_with("renamed.mp3"), "path {new_path}");
+
+    // On-disk file moved (old path gone, new path present with same bytes).
+    assert!(!a_path.exists(), "old on-disk path no longer exists");
+    let renamed_path = a_path.with_file_name("renamed.mp3");
+    assert!(renamed_path.exists(), "renamed on-disk file exists");
+    assert_eq!(std::fs::read(&renamed_path).unwrap(), b"audio bytes");
+
+    // Catalog row carries the new name + path.
+    let row: (String, String) =
+        sqlx::query_as("SELECT name, path FROM files WHERE uuid = ?")
+            .bind(&uuid)
+            .fetch_one(&test.pool)
+            .await
+            .expect("catalog row");
+    assert_eq!(row.0, "renamed.mp3");
+    assert!(row.1.ends_with("renamed.mp3"));
+}
+
+#[tokio::test]
+async fn given_invalid_name_when_post_rename_then_400() {
+    let lib = tempdir().unwrap();
+    common::write_file(&lib, "song.mp3", b"x");
+    let test = test_app().await;
+    index_library(&lib, &test.pool, &[("song.mp3", b"x")]).await;
+    let uuid = uuid_for_name(&test.pool, "song.mp3").await;
+
+    for bad in ["/slash", "..", "a:b", "name."] {
+        let response = app(Settings::default(), test.services.clone())
+            .oneshot(rename_request(&uuid, json!({ "name": bad })))
+            .await
+            .expect("rename one-shot");
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "name {bad:?} rejected as invalid input"
+        );
+    }
+}
+
+#[tokio::test]
+async fn given_missing_body_when_post_rename_then_400() {
+    let lib = tempdir().unwrap();
+    common::write_file(&lib, "song.mp3", b"x");
+    let test = test_app().await;
+    index_library(&lib, &test.pool, &[("song.mp3", b"x")]).await;
+    let uuid = uuid_for_name(&test.pool, "song.mp3").await;
+
+    let request = Request::builder()
+        .method("POST")
+        .uri(format!("/v1/files/{uuid}/rename"))
+        .header("authorization", "Bearer test-token")
+        .body(Body::empty())
+        .unwrap();
+    let response = app(Settings::default(), test.services).oneshot(request).await.expect("one-shot");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn given_missing_uuid_when_post_rename_then_404() {
+    let test = test_app().await;
+    let missing = uuid::Uuid::new_v4().to_string();
+    let response = app(Settings::default(), test.services)
+        .oneshot(rename_request(&missing, json!({ "name": "x.mp3" })))
+        .await
+        .expect("rename one-shot");
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn given_no_bearer_when_post_rename_then_401() {
+    let test = test_app().await;
+    let uuid = uuid::Uuid::new_v4().to_string();
+    let request = Request::builder()
+        .method("POST")
+        .uri(format!("/v1/files/{uuid}/rename"))
+        .header("content-type", "application/json")
+        .body(Body::from(json!({ "name": "x.mp3" }).to_string()))
+        .unwrap();
+    let response = app(Settings::default(), test.services).oneshot(request).await.expect("one-shot");
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn given_soft_deleted_file_when_post_rename_then_409() {
+    let lib = tempdir().unwrap();
+    common::write_file(&lib, "song.mp3", b"x");
+    let test = test_app().await;
+    index_library(&lib, &test.pool, &[("song.mp3", b"x")]).await;
+    let uuid = uuid_for_name(&test.pool, "song.mp3").await;
+
+    sqlx::query("UPDATE files SET state = 'deleted', deleted_at = ? WHERE uuid = ?")
+        .bind("2024-01-01T00:00:00Z")
+        .bind(&uuid)
+        .execute(&test.pool)
+        .await
+        .expect("soft-delete seed");
+
+    let response = app(Settings::default(), test.services)
+        .oneshot(rename_request(&uuid, json!({ "name": "renamed.mp3" })))
+        .await
+        .expect("rename one-shot");
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn given_target_path_owned_by_other_file_when_post_rename_then_500_disk_error() {
+    let lib = tempdir().unwrap();
+    common::write_file(&lib, "a.mp3", b"aaa");
+    common::write_file(&lib, "b.mp3", b"bbb");
+    let test = test_app().await;
+    index_library(&lib, &test.pool, &[("a.mp3", b"aaa"), ("b.mp3", b"bbb")]).await;
+
+    let uuid_a = uuid_for_name(&test.pool, "a.mp3").await;
+
+    let response = app(Settings::default(), test.services)
+        .oneshot(rename_request(&uuid_a, json!({ "name": "b.mp3" })))
+        .await
+        .expect("rename one-shot");
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let body: Value = serde_json::from_slice(
+        &to_bytes(response.into_body(), usize::MAX).await.unwrap(),
+    )
+    .unwrap();
+    assert_eq!(body["error"], "disk error");
+
+    let a_path = lib.path().join("a.mp3");
+    assert!(a_path.exists(), "a.mp3 left untouched on disk");
+}
+
+#[tokio::test]
+async fn given_no_bearer_and_malformed_body_when_post_rename_then_401_not_400() {
+    let test = test_app().await;
+    let request = Request::builder()
+        .method("POST")
+        .uri(format!("/v1/files/{}/rename", uuid::Uuid::new_v4()))
+        .header("content-type", "application/json")
+        .body(Body::from("{ not json"))
+        .unwrap();
+    let response = app(Settings::default(), test.services).oneshot(request).await.expect("one-shot");
+    assert_eq!(
+        response.status(),
+        StatusCode::UNAUTHORIZED,
+        "auth must be decided before the path or body is parsed"
+    );
+}

@@ -18,6 +18,7 @@ impl IntoResponse for ApiError {
             DomainError::Unauthorized => (StatusCode::UNAUTHORIZED, "unauthorized"),
             DomainError::InvalidInput(msg) => (StatusCode::BAD_REQUEST, msg.as_str()),
             DomainError::InvalidState => (StatusCode::CONFLICT, "invalid state"),
+            DomainError::Disk(_) => (StatusCode::INTERNAL_SERVER_ERROR, "disk error"),
             DomainError::Database(_) | DomainError::Migration(_) => {
                 (StatusCode::INTERNAL_SERVER_ERROR, "database error")
             }
