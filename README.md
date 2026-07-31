@@ -224,15 +224,20 @@ cp config.toml.example config.toml
 
 # 2. Optional: run migrations ahead of time. The server and the FFI
 #    `alexandria_index_init` both apply them on startup, so this is only
-#    needed to prepare a database out-of-band. sqlx-cli takes a URL:
+#    needed to prepare a database out-of-band.
 sqlx migrate run --source crates/alexandria-core/migrations \
-  --database-url "sqlite://${ALEXANDRIA_DATABASE_PATH:-alexandria.sqlite}"
+  --database-url "sqlite:${ALEXANDRIA_DATABASE_PATH:-alexandria.sqlite}?mode=rwc"
 
 # 3. Start the HTTP server (binds to loopback by default)
 cargo run --release -p alexandria-http
 
 # or, once packaged, run the bundled binary alongside the Flutter desktop app
 ```
+
+Two notes on that URL, verified against sqlx-cli 0.9.0: `?mode=rwc` is required
+or the CLI refuses to create a database that does not exist yet, and the scheme
+takes a single colon with no `//`. The `sqlite://` form fails on Windows
+absolute paths, where the drive letter parses as a URL authority.
 
 Both surfaces read the same configuration: `ALEXANDRIA_CONFIG` (default
 `config.toml`) plus `ALEXANDRIA_*` environment overrides.
