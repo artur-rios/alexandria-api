@@ -1,15 +1,13 @@
 use axum::http::StatusCode;
-use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde_json::json;
 
 use alexandria_core::errors::DomainError;
 
-pub async fn error_stub(req: axum::extract::Request, next: Next) -> Response {
-    next.run(req).await
-}
-
+/// A `DomainError` rendered as this surface's error response: the mapped status
+/// plus a `{"error": …}` body. Every failure path on `/v1` goes through it, so
+/// clients see one envelope regardless of which layer rejected the request.
 #[derive(Debug)]
 pub struct ApiError(pub DomainError);
 

@@ -34,6 +34,11 @@ pub struct Services {
     pub refresh_handler: Arc<DefaultRefreshHandler>,
     pub edit_metadata_handler: Arc<DefaultEditMetadataHandler>,
     pub browse_files_handler: Arc<DefaultBrowseFilesHandler>,
+    /// The same auth service the handlers hold, exposed so a transport can
+    /// reject an unauthenticated caller *before* it parses a request body or
+    /// path (FR-AU-07 / SRD §7). Handlers still authenticate independently —
+    /// this is the transport gate, not a replacement for the domain check.
+    pub auth: BearerAuthService,
     pub pool: SqlitePool,
 }
 
@@ -55,6 +60,7 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         refresh_handler,
         edit_metadata_handler,
         browse_files_handler,
+        auth,
         pool,
     }
 }

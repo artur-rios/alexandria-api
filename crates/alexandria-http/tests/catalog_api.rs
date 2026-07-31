@@ -1,7 +1,5 @@
 mod common;
 
-use std::collections::BTreeMap;
-
 use alexandria_core::config::Settings;
 use alexandria_http::app;
 use axum::body::{to_bytes, Body};
@@ -156,7 +154,6 @@ async fn given_subtype_rows_when_indexed_then_each_file_has_subtype_row() {
     assert_eq!(video.0, 1);
     assert_eq!(document.0, 1);
 
-    let _: &BTreeMap<(), ()> = &BTreeMap::new(); // silence unused import if any
 }
 
 #[tokio::test]
@@ -773,4 +770,160 @@ async fn given_soft_deleted_file_when_patch_then_409() {
         .await
         .expect("patch one-shot");
     assert_eq!(response.status(), StatusCode::CONFLICT);
+}
+// ---------------------------------------------------------------------------
+// Auth ordering (B3): authentication is decided before any request payload is
+// parsed, so an unauthenticated caller always sees 401 — never a 400/422 that
+// leaks whether the body or path happened to be well-formed.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn given_no_bearer_and_malformed_body_when_patch_then_401_not_422() {
+    let test = test_app().await;
+    let request = Request::builder()
+        .method("PATCH")
+        .uri(format!("/v1/files/{}/metadata", uuid::Uuid::new_v4()))
+        .header("content-type", "application/json")
+        .body(Body::from("{ not json at all"))
+        .unwrap();
+
+    let response = app(Settings::default(), test.services)
+        .oneshot(request)
+        .await
+        .expect("patch one-shot");
+
+    assert_eq!(
+        response.status(),
+        StatusCode::UNAUTHORIZED,
+        "auth must be decided before the body is parsed"
+    );
+}
+
+#[tokio::test]
+async fn given_no_bearer_and_invalid_uuid_when_patch_then_401_not_400() {
+    let test = test_app().await;
+    let request = Request::builder()
+        .method("PATCH")
+        .uri("/v1/files/not-a-uuid/metadata")
+        .header("content-type", "application/json")
+        .body(Body::from(json!({ "type": "audio" }).to_string()))
+        .unwrap();
+
+    let response = app(Settings::default(), test.services)
+        .oneshot(request)
+        .await
+        .expect("patch one-shot");
+
+    assert_eq!(
+        response.status(),
+        StatusCode::UNAUTHORIZED,
+        "auth must be decided before the path is parsed"
+    );
+}
+
+#[tokio::test]
+async fn given_authenticated_and_malformed_body_when_patch_then_400_with_error_envelope() {
+    let test = test_app().await;
+    let request = Request::builder()
+        .method("PATCH")
+        .uri(format!("/v1/files/{}/metadata", uuid::Uuid::new_v4()))
+        .header("authorization", "Bearer test-token")
+        .header("content-type", "application/json")
+        .body(Body::from("{ not json at all"))
+        .unwrap();
+
+    let response = app(Settings::default(), test.services)
+        .oneshot(request)
+        .await
+        .expect("patch one-shot");
+
+    assert_eq!(
+        response.status(),
+        StatusCode::BAD_REQUEST,
+        "a malformed body is invalid input, not axum's default 422"
+    );
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+            .expect("error responses are JSON");
+    assert!(
+        body["error"].is_string(),
+        "must use the {{\"error\": …}} envelope like every other failure"
+    );
+}
+
+#[tokio::test]
+async fn given_no_bearer_when_health_requested_then_still_reachable() {
+    let test = test_app().await;
+    let request = Request::builder()
+        .method("GET")
+        .uri("/health")
+        .body(Body::empty())
+        .unwrap();
+
+    let response = app(Settings::default(), test.services)
+        .oneshot(request)
+        .await
+        .expect("health one-shot");
+
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "health must stay open — it is not a /v1 catalog operation"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Data-integrity failures are surfaced, not coerced into plausible answers.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn given_missing_subtype_row_when_patch_then_error_not_silent_success() {
+    // B5: the UPDATE matches zero rows. The caller must not be told the write
+    // succeeded and handed back metadata the database never stored.
+    let lib = tempdir().unwrap();
+    let test = test_app().await;
+    index_library(&lib, &test.pool, &[("song.mp3", b"audio")]).await;
+    let uuid = uuid_for_name(&test.pool, "song.mp3").await;
+
+    sqlx::query("DELETE FROM audio_files WHERE file_id = (SELECT id FROM files WHERE uuid = ?)")
+        .bind(&uuid)
+        .execute(&test.pool)
+        .await
+        .expect("drop subtype row");
+
+    let response = app(Settings::default(), test.services)
+        .oneshot(patch_metadata(&uuid, json!({ "type": "audio", "title": "T" })))
+        .await
+        .expect("patch one-shot");
+
+    assert_ne!(
+        response.status(),
+        StatusCode::OK,
+        "a write that touched no rows must not report success"
+    );
+}
+
+#[tokio::test]
+async fn given_corrupt_uuid_row_when_get_files_then_error_not_nil_uuid() {
+    // B6: an unparseable stored uuid used to be coerced to the nil UUID and
+    // served as though it were real.
+    let lib = tempdir().unwrap();
+    let test = test_app().await;
+    index_library(&lib, &test.pool, &[("song.mp3", b"audio")]).await;
+
+    sqlx::query("UPDATE files SET uuid = 'definitely-not-a-uuid' WHERE name = 'song.mp3'")
+        .execute(&test.pool)
+        .await
+        .expect("corrupt the uuid");
+
+    let response = app(Settings::default(), test.services)
+        .oneshot(get_files("/v1/files"))
+        .await
+        .expect("list one-shot");
+
+    assert_eq!(
+        response.status(),
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "a corrupt row must surface as an error, not a nil-uuid record"
+    );
 }

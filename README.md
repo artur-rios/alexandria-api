@@ -183,7 +183,7 @@ over the same handlers.
 alexandria-api/
 ├── Cargo.toml                 # workspace
 ├── crates/
-│   ├── alexandria-core/       # domain: commands, queries, repos, auth, text
+│   ├── alexandria-core/       # domain: commands, queries, repos, auth, config
 │   ├── alexandria-http/       # axum routes + middleware
 │   └── alexandria-ffi/        # extern "C" + cbindgen header
 ├── config.toml.example
@@ -222,14 +222,20 @@ concurrency, soft-delete retention, log level).
 # 1. Create a local config from the example
 cp config.toml.example config.toml
 
-# 2. Run database migrations (idempotent; also runs on server boot)
-sqlx migrate run --source crates/alexandria-core/migrations "$ALEXANDRIA_DATABASE_PATH"
+# 2. Optional: run migrations ahead of time. The server and the FFI
+#    `alexandria_index_init` both apply them on startup, so this is only
+#    needed to prepare a database out-of-band. sqlx-cli takes a URL:
+sqlx migrate run --source crates/alexandria-core/migrations \
+  --database-url "sqlite://${ALEXANDRIA_DATABASE_PATH:-alexandria.sqlite}"
 
 # 3. Start the HTTP server (binds to loopback by default)
 cargo run --release -p alexandria-http
 
 # or, once packaged, run the bundled binary alongside the Flutter desktop app
 ```
+
+Both surfaces read the same configuration: `ALEXANDRIA_CONFIG` (default
+`config.toml`) plus `ALEXANDRIA_*` environment overrides.
 
 In external auth mode, set `ALEXANDRIA_AUTH_MODE=external` and
 `ALEXANDRIA_AUTH_JWKS_URL` to the external auth service's JWKS endpoint. In

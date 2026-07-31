@@ -88,60 +88,76 @@ impl SqliteCatalogRepository {
     }
 }
 
-fn parse_type_str(s: &str) -> FileType {
+/// Parse the stored `type` discriminator. A value outside the enum means the
+/// row violates the schema's CHECK constraint — that is corruption, not a
+/// `text` file, so it is reported rather than guessed at.
+fn parse_type_str(s: &str) -> Result<FileType, DomainError> {
     match s {
-        "audio" => FileType::Audio,
-        "video" => FileType::Video,
-        "html" => FileType::Html,
-        "text" => FileType::Text,
-        "document" => FileType::Document,
-        "comic" => FileType::Comic,
-        "image" => FileType::Image,
-        _ => FileType::Text,
+        "audio" => Ok(FileType::Audio),
+        "video" => Ok(FileType::Video),
+        "html" => Ok(FileType::Html),
+        "text" => Ok(FileType::Text),
+        "document" => Ok(FileType::Document),
+        "comic" => Ok(FileType::Comic),
+        "image" => Ok(FileType::Image),
+        other => Err(DomainError::internal(format!(
+            "corrupt catalog row: unknown file type {other:?}"
+        ))),
     }
 }
 
+/// A `files` row as selected by every catalog read, in column order:
+/// uuid, path, name, type, content_hash, state, deleted_at, indexed_at,
+/// missing_at. Named so the four read paths share one shape and `parse_file_row`
+/// has a single source of truth for it.
+type FileRow = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+    String,
+    Option<String>,
+);
+
+/// The editable columns of each subtype row, as selected by
+/// `find_metadata_by_uuid`.
+type AudioRow = (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<i64>,
+    Option<String>,
+    Option<i64>,
+);
+type VideoRow = (Option<String>, Option<i64>, Option<String>, Option<String>);
+type DocumentRow = (Option<String>, Option<String>, Option<i64>, Option<String>);
+type ComicRow = (Option<String>, Option<String>, Option<i64>);
+type ImageRow = (Option<String>, Option<String>);
+
 impl CatalogRepository for SqliteCatalogRepository {
     async fn find_by_path(&self, path: &str) -> Result<Option<File>, DomainError> {
-        let row: Option<(
-            String,
-            String,
-            String,
-            String,
-            String,
-            String,
-            Option<String>,
-            String,
-            Option<String>,
-        )> = sqlx::query_as(
+        let row: Option<FileRow> = sqlx::query_as(
             "SELECT uuid, path, name, type, content_hash, state, deleted_at, indexed_at, \
              missing_at FROM files WHERE path = ?",
         )
         .bind(path)
         .fetch_optional(&self.pool)
         .await?;
-        Ok(row.map(parse_file_row))
+        row.map(parse_file_row).transpose()
     }
 
     async fn find_by_uuid(&self, uuid: Uuid) -> Result<Option<File>, DomainError> {
-        let row: Option<(
-            String,
-            String,
-            String,
-            String,
-            String,
-            String,
-            Option<String>,
-            String,
-            Option<String>,
-        )> = sqlx::query_as(
+        let row: Option<FileRow> = sqlx::query_as(
             "SELECT uuid, path, name, type, content_hash, state, deleted_at, indexed_at, \
              missing_at FROM files WHERE uuid = ?",
         )
         .bind(uuid.to_string())
         .fetch_optional(&self.pool)
         .await?;
-        Ok(row.map(parse_file_row))
+        row.map(parse_file_row).transpose()
     }
 
     async fn insert_file(&self, new_file: NewFile) -> Result<File, DomainError> {
@@ -186,23 +202,13 @@ impl CatalogRepository for SqliteCatalogRepository {
     }
 
     async fn list_all(&self) -> Result<Vec<File>, DomainError> {
-        let rows: Vec<(
-            String,
-            String,
-            String,
-            String,
-            String,
-            String,
-            Option<String>,
-            String,
-            Option<String>,
-        )> = sqlx::query_as(
+        let rows: Vec<FileRow> = sqlx::query_as(
             "SELECT uuid, path, name, type, content_hash, state, deleted_at, indexed_at, \
              missing_at FROM files ORDER BY path",
         )
         .fetch_all(&self.pool)
         .await?;
-        Ok(rows.into_iter().map(parse_file_row).collect())
+        rows.into_iter().map(parse_file_row).collect()
     }
 
     async fn refresh_hash(
@@ -249,14 +255,17 @@ impl CatalogRepository for SqliteCatalogRepository {
                 .await?
                 .ok_or(DomainError::NotFound)?;
 
-        let actual_type = parse_type_str(&type_str);
+        let actual_type = parse_type_str(&type_str)?;
         if actual_type != metadata.file_type() {
             return Err(DomainError::InvalidInput(
                 "metadata does not match file subtype".into(),
             ));
         }
 
-        match metadata {
+        // Every arm writes exactly the file's own subtype row. The affected-row
+        // count is checked after the match: a zero-row UPDATE means the subtype
+        // row is missing, which is a broken invariant, not a successful edit.
+        let affected = match metadata {
             SubtypeMetadata::Audio {
                 title,
                 artist,
@@ -278,7 +287,7 @@ impl CatalogRepository for SqliteCatalogRepository {
                 .bind(*track)
                 .bind(id)
                 .execute(&mut *tx)
-                .await?;
+                .await?
             }
             SubtypeMetadata::Video {
                 title,
@@ -297,7 +306,7 @@ impl CatalogRepository for SqliteCatalogRepository {
                 .bind(media_kind.map(|m| m.as_str()))
                 .bind(id)
                 .execute(&mut *tx)
-                .await?;
+                .await?
             }
             SubtypeMetadata::Document {
                 title,
@@ -316,7 +325,7 @@ impl CatalogRepository for SqliteCatalogRepository {
                 .bind(format_kind.map(|f| f.as_str()))
                 .bind(id)
                 .execute(&mut *tx)
-                .await?;
+                .await?
             }
             SubtypeMetadata::Comic {
                 title,
@@ -333,7 +342,7 @@ impl CatalogRepository for SqliteCatalogRepository {
                 .bind(*issue_number)
                 .bind(id)
                 .execute(&mut *tx)
-                .await?;
+                .await?
             }
             SubtypeMetadata::Image { title, caption } => {
                 sqlx::query("UPDATE images SET title = ?, caption = ? WHERE file_id = ?")
@@ -341,8 +350,16 @@ impl CatalogRepository for SqliteCatalogRepository {
                     .bind(caption)
                     .bind(id)
                     .execute(&mut *tx)
-                    .await?;
+                    .await?
             }
+        }
+        .rows_affected();
+
+        if affected == 0 {
+            return Err(DomainError::internal(format!(
+                "subtype row missing for file {uuid} ({})",
+                actual_type.as_str()
+            )));
         }
 
         tx.commit().await?;
@@ -379,14 +396,14 @@ impl CatalogRepository for SqliteCatalogRepository {
         }
         sql.push_str(" ORDER BY path");
 
-        let query = sqlx::query_as::<_, (String, String, String, String, String, String, Option<String>, String, Option<String>)>(&sql);
+        let query = sqlx::query_as::<_, FileRow>(&sql);
         let query = match file_type {
             Some(t) => query.bind(t.as_str()),
             None => query,
         };
 
         let rows = query.fetch_all(&self.pool).await?;
-        Ok(rows.into_iter().map(parse_file_row).collect())
+        rows.into_iter().map(parse_file_row).collect()
     }
 
     async fn find_metadata_by_uuid(
@@ -404,7 +421,7 @@ impl CatalogRepository for SqliteCatalogRepository {
             Some(r) => r,
             None => return Ok(None),
         };
-        let file_type = parse_type_str(&type_str);
+        let file_type = parse_type_str(&type_str)?;
 
         // "Metadata is present" means at least one editable field is
         // populated. The indexer inserts an empty subtype row (all NULLs)
@@ -416,7 +433,7 @@ impl CatalogRepository for SqliteCatalogRepository {
         // SubtypeMetadata variant at all).
         let metadata = match file_type {
             FileType::Audio => {
-                let r: Option<(Option<String>, Option<String>, Option<String>, Option<i64>, Option<String>, Option<i64>)> =
+                let r: Option<AudioRow> =
                     sqlx::query_as("SELECT title, artist, album, year, genre, track FROM audio_files WHERE file_id = ?")
                         .bind(id)
                         .fetch_optional(&self.pool)
@@ -434,7 +451,7 @@ impl CatalogRepository for SqliteCatalogRepository {
                 })
             }
             FileType::Video => {
-                let r: Option<(Option<String>, Option<i64>, Option<String>, Option<String>)> =
+                let r: Option<VideoRow> =
                     sqlx::query_as("SELECT title, year, resolution, media_kind FROM video_files WHERE file_id = ?")
                         .bind(id)
                         .fetch_optional(&self.pool)
@@ -453,7 +470,7 @@ impl CatalogRepository for SqliteCatalogRepository {
                 })
             }
             FileType::Document => {
-                let r: Option<(Option<String>, Option<String>, Option<i64>, Option<String>)> =
+                let r: Option<DocumentRow> =
                     sqlx::query_as("SELECT title, author, year, format_kind FROM documents WHERE file_id = ?")
                         .bind(id)
                         .fetch_optional(&self.pool)
@@ -472,7 +489,7 @@ impl CatalogRepository for SqliteCatalogRepository {
                 })
             }
             FileType::Comic => {
-                let r: Option<(Option<String>, Option<String>, Option<i64>)> =
+                let r: Option<ComicRow> =
                     sqlx::query_as("SELECT title, series, issue_number FROM comic_books WHERE file_id = ?")
                         .bind(id)
                         .fetch_optional(&self.pool)
@@ -488,7 +505,7 @@ impl CatalogRepository for SqliteCatalogRepository {
                 })
             }
             FileType::Image => {
-                let r: Option<(Option<String>, Option<String>)> =
+                let r: Option<ImageRow> =
                     sqlx::query_as("SELECT title, caption FROM images WHERE file_id = ?")
                         .bind(id)
                         .fetch_optional(&self.pool)
@@ -505,19 +522,15 @@ impl CatalogRepository for SqliteCatalogRepository {
     }
 }
 
-fn parse_file_row(
-    row: (
-        String,
-        String,
-        String,
-        String,
-        String,
-        String,
-        Option<String>,
-        String,
-        Option<String>,
-    ),
-) -> File {
+/// Build a `File` from a catalog row.
+///
+/// A value the domain cannot represent — an unparseable UUID or timestamp, an
+/// unknown `type` — means the row is corrupt. Returning an error surfaces that
+/// as a `500`; silently substituting the nil UUID or `text` would hand the
+/// caller a plausible-looking record that does not correspond to reality.
+/// Nullable columns (`deleted_at`, `missing_at`) are absent-or-valid: a NULL is
+/// legitimately `None`, but a present-and-unparseable value is corruption.
+fn parse_file_row(row: FileRow) -> Result<File, DomainError> {
     let (
         uuid_str,
         path,
@@ -530,37 +543,28 @@ fn parse_file_row(
         missing_at_str,
     ) = row;
 
-    let uuid = Uuid::parse_str(&uuid_str).unwrap_or_default();
-    let file_type = match type_str.as_str() {
-        "audio" => FileType::Audio,
-        "video" => FileType::Video,
-        "html" => FileType::Html,
-        "text" => FileType::Text,
-        "document" => FileType::Document,
-        "comic" => FileType::Comic,
-        "image" => FileType::Image,
-        _ => FileType::Text,
+    let uuid = Uuid::parse_str(&uuid_str).map_err(|_| {
+        DomainError::internal(format!("corrupt catalog row: unparseable uuid {uuid_str:?}"))
+    })?;
+    let file_type = parse_type_str(&type_str)?;
+    let state = match state_str.as_str() {
+        "active" => FileState::Active,
+        "deleted" => FileState::Deleted,
+        other => {
+            return Err(DomainError::internal(format!(
+                "corrupt catalog row: unknown state {other:?}"
+            )))
+        }
     };
-    let state = if state_str == "deleted" {
-        FileState::Deleted
-    } else {
-        FileState::Active
-    };
-    let indexed_at = DateTime::parse_from_rfc3339(&indexed_at_str)
-        .map(|dt| dt.with_timezone(&Utc))
-        .unwrap_or_else(|_| DateTime::<Utc>::from_timestamp(0, 0).unwrap());
-    let deleted_at = deleted_at_str.and_then(|s| {
-        DateTime::parse_from_rfc3339(&s)
-            .map(|dt| dt.with_timezone(&Utc))
-            .ok()
-    });
-    let missing_at = missing_at_str.and_then(|s| {
-        DateTime::parse_from_rfc3339(&s)
-            .map(|dt| dt.with_timezone(&Utc))
-            .ok()
-    });
+    let indexed_at = parse_timestamp(&indexed_at_str, "indexed_at")?;
+    let deleted_at = deleted_at_str
+        .map(|s| parse_timestamp(&s, "deleted_at"))
+        .transpose()?;
+    let missing_at = missing_at_str
+        .map(|s| parse_timestamp(&s, "missing_at"))
+        .transpose()?;
 
-    File {
+    Ok(File {
         uuid,
         path,
         name,
@@ -570,5 +574,15 @@ fn parse_file_row(
         deleted_at,
         indexed_at,
         missing_at,
-    }
+    })
+}
+
+fn parse_timestamp(value: &str, column: &str) -> Result<DateTime<Utc>, DomainError> {
+    DateTime::parse_from_rfc3339(value)
+        .map(|dt| dt.with_timezone(&Utc))
+        .map_err(|_| {
+            DomainError::internal(format!(
+                "corrupt catalog row: unparseable {column} {value:?}"
+            ))
+        })
 }

@@ -101,7 +101,8 @@ fn given_supported_files_when_ffi_index_start_then_returns_ok_with_run_id_and_pe
     assert!(!raw.is_null());
     // SAFETY: returned by the FFI accessor as a NUL-terminated string.
     let json = unsafe { CStr::from_ptr(raw) }.to_str().unwrap().to_string();
-    alexandria_free_string(raw);
+    // SAFETY: pointer came from this library and is freed once.
+    unsafe { alexandria_free_string(raw); }
     let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
     assert_eq!(parsed.as_array().unwrap().len(), 2);
     assert_eq!(parsed[0]["type"], "audio");
@@ -146,7 +147,8 @@ fn files_json_value() -> serde_json::Value {
     assert!(!raw.is_null());
     // SAFETY: returned by the FFI accessor as a NUL-terminated string.
     let json = unsafe { CStr::from_ptr(raw) }.to_str().unwrap().to_string();
-    alexandria_free_string(raw);
+    // SAFETY: pointer came from this library and is freed once.
+    unsafe { alexandria_free_string(raw); }
     serde_json::from_str(&json).unwrap()
 }
 
@@ -247,7 +249,8 @@ fn metadata_json(result: FileMetadataResult) -> serde_json::Value {
         .to_str()
         .unwrap()
         .to_string();
-    alexandria_free_string(result.json);
+    // SAFETY: pointer came from this library and is freed once.
+    unsafe { alexandria_free_string(result.json); }
     serde_json::from_str(&json).expect("FileMetadata json")
 }
 

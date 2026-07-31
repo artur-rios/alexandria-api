@@ -125,7 +125,8 @@ async fn given_same_lib_when_indexed_via_http_and_ffi_then_files_rows_identical(
         assert!(!raw.is_null());
         // SAFETY: returned by the FFI accessor as a NUL-terminated string.
         let json = unsafe { CStr::from_ptr(raw) }.to_str().unwrap().to_string();
-        alexandria_free_string(raw);
+        // SAFETY: pointer came from this library and is freed once.
+        unsafe { alexandria_free_string(raw); }
         json
     })
     .await
@@ -238,7 +239,8 @@ async fn given_same_lib_when_refreshed_via_http_and_ffi_then_rows_and_missing_ma
             let raw = alexandria_index_files_json();
             assert!(!raw.is_null());
             let json = unsafe { CStr::from_ptr(raw) }.to_str().unwrap().to_string();
-            alexandria_free_string(raw);
+            // SAFETY: pointer came from this library and is freed once.
+            unsafe { alexandria_free_string(raw); }
             let v: serde_json::Value = serde_json::from_str(&json).unwrap();
             v.as_array()
                 .unwrap()
@@ -461,7 +463,8 @@ async fn given_same_audio_file_when_metadata_edited_via_http_and_ffi_then_respon
                 .to_str()
                 .unwrap()
                 .to_string();
-            alexandria_free_string(result.json);
+            // SAFETY: pointer came from this library and is freed once.
+            unsafe { alexandria_free_string(result.json); }
             let ffi_value: serde_json::Value = serde_json::from_str(&json_str).unwrap();
 
             // Persisted audio row from the FFI db.
@@ -719,7 +722,8 @@ async fn given_same_lib_when_files_listed_via_http_and_ffi_then_arrays_identical
                 assert_eq!(r.status, alexandria_ffi::FILE_OK, "ffi list failed");
                 assert!(!r.json.is_null());
                 let s = unsafe { CStr::from_ptr(r.json) }.to_str().unwrap().to_string();
-                alexandria_free_string(r.json);
+                // SAFETY: pointer came from this library and is freed once.
+                unsafe { alexandria_free_string(r.json); }
                 serde_json::from_str(&s).unwrap()
             };
 
@@ -855,7 +859,8 @@ async fn given_same_file_when_fetched_via_http_and_ffi_then_file_view_bodies_ide
             assert_eq!(r.status, alexandria_ffi::FILE_OK, "ffi get failed");
             assert!(!r.json.is_null());
             let s = unsafe { CStr::from_ptr(r.json) }.to_str().unwrap().to_string();
-            alexandria_free_string(r.json);
+            // SAFETY: pointer came from this library and is freed once.
+            unsafe { alexandria_free_string(r.json); }
             serde_json::from_str(&s).unwrap()
         })
         .await
@@ -1008,7 +1013,8 @@ async fn given_unknown_filter_values_when_listed_via_http_and_ffi_then_both_reje
                 let f = CString::new(filters).unwrap();
                 let r = alexandria_files_list(f.as_ptr(), token.as_ptr());
                 if !r.json.is_null() {
-                    alexandria_free_string(r.json);
+                    // SAFETY: pointer came from this library and is freed once.
+                    unsafe { alexandria_free_string(r.json); }
                 }
                 r.status
             };
@@ -1079,4 +1085,90 @@ async fn given_no_token_when_files_listed_via_http_and_ffi_then_both_unauthorize
     .unwrap();
 
     assert_eq!(ffi_status, alexandria_ffi::FILE_ERR_UNAUTHORIZED);
+}
+
+/// B3 parity — an unauthenticated caller is denied before its payload is
+/// parsed, on both surfaces. Previously HTTP answered `400`/`422` (extractors
+/// run before the handler) and the FFI answered `FILE_ERR_INVALID_INPUT` (JSON
+/// parsed before the auth check), so a caller with no credentials could learn
+/// whether its body was well-formed (FR-AU-07 / SRD §7).
+#[tokio::test]
+async fn given_no_token_and_malformed_payload_when_edited_via_http_and_ffi_then_both_unauthorized() {
+    let _g = SERIAL.lock().unwrap();
+
+    // ---- HTTP leg ----
+    let http_dir = tempdir().unwrap();
+    let http_db = db_path(&http_dir, "http.sqlite");
+    let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    let http_services =
+        std::sync::Arc::new(build_services(&Settings::default(), http_pool.clone()).await);
+
+    let req = Request::builder()
+        .method("PATCH")
+        .uri("/v1/files/not-a-uuid/metadata")
+        .header("content-type", "application/json")
+        .body(Body::from("{ not json"))
+        .unwrap();
+    let resp = app(Settings::default(), http_services)
+        .oneshot(req)
+        .await
+        .expect("http patch");
+    assert_eq!(resp.status(), axum::http::StatusCode::UNAUTHORIZED);
+
+    // ---- FFI leg ----
+    let ffi_dir = tempdir().unwrap();
+    let ffi_db = db_path(&ffi_dir, "ffi.sqlite");
+    let (edit_status, get_status, list_status) =
+        tokio::task::spawn_blocking(move || -> (i32, i32, i32) {
+            let cdb = CString::new(ffi_db).unwrap();
+            assert_eq!(alexandria_index_init(cdb.as_ptr()), alexandria_ffi::INDEX_OK);
+
+            // Null token => empty token => unauthenticated, paired with a
+            // payload that would otherwise fail to parse first.
+            let bad_uuid = CString::new("not-a-uuid").unwrap();
+            let bad_json = CString::new("{ not json").unwrap();
+
+            let edit = alexandria_file_edit_metadata(
+                bad_uuid.as_ptr(),
+                bad_json.as_ptr(),
+                std::ptr::null(),
+            );
+            if !edit.json.is_null() {
+                // SAFETY: pointer came from this library and is freed once.
+                unsafe { alexandria_free_string(edit.json); }
+            }
+
+            let get = alexandria_file_get_by_uuid(bad_uuid.as_ptr(), std::ptr::null());
+            if !get.json.is_null() {
+                // SAFETY: pointer came from this library and is freed once.
+                unsafe { alexandria_free_string(get.json); }
+            }
+
+            let bad_filters = CString::new(r#"{"type":"banana"}"#).unwrap();
+            let list = alexandria_files_list(bad_filters.as_ptr(), std::ptr::null());
+            if !list.json.is_null() {
+                // SAFETY: pointer came from this library and is freed once.
+                unsafe { alexandria_free_string(list.json); }
+            }
+
+            (edit.status, get.status, list.status)
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        edit_status,
+        alexandria_ffi::FILE_ERR_UNAUTHORIZED,
+        "edit must deny before parsing the uuid or body"
+    );
+    assert_eq!(
+        get_status,
+        alexandria_ffi::FILE_ERR_UNAUTHORIZED,
+        "get must deny before parsing the uuid"
+    );
+    assert_eq!(
+        list_status,
+        alexandria_ffi::FILE_ERR_UNAUTHORIZED,
+        "list must deny before validating filters"
+    );
 }

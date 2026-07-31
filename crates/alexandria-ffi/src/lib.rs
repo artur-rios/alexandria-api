@@ -6,7 +6,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use tokio::runtime::{Builder, Runtime};
 
-use alexandria_core::catalog::commands::index::{IndexRequest};
+use alexandria_core::auth::AuthService;
+use alexandria_core::catalog::commands::index::IndexRequest;
 use alexandria_core::config::Settings;
 use alexandria_core::errors::DomainError;
 use alexandria_core::migrate::migrate_database;
@@ -46,6 +47,17 @@ fn runtime() -> &'static Runtime {
 
 fn services_slot() -> &'static Mutex<Option<Arc<Services>>> {
     SERVICES.get_or_init(|| Mutex::new(None))
+}
+
+/// Authenticate the caller before any payload is looked at.
+///
+/// The handlers authenticate too, but they can only do so *after* their
+/// arguments have been parsed — which let a caller with no credentials learn
+/// that its UUID or JSON was malformed. SRD §7 and FR-AU-07 deny an
+/// unauthenticated call outright, and the HTTP surface gates the same way in
+/// its `require_auth` middleware (FR-FC-24 / NFR-09).
+fn authenticated(services: &Services, token: &str) -> bool {
+    runtime().block_on(async { services.auth.authenticate(token).await.is_ok() })
 }
 
 /// Result of starting an index run. `run_id` is a NUL-terminated UUID string
@@ -88,7 +100,7 @@ impl IndexStartResult {
     }
 }
 
-#[allow(unsafe_code)]
+#[allow(unsafe_code)] // dereferences a caller-supplied raw pointer
 fn cstr_lossy(ptr: *const c_char) -> Option<String> {
     if ptr.is_null() {
         return None;
@@ -98,13 +110,13 @@ fn cstr_lossy(ptr: *const c_char) -> Option<String> {
     Some(s)
 }
 
-#[allow(unsafe_code)]
+#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
 pub extern "C" fn alexandria_version() -> *const c_char {
     VERSION_CSTRING.as_ptr() as *const c_char
 }
 
-#[allow(unsafe_code)]
+#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
 pub extern "C" fn alexandria_health_status_code() -> i32 {
     200
@@ -113,17 +125,27 @@ pub extern "C" fn alexandria_health_status_code() -> i32 {
 /// Initialize the FFI services against a database path (created/migrated on
 /// demand). Safe to call again to point at a different database (replaces).
 /// Returns 0 on success, a non-zero status otherwise.
-#[allow(unsafe_code)]
+///
+/// Configuration is loaded the same way `alexandria-http` loads it — from the
+/// path in `ALEXANDRIA_CONFIG` (default `config.toml`), with `ALEXANDRIA_*`
+/// environment overrides applied — so a setting such as the auth mode or the
+/// retention window means the same thing on both surfaces (FR-FC-24 / NFR-09).
+/// A missing or unreadable config file falls back to defaults rather than
+/// failing, matching the HTTP binary. `db_path` wins over the config's
+/// `database.path`: the embedder passed it explicitly.
+#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
 pub extern "C" fn alexandria_index_init(db_path: *const c_char) -> c_int {
     let path = match cstr_lossy(db_path) {
         Some(p) => p,
         None => return INDEX_ERR_INVALID_INPUT,
     };
+    let mut settings = load_settings();
+    settings.database.path = path.clone();
     let _ = runtime();
     let result = runtime().block_on(async {
         let pool = migrate_database(&path).await?;
-        let services = Arc::new(build_services(&Settings::default(), pool).await);
+        let services = Arc::new(build_services(&settings, pool).await);
         *services_slot().lock().unwrap() = Some(services);
         Ok::<(), DomainError>(())
     });
@@ -133,10 +155,19 @@ pub extern "C" fn alexandria_index_init(db_path: *const c_char) -> c_int {
     }
 }
 
+/// Load settings exactly as the HTTP binary does: `ALEXANDRIA_CONFIG` or
+/// `config.toml`, then `ALEXANDRIA_*` environment overrides.
+fn load_settings() -> Settings {
+    let config_path = std::env::var("ALEXANDRIA_CONFIG")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from("config.toml"));
+    Settings::load_or_default(&config_path)
+}
+
 /// Start an asynchronous index scan of `root`. Returns a `IndexStartResult`
 /// with a `run_id` and `status` (parity with HTTP 202 body). The scan runs in
 /// the background on the FFI runtime; read results via the accessor functions.
-#[allow(unsafe_code)]
+#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
 pub extern "C" fn alexandria_index_start(
     root: *const c_char,
@@ -187,7 +218,7 @@ pub extern "C" fn alexandria_index_start(
 /// returns a `IndexStartResult` with a `run_id` and `status` (parity with the
 /// HTTP `POST /v1/index/refresh` 202 body). The refresh runs in the background
 /// on the FFI runtime; read results via the accessor functions.
-#[allow(unsafe_code)]
+#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
 pub extern "C" fn alexandria_index_refresh_start(token: *const c_char) -> IndexStartResult {
     let services = match services_slot().lock().unwrap().clone() {
@@ -220,7 +251,7 @@ pub extern "C" fn alexandria_index_refresh_start(token: *const c_char) -> IndexS
 }
 
 /// Count of indexed files. For tests waiting for the background scan.
-#[allow(unsafe_code)]
+#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
 pub extern "C" fn alexandria_index_count_files() -> i64 {
     let services = match services_slot().lock().unwrap().clone() {
@@ -272,7 +303,7 @@ impl FileMetadataResult {
 /// the HTTP route uses, and on success serializes the returned `FileMetadata`
 /// back to JSON — so the FFI and HTTP surfaces agree byte-for-byte modulo key
 /// ordering (parity, FR-FC-24 / NFR-09). `token` is the bearer auth token.
-#[allow(unsafe_code)]
+#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
 pub extern "C" fn alexandria_file_edit_metadata(
     uuid: *const c_char,
@@ -283,6 +314,13 @@ pub extern "C" fn alexandria_file_edit_metadata(
         Some(s) => s,
         None => return FileMetadataResult::err(FILE_ERR_NOT_INITIALIZED),
     };
+
+    // Deny before touching the payload — an unauthenticated caller must
+    // not learn whether its uuid or body would have parsed.
+    let token = cstr_lossy(token).unwrap_or_default();
+    if !authenticated(&services, &token) {
+        return FileMetadataResult::err(FILE_ERR_UNAUTHORIZED);
+    }
 
     let uuid_str = match cstr_lossy(uuid) {
         Some(s) => s,
@@ -302,8 +340,6 @@ pub extern "C" fn alexandria_file_edit_metadata(
             Ok(m) => m,
             Err(_) => return FileMetadataResult::err(FILE_ERR_INVALID_INPUT),
         };
-
-    let token = cstr_lossy(token).unwrap_or_default();
 
     let result = runtime().block_on(async {
         services
@@ -398,7 +434,7 @@ impl FilesListFilter {
 /// returned `Vec<File>` back to a JSON array — so the FFI and HTTP surfaces
 /// agree byte-for-byte modulo key ordering (parity, FR-FC-24 / NFR-09).
 /// `token` is the bearer auth token.
-#[allow(unsafe_code)]
+#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
 pub extern "C" fn alexandria_files_list(
     json_filters: *const c_char,
@@ -408,6 +444,13 @@ pub extern "C" fn alexandria_files_list(
         Some(s) => s,
         None => return FileJsonResult::err(FILE_ERR_NOT_INITIALIZED),
     };
+
+    // Deny before touching the payload — an unauthenticated caller must
+    // not learn whether its filters would have validated.
+    let token = cstr_lossy(token).unwrap_or_default();
+    if !authenticated(&services, &token) {
+        return FileJsonResult::err(FILE_ERR_UNAUTHORIZED);
+    }
 
     let filter_str = cstr_lossy(json_filters).unwrap_or_default();
     let parsed = match FilesListFilter::from_json_str(&filter_str) {
@@ -439,8 +482,6 @@ pub extern "C" fn alexandria_files_list(
         filter = filter.with_type(t);
     }
 
-    let token = cstr_lossy(token).unwrap_or_default();
-
     let result = runtime().block_on(async {
         services.browse_files_handler.list(filter, &token).await
     });
@@ -461,7 +502,7 @@ pub extern "C" fn alexandria_files_list(
 /// serializes the returned `FileView` back to JSON — the same shape HTTP
 /// returns from `GET /v1/files/{uuid}` (parity, FR-FC-24 / NFR-09). `token`
 /// is the bearer auth token.
-#[allow(unsafe_code)]
+#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
 pub extern "C" fn alexandria_file_get_by_uuid(
     uuid: *const c_char,
@@ -472,6 +513,13 @@ pub extern "C" fn alexandria_file_get_by_uuid(
         None => return FileJsonResult::err(FILE_ERR_NOT_INITIALIZED),
     };
 
+    // Deny before touching the payload — an unauthenticated caller must
+    // not learn whether its uuid would have parsed.
+    let token = cstr_lossy(token).unwrap_or_default();
+    if !authenticated(&services, &token) {
+        return FileJsonResult::err(FILE_ERR_UNAUTHORIZED);
+    }
+
     let uuid_str = match cstr_lossy(uuid) {
         Some(s) => s,
         None => return FileJsonResult::err(FILE_ERR_INVALID_INPUT),
@@ -480,8 +528,6 @@ pub extern "C" fn alexandria_file_get_by_uuid(
         Ok(u) => u,
         Err(_) => return FileJsonResult::err(FILE_ERR_INVALID_INPUT),
     };
-
-    let token = cstr_lossy(token).unwrap_or_default();
 
     let result = runtime().block_on(async {
         services.browse_files_handler.get_by_uuid(uuid, &token).await
@@ -521,7 +567,7 @@ fn map_file_err(err: DomainError) -> FileJsonResult {
 }
 
 /// Count of cataloged files currently marked missing on disk (UC-02 AF-01).
-#[allow(unsafe_code)]
+#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
 pub extern "C" fn alexandria_index_count_missing() -> i64 {
     let services = match services_slot().lock().unwrap().clone() {
@@ -539,7 +585,7 @@ pub extern "C" fn alexandria_index_count_missing() -> i64 {
 
 /// JSON array of `{"path","name","type","hash"}` for every indexed file, or a
 /// NUL pointer on error. Caller must free it with `alexandria_free_string`.
-#[allow(unsafe_code)]
+#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
 pub extern "C" fn alexandria_index_files_json() -> *mut c_char {
     let services = match services_slot().lock().unwrap().clone() {
@@ -575,9 +621,16 @@ pub extern "C" fn alexandria_index_files_json() -> *mut c_char {
 }
 
 /// Free a string previously returned by an FFI accessor.
-#[allow(unsafe_code)]
+///
+/// # Safety
+///
+/// `ptr` must be null, or a pointer returned by one of this library's
+/// accessors and not yet freed. Passing anything else — a pointer this library
+/// did not produce, or one already freed — is undefined behaviour. Declared
+/// `unsafe` because that obligation is the caller's and cannot be checked here.
+#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
-pub extern "C" fn alexandria_free_string(ptr: *mut c_char) {
+pub unsafe extern "C" fn alexandria_free_string(ptr: *mut c_char) {
     if !ptr.is_null() {
         // SAFETY: `ptr` came from `CString::into_raw` above.
         unsafe {

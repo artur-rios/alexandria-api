@@ -1,4 +1,3 @@
-use chrono::Utc;
 use uuid::Uuid;
 
 use alexandria_core::auth::AuthService;
@@ -334,5 +333,4 @@ async fn given_mixed_cataloged_files_when_execute_then_each_handled_correctly() 
         .missing_at
         .is_some());
 
-    let _: &chrono::DateTime<Utc> = &now(); // keep import live
 }

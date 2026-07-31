@@ -5,7 +5,7 @@ pub mod routes;
 
 use std::sync::Arc;
 
-use axum::middleware::from_fn;
+use axum::middleware::from_fn_with_state;
 use axum::routing::{get, patch, post};
 use axum::Router;
 use tower_http::trace::TraceLayer;
@@ -25,8 +25,10 @@ pub fn app(settings: Settings, services: Arc<Services>) -> Router {
         services,
     };
 
-    Router::new()
-        .route("/health", get(routes::health::health))
+    // Every `/v1` route requires the owner's credentials. `route_layer` runs
+    // the gate before the matched route's extractors, so an unauthenticated
+    // caller is denied without its body or path ever being parsed (FR-AU-07).
+    let v1 = Router::new()
         .route("/v1/index", post(routes::index::index))
         .route("/v1/index/refresh", post(routes::refresh::refresh))
         .route(
@@ -35,8 +37,16 @@ pub fn app(settings: Settings, services: Arc<Services>) -> Router {
         )
         .route("/v1/files", get(routes::browse::list_files))
         .route("/v1/files/:uuid", get(routes::browse::get_file))
-        .layer(from_fn(middleware::auth::auth_stub))
-        .layer(from_fn(middleware::error::error_stub))
+        .route_layer(from_fn_with_state(
+            state.clone(),
+            middleware::auth::require_auth,
+        ));
+
+    // `/health` is deliberately outside the gate — it reports reachability to
+    // an operator or orchestrator that holds no catalog credentials.
+    Router::new()
+        .route("/health", get(routes::health::health))
+        .merge(v1)
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }

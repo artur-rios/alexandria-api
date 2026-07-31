@@ -4,7 +4,7 @@ use axum::Json;
 use serde::Deserialize;
 use uuid::Uuid;
 
-use alexandria_core::catalog::model::{File, FileState, FileView, FileType, StateFilter};
+use alexandria_core::catalog::model::{File, FileView, FileType, StateFilter};
 use alexandria_core::catalog::queries::browse::FileFilter;
 
 use crate::middleware::error::ApiError;
@@ -102,12 +102,4 @@ fn parse_file_type(s: &str) -> Option<FileType> {
         "image" => Some(FileType::Image),
         _ => None,
     }
-}
-
-// Keeps the `FileState` import in parity with sibling route modules in case
-// future handlers expose it through the response body; harmless and clearly
-// labeled.
-#[allow(dead_code)]
-fn _unused_file_state() -> FileState {
-    FileState::Active
 }

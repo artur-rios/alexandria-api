@@ -1,7 +1,6 @@
-use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
-use alexandria_core::auth::{AuthService, Principal};
+use alexandria_core::auth::AuthService;
 use alexandria_core::catalog::classify::classify_by_extension;
 use alexandria_core::catalog::clock::Clock;
 use alexandria_core::catalog::commands::index::{IndexHandler, IndexRequest};
@@ -210,10 +209,4 @@ async fn given_bearer_auth_when_empty_token_then_unauthorized() {
 fn given_fixed_clock_when_now_then_returns_seeded_time() {
     let clock = fixed_clock(now());
     assert_eq!(clock.now(), now());
-}
-
-#[allow(dead_code)]
-fn _unused_import() {
-    let _ = DateTime::<Utc>::from_timestamp(0, 0).unwrap();
-    let _: Principal;
 }
