@@ -8,6 +8,7 @@ use crate::catalog::commands::edit_metadata::EditMetadataHandler;
 use crate::catalog::commands::index::IndexHandler;
 use crate::catalog::commands::refresh::RefreshHandler;
 use crate::catalog::fs::StdFilesystem;
+use crate::catalog::queries::browse::BrowseFilesHandler;
 use crate::catalog::repos::SqliteCatalogRepository;
 use crate::config::Settings;
 
@@ -24,11 +25,15 @@ pub type DefaultRefreshHandler =
 pub type DefaultEditMetadataHandler =
     EditMetadataHandler<BearerAuthService, SqliteCatalogRepository>;
 
+pub type DefaultBrowseFilesHandler =
+    BrowseFilesHandler<BearerAuthService, SqliteCatalogRepository>;
+
 #[derive(Clone)]
 pub struct Services {
     pub index_handler: Arc<DefaultIndexHandler>,
     pub refresh_handler: Arc<DefaultRefreshHandler>,
     pub edit_metadata_handler: Arc<DefaultEditMetadataHandler>,
+    pub browse_files_handler: Arc<DefaultBrowseFilesHandler>,
     pub pool: SqlitePool,
 }
 
@@ -43,11 +48,13 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
     let clock = SystemClock;
     let index_handler = Arc::new(IndexHandler::new(auth, repo.clone(), fs, clock));
     let refresh_handler = Arc::new(RefreshHandler::new(auth, repo.clone(), fs, clock));
-    let edit_metadata_handler = Arc::new(EditMetadataHandler::new(auth, repo));
+    let edit_metadata_handler = Arc::new(EditMetadataHandler::new(auth, repo.clone()));
+    let browse_files_handler = Arc::new(BrowseFilesHandler::new(auth, repo));
     Services {
         index_handler,
         refresh_handler,
         edit_metadata_handler,
+        browse_files_handler,
         pool,
     }
 }
