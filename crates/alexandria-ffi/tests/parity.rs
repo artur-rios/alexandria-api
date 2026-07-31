@@ -12,9 +12,10 @@ use alexandria_core::migrate::migrate_database;
 use alexandria_core::services::build_services;
 use alexandria_http::app;
 use alexandria_ffi::{
-    alexandria_file_edit_metadata, alexandria_free_string, alexandria_index_count_files,
-    alexandria_index_count_missing, alexandria_index_files_json, alexandria_index_init,
-    alexandria_index_refresh_start, alexandria_index_start, IndexStartResult,
+    alexandria_file_edit_metadata, alexandria_file_get_by_uuid, alexandria_files_list,
+    alexandria_free_string, alexandria_index_count_files, alexandria_index_count_missing,
+    alexandria_index_files_json, alexandria_index_init, alexandria_index_refresh_start,
+    alexandria_index_start, IndexStartResult,
 };
 use axum::body::{to_bytes, Body};
 use axum::http::Request;
@@ -538,4 +539,430 @@ async fn given_same_audio_file_when_metadata_edited_via_http_and_ffi_then_respon
     // Also confirm the patch we sent equals the metadata we got back (the
     // handler echoes the written metadata).
     assert_eq!(http_body["metadata"], patch_value, "metadata must echo patch");
+}
+
+/// UC-03 parity — list files through both transports with identical filters
+/// and assert the returned JSON arrays agree (modulo the per-database values
+/// `uuid`, `path`, and `indexedAt`, which differ for each temp library)
+/// (Testing Specification §7.3, FR-FC-24).
+#[tokio::test]
+async fn given_same_lib_when_files_listed_via_http_and_ffi_then_arrays_identical() {
+    let _g = SERIAL.lock().unwrap();
+
+    // ---- HTTP leg ----
+    let http_lib = tempdir().unwrap();
+    std::fs::write(http_lib.path().join("song.mp3"), b"audio").unwrap();
+    std::fs::write(http_lib.path().join("notes.md"), b"# h").unwrap();
+    std::fs::write(http_lib.path().join("clip.mkv"), b"video").unwrap();
+
+    let http_dir = tempdir().unwrap();
+    let http_db = db_path(&http_dir, "http.sqlite");
+    let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    let http_services = std::sync::Arc::new(
+        build_services(&Settings::default(), http_pool.clone()).await,
+    );
+
+    let index_req = Request::builder()
+        .method("POST")
+        .uri("/v1/index")
+        .header("authorization", "Bearer parity")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({ "root": http_lib.path().to_str().unwrap() }).to_string(),
+        ))
+        .unwrap();
+    let _ = app(Settings::default(), http_services.clone())
+        .oneshot(index_req)
+        .await
+        .expect("http index");
+    wait_for_http_files(&http_pool, 3).await;
+
+    // Soft-delete one record so we can exercise the default-excludes-deleted
+    // behavior and the state=all filter on both surfaces.
+    let (del_uuid,): (String,) =
+        sqlx::query_as("SELECT uuid FROM files WHERE name = ?")
+            .bind("song.mp3")
+            .fetch_one(&http_pool)
+            .await
+            .unwrap();
+    sqlx::query("UPDATE files SET state='deleted', deleted_at=? WHERE uuid=?")
+        .bind("2024-01-01T00:00:00Z")
+        .bind(&del_uuid)
+        .execute(&http_pool)
+        .await
+        .expect("soft-delete");
+
+    let norm = |v: serde_json::Value| -> Vec<(String, String, String)> {
+        // (name, fileType, state) sorted by name — uuid/path/indexedAt are
+        // per-database and excluded from the parity comparison.
+        let mut arr: Vec<(String, String, String)> = v
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| {
+                (
+                    f["name"].as_str().unwrap().to_string(),
+                    f["fileType"].as_str().unwrap().to_string(),
+                    f["state"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect();
+        arr.sort();
+        arr
+    };
+
+    // Default filter (excludes deleted): HTTP returns notes.md + clip.mkv.
+    let default_req = Request::builder()
+        .method("GET")
+        .uri("/v1/files")
+        .header("authorization", "Bearer parity")
+        .body(Body::empty())
+        .unwrap();
+    let default_resp = app(Settings::default(), http_services.clone())
+        .oneshot(default_req)
+        .await
+        .expect("http list");
+    assert_eq!(default_resp.status(), axum::http::StatusCode::OK);
+    let http_default: serde_json::Value = serde_json::from_slice(
+        &to_bytes(default_resp.into_body(), usize::MAX).await.unwrap(),
+    )
+    .unwrap();
+    let http_default_n = norm(http_default);
+    assert_eq!(http_default_n.len(), 2, "default excludes deleted (http)");
+
+    // state=all filter: HTTP returns all three.
+    let all_req = Request::builder()
+        .method("GET")
+        .uri("/v1/files?state=all")
+        .header("authorization", "Bearer parity")
+        .body(Body::empty())
+        .unwrap();
+    let all_resp = app(Settings::default(), http_services.clone())
+        .oneshot(all_req)
+        .await
+        .expect("http list all");
+    let http_all: serde_json::Value = serde_json::from_slice(
+        &to_bytes(all_resp.into_body(), usize::MAX).await.unwrap(),
+    )
+    .unwrap();
+    let http_all_n = norm(http_all);
+    assert_eq!(http_all_n.len(), 3, "state=all returns everything (http)");
+
+    // type=audio + state=all filter: HTTP returns only the soft-deleted song.
+    let audio_req = Request::builder()
+        .method("GET")
+        .uri("/v1/files?type=audio&state=all")
+        .header("authorization", "Bearer parity")
+        .body(Body::empty())
+        .unwrap();
+    let audio_resp = app(Settings::default(), http_services.clone())
+        .oneshot(audio_req)
+        .await
+        .expect("http list audio");
+    let http_audio: serde_json::Value = serde_json::from_slice(
+        &to_bytes(audio_resp.into_body(), usize::MAX).await.unwrap(),
+    )
+    .unwrap();
+    let http_audio_n = norm(http_audio);
+    assert_eq!(http_audio_n.len(), 1);
+    assert_eq!(http_audio_n[0].0, "song.mp3");
+    assert_eq!(http_audio_n[0].2, "deleted");
+
+    // ---- FFI leg (own identical lib + db) ----
+    let ffi_lib = tempdir().unwrap();
+    std::fs::write(ffi_lib.path().join("song.mp3"), b"audio").unwrap();
+    std::fs::write(ffi_lib.path().join("notes.md"), b"# h").unwrap();
+    std::fs::write(ffi_lib.path().join("clip.mkv"), b"video").unwrap();
+    let ffi_dir = tempdir().unwrap();
+    let ffi_db = db_path(&ffi_dir, "ffi.sqlite");
+    let ffi_lib_path = ffi_lib.path().to_str().unwrap().to_string();
+
+    let (ffi_default_n, ffi_all_n, ffi_audio_n) =
+        tokio::task::spawn_blocking(move || -> (Vec<(String,String,String)>, Vec<(String,String,String)>, Vec<(String,String,String)>) {
+            let cdb = CString::new(ffi_db).unwrap();
+            assert_eq!(alexandria_index_init(cdb.as_ptr()), alexandria_ffi::INDEX_OK);
+
+            let root = CString::new(ffi_lib_path).unwrap();
+            let token = CString::new("parity").unwrap();
+            let started = alexandria_index_start(root.as_ptr(), token.as_ptr());
+            assert_eq!(started.status, alexandria_ffi::INDEX_OK);
+            wait_for_ffi_files(3);
+
+            // Soft-delete song.mp3 via a direct SQL update on the FFI db, so
+            // the data state matches the HTTP leg exactly.
+            let ffi_db_path = std::path::PathBuf::from(ffi_dir.path()).join("ffi.sqlite");
+            let ffi_uuid = std::thread::spawn({
+                let ffi_db_path = ffi_db_path.clone();
+                move || -> String {
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all().build().unwrap();
+                    rt.block_on(async move {
+                        let url = format!("sqlite://{}", ffi_db_path.to_str().unwrap());
+                        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+                            .max_connections(1)
+                            .connect(&format!("{url}?mode=rw")).await.unwrap();
+                        sqlx::query("UPDATE files SET state='deleted', deleted_at=? WHERE name=?")
+                            .bind("2024-01-01T00:00:00Z")
+                            .bind("song.mp3")
+                            .execute(&pool).await.unwrap();
+                        let (uuid,): (String,) = sqlx::query_as("SELECT uuid FROM files WHERE name=?")
+                            .bind("song.mp3").fetch_one(&pool).await.unwrap();
+                        uuid
+                    })
+                }
+            }).join().unwrap();
+            let _ = ffi_uuid; // not used by FFI list, but confirms the delete landed
+
+            let ffi_list = |filters: &str| -> serde_json::Value {
+                let f = CString::new(filters).unwrap();
+                let r = alexandria_files_list(f.as_ptr(), token.as_ptr());
+                assert_eq!(r.status, alexandria_ffi::FILE_OK, "ffi list failed");
+                assert!(!r.json.is_null());
+                let s = unsafe { CStr::from_ptr(r.json) }.to_str().unwrap().to_string();
+                alexandria_free_string(r.json);
+                serde_json::from_str(&s).unwrap()
+            };
+
+            let ffi_default_n = norm(ffi_list(""));
+            let ffi_all_n = norm(ffi_list(r#"{"state":"all"}"#));
+            let ffi_audio_n = norm(ffi_list(r#"{"type":"audio","state":"all"}"#));
+            (ffi_default_n, ffi_all_n, ffi_audio_n)
+        })
+        .await
+        .unwrap();
+
+    // ---- compare ----
+    assert_eq!(http_default_n, ffi_default_n, "default list diverges across surfaces");
+    assert_eq!(http_all_n, ffi_all_n, "state=all list diverges across surfaces");
+    assert_eq!(http_audio_n, ffi_audio_n, "type+state list diverges across surfaces");
+}
+
+/// UC-03 parity — get a single file by UUID through both transports and
+/// assert the returned `FileView` bodies agree (modulo the per-database
+/// values `uuid`, `path`, and `indexedAt`) (Testing Specification §7.3,
+/// FR-FC-24).
+#[tokio::test]
+async fn given_same_file_when_fetched_via_http_and_ffi_then_file_view_bodies_identical() {
+    let _g = SERIAL.lock().unwrap();
+
+    // ---- HTTP leg ----
+    let http_lib = tempdir().unwrap();
+    std::fs::write(http_lib.path().join("song.mp3"), b"parity-audio").unwrap();
+
+    let http_dir = tempdir().unwrap();
+    let http_db = db_path(&http_dir, "http.sqlite");
+    let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    let http_services = std::sync::Arc::new(
+        build_services(&Settings::default(), http_pool.clone()).await,
+    );
+
+    let index_req = Request::builder()
+        .method("POST")
+        .uri("/v1/index")
+        .header("authorization", "Bearer parity")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({ "root": http_lib.path().to_str().unwrap() }).to_string(),
+        ))
+        .unwrap();
+    let _ = app(Settings::default(), http_services.clone())
+        .oneshot(index_req)
+        .await
+        .expect("http index");
+    wait_for_http_files(&http_pool, 1).await;
+
+    // Write subtype metadata so the FileView's `metadata` is non-null and
+    // can be compared across surfaces.
+    let (http_uuid,): (String,) = sqlx::query_as("SELECT uuid FROM files WHERE name=?")
+        .bind("song.mp3")
+        .fetch_one(&http_pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE audio_files SET title=?, artist=?, year=? \
+         FROM files WHERE audio_files.file_id = files.id AND files.uuid = ?",
+    )
+    .bind("T")
+    .bind("A")
+    .bind(2001i64)
+    .bind(&http_uuid)
+    .execute(&http_pool)
+    .await
+    .expect("audio metadata update");
+
+    let get_req = Request::builder()
+        .method("GET")
+        .uri(format!("/v1/files/{http_uuid}"))
+        .header("authorization", "Bearer parity")
+        .body(Body::empty())
+        .unwrap();
+    let get_resp = app(Settings::default(), http_services.clone())
+        .oneshot(get_req)
+        .await
+        .expect("http get");
+    assert_eq!(get_resp.status(), axum::http::StatusCode::OK);
+    let http_body: serde_json::Value = serde_json::from_slice(
+        &to_bytes(get_resp.into_body(), usize::MAX).await.unwrap(),
+    )
+    .unwrap();
+
+    // ---- FFI leg (own identical lib + db) ----
+    let ffi_lib = tempdir().unwrap();
+    std::fs::write(ffi_lib.path().join("song.mp3"), b"parity-audio").unwrap();
+    let ffi_dir = tempdir().unwrap();
+    let ffi_db = db_path(&ffi_dir, "ffi.sqlite");
+    let ffi_lib_path = ffi_lib.path().to_str().unwrap().to_string();
+
+    let ffi_body: serde_json::Value =
+        tokio::task::spawn_blocking(move || -> serde_json::Value {
+            let cdb = CString::new(ffi_db).unwrap();
+            assert_eq!(alexandria_index_init(cdb.as_ptr()), alexandria_ffi::INDEX_OK);
+
+            let root = CString::new(ffi_lib_path).unwrap();
+            let token = CString::new("parity").unwrap();
+            let started = alexandria_index_start(root.as_ptr(), token.as_ptr());
+            assert_eq!(started.status, alexandria_ffi::INDEX_OK);
+            wait_for_ffi_files(1);
+
+            // Write the same metadata on the FFI db via a direct SQL update.
+            let ffi_dir_path = ffi_dir.path().to_path_buf();
+            let ffi_uuid = std::thread::spawn({
+                let ffi_dir_path = ffi_dir_path.clone();
+                move || -> String {
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all().build().unwrap();
+                    rt.block_on(async move {
+                        let path = ffi_dir_path.join("ffi.sqlite");
+                        let url = format!("sqlite://{}", path.to_str().unwrap());
+                        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+                            .max_connections(1)
+                            .connect(&format!("{url}?mode=rw")).await.unwrap();
+                        sqlx::query(
+                            "UPDATE audio_files SET title=?, artist=?, year=? \
+                             FROM files WHERE audio_files.file_id = files.id AND files.name = ?",
+                        )
+                        .bind("T").bind("A").bind(2001i64).bind("song.mp3")
+                        .execute(&pool).await.unwrap();
+                        let (uuid,): (String,) = sqlx::query_as("SELECT uuid FROM files WHERE name=?")
+                            .bind("song.mp3").fetch_one(&pool).await.unwrap();
+                        uuid
+                    })
+                }
+            }).join().unwrap();
+
+            let uuid_c = CString::new(ffi_uuid).unwrap();
+            let r = alexandria_file_get_by_uuid(uuid_c.as_ptr(), token.as_ptr());
+            assert_eq!(r.status, alexandria_ffi::FILE_OK, "ffi get failed");
+            assert!(!r.json.is_null());
+            let s = unsafe { CStr::from_ptr(r.json) }.to_str().unwrap().to_string();
+            alexandria_free_string(r.json);
+            serde_json::from_str(&s).unwrap()
+        })
+        .await
+        .unwrap();
+
+    // ---- compare ----
+    // `metadata` is fully server-derived from the written row and must agree
+    // byte-for-byte across surfaces.
+    assert_eq!(http_body["metadata"], ffi_body["metadata"], "metadata diverges");
+
+    // `file` matches field-for-field except per-database values: `uuid`,
+    // `path`, `indexedAt`.
+    let norm_file = |v: &serde_json::Value| -> serde_json::Value {
+        let mut f = v["file"].clone();
+        if let Some(obj) = f.as_object_mut() {
+            obj.remove("uuid");
+            obj.remove("path");
+            obj.remove("indexedAt");
+        }
+        f
+    };
+    assert_eq!(norm_file(&http_body), norm_file(&ffi_body), "file body diverges");
+}
+
+/// UC-03 parity — AF-01 (not-found) maps to the same status on both
+/// surfaces (HTTP 404, FFI `FILE_ERR_NOT_FOUND`).
+#[tokio::test]
+async fn given_missing_uuid_when_fetched_via_http_and_ffi_then_both_not_found() {
+    let _g = SERIAL.lock().unwrap();
+
+    let missing = uuid::Uuid::new_v4();
+
+    // ---- HTTP leg ----
+    let http_dir = tempdir().unwrap();
+    let http_db = db_path(&http_dir, "http.sqlite");
+    let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    let http_services = std::sync::Arc::new(
+        build_services(&Settings::default(), http_pool.clone()).await,
+    );
+
+    let req = Request::builder()
+        .method("GET")
+        .uri(format!("/v1/files/{missing}"))
+        .header("authorization", "Bearer parity")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app(Settings::default(), http_services.clone())
+        .oneshot(req)
+        .await
+        .expect("http get");
+    assert_eq!(resp.status(), axum::http::StatusCode::NOT_FOUND);
+
+    // ---- FFI leg ----
+    let ffi_dir = tempdir().unwrap();
+    let ffi_db = db_path(&ffi_dir, "ffi.sqlite");
+    let missing_str = missing.to_string();
+    let ffi_status = tokio::task::spawn_blocking(move || -> i32 {
+        let cdb = CString::new(ffi_db).unwrap();
+        assert_eq!(alexandria_index_init(cdb.as_ptr()), alexandria_ffi::INDEX_OK);
+        let token = CString::new("parity").unwrap();
+        let uuid_c = CString::new(missing_str).unwrap();
+        let r = alexandria_file_get_by_uuid(uuid_c.as_ptr(), token.as_ptr());
+        r.status
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(ffi_status, alexandria_ffi::FILE_ERR_NOT_FOUND);
+}
+
+/// UC-03 parity — AF-02 (unauthenticated) maps to the same status on both
+/// surfaces (HTTP 401, FFI `FILE_ERR_UNAUTHORIZED`).
+#[tokio::test]
+async fn given_no_token_when_files_listed_via_http_and_ffi_then_both_unauthorized() {
+    let _g = SERIAL.lock().unwrap();
+
+    // ---- HTTP leg ----
+    let http_dir = tempdir().unwrap();
+    let http_db = db_path(&http_dir, "http.sqlite");
+    let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    let http_services = std::sync::Arc::new(
+        build_services(&Settings::default(), http_pool.clone()).await,
+    );
+
+    let req = Request::builder()
+        .method("GET")
+        .uri("/v1/files")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app(Settings::default(), http_services.clone())
+        .oneshot(req)
+        .await
+        .expect("http list");
+    assert_eq!(resp.status(), axum::http::StatusCode::UNAUTHORIZED);
+
+    let ffi_dir = tempdir().unwrap();
+    let ffi_db = db_path(&ffi_dir, "ffi.sqlite");
+    let ffi_status = tokio::task::spawn_blocking(move || -> i32 {
+        let cdb = CString::new(ffi_db).unwrap();
+        assert_eq!(alexandria_index_init(cdb.as_ptr()), alexandria_ffi::INDEX_OK);
+        let empty_filters = CString::new("").unwrap();
+        // Null token pointer → cstr_lossy returns None → empty token.
+        let r = alexandria_files_list(empty_filters.as_ptr(), std::ptr::null());
+        r.status
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(ffi_status, alexandria_ffi::FILE_ERR_UNAUTHORIZED);
 }
