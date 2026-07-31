@@ -442,6 +442,276 @@ async fn given_no_bearer_when_patch_then_401() {
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 }
 
+// ---------------------------------------------------------------------------
+// UC-03: GET /v1/files and GET /v1/files/{uuid} (FR-FC-12, FR-FC-13, FR-FC-24)
+// ---------------------------------------------------------------------------
+
+/// Index a temp library with `names.len()` files into the given pool and
+/// wait for persistence. Builds a one-shot services instance against `pool`
+/// so the spawned index task persists to the same database the test queries.
+async fn index_library(
+    lib: &tempfile::TempDir,
+    pool: &sqlx::sqlite::SqlitePool,
+    names: &[(&str, &[u8])],
+) {
+    for (name, bytes) in names {
+        common::write_file(lib, name, bytes);
+    }
+    let services = std::sync::Arc::new(
+        alexandria_core::services::build_services(&Settings::default(), pool.clone()).await,
+    );
+    let _ = app(Settings::default(), services)
+        .oneshot(index_request(lib.path().to_str().unwrap()))
+        .await
+        .expect("index one-shot");
+    wait_for_files(pool, names.len() as i64).await;
+}
+
+fn get_files(uri: &str) -> Request<Body> {
+    Request::builder()
+        .method("GET")
+        .uri(uri)
+        .header("authorization", "Bearer test-token")
+        .body(Body::empty())
+        .unwrap()
+}
+
+fn get_files_no_auth(uri: &str) -> Request<Body> {
+    Request::builder().method("GET").uri(uri).body(Body::empty()).unwrap()
+}
+
+#[tokio::test]
+async fn given_indexed_files_when_get_files_then_200_array_excluding_deleted_by_default() {
+    let lib = tempdir().unwrap();
+    let test = test_app().await;
+    index_library(&lib, &test.pool, &[("a.mp3", b"x"), ("b.md", b"y")]).await;
+
+    let response = app(Settings::default(), test.services)
+        .oneshot(get_files("/v1/files"))
+        .await
+        .expect("list one-shot");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body: Value = serde_json::from_slice(
+        &to_bytes(response.into_body(), usize::MAX).await.unwrap(),
+    )
+    .unwrap();
+    let arr = body.as_array().expect("array");
+    assert_eq!(arr.len(), 2);
+    // Ordered by path; both are active.
+    assert_eq!(arr.iter().all(|f| f["state"] == "active"), true);
+}
+
+#[tokio::test]
+async fn given_indexed_files_when_get_files_with_type_filter_then_only_matching_type_returned() {
+    let lib = tempdir().unwrap();
+    let test = test_app().await;
+    index_library(&lib, &test.pool, &[("a.mp3", b"x"), ("b.mp4", b"y")]).await;
+
+    let response = app(Settings::default(), test.services)
+        .oneshot(get_files("/v1/files?type=audio"))
+        .await
+        .expect("list one-shot");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = serde_json::from_slice(
+        &to_bytes(response.into_body(), usize::MAX).await.unwrap(),
+    )
+    .unwrap();
+    let arr = body.as_array().expect("array");
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["fileType"], "audio");
+}
+
+#[tokio::test]
+async fn given_unknown_type_when_get_files_then_400() {
+    let test = test_app().await;
+    let response = app(Settings::default(), test.services)
+        .oneshot(get_files("/v1/files?type=banana"))
+        .await
+        .expect("list one-shot");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn given_deleted_file_when_get_files_default_then_excluded() {
+    let lib = tempdir().unwrap();
+    let test = test_app().await;
+    index_library(&lib, &test.pool, &[("song.mp3", b"x")]).await;
+
+    let uuid = uuid_for_name(&test.pool, "song.mp3").await;
+    // Seed a soft-delete directly.
+    sqlx::query("UPDATE files SET state='deleted', deleted_at=? WHERE uuid=?")
+        .bind("2024-01-01T00:00:00Z")
+        .bind(&uuid)
+        .execute(&test.pool)
+        .await
+        .expect("soft-delete");
+
+    let response = app(Settings::default(), test.services.clone())
+        .oneshot(get_files("/v1/files"))
+        .await
+        .expect("list one-shot");
+    let body: Value = serde_json::from_slice(
+        &to_bytes(response.into_body(), usize::MAX).await.unwrap(),
+    )
+    .unwrap();
+    assert_eq!(body.as_array().unwrap().len(), 0, "deleted excluded by default");
+}
+
+#[tokio::test]
+async fn given_deleted_file_when_get_files_state_deleted_then_only_deleted_returned() {
+    let lib = tempdir().unwrap();
+    let test = test_app().await;
+    index_library(&lib, &test.pool, &[("a.mp3", b"x"), ("b.md", b"y")]).await;
+    let uuid_a = uuid_for_name(&test.pool, "a.mp3").await;
+    sqlx::query("UPDATE files SET state='deleted', deleted_at=? WHERE uuid=?")
+        .bind("2024-01-01T00:00:00Z")
+        .bind(&uuid_a)
+        .execute(&test.pool)
+        .await
+        .expect("soft-delete");
+
+    let response = app(Settings::default(), test.services)
+        .oneshot(get_files("/v1/files?state=deleted"))
+        .await
+        .expect("list one-shot");
+    let body: Value = serde_json::from_slice(
+        &to_bytes(response.into_body(), usize::MAX).await.unwrap(),
+    )
+    .unwrap();
+    let arr = body.as_array().unwrap();
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["state"], "deleted");
+    assert_eq!(arr[0]["name"], "a.mp3");
+}
+
+#[tokio::test]
+async fn given_deleted_file_when_get_files_state_all_then_both_returned() {
+    let lib = tempdir().unwrap();
+    let test = test_app().await;
+    index_library(&lib, &test.pool, &[("a.mp3", b"x"), ("b.md", b"y")]).await;
+    let uuid_a = uuid_for_name(&test.pool, "a.mp3").await;
+    sqlx::query("UPDATE files SET state='deleted', deleted_at=? WHERE uuid=?")
+        .bind("2024-01-01T00:00:00Z")
+        .bind(&uuid_a)
+        .execute(&test.pool)
+        .await
+        .expect("soft-delete");
+
+    let response = app(Settings::default(), test.services)
+        .oneshot(get_files("/v1/files?state=all"))
+        .await
+        .expect("list one-shot");
+    let body: Value = serde_json::from_slice(
+        &to_bytes(response.into_body(), usize::MAX).await.unwrap(),
+    )
+    .unwrap();
+    assert_eq!(body.as_array().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn given_no_bearer_when_get_files_then_401() {
+    let test = test_app().await;
+    let response = app(Settings::default(), test.services)
+        .oneshot(get_files_no_auth("/v1/files"))
+        .await
+        .expect("list one-shot");
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn given_indexed_file_when_get_file_by_uuid_then_200_with_file_view() {
+    let lib = tempdir().unwrap();
+    let test = test_app().await;
+    index_library(&lib, &test.pool, &[("song.mp3", b"x")]).await;
+    let uuid = uuid_for_name(&test.pool, "song.mp3").await;
+
+    let response = app(Settings::default(), test.services)
+        .oneshot(get_files(&format!("/v1/files/{uuid}")))
+        .await
+        .expect("get one-shot");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = serde_json::from_slice(
+        &to_bytes(response.into_body(), usize::MAX).await.unwrap(),
+    )
+    .unwrap();
+    assert_eq!(body["file"]["uuid"], uuid);
+    assert_eq!(body["file"]["fileType"], "audio");
+    assert_eq!(body["file"]["state"], "active");
+    // No metadata written yet → null.
+    assert!(body["metadata"].is_null());
+}
+
+#[tokio::test]
+async fn given_indexed_file_with_written_metadata_when_get_file_by_uuid_then_metadata_echoed() {
+    let lib = tempdir().unwrap();
+    let test = test_app().await;
+    index_library(&lib, &test.pool, &[("song.mp3", b"x")]).await;
+    let uuid = uuid_for_name(&test.pool, "song.mp3").await;
+    sqlx::query(
+        "UPDATE audio_files SET title='T', artist='A', album=NULL, year=2001, genre=NULL, \
+         track=NULL FROM files WHERE audio_files.file_id = files.id AND files.uuid = ?",
+    )
+    .bind(&uuid)
+    .execute(&test.pool)
+    .await
+    .expect("audio metadata");
+
+    let response = app(Settings::default(), test.services)
+        .oneshot(get_files(&format!("/v1/files/{uuid}")))
+        .await
+        .expect("get one-shot");
+    let body: Value = serde_json::from_slice(
+        &to_bytes(response.into_body(), usize::MAX).await.unwrap(),
+    )
+    .unwrap();
+    assert_eq!(body["metadata"]["type"], "audio");
+    assert_eq!(body["metadata"]["title"], "T");
+    assert_eq!(body["metadata"]["artist"], "A");
+    assert_eq!(body["metadata"]["year"], 2001);
+}
+
+#[tokio::test]
+async fn given_missing_uuid_when_get_file_then_404() {
+    let test = test_app().await;
+    let missing = uuid::Uuid::new_v4().to_string();
+    let response = app(Settings::default(), test.services)
+        .oneshot(get_files(&format!("/v1/files/{missing}")))
+        .await
+        .expect("get one-shot");
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn given_no_bearer_when_get_file_by_uuid_then_401() {
+    let test = test_app().await;
+    let uuid = uuid::Uuid::new_v4().to_string();
+    let response = app(Settings::default(), test.services)
+        .oneshot(get_files_no_auth(&format!("/v1/files/{uuid}")))
+        .await
+        .expect("get one-shot");
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn given_indexed_text_file_when_get_file_by_uuid_then_metadata_is_null() {
+    let lib = tempdir().unwrap();
+    let test = test_app().await;
+    index_library(&lib, &test.pool, &[("notes.md", b"# h")]).await;
+    let uuid = uuid_for_name(&test.pool, "notes.md").await;
+
+    let response = app(Settings::default(), test.services)
+        .oneshot(get_files(&format!("/v1/files/{uuid}")))
+        .await
+        .expect("get one-shot");
+    let body: Value = serde_json::from_slice(
+        &to_bytes(response.into_body(), usize::MAX).await.unwrap(),
+    )
+    .unwrap();
+    assert_eq!(body["file"]["fileType"], "text");
+    assert!(body["metadata"].is_null());
+}
+
 #[tokio::test]
 async fn given_soft_deleted_file_when_patch_then_409() {
     let lib = tempdir().unwrap();
