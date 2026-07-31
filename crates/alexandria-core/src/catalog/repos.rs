@@ -2,7 +2,9 @@ use chrono::{DateTime, Utc};
 use sqlx::sqlite::SqlitePool;
 use uuid::Uuid;
 
-use crate::catalog::model::{File, FileState, FileType, NewFile, SubtypeMetadata};
+use crate::catalog::model::{
+    File, FileState, FileType, FormatKind, MediaKind, NewFile, StateFilter, SubtypeMetadata,
+};
 use crate::errors::DomainError;
 
 /// Catalog repository port. The indexer depends on this trait so its decision
@@ -42,6 +44,25 @@ pub trait CatalogRepository: Send + Sync {
         uuid: Uuid,
         metadata: &SubtypeMetadata,
     ) -> Result<(), DomainError>;
+
+    /// List files filtered by type and lifecycle state (UC-03 / FR-FC-12).
+    /// `file_type = None` means no type filter; `state` selects the lifecycle
+    /// subset (`Active` excludes `deleted`, `Deleted` only deleted, `All`
+    /// both). Ordered by path. Uses `idx_files_type` / `idx_files_state`.
+    async fn list_filtered(
+        &self,
+        file_type: Option<FileType>,
+        state: StateFilter,
+    ) -> Result<Vec<File>, DomainError>;
+
+    /// Read the stored subtype metadata for the file identified by `uuid`
+    /// (UC-03 single-file view / FR-FC-13). Returns `Ok(None)` when the file
+    /// does not exist, when its subtype has no `SubtypeMetadata` (Text/Html),
+    /// or when no editable metadata has been written to the subtype row yet.
+    async fn find_metadata_by_uuid(
+        &self,
+        uuid: Uuid,
+    ) -> Result<Option<SubtypeMetadata>, DomainError>;
 }
 
 #[derive(Clone)]
@@ -326,6 +347,161 @@ impl CatalogRepository for SqliteCatalogRepository {
 
         tx.commit().await?;
         Ok(())
+    }
+
+    async fn list_filtered(
+        &self,
+        file_type: Option<FileType>,
+        state: StateFilter,
+    ) -> Result<Vec<File>, DomainError> {
+        // Build the query dynamically based on which filters are active. The
+        // filters are enumerated (not user strings) so there is no SQL
+        // injection surface; `?` placeholders bind the type discriminator.
+        let base = "SELECT uuid, path, name, type, content_hash, state, deleted_at, \
+                    indexed_at, missing_at FROM files";
+        let mut sql = String::from(base);
+        let mut conj = " WHERE ";
+        if file_type.is_some() {
+            sql.push_str(conj);
+            sql.push_str("type = ?");
+            conj = " AND ";
+        }
+        match state {
+            StateFilter::Active => {
+                sql.push_str(conj);
+                sql.push_str("state = 'active'");
+            }
+            StateFilter::Deleted => {
+                sql.push_str(conj);
+                sql.push_str("state = 'deleted'");
+            }
+            StateFilter::All => {}
+        }
+        sql.push_str(" ORDER BY path");
+
+        let query = sqlx::query_as::<_, (String, String, String, String, String, String, Option<String>, String, Option<String>)>(&sql);
+        let query = match file_type {
+            Some(t) => query.bind(t.as_str()),
+            None => query,
+        };
+
+        let rows = query.fetch_all(&self.pool).await?;
+        Ok(rows.into_iter().map(parse_file_row).collect())
+    }
+
+    async fn find_metadata_by_uuid(
+        &self,
+        uuid: Uuid,
+    ) -> Result<Option<SubtypeMetadata>, DomainError> {
+        // First resolve the file + its type; None means no such file or a
+        // subtype with no SubtypeMetadata variant (Text/Html).
+        let row: Option<(i64, String)> =
+            sqlx::query_as("SELECT id, type FROM files WHERE uuid = ?")
+                .bind(uuid.to_string())
+                .fetch_optional(&self.pool)
+                .await?;
+        let (id, type_str) = match row {
+            Some(r) => r,
+            None => return Ok(None),
+        };
+        let file_type = parse_type_str(&type_str);
+
+        // "Metadata is present" means at least one editable field is
+        // populated. The indexer inserts an empty subtype row (all NULLs)
+        // for every file, so a row existing is not enough — we return
+        // `None` when every editable field is NULL (no metadata written
+        // yet, or UC-04 cleared them all). The client still gets the
+        // file's `type` via the `file` object, so it can tell an audio
+        // file with no metadata from a text file (which has no
+        // SubtypeMetadata variant at all).
+        let metadata = match file_type {
+            FileType::Audio => {
+                let r: Option<(Option<String>, Option<String>, Option<String>, Option<i64>, Option<String>, Option<i64>)> =
+                    sqlx::query_as("SELECT title, artist, album, year, genre, track FROM audio_files WHERE file_id = ?")
+                        .bind(id)
+                        .fetch_optional(&self.pool)
+                        .await?;
+                r.and_then(|(title, artist, album, year, genre, track)| {
+                    let all_none = title.is_none()
+                        && artist.is_none()
+                        && album.is_none()
+                        && year.is_none()
+                        && genre.is_none()
+                        && track.is_none();
+                    (!all_none).then_some(SubtypeMetadata::Audio {
+                        title, artist, album, year, genre, track,
+                    })
+                })
+            }
+            FileType::Video => {
+                let r: Option<(Option<String>, Option<i64>, Option<String>, Option<String>)> =
+                    sqlx::query_as("SELECT title, year, resolution, media_kind FROM video_files WHERE file_id = ?")
+                        .bind(id)
+                        .fetch_optional(&self.pool)
+                        .await?;
+                r.and_then(|(title, year, resolution, media_kind)| {
+                    let all_none = title.is_none()
+                        && year.is_none()
+                        && resolution.is_none()
+                        && media_kind.is_none();
+                    (!all_none).then_some(SubtypeMetadata::Video {
+                        title,
+                        year,
+                        resolution,
+                        media_kind: media_kind.and_then(|m| MediaKind::parse(&m)),
+                    })
+                })
+            }
+            FileType::Document => {
+                let r: Option<(Option<String>, Option<String>, Option<i64>, Option<String>)> =
+                    sqlx::query_as("SELECT title, author, year, format_kind FROM documents WHERE file_id = ?")
+                        .bind(id)
+                        .fetch_optional(&self.pool)
+                        .await?;
+                r.and_then(|(title, author, year, format_kind)| {
+                    let all_none = title.is_none()
+                        && author.is_none()
+                        && year.is_none()
+                        && format_kind.is_none();
+                    (!all_none).then_some(SubtypeMetadata::Document {
+                        title,
+                        author,
+                        year,
+                        format_kind: format_kind.and_then(|f| FormatKind::parse(&f)),
+                    })
+                })
+            }
+            FileType::Comic => {
+                let r: Option<(Option<String>, Option<String>, Option<i64>)> =
+                    sqlx::query_as("SELECT title, series, issue_number FROM comic_books WHERE file_id = ?")
+                        .bind(id)
+                        .fetch_optional(&self.pool)
+                        .await?;
+                r.and_then(|(title, series, issue_number)| {
+                    let all_none =
+                        title.is_none() && series.is_none() && issue_number.is_none();
+                    (!all_none).then_some(SubtypeMetadata::Comic {
+                        title,
+                        series,
+                        issue_number,
+                    })
+                })
+            }
+            FileType::Image => {
+                let r: Option<(Option<String>, Option<String>)> =
+                    sqlx::query_as("SELECT title, caption FROM images WHERE file_id = ?")
+                        .bind(id)
+                        .fetch_optional(&self.pool)
+                        .await?;
+                r.and_then(|(title, caption)| {
+                    let all_none = title.is_none() && caption.is_none();
+                    (!all_none).then_some(SubtypeMetadata::Image { title, caption })
+                })
+            }
+            // Text and Html have no editable SubtypeMetadata variant (UC-04).
+            FileType::Text | FileType::Html => None,
+        };
+        Ok(metadata)
     }
 }
 

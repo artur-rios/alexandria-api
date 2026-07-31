@@ -217,6 +217,56 @@ pub struct FileMetadata {
     pub metadata: SubtypeMetadata,
 }
 
+/// Lifecycle filter for catalog browse queries (UC-03 / FR-FC-12). The
+/// default view excludes soft-deleted records (`Active`); the owner may
+/// explicitly request `Deleted` (only soft-deleted) or `All` (both).
+///
+/// Serialized lowercase so the HTTP query-string value (`?state=active`) and
+/// the FFI JSON filter body stay at parity with the REST contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StateFilter {
+    /// Only `active` records (default — excludes `deleted`).
+    #[default]
+    Active,
+    /// Only `deleted` records (explicitly requested).
+    Deleted,
+    /// Both `active` and `deleted` records.
+    All,
+}
+
+impl StateFilter {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            StateFilter::Active => "active",
+            StateFilter::Deleted => "deleted",
+            StateFilter::All => "all",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "active" => Some(StateFilter::Active),
+            "deleted" => Some(StateFilter::Deleted),
+            "all" => Some(StateFilter::All),
+            _ => None,
+        }
+    }
+}
+
+/// Response of UC-03 single-file view (FR-FC-13): the file record plus its
+/// stored subtype metadata, when the subtype has one. Text and Html files
+/// have no `SubtypeMetadata` variant, so `metadata` is `None` for them.
+/// Serialized as `{"file": …, "metadata": …}` over both the HTTP and FFI
+/// surfaces so the two stay at parity (FR-FC-24 / NFR-09).
+#[derive(Debug, Clone, Serialize)]
+pub struct FileView {
+    pub file: File,
+    /// `None` when the subtype has no editable metadata (Text/Html), or when
+    /// no metadata has been written to the subtype row yet.
+    pub metadata: Option<SubtypeMetadata>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct File {
