@@ -118,11 +118,10 @@ impl Default for DatabaseSettings {
     }
 }
 
-impl DatabaseSettings {
-    pub fn connection_url(&self) -> String {
-        format!("sqlite://{}", self.path)
-    }
-}
+// The connection URL is built in one place only — `migrate_database` — so the
+// scheme, the `mode=rwc` flag, and Windows path handling cannot drift between
+// two spellings. A second builder here previously went unused for exactly that
+// reason.
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct IndexingSettings {
