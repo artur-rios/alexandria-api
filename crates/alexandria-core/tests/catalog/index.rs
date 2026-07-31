@@ -142,6 +142,56 @@ async fn given_unsupported_extension_when_execute_then_skipped() {
 }
 
 #[tokio::test]
+async fn given_unreadable_file_when_execute_then_run_continues_and_counts_failure() {
+    // b.mp3 sits between two readable files and cannot be hashed. The run must
+    // index a and c anyway rather than aborting at b.
+    let fs = FakeFilesystem::builder()
+        .with_file(ROOT, "/library/a.mp3", "a.mp3", "h-a")
+        .with_unreadable_file(ROOT, "/library/b.mp3", "b.mp3")
+        .with_file(ROOT, "/library/c.mp3", "c.mp3", "h-c")
+        .build();
+    let repo = FakeCatalogRepository::new();
+    let repo_handle = repo.clone();
+    let handler = handler(FakeAuth::Allowing, repo, fs, fixed_clock(now()));
+
+    let outcome = handler
+        .execute(ROOT, Uuid::new_v4())
+        .await
+        .expect("an unreadable file must not fail the whole run");
+
+    assert_eq!(outcome.scanned, 3);
+    assert_eq!(outcome.indexed, 2, "the two readable files are indexed");
+    assert_eq!(outcome.failed, 1, "the unreadable file is counted as failed");
+    assert_eq!(outcome.skipped, 0, "failed is not the same as skipped");
+    assert!(repo_handle.has_path("/library/a.mp3"));
+    assert!(repo_handle.has_path("/library/c.mp3"));
+    assert!(
+        !repo_handle.has_path("/library/b.mp3"),
+        "the unreadable file is not cataloged"
+    );
+}
+
+#[tokio::test]
+async fn given_failing_repository_write_when_execute_then_run_continues_and_counts_failure() {
+    let fs = FakeFilesystem::builder()
+        .with_file(ROOT, "/library/a.mp3", "a.mp3", "h-a")
+        .with_file(ROOT, "/library/b.mp3", "b.mp3", "h-b")
+        .build();
+    let repo = FakeCatalogRepository::new().failing_for("/library/a.mp3");
+    let repo_handle = repo.clone();
+    let handler = handler(FakeAuth::Allowing, repo, fs, fixed_clock(now()));
+
+    let outcome = handler
+        .execute(ROOT, Uuid::new_v4())
+        .await
+        .expect("a per-file repository error must not fail the whole run");
+
+    assert_eq!(outcome.indexed, 1);
+    assert_eq!(outcome.failed, 1);
+    assert!(repo_handle.has_path("/library/b.mp3"), "b still indexed");
+}
+
+#[tokio::test]
 async fn given_bearer_auth_when_authenticated_then_principal_owner() {
     let principal = alexandria_core::auth::BearerAuthService
         .authenticate("some-bearer")

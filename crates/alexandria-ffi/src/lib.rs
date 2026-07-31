@@ -165,7 +165,12 @@ pub extern "C" fn alexandria_index_start(
             let run_id = s.run_id;
             let handler = services.index_handler.clone();
             rt.spawn(async move {
-                let _ = handler.execute(&root, run_id).await;
+                // Per-file failures are counted inside `execute`; an `Err` here
+                // means the run could not start at all. Log it — nothing else
+                // observes this task's result.
+                if let Err(err) = handler.execute(&root, run_id).await {
+                    tracing::error!(%run_id, error = %err, "index run aborted");
+                }
             });
             IndexStartResult::ok(&s.run_id.to_string())
         }
@@ -200,7 +205,12 @@ pub extern "C" fn alexandria_index_refresh_start(token: *const c_char) -> IndexS
             let run_id = s.run_id;
             let handler = services.refresh_handler.clone();
             rt.spawn(async move {
-                let _ = handler.execute(run_id).await;
+                // Per-file failures are counted inside `execute`; an `Err` here
+                // means the run could not start at all. Log it — nothing else
+                // observes this task's result.
+                if let Err(err) = handler.execute(run_id).await {
+                    tracing::error!(%run_id, error = %err, "re-index run aborted");
+                }
             });
             IndexStartResult::ok(&s.run_id.to_string())
         }
@@ -349,10 +359,11 @@ impl FileJsonResult {
 }
 
 /// JSON filter body accepted by `alexandria_files_list` (UC-03 / FR-FC-12).
-/// Both fields optional; an empty/null body or omitted fields use the defaults
-/// (`file_type = None`, `state = "active"` — excludes deleted records per
-/// the use case's main-flow step 2). Unknown `type` values map to no type
-/// filter; unknown `state` values default to `active`.
+/// Both fields optional; an empty/null body, omitted fields, or empty-string
+/// values use the defaults (`file_type = None`, `state = "active"` — excludes
+/// deleted records per the use case's main-flow step 2). An unrecognised
+/// `type` or `state` value is rejected as `FILE_ERR_INVALID_INPUT`, matching
+/// the HTTP surface's `400` (FR-FC-24 / NFR-09).
 #[derive(Debug, Default)]
 struct FilesListFilter {
     file_type: Option<String>,
@@ -404,12 +415,23 @@ pub extern "C" fn alexandria_files_list(
         None => return FileJsonResult::err(FILE_ERR_INVALID_INPUT),
     };
 
-    let file_type = parsed.file_type.as_deref().and_then(parse_file_type);
-    let state = parsed
-        .state
-        .as_deref()
-        .and_then(alexandria_core::catalog::model::StateFilter::parse)
-        .unwrap_or(alexandria_core::catalog::model::StateFilter::Active);
+    // An unrecognised filter value is invalid input, not a silently dropped
+    // filter — HTTP answers `400` for these and the two surfaces must agree
+    // (FR-FC-24 / NFR-09). An empty string means "no filter", as on HTTP.
+    let file_type = match parsed.file_type.as_deref().filter(|s| !s.is_empty()) {
+        Some(t) => match parse_file_type(t) {
+            Some(ft) => Some(ft),
+            None => return FileJsonResult::err(FILE_ERR_INVALID_INPUT),
+        },
+        None => None,
+    };
+    let state = match parsed.state.as_deref().filter(|s| !s.is_empty()) {
+        Some(s) => match alexandria_core::catalog::model::StateFilter::parse(s) {
+            Some(st) => st,
+            None => return FileJsonResult::err(FILE_ERR_INVALID_INPUT),
+        },
+        None => alexandria_core::catalog::model::StateFilter::Active,
+    };
 
     let mut filter =
         alexandria_core::catalog::queries::browse::FileFilter::new().with_state(state);

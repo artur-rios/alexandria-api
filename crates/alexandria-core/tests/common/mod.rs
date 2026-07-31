@@ -55,6 +55,10 @@ impl AuthService for FakeAuth {
 pub struct FakeCatalogRepository {
     files: Arc<Mutex<HashMap<String, File>>>,
     metadata: Arc<Mutex<HashMap<Uuid, SubtypeMetadata>>>,
+    /// Paths whose `insert_file` / `refresh_hash` / `mark_missing` must fail,
+    /// simulating a per-file repository error mid-run (UC-01 / UC-02: the run
+    /// counts the failure and continues rather than aborting).
+    failing_paths: Arc<Mutex<std::collections::HashSet<String>>>,
 }
 
 impl FakeCatalogRepository {
@@ -100,6 +104,18 @@ impl FakeCatalogRepository {
     pub fn metadata_for(&self, uuid: Uuid) -> Option<SubtypeMetadata> {
         self.metadata.lock().unwrap().get(&uuid).cloned()
     }
+
+    /// Make every write against `path` fail with a database error, simulating
+    /// a per-file repository failure part-way through a run.
+    #[allow(dead_code)]
+    pub fn failing_for(self, path: &str) -> Self {
+        self.failing_paths.lock().unwrap().insert(path.to_string());
+        self
+    }
+
+    fn fails(&self, path: &str) -> bool {
+        self.failing_paths.lock().unwrap().contains(path)
+    }
 }
 
 impl CatalogRepository for FakeCatalogRepository {
@@ -112,6 +128,9 @@ impl CatalogRepository for FakeCatalogRepository {
     }
 
     async fn insert_file(&self, new_file: NewFile) -> Result<File, DomainError> {
+        if self.fails(&new_file.path) {
+            return Err(DomainError::internal("fake insert failure"));
+        }
         let file = File {
             uuid: new_file.uuid,
             path: new_file.path.clone(),
@@ -139,6 +158,9 @@ impl CatalogRepository for FakeCatalogRepository {
         content_hash: &str,
         indexed_at: chrono::DateTime<chrono::Utc>,
     ) -> Result<(), DomainError> {
+        if self.fails(path) {
+            return Err(DomainError::internal("fake refresh failure"));
+        }
         let mut files = self.files.lock().unwrap();
         if let Some(file) = files.get_mut(path) {
             file.content_hash = content_hash.to_string();
@@ -153,6 +175,9 @@ impl CatalogRepository for FakeCatalogRepository {
         path: &str,
         missing_at: chrono::DateTime<chrono::Utc>,
     ) -> Result<(), DomainError> {
+        if self.fails(path) {
+            return Err(DomainError::internal("fake mark-missing failure"));
+        }
         let mut files = self.files.lock().unwrap();
         if let Some(file) = files.get_mut(path) {
             file.missing_at = Some(missing_at);
@@ -217,6 +242,10 @@ pub struct FakeFilesystem {
     roots: std::collections::HashSet<String>,
     entries_by_root: HashMap<String, Vec<FileEntry>>,
     hash_by_path: HashMap<String, String>,
+    /// Paths that exist and are listed but cannot be read (locked / permission
+    /// denied). `content_hash` fails for these, simulating the single bad file
+    /// that must not abort a whole index or refresh run.
+    unreadable: std::collections::HashSet<String>,
 }
 
 impl FakeFilesystem {
@@ -248,6 +277,19 @@ impl FakeFilesystemBuilder {
         self
     }
 
+    /// A file that is present and listed but whose bytes cannot be read.
+    #[allow(dead_code)]
+    pub fn with_unreadable_file(mut self, root: &str, path: &str, name: &str) -> Self {
+        self.fs.roots.insert(root.to_string());
+        self.fs
+            .entries_by_root
+            .entry(root.to_string())
+            .or_default()
+            .push(FileEntry::new(path, name));
+        self.fs.unreadable.insert(path.to_string());
+        self
+    }
+
     pub fn build(self) -> FakeFilesystem {
         self.fs
     }
@@ -257,7 +299,10 @@ impl Filesystem for FakeFilesystem {
     async fn path_exists(&self, root: &str) -> bool {
         // UC-01 calls with a root dir; UC-02 calls with a file path. A path is
         // "present" if it is either a registered root or a registered file.
-        self.roots.contains(root) || self.hash_by_path.contains_key(root)
+        // An unreadable file is still present — it just cannot be hashed.
+        self.roots.contains(root)
+            || self.hash_by_path.contains_key(root)
+            || self.unreadable.contains(root)
     }
 
     async fn list_files(&self, root: &str) -> Result<Vec<FileEntry>, DomainError> {
@@ -269,6 +314,9 @@ impl Filesystem for FakeFilesystem {
     }
 
     async fn content_hash(&self, path: &str) -> Result<String, DomainError> {
+        if self.unreadable.contains(path) {
+            return Err(DomainError::internal(format!("failed to read {path}")));
+        }
         Ok(self
             .hash_by_path
             .get(path)

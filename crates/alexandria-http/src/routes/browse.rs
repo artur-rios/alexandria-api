@@ -12,10 +12,11 @@ use crate::routes::bearer_token;
 use crate::AppState;
 
 /// Query-string parameters for `GET /v1/files` (UC-03 / FR-FC-12). All
-/// optional: omitted `type` means no type filter; omitted `state` defaults to
-/// `active` (excludes soft-deleted records per the use case's main-flow
-/// step 2). An unknown `type` value is rejected as `400` invalid input;
-/// unknown `state` values default to `active`.
+/// optional: an omitted or empty `type` means no type filter; an omitted or
+/// empty `state` defaults to `active` (excludes soft-deleted records per the
+/// use case's main-flow step 2). An unrecognised value for either is rejected
+/// as `400` invalid input rather than silently ignored — the FFI surface
+/// rejects the same inputs identically (FR-FC-24 / NFR-09).
 #[derive(Debug, Default, Deserialize)]
 pub struct FileListParams {
     #[serde(rename = "type", default)]
@@ -25,10 +26,17 @@ pub struct FileListParams {
 }
 
 /// Map a state query value to the `StateFilter`, defaulting to `Active` per
-/// the use case's main-flow step 2 (deleted records excluded by default).
-fn parse_state(s: Option<&str>) -> StateFilter {
-    s.and_then(StateFilter::parse)
-        .unwrap_or(StateFilter::Active)
+/// the use case's main-flow step 2 (deleted records excluded by default). An
+/// unrecognised value is invalid input, not a silent fallback to the default.
+fn parse_state(s: Option<&str>) -> Result<StateFilter, ApiError> {
+    match s.filter(|v| !v.is_empty()) {
+        None => Ok(StateFilter::Active),
+        Some(v) => StateFilter::parse(v).ok_or_else(|| {
+            ApiError(alexandria_core::errors::DomainError::InvalidInput(format!(
+                "unknown state: {v}"
+            )))
+        }),
+    }
 }
 
 /// `GET /v1/files` — list/query files by type and lifecycle state (UC-03 /
@@ -42,7 +50,7 @@ pub async fn list_files(
 ) -> Result<Json<Vec<File>>, ApiError> {
     let token = bearer_token(&headers);
 
-    let mut filter = FileFilter::new().with_state(parse_state(params.state.as_deref()));
+    let mut filter = FileFilter::new().with_state(parse_state(params.state.as_deref())?);
     if let Some(t) = params.file_type.as_deref().filter(|s| !s.is_empty()) {
         let file_type = parse_file_type(t).ok_or_else(|| {
             ApiError(alexandria_core::errors::DomainError::InvalidInput(format!(

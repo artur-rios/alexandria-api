@@ -196,6 +196,85 @@ async fn given_already_missing_and_still_gone_when_execute_then_left_as_is() {
 }
 
 #[tokio::test]
+async fn given_unreadable_file_when_execute_then_refresh_continues_and_counts_failure() {
+    // b is present on disk but unreadable; a is present and changed. The run
+    // must still refresh a rather than aborting when b fails to hash.
+    let repo = FakeCatalogRepository::new();
+    repo.seed(existing_file_with_hash(
+        "/lib/a.mp3",
+        "a.mp3",
+        FileType::Audio,
+        "a-old",
+    ));
+    repo.seed(existing_file_with_hash(
+        "/lib/b.mp3",
+        "b.mp3",
+        FileType::Audio,
+        "b-old",
+    ));
+    let repo_handle = repo.clone();
+
+    let fs = FakeFilesystem::builder()
+        .with_file("/lib", "/lib/a.mp3", "a.mp3", "a-new")
+        .with_unreadable_file("/lib", "/lib/b.mp3", "b.mp3")
+        .build();
+    let handler = refresh_handler(FakeAuth::Allowing, repo, fs, fixed_clock(now()));
+
+    let outcome = handler
+        .execute(Uuid::new_v4())
+        .await
+        .expect("an unreadable file must not fail the whole refresh");
+
+    assert_eq!(outcome.refreshed, 1, "a is refreshed despite b failing");
+    assert_eq!(outcome.failed, 1);
+    assert_eq!(outcome.marked_missing, 0, "b exists — it is not missing");
+
+    assert_eq!(repo_handle.file_for("/lib/a.mp3").unwrap().content_hash, "a-new");
+    assert_eq!(
+        repo_handle.file_for("/lib/b.mp3").unwrap().content_hash,
+        "b-old",
+        "the unreadable file keeps its prior hash"
+    );
+}
+
+#[tokio::test]
+async fn given_failing_repository_write_when_execute_then_refresh_continues_and_counts_failure() {
+    let repo = FakeCatalogRepository::new();
+    repo.seed(existing_file_with_hash(
+        "/lib/a.mp3",
+        "a.mp3",
+        FileType::Audio,
+        "a-old",
+    ));
+    repo.seed(existing_file_with_hash(
+        "/lib/b.mp3",
+        "b.mp3",
+        FileType::Audio,
+        "b-old",
+    ));
+    let repo = repo.failing_for("/lib/a.mp3");
+    let repo_handle = repo.clone();
+
+    let fs = FakeFilesystem::builder()
+        .with_file("/lib", "/lib/a.mp3", "a.mp3", "a-new")
+        .with_file("/lib", "/lib/b.mp3", "b.mp3", "b-new")
+        .build();
+    let handler = refresh_handler(FakeAuth::Allowing, repo, fs, fixed_clock(now()));
+
+    let outcome = handler
+        .execute(Uuid::new_v4())
+        .await
+        .expect("a per-file repository error must not fail the whole refresh");
+
+    assert_eq!(outcome.refreshed, 1);
+    assert_eq!(outcome.failed, 1);
+    assert_eq!(
+        repo_handle.file_for("/lib/b.mp3").unwrap().content_hash,
+        "b-new"
+    );
+}
+
+#[tokio::test]
 async fn given_no_cataloged_files_when_execute_then_empty_outcome() {
     let repo = FakeCatalogRepository::new();
     let fs = FakeFilesystem::builder().build();

@@ -533,6 +533,38 @@ async fn given_unknown_type_when_get_files_then_400() {
 }
 
 #[tokio::test]
+async fn given_unknown_state_when_get_files_then_400() {
+    let test = test_app().await;
+    let response = app(Settings::default(), test.services)
+        .oneshot(get_files("/v1/files?state=delted"))
+        .await
+        .expect("list one-shot");
+    assert_eq!(
+        response.status(),
+        StatusCode::BAD_REQUEST,
+        "an unknown state must be rejected, not silently coerced to active"
+    );
+}
+
+#[tokio::test]
+async fn given_empty_type_and_state_when_get_files_then_treated_as_no_filter() {
+    let lib = tempdir().unwrap();
+    let test = test_app().await;
+    index_library(&lib, &test.pool, &[("song.mp3", b"x")]).await;
+
+    let response = app(Settings::default(), test.services)
+        .oneshot(get_files("/v1/files?type=&state="))
+        .await
+        .expect("list one-shot");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_slice(
+        &to_bytes(response.into_body(), usize::MAX).await.unwrap(),
+    )
+    .unwrap();
+    assert_eq!(body.as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
 async fn given_deleted_file_when_get_files_default_then_excluded() {
     let lib = tempdir().unwrap();
     let test = test_app().await;

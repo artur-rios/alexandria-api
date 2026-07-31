@@ -926,6 +926,120 @@ async fn given_missing_uuid_when_fetched_via_http_and_ffi_then_both_not_found() 
     assert_eq!(ffi_status, alexandria_ffi::FILE_ERR_NOT_FOUND);
 }
 
+/// UC-03 parity — an unrecognised filter value must be rejected identically on
+/// both surfaces (HTTP 400, FFI `FILE_ERR_INVALID_INPUT`). Previously HTTP
+/// rejected an unknown `type` while the FFI silently dropped the filter and
+/// returned the whole catalog — the exact divergence FR-FC-24 / NFR-09 forbid.
+#[tokio::test]
+async fn given_unknown_filter_values_when_listed_via_http_and_ffi_then_both_reject() {
+    let _g = SERIAL.lock().unwrap();
+
+    // ---- HTTP leg: index a file so a silently-dropped filter would show up
+    // as a non-empty 200 rather than an error. ----
+    let http_lib = tempdir().unwrap();
+    std::fs::write(http_lib.path().join("song.mp3"), b"audio").unwrap();
+
+    let http_dir = tempdir().unwrap();
+    let http_db = db_path(&http_dir, "http.sqlite");
+    let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    let http_services =
+        std::sync::Arc::new(build_services(&Settings::default(), http_pool.clone()).await);
+
+    let index_req = Request::builder()
+        .method("POST")
+        .uri("/v1/index")
+        .header("authorization", "Bearer parity")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({ "root": http_lib.path().to_str().unwrap() }).to_string(),
+        ))
+        .unwrap();
+    let _ = app(Settings::default(), http_services.clone())
+        .oneshot(index_req)
+        .await
+        .expect("http index");
+    wait_for_http_files(&http_pool, 1).await;
+
+    let http_status = |uri: &'static str| {
+        let services = http_services.clone();
+        async move {
+            let req = Request::builder()
+                .method("GET")
+                .uri(uri)
+                .header("authorization", "Bearer parity")
+                .body(Body::empty())
+                .unwrap();
+            app(Settings::default(), services)
+                .oneshot(req)
+                .await
+                .expect("http list")
+                .status()
+        }
+    };
+
+    assert_eq!(
+        http_status("/v1/files?type=banana").await,
+        axum::http::StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        http_status("/v1/files?state=delted").await,
+        axum::http::StatusCode::BAD_REQUEST
+    );
+
+    // ---- FFI leg ----
+    let ffi_lib = tempdir().unwrap();
+    std::fs::write(ffi_lib.path().join("song.mp3"), b"audio").unwrap();
+    let ffi_dir = tempdir().unwrap();
+    let ffi_db = db_path(&ffi_dir, "ffi.sqlite");
+    let ffi_lib_path = ffi_lib.path().to_str().unwrap().to_string();
+
+    let (bad_type, bad_state, empty_values) =
+        tokio::task::spawn_blocking(move || -> (i32, i32, i32) {
+            let cdb = CString::new(ffi_db).unwrap();
+            assert_eq!(alexandria_index_init(cdb.as_ptr()), alexandria_ffi::INDEX_OK);
+
+            let root = CString::new(ffi_lib_path).unwrap();
+            let token = CString::new("parity").unwrap();
+            let started = alexandria_index_start(root.as_ptr(), token.as_ptr());
+            assert_eq!(started.status, alexandria_ffi::INDEX_OK);
+            wait_for_ffi_files(1);
+
+            let status_for = |filters: &str| -> i32 {
+                let f = CString::new(filters).unwrap();
+                let r = alexandria_files_list(f.as_ptr(), token.as_ptr());
+                if !r.json.is_null() {
+                    alexandria_free_string(r.json);
+                }
+                r.status
+            };
+
+            (
+                status_for(r#"{"type":"banana"}"#),
+                status_for(r#"{"state":"delted"}"#),
+                // Empty strings mean "no filter" on both surfaces, not an error.
+                status_for(r#"{"type":"","state":""}"#),
+            )
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        bad_type,
+        alexandria_ffi::FILE_ERR_INVALID_INPUT,
+        "FFI must reject an unknown type like HTTP does, not drop the filter"
+    );
+    assert_eq!(
+        bad_state,
+        alexandria_ffi::FILE_ERR_INVALID_INPUT,
+        "FFI must reject an unknown state like HTTP does"
+    );
+    assert_eq!(
+        empty_values,
+        alexandria_ffi::FILE_OK,
+        "empty filter values mean no filter on both surfaces"
+    );
+}
+
 /// UC-03 parity — AF-02 (unauthenticated) maps to the same status on both
 /// surfaces (HTTP 401, FFI `FILE_ERR_UNAUTHORIZED`).
 #[tokio::test]

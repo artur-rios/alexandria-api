@@ -1,11 +1,12 @@
+use chrono::{DateTime, Utc};
 use serde::Serialize;
 use uuid::Uuid;
 
 use crate::auth::AuthService;
 use crate::catalog::classify::classify_by_extension;
 use crate::catalog::clock::Clock;
-use crate::catalog::fs::Filesystem;
-use crate::catalog::model::{NewFile};
+use crate::catalog::fs::{FileEntry, Filesystem};
+use crate::catalog::model::{FileType, NewFile};
 use crate::catalog::repos::CatalogRepository;
 use crate::errors::DomainError;
 
@@ -27,6 +28,10 @@ pub struct IndexOutcome {
     pub scanned: usize,
     pub indexed: usize,
     pub skipped: usize,
+    /// Entries that could not be indexed because an operation against that one
+    /// file failed (unreadable bytes, or a repository write error). The run
+    /// continues past them; each is logged at `warn`.
+    pub failed: usize,
 }
 
 /// Index library files (UC-01).
@@ -77,12 +82,18 @@ where
 
     /// Walk, classify, hash, and persist. Skips unsupported extensions and
     /// paths already cataloged (AF-03). Completion is logged at `info`.
+    ///
+    /// A failure that concerns one specific file — its bytes cannot be read, or
+    /// a repository write for it fails — is counted in `failed`, logged at
+    /// `warn`, and the walk continues. One locked file must not abandon the
+    /// rest of the library. Only a failure to list the root at all aborts.
     pub async fn execute(&self, root: &str, run_id: Uuid) -> Result<IndexOutcome, DomainError> {
         let now = self.clock.now();
         let entries = self.fs.list_files(root).await?;
         let scanned = entries.len();
         let mut indexed = 0usize;
         let mut skipped = 0usize;
+        let mut failed = 0usize;
 
         for entry in entries {
             let file_type = match classify_by_extension(&entry.name) {
@@ -92,30 +103,55 @@ where
                     continue;
                 }
             };
-            if self.repo.find_by_path(&entry.path).await?.is_some() {
-                skipped += 1;
-                continue;
+            let path = entry.path.clone();
+            match self.index_entry(entry, file_type, now).await {
+                Ok(true) => indexed += 1,
+                Ok(false) => skipped += 1,
+                Err(err) => {
+                    failed += 1;
+                    tracing::warn!(
+                        %run_id,
+                        path = %path,
+                        error = %err,
+                        "skipping file that could not be indexed"
+                    );
+                }
             }
-            let content_hash = self.fs.content_hash(&entry.path).await?;
-            self.repo
-                .insert_file(NewFile {
-                    uuid: Uuid::new_v4(),
-                    path: entry.path,
-                    name: entry.name,
-                    file_type,
-                    content_hash,
-                    indexed_at: now,
-                })
-                .await?;
-            indexed += 1;
         }
 
-        tracing::info!(%run_id, scanned, indexed, skipped, "indexing complete");
+        tracing::info!(%run_id, scanned, indexed, skipped, failed, "indexing complete");
         Ok(IndexOutcome {
             run_id,
             scanned,
             indexed,
             skipped,
+            failed,
         })
+    }
+
+    /// Index one already-classified entry. `Ok(true)` means a record was
+    /// created, `Ok(false)` that the path was already cataloged (AF-03), and
+    /// `Err` that this one file failed — the caller counts it and moves on.
+    async fn index_entry(
+        &self,
+        entry: FileEntry,
+        file_type: FileType,
+        now: DateTime<Utc>,
+    ) -> Result<bool, DomainError> {
+        if self.repo.find_by_path(&entry.path).await?.is_some() {
+            return Ok(false);
+        }
+        let content_hash = self.fs.content_hash(&entry.path).await?;
+        self.repo
+            .insert_file(NewFile {
+                uuid: Uuid::new_v4(),
+                path: entry.path,
+                name: entry.name,
+                file_type,
+                content_hash,
+                indexed_at: now,
+            })
+            .await?;
+        Ok(true)
     }
 }

@@ -27,7 +27,12 @@ pub async fn refresh(
     let run_id = started.run_id;
     let handler = state.services.refresh_handler.clone();
     tokio::spawn(async move {
-        let _ = handler.execute(run_id).await;
+        // Per-file failures are counted inside `execute`; an `Err` here means
+        // the run could not start at all (e.g. the catalog was unreadable).
+        // Log it — nothing else observes this task's result.
+        if let Err(err) = handler.execute(run_id).await {
+            tracing::error!(%run_id, error = %err, "re-index run aborted");
+        }
     });
 
     Ok((StatusCode::ACCEPTED, Json(started)))
