@@ -76,18 +76,18 @@ graph LR
 
 | ID | Requirement |
 | --- | --- |
-| FR-FC-01 | The system shall index audio files from a specified root path, creating a File record with path, content hash, and parsed music metadata. |
-| FR-FC-02 | The system shall index video files (movies and series), recording `mediaKind`. |
+| FR-FC-01 | The system shall index audio files from a specified root path, creating a File record with path, name, type, and content hash, plus an AudioFile subtype record. Its metadata fields are owner-supplied via FR-FC-14; indexing does not read embedded tags. |
+| FR-FC-02 | The system shall index video files as VideoFiles. `mediaKind` (movie/series) is owner-supplied via FR-FC-15; indexing does not infer it. |
 | FR-FC-03 | The system shall index saved HTML pages. |
 | FR-FC-04 | The system shall index Markdown and plain-text files as TextFiles. |
-| FR-FC-05 | The system shall index PDF and e-book files as Documents, recording `formatKind`. |
-| FR-FC-06 | The system shall index comic-book files (CBR/CBZ/PDF comics) as ComicBooks, recording series and issue metadata when present. |
+| FR-FC-05 | The system shall index PDF and e-book files as Documents. `formatKind` (book/ebook) is owner-supplied via FR-FC-16; indexing does not infer it. |
+| FR-FC-06 | The system shall index comic-book files (CBR/CBZ) as ComicBooks. Series and issue metadata are owner-supplied via FR-FC-17. A `.pdf` indexes as a Document (FR-FC-05): file extension alone cannot distinguish a comic PDF from a book PDF. |
 | FR-FC-07 | The system shall index image files. |
 | FR-FC-08 | The system shall run indexing asynchronously and shall not block read/query operations while indexing is in progress. |
 | FR-FC-09 | The system shall compute a SHA-256 content hash for each indexed file and store it on the File record. |
-| FR-FC-10 | The system shall, on re-index, detect a content-hash change for an existing path and refresh that File's metadata. |
-| FR-FC-11 | The system shall, on re-index, detect a path that no longer exists on disk and mark the File's state accordingly without deleting the record. |
-| FR-FC-12 | The system shall list and query files filtered by type, containing collection, and lifecycle state. |
+| FR-FC-10 | The system shall, on re-index, detect a content-hash change for an existing path and refresh that File's stored hash and `indexedAt`. |
+| FR-FC-11 | The system shall, on re-index, detect a path that no longer exists on disk and set the File's `missingAt` marker without deleting the record or changing its `state`. |
+| FR-FC-12 | The system shall list and query files filtered by type and lifecycle state. Filtering by containing collection is delivered with Collections (FR-CO-07), since no collection exists before then. |
 | FR-FC-13 | The system shall return a single file's metadata by its public UUID. |
 | FR-FC-14 | The system shall allow editing audio metadata (title, artist, album, year, genre, track). |
 | FR-FC-15 | The system shall allow editing video metadata (title, year, resolution; `mediaKind` movie/series). |
@@ -218,7 +218,8 @@ erDiagram
 | state | enum | required; one of `active`, `deleted` | Lifecycle state. |
 | deletedAt | timestamp | nullable | Set when soft-deleted; drives the retention window. |
 | indexedAt | timestamp | required | Last index/re-index time. |
-| collectionId | integer | nullable, FK → Collection | Containing collection, if any. |
+| missingAt | timestamp | nullable | Set by re-index when the on-disk file is gone (FR-FC-11); cleared when it returns. Orthogonal to `state`: a file may be `active` and missing. |
+| collectionId | integer | nullable, FK → Collection | Containing collection, if any. Not exposed in API responses until Collections ship. |
 
 Type-specific subtype tables (AudioFile, VideoFile, HtmlPage, TextFile, Document,
 ComicBook, Image) share the File's `id` as a foreign key and carry only their
@@ -324,7 +325,7 @@ endpoint requires authentication from the active mode (see §7).
 
 | Method | Path | Description | Requirement |
 | --- | --- | --- | --- |
-| GET | /v1/files | List/query files by type, collection, state. | FR-FC-12 |
+| GET | /v1/files | List/query files by type and state (collection filter ships with Collections). An unrecognised filter value is rejected as invalid input. | FR-FC-12 |
 | GET | /v1/files/{uuid} | Get one file's metadata. | FR-FC-13 |
 | PATCH | /v1/files/{uuid}/metadata | Edit type-specific metadata. | FR-FC-14..18 |
 | POST | /v1/files/{uuid}/rename | Rename the file (and on-disk file). | FR-FC-19 |
@@ -430,6 +431,12 @@ request, not by an endpoint.
 | External JWT validation | ✅ | ⚠️ only as the bearer of a valid JWT; invalid tokens denied |
 
 Legend: ✅ allowed · ⚠️ allowed under a stated condition · ❌ denied.
+
+Note: authentication is evaluated **before** a request's path or body is parsed.
+An unauthenticated call is denied outright and never learns whether its payload
+would have been accepted — a malformed body or an unparseable identifier does
+not turn a `401` into a `400`. Both the HTTP and FFI surfaces gate this way
+(FR-AU-07, FR-FC-24).
 
 Note: local-login verification is the one operation that accepts unauthenticated
 input (the credentials being verified); success is what grants owner status for

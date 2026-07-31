@@ -96,15 +96,17 @@ graph LR
 | **Actors** | Owner, Local Filesystem |
 | **Description** | Scan a root directory and create type-aware catalog records for every supported file type. |
 | **Preconditions** | The caller is authenticated as the owner; the root path is supplied. |
-| **Postconditions** | A File record (with subtype) exists for each supported file found, each with a content hash; indexing runs without blocking reads. |
+| **Postconditions** | A File record (with an empty subtype record) exists for each supported file found, each with a content hash; indexing runs without blocking reads. |
 | **Requirements** | FR-FC-01, FR-FC-02, FR-FC-03, FR-FC-04, FR-FC-05, FR-FC-06, FR-FC-07, FR-FC-08, FR-FC-09, FR-FC-24 |
 
 **Main Flow**
 
 1. The owner requests indexing with a root path.
 2. The system starts an asynchronous scan and returns immediately.
-3. The system walks the tree, classifies each supported file by type, and creates a File record (with the matching subtype) carrying path, name, type, and the computed SHA-256 content hash.
-4. The system records the `indexedAt` timestamp and notifies completion.
+3. The system walks the tree, classifies each supported file **by extension**, and creates a File record (with an empty row in the matching subtype table) carrying path, name, type, and the computed SHA-256 content hash. Type-specific metadata is not read from file contents — the owner supplies it via UC-04.
+4. The system records the `indexedAt` timestamp and logs the run's outcome (scanned, indexed, skipped, failed).
+
+The `runId` returned in step 2 is opaque: completion is reported to the log only, and there is no query to retrieve a run's outcome.
 
 **Alternative Flows**
 
@@ -113,6 +115,7 @@ graph LR
 | AF-01 | The root path does not exist on disk | The system rejects the request with an invalid-input error. |
 | AF-02 | The caller is not authenticated | The system denies with an unauthorized error. |
 | AF-03 | A file path is already cataloged | The system skips creation (no duplicate path); a refresh is handled by UC-02. |
+| AF-04 | A single file cannot be read or persisted | The system counts it as failed, logs a warning naming the path, and continues the run; the remaining files are still indexed. |
 
 ---
 
@@ -125,22 +128,23 @@ graph LR
 | **Actors** | Owner, Local Filesystem |
 | **Description** | Re-scan indexed paths and refresh metadata and content hashes. |
 | **Preconditions** | The caller is authenticated; at least one indexing run has occurred. |
-| **Postconditions** | Changed files have refreshed metadata and hashes; missing-on-disk files are marked but not deleted. |
+| **Postconditions** | Changed files have refreshed content hashes and `indexedAt`; missing-on-disk files carry a `missingAt` marker but are not deleted. |
 | **Requirements** | FR-FC-08, FR-FC-10, FR-FC-11, FR-FC-24 |
 
 **Main Flow**
 
 1. The owner requests a re-index.
-2. The system re-reads each cataloged path's bytes and metadata asynchronously.
-3. For each path whose content hash changed, the system refreshes the metadata and hash and updates `indexedAt`.
-4. For each path that no longer exists on disk, the system marks the File's state as missing without deleting the record.
+2. The system re-reads each cataloged path's bytes asynchronously.
+3. For each path whose content hash changed, the system refreshes the hash and updates `indexedAt`. (There is no stored metadata to refresh — see UC-01 main flow step 3.)
+4. For each path that no longer exists on disk, the system sets the File's `missingAt` marker without deleting the record. `state` is untouched: `missingAt` is orthogonal to the soft-delete lifecycle owned by UC-06/UC-07, so a file may be `active` and missing at the same time. A file that returns to disk has its marker cleared.
 
 **Alternative Flows**
 
 | ID | Condition | Outcome |
 | --- | --- | --- |
-| AF-01 | A path on disk was deleted since indexing | The system marks the File missing (per main flow step 4), not deleted. (Explicit deletion is UC-06.) |
+| AF-01 | A path on disk was deleted since indexing | The system sets `missingAt` (per main flow step 4); the record is neither deleted nor moved to the `deleted` state. (Explicit deletion is UC-06.) |
 | AF-02 | The caller is not authenticated | The system denies with an unauthorized error. |
+| AF-03 | A single cataloged path cannot be read or written | The system counts it as failed, logs a warning naming the path, and continues the run; the remaining paths are still refreshed. |
 
 ---
 
@@ -158,7 +162,7 @@ graph LR
 
 **Main Flow**
 
-1. The owner requests a file list (optionally filtered by type, collection, lifecycle state) or a single file by UUID.
+1. The owner requests a file list (optionally filtered by type and lifecycle state) or a single file by UUID. Filtering by containing collection is delivered with UC-14, since no collection exists before then.
 2. The system excludes `deleted` records from default views unless the owner explicitly requests them.
 3. The system returns the matching file(s) with their metadata.
 
@@ -168,6 +172,7 @@ graph LR
 | --- | --- | --- |
 | AF-01 | The requested UUID does not exist | The system responds with a not-found error. |
 | AF-02 | The caller is not authenticated | The system denies with an unauthorized error. |
+| AF-03 | A filter value is not a recognised type or lifecycle state | The system rejects with an invalid-input error rather than ignoring the filter. An empty value means "no filter". |
 
 ---
 
@@ -462,10 +467,10 @@ graph LR
 | **ID** | UC-14 |
 | **Name** | Remove and list items in a collection |
 | **Actors** | Owner |
-| **Description** | Remove items from a collection (unlink only) and list the items in a collection. |
+| **Description** | Remove items from a collection (unlink only), list the items in a collection, and enable the by-collection file filter deferred from UC-03. |
 | **Preconditions** | The caller is authenticated; the collection exists. |
-| **Postconditions** | Removed items' `collectionId` are cleared; list requests return current members. |
-| **Requirements** | FR-CO-06, FR-CO-07, FR-FC-24 |
+| **Postconditions** | Removed items' `collectionId` are cleared; list requests return current members; the UC-03 file list accepts a collection filter (FR-FC-12). |
+| **Requirements** | FR-CO-06, FR-CO-07, FR-FC-12 (collection filter), FR-FC-24 |
 
 **Main Flow**
 
@@ -1114,7 +1119,7 @@ graph LR
 | UC-11: Rename a collection | FR-CO-03, FR-FC-24 |
 | UC-12: Delete a collection | FR-CO-04, FR-FC-24 |
 | UC-13: Add items to a collection | FR-CO-05, FR-FC-24 |
-| UC-14: Remove and list items in a collection | FR-CO-06, FR-CO-07, FR-FC-24 |
+| UC-14: Remove and list items in a collection | FR-CO-06, FR-CO-07, FR-FC-12 (collection filter), FR-FC-24 |
 | UC-15: Create a bookmark | FR-BM-01, FR-FC-24 |
 | UC-16: Update a bookmark | FR-BM-02, FR-FC-24 |
 | UC-17: Browse bookmarks | FR-BM-06, FR-FC-24 |

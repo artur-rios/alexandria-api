@@ -94,7 +94,7 @@ Flat file and bookmark groupings; deleting a collection preserves its items.
 | [#12](https://github.com/artur-rios/alexandria-api/issues/12) | UC-11 | &#9744; | Rename a collection | FR-CO-03, FR-FC-24 |
 | [#13](https://github.com/artur-rios/alexandria-api/issues/13) | UC-12 | &#9744; | Delete a collection | FR-CO-04, FR-FC-24 |
 | [#14](https://github.com/artur-rios/alexandria-api/issues/14) | UC-13 | &#9744; | Add items to a collection | FR-CO-05, FR-FC-24 |
-| [#15](https://github.com/artur-rios/alexandria-api/issues/15) | UC-14 | &#9744; | Remove and list items in a collection | FR-CO-06, FR-CO-07, FR-FC-24 |
+| [#15](https://github.com/artur-rios/alexandria-api/issues/15) | UC-14 | &#9744; | Remove and list items in a collection | FR-CO-06, FR-CO-07, FR-FC-12, FR-FC-24 |
 
 ### F-06 — Bookmarks
 

@@ -10,7 +10,7 @@
 | **HtmlPage** | A saved/linked HTML page **File** (metadata + references to the page/format). |
 | **TextFile** | A Markdown or plain-text **File** whose content can be read and edited in place on disk. |
 | **Document** | A PDF or e-book (book) **File**. Metadata only, no content editing; eligible for reading lists. |
-| **ComicBook** | A comic book **File** (CBR/CBZ/PDF comics). Metadata only; eligible for reading lists. Distinguished from books so reading lists can target books vs comics distinctly. |
+| **ComicBook** | A comic book **File** (CBR/CBZ). Metadata only; eligible for reading lists. Distinguished from books so reading lists can target books vs comics distinctly. A `.pdf` indexes as a Document — extension alone cannot tell a comic PDF from a book PDF. |
 | **Image** | An image **File** (metadata only, no editing). |
 | **Bookmark** | A browser bookmark pointing to a URL, organized in bookmark collections. Independent of on-disk files. |
 | **Collection** | A named folder grouping a set of items. Applies to files (file collections) and to bookmarks (bookmark collections) by its `kind` discriminator. Nesting is out of the current scope (flat collections). |
