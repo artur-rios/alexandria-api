@@ -196,7 +196,8 @@ alexandria-api/
 
 ## Building
 
-Requirements: a recent stable Rust toolchain (edition 2021) and `cargo`.
+Requirements: Rust **1.94** or newer (edition 2021) and `cargo`. The floor comes
+from sqlx 0.9, the highest MSRV in the dependency graph.
 
 ```bash
 # Build the whole workspace (core + http + ffi)

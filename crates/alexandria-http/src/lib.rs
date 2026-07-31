@@ -32,11 +32,11 @@ pub fn app(settings: Settings, services: Arc<Services>) -> Router {
         .route("/v1/index", post(routes::index::index))
         .route("/v1/index/refresh", post(routes::refresh::refresh))
         .route(
-            "/v1/files/:uuid/metadata",
+            "/v1/files/{uuid}/metadata",
             patch(routes::edit_metadata::edit_metadata),
         )
         .route("/v1/files", get(routes::browse::list_files))
-        .route("/v1/files/:uuid", get(routes::browse::get_file))
+        .route("/v1/files/{uuid}", get(routes::browse::get_file))
         .route_layer(from_fn_with_state(
             state.clone(),
             middleware::auth::require_auth,

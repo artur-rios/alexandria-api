@@ -396,7 +396,11 @@ impl CatalogRepository for SqliteCatalogRepository {
         }
         sql.push_str(" ORDER BY path");
 
-        let query = sqlx::query_as::<_, FileRow>(&sql);
+        // sqlx 0.9 refuses a runtime-built SQL string unless the caller asserts
+        // it was audited. `sql` is assembled only from string literals chosen by
+        // the `Option<FileType>` / `StateFilter` enums above — no caller input
+        // reaches it, and the type discriminator is still a bound `?` parameter.
+        let query = sqlx::query_as::<_, FileRow>(sqlx::AssertSqlSafe(sql));
         let query = match file_type {
             Some(t) => query.bind(t.as_str()),
             None => query,

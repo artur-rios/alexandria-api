@@ -70,7 +70,17 @@ impl Filesystem for StdFilesystem {
             .map_err(|e| DomainError::Internal(format!("failed to read {}: {e}", path)))?;
         let mut hasher = Sha256::new();
         hasher.update(&bytes);
-        Ok(format!("{:x}", hasher.finalize()))
+        // Lowercase hex, written byte by byte. digest 0.11 returns an `Array`
+        // that no longer implements `LowerHex`, so `{:x}` is unavailable — but
+        // the output must stay identical to what earlier versions produced,
+        // because these hashes are persisted and compared on every re-index.
+        let digest = hasher.finalize();
+        let mut hex = String::with_capacity(digest.len() * 2);
+        for byte in digest {
+            use std::fmt::Write;
+            let _ = write!(hex, "{byte:02x}");
+        }
+        Ok(hex)
     }
 }
 
