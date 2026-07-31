@@ -3,6 +3,7 @@ pub mod edit_metadata;
 pub mod health;
 pub mod index;
 pub mod refresh;
+pub mod rename;
 
 use axum::http::HeaderMap;
 

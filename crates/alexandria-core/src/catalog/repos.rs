@@ -63,6 +63,24 @@ pub trait CatalogRepository: Send + Sync {
         &self,
         uuid: Uuid,
     ) -> Result<Option<SubtypeMetadata>, DomainError>;
+
+    /// Rename a file within its current directory (UC-05 / FR-FC-19). Updates
+    /// the cataloged `name` and `path` for the file identified by `uuid` to
+    /// `new_name` and `new_path`. The caller is responsible for the on-disk
+    /// rename (and rolling it back if this call fails); this method only
+    /// touches the catalog row so the variant stays unit-testable against a
+    /// fake repo with no filesystem.
+    ///
+    /// Returns `NotFound` when no file carries the UUID and `InvalidInput`
+    /// when `new_path` is already cataloged under a different file (AF-02
+    /// target-exists is reported as a disk error by the handler; the
+    /// repository defends the unique-path invariant separately).
+    async fn rename_file(
+        &self,
+        uuid: Uuid,
+        new_name: &str,
+        new_path: &str,
+    ) -> Result<File, DomainError>;
 }
 
 #[derive(Clone)]
@@ -523,6 +541,64 @@ impl CatalogRepository for SqliteCatalogRepository {
             FileType::Text | FileType::Html => None,
         };
         Ok(metadata)
+    }
+
+    async fn rename_file(
+        &self,
+        uuid: Uuid,
+        new_name: &str,
+        new_path: &str,
+    ) -> Result<File, DomainError> {
+        let mut tx = self.pool.begin().await?;
+
+        // Resolve the file's internal id so a missing uuid is NotFound, not
+        // a zero-row UPDATE that the caller could mistake for success.
+        let (id,): (i64,) = sqlx::query_as("SELECT id FROM files WHERE uuid = ?")
+            .bind(uuid.to_string())
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or(DomainError::NotFound)?;
+
+        // A UPDATE that moves the row to a path already owned by a different
+        // file violates the unique constraint, surfacing as a Database error;
+        // the handler maps that to AF-02 (disk-error / target-exists). Within
+        // a transaction the row's own path is no collision (same row).
+        let result = sqlx::query("UPDATE files SET name = ?, path = ? WHERE id = ?")
+            .bind(new_name)
+            .bind(new_path)
+            .bind(id)
+            .execute(&mut *tx)
+            .await;
+
+        // sqlx 0.9 surfaces SQLite UNIQUE violations as `Database` errors.
+        // Treat the unique-path collision as the invariant failure it is
+        // (another file owns the target path) — the handler maps it to AF-02.
+        let affected = match result {
+            Ok(r) => r.rows_affected(),
+            Err(sqlx::Error::Database(_)) => {
+                return Err(DomainError::InvalidInput(
+                    "target path already cataloged for a different file".into(),
+                ))
+            }
+            Err(e) => return Err(e.into()),
+        };
+        if affected == 0 {
+            return Err(DomainError::internal(format!(
+                "rename_file matched zero rows for uuid {uuid}"
+            )));
+        }
+
+        tx.commit().await?;
+        let _ = id;
+
+        // Re-read through `find_by_uuid` so the returned `File` carries the
+        // exact persisted values (parsed via the single `parse_file_row`
+        // path) — no second source of truth for the row shape.
+        self.find_by_uuid(uuid).await?.ok_or_else(|| {
+            DomainError::internal(format!(
+                "rename_file: row disappeared after update for uuid {uuid}"
+            ))
+        })
     }
 }
 

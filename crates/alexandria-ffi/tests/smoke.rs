@@ -14,9 +14,10 @@ fn serial() -> std::sync::MutexGuard<'static, ()> {
 }
 
 use alexandria_ffi::{
-    alexandria_file_edit_metadata, alexandria_free_string, alexandria_index_count_files,
-    alexandria_index_count_missing, alexandria_index_files_json, alexandria_index_init,
-    alexandria_index_refresh_start, alexandria_index_start, FileMetadataResult, IndexStartResult,
+    alexandria_file_edit_metadata, alexandria_file_rename, alexandria_free_string,
+    alexandria_index_count_files, alexandria_index_count_missing, alexandria_index_files_json,
+    alexandria_index_init, alexandria_index_refresh_start, alexandria_index_start,
+    FileMetadataResult, IndexStartResult,
 };
 
 const STATUS_OK: i32 = alexandria_ffi::INDEX_OK;
@@ -29,6 +30,7 @@ const STATUS_FILE_NOT_FOUND: i32 = alexandria_ffi::FILE_ERR_NOT_FOUND;
 const STATUS_FILE_INVALID_STATE: i32 = alexandria_ffi::FILE_ERR_INVALID_STATE;
 const STATUS_FILE_OK: i32 = alexandria_ffi::FILE_OK;
 const STATUS_FILE_OTHER: i32 = alexandria_ffi::FILE_ERR_OTHER;
+const STATUS_FILE_DISK: i32 = alexandria_ffi::FILE_ERR_DISK;
 
 fn init_temp_db() -> (TempDir, String) {
     let dir = tempdir().unwrap();
@@ -461,5 +463,158 @@ fn _ffi_file_status_constants_are_stable() {
         STATUS_FILE_NOT_FOUND,
         STATUS_FILE_INVALID_STATE,
         STATUS_FILE_OTHER,
+        STATUS_FILE_DISK,
     );
+}
+
+// ---------------------------------------------------------------------------
+// UC-05: alexandria_file_rename (FR-FC-19, FR-FC-24)
+// ---------------------------------------------------------------------------
+
+/// Result JSON of a `FileJsonResult` on success, parsed. Asserts `FILE_OK`.
+fn file_json_ok(result: alexandria_ffi::FileJsonResult) -> serde_json::Value {
+    assert_eq!(result.status, STATUS_FILE_OK, "expected FILE_OK, got {}", result.status);
+    assert!(!result.json.is_null(), "success must carry a json pointer");
+    let json = unsafe { CStr::from_ptr(result.json) }.to_str().unwrap().to_string();
+    unsafe { alexandria_free_string(result.json); }
+    serde_json::from_str(&json).expect("File json")
+}
+
+#[test]
+fn given_indexed_file_when_ffi_rename_then_ok_and_disk_and_catalog_updated() {
+    let _g = serial();
+    let (_db_dir, db_path) = init_temp_db();
+    let lib = tempdir().unwrap();
+    std::fs::write(lib.path().join("song.mp3"), b"audio bytes").unwrap();
+
+    let root = c(lib.path().to_str().unwrap());
+    let token = c("bearer");
+    alexandria_index_start(root.as_ptr(), token.as_ptr());
+    wait_for_files(1);
+
+    let uuid = uuid_by_name(&db_path, "song.mp3");
+    let name = c("renamed.mp3");
+    let result = alexandria_file_rename(c(&uuid).as_ptr(), name.as_ptr(), token.as_ptr());
+
+    let json = file_json_ok(result);
+    assert_eq!(json["uuid"], uuid);
+    assert_eq!(json["name"], "renamed.mp3");
+    assert_eq!(json["state"], "active");
+    let new_path = json["path"].as_str().expect("path string");
+    assert!(new_path.ends_with("renamed.mp3"));
+
+    // On-disk file moved.
+    assert!(!lib.path().join("song.mp3").exists(), "old path gone after rename");
+    assert!(lib.path().join("renamed.mp3").exists(), "new path present");
+    assert_eq!(std::fs::read(lib.path().join("renamed.mp3")).unwrap(), b"audio bytes");
+
+    // Catalog row updated.
+    let (name, path): (String, String) =
+        with_db(&db_path, move |pool| async move {
+            sqlx::query_as("SELECT name, path FROM files WHERE uuid = ?")
+                .bind(&uuid)
+                .fetch_one(&pool)
+                .await
+                .expect("catalog row")
+        });
+    assert_eq!(name, "renamed.mp3");
+    assert!(path.ends_with("renamed.mp3"));
+}
+
+#[test]
+fn given_ffi_rename_invalid_name_then_invalid_input() {
+    let _g = serial();
+    let (_db_dir, db_path) = init_temp_db();
+    let lib = tempdir().unwrap();
+    std::fs::write(lib.path().join("song.mp3"), b"x").unwrap();
+    let root = c(lib.path().to_str().unwrap());
+    let token = c("bearer");
+    alexandria_index_start(root.as_ptr(), token.as_ptr());
+    wait_for_files(1);
+    let uuid = uuid_by_name(&db_path, "song.mp3");
+
+    for bad in ["/x", "..", "a:b"] {
+        let bad = c(bad);
+        let result = alexandria_file_rename(c(&uuid).as_ptr(), bad.as_ptr(), token.as_ptr());
+        assert_eq!(result.status, STATUS_FILE_INVALID_INPUT, "bad name rejected");
+        assert!(result.json.is_null());
+    }
+}
+
+#[test]
+fn given_ffi_rename_missing_uuid_then_not_found() {
+    let _g = serial();
+    let (_db_dir, _db_path) = init_temp_db();
+    let token = c("bearer");
+    let uuid = c("11111111-1111-1111-1111-111111111111");
+    let name = c("new.mp3");
+    let result = alexandria_file_rename(uuid.as_ptr(), name.as_ptr(), token.as_ptr());
+    assert_eq!(result.status, STATUS_FILE_NOT_FOUND);
+}
+
+#[test]
+fn given_ffi_rename_no_token_then_unauthorized() {
+    let _g = serial();
+    let (_db_dir, db_path) = init_temp_db();
+    let lib = tempdir().unwrap();
+    std::fs::write(lib.path().join("song.mp3"), b"x").unwrap();
+    let root = c(lib.path().to_str().unwrap());
+    let token = c("bearer");
+    alexandria_index_start(root.as_ptr(), token.as_ptr());
+    wait_for_files(1);
+
+    let uuid = uuid_by_name(&db_path, "song.mp3");
+    let name = c("renamed.mp3");
+    let empty = c("");
+    let result = alexandria_file_rename(c(&uuid).as_ptr(), name.as_ptr(), empty.as_ptr());
+    assert_eq!(result.status, STATUS_FILE_UNAUTHORIZED);
+}
+
+#[test]
+fn given_ffi_rename_deleted_file_then_invalid_state() {
+    let _g = serial();
+    let (_db_dir, db_path) = init_temp_db();
+    let lib = tempdir().unwrap();
+    std::fs::write(lib.path().join("song.mp3"), b"x").unwrap();
+    let root = c(lib.path().to_str().unwrap());
+    let token = c("bearer");
+    alexandria_index_start(root.as_ptr(), token.as_ptr());
+    wait_for_files(1);
+
+    let uuid = uuid_by_name(&db_path, "song.mp3");
+    let uuid_for_seed = uuid.clone();
+    with_db(&db_path, move |pool| async move {
+        sqlx::query("UPDATE files SET state = 'deleted', deleted_at = ? WHERE uuid = ?")
+            .bind("2024-01-01T00:00:00Z")
+            .bind(uuid_for_seed)
+            .execute(&pool)
+            .await
+            .expect("soft-delete seed");
+    });
+
+    let name = c("renamed.mp3");
+    let result = alexandria_file_rename(c(&uuid).as_ptr(), name.as_ptr(), token.as_ptr());
+    assert_eq!(result.status, STATUS_FILE_INVALID_STATE);
+}
+
+#[test]
+fn given_ffi_rename_target_owned_by_other_file_then_disk_error() {
+    let _g = serial();
+    let (_db_dir, db_path) = init_temp_db();
+    let lib = tempdir().unwrap();
+    std::fs::write(lib.path().join("a.mp3"), b"aaa").unwrap();
+    std::fs::write(lib.path().join("b.mp3"), b"bbb").unwrap();
+    let root = c(lib.path().to_str().unwrap());
+    let token = c("bearer");
+    alexandria_index_start(root.as_ptr(), token.as_ptr());
+    wait_for_files(2);
+
+    let uuid_a = uuid_by_name(&db_path, "a.mp3");
+    let name = c("b.mp3");
+    let result = alexandria_file_rename(c(&uuid_a).as_ptr(), name.as_ptr(), token.as_ptr());
+    assert_eq!(result.status, STATUS_FILE_DISK, "target-exists must map to FILE_ERR_DISK");
+    assert!(result.json.is_null());
+
+    // a.mp3 left untouched on disk.
+    assert!(lib.path().join("a.mp3").exists(), "a.mp3 untouched after refusal");
 }
