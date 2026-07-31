@@ -59,6 +59,20 @@ pub async fn file_rows(pool: &SqlitePool) -> Vec<(String, String, String, String
         .expect("rows")
 }
 
+/// `(uuid, path, name, type, content_hash)` ordered by path. Used by UC-04
+/// integration tests to resolve a cataloged file's public UUID for the
+/// `PATCH /v1/files/{uuid}/metadata` request.
+pub async fn file_rows_with_uuid(
+    pool: &SqlitePool,
+) -> Vec<(String, String, String, String, String)> {
+    sqlx::query_as(
+        "SELECT uuid, path, name, type, content_hash FROM files ORDER BY path",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("rows")
+}
+
 /// `(path, name, type, content_hash, missing_at)` — `missing_at` is NULL when
 /// the on-disk file was present at last refresh.
 pub async fn file_rows_with_missing(

@@ -4,6 +4,7 @@ use sqlx::sqlite::SqlitePool;
 
 use crate::auth::BearerAuthService;
 use crate::catalog::clock::SystemClock;
+use crate::catalog::commands::edit_metadata::EditMetadataHandler;
 use crate::catalog::commands::index::IndexHandler;
 use crate::catalog::commands::refresh::RefreshHandler;
 use crate::catalog::fs::StdFilesystem;
@@ -20,10 +21,14 @@ pub type DefaultIndexHandler =
 pub type DefaultRefreshHandler =
     RefreshHandler<BearerAuthService, SqliteCatalogRepository, StdFilesystem, SystemClock>;
 
+pub type DefaultEditMetadataHandler =
+    EditMetadataHandler<BearerAuthService, SqliteCatalogRepository>;
+
 #[derive(Clone)]
 pub struct Services {
     pub index_handler: Arc<DefaultIndexHandler>,
     pub refresh_handler: Arc<DefaultRefreshHandler>,
+    pub edit_metadata_handler: Arc<DefaultEditMetadataHandler>,
     pub pool: SqlitePool,
 }
 
@@ -37,10 +42,12 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
     let fs = StdFilesystem;
     let clock = SystemClock;
     let index_handler = Arc::new(IndexHandler::new(auth, repo.clone(), fs, clock));
-    let refresh_handler = Arc::new(RefreshHandler::new(auth, repo, fs, clock));
+    let refresh_handler = Arc::new(RefreshHandler::new(auth, repo.clone(), fs, clock));
+    let edit_metadata_handler = Arc::new(EditMetadataHandler::new(auth, repo));
     Services {
         index_handler,
         refresh_handler,
+        edit_metadata_handler,
         pool,
     }
 }

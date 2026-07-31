@@ -10,7 +10,7 @@ use serde_json::{json, Value};
 use tempfile::tempdir;
 use tower::ServiceExt;
 
-use crate::common::{file_rows, file_rows_with_missing, test_app, wait_for_files};
+use crate::common::{file_rows, file_rows_with_missing, file_rows_with_uuid, test_app, wait_for_files};
 
 fn index_request(root: &str) -> Request<Body> {
     Request::builder()
@@ -234,4 +234,241 @@ async fn given_no_bearer_when_refresh_posted_then_returns_401() {
         .unwrap();
     let response = router.oneshot(request).await.expect("one-shot");
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+// ---------------------------------------------------------------------------
+// UC-04: PATCH /v1/files/{uuid}/metadata (FR-FC-14..18, FR-FC-24)
+// ---------------------------------------------------------------------------
+
+fn patch_metadata(uuid: &str, body: Value) -> Request<Body> {
+    Request::builder()
+        .method("PATCH")
+        .uri(format!("/v1/files/{uuid}/metadata"))
+        .header("authorization", "Bearer test-token")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap()
+}
+
+/// Resolve the public UUID of the single cataloged file named `name`.
+async fn uuid_for_name(pool: &sqlx::sqlite::SqlitePool, name: &str) -> String {
+    let rows = file_rows_with_uuid(pool).await;
+    rows.iter()
+        .find(|r| r.2 == name)
+        .map(|r| r.0.clone())
+        .unwrap_or_else(|| panic!("no cataloged file named {name}"))
+}
+
+#[tokio::test]
+async fn given_indexed_audio_file_when_patch_audio_metadata_then_200_and_row_updated() {
+    let lib = tempdir().unwrap();
+    common::write_file(&lib, "song.mp3", b"audio bytes");
+
+    let test = test_app().await;
+    let router = app(Settings::default(), test.services.clone());
+    let _ = router
+        .oneshot(index_request(lib.path().to_str().unwrap()))
+        .await
+        .expect("index one-shot");
+    wait_for_files(&test.pool, 1).await;
+
+    let uuid = uuid_for_name(&test.pool, "song.mp3").await;
+    let body = json!({
+        "type": "audio",
+        "title": "New Title",
+        "artist": "New Artist",
+        "album": "New Album",
+        "year": 2001,
+        "genre": "Rock",
+        "track": 3
+    });
+
+    let response = app(Settings::default(), test.services)
+        .oneshot(patch_metadata(&uuid, body))
+        .await
+        .expect("patch one-shot");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let bytes = to_bytes(response.into_body(), usize::MAX).await.expect("body");
+    let json: Value = serde_json::from_slice(&bytes).expect("json");
+    assert_eq!(json["file"]["uuid"], uuid);
+    assert_eq!(json["file"]["fileType"], "audio");
+    assert_eq!(json["file"]["state"], "active");
+    assert_eq!(json["metadata"]["type"], "audio");
+    assert_eq!(json["metadata"]["title"], "New Title");
+    assert_eq!(json["metadata"]["track"], 3);
+
+    // Persisted subtype row reflects the full-replace PATCH.
+    let row: (Option<String>, Option<String>, Option<String>, Option<i64>, Option<String>, Option<i64>) =
+        sqlx::query_as(
+            "SELECT title, artist, album, year, genre, track FROM audio_files \
+             JOIN files ON files.id = audio_files.file_id WHERE files.uuid = ?",
+        )
+        .bind(&uuid)
+        .fetch_one(&test.pool)
+        .await
+        .expect("audio row");
+    assert_eq!(row.0.as_deref(), Some("New Title"));
+    assert_eq!(row.1.as_deref(), Some("New Artist"));
+    assert_eq!(row.2.as_deref(), Some("New Album"));
+    assert_eq!(row.3, Some(2001));
+    assert_eq!(row.4.as_deref(), Some("Rock"));
+    assert_eq!(row.5, Some(3));
+}
+
+#[tokio::test]
+async fn given_indexed_video_file_when_patch_video_metadata_then_200_and_row_updated() {
+    let lib = tempdir().unwrap();
+    common::write_file(&lib, "clip.mkv", b"video bytes");
+
+    let test = test_app().await;
+    let router = app(Settings::default(), test.services.clone());
+    let _ = router
+        .oneshot(index_request(lib.path().to_str().unwrap()))
+        .await
+        .expect("index one-shot");
+    wait_for_files(&test.pool, 1).await;
+
+    let uuid = uuid_for_name(&test.pool, "clip.mkv").await;
+    let body = json!({
+        "type": "video",
+        "title": "A Film",
+        "year": 1999,
+        "resolution": "1080p",
+        "mediaKind": "movie"
+    });
+
+    let response = app(Settings::default(), test.services)
+        .oneshot(patch_metadata(&uuid, body))
+        .await
+        .expect("patch one-shot");
+    assert_eq!(response.status(), StatusCode::OK);
+    let json: Value = serde_json::from_slice(
+        &to_bytes(response.into_body(), usize::MAX).await.unwrap(),
+    )
+    .unwrap();
+    assert_eq!(json["metadata"]["mediaKind"], "movie");
+
+    let row: (Option<String>, Option<i64>, Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT title, year, resolution, media_kind FROM video_files \
+         JOIN files ON files.id = video_files.file_id WHERE files.uuid = ?",
+    )
+    .bind(&uuid)
+    .fetch_one(&test.pool)
+    .await
+    .expect("video row");
+    assert_eq!(row.0.as_deref(), Some("A Film"));
+    assert_eq!(row.1, Some(1999));
+    assert_eq!(row.2.as_deref(), Some("1080p"));
+    assert_eq!(row.3.as_deref(), Some("movie"));
+}
+
+#[tokio::test]
+async fn given_indexed_text_file_when_patch_any_metadata_then_400() {
+    let lib = tempdir().unwrap();
+    common::write_file(&lib, "notes.md", b"# title");
+
+    let test = test_app().await;
+    let router = app(Settings::default(), test.services.clone());
+    let _ = router
+        .oneshot(index_request(lib.path().to_str().unwrap()))
+        .await
+        .expect("index one-shot");
+    wait_for_files(&test.pool, 1).await;
+
+    let uuid = uuid_for_name(&test.pool, "notes.md").await;
+    // Text has no editable subtype metadata; any PATCH body's variant
+    // mismatches the file's `text` type → AF-01 invalid input.
+    let body = json!({ "type": "audio", "title": "x" });
+
+    let response = app(Settings::default(), test.services)
+        .oneshot(patch_metadata(&uuid, body))
+        .await
+        .expect("patch one-shot");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn given_indexed_audio_file_when_patch_with_video_body_then_400() {
+    let lib = tempdir().unwrap();
+    common::write_file(&lib, "song.mp3", b"audio bytes");
+
+    let test = test_app().await;
+    let router = app(Settings::default(), test.services.clone());
+    let _ = router
+        .oneshot(index_request(lib.path().to_str().unwrap()))
+        .await
+        .expect("index one-shot");
+    wait_for_files(&test.pool, 1).await;
+
+    let uuid = uuid_for_name(&test.pool, "song.mp3").await;
+    let body = json!({ "type": "video", "title": "x" });
+
+    let response = app(Settings::default(), test.services)
+        .oneshot(patch_metadata(&uuid, body))
+        .await
+        .expect("patch one-shot");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn given_missing_uuid_when_patch_then_404() {
+    let test = test_app().await;
+    let router = app(Settings::default(), test.services);
+    let missing = uuid::Uuid::new_v4().to_string();
+    let body = json!({ "type": "audio", "title": "x" });
+
+    let response = router
+        .oneshot(patch_metadata(&missing, body))
+        .await
+        .expect("patch one-shot");
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn given_no_bearer_when_patch_then_401() {
+    let test = test_app().await;
+    let router = app(Settings::default(), test.services);
+    let uuid = uuid::Uuid::new_v4().to_string();
+    let body = json!({ "type": "audio", "title": "x" });
+
+    let request = Request::builder()
+        .method("PATCH")
+        .uri(format!("/v1/files/{uuid}/metadata"))
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let response = router.oneshot(request).await.expect("one-shot");
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn given_soft_deleted_file_when_patch_then_409() {
+    let lib = tempdir().unwrap();
+    common::write_file(&lib, "song.mp3", b"audio bytes");
+
+    let test = test_app().await;
+    let router = app(Settings::default(), test.services.clone());
+    let _ = router
+        .oneshot(index_request(lib.path().to_str().unwrap()))
+        .await
+        .expect("index one-shot");
+    wait_for_files(&test.pool, 1).await;
+
+    let uuid = uuid_for_name(&test.pool, "song.mp3").await;
+    // Seed a soft-delete directly (UC-06 is not implemented yet) so the
+    // record is in `deleted` state with `deleted_at` set.
+    sqlx::query("UPDATE files SET state = 'deleted', deleted_at = ? WHERE uuid = ?")
+        .bind("2024-01-01T00:00:00Z")
+        .bind(&uuid)
+        .execute(&test.pool)
+        .await
+        .expect("soft-delete seed");
+
+    let body = json!({ "type": "audio", "title": "x" });
+    let response = app(Settings::default(), test.services)
+        .oneshot(patch_metadata(&uuid, body))
+        .await
+        .expect("patch one-shot");
+    assert_eq!(response.status(), StatusCode::CONFLICT);
 }

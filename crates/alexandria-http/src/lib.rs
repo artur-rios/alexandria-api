@@ -6,7 +6,7 @@ pub mod routes;
 use std::sync::Arc;
 
 use axum::middleware::from_fn;
-use axum::routing::{get, post};
+use axum::routing::{get, patch, post};
 use axum::Router;
 use tower_http::trace::TraceLayer;
 
@@ -29,6 +29,10 @@ pub fn app(settings: Settings, services: Arc<Services>) -> Router {
         .route("/health", get(routes::health::health))
         .route("/v1/index", post(routes::index::index))
         .route("/v1/index/refresh", post(routes::refresh::refresh))
+        .route(
+            "/v1/files/:uuid/metadata",
+            patch(routes::edit_metadata::edit_metadata),
+        )
         .layer(from_fn(middleware::auth::auth_stub))
         .layer(from_fn(middleware::error::error_stub))
         .layer(TraceLayer::new_for_http())

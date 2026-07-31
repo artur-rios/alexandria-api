@@ -24,6 +24,17 @@ pub const INDEX_ERR_UNAUTHORIZED: c_int = 2;
 pub const INDEX_ERR_NOT_INITIALIZED: c_int = 3;
 pub const INDEX_ERR_OTHER: c_int = 4;
 
+/// FFI status codes returned by file operations (UC-04+). Deliberately
+/// separate from `INDEX_*` so a future use case can grow either set without
+/// colliding; `FILE_OK == INDEX_OK == 0` by convention.
+pub const FILE_OK: c_int = 0;
+pub const FILE_ERR_INVALID_INPUT: c_int = 1;
+pub const FILE_ERR_UNAUTHORIZED: c_int = 2;
+pub const FILE_ERR_NOT_INITIALIZED: c_int = 3;
+pub const FILE_ERR_NOT_FOUND: c_int = 4;
+pub const FILE_ERR_INVALID_STATE: c_int = 5;
+pub const FILE_ERR_OTHER: c_int = 9;
+
 fn runtime() -> &'static Runtime {
     RUNTIME.get_or_init(|| {
         Builder::new_multi_thread()
@@ -211,6 +222,99 @@ pub extern "C" fn alexandria_index_count_files() -> i64 {
             sqlx::query_as("SELECT COUNT(*) FROM files").fetch_one(&services.pool).await;
         row.map(|(c,)| c).unwrap_or(-1)
     })
+}
+
+/// Result of `alexandria_file_edit_metadata` (UC-04). On success `status` is
+/// `FILE_OK` and `json` is a NUL-terminated JSON string of the `FileMetadata`
+/// body — byte-for-byte the same shape HTTP returns from
+/// `PATCH /v1/files/{uuid}/metadata` (FR-FC-24 / NFR-09). On failure `json`
+/// is NULL and `status` carries the mapped error code. The caller must free
+/// `json` with `alexandria_free_string`.
+#[repr(C)]
+#[derive(Debug)]
+pub struct FileMetadataResult {
+    pub status: c_int,
+    pub json: *mut c_char,
+}
+
+impl FileMetadataResult {
+    fn err(status: c_int) -> Self {
+        Self {
+            status,
+            json: std::ptr::null_mut(),
+        }
+    }
+
+    fn ok(json: String) -> Self {
+        let cstring = CString::new(json).unwrap_or_default();
+        Self {
+            status: FILE_OK,
+            json: cstring.into_raw(),
+        }
+    }
+}
+
+/// Edit a file's type-specific metadata (UC-04 / FR-FC-14..18).
+///
+/// `uuid` is the file's public UUID string; `json_patch` is the JSON body
+/// (the `SubtypeMetadata` enum, internally tagged by `type`) that HTTP would
+/// send. The function deserializes it, calls the same `EditMetadataHandler`
+/// the HTTP route uses, and on success serializes the returned `FileMetadata`
+/// back to JSON — so the FFI and HTTP surfaces agree byte-for-byte modulo key
+/// ordering (parity, FR-FC-24 / NFR-09). `token` is the bearer auth token.
+#[allow(unsafe_code)]
+#[no_mangle]
+pub extern "C" fn alexandria_file_edit_metadata(
+    uuid: *const c_char,
+    json_patch: *const c_char,
+    token: *const c_char,
+) -> FileMetadataResult {
+    let services = match services_slot().lock().unwrap().clone() {
+        Some(s) => s,
+        None => return FileMetadataResult::err(FILE_ERR_NOT_INITIALIZED),
+    };
+
+    let uuid_str = match cstr_lossy(uuid) {
+        Some(s) => s,
+        None => return FileMetadataResult::err(FILE_ERR_INVALID_INPUT),
+    };
+    let uuid = match uuid::Uuid::parse_str(&uuid_str) {
+        Ok(u) => u,
+        Err(_) => return FileMetadataResult::err(FILE_ERR_INVALID_INPUT),
+    };
+
+    let patch_str = match cstr_lossy(json_patch) {
+        Some(s) => s,
+        None => return FileMetadataResult::err(FILE_ERR_INVALID_INPUT),
+    };
+    let metadata: alexandria_core::catalog::model::SubtypeMetadata =
+        match serde_json::from_str(&patch_str) {
+            Ok(m) => m,
+            Err(_) => return FileMetadataResult::err(FILE_ERR_INVALID_INPUT),
+        };
+
+    let token = cstr_lossy(token).unwrap_or_default();
+
+    let result = runtime().block_on(async {
+        services
+            .edit_metadata_handler
+            .edit(uuid, metadata, &token)
+            .await
+    });
+
+    match result {
+        Ok(file_metadata) => {
+            let json = serde_json::to_string(&file_metadata).unwrap_or_default();
+            FileMetadataResult::ok(json)
+        }
+        Err(err) => match err {
+            DomainError::NotFound => FileMetadataResult::err(FILE_ERR_NOT_FOUND),
+            DomainError::Unauthorized => FileMetadataResult::err(FILE_ERR_UNAUTHORIZED),
+            DomainError::InvalidInput(_) => FileMetadataResult::err(FILE_ERR_INVALID_INPUT),
+            DomainError::InvalidState => FileMetadataResult::err(FILE_ERR_INVALID_STATE),
+            _ => FileMetadataResult::err(FILE_ERR_OTHER),
+        },
+    }
 }
 
 /// Count of cataloged files currently marked missing on disk (UC-02 AF-01).

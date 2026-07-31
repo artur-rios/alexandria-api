@@ -6,11 +6,12 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
+use uuid::Uuid;
 
 use alexandria_core::auth::{AuthService, Principal};
 use alexandria_core::catalog::clock::FixedClock;
 use alexandria_core::catalog::fs::{FileEntry, Filesystem};
-use alexandria_core::catalog::model::{File, FileType, NewFile};
+use alexandria_core::catalog::model::{File, FileType, NewFile, SubtypeMetadata};
 use alexandria_core::catalog::repos::CatalogRepository;
 use alexandria_core::config::AuthMode;
 use alexandria_core::errors::DomainError;
@@ -53,6 +54,7 @@ impl AuthService for FakeAuth {
 #[derive(Debug, Default, Clone)]
 pub struct FakeCatalogRepository {
     files: Arc<Mutex<HashMap<String, File>>>,
+    metadata: Arc<Mutex<HashMap<Uuid, SubtypeMetadata>>>,
 }
 
 impl FakeCatalogRepository {
@@ -81,11 +83,32 @@ impl FakeCatalogRepository {
     pub fn has_path(&self, path: &str) -> bool {
         self.files.lock().unwrap().contains_key(path)
     }
+
+    /// File looked up by UUID — the UC-04 read path.
+    pub fn file_for_uuid(&self, uuid: Uuid) -> Option<File> {
+        self.files
+            .lock()
+            .unwrap()
+            .values()
+            .find(|f| f.uuid == uuid)
+            .cloned()
+    }
+
+    /// Subtype metadata last written for `uuid` (UC-04 write path). `None`
+    /// means no `update_metadata` call has persisted metadata for that file
+    /// yet (the subtype row is still empty).
+    pub fn metadata_for(&self, uuid: Uuid) -> Option<SubtypeMetadata> {
+        self.metadata.lock().unwrap().get(&uuid).cloned()
+    }
 }
 
 impl CatalogRepository for FakeCatalogRepository {
     async fn find_by_path(&self, path: &str) -> Result<Option<File>, DomainError> {
         Ok(self.files.lock().unwrap().get(path).cloned())
+    }
+
+    async fn find_by_uuid(&self, uuid: Uuid) -> Result<Option<File>, DomainError> {
+        Ok(self.file_for_uuid(uuid))
     }
 
     async fn insert_file(&self, new_file: NewFile) -> Result<File, DomainError> {
@@ -134,6 +157,28 @@ impl CatalogRepository for FakeCatalogRepository {
         if let Some(file) = files.get_mut(path) {
             file.missing_at = Some(missing_at);
         }
+        Ok(())
+    }
+
+    async fn update_metadata(
+        &self,
+        uuid: Uuid,
+        metadata: &SubtypeMetadata,
+    ) -> Result<(), DomainError> {
+        let files = self.files.lock().unwrap();
+        let file = files
+            .values()
+            .find(|f| f.uuid == uuid)
+            .ok_or(DomainError::NotFound)?;
+        if file.file_type != metadata.file_type() {
+            return Err(DomainError::InvalidInput(
+                "metadata does not match file subtype".into(),
+            ));
+        }
+        self.metadata
+            .lock()
+            .unwrap()
+            .insert(uuid, metadata.clone());
         Ok(())
     }
 }
@@ -227,6 +272,24 @@ pub fn existing_file(path: &str, file_type: FileType) -> File {
         state: alexandria_core::catalog::model::FileState::Active,
         deleted_at: None,
         indexed_at: now(),
+        missing_at: None,
+    }
+}
+
+/// A cataloged file in the `deleted` state (UC-04 AF-04 / UC-06). Used to
+/// assert that editing metadata on a soft-deleted record is rejected with
+/// `InvalidState` (restore first via UC-07).
+#[allow(dead_code)]
+pub fn deleted_file(path: &str, name: &str, file_type: FileType) -> File {
+    File {
+        uuid: uuid::Uuid::new_v4(),
+        path: path.to_string(),
+        name: name.to_string(),
+        file_type,
+        content_hash: "preexisting".to_string(),
+        state: alexandria_core::catalog::model::FileState::Deleted,
+        deleted_at: Some(earlier()),
+        indexed_at: earlier(),
         missing_at: None,
     }
 }

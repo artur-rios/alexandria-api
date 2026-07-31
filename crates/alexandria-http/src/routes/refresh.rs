@@ -5,6 +5,7 @@ use axum::Json;
 use alexandria_core::catalog::commands::refresh::RefreshStarted;
 
 use crate::middleware::error::ApiError;
+use crate::routes::bearer_token;
 use crate::AppState;
 
 /// `POST /v1/index/refresh` — re-index and refresh the catalog (UC-02).
@@ -30,13 +31,4 @@ pub async fn refresh(
     });
 
     Ok((StatusCode::ACCEPTED, Json(started)))
-}
-
-fn bearer_token(headers: &HeaderMap) -> String {
-    headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|s| s.strip_prefix("Bearer ").or_else(|| s.strip_prefix("bearer ")))
-        .unwrap_or("")
-        .to_string()
 }

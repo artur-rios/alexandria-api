@@ -1,6 +1,9 @@
 #[path = "common/mod.rs"]
 mod common;
 
+#[path = "catalog/edit_metadata.rs"]
+mod edit_metadata;
+
 #[path = "catalog/index.rs"]
 mod index;
 
