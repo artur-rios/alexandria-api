@@ -11,7 +11,7 @@ use uuid::Uuid;
 use alexandria_core::auth::{AuthService, Principal};
 use alexandria_core::catalog::clock::FixedClock;
 use alexandria_core::catalog::fs::{FileEntry, Filesystem};
-use alexandria_core::catalog::model::{File, FileType, NewFile, SubtypeMetadata};
+use alexandria_core::catalog::model::{File, FileState, FileType, NewFile, StateFilter, SubtypeMetadata};
 use alexandria_core::catalog::repos::CatalogRepository;
 use alexandria_core::config::AuthMode;
 use alexandria_core::errors::DomainError;
@@ -181,6 +181,33 @@ impl CatalogRepository for FakeCatalogRepository {
             .insert(uuid, metadata.clone());
         Ok(())
     }
+
+    async fn list_filtered(
+        &self,
+        file_type: Option<FileType>,
+        state: StateFilter,
+    ) -> Result<Vec<File>, DomainError> {
+        let files = self.files.lock().unwrap();
+        let mut out: Vec<File> = files
+            .values()
+            .filter(|f| file_type.is_none() || Some(f.file_type) == file_type)
+            .filter(|f| match state {
+                StateFilter::Active => f.state == FileState::Active,
+                StateFilter::Deleted => f.state == FileState::Deleted,
+                StateFilter::All => true,
+            })
+            .cloned()
+            .collect();
+        out.sort_by(|a, b| a.path.cmp(&b.path));
+        Ok(out)
+    }
+
+    async fn find_metadata_by_uuid(
+        &self,
+        uuid: Uuid,
+    ) -> Result<Option<SubtypeMetadata>, DomainError> {
+        Ok(self.metadata.lock().unwrap().get(&uuid).cloned())
+    }
 }
 
 /// In-memory filesystem. Stores which roots "exist" and a map of root -> the
@@ -331,6 +358,13 @@ pub fn existing_missing_file(path: &str, name: &str, file_type: FileType, hash: 
 impl FakeCatalogRepository {
     pub fn seed(&self, file: File) {
         self.files.lock().unwrap().insert(file.path.clone(), file);
+    }
+
+    /// Seed stored subtype metadata for a file UUID (as if UC-04 had
+    /// written it). Used by UC-03 read-path tests to assert the metadata
+    /// appears in the returned `FileView`.
+    pub fn seed_metadata(&self, uuid: Uuid, metadata: SubtypeMetadata) {
+        self.metadata.lock().unwrap().insert(uuid, metadata);
     }
 }
 

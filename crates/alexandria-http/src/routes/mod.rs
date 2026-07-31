@@ -1,3 +1,4 @@
+pub mod browse;
 pub mod edit_metadata;
 pub mod health;
 pub mod index;

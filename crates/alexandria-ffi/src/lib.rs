@@ -317,6 +317,187 @@ pub extern "C" fn alexandria_file_edit_metadata(
     }
 }
 
+/// Result of `alexandria_files_list` and `alexandria_file_get_by_uuid` (UC-03).
+/// On success `status` is `FILE_OK` and `json` is a NUL-terminated JSON string
+/// — byte-for-byte the same shape HTTP returns from `GET /v1/files` (a JSON
+/// array of `File` records) or `GET /v1/files/{uuid}` (a `FileView` object),
+/// so the FFI and HTTP surfaces agree modulo key ordering (parity, FR-FC-24 /
+/// NFR-09). On failure `json` is NULL and `status` carries the mapped error
+/// code. The caller must free `json` with `alexandria_free_string`.
+#[repr(C)]
+#[derive(Debug)]
+pub struct FileJsonResult {
+    pub status: c_int,
+    pub json: *mut c_char,
+}
+
+impl FileJsonResult {
+    fn err(status: c_int) -> Self {
+        Self {
+            status,
+            json: std::ptr::null_mut(),
+        }
+    }
+
+    fn ok(json: String) -> Self {
+        let cstring = CString::new(json).unwrap_or_default();
+        Self {
+            status: FILE_OK,
+            json: cstring.into_raw(),
+        }
+    }
+}
+
+/// JSON filter body accepted by `alexandria_files_list` (UC-03 / FR-FC-12).
+/// Both fields optional; an empty/null body or omitted fields use the defaults
+/// (`file_type = None`, `state = "active"` — excludes deleted records per
+/// the use case's main-flow step 2). Unknown `type` values map to no type
+/// filter; unknown `state` values default to `active`.
+#[derive(Debug, Default)]
+struct FilesListFilter {
+    file_type: Option<String>,
+    state: Option<String>,
+}
+
+impl FilesListFilter {
+    fn from_json_str(s: &str) -> Option<Self> {
+        if s.trim().is_empty() {
+            return Some(Self::default());
+        }
+        let value: serde_json::Value = serde_json::from_str(s).ok()?;
+        if value.is_null() {
+            return Some(Self::default());
+        }
+        let obj = value.as_object()?;
+        Some(Self {
+            file_type: obj
+                .get("type")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            state: obj.get("state").and_then(|v| v.as_str()).map(|s| s.to_string()),
+        })
+    }
+}
+
+/// List/query files filtered by type and lifecycle state (UC-03 / FR-FC-12).
+///
+/// `json_filters` is a JSON string `{"type":"audio","state":"all"}` (empty
+/// string or NULL for defaults). The function deserializes it, calls the same
+/// `BrowseFilesHandler` the HTTP route uses, and on success serializes the
+/// returned `Vec<File>` back to a JSON array — so the FFI and HTTP surfaces
+/// agree byte-for-byte modulo key ordering (parity, FR-FC-24 / NFR-09).
+/// `token` is the bearer auth token.
+#[allow(unsafe_code)]
+#[no_mangle]
+pub extern "C" fn alexandria_files_list(
+    json_filters: *const c_char,
+    token: *const c_char,
+) -> FileJsonResult {
+    let services = match services_slot().lock().unwrap().clone() {
+        Some(s) => s,
+        None => return FileJsonResult::err(FILE_ERR_NOT_INITIALIZED),
+    };
+
+    let filter_str = cstr_lossy(json_filters).unwrap_or_default();
+    let parsed = match FilesListFilter::from_json_str(&filter_str) {
+        Some(f) => f,
+        None => return FileJsonResult::err(FILE_ERR_INVALID_INPUT),
+    };
+
+    let file_type = parsed.file_type.as_deref().and_then(parse_file_type);
+    let state = parsed
+        .state
+        .as_deref()
+        .and_then(alexandria_core::catalog::model::StateFilter::parse)
+        .unwrap_or(alexandria_core::catalog::model::StateFilter::Active);
+
+    let mut filter =
+        alexandria_core::catalog::queries::browse::FileFilter::new().with_state(state);
+    if let Some(t) = file_type {
+        filter = filter.with_type(t);
+    }
+
+    let token = cstr_lossy(token).unwrap_or_default();
+
+    let result = runtime().block_on(async {
+        services.browse_files_handler.list(filter, &token).await
+    });
+
+    match result {
+        Ok(files) => {
+            let json = serde_json::to_string(&files).unwrap_or_else(|_| "[]".to_string());
+            FileJsonResult::ok(json)
+        }
+        Err(err) => map_file_err(err),
+    }
+}
+
+/// Get a single file's metadata by its public UUID (UC-03 / FR-FC-13).
+///
+/// `uuid` is the file's public UUID string. The function calls the same
+/// `BrowseFilesHandler::get_by_uuid` the HTTP route uses, and on success
+/// serializes the returned `FileView` back to JSON — the same shape HTTP
+/// returns from `GET /v1/files/{uuid}` (parity, FR-FC-24 / NFR-09). `token`
+/// is the bearer auth token.
+#[allow(unsafe_code)]
+#[no_mangle]
+pub extern "C" fn alexandria_file_get_by_uuid(
+    uuid: *const c_char,
+    token: *const c_char,
+) -> FileJsonResult {
+    let services = match services_slot().lock().unwrap().clone() {
+        Some(s) => s,
+        None => return FileJsonResult::err(FILE_ERR_NOT_INITIALIZED),
+    };
+
+    let uuid_str = match cstr_lossy(uuid) {
+        Some(s) => s,
+        None => return FileJsonResult::err(FILE_ERR_INVALID_INPUT),
+    };
+    let uuid = match uuid::Uuid::parse_str(&uuid_str) {
+        Ok(u) => u,
+        Err(_) => return FileJsonResult::err(FILE_ERR_INVALID_INPUT),
+    };
+
+    let token = cstr_lossy(token).unwrap_or_default();
+
+    let result = runtime().block_on(async {
+        services.browse_files_handler.get_by_uuid(uuid, &token).await
+    });
+
+    match result {
+        Ok(view) => {
+            let json = serde_json::to_string(&view).unwrap_or_default();
+            FileJsonResult::ok(json)
+        }
+        Err(err) => map_file_err(err),
+    }
+}
+
+fn parse_file_type(s: &str) -> Option<alexandria_core::catalog::model::FileType> {
+    use alexandria_core::catalog::model::FileType;
+    match s {
+        "audio" => Some(FileType::Audio),
+        "video" => Some(FileType::Video),
+        "html" => Some(FileType::Html),
+        "text" => Some(FileType::Text),
+        "document" => Some(FileType::Document),
+        "comic" => Some(FileType::Comic),
+        "image" => Some(FileType::Image),
+        _ => None,
+    }
+}
+
+fn map_file_err(err: DomainError) -> FileJsonResult {
+    match err {
+        DomainError::NotFound => FileJsonResult::err(FILE_ERR_NOT_FOUND),
+        DomainError::Unauthorized => FileJsonResult::err(FILE_ERR_UNAUTHORIZED),
+        DomainError::InvalidInput(_) => FileJsonResult::err(FILE_ERR_INVALID_INPUT),
+        DomainError::InvalidState => FileJsonResult::err(FILE_ERR_INVALID_STATE),
+        _ => FileJsonResult::err(FILE_ERR_OTHER),
+    }
+}
+
 /// Count of cataloged files currently marked missing on disk (UC-02 AF-01).
 #[allow(unsafe_code)]
 #[no_mangle]
