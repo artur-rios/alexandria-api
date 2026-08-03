@@ -67,6 +67,10 @@ pub struct FakeCatalogRepository {
     /// error and the catalog row is untouched because the fake never wrote
     /// it).
     failing_soft_delete_uuids: Arc<Mutex<std::collections::HashSet<Uuid>>>,
+    /// UUIDs whose `restore` must fail, simulating a catalog-write failure in
+    /// UC-07 (no on-disk leg to compensate — the handler surfaces the error
+    /// and the catalog row is left `deleted` because the fake never wrote it).
+    failing_restore_uuids: Arc<Mutex<std::collections::HashSet<Uuid>>>,
 }
 
 impl FakeCatalogRepository {
@@ -137,6 +141,14 @@ impl FakeCatalogRepository {
     /// so the handler merely surfaces the error and the row is left as-is.
     pub fn fail_soft_delete(&self, uuid: Uuid) {
         self.failing_soft_delete_uuids.lock().unwrap().insert(uuid);
+    }
+
+    /// Make `restore` return an `Internal` error for `uuid`, simulating a
+    /// catalog-write failure in UC-07. As with `soft_delete` there is no
+    /// on-disk leg to compensate, so the handler merely surfaces the error
+    /// and the row stays `deleted`.
+    pub fn fail_restore(&self, uuid: Uuid) {
+        self.failing_restore_uuids.lock().unwrap().insert(uuid);
     }
 }
 
@@ -315,6 +327,22 @@ impl CatalogRepository for FakeCatalogRepository {
         let entry = files.get_mut(&file.path).expect("seeded file present");
         entry.state = FileState::Deleted;
         entry.deleted_at = Some(deleted_at);
+        Ok(entry.clone())
+    }
+
+    async fn restore(&self, uuid: Uuid) -> Result<File, DomainError> {
+        let mut files = self.files.lock().unwrap();
+        let file = files
+            .values()
+            .find(|f| f.uuid == uuid)
+            .cloned()
+            .ok_or(DomainError::NotFound)?;
+        if self.failing_restore_uuids.lock().unwrap().contains(&uuid) {
+            return Err(DomainError::internal("fake restore failure"));
+        }
+        let entry = files.get_mut(&file.path).expect("seeded file present");
+        entry.state = FileState::Active;
+        entry.deleted_at = None;
         Ok(entry.clone())
     }
 }
@@ -513,9 +541,25 @@ pub fn existing_file(path: &str, file_type: FileType) -> File {
 
 /// A cataloged file in the `deleted` state (UC-04 AF-04 / UC-06). Used to
 /// assert that editing metadata on a soft-deleted record is rejected with
-/// `InvalidState` (restore first via UC-07).
+/// `InvalidState` (restore first via UC-07). The `deleted_at` stamp is
+/// `earlier()` (~115 days before `now()`), so this helper is **past** the
+/// default 30-day retention window and is the fixture for the AF-01
+/// "past-retention → NotFound" branch of UC-07.
 #[allow(dead_code)]
 pub fn deleted_file(path: &str, name: &str, file_type: FileType) -> File {
+    deleted_file_at(path, name, file_type, earlier())
+}
+
+/// A cataloged file in the `deleted` state with an explicit `deleted_at`,
+/// so UC-07 retention-window tests can place the row precisely relative to
+/// `now()` (within-retention, exactly on the boundary, or past it).
+#[allow(dead_code)]
+pub fn deleted_file_at(
+    path: &str,
+    name: &str,
+    file_type: FileType,
+    deleted_at: DateTime<Utc>,
+) -> File {
     File {
         uuid: uuid::Uuid::new_v4(),
         path: path.to_string(),
@@ -523,8 +567,8 @@ pub fn deleted_file(path: &str, name: &str, file_type: FileType) -> File {
         file_type,
         content_hash: "preexisting".to_string(),
         state: alexandria_core::catalog::model::FileState::Deleted,
-        deleted_at: Some(earlier()),
-        indexed_at: earlier(),
+        deleted_at: Some(deleted_at),
+        indexed_at: deleted_at,
         missing_at: None,
     }
 }

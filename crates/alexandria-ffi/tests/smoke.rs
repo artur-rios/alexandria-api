@@ -14,10 +14,10 @@ fn serial() -> std::sync::MutexGuard<'static, ()> {
 }
 
 use alexandria_ffi::{
-    alexandria_file_edit_metadata, alexandria_file_rename, alexandria_file_soft_delete,
-    alexandria_free_string, alexandria_index_count_files, alexandria_index_count_missing,
-    alexandria_index_files_json, alexandria_index_init, alexandria_index_refresh_start,
-    alexandria_index_start, FileMetadataResult, IndexStartResult,
+    alexandria_file_edit_metadata, alexandria_file_rename, alexandria_file_restore,
+    alexandria_file_soft_delete, alexandria_free_string, alexandria_index_count_files,
+    alexandria_index_count_missing, alexandria_index_files_json, alexandria_index_init,
+    alexandria_index_refresh_start, alexandria_index_start, FileMetadataResult, IndexStartResult,
 };
 
 const STATUS_OK: i32 = alexandria_ffi::INDEX_OK;
@@ -716,4 +716,138 @@ fn given_ffi_soft_delete_already_deleted_then_invalid_state() {
 
     let result = alexandria_file_soft_delete(c(&uuid).as_ptr(), token.as_ptr());
     assert_eq!(result.status, STATUS_FILE_INVALID_STATE);
+}
+
+// ---------------------------------------------------------------------------
+// UC-07: alexandria_file_restore (FR-FC-21, FR-FC-24)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn given_soft_deleted_file_when_ffi_restore_then_ok_and_catalog_active() {
+    let _g = serial();
+    let (_db_dir, db_path) = init_temp_db();
+    let lib = tempdir().unwrap();
+    std::fs::write(lib.path().join("song.mp3"), b"audio bytes").unwrap();
+
+    let root = c(lib.path().to_str().unwrap());
+    let token = c("bearer");
+    alexandria_index_start(root.as_ptr(), token.as_ptr());
+    wait_for_files(1);
+
+    let uuid = uuid_by_name(&db_path, "song.mp3");
+
+    // Seed a soft-deleted row whose `deleted_at` is comfortably within the
+    // default 30-day retention window (one day ago). Exact-boundary coverage
+    // is in the core unit tests with a FixedClock.
+    let uuid_for_seed = uuid.clone();
+    with_db(&db_path, move |pool| async move {
+        sqlx::query("UPDATE files SET state = 'deleted', deleted_at = ? WHERE uuid = ?")
+            .bind(chrono::Utc::now() - chrono::Duration::days(1))
+            .bind(uuid_for_seed)
+            .execute(&pool)
+            .await
+            .expect("soft-delete seed");
+    });
+
+    let result = alexandria_file_restore(c(&uuid).as_ptr(), token.as_ptr());
+
+    let json = file_json_ok(result);
+    assert_eq!(json["uuid"], uuid);
+    assert_eq!(json["state"], "active");
+    assert!(
+        json["deletedAt"].is_null(),
+        "deletedAt cleared on the returned File"
+    );
+
+    // The on-disk file is untouched (UC-07 leaves it; purge-on-disk is UC-09).
+    assert!(lib.path().join("song.mp3").exists(), "on-disk file preserved");
+
+    // Catalog row carries state=active and a cleared deleted_at.
+    let uuid_for_row = uuid.clone();
+    let (state, deleted_at): (String, Option<String>) =
+        with_db(&db_path, move |pool| async move {
+            sqlx::query_as("SELECT state, deleted_at FROM files WHERE uuid = ?")
+                .bind(&uuid_for_row)
+                .fetch_one(&pool)
+                .await
+                .expect("catalog row")
+        });
+    assert_eq!(state, "active");
+    assert!(deleted_at.is_none(), "deleted_at cleared in the catalog");
+}
+
+#[test]
+fn given_ffi_restore_missing_uuid_then_not_found() {
+    let _g = serial();
+    let (_db_dir, _db_path) = init_temp_db();
+    let token = c("bearer");
+    let uuid = c("11111111-1111-1111-1111-111111111111");
+    let result = alexandria_file_restore(uuid.as_ptr(), token.as_ptr());
+    assert_eq!(result.status, STATUS_FILE_NOT_FOUND);
+    assert!(result.json.is_null());
+}
+
+#[test]
+fn given_ffi_restore_no_token_then_unauthorized() {
+    let _g = serial();
+    let (_db_dir, db_path) = init_temp_db();
+    let lib = tempdir().unwrap();
+    std::fs::write(lib.path().join("song.mp3"), b"x").unwrap();
+    let root = c(lib.path().to_str().unwrap());
+    let token = c("bearer");
+    alexandria_index_start(root.as_ptr(), token.as_ptr());
+    wait_for_files(1);
+
+    let uuid = uuid_by_name(&db_path, "song.mp3");
+    let empty = c("");
+    let result = alexandria_file_restore(c(&uuid).as_ptr(), empty.as_ptr());
+    assert_eq!(result.status, STATUS_FILE_UNAUTHORIZED);
+    assert!(result.json.is_null());
+}
+
+#[test]
+fn given_ffi_restore_active_file_then_invalid_state() {
+    let _g = serial();
+    let (_db_dir, db_path) = init_temp_db();
+    let lib = tempdir().unwrap();
+    std::fs::write(lib.path().join("song.mp3"), b"x").unwrap();
+    let root = c(lib.path().to_str().unwrap());
+    let token = c("bearer");
+    alexandria_index_start(root.as_ptr(), token.as_ptr());
+    wait_for_files(1);
+
+    // Indexed but never soft-deleted — `state = 'active'` (AF-02 not-deleted).
+    let uuid = uuid_by_name(&db_path, "song.mp3");
+    let result = alexandria_file_restore(c(&uuid).as_ptr(), token.as_ptr());
+    assert_eq!(result.status, STATUS_FILE_INVALID_STATE);
+}
+
+#[test]
+fn given_soft_deleted_file_past_retention_when_ffi_restore_then_not_found() {
+    // AF-01: a record past the configured retention window is reported as
+    // not-found here too (UC-08 owns the actual hard purge; before it runs
+    // the row still exists, so the elapsed check is what UC-07 surfaces as
+    // FILE_ERR_NOT_FOUND over FFI).
+    let _g = serial();
+    let (_db_dir, db_path) = init_temp_db();
+    let lib = tempdir().unwrap();
+    std::fs::write(lib.path().join("song.mp3"), b"x").unwrap();
+    let root = c(lib.path().to_str().unwrap());
+    let token = c("bearer");
+    alexandria_index_start(root.as_ptr(), token.as_ptr());
+    wait_for_files(1);
+
+    let uuid = uuid_by_name(&db_path, "song.mp3");
+    let uuid_for_seed = uuid.clone();
+    with_db(&db_path, move |pool| async move {
+        sqlx::query("UPDATE files SET state = 'deleted', deleted_at = ? WHERE uuid = ?")
+            .bind("2024-01-01T00:00:00Z")
+            .bind(uuid_for_seed)
+            .execute(&pool)
+            .await
+            .expect("past-retention seed");
+    });
+
+    let result = alexandria_file_restore(c(&uuid).as_ptr(), token.as_ptr());
+    assert_eq!(result.status, STATUS_FILE_NOT_FOUND);
 }

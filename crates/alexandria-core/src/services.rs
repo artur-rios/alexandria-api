@@ -8,6 +8,7 @@ use crate::catalog::commands::edit_metadata::EditMetadataHandler;
 use crate::catalog::commands::index::IndexHandler;
 use crate::catalog::commands::refresh::RefreshHandler;
 use crate::catalog::commands::rename::RenameFileHandler;
+use crate::catalog::commands::restore::RestoreFileHandler;
 use crate::catalog::commands::soft_delete::SoftDeleteFileHandler;
 use crate::catalog::fs::StdFilesystem;
 use crate::catalog::queries::browse::BrowseFilesHandler;
@@ -33,6 +34,9 @@ pub type DefaultRenameFileHandler =
 pub type DefaultSoftDeleteFileHandler =
     SoftDeleteFileHandler<BearerAuthService, SqliteCatalogRepository, SystemClock>;
 
+pub type DefaultRestoreFileHandler =
+    RestoreFileHandler<BearerAuthService, SqliteCatalogRepository, SystemClock>;
+
 pub type DefaultBrowseFilesHandler =
     BrowseFilesHandler<BearerAuthService, SqliteCatalogRepository>;
 
@@ -43,6 +47,7 @@ pub struct Services {
     pub edit_metadata_handler: Arc<DefaultEditMetadataHandler>,
     pub rename_file_handler: Arc<DefaultRenameFileHandler>,
     pub soft_delete_file_handler: Arc<DefaultSoftDeleteFileHandler>,
+    pub restore_file_handler: Arc<DefaultRestoreFileHandler>,
     pub browse_files_handler: Arc<DefaultBrowseFilesHandler>,
     /// The same auth service the handlers hold, exposed so a transport can
     /// reject an unauthenticated caller *before* it parses a request body or
@@ -56,7 +61,7 @@ pub struct Services {
 /// pool. Callers (the HTTP server binary, integration tests) are responsible
 /// for running migrations first.
 pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
-    let _ = settings;
+    let retention_days = settings.deletion.retention_days;
     let repo = SqliteCatalogRepository::new(pool.clone());
     let auth = BearerAuthService;
     let fs = StdFilesystem;
@@ -66,6 +71,8 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
     let edit_metadata_handler = Arc::new(EditMetadataHandler::new(auth, repo.clone()));
     let rename_file_handler = Arc::new(RenameFileHandler::new(auth, repo.clone(), fs));
     let soft_delete_file_handler = Arc::new(SoftDeleteFileHandler::new(auth, repo.clone(), clock));
+    let restore_file_handler =
+        Arc::new(RestoreFileHandler::new(auth, repo.clone(), clock, retention_days));
     let browse_files_handler = Arc::new(BrowseFilesHandler::new(auth, repo));
     Services {
         index_handler,
@@ -73,6 +80,7 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         edit_metadata_handler,
         rename_file_handler,
         soft_delete_file_handler,
+        restore_file_handler,
         browse_files_handler,
         auth,
         pool,
