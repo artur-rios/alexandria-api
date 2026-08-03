@@ -62,6 +62,11 @@ pub struct FakeCatalogRepository {
     /// UUIDs whose `rename_file` must fail with a Database error, simulating
     /// the post-rename catalog-failure branch of UC-05.
     failing_rename_file_uuids: Arc<Mutex<std::collections::HashSet<Uuid>>>,
+    /// UUIDs whose `soft_delete` must fail, simulating a catalog-write failure
+    /// in UC-06 (no on-disk leg to compensate — the handler surfaces the
+    /// error and the catalog row is untouched because the fake never wrote
+    /// it).
+    failing_soft_delete_uuids: Arc<Mutex<std::collections::HashSet<Uuid>>>,
 }
 
 impl FakeCatalogRepository {
@@ -125,6 +130,13 @@ impl FakeCatalogRepository {
     /// on-disk rename back). Used by the rename rollback unit test.
     pub fn fail_rename_file(&self, uuid: Uuid) {
         self.failing_rename_file_uuids.lock().unwrap().insert(uuid);
+    }
+
+    /// Make `soft_delete` return an `Internal` error for `uuid`, simulating a
+    /// catalog-write failure in UC-06. There is no on-disk leg to compensate,
+    /// so the handler merely surfaces the error and the row is left as-is.
+    pub fn fail_soft_delete(&self, uuid: Uuid) {
+        self.failing_soft_delete_uuids.lock().unwrap().insert(uuid);
     }
 }
 
@@ -279,6 +291,31 @@ impl CatalogRepository for FakeCatalogRepository {
         files.remove(&file.path);
         files.insert(new_path.to_string(), renamed.clone());
         Ok(renamed)
+    }
+
+    async fn soft_delete(
+        &self,
+        uuid: Uuid,
+        deleted_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<File, DomainError> {
+        let mut files = self.files.lock().unwrap();
+        let file = files
+            .values()
+            .find(|f| f.uuid == uuid)
+            .cloned()
+            .ok_or(DomainError::NotFound)?;
+        if self
+            .failing_soft_delete_uuids
+            .lock()
+            .unwrap()
+            .contains(&uuid)
+        {
+            return Err(DomainError::internal("fake soft_delete failure"));
+        }
+        let entry = files.get_mut(&file.path).expect("seeded file present");
+        entry.state = FileState::Deleted;
+        entry.deleted_at = Some(deleted_at);
+        Ok(entry.clone())
     }
 }
 
