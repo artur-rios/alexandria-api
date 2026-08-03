@@ -15,3 +15,6 @@ mod refresh;
 
 #[path = "catalog/rename.rs"]
 mod rename;
+
+#[path = "catalog/soft_delete.rs"]
+mod soft_delete;

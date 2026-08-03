@@ -600,6 +600,55 @@ pub extern "C" fn alexandria_file_rename(
     }
 }
 
+/// Soft-delete a file (UC-06 / FR-FC-20).
+///
+/// `uuid` is the file's public UUID string; `token` is the bearer auth token.
+/// The function calls the same `SoftDeleteFileHandler` the HTTP route uses
+/// and on success serializes the returned `File` back to JSON — the same
+/// shape HTTP returns from `DELETE /v1/files/{uuid}`, so the FFI and HTTP
+/// surfaces agree byte-for-byte modulo key ordering (parity, FR-FC-24 /
+/// NFR-09). The on-disk file is untouched (only `state` and `deleted_at`
+/// change on the catalog row).
+#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
+#[no_mangle]
+pub extern "C" fn alexandria_file_soft_delete(
+    uuid: *const c_char,
+    token: *const c_char,
+) -> FileJsonResult {
+    let services = match services_slot().lock().unwrap().clone() {
+        Some(s) => s,
+        None => return FileJsonResult::err(FILE_ERR_NOT_INITIALIZED),
+    };
+
+    // Deny before touching the payload — an unauthenticated caller must not
+    // learn whether its uuid would have parsed.
+    let token = cstr_lossy(token).unwrap_or_default();
+    if !authenticated(&services, &token) {
+        return FileJsonResult::err(FILE_ERR_UNAUTHORIZED);
+    }
+
+    let uuid_str = match cstr_lossy(uuid) {
+        Some(s) => s,
+        None => return FileJsonResult::err(FILE_ERR_INVALID_INPUT),
+    };
+    let uuid = match uuid::Uuid::parse_str(&uuid_str) {
+        Ok(u) => u,
+        Err(_) => return FileJsonResult::err(FILE_ERR_INVALID_INPUT),
+    };
+
+    let result = runtime().block_on(async {
+        services.soft_delete_file_handler.soft_delete(uuid, &token).await
+    });
+
+    match result {
+        Ok(file) => {
+            let json = serde_json::to_string(&file).unwrap_or_default();
+            FileJsonResult::ok(json)
+        }
+        Err(err) => map_file_err(err),
+    }
+}
+
 fn parse_file_type(s: &str) -> Option<alexandria_core::catalog::model::FileType> {
     use alexandria_core::catalog::model::FileType;
     match s {

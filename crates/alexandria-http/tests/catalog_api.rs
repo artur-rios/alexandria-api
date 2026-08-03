@@ -1111,3 +1111,115 @@ async fn given_no_bearer_and_malformed_body_when_post_rename_then_401_not_400() 
         "auth must be decided before the path or body is parsed"
     );
 }
+
+// ---------------------------------------------------------------------------
+// UC-06: DELETE /v1/files/{uuid} (FR-FC-20, FR-FC-24)
+// ---------------------------------------------------------------------------
+
+fn delete_file_request(uuid: &str) -> Request<Body> {
+    Request::builder()
+        .method("DELETE")
+        .uri(format!("/v1/files/{uuid}"))
+        .header("authorization", "Bearer test-token")
+        .body(Body::empty())
+        .unwrap()
+}
+
+#[tokio::test]
+async fn given_indexed_file_when_delete_file_then_200_and_state_deleted_in_catalog() {
+    let lib = tempdir().unwrap();
+    let on_disk = common::write_file(&lib, "song.mp3", b"audio bytes");
+    let test = test_app().await;
+    index_library(&lib, &test.pool, &[("song.mp3", b"audio bytes")]).await;
+    let uuid = uuid_for_name(&test.pool, "song.mp3").await;
+
+    let response = app(Settings::default(), test.services)
+        .oneshot(delete_file_request(&uuid))
+        .await
+        .expect("delete one-shot");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body: Value = serde_json::from_slice(
+        &to_bytes(response.into_body(), usize::MAX).await.unwrap(),
+    )
+    .unwrap();
+    assert_eq!(body["uuid"], uuid);
+    assert_eq!(body["state"], "deleted");
+    assert!(
+        body["deletedAt"].as_str().is_some(),
+        "deletedAt is present on the response"
+    );
+
+    // Catalog row carries state=deleted and a stamped deleted_at.
+    let row: (String, Option<String>) =
+        sqlx::query_as("SELECT state, deleted_at FROM files WHERE uuid = ?")
+            .bind(&uuid)
+            .fetch_one(&test.pool)
+            .await
+            .expect("catalog row");
+    assert_eq!(row.0, "deleted");
+    assert!(row.1.is_some(), "deleted_at stamped");
+
+    // The on-disk file is untouched (UC-06 leaves it; purge-on-disk is UC-09).
+    assert!(on_disk.exists(), "on-disk file preserved by soft-delete");
+}
+
+#[tokio::test]
+async fn given_missing_uuid_when_delete_file_then_404() {
+    let test = test_app().await;
+    let missing = uuid::Uuid::new_v4().to_string();
+    let response = app(Settings::default(), test.services)
+        .oneshot(delete_file_request(&missing))
+        .await
+        .expect("delete one-shot");
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn given_no_bearer_when_delete_file_then_401() {
+    let test = test_app().await;
+    let uuid = uuid::Uuid::new_v4().to_string();
+    let request = Request::builder()
+        .method("DELETE")
+        .uri(format!("/v1/files/{uuid}"))
+        .body(Body::empty())
+        .unwrap();
+    let response = app(Settings::default(), test.services).oneshot(request).await.expect("one-shot");
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn given_no_bearer_and_malformed_uuid_when_delete_file_then_401_not_400() {
+    // Auth must be decided before the path is parsed (FR-AU-07 / SRD §7): a
+    // malformed uuid alone cannot turn a 401 into a 400.
+    let test = test_app().await;
+    let request = Request::builder()
+        .method("DELETE")
+        .uri("/v1/files/not-a-uuid")
+        .body(Body::empty())
+        .unwrap();
+    let response = app(Settings::default(), test.services).oneshot(request).await.expect("one-shot");
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn given_soft_deleted_file_when_delete_file_then_409() {
+    let lib = tempdir().unwrap();
+    common::write_file(&lib, "song.mp3", b"x");
+    let test = test_app().await;
+    index_library(&lib, &test.pool, &[("song.mp3", b"x")]).await;
+    let uuid = uuid_for_name(&test.pool, "song.mp3").await;
+
+    sqlx::query("UPDATE files SET state = 'deleted', deleted_at = ? WHERE uuid = ?")
+        .bind("2024-01-01T00:00:00Z")
+        .bind(&uuid)
+        .execute(&test.pool)
+        .await
+        .expect("soft-delete seed");
+
+    let response = app(Settings::default(), test.services)
+        .oneshot(delete_file_request(&uuid))
+        .await
+        .expect("delete one-shot");
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+}

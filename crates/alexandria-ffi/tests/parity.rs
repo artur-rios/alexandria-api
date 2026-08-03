@@ -13,9 +13,10 @@ use alexandria_core::services::build_services;
 use alexandria_http::app;
 use alexandria_ffi::{
     alexandria_file_edit_metadata, alexandria_file_get_by_uuid, alexandria_file_rename,
-    alexandria_files_list, alexandria_free_string, alexandria_index_count_files,
-    alexandria_index_count_missing, alexandria_index_files_json, alexandria_index_init,
-    alexandria_index_refresh_start, alexandria_index_start, IndexStartResult,
+    alexandria_file_soft_delete, alexandria_files_list, alexandria_free_string,
+    alexandria_index_count_files, alexandria_index_count_missing, alexandria_index_files_json,
+    alexandria_index_init, alexandria_index_refresh_start, alexandria_index_start,
+    IndexStartResult,
 };
 use axum::body::{to_bytes, Body};
 use axum::http::Request;
@@ -1383,4 +1384,222 @@ async fn given_no_token_when_renamed_via_http_and_ffi_then_both_unauthorized() {
         "rename must deny before parsing the uuid or name"
     );
     assert_eq!(bad_payload_status, 1, "clean-uuid rename with no token also denies");
+}
+
+/// UC-06 parity — soft-delete a file over both transports with identical
+/// inputs and assert the returned `File` bodies agree modulo the per-database
+/// values `uuid`, `path`, `indexedAt`, `deletedAt` (the clock fires
+/// independently per leg, so `deletedAt` differs by sub-ms) and that both
+/// surfaces report `state = "deleted"` (Testing Specification §7.3,
+/// FR-FC-24). The on-disk file is preserved on both legs (UC-06 leaves it;
+/// purge-on-disk is UC-09).
+#[tokio::test]
+async fn given_same_file_when_soft_deleted_via_http_and_ffi_then_file_bodies_identical() {
+    let _g = SERIAL.lock().unwrap();
+
+    // ---- HTTP leg ----
+    let http_lib = tempdir().unwrap();
+    std::fs::write(http_lib.path().join("song.mp3"), b"parity-audio").unwrap();
+
+    let http_dir = tempdir().unwrap();
+    let http_db = db_path(&http_dir, "http.sqlite");
+    let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    let http_services = std::sync::Arc::new(
+        build_services(&Settings::default(), http_pool.clone()).await,
+    );
+
+    let index_req = Request::builder()
+        .method("POST")
+        .uri("/v1/index")
+        .header("authorization", "Bearer parity")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({ "root": http_lib.path().to_str().unwrap() }).to_string(),
+        ))
+        .unwrap();
+    let _ = app(Settings::default(), http_services.clone())
+        .oneshot(index_req)
+        .await
+        .expect("http index");
+    wait_for_http_files(&http_pool, 1).await;
+
+    let (http_uuid,): (String,) = sqlx::query_as("SELECT uuid FROM files WHERE name = ?")
+        .bind("song.mp3")
+        .fetch_one(&http_pool)
+        .await
+        .unwrap();
+
+    let delete_req = Request::builder()
+        .method("DELETE")
+        .uri(format!("/v1/files/{http_uuid}"))
+        .header("authorization", "Bearer parity")
+        .body(Body::empty())
+        .unwrap();
+    let http_resp = app(Settings::default(), http_services.clone())
+        .oneshot(delete_req)
+        .await
+        .expect("http soft-delete");
+    assert_eq!(http_resp.status(), axum::http::StatusCode::OK);
+    let http_body: serde_json::Value = serde_json::from_slice(
+        &to_bytes(http_resp.into_body(), usize::MAX).await.unwrap(),
+    )
+    .unwrap();
+
+    // ---- FFI leg (own identical lib + db) ----
+    let ffi_lib = tempdir().unwrap();
+    std::fs::write(ffi_lib.path().join("song.mp3"), b"parity-audio").unwrap();
+    let ffi_dir = tempdir().unwrap();
+    let ffi_db = db_path(&ffi_dir, "ffi.sqlite");
+    let ffi_lib_path = ffi_lib.path().to_str().unwrap().to_string();
+
+    let (ffi_uuid, ffi_body) = tokio::task::spawn_blocking(move || -> (String, serde_json::Value) {
+        let cdb = CString::new(ffi_db).unwrap();
+        assert_eq!(alexandria_index_init(cdb.as_ptr()), alexandria_ffi::INDEX_OK);
+
+        let root = CString::new(ffi_lib_path).unwrap();
+        let token = CString::new("parity").unwrap();
+        let started = alexandria_index_start(root.as_ptr(), token.as_ptr());
+        assert_eq!(started.status, alexandria_ffi::INDEX_OK);
+        wait_for_ffi_files(1);
+
+        // Resolve the file's uuid via a dedicated read connection to the FFI db.
+        let ffi_db_path = std::path::PathBuf::from(ffi_dir.path()).join("ffi.sqlite");
+        let ffi_uuid = std::thread::spawn({
+            let ffi_db_path = ffi_db_path.clone();
+            move || -> String {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all().build().unwrap();
+                rt.block_on(async move {
+                    let url = format!("sqlite://{}", ffi_db_path.to_str().unwrap());
+                    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+                        .max_connections(1)
+                        .connect(&format!("{url}?mode=rw")).await.unwrap();
+                    let (uuid,): (String,) = sqlx::query_as("SELECT uuid FROM files WHERE name=?")
+                        .bind("song.mp3").fetch_one(&pool).await.unwrap();
+                    uuid
+                })
+            }
+        }).join().unwrap();
+
+        let result = alexandria_file_soft_delete(
+            CString::new(ffi_uuid.clone()).unwrap().as_ptr(),
+            token.as_ptr(),
+        );
+        assert_eq!(result.status, alexandria_ffi::FILE_OK, "ffi soft_delete failed");
+        assert!(!result.json.is_null());
+        let s = unsafe { CStr::from_ptr(result.json) }.to_str().unwrap().to_string();
+        // SAFETY: pointer came from this library and is freed once.
+        unsafe { alexandria_free_string(result.json); }
+        let ffi_body: serde_json::Value = serde_json::from_str(&s).unwrap();
+        (ffi_uuid, ffi_body)
+    })
+    .await
+    .unwrap();
+
+    // ---- compare ----
+    // `state` agrees on both surfaces (the soft-delete took effect).
+    assert_eq!(http_body["state"], "deleted", "http body reports deleted");
+    assert_eq!(ffi_body["state"], "deleted", "ffi body reports deleted");
+
+    // Both surfaces return a stamped `deletedAt` (a non-null ISO timestamp).
+    assert!(
+        http_body["deletedAt"].as_str().is_some(),
+        "http body carries deletedAt"
+    );
+    assert!(
+        ffi_body["deletedAt"].as_str().is_some(),
+        "ffi body carries deletedAt"
+    );
+
+    // `file` matches field-for-field except the per-database values `uuid`,
+    // `path`, `indexedAt`, and `deletedAt` (each leg's clock stamps its own
+    // value; parity is on the *presence* and *shape*, already asserted
+    // above).
+    let norm = |v: &serde_json::Value| -> serde_json::Value {
+        let mut f = v.clone();
+        if let Some(obj) = f.as_object_mut() {
+            obj.remove("uuid");
+            obj.remove("path");
+            obj.remove("indexedAt");
+            obj.remove("deletedAt");
+        }
+        f
+    };
+    assert_eq!(norm(&http_body), norm(&ffi_body), "File body diverges across surfaces");
+
+    // On-disk parity: the file is untouched on both legs (UC-06 does not
+    // remove the on-disk file; purge-on-disk is UC-09).
+    assert!(http_lib.path().join("song.mp3").exists(), "http on-disk file preserved");
+    assert!(ffi_lib.path().join("song.mp3").exists(), "ffi on-disk file preserved");
+    assert_eq!(
+        std::fs::read(http_lib.path().join("song.mp3")).unwrap(),
+        std::fs::read(ffi_lib.path().join("song.mp3")).unwrap(),
+        "on-disk files agree byte-for-byte across surfaces"
+    );
+
+    // Suppress unused warning while keeping the per-leg uuid visible.
+    let _ = (http_uuid, ffi_uuid);
+}
+
+/// UC-06 parity — an unauthenticated caller is rejected before its payload is
+/// parsed, on both surfaces (HTTP 401, FFI `FILE_ERR_UNAUTHORIZED`)
+/// (FR-AU-07 / SRD §7, FR-FC-24 / NFR-09).
+#[tokio::test]
+async fn given_no_token_when_soft_deleted_via_http_and_ffi_then_both_unauthorized() {
+    let _g = SERIAL.lock().unwrap();
+
+    // ---- HTTP leg ----
+    let http_dir = tempdir().unwrap();
+    let http_db = db_path(&http_dir, "http.sqlite");
+    let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    let http_services = std::sync::Arc::new(
+        build_services(&Settings::default(), http_pool.clone()).await,
+    );
+
+    let req = Request::builder()
+        .method("DELETE")
+        .uri(format!("/v1/files/{}", uuid::Uuid::new_v4()))
+        .body(Body::empty())
+        .unwrap();
+    let resp = app(Settings::default(), http_services)
+        .oneshot(req)
+        .await
+        .expect("http soft-delete");
+    assert_eq!(resp.status(), axum::http::StatusCode::UNAUTHORIZED);
+
+    // ---- FFI leg ----
+    let ffi_dir = tempdir().unwrap();
+    let ffi_db = db_path(&ffi_dir, "ffi.sqlite");
+    let (soft_delete_status, clean_uuid_status) =
+        tokio::task::spawn_blocking(move || -> (i32, i32) {
+            let cdb = CString::new(ffi_db).unwrap();
+            assert_eq!(alexandria_index_init(cdb.as_ptr()), alexandria_ffi::INDEX_OK);
+
+            // Null token => empty token => unauthenticated. Pair it with a
+            // payload that would otherwise fail to parse first (a bad uuid)
+            // so the auth check must fire before it is read.
+            let bad_uuid = CString::new("not-a-uuid").unwrap();
+            let r = alexandria_file_soft_delete(bad_uuid.as_ptr(), std::ptr::null());
+            if !r.json.is_null() {
+                // SAFETY: pointer came from this library and is freed once.
+                unsafe { alexandria_free_string(r.json); }
+            }
+            let clean_status = alexandria_ffi::FILE_ERR_UNAUTHORIZED;
+            // A second call with a clean uuid but no token still denies.
+            let ok_uuid = CString::new("11111111-1111-1111-1111-111111111111").unwrap();
+            let r2 = alexandria_file_soft_delete(ok_uuid.as_ptr(), std::ptr::null());
+            if !r2.json.is_null() {
+                unsafe { alexandria_free_string(r2.json); }
+            }
+            (r.status, if r2.status == clean_status { 1 } else { 0 })
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        soft_delete_status,
+        alexandria_ffi::FILE_ERR_UNAUTHORIZED,
+        "soft_delete must deny before parsing the uuid"
+    );
+    assert_eq!(clean_uuid_status, 1, "clean-uuid soft_delete with no token also denies");
 }

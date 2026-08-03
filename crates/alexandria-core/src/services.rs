@@ -8,6 +8,7 @@ use crate::catalog::commands::edit_metadata::EditMetadataHandler;
 use crate::catalog::commands::index::IndexHandler;
 use crate::catalog::commands::refresh::RefreshHandler;
 use crate::catalog::commands::rename::RenameFileHandler;
+use crate::catalog::commands::soft_delete::SoftDeleteFileHandler;
 use crate::catalog::fs::StdFilesystem;
 use crate::catalog::queries::browse::BrowseFilesHandler;
 use crate::catalog::repos::SqliteCatalogRepository;
@@ -29,6 +30,9 @@ pub type DefaultEditMetadataHandler =
 pub type DefaultRenameFileHandler =
     RenameFileHandler<BearerAuthService, SqliteCatalogRepository, StdFilesystem>;
 
+pub type DefaultSoftDeleteFileHandler =
+    SoftDeleteFileHandler<BearerAuthService, SqliteCatalogRepository, SystemClock>;
+
 pub type DefaultBrowseFilesHandler =
     BrowseFilesHandler<BearerAuthService, SqliteCatalogRepository>;
 
@@ -38,6 +42,7 @@ pub struct Services {
     pub refresh_handler: Arc<DefaultRefreshHandler>,
     pub edit_metadata_handler: Arc<DefaultEditMetadataHandler>,
     pub rename_file_handler: Arc<DefaultRenameFileHandler>,
+    pub soft_delete_file_handler: Arc<DefaultSoftDeleteFileHandler>,
     pub browse_files_handler: Arc<DefaultBrowseFilesHandler>,
     /// The same auth service the handlers hold, exposed so a transport can
     /// reject an unauthenticated caller *before* it parses a request body or
@@ -60,12 +65,14 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
     let refresh_handler = Arc::new(RefreshHandler::new(auth, repo.clone(), fs, clock));
     let edit_metadata_handler = Arc::new(EditMetadataHandler::new(auth, repo.clone()));
     let rename_file_handler = Arc::new(RenameFileHandler::new(auth, repo.clone(), fs));
+    let soft_delete_file_handler = Arc::new(SoftDeleteFileHandler::new(auth, repo.clone(), clock));
     let browse_files_handler = Arc::new(BrowseFilesHandler::new(auth, repo));
     Services {
         index_handler,
         refresh_handler,
         edit_metadata_handler,
         rename_file_handler,
+        soft_delete_file_handler,
         browse_files_handler,
         auth,
         pool,
