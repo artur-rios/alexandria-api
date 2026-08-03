@@ -1223,3 +1223,155 @@ async fn given_soft_deleted_file_when_delete_file_then_409() {
         .expect("delete one-shot");
     assert_eq!(response.status(), StatusCode::CONFLICT);
 }
+
+// ---------------------------------------------------------------------------
+// UC-07: POST /v1/files/{uuid}/restore (FR-FC-21, FR-FC-24)
+// ---------------------------------------------------------------------------
+
+fn restore_file_request(uuid: &str) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri(format!("/v1/files/{uuid}/restore"))
+        .header("authorization", "Bearer test-token")
+        .body(Body::empty())
+        .unwrap()
+}
+
+#[tokio::test]
+async fn given_soft_deleted_file_when_restore_file_then_200_and_state_active_in_catalog() {
+    let lib = tempdir().unwrap();
+    let on_disk = common::write_file(&lib, "song.mp3", b"audio bytes");
+    let test = test_app().await;
+    index_library(&lib, &test.pool, &[("song.mp3", b"audio bytes")]).await;
+    let uuid = uuid_for_name(&test.pool, "song.mp3").await;
+
+    // Seed a soft-deleted row whose `deleted_at` is comfortably within the
+    // default 30-day retention window (one day ago). The handler must accept
+    // it; unit tests cover the exact-boundary case with a FixedClock.
+    sqlx::query("UPDATE files SET state = 'deleted', deleted_at = ? WHERE uuid = ?")
+        .bind(chrono::Utc::now() - chrono::Duration::days(1))
+        .bind(&uuid)
+        .execute(&test.pool)
+        .await
+        .expect("soft-delete seed");
+
+    let response = app(Settings::default(), test.services)
+        .oneshot(restore_file_request(&uuid))
+        .await
+        .expect("restore one-shot");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body: Value = serde_json::from_slice(
+        &to_bytes(response.into_body(), usize::MAX).await.unwrap(),
+    )
+    .unwrap();
+    assert_eq!(body["uuid"], uuid);
+    assert_eq!(body["state"], "active");
+    assert!(
+        body["deletedAt"].is_null(),
+        "deletedAt is cleared on the response"
+    );
+
+    // Catalog row carries state=active and cleared deleted_at.
+    let row: (String, Option<String>) =
+        sqlx::query_as("SELECT state, deleted_at FROM files WHERE uuid = ?")
+            .bind(&uuid)
+            .fetch_one(&test.pool)
+            .await
+            .expect("catalog row");
+    assert_eq!(row.0, "active");
+    assert!(row.1.is_none(), "deleted_at cleared in the catalog");
+
+    // The on-disk file is untouched (UC-07 leaves it; purge-on-disk is UC-09).
+    assert!(on_disk.exists(), "on-disk file preserved by restore");
+}
+
+#[tokio::test]
+async fn given_missing_uuid_when_restore_file_then_404() {
+    let test = test_app().await;
+    let missing = uuid::Uuid::new_v4().to_string();
+    let response = app(Settings::default(), test.services)
+        .oneshot(restore_file_request(&missing))
+        .await
+        .expect("restore one-shot");
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn given_no_bearer_when_restore_file_then_401() {
+    let test = test_app().await;
+    let uuid = uuid::Uuid::new_v4().to_string();
+    let request = Request::builder()
+        .method("POST")
+        .uri(format!("/v1/files/{uuid}/restore"))
+        .body(Body::empty())
+        .unwrap();
+    let response = app(Settings::default(), test.services).oneshot(request).await.expect("one-shot");
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn given_no_bearer_and_malformed_uuid_when_restore_file_then_401_not_400() {
+    // Auth must be decided before the path is parsed (FR-AU-07 / SRD §7): a
+    // malformed uuid alone cannot turn a 401 into a 400.
+    let test = test_app().await;
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/files/not-a-uuid/restore")
+        .body(Body::empty())
+        .unwrap();
+    let response = app(Settings::default(), test.services).oneshot(request).await.expect("one-shot");
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn given_active_file_when_restore_file_then_409() {
+    let lib = tempdir().unwrap();
+    common::write_file(&lib, "song.mp3", b"x");
+    let test = test_app().await;
+    index_library(&lib, &test.pool, &[("song.mp3", b"x")]).await;
+    let uuid = uuid_for_name(&test.pool, "song.mp3").await;
+
+    // Indexed but never soft-deleted — `state = 'active'` (AF-02 not-deleted).
+    let response = app(Settings::default(), test.services)
+        .oneshot(restore_file_request(&uuid))
+        .await
+        .expect("restore one-shot");
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn given_soft_deleted_file_past_retention_when_restore_file_then_404() {
+    // AF-01: a record past the configured retention window is reported as
+    // not-found (UC-08 owns the actual hard purge; before it runs the row
+    // still exists, so the elapsed check is what UC-07 surfaces as 404).
+    let lib = tempdir().unwrap();
+    common::write_file(&lib, "song.mp3", b"x");
+    let test = test_app().await;
+    index_library(&lib, &test.pool, &[("song.mp3", b"x")]).await;
+    let uuid = uuid_for_name(&test.pool, "song.mp3").await;
+
+    // `deleted_at` well before the 30-day default retention window.
+    sqlx::query("UPDATE files SET state = 'deleted', deleted_at = ? WHERE uuid = ?")
+        .bind("2024-01-01T00:00:00Z")
+        .bind(&uuid)
+        .execute(&test.pool)
+        .await
+        .expect("past-retention seed");
+
+    let response = app(Settings::default(), test.services)
+        .oneshot(restore_file_request(&uuid))
+        .await
+        .expect("restore one-shot");
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+    // The catalog row is unchanged: still deleted, still past retention.
+    let row: (String, Option<String>) =
+        sqlx::query_as("SELECT state, deleted_at FROM files WHERE uuid = ?")
+            .bind(&uuid)
+            .fetch_one(&test.pool)
+            .await
+            .expect("catalog row");
+    assert_eq!(row.0, "deleted");
+    assert!(row.1.is_some(), "deleted_at unchanged by past-retention restore");
+}

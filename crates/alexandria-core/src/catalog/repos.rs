@@ -96,6 +96,17 @@ pub trait CatalogRepository: Send + Sync {
         uuid: Uuid,
         deleted_at: DateTime<Utc>,
     ) -> Result<File, DomainError>;
+
+    /// Restore a soft-deleted file (UC-07 / FR-FC-21). Sets the row's `state`
+    /// back to `'active'` and clears `deleted_at`; the on-disk file is
+    /// untouched (only the catalog row changes). The caller is responsible
+    /// for confirming the file is still restorable (the handler verifies the
+    /// retention window has not elapsed and rejects a non-`deleted` row with
+    /// `InvalidState`); the repository defends the `NotFound` invariant.
+    ///
+    /// Returns the re-read `File` (so the caller sees the exact persisted
+    /// `state`/`deleted_at`) or `NotFound` when no row carries the UUID.
+    async fn restore(&self, uuid: Uuid) -> Result<File, DomainError>;
 }
 
 #[derive(Clone)]
@@ -652,6 +663,43 @@ impl CatalogRepository for SqliteCatalogRepository {
         self.find_by_uuid(uuid).await?.ok_or_else(|| {
             DomainError::internal(format!(
                 "soft_delete: row disappeared after update for uuid {uuid}"
+            ))
+        })
+    }
+
+    async fn restore(&self, uuid: Uuid) -> Result<File, DomainError> {
+        let mut tx = self.pool.begin().await?;
+
+        // Resolve the file's internal id so a missing uuid is NotFound, not
+        // a zero-row UPDATE that the caller could mistake for success. This
+        // mirrors `soft_delete`: the handler has already verified the row is
+        // in `deleted` state and within retention.
+        let (id,): (i64,) = sqlx::query_as("SELECT id FROM files WHERE uuid = ?")
+            .bind(uuid.to_string())
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or(DomainError::NotFound)?;
+
+        let affected = sqlx::query("UPDATE files SET state = 'active', deleted_at = NULL WHERE id = ?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        if affected == 0 {
+            return Err(DomainError::internal(format!(
+                "restore matched zero rows for uuid {uuid}"
+            )));
+        }
+
+        tx.commit().await?;
+        let _ = id;
+
+        // Re-read through `find_by_uuid` so the returned `File` carries the
+        // exact persisted values (parsed via the single `parse_file_row`
+        // path) — no second source of truth for the row shape.
+        self.find_by_uuid(uuid).await?.ok_or_else(|| {
+            DomainError::internal(format!(
+                "restore: row disappeared after update for uuid {uuid}"
             ))
         })
     }

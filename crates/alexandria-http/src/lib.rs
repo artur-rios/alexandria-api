@@ -45,6 +45,10 @@ pub fn app(settings: Settings, services: Arc<Services>) -> Router {
             "/v1/files/{uuid}",
             delete(routes::soft_delete::soft_delete),
         )
+        .route(
+            "/v1/files/{uuid}/restore",
+            post(routes::restore::restore),
+        )
         .route_layer(from_fn_with_state(
             state.clone(),
             middleware::auth::require_auth,
