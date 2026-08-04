@@ -71,6 +71,11 @@ pub struct FakeCatalogRepository {
     /// UC-07 (no on-disk leg to compensate — the handler surfaces the error
     /// and the catalog row is left `deleted` because the fake never wrote it).
     failing_restore_uuids: Arc<Mutex<std::collections::HashSet<Uuid>>>,
+    /// UUIDs whose `purge` must fail, simulating a catalog-write failure in
+    /// UC-08 (no on-disk leg to compensate — the handler surfaces the error
+    /// and the catalog row is left `deleted` because the fake never removed
+    /// it).
+    failing_purge_uuids: Arc<Mutex<std::collections::HashSet<Uuid>>>,
 }
 
 impl FakeCatalogRepository {
@@ -149,6 +154,14 @@ impl FakeCatalogRepository {
     /// and the row stays `deleted`.
     pub fn fail_restore(&self, uuid: Uuid) {
         self.failing_restore_uuids.lock().unwrap().insert(uuid);
+    }
+
+    /// Make `purge` return an `Internal` error for `uuid`, simulating a
+    /// catalog-write failure in UC-08. As with `restore` there is no on-disk
+    /// leg to compensate, so the handler merely surfaces the error and the
+    /// row stays present.
+    pub fn fail_purge(&self, uuid: Uuid) {
+        self.failing_purge_uuids.lock().unwrap().insert(uuid);
     }
 }
 
@@ -344,6 +357,20 @@ impl CatalogRepository for FakeCatalogRepository {
         entry.state = FileState::Active;
         entry.deleted_at = None;
         Ok(entry.clone())
+    }
+
+    async fn purge(&self, uuid: Uuid) -> Result<(), DomainError> {
+        let mut files = self.files.lock().unwrap();
+        let file = files
+            .values()
+            .find(|f| f.uuid == uuid)
+            .cloned()
+            .ok_or(DomainError::NotFound)?;
+        if self.failing_purge_uuids.lock().unwrap().contains(&uuid) {
+            return Err(DomainError::internal("fake purge failure"));
+        }
+        files.remove(&file.path);
+        Ok(())
     }
 }
 

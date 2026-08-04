@@ -107,6 +107,13 @@ pub trait CatalogRepository: Send + Sync {
     /// Returns the re-read `File` (so the caller sees the exact persisted
     /// `state`/`deleted_at`) or `NotFound` when no row carries the UUID.
     async fn restore(&self, uuid: Uuid) -> Result<File, DomainError>;
+
+    /// Hard-purge a file record (UC-08 / FR-FC-22). Permanently removes the
+    /// `files` row and its subtype row; the on-disk file is untouched (NFR-07).
+    /// The caller is responsible for confirming the file is `deleted` and past
+    /// its retention window (the handler enforces both, rejecting otherwise
+    /// with `InvalidState`); the repository defends the `NotFound` invariant.
+    async fn purge(&self, uuid: Uuid) -> Result<(), DomainError>;
 }
 
 #[derive(Clone)]
@@ -128,6 +135,21 @@ impl SqliteCatalogRepository {
             FileType::Document => "INSERT INTO documents (file_id) VALUES (?)",
             FileType::Comic => "INSERT INTO comic_books (file_id) VALUES (?)",
             FileType::Image => "INSERT INTO images (file_id) VALUES (?)",
+        }
+    }
+
+    /// The subtype row is deleted explicitly (not via `ON DELETE CASCADE`) —
+    /// the FK constraints exist in the schema but nothing pins
+    /// `PRAGMA foreign_keys = ON`, so cascade cannot be relied on (UC-08).
+    fn delete_subtype_sql(file_type: FileType) -> &'static str {
+        match file_type {
+            FileType::Audio => "DELETE FROM audio_files WHERE file_id = ?",
+            FileType::Video => "DELETE FROM video_files WHERE file_id = ?",
+            FileType::Html => "DELETE FROM html_pages WHERE file_id = ?",
+            FileType::Text => "DELETE FROM text_files WHERE file_id = ?",
+            FileType::Document => "DELETE FROM documents WHERE file_id = ?",
+            FileType::Comic => "DELETE FROM comic_books WHERE file_id = ?",
+            FileType::Image => "DELETE FROM images WHERE file_id = ?",
         }
     }
 }
@@ -702,6 +724,42 @@ impl CatalogRepository for SqliteCatalogRepository {
                 "restore: row disappeared after update for uuid {uuid}"
             ))
         })
+    }
+
+    async fn purge(&self, uuid: Uuid) -> Result<(), DomainError> {
+        let mut tx = self.pool.begin().await?;
+
+        // Resolve the file's internal id and type so a missing uuid is
+        // NotFound, not a zero-row DELETE the caller could mistake for
+        // success. The handler has already verified the row is `deleted`
+        // and past retention.
+        let (id, type_str): (i64, String) =
+            sqlx::query_as("SELECT id, type FROM files WHERE uuid = ?")
+                .bind(uuid.to_string())
+                .fetch_optional(&mut *tx)
+                .await?
+                .ok_or(DomainError::NotFound)?;
+
+        let file_type = parse_type_str(&type_str)?;
+
+        sqlx::query(Self::delete_subtype_sql(file_type))
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+
+        let affected = sqlx::query("DELETE FROM files WHERE id = ?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        if affected == 0 {
+            return Err(DomainError::internal(format!(
+                "purge matched zero rows for uuid {uuid}"
+            )));
+        }
+
+        tx.commit().await?;
+        Ok(())
     }
 }
 
