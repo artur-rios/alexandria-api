@@ -5,7 +5,8 @@ use axum::Json;
 use serde::Deserialize;
 use uuid::Uuid;
 
-use alexandria_core::collections::model::{Collection, CollectionKind};
+use alexandria_core::collections::model::{Collection, CollectionItemsResult, CollectionKind};
+use alexandria_core::errors::DomainError;
 
 use crate::middleware::auth::invalid_input;
 use crate::middleware::error::ApiError;
@@ -119,6 +120,55 @@ pub async fn delete(
         .services
         .delete_collection_handler
         .delete(uuid, &token)
+        .await
+        .map_err(ApiError)?;
+
+    Ok((StatusCode::OK, Json(result)))
+}
+
+/// Request body for `POST /v1/collections/{uuid}/items` (UC-13 / FR-CO-05):
+/// the item UUIDs to add. Required and must be non-empty — an absent or
+/// empty list is rejected as invalid input, matching the FFI surface's
+/// handling of the same payload (FR-FC-24 / NFR-09).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AddItemsRequest {
+    pub item_uuids: Vec<Uuid>,
+}
+
+/// `POST /v1/collections/{uuid}/items` — add items to a collection (UC-13 /
+/// FR-CO-05). The body carries `itemUuids`; the handler verifies every item
+/// exists and matches the collection's `kind` before linking any of them.
+/// Returns `200` with the linked `collectionUuid` and `itemUuids`, or `400`
+/// (an item's type does not match the collection's kind), `404` (the
+/// collection or an item does not exist), or `401` (unauthenticated). Both
+/// the HTTP and FFI surfaces call the same core handler so the two stay at
+/// parity (FR-FC-24 / NFR-09).
+///
+/// The path and body are taken as `Result` so their rejections become this
+/// surface's `400` + `{"error": …}` envelope rather than axum's bare-text
+/// `422`/`400`.
+pub async fn add_items(
+    State(state): State<AppState>,
+    uuid: Result<Path<Uuid>, PathRejection>,
+    headers: HeaderMap,
+    body: Result<Json<AddItemsRequest>, JsonRejection>,
+) -> Result<(StatusCode, Json<CollectionItemsResult>), ApiError> {
+    let token = bearer_token(&headers);
+
+    let Path(uuid) = uuid.map_err(|_| invalid_input("path segment is not a valid UUID"))?;
+    let Json(request) =
+        body.map_err(|err| invalid_input(format!("invalid add items body: {err}")))?;
+    if request.item_uuids.is_empty() {
+        return Err(ApiError(DomainError::InvalidInput(
+            "itemUuids must not be empty".into(),
+        )));
+    }
+
+    let result = state
+        .services
+        .add_items_to_collection_handler
+        .add(uuid, request.item_uuids, &token)
         .await
         .map_err(ApiError)?;
 

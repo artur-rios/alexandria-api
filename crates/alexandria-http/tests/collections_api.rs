@@ -405,12 +405,13 @@ async fn seed_linked_file(pool: &SqlitePool, collection_uuid: &str) -> String {
     let file_uuid = uuid::Uuid::new_v4().to_string();
     sqlx::query(
         "INSERT INTO files (uuid, path, name, type, content_hash, indexed_at, collection_id) \
-         VALUES (?, ?, ?, 'text', 'hash', datetime('now'), \
+         VALUES (?, ?, ?, 'text', 'hash', ?, \
          (SELECT id FROM collections WHERE uuid = ?))",
     )
     .bind(&file_uuid)
     .bind(format!("/lib/{file_uuid}.txt"))
     .bind("note.txt")
+    .bind(chrono::Utc::now().to_rfc3339())
     .bind(collection_uuid)
     .execute(pool)
     .await
@@ -502,4 +503,248 @@ async fn given_no_token_when_deleted_then_401_and_collection_kept() {
 
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     assert_eq!(collection_rows(&test.pool).await.len(), 1);
+}
+
+// ==================== UC-13: Add items to a collection ====================
+
+fn add_items_request(uuid: &str, body: Value) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri(format!("/v1/collections/{uuid}/items"))
+        .header("authorization", "Bearer test-token")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap()
+}
+
+fn unauthenticated_add_items_request(uuid: &str, body: Value) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri(format!("/v1/collections/{uuid}/items"))
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap()
+}
+
+/// Insert a minimal, unlinked `files` row and return its uuid.
+async fn seed_standalone_file(pool: &SqlitePool) -> String {
+    let file_uuid = uuid::Uuid::new_v4().to_string();
+    sqlx::query(
+        "INSERT INTO files (uuid, path, name, type, content_hash, indexed_at) \
+         VALUES (?, ?, ?, 'text', 'hash', ?)",
+    )
+    .bind(&file_uuid)
+    .bind(format!("/lib/{file_uuid}.txt"))
+    .bind("note.txt")
+    .bind(chrono::Utc::now().to_rfc3339())
+    .execute(pool)
+    .await
+    .expect("seed standalone file");
+    file_uuid
+}
+
+/// Create a `kind: bookmark` collection via the router and return its uuid.
+async fn create_bookmark_collection(router: axum::Router, name: &str) -> (axum::Router, String) {
+    let response = router
+        .clone()
+        .oneshot(create_request(json!({ "name": name, "kind": "bookmark" })))
+        .await
+        .expect("create bookmark collection");
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let uuid = body_json(response).await["uuid"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    (router, uuid)
+}
+
+/// Create a bookmark via the router and return its uuid.
+async fn create_bookmark(router: axum::Router, url: &str, title: &str) -> (axum::Router, String) {
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/bookmarks")
+                .header("authorization", "Bearer test-token")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({ "url": url, "title": title }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .expect("create bookmark");
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let uuid = body_json(response).await["uuid"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    (router, uuid)
+}
+
+// ---------------- Main flow ----------------
+
+#[tokio::test]
+async fn given_file_collection_and_existing_files_when_posted_then_200_and_files_linked() {
+    let test = test_app().await;
+    let router = app(Settings::default(), test.services.clone());
+    let (router, collection_uuid) = create_collection(router, "My files").await;
+    let file_uuid = seed_standalone_file(&test.pool).await;
+
+    let response = router
+        .oneshot(add_items_request(
+            &collection_uuid,
+            json!({ "itemUuids": [file_uuid] }),
+        ))
+        .await
+        .expect("add items");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_json(response).await;
+    assert_eq!(body["collectionUuid"], collection_uuid);
+    assert_eq!(body["itemUuids"], json!([file_uuid]));
+
+    let (linked_collection_id, collection_id): (Option<i64>, i64) = {
+        let linked: Option<i64> =
+            sqlx::query_scalar("SELECT collection_id FROM files WHERE uuid = ?")
+                .bind(&file_uuid)
+                .fetch_one(&test.pool)
+                .await
+                .unwrap();
+        let cid: i64 = sqlx::query_scalar("SELECT id FROM collections WHERE uuid = ?")
+            .bind(&collection_uuid)
+            .fetch_one(&test.pool)
+            .await
+            .unwrap();
+        (linked, cid)
+    };
+    assert_eq!(linked_collection_id, Some(collection_id));
+}
+
+#[tokio::test]
+async fn given_bookmark_collection_and_existing_bookmark_when_posted_then_200_and_bookmark_linked()
+{
+    let test = test_app().await;
+    let router = app(Settings::default(), test.services.clone());
+    let (router, collection_uuid) = create_bookmark_collection(router, "Reading list").await;
+    let (router, bookmark_uuid) = create_bookmark(router, "https://example.com", "Example").await;
+
+    let response = router
+        .oneshot(add_items_request(
+            &collection_uuid,
+            json!({ "itemUuids": [bookmark_uuid] }),
+        ))
+        .await
+        .expect("add items");
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let linked: Option<i64> =
+        sqlx::query_scalar("SELECT collection_id FROM bookmarks WHERE uuid = ?")
+            .bind(&bookmark_uuid)
+            .fetch_one(&test.pool)
+            .await
+            .unwrap();
+    assert!(linked.is_some());
+}
+
+// ---------------- AF-01: item type does not match collection kind ----------------
+
+#[tokio::test]
+async fn given_bookmark_item_for_file_collection_when_posted_then_400_and_nothing_linked() {
+    let test = test_app().await;
+    let router = app(Settings::default(), test.services.clone());
+    let (router, collection_uuid) = create_collection(router, "My files").await;
+    let (router, bookmark_uuid) = create_bookmark(router, "https://example.com", "Example").await;
+
+    let response = router
+        .oneshot(add_items_request(
+            &collection_uuid,
+            json!({ "itemUuids": [bookmark_uuid] }),
+        ))
+        .await
+        .expect("add items");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let linked: Option<i64> =
+        sqlx::query_scalar("SELECT collection_id FROM bookmarks WHERE uuid = ?")
+            .bind(&bookmark_uuid)
+            .fetch_one(&test.pool)
+            .await
+            .unwrap();
+    assert_eq!(linked, None);
+}
+
+// ---------------- AF-02: referenced item does not exist ----------------
+
+#[tokio::test]
+async fn given_unknown_item_uuid_when_posted_then_404() {
+    let test = test_app().await;
+    let router = app(Settings::default(), test.services);
+    let (router, collection_uuid) = create_collection(router, "My files").await;
+
+    let response = router
+        .oneshot(add_items_request(
+            &collection_uuid,
+            json!({ "itemUuids": [uuid::Uuid::new_v4().to_string()] }),
+        ))
+        .await
+        .expect("add items");
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn given_empty_item_uuids_when_posted_then_400() {
+    let test = test_app().await;
+    let router = app(Settings::default(), test.services);
+    let (router, collection_uuid) = create_collection(router, "My files").await;
+
+    let response = router
+        .oneshot(add_items_request(
+            &collection_uuid,
+            json!({ "itemUuids": [] }),
+        ))
+        .await
+        .expect("add items");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+// ---------------- AF-03: collection does not exist ----------------
+
+#[tokio::test]
+async fn given_unknown_collection_uuid_when_posted_then_404() {
+    let test = test_app().await;
+    let router = app(Settings::default(), test.services);
+
+    let response = router
+        .oneshot(add_items_request(
+            &uuid::Uuid::new_v4().to_string(),
+            json!({ "itemUuids": [uuid::Uuid::new_v4().to_string()] }),
+        ))
+        .await
+        .expect("add items");
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+// ---------------- AF-04: unauthorized ----------------
+
+#[tokio::test]
+async fn given_no_token_when_posted_items_then_401() {
+    let test = test_app().await;
+    let router = app(Settings::default(), test.services);
+    let (router, collection_uuid) = create_collection(router, "My files").await;
+
+    let response = router
+        .oneshot(unauthenticated_add_items_request(
+            &collection_uuid,
+            json!({ "itemUuids": [uuid::Uuid::new_v4().to_string()] }),
+        ))
+        .await
+        .expect("add items");
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 }
