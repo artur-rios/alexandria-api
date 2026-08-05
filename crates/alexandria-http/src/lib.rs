@@ -72,6 +72,10 @@ pub fn app(settings: Settings, services: Arc<Services>) -> Router {
             "/v1/watchlists/{uuid}/items",
             post(routes::watchlists::add_video),
         )
+        .route(
+            "/v1/watchlists/{uuid}/items/{video_uuid}",
+            patch(routes::watchlists::update_progress),
+        )
         .route_layer(from_fn_with_state(
             state.clone(),
             middleware::auth::require_auth,

@@ -9,3 +9,6 @@ mod add_video;
 
 #[path = "watchlists/browse.rs"]
 mod browse;
+
+#[path = "watchlists/update_progress.rs"]
+mod update_progress;

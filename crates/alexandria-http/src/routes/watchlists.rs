@@ -6,7 +6,9 @@ use serde::Deserialize;
 use uuid::Uuid;
 
 use alexandria_core::errors::DomainError;
-use alexandria_core::watchlists::model::{WatchProgress, Watchlist, WatchlistWithProgress};
+use alexandria_core::watchlists::model::{
+    WatchProgress, WatchState, Watchlist, WatchlistWithProgress,
+};
 
 use crate::middleware::auth::invalid_input;
 use crate::middleware::error::ApiError;
@@ -136,4 +138,64 @@ pub async fn list(
         .map_err(ApiError)?;
 
     Ok(Json(result))
+}
+
+/// Request body for `PATCH /v1/watchlists/{uuid}/items/{videoUuid}` (UC-23 /
+/// FR-WL-04, FR-WL-05): the new `state`, and optionally `currentEpisode` /
+/// `totalEpisodes` for a series. Full replace, not a merge — an absent
+/// episode field clears it. `state` is required and must be a recognised
+/// `WatchState` — an absent or unrecognised value is rejected as invalid
+/// input, matching the FFI surface's handling of the same payload
+/// (FR-FC-24 / NFR-09).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateWatchProgressRequest {
+    pub state: String,
+    pub current_episode: Option<i64>,
+    pub total_episodes: Option<i64>,
+}
+
+/// `PATCH /v1/watchlists/{uuid}/items/{videoUuid}` — update watch progress
+/// (UC-23 / FR-WL-04, FR-WL-05). The body carries the new `state` and,
+/// optionally, the current/total episode for a series; the handler validates
+/// the transition (`Pending` → `Watching` → `Watched`, one step at a time)
+/// before applying it. Returns `200` with the updated `WatchProgress`, or
+/// `400` (unrecognised `state`), `404` (the video is not on that watchlist,
+/// AF-02), `409` (invalid transition, AF-01), or `401` (unauthenticated).
+/// Both the HTTP and FFI surfaces call the same core handler so the two stay
+/// at parity (FR-FC-24 / NFR-09).
+///
+/// The path and body are taken as `Result` so their rejections become this
+/// surface's `400` + `{"error": …}` envelope rather than axum's bare-text
+/// `422`/`400`.
+pub async fn update_progress(
+    State(state): State<AppState>,
+    uuids: Result<Path<(Uuid, Uuid)>, PathRejection>,
+    headers: HeaderMap,
+    body: Result<Json<UpdateWatchProgressRequest>, JsonRejection>,
+) -> Result<(StatusCode, Json<WatchProgress>), ApiError> {
+    let token = bearer_token(&headers);
+
+    let Path((watchlist_uuid, video_uuid)) =
+        uuids.map_err(|_| invalid_input("path segment is not a valid UUID"))?;
+    let Json(request) =
+        body.map_err(|err| invalid_input(format!("invalid update progress body: {err}")))?;
+    let new_state = WatchState::parse(&request.state)
+        .ok_or_else(|| invalid_input(format!("unknown state: {}", request.state)))?;
+
+    let result = state
+        .services
+        .update_watch_progress_handler
+        .update(
+            watchlist_uuid,
+            video_uuid,
+            new_state,
+            request.current_episode,
+            request.total_episodes,
+            &token,
+        )
+        .await
+        .map_err(ApiError)?;
+
+    Ok((StatusCode::OK, Json(result)))
 }

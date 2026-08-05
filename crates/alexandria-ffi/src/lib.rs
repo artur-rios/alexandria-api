@@ -1987,6 +1987,109 @@ pub extern "C" fn alexandria_watchlists_list(
     }
 }
 
+/// Request body accepted by `alexandria_watchlist_update_progress` — the
+/// same JSON `PATCH /v1/watchlists/{uuid}/items/{videoUuid}` takes:
+/// `{"state":"…","currentEpisode":…,"totalEpisodes":…}` (episode fields
+/// optional/nullable; absent or null clears them).
+#[derive(Debug)]
+struct UpdateWatchProgressBody {
+    state: String,
+    current_episode: Option<i64>,
+    total_episodes: Option<i64>,
+}
+
+impl UpdateWatchProgressBody {
+    fn from_json_str(s: &str) -> Option<Self> {
+        let value: serde_json::Value = serde_json::from_str(s).ok()?;
+        let obj = value.as_object()?;
+        Some(Self {
+            state: obj.get("state")?.as_str()?.to_string(),
+            current_episode: obj.get("currentEpisode").and_then(|v| v.as_i64()),
+            total_episodes: obj.get("totalEpisodes").and_then(|v| v.as_i64()),
+        })
+    }
+}
+
+/// Update watch progress (UC-23 / FR-WL-04, FR-WL-05).
+///
+/// `watchlist_uuid` and `video_uuid` are the watchlist's and video's public
+/// UUIDs (NUL-terminated strings). `json_body` is the JSON body HTTP would
+/// send (`state`, optional `currentEpisode`/`totalEpisodes`). On success
+/// `json` carries the updated `WatchProgress` — byte-for-byte the same shape
+/// HTTP returns from `PATCH /v1/watchlists/{uuid}/items/{videoUuid}`
+/// (parity, FR-FC-24 / NFR-09). `token` is the bearer auth token.
+#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
+#[no_mangle]
+pub extern "C" fn alexandria_watchlist_update_progress(
+    watchlist_uuid: *const c_char,
+    video_uuid: *const c_char,
+    json_body: *const c_char,
+    token: *const c_char,
+) -> WatchlistJsonResult {
+    let services = match services_slot().lock().unwrap().clone() {
+        Some(s) => s,
+        None => return WatchlistJsonResult::err(WATCHLIST_ERR_NOT_INITIALIZED),
+    };
+
+    let token = cstr_lossy(token).unwrap_or_default();
+    if !authenticated(&services, &token) {
+        return WatchlistJsonResult::err(WATCHLIST_ERR_UNAUTHORIZED);
+    }
+
+    let watchlist_uuid_str = match cstr_lossy(watchlist_uuid) {
+        Some(s) => s,
+        None => return WatchlistJsonResult::err(WATCHLIST_ERR_INVALID_INPUT),
+    };
+    let watchlist_uuid = match uuid::Uuid::parse_str(&watchlist_uuid_str) {
+        Ok(u) => u,
+        Err(_) => return WatchlistJsonResult::err(WATCHLIST_ERR_INVALID_INPUT),
+    };
+
+    let video_uuid_str = match cstr_lossy(video_uuid) {
+        Some(s) => s,
+        None => return WatchlistJsonResult::err(WATCHLIST_ERR_INVALID_INPUT),
+    };
+    let video_uuid = match uuid::Uuid::parse_str(&video_uuid_str) {
+        Ok(u) => u,
+        Err(_) => return WatchlistJsonResult::err(WATCHLIST_ERR_INVALID_INPUT),
+    };
+
+    let body_str = match cstr_lossy(json_body) {
+        Some(s) => s,
+        None => return WatchlistJsonResult::err(WATCHLIST_ERR_INVALID_INPUT),
+    };
+    let body = match UpdateWatchProgressBody::from_json_str(&body_str) {
+        Some(b) => b,
+        None => return WatchlistJsonResult::err(WATCHLIST_ERR_INVALID_INPUT),
+    };
+    let new_state = match alexandria_core::watchlists::model::WatchState::parse(&body.state) {
+        Some(s) => s,
+        None => return WatchlistJsonResult::err(WATCHLIST_ERR_INVALID_INPUT),
+    };
+
+    let result = runtime().block_on(async {
+        services
+            .update_watch_progress_handler
+            .update(
+                watchlist_uuid,
+                video_uuid,
+                new_state,
+                body.current_episode,
+                body.total_episodes,
+                &token,
+            )
+            .await
+    });
+
+    match result {
+        Ok(progress) => {
+            let json = serde_json::to_string(&progress).unwrap_or_default();
+            WatchlistJsonResult::ok(json)
+        }
+        Err(err) => map_watchlist_err(err),
+    }
+}
+
 fn parse_file_type(s: &str) -> Option<alexandria_core::catalog::model::FileType> {
     use alexandria_core::catalog::model::FileType;
     match s {

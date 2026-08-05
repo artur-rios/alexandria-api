@@ -1074,4 +1074,39 @@ impl WatchlistRepository for FakeWatchlistRepository {
             });
         Ok(entry.clone())
     }
+
+    async fn find_progress(
+        &self,
+        watchlist_uuid: Uuid,
+        video_uuid: Uuid,
+    ) -> Result<Option<WatchProgress>, DomainError> {
+        Ok(self
+            .progress
+            .lock()
+            .unwrap()
+            .get(&(watchlist_uuid, video_uuid))
+            .cloned())
+    }
+
+    async fn update_progress(
+        &self,
+        watchlist_uuid: Uuid,
+        video_uuid: Uuid,
+        state: WatchState,
+        current_episode: Option<i64>,
+        total_episodes: Option<i64>,
+    ) -> Result<WatchProgress, DomainError> {
+        let updated = WatchProgress {
+            watchlist_uuid,
+            video_uuid,
+            state,
+            current_episode,
+            total_episodes,
+        };
+        self.progress
+            .lock()
+            .unwrap()
+            .insert((watchlist_uuid, video_uuid), updated.clone());
+        Ok(updated)
+    }
 }
