@@ -27,7 +27,10 @@ fn index_request(root: &str) -> Request<Body> {
     Request::builder()
         .method("POST")
         .uri("/v1/index")
-        .header("authorization", "Bearer test-token")
+        .header(
+            "authorization",
+            format!("Bearer {}", common::TEST_TOKEN).as_str(),
+        )
         .header("content-type", "application/json")
         .body(Body::from(json!({ "root": root }).to_string()))
         .unwrap()
@@ -37,7 +40,10 @@ fn refresh_request() -> Request<Body> {
     Request::builder()
         .method("POST")
         .uri("/v1/index/refresh")
-        .header("authorization", "Bearer test-token")
+        .header(
+            "authorization",
+            format!("Bearer {}", common::TEST_TOKEN).as_str(),
+        )
         .body(Body::empty())
         .unwrap()
 }
@@ -258,7 +264,10 @@ fn patch_metadata(uuid: &str, body: Value) -> Request<Body> {
     Request::builder()
         .method("PATCH")
         .uri(format!("/v1/files/{uuid}/metadata"))
-        .header("authorization", "Bearer test-token")
+        .header(
+            "authorization",
+            format!("Bearer {}", common::TEST_TOKEN).as_str(),
+        )
         .header("content-type", "application/json")
         .body(Body::from(body.to_string()))
         .unwrap()
@@ -470,8 +479,10 @@ async fn index_library(
     for (name, bytes) in names {
         common::write_file(lib, name, bytes);
     }
+    let mut settings = Settings::default();
+    settings.auth.mode = alexandria_core::config::AuthMode::Local;
     let services = std::sync::Arc::new(
-        alexandria_core::services::build_services(&Settings::default(), pool.clone()).await,
+        alexandria_core::services::build_services(&settings, pool.clone()).await,
     );
     let _ = app(Settings::default(), services)
         .oneshot(index_request(lib.path().to_str().unwrap()))
@@ -484,7 +495,10 @@ fn get_files(uri: &str) -> Request<Body> {
     Request::builder()
         .method("GET")
         .uri(uri)
-        .header("authorization", "Bearer test-token")
+        .header(
+            "authorization",
+            format!("Bearer {}", common::TEST_TOKEN).as_str(),
+        )
         .body(Body::empty())
         .unwrap()
 }
@@ -548,7 +562,10 @@ async fn given_indexed_files_when_get_files_with_collection_filter_then_only_lin
             Request::builder()
                 .method("POST")
                 .uri("/v1/collections")
-                .header("authorization", "Bearer test-token")
+                .header(
+                    "authorization",
+                    format!("Bearer {}", common::TEST_TOKEN).as_str(),
+                )
                 .header("content-type", "application/json")
                 .body(Body::from(
                     json!({ "name": "My files", "kind": "file" }).to_string(),
@@ -575,7 +592,10 @@ async fn given_indexed_files_when_get_files_with_collection_filter_then_only_lin
             Request::builder()
                 .method("POST")
                 .uri(format!("/v1/collections/{collection_uuid}/items"))
-                .header("authorization", "Bearer test-token")
+                .header(
+                    "authorization",
+                    format!("Bearer {}", common::TEST_TOKEN).as_str(),
+                )
                 .header("content-type", "application/json")
                 .body(Body::from(
                     json!({ "itemUuids": [a_uuid.clone()] }).to_string(),
@@ -927,7 +947,10 @@ async fn given_authenticated_and_malformed_body_when_patch_then_400_with_error_e
     let request = Request::builder()
         .method("PATCH")
         .uri(format!("/v1/files/{}/metadata", uuid::Uuid::new_v4()))
-        .header("authorization", "Bearer test-token")
+        .header(
+            "authorization",
+            format!("Bearer {}", common::TEST_TOKEN).as_str(),
+        )
         .header("content-type", "application/json")
         .body(Body::from("{ not json at all"))
         .unwrap();
@@ -1039,7 +1062,10 @@ fn rename_request(uuid: &str, body: Value) -> Request<Body> {
     Request::builder()
         .method("POST")
         .uri(format!("/v1/files/{uuid}/rename"))
-        .header("authorization", "Bearer test-token")
+        .header(
+            "authorization",
+            format!("Bearer {}", common::TEST_TOKEN).as_str(),
+        )
         .header("content-type", "application/json")
         .body(Body::from(body.to_string()))
         .unwrap()
@@ -1116,7 +1142,10 @@ async fn given_missing_body_when_post_rename_then_400() {
     let request = Request::builder()
         .method("POST")
         .uri(format!("/v1/files/{uuid}/rename"))
-        .header("authorization", "Bearer test-token")
+        .header(
+            "authorization",
+            format!("Bearer {}", common::TEST_TOKEN).as_str(),
+        )
         .body(Body::empty())
         .unwrap();
     let response = app(Settings::default(), test.services)
@@ -1227,7 +1256,10 @@ fn delete_file_request(uuid: &str) -> Request<Body> {
     Request::builder()
         .method("DELETE")
         .uri(format!("/v1/files/{uuid}"))
-        .header("authorization", "Bearer test-token")
+        .header(
+            "authorization",
+            format!("Bearer {}", common::TEST_TOKEN).as_str(),
+        )
         .body(Body::empty())
         .unwrap()
 }
@@ -1343,7 +1375,10 @@ fn restore_file_request(uuid: &str) -> Request<Body> {
     Request::builder()
         .method("POST")
         .uri(format!("/v1/files/{uuid}/restore"))
-        .header("authorization", "Bearer test-token")
+        .header(
+            "authorization",
+            format!("Bearer {}", common::TEST_TOKEN).as_str(),
+        )
         .body(Body::empty())
         .unwrap()
 }
@@ -1502,7 +1537,10 @@ fn purge_file_request(uuid: &str) -> Request<Body> {
     Request::builder()
         .method("DELETE")
         .uri(format!("/v1/files/{uuid}?purge=true"))
-        .header("authorization", "Bearer test-token")
+        .header(
+            "authorization",
+            format!("Bearer {}", common::TEST_TOKEN).as_str(),
+        )
         .body(Body::empty())
         .unwrap()
 }
@@ -1668,7 +1706,10 @@ async fn given_non_boolean_purge_query_when_delete_then_400_with_error_envelope(
     let request = Request::builder()
         .method("DELETE")
         .uri(format!("/v1/files/{uuid}?purge=notabool"))
-        .header("authorization", "Bearer test-token")
+        .header(
+            "authorization",
+            format!("Bearer {}", common::TEST_TOKEN).as_str(),
+        )
         .body(Body::empty())
         .unwrap();
     let response = app(Settings::default(), test.services)
@@ -1720,7 +1761,10 @@ fn purge_on_disk_request(uuid: &str) -> Request<Body> {
     Request::builder()
         .method("DELETE")
         .uri(format!("/v1/files/{uuid}?purge-on-disk=true"))
-        .header("authorization", "Bearer test-token")
+        .header(
+            "authorization",
+            format!("Bearer {}", common::TEST_TOKEN).as_str(),
+        )
         .body(Body::empty())
         .unwrap()
 }
@@ -1899,7 +1943,10 @@ async fn given_purge_and_purge_on_disk_both_true_when_delete_then_400_with_error
     let request = Request::builder()
         .method("DELETE")
         .uri(format!("/v1/files/{uuid}?purge=true&purge-on-disk=true"))
-        .header("authorization", "Bearer test-token")
+        .header(
+            "authorization",
+            format!("Bearer {}", common::TEST_TOKEN).as_str(),
+        )
         .body(Body::empty())
         .unwrap();
     let response = app(Settings::default(), test.services)
@@ -1920,7 +1967,10 @@ async fn given_non_boolean_purge_on_disk_query_when_delete_then_400_with_error_e
     let request = Request::builder()
         .method("DELETE")
         .uri(format!("/v1/files/{uuid}?purge-on-disk=notabool"))
-        .header("authorization", "Bearer test-token")
+        .header(
+            "authorization",
+            format!("Bearer {}", common::TEST_TOKEN).as_str(),
+        )
         .body(Body::empty())
         .unwrap();
     let response = app(Settings::default(), test.services)

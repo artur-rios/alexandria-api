@@ -21,7 +21,10 @@ fn index_request(root: &str) -> Request<Body> {
     Request::builder()
         .method("POST")
         .uri("/v1/index")
-        .header("authorization", "Bearer test-token")
+        .header(
+            "authorization",
+            format!("Bearer {}", common::TEST_TOKEN).as_str(),
+        )
         .header("content-type", "application/json")
         .body(Body::from(json!({ "root": root }).to_string()))
         .unwrap()
@@ -31,7 +34,10 @@ fn edit_content_request(uuid: &str, content: &str) -> Request<Body> {
     Request::builder()
         .method("PUT")
         .uri(format!("/v1/files/{uuid}/content"))
-        .header("authorization", "Bearer test-token")
+        .header(
+            "authorization",
+            format!("Bearer {}", common::TEST_TOKEN).as_str(),
+        )
         .header("content-type", "application/json")
         .body(Body::from(json!({ "content": content }).to_string()))
         .unwrap()

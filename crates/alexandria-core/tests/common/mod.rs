@@ -16,6 +16,7 @@ use std::sync::{Arc, Mutex};
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
+use alexandria_core::auth::local::{LocalCredential, LocalCredentialRepository, SessionRepository};
 use alexandria_core::auth::{AuthService, Principal};
 use alexandria_core::bookmarks::model::{Bookmark, BookmarkState, NewBookmark};
 use alexandria_core::bookmarks::repos::BookmarkRepository;
@@ -1378,5 +1379,84 @@ impl ReadingListRepository for FakeReadingListRepository {
             .unwrap()
             .retain(|(reading_list_uuid, _), _| *reading_list_uuid != uuid);
         Ok(())
+    }
+}
+
+/// In-memory local-login credentials repository (UC-34/UC-35). Starts with no
+/// row — `get()` answers `None` until `upsert` is called, mirroring
+/// first-time setup.
+#[derive(Debug, Default, Clone)]
+pub struct FakeLocalCredentialRepository {
+    credential: Arc<Mutex<Option<LocalCredential>>>,
+}
+
+impl FakeLocalCredentialRepository {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Seed a credential row directly, as if a prior UC-35 call had set it.
+    pub fn seed(&self, email: &str, password_hash: &str) {
+        *self.credential.lock().unwrap() = Some(LocalCredential {
+            email: email.to_string(),
+            password_hash: password_hash.to_string(),
+        });
+    }
+}
+
+impl LocalCredentialRepository for FakeLocalCredentialRepository {
+    async fn get(&self) -> Result<Option<LocalCredential>, DomainError> {
+        Ok(self.credential.lock().unwrap().clone())
+    }
+
+    async fn upsert(
+        &self,
+        email: &str,
+        password_hash: &str,
+        _updated_at: DateTime<Utc>,
+    ) -> Result<(), DomainError> {
+        *self.credential.lock().unwrap() = Some(LocalCredential {
+            email: email.to_string(),
+            password_hash: password_hash.to_string(),
+        });
+        Ok(())
+    }
+}
+
+/// In-memory session repository (UC-34's postcondition: "a session must be
+/// created to keep track of the login").
+#[derive(Debug, Default, Clone)]
+pub struct FakeSessionRepository {
+    sessions: Arc<Mutex<HashMap<Uuid, DateTime<Utc>>>>,
+}
+
+impl FakeSessionRepository {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn count(&self) -> usize {
+        self.sessions.lock().unwrap().len()
+    }
+}
+
+impl SessionRepository for FakeSessionRepository {
+    async fn create_session(
+        &self,
+        id: Uuid,
+        _created_at: DateTime<Utc>,
+        expires_at: DateTime<Utc>,
+    ) -> Result<(), DomainError> {
+        self.sessions.lock().unwrap().insert(id, expires_at);
+        Ok(())
+    }
+
+    async fn is_valid(&self, id: Uuid, now: DateTime<Utc>) -> Result<bool, DomainError> {
+        Ok(self
+            .sessions
+            .lock()
+            .unwrap()
+            .get(&id)
+            .is_some_and(|expires_at| now < *expires_at))
     }
 }

@@ -112,10 +112,20 @@ pub fn app(settings: Settings, services: Arc<Services>) -> Router {
             middleware::auth::require_auth,
         ));
 
-    // `/health` is deliberately outside the gate — it reports reachability to
-    // an operator or orchestrator that holds no catalog credentials.
+    // `/health`, the local login, and the local credentials endpoints are
+    // deliberately outside the gate: `/health` reports reachability to a
+    // caller with no catalog credentials, login is how a caller obtains
+    // credentials in the first place (UC-34), and setting credentials must
+    // be reachable with no credentials yet on first-time setup (UC-35 —
+    // the handler enforces its own conditional authorization once
+    // credentials already exist, AF-03).
     Router::new()
         .route("/health", get(routes::health::health))
+        .route("/v1/auth/local/login", post(routes::auth::login))
+        .route(
+            "/v1/auth/local/credentials",
+            post(routes::auth::set_credentials),
+        )
         .merge(v1)
         .layer(TraceLayer::new_for_http())
         .with_state(state)

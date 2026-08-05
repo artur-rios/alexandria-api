@@ -44,10 +44,40 @@ const STATUS_FILE_OK: i32 = alexandria_ffi::FILE_OK;
 const STATUS_FILE_OTHER: i32 = alexandria_ffi::FILE_ERR_OTHER;
 const STATUS_FILE_DISK: i32 = alexandria_ffi::FILE_ERR_DISK;
 
+/// Bearer token every smoke test authenticates with. A valid UUID: the
+/// active auth mode is local (`init_temp_db` sets `ALEXANDRIA_AUTH_MODE`), so
+/// it must parse as a session id (`LocalAuthService::authenticate`). A
+/// matching session is seeded into the fresh database below so it validates.
+const TEST_TOKEN: &str = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+
 fn init_temp_db() -> (TempDir, String) {
+    // `alexandria_index_init` loads settings via `load_settings()`
+    // (`ALEXANDRIA_*` env), not a `Settings` value this test controls
+    // directly — flip the process-wide auth mode to local. Safe across tests
+    // since `serial()` guards this whole file and the value never differs.
+    std::env::set_var("ALEXANDRIA_AUTH_MODE", "local");
+
     let dir = tempdir().unwrap();
     let db = dir.path().join("ffi.sqlite");
     let db_path = db.to_str().unwrap().to_string();
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let pool = alexandria_core::migrate::migrate_database(&db_path)
+            .await
+            .expect("ffi pre-migrate");
+        let now = chrono::Utc::now();
+        let expires_at = now + chrono::Duration::hours(24);
+        sqlx::query("INSERT INTO sessions (id, created_at, expires_at) VALUES (?, ?, ?)")
+            .bind(TEST_TOKEN)
+            .bind(now.to_rfc3339())
+            .bind(expires_at.to_rfc3339())
+            .execute(&pool)
+            .await
+            .expect("seed session");
+        pool.close().await;
+    });
+
     let cpath = CString::new(db_path.clone()).unwrap();
     let status = alexandria_index_init(cpath.as_ptr());
     assert_eq!(status, STATUS_OK, "ffi services init failed");
@@ -112,7 +142,7 @@ fn given_supported_files_when_ffi_index_start_then_returns_ok_with_run_id_and_pe
     std::fs::write(lib.path().join("b.md"), b"text").unwrap();
 
     let root = c(lib.path().to_str().unwrap());
-    let token = c("bearer");
+    let token = c(TEST_TOKEN);
     let result = alexandria_index_start(root.as_ptr(), token.as_ptr());
 
     assert_eq!(result.status, STATUS_OK);
@@ -139,7 +169,7 @@ fn given_missing_root_when_ffi_index_start_then_returns_invalid_input() {
     let _g = serial();
     let _db = init_temp_db();
     let root = c("/no/such/dir/here");
-    let token = c("bearer");
+    let token = c(TEST_TOKEN);
     let result = alexandria_index_start(root.as_ptr(), token.as_ptr());
     assert_eq!(result.status, STATUS_INVALID_INPUT);
 }
@@ -205,7 +235,7 @@ fn given_changed_and_deleted_files_when_ffi_refresh_then_refreshes_and_marks_mis
     std::fs::write(&b_path, b"text-v1").unwrap();
 
     let root = c(lib.path().to_str().unwrap());
-    let token = c("bearer");
+    let token = c(TEST_TOKEN);
     let started = alexandria_index_start(root.as_ptr(), token.as_ptr());
     assert_eq!(started.status, STATUS_OK);
     assert_eq!(wait_for_files(2), 2);
@@ -335,7 +365,7 @@ fn given_indexed_audio_file_when_ffi_edit_metadata_then_ok_and_row_updated() {
     std::fs::write(lib.path().join("song.mp3"), b"audio bytes").unwrap();
 
     let root = c(lib.path().to_str().unwrap());
-    let token = c("bearer");
+    let token = c(TEST_TOKEN);
     let started = alexandria_index_start(root.as_ptr(), token.as_ptr());
     assert_eq!(started.status, STATUS_OK);
     assert_eq!(wait_for_files(1), 1);
@@ -381,7 +411,7 @@ fn given_ffi_edit_metadata_variant_mismatch_then_invalid_input() {
     std::fs::write(lib.path().join("song.mp3"), b"audio").unwrap();
 
     let root = c(lib.path().to_str().unwrap());
-    let token = c("bearer");
+    let token = c(TEST_TOKEN);
     let started = alexandria_index_start(root.as_ptr(), token.as_ptr());
     assert_eq!(started.status, STATUS_OK);
     assert_eq!(wait_for_files(1), 1);
@@ -400,7 +430,7 @@ fn given_ffi_edit_metadata_bad_patch_json_then_invalid_input() {
     let lib = tempdir().unwrap();
     std::fs::write(lib.path().join("song.mp3"), b"audio").unwrap();
     let root = c(lib.path().to_str().unwrap());
-    let token = c("bearer");
+    let token = c(TEST_TOKEN);
     alexandria_index_start(root.as_ptr(), token.as_ptr());
     assert_eq!(wait_for_files(1), 1);
 
@@ -414,7 +444,7 @@ fn given_ffi_edit_metadata_bad_patch_json_then_invalid_input() {
 fn given_ffi_edit_metadata_missing_uuid_then_not_found() {
     let _g = serial();
     let (_db_dir, _db_path) = init_temp_db();
-    let token = c("bearer");
+    let token = c(TEST_TOKEN);
     let uuid = c("11111111-1111-1111-1111-111111111111");
     let patch = c(r#"{"type":"audio","title":"x"}"#);
     let result = alexandria_file_edit_metadata(uuid.as_ptr(), patch.as_ptr(), token.as_ptr());
@@ -428,7 +458,7 @@ fn given_ffi_edit_metadata_no_token_then_unauthorized() {
     let lib = tempdir().unwrap();
     std::fs::write(lib.path().join("song.mp3"), b"audio").unwrap();
     let root = c(lib.path().to_str().unwrap());
-    let token = c("bearer");
+    let token = c(TEST_TOKEN);
     alexandria_index_start(root.as_ptr(), token.as_ptr());
     assert_eq!(wait_for_files(1), 1);
 
@@ -446,7 +476,7 @@ fn given_ffi_edit_metadata_deleted_file_then_invalid_state() {
     let lib = tempdir().unwrap();
     std::fs::write(lib.path().join("song.mp3"), b"audio").unwrap();
     let root = c(lib.path().to_str().unwrap());
-    let token = c("bearer");
+    let token = c(TEST_TOKEN);
     alexandria_index_start(root.as_ptr(), token.as_ptr());
     assert_eq!(wait_for_files(1), 1);
 
@@ -511,7 +541,7 @@ fn given_indexed_file_when_ffi_rename_then_ok_and_disk_and_catalog_updated() {
     std::fs::write(lib.path().join("song.mp3"), b"audio bytes").unwrap();
 
     let root = c(lib.path().to_str().unwrap());
-    let token = c("bearer");
+    let token = c(TEST_TOKEN);
     alexandria_index_start(root.as_ptr(), token.as_ptr());
     wait_for_files(1);
 
@@ -556,7 +586,7 @@ fn given_ffi_rename_invalid_name_then_invalid_input() {
     let lib = tempdir().unwrap();
     std::fs::write(lib.path().join("song.mp3"), b"x").unwrap();
     let root = c(lib.path().to_str().unwrap());
-    let token = c("bearer");
+    let token = c(TEST_TOKEN);
     alexandria_index_start(root.as_ptr(), token.as_ptr());
     wait_for_files(1);
     let uuid = uuid_by_name(&db_path, "song.mp3");
@@ -576,7 +606,7 @@ fn given_ffi_rename_invalid_name_then_invalid_input() {
 fn given_ffi_rename_missing_uuid_then_not_found() {
     let _g = serial();
     let (_db_dir, _db_path) = init_temp_db();
-    let token = c("bearer");
+    let token = c(TEST_TOKEN);
     let uuid = c("11111111-1111-1111-1111-111111111111");
     let name = c("new.mp3");
     let result = alexandria_file_rename(uuid.as_ptr(), name.as_ptr(), token.as_ptr());
@@ -590,7 +620,7 @@ fn given_ffi_rename_no_token_then_unauthorized() {
     let lib = tempdir().unwrap();
     std::fs::write(lib.path().join("song.mp3"), b"x").unwrap();
     let root = c(lib.path().to_str().unwrap());
-    let token = c("bearer");
+    let token = c(TEST_TOKEN);
     alexandria_index_start(root.as_ptr(), token.as_ptr());
     wait_for_files(1);
 
@@ -608,7 +638,7 @@ fn given_ffi_rename_deleted_file_then_invalid_state() {
     let lib = tempdir().unwrap();
     std::fs::write(lib.path().join("song.mp3"), b"x").unwrap();
     let root = c(lib.path().to_str().unwrap());
-    let token = c("bearer");
+    let token = c(TEST_TOKEN);
     alexandria_index_start(root.as_ptr(), token.as_ptr());
     wait_for_files(1);
 
@@ -636,7 +666,7 @@ fn given_ffi_rename_target_owned_by_other_file_then_disk_error() {
     std::fs::write(lib.path().join("a.mp3"), b"aaa").unwrap();
     std::fs::write(lib.path().join("b.mp3"), b"bbb").unwrap();
     let root = c(lib.path().to_str().unwrap());
-    let token = c("bearer");
+    let token = c(TEST_TOKEN);
     alexandria_index_start(root.as_ptr(), token.as_ptr());
     wait_for_files(2);
 
@@ -668,7 +698,7 @@ fn given_indexed_file_when_ffi_soft_delete_then_ok_and_catalog_deleted() {
     std::fs::write(lib.path().join("song.mp3"), b"audio bytes").unwrap();
 
     let root = c(lib.path().to_str().unwrap());
-    let token = c("bearer");
+    let token = c(TEST_TOKEN);
     alexandria_index_start(root.as_ptr(), token.as_ptr());
     wait_for_files(1);
 
@@ -706,7 +736,7 @@ fn given_indexed_file_when_ffi_soft_delete_then_ok_and_catalog_deleted() {
 fn given_ffi_soft_delete_missing_uuid_then_not_found() {
     let _g = serial();
     let (_db_dir, _db_path) = init_temp_db();
-    let token = c("bearer");
+    let token = c(TEST_TOKEN);
     let uuid = c("11111111-1111-1111-1111-111111111111");
     let result = alexandria_file_soft_delete(uuid.as_ptr(), token.as_ptr());
     assert_eq!(result.status, STATUS_FILE_NOT_FOUND);
@@ -720,7 +750,7 @@ fn given_ffi_soft_delete_no_token_then_unauthorized() {
     let lib = tempdir().unwrap();
     std::fs::write(lib.path().join("song.mp3"), b"x").unwrap();
     let root = c(lib.path().to_str().unwrap());
-    let token = c("bearer");
+    let token = c(TEST_TOKEN);
     alexandria_index_start(root.as_ptr(), token.as_ptr());
     wait_for_files(1);
 
@@ -738,7 +768,7 @@ fn given_ffi_soft_delete_already_deleted_then_invalid_state() {
     let lib = tempdir().unwrap();
     std::fs::write(lib.path().join("song.mp3"), b"x").unwrap();
     let root = c(lib.path().to_str().unwrap());
-    let token = c("bearer");
+    let token = c(TEST_TOKEN);
     alexandria_index_start(root.as_ptr(), token.as_ptr());
     wait_for_files(1);
 
@@ -769,7 +799,7 @@ fn given_soft_deleted_file_when_ffi_restore_then_ok_and_catalog_active() {
     std::fs::write(lib.path().join("song.mp3"), b"audio bytes").unwrap();
 
     let root = c(lib.path().to_str().unwrap());
-    let token = c("bearer");
+    let token = c(TEST_TOKEN);
     alexandria_index_start(root.as_ptr(), token.as_ptr());
     wait_for_files(1);
 
@@ -821,7 +851,7 @@ fn given_soft_deleted_file_when_ffi_restore_then_ok_and_catalog_active() {
 fn given_ffi_restore_missing_uuid_then_not_found() {
     let _g = serial();
     let (_db_dir, _db_path) = init_temp_db();
-    let token = c("bearer");
+    let token = c(TEST_TOKEN);
     let uuid = c("11111111-1111-1111-1111-111111111111");
     let result = alexandria_file_restore(uuid.as_ptr(), token.as_ptr());
     assert_eq!(result.status, STATUS_FILE_NOT_FOUND);
@@ -835,7 +865,7 @@ fn given_ffi_restore_no_token_then_unauthorized() {
     let lib = tempdir().unwrap();
     std::fs::write(lib.path().join("song.mp3"), b"x").unwrap();
     let root = c(lib.path().to_str().unwrap());
-    let token = c("bearer");
+    let token = c(TEST_TOKEN);
     alexandria_index_start(root.as_ptr(), token.as_ptr());
     wait_for_files(1);
 
@@ -853,7 +883,7 @@ fn given_ffi_restore_active_file_then_invalid_state() {
     let lib = tempdir().unwrap();
     std::fs::write(lib.path().join("song.mp3"), b"x").unwrap();
     let root = c(lib.path().to_str().unwrap());
-    let token = c("bearer");
+    let token = c(TEST_TOKEN);
     alexandria_index_start(root.as_ptr(), token.as_ptr());
     wait_for_files(1);
 
@@ -874,7 +904,7 @@ fn given_soft_deleted_file_past_retention_when_ffi_restore_then_not_found() {
     let lib = tempdir().unwrap();
     std::fs::write(lib.path().join("song.mp3"), b"x").unwrap();
     let root = c(lib.path().to_str().unwrap());
-    let token = c("bearer");
+    let token = c(TEST_TOKEN);
     alexandria_index_start(root.as_ptr(), token.as_ptr());
     wait_for_files(1);
 
@@ -905,7 +935,7 @@ fn given_soft_deleted_file_past_retention_when_ffi_purge_then_ok_and_rows_remove
     std::fs::write(lib.path().join("song.mp3"), b"audio bytes").unwrap();
 
     let root = c(lib.path().to_str().unwrap());
-    let token = c("bearer");
+    let token = c(TEST_TOKEN);
     alexandria_index_start(root.as_ptr(), token.as_ptr());
     wait_for_files(1);
 
@@ -968,7 +998,7 @@ fn given_soft_deleted_file_past_retention_when_ffi_purge_then_ok_and_rows_remove
 fn given_ffi_purge_missing_uuid_then_not_found() {
     let _g = serial();
     let (_db_dir, _db_path) = init_temp_db();
-    let token = c("bearer");
+    let token = c(TEST_TOKEN);
     let uuid = c("11111111-1111-1111-1111-111111111111");
     let result = alexandria_file_purge(uuid.as_ptr(), token.as_ptr());
     assert_eq!(result.status, STATUS_FILE_NOT_FOUND);
@@ -982,7 +1012,7 @@ fn given_ffi_purge_no_token_then_unauthorized() {
     let lib = tempdir().unwrap();
     std::fs::write(lib.path().join("song.mp3"), b"x").unwrap();
     let root = c(lib.path().to_str().unwrap());
-    let token = c("bearer");
+    let token = c(TEST_TOKEN);
     alexandria_index_start(root.as_ptr(), token.as_ptr());
     wait_for_files(1);
 
@@ -997,7 +1027,7 @@ fn given_ffi_purge_no_token_then_unauthorized() {
 fn given_ffi_purge_malformed_uuid_then_invalid_input() {
     let _g = serial();
     let (_db_dir, _db_path) = init_temp_db();
-    let token = c("bearer");
+    let token = c(TEST_TOKEN);
     let uuid = c("not-a-uuid");
     let result = alexandria_file_purge(uuid.as_ptr(), token.as_ptr());
     assert_eq!(result.status, STATUS_FILE_INVALID_INPUT);
@@ -1011,7 +1041,7 @@ fn given_ffi_purge_active_file_then_invalid_state() {
     let lib = tempdir().unwrap();
     std::fs::write(lib.path().join("song.mp3"), b"x").unwrap();
     let root = c(lib.path().to_str().unwrap());
-    let token = c("bearer");
+    let token = c(TEST_TOKEN);
     alexandria_index_start(root.as_ptr(), token.as_ptr());
     wait_for_files(1);
 
@@ -1029,7 +1059,7 @@ fn given_ffi_purge_within_retention_then_invalid_state_and_row_kept() {
     let lib = tempdir().unwrap();
     std::fs::write(lib.path().join("song.mp3"), b"x").unwrap();
     let root = c(lib.path().to_str().unwrap());
-    let token = c("bearer");
+    let token = c(TEST_TOKEN);
     alexandria_index_start(root.as_ptr(), token.as_ptr());
     wait_for_files(1);
 
@@ -1076,7 +1106,7 @@ fn given_active_file_when_ffi_purge_on_disk_then_ok_and_disk_and_rows_removed() 
     std::fs::write(lib.path().join("song.mp3"), b"audio bytes").unwrap();
 
     let root = c(lib.path().to_str().unwrap());
-    let token = c("bearer");
+    let token = c(TEST_TOKEN);
     alexandria_index_start(root.as_ptr(), token.as_ptr());
     wait_for_files(1);
 
@@ -1134,7 +1164,7 @@ fn given_missing_disk_file_when_ffi_purge_on_disk_then_ok_and_absence_reported()
     std::fs::write(lib.path().join("song.mp3"), b"audio bytes").unwrap();
 
     let root = c(lib.path().to_str().unwrap());
-    let token = c("bearer");
+    let token = c(TEST_TOKEN);
     alexandria_index_start(root.as_ptr(), token.as_ptr());
     wait_for_files(1);
 
@@ -1175,7 +1205,7 @@ fn given_disk_delete_failure_when_ffi_purge_on_disk_then_disk_error_and_row_kept
     std::fs::write(lib.path().join("song.mp3"), b"audio bytes").unwrap();
 
     let root = c(lib.path().to_str().unwrap());
-    let token = c("bearer");
+    let token = c(TEST_TOKEN);
     alexandria_index_start(root.as_ptr(), token.as_ptr());
     wait_for_files(1);
 
@@ -1232,7 +1262,7 @@ fn given_disk_delete_failure_when_ffi_purge_on_disk_then_disk_error_and_row_kept
 fn given_ffi_purge_on_disk_missing_uuid_then_not_found() {
     let _g = serial();
     let (_db_dir, _db_path) = init_temp_db();
-    let token = c("bearer");
+    let token = c(TEST_TOKEN);
     let uuid = c("11111111-1111-1111-1111-111111111111");
     let result = alexandria_file_purge_on_disk(uuid.as_ptr(), token.as_ptr());
     assert_eq!(result.status, STATUS_FILE_NOT_FOUND);
@@ -1246,7 +1276,7 @@ fn given_ffi_purge_on_disk_no_token_then_unauthorized() {
     let lib = tempdir().unwrap();
     std::fs::write(lib.path().join("song.mp3"), b"x").unwrap();
     let root = c(lib.path().to_str().unwrap());
-    let token = c("bearer");
+    let token = c(TEST_TOKEN);
     alexandria_index_start(root.as_ptr(), token.as_ptr());
     wait_for_files(1);
 
@@ -1267,7 +1297,7 @@ fn given_ffi_purge_on_disk_no_token_then_unauthorized() {
 fn given_ffi_purge_on_disk_malformed_uuid_then_invalid_input() {
     let _g = serial();
     let (_db_dir, _db_path) = init_temp_db();
-    let token = c("bearer");
+    let token = c(TEST_TOKEN);
     let uuid = c("not-a-uuid");
     let result = alexandria_file_purge_on_disk(uuid.as_ptr(), token.as_ptr());
     assert_eq!(result.status, STATUS_FILE_INVALID_INPUT);

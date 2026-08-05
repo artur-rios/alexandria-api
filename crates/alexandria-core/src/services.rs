@@ -2,7 +2,13 @@ use std::sync::Arc;
 
 use sqlx::sqlite::SqlitePool;
 
-use crate::auth::BearerAuthService;
+use crate::auth::commands::login::LocalLoginHandler;
+use crate::auth::commands::set_credentials::SetLocalCredentialsHandler;
+use crate::auth::external::{ExternalAuthService, HttpJwksProvider};
+use crate::auth::local::{
+    LocalAuthService, SqliteLocalCredentialRepository, SqliteSessionRepository,
+};
+use crate::auth::RuntimeAuthService;
 use crate::bookmarks::commands::create::CreateBookmarkHandler;
 use crate::bookmarks::commands::lifecycle::BookmarkLifecycleHandler;
 use crate::bookmarks::commands::purge::PurgeBookmarkHandler;
@@ -30,6 +36,7 @@ use crate::collections::commands::remove_item::RemoveItemFromCollectionHandler;
 use crate::collections::commands::rename::RenameCollectionHandler;
 use crate::collections::queries::list_items::ListCollectionItemsHandler;
 use crate::collections::repos::SqliteCollectionRepository;
+use crate::config::AuthMode;
 use crate::config::Settings;
 use crate::reading_lists::commands::add_item::AddItemToReadingListHandler;
 use crate::reading_lists::commands::create::CreateReadingListHandler;
@@ -51,127 +58,137 @@ use crate::watchlists::repos::SqliteWatchlistRepository;
 /// system clock. Both the HTTP and FFI surfaces depend on the same `Services`
 /// instance so the two transports stay at parity (NFR-09).
 pub type DefaultIndexHandler =
-    IndexHandler<BearerAuthService, SqliteCatalogRepository, StdFilesystem, SystemClock>;
+    IndexHandler<RuntimeAuthService, SqliteCatalogRepository, StdFilesystem, SystemClock>;
 
 pub type DefaultRefreshHandler =
-    RefreshHandler<BearerAuthService, SqliteCatalogRepository, StdFilesystem, SystemClock>;
+    RefreshHandler<RuntimeAuthService, SqliteCatalogRepository, StdFilesystem, SystemClock>;
 
 pub type DefaultEditMetadataHandler =
-    EditMetadataHandler<BearerAuthService, SqliteCatalogRepository>;
+    EditMetadataHandler<RuntimeAuthService, SqliteCatalogRepository>;
 
 pub type DefaultRenameFileHandler =
-    RenameFileHandler<BearerAuthService, SqliteCatalogRepository, StdFilesystem>;
+    RenameFileHandler<RuntimeAuthService, SqliteCatalogRepository, StdFilesystem>;
 
 pub type DefaultSoftDeleteFileHandler =
-    SoftDeleteFileHandler<BearerAuthService, SqliteCatalogRepository, SystemClock>;
+    SoftDeleteFileHandler<RuntimeAuthService, SqliteCatalogRepository, SystemClock>;
 
 pub type DefaultRestoreFileHandler =
-    RestoreFileHandler<BearerAuthService, SqliteCatalogRepository, SystemClock>;
+    RestoreFileHandler<RuntimeAuthService, SqliteCatalogRepository, SystemClock>;
 
 pub type DefaultPurgeFileHandler =
-    PurgeFileHandler<BearerAuthService, SqliteCatalogRepository, SystemClock>;
+    PurgeFileHandler<RuntimeAuthService, SqliteCatalogRepository, SystemClock>;
 
 pub type DefaultPurgeFileOnDiskHandler =
-    PurgeFileOnDiskHandler<BearerAuthService, SqliteCatalogRepository, StdFilesystem>;
+    PurgeFileOnDiskHandler<RuntimeAuthService, SqliteCatalogRepository, StdFilesystem>;
 
-pub type DefaultBrowseFilesHandler = BrowseFilesHandler<BearerAuthService, SqliteCatalogRepository>;
+pub type DefaultBrowseFilesHandler =
+    BrowseFilesHandler<RuntimeAuthService, SqliteCatalogRepository>;
 
 pub type DefaultReadTextFileContentHandler =
-    ReadTextFileContentHandler<BearerAuthService, SqliteCatalogRepository, StdFilesystem>;
+    ReadTextFileContentHandler<RuntimeAuthService, SqliteCatalogRepository, StdFilesystem>;
 
 pub type DefaultEditTextFileContentHandler = EditTextFileContentHandler<
-    BearerAuthService,
+    RuntimeAuthService,
     SqliteCatalogRepository,
     StdFilesystem,
     SystemClock,
 >;
 
 pub type DefaultCreateCollectionHandler =
-    CreateCollectionHandler<BearerAuthService, SqliteCollectionRepository>;
+    CreateCollectionHandler<RuntimeAuthService, SqliteCollectionRepository>;
 
 pub type DefaultRenameCollectionHandler =
-    RenameCollectionHandler<BearerAuthService, SqliteCollectionRepository>;
+    RenameCollectionHandler<RuntimeAuthService, SqliteCollectionRepository>;
 
 pub type DefaultDeleteCollectionHandler =
-    DeleteCollectionHandler<BearerAuthService, SqliteCollectionRepository>;
+    DeleteCollectionHandler<RuntimeAuthService, SqliteCollectionRepository>;
 
 pub type DefaultCreateBookmarkHandler =
-    CreateBookmarkHandler<BearerAuthService, SqliteBookmarkRepository, SqliteCollectionRepository>;
+    CreateBookmarkHandler<RuntimeAuthService, SqliteBookmarkRepository, SqliteCollectionRepository>;
 
 pub type DefaultUpdateBookmarkHandler =
-    UpdateBookmarkHandler<BearerAuthService, SqliteBookmarkRepository, SqliteCollectionRepository>;
+    UpdateBookmarkHandler<RuntimeAuthService, SqliteBookmarkRepository, SqliteCollectionRepository>;
 
-pub type DefaultBrowseBookmarksHandler =
-    BrowseBookmarksHandler<BearerAuthService, SqliteBookmarkRepository, SqliteCollectionRepository>;
+pub type DefaultBrowseBookmarksHandler = BrowseBookmarksHandler<
+    RuntimeAuthService,
+    SqliteBookmarkRepository,
+    SqliteCollectionRepository,
+>;
 
 pub type DefaultBookmarkLifecycleHandler =
-    BookmarkLifecycleHandler<BearerAuthService, SqliteBookmarkRepository, SystemClock>;
+    BookmarkLifecycleHandler<RuntimeAuthService, SqliteBookmarkRepository, SystemClock>;
 
 pub type DefaultPurgeBookmarkHandler =
-    PurgeBookmarkHandler<BearerAuthService, SqliteBookmarkRepository, SystemClock>;
+    PurgeBookmarkHandler<RuntimeAuthService, SqliteBookmarkRepository, SystemClock>;
 
 pub type DefaultAddItemsToCollectionHandler = AddItemsToCollectionHandler<
-    BearerAuthService,
+    RuntimeAuthService,
     SqliteCollectionRepository,
     SqliteCatalogRepository,
     SqliteBookmarkRepository,
 >;
 
 pub type DefaultRemoveItemFromCollectionHandler = RemoveItemFromCollectionHandler<
-    BearerAuthService,
+    RuntimeAuthService,
     SqliteCollectionRepository,
     SqliteCatalogRepository,
     SqliteBookmarkRepository,
 >;
 
 pub type DefaultListCollectionItemsHandler = ListCollectionItemsHandler<
-    BearerAuthService,
+    RuntimeAuthService,
     SqliteCollectionRepository,
     SqliteCatalogRepository,
     SqliteBookmarkRepository,
 >;
 
 pub type DefaultCreateWatchlistHandler =
-    CreateWatchlistHandler<BearerAuthService, SqliteWatchlistRepository>;
+    CreateWatchlistHandler<RuntimeAuthService, SqliteWatchlistRepository>;
 
 pub type DefaultAddVideoToWatchlistHandler = AddVideoToWatchlistHandler<
-    BearerAuthService,
+    RuntimeAuthService,
     SqliteWatchlistRepository,
     SqliteCatalogRepository,
 >;
 
 pub type DefaultBrowseWatchlistsHandler =
-    BrowseWatchlistsHandler<BearerAuthService, SqliteWatchlistRepository>;
+    BrowseWatchlistsHandler<RuntimeAuthService, SqliteWatchlistRepository>;
 
 pub type DefaultUpdateWatchProgressHandler =
-    UpdateWatchProgressHandler<BearerAuthService, SqliteWatchlistRepository>;
+    UpdateWatchProgressHandler<RuntimeAuthService, SqliteWatchlistRepository>;
 
 pub type DefaultRemoveVideoFromWatchlistHandler =
-    RemoveVideoFromWatchlistHandler<BearerAuthService, SqliteWatchlistRepository>;
+    RemoveVideoFromWatchlistHandler<RuntimeAuthService, SqliteWatchlistRepository>;
 
 pub type DefaultDeleteWatchlistHandler =
-    DeleteWatchlistHandler<BearerAuthService, SqliteWatchlistRepository>;
+    DeleteWatchlistHandler<RuntimeAuthService, SqliteWatchlistRepository>;
 
 pub type DefaultCreateReadingListHandler =
-    CreateReadingListHandler<BearerAuthService, SqliteReadingListRepository>;
+    CreateReadingListHandler<RuntimeAuthService, SqliteReadingListRepository>;
 
 pub type DefaultAddItemToReadingListHandler = AddItemToReadingListHandler<
-    BearerAuthService,
+    RuntimeAuthService,
     SqliteReadingListRepository,
     SqliteCatalogRepository,
 >;
 
 pub type DefaultBrowseReadingListsHandler =
-    BrowseReadingListsHandler<BearerAuthService, SqliteReadingListRepository>;
+    BrowseReadingListsHandler<RuntimeAuthService, SqliteReadingListRepository>;
 
 pub type DefaultUpdateReadingProgressHandler =
-    UpdateReadingProgressHandler<BearerAuthService, SqliteReadingListRepository>;
+    UpdateReadingProgressHandler<RuntimeAuthService, SqliteReadingListRepository>;
 
 pub type DefaultRemoveItemFromReadingListHandler =
-    RemoveItemFromReadingListHandler<BearerAuthService, SqliteReadingListRepository>;
+    RemoveItemFromReadingListHandler<RuntimeAuthService, SqliteReadingListRepository>;
 
 pub type DefaultDeleteReadingListHandler =
-    DeleteReadingListHandler<BearerAuthService, SqliteReadingListRepository>;
+    DeleteReadingListHandler<RuntimeAuthService, SqliteReadingListRepository>;
+
+pub type DefaultSetLocalCredentialsHandler =
+    SetLocalCredentialsHandler<RuntimeAuthService, SqliteLocalCredentialRepository, SystemClock>;
+
+pub type DefaultLocalLoginHandler =
+    LocalLoginHandler<SqliteLocalCredentialRepository, SqliteSessionRepository, SystemClock>;
 
 #[derive(Clone)]
 pub struct Services {
@@ -209,11 +226,13 @@ pub struct Services {
     pub update_reading_progress_handler: Arc<DefaultUpdateReadingProgressHandler>,
     pub remove_item_from_reading_list_handler: Arc<DefaultRemoveItemFromReadingListHandler>,
     pub delete_reading_list_handler: Arc<DefaultDeleteReadingListHandler>,
+    pub set_local_credentials_handler: Arc<DefaultSetLocalCredentialsHandler>,
+    pub local_login_handler: Arc<DefaultLocalLoginHandler>,
     /// The same auth service the handlers hold, exposed so a transport can
     /// reject an unauthenticated caller *before* it parses a request body or
     /// path (FR-AU-07 / SRD §7). Handlers still authenticate independently —
     /// this is the transport gate, not a replacement for the domain check.
-    pub auth: BearerAuthService,
+    pub auth: RuntimeAuthService,
     pub pool: SqlitePool,
 }
 
@@ -223,135 +242,174 @@ pub struct Services {
 pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
     let retention_days = settings.deletion.retention_days;
     let repo = SqliteCatalogRepository::new(pool.clone());
-    let auth = BearerAuthService;
+    let session_repo = SqliteSessionRepository::new(pool.clone());
+    let credential_repo = SqliteLocalCredentialRepository::new(pool.clone());
     let fs = StdFilesystem;
     let clock = SystemClock;
-    let index_handler = Arc::new(IndexHandler::new(auth, repo.clone(), fs, clock));
-    let refresh_handler = Arc::new(RefreshHandler::new(auth, repo.clone(), fs, clock));
-    let edit_metadata_handler = Arc::new(EditMetadataHandler::new(auth, repo.clone()));
-    let rename_file_handler = Arc::new(RenameFileHandler::new(auth, repo.clone(), fs));
-    let soft_delete_file_handler = Arc::new(SoftDeleteFileHandler::new(auth, repo.clone(), clock));
+    // FR-AU-01/FR-AU-03: exactly one auth mode is active, selected once here
+    // from startup configuration.
+    let auth = match settings.auth.mode {
+        AuthMode::Local => {
+            RuntimeAuthService::Local(LocalAuthService::new(session_repo.clone(), clock))
+        }
+        AuthMode::External => RuntimeAuthService::External(ExternalAuthService::new(
+            HttpJwksProvider::new(settings.auth.jwks_url.clone()),
+        )),
+    };
+    let index_handler = Arc::new(IndexHandler::new(auth.clone(), repo.clone(), fs, clock));
+    let refresh_handler = Arc::new(RefreshHandler::new(auth.clone(), repo.clone(), fs, clock));
+    let edit_metadata_handler = Arc::new(EditMetadataHandler::new(auth.clone(), repo.clone()));
+    let rename_file_handler = Arc::new(RenameFileHandler::new(auth.clone(), repo.clone(), fs));
+    let soft_delete_file_handler = Arc::new(SoftDeleteFileHandler::new(
+        auth.clone(),
+        repo.clone(),
+        clock,
+    ));
     let restore_file_handler = Arc::new(RestoreFileHandler::new(
-        auth,
+        auth.clone(),
         repo.clone(),
         clock,
         retention_days,
     ));
     let purge_file_handler = Arc::new(PurgeFileHandler::new(
-        auth,
+        auth.clone(),
         repo.clone(),
         clock,
         retention_days,
     ));
-    let purge_file_on_disk_handler = Arc::new(PurgeFileOnDiskHandler::new(auth, repo.clone(), fs));
-    let browse_files_handler = Arc::new(BrowseFilesHandler::new(auth, repo.clone()));
-    let read_text_file_content_handler =
-        Arc::new(ReadTextFileContentHandler::new(auth, repo.clone(), fs));
+    let purge_file_on_disk_handler =
+        Arc::new(PurgeFileOnDiskHandler::new(auth.clone(), repo.clone(), fs));
+    let browse_files_handler = Arc::new(BrowseFilesHandler::new(auth.clone(), repo.clone()));
+    let read_text_file_content_handler = Arc::new(ReadTextFileContentHandler::new(
+        auth.clone(),
+        repo.clone(),
+        fs,
+    ));
     let edit_text_file_content_handler = Arc::new(EditTextFileContentHandler::new(
-        auth,
+        auth.clone(),
         repo.clone(),
         fs,
         clock,
     ));
     let create_collection_handler = Arc::new(CreateCollectionHandler::new(
-        auth,
+        auth.clone(),
         SqliteCollectionRepository::new(pool.clone()),
     ));
     let rename_collection_handler = Arc::new(RenameCollectionHandler::new(
-        auth,
+        auth.clone(),
         SqliteCollectionRepository::new(pool.clone()),
     ));
     let delete_collection_handler = Arc::new(DeleteCollectionHandler::new(
-        auth,
+        auth.clone(),
         SqliteCollectionRepository::new(pool.clone()),
     ));
     let create_bookmark_handler = Arc::new(CreateBookmarkHandler::new(
-        auth,
+        auth.clone(),
         SqliteBookmarkRepository::new(pool.clone()),
         SqliteCollectionRepository::new(pool.clone()),
     ));
     let update_bookmark_handler = Arc::new(UpdateBookmarkHandler::new(
-        auth,
+        auth.clone(),
         SqliteBookmarkRepository::new(pool.clone()),
         SqliteCollectionRepository::new(pool.clone()),
     ));
     let browse_bookmarks_handler = Arc::new(BrowseBookmarksHandler::new(
-        auth,
+        auth.clone(),
         SqliteBookmarkRepository::new(pool.clone()),
         SqliteCollectionRepository::new(pool.clone()),
     ));
     let bookmark_lifecycle_handler = Arc::new(BookmarkLifecycleHandler::new(
-        auth,
+        auth.clone(),
         SqliteBookmarkRepository::new(pool.clone()),
         clock,
     ));
     let purge_bookmark_handler = Arc::new(PurgeBookmarkHandler::new(
-        auth,
+        auth.clone(),
         SqliteBookmarkRepository::new(pool.clone()),
         clock,
         retention_days,
     ));
     let add_items_to_collection_handler = Arc::new(AddItemsToCollectionHandler::new(
-        auth,
+        auth.clone(),
         SqliteCollectionRepository::new(pool.clone()),
         repo.clone(),
         SqliteBookmarkRepository::new(pool.clone()),
     ));
     let remove_item_from_collection_handler = Arc::new(RemoveItemFromCollectionHandler::new(
-        auth,
+        auth.clone(),
         SqliteCollectionRepository::new(pool.clone()),
         repo.clone(),
         SqliteBookmarkRepository::new(pool.clone()),
     ));
     let list_collection_items_handler = Arc::new(ListCollectionItemsHandler::new(
-        auth,
+        auth.clone(),
         SqliteCollectionRepository::new(pool.clone()),
         repo.clone(),
         SqliteBookmarkRepository::new(pool.clone()),
     ));
     let watchlist_repo = SqliteWatchlistRepository::new(pool.clone());
-    let create_watchlist_handler =
-        Arc::new(CreateWatchlistHandler::new(auth, watchlist_repo.clone()));
+    let create_watchlist_handler = Arc::new(CreateWatchlistHandler::new(
+        auth.clone(),
+        watchlist_repo.clone(),
+    ));
     let add_video_to_watchlist_handler = Arc::new(AddVideoToWatchlistHandler::new(
-        auth,
+        auth.clone(),
         watchlist_repo.clone(),
         repo.clone(),
     ));
-    let browse_watchlists_handler =
-        Arc::new(BrowseWatchlistsHandler::new(auth, watchlist_repo.clone()));
+    let browse_watchlists_handler = Arc::new(BrowseWatchlistsHandler::new(
+        auth.clone(),
+        watchlist_repo.clone(),
+    ));
     let update_watch_progress_handler = Arc::new(UpdateWatchProgressHandler::new(
-        auth,
+        auth.clone(),
         watchlist_repo.clone(),
     ));
     let remove_video_from_watchlist_handler = Arc::new(RemoveVideoFromWatchlistHandler::new(
-        auth,
+        auth.clone(),
         watchlist_repo.clone(),
     ));
-    let delete_watchlist_handler = Arc::new(DeleteWatchlistHandler::new(auth, watchlist_repo));
+    let delete_watchlist_handler =
+        Arc::new(DeleteWatchlistHandler::new(auth.clone(), watchlist_repo));
     let reading_list_repo = SqliteReadingListRepository::new(pool.clone());
     let create_reading_list_handler = Arc::new(CreateReadingListHandler::new(
-        auth,
+        auth.clone(),
         reading_list_repo.clone(),
     ));
     let add_item_to_reading_list_handler = Arc::new(AddItemToReadingListHandler::new(
-        auth,
+        auth.clone(),
         reading_list_repo.clone(),
         repo.clone(),
     ));
     let browse_reading_lists_handler = Arc::new(BrowseReadingListsHandler::new(
-        auth,
+        auth.clone(),
         reading_list_repo.clone(),
     ));
     let update_reading_progress_handler = Arc::new(UpdateReadingProgressHandler::new(
-        auth,
+        auth.clone(),
         reading_list_repo.clone(),
     ));
     let remove_item_from_reading_list_handler = Arc::new(RemoveItemFromReadingListHandler::new(
-        auth,
+        auth.clone(),
         reading_list_repo.clone(),
     ));
-    let delete_reading_list_handler =
-        Arc::new(DeleteReadingListHandler::new(auth, reading_list_repo));
+    let delete_reading_list_handler = Arc::new(DeleteReadingListHandler::new(
+        auth.clone(),
+        reading_list_repo,
+    ));
+    let set_local_credentials_handler = Arc::new(SetLocalCredentialsHandler::new(
+        auth.clone(),
+        credential_repo.clone(),
+        clock,
+        settings.auth.mode,
+    ));
+    let local_login_handler = Arc::new(LocalLoginHandler::new(
+        credential_repo,
+        session_repo,
+        clock,
+        settings.auth.mode,
+        settings.auth.session_ttl_hours,
+    ));
     Services {
         index_handler,
         refresh_handler,
@@ -387,6 +445,8 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         update_reading_progress_handler,
         remove_item_from_reading_list_handler,
         delete_reading_list_handler,
+        set_local_credentials_handler,
+        local_login_handler,
         auth,
         pool,
     }

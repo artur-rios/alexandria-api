@@ -2875,6 +2875,162 @@ pub extern "C" fn alexandria_reading_list_delete(
     }
 }
 
+/// FFI status codes returned by local-auth operations (UC-34/UC-35).
+/// Deliberately separate from the other `*_OK == 0` families — per the
+/// convention above — so local-auth use cases can grow their own set
+/// without colliding.
+pub const AUTH_OK: c_int = 0;
+pub const AUTH_ERR_INVALID_INPUT: c_int = 1;
+pub const AUTH_ERR_UNAUTHORIZED: c_int = 2;
+pub const AUTH_ERR_NOT_INITIALIZED: c_int = 3;
+pub const AUTH_ERR_INVALID_STATE: c_int = 5;
+pub const AUTH_ERR_CONFIG: c_int = 8;
+pub const AUTH_ERR_OTHER: c_int = 9;
+
+/// Result of `alexandria_auth_local_login` / `alexandria_auth_local_set_credentials`
+/// (UC-34/UC-35). On success `status` is `AUTH_OK` and `json` is a
+/// NUL-terminated JSON string of the `LocalLoginResult` /
+/// `LocalCredentialsResult` body — byte-for-byte the same shape HTTP
+/// returns from the matching `/v1/auth/local/*` endpoint (FR-FC-24 /
+/// NFR-09). On failure `json` is NULL and `status` carries the mapped
+/// error code. The caller must free `json` with `alexandria_free_string`.
+#[repr(C)]
+#[derive(Debug)]
+pub struct AuthJsonResult {
+    pub status: c_int,
+    pub json: *mut c_char,
+}
+
+impl AuthJsonResult {
+    fn err(status: c_int) -> Self {
+        Self {
+            status,
+            json: std::ptr::null_mut(),
+        }
+    }
+
+    fn ok(json: String) -> Self {
+        let cstring = CString::new(json).unwrap_or_default();
+        Self {
+            status: AUTH_OK,
+            json: cstring.into_raw(),
+        }
+    }
+}
+
+fn map_auth_err(err: DomainError) -> AuthJsonResult {
+    match err {
+        DomainError::Unauthorized => AuthJsonResult::err(AUTH_ERR_UNAUTHORIZED),
+        DomainError::InvalidInput(_) => AuthJsonResult::err(AUTH_ERR_INVALID_INPUT),
+        DomainError::InvalidState => AuthJsonResult::err(AUTH_ERR_INVALID_STATE),
+        DomainError::Config(_) => AuthJsonResult::err(AUTH_ERR_CONFIG),
+        _ => AuthJsonResult::err(AUTH_ERR_OTHER),
+    }
+}
+
+/// Request body accepted by both `alexandria_auth_local_login` and
+/// `alexandria_auth_local_set_credentials` — the same JSON both
+/// `/v1/auth/local/*` endpoints take: `{"email":"…","password":"…"}`.
+#[derive(Debug)]
+struct LocalCredentialsBody {
+    email: String,
+    password: String,
+}
+
+impl LocalCredentialsBody {
+    fn from_json_str(s: &str) -> Option<Self> {
+        let value: serde_json::Value = serde_json::from_str(s).ok()?;
+        let obj = value.as_object()?;
+        Some(Self {
+            email: obj.get("email")?.as_str()?.to_string(),
+            password: obj.get("password")?.as_str()?.to_string(),
+        })
+    }
+}
+
+/// Local login (UC-34 / FR-AU-04): verify email + password and create a
+/// session. `json_body` is the JSON body HTTP would send (`email`,
+/// `password`). On success `json` carries the `LocalLoginResult` — the
+/// caller presents its `sessionId` on subsequent requests instead of a
+/// bearer token in local mode.
+///
+/// Deliberately takes no `token`: this is how a caller obtains credentials
+/// in the first place (mirrors the HTTP route being outside the auth gate).
+#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
+#[no_mangle]
+pub extern "C" fn alexandria_auth_local_login(json_body: *const c_char) -> AuthJsonResult {
+    let services = match services_slot().lock().unwrap().clone() {
+        Some(s) => s,
+        None => return AuthJsonResult::err(AUTH_ERR_NOT_INITIALIZED),
+    };
+
+    let body_str = match cstr_lossy(json_body) {
+        Some(s) => s,
+        None => return AuthJsonResult::err(AUTH_ERR_INVALID_INPUT),
+    };
+    let body = match LocalCredentialsBody::from_json_str(&body_str) {
+        Some(b) => b,
+        None => return AuthJsonResult::err(AUTH_ERR_INVALID_INPUT),
+    };
+
+    let result = runtime().block_on(async {
+        services
+            .local_login_handler
+            .login(&body.email, &body.password)
+            .await
+    });
+
+    match result {
+        Ok(login) => {
+            let json = serde_json::to_string(&login).unwrap_or_default();
+            AuthJsonResult::ok(json)
+        }
+        Err(err) => map_auth_err(err),
+    }
+}
+
+/// Set or change local-login credentials (UC-35 / FR-AU-05, FR-AU-06).
+/// `json_body` is the JSON body HTTP would send (`email`, `password`).
+/// `token` is optional: required only once credentials already exist
+/// (AF-03) — pass an empty string on first-time setup.
+#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
+#[no_mangle]
+pub extern "C" fn alexandria_auth_local_set_credentials(
+    json_body: *const c_char,
+    token: *const c_char,
+) -> AuthJsonResult {
+    let services = match services_slot().lock().unwrap().clone() {
+        Some(s) => s,
+        None => return AuthJsonResult::err(AUTH_ERR_NOT_INITIALIZED),
+    };
+
+    let token = cstr_lossy(token).unwrap_or_default();
+
+    let body_str = match cstr_lossy(json_body) {
+        Some(s) => s,
+        None => return AuthJsonResult::err(AUTH_ERR_INVALID_INPUT),
+    };
+    let body = match LocalCredentialsBody::from_json_str(&body_str) {
+        Some(b) => b,
+        None => return AuthJsonResult::err(AUTH_ERR_INVALID_INPUT),
+    };
+
+    let result = runtime().block_on(async {
+        services
+            .set_local_credentials_handler
+            .set(body.email, body.password, &token)
+            .await
+    });
+
+    match result {
+        Ok(credentials) => {
+            let json = serde_json::to_string(&credentials).unwrap_or_default();
+            AuthJsonResult::ok(json)
+        }
+        Err(err) => map_auth_err(err),
+    }
+}
+
 /// Free a string previously returned by an FFI accessor.
 ///
 /// # Safety

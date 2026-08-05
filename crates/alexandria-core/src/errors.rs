@@ -19,6 +19,10 @@ pub enum DomainError {
     /// submitted bytes, even after one retry (UC-33 AF-03).
     #[error("integrity error: {0}")]
     Integrity(String),
+    /// A required external dependency could not be reached (UC-36 AF-03: the
+    /// external auth service is unreachable).
+    #[error("service unavailable: {0}")]
+    ServiceUnavailable(String),
     #[error("database error: {0}")]
     Database(#[from] sqlx::Error),
     #[error("database migration error: {0}")]
@@ -44,5 +48,9 @@ impl DomainError {
 
     pub fn integrity(message: impl Into<String>) -> Self {
         Self::Integrity(message.into())
+    }
+
+    pub fn service_unavailable(message: impl Into<String>) -> Self {
+        Self::ServiceUnavailable(message.into())
     }
 }

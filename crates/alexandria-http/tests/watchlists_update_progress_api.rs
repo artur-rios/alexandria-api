@@ -20,7 +20,10 @@ fn create_watchlist_request(name: &str) -> Request<Body> {
     Request::builder()
         .method("POST")
         .uri("/v1/watchlists")
-        .header("authorization", "Bearer test-token")
+        .header(
+            "authorization",
+            format!("Bearer {}", common::TEST_TOKEN).as_str(),
+        )
         .header("content-type", "application/json")
         .body(Body::from(json!({ "name": name }).to_string()))
         .unwrap()
@@ -30,7 +33,10 @@ fn add_video_request(watchlist_uuid: &str, video_uuid: &str) -> Request<Body> {
     Request::builder()
         .method("POST")
         .uri(format!("/v1/watchlists/{watchlist_uuid}/items"))
-        .header("authorization", "Bearer test-token")
+        .header(
+            "authorization",
+            format!("Bearer {}", common::TEST_TOKEN).as_str(),
+        )
         .header("content-type", "application/json")
         .body(Body::from(json!({ "videoUuid": video_uuid }).to_string()))
         .unwrap()
@@ -42,7 +48,10 @@ fn update_progress_request(watchlist_uuid: &str, video_uuid: &str, body: Value) 
         .uri(format!(
             "/v1/watchlists/{watchlist_uuid}/items/{video_uuid}"
         ))
-        .header("authorization", "Bearer test-token")
+        .header(
+            "authorization",
+            format!("Bearer {}", common::TEST_TOKEN).as_str(),
+        )
         .header("content-type", "application/json")
         .body(Body::from(body.to_string()))
         .unwrap()

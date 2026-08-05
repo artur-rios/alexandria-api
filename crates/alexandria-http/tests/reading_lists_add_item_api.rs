@@ -21,7 +21,10 @@ fn create_reading_list_request(name: &str) -> Request<Body> {
     Request::builder()
         .method("POST")
         .uri("/v1/reading-lists")
-        .header("authorization", "Bearer test-token")
+        .header(
+            "authorization",
+            format!("Bearer {}", common::TEST_TOKEN).as_str(),
+        )
         .header("content-type", "application/json")
         .body(Body::from(json!({ "name": name }).to_string()))
         .unwrap()
@@ -31,7 +34,10 @@ fn add_item_request(reading_list_uuid: &str, item_uuid: &str) -> Request<Body> {
     Request::builder()
         .method("POST")
         .uri(format!("/v1/reading-lists/{reading_list_uuid}/items"))
-        .header("authorization", "Bearer test-token")
+        .header(
+            "authorization",
+            format!("Bearer {}", common::TEST_TOKEN).as_str(),
+        )
         .header("content-type", "application/json")
         .body(Body::from(json!({ "itemUuid": item_uuid }).to_string()))
         .unwrap()

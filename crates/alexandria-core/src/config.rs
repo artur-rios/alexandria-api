@@ -51,10 +51,17 @@ pub struct AuthSettings {
     pub jwks_url: String,
     #[serde(default)]
     pub local_db: bool,
+    /// How long a session created by local login (UC-34) stays valid.
+    #[serde(default = "default_session_ttl_hours")]
+    pub session_ttl_hours: u32,
 }
 
 fn default_auth_mode() -> AuthMode {
     AuthMode::External
+}
+
+fn default_session_ttl_hours() -> u32 {
+    24
 }
 
 impl Default for AuthSettings {
@@ -63,6 +70,7 @@ impl Default for AuthSettings {
             mode: default_auth_mode(),
             jwks_url: String::new(),
             local_db: false,
+            session_ttl_hours: default_session_ttl_hours(),
         }
     }
 }
@@ -159,6 +167,16 @@ impl Default for DeletionSettings {
     }
 }
 
+/// The on-disk library root the health check probes for reachability
+/// (UC-37 / IR-03). Distinct from the per-request `root` UC-01/UC-02 take —
+/// this is the single configured location an operator points the health
+/// probe at.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct FilesystemSettings {
+    #[serde(default)]
+    pub root: String,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct LoggingSettings {
     #[serde(default = "default_log_level")]
@@ -191,6 +209,8 @@ pub struct Settings {
     pub deletion: DeletionSettings,
     #[serde(default)]
     pub logging: LoggingSettings,
+    #[serde(default)]
+    pub filesystem: FilesystemSettings,
 }
 
 impl Settings {
@@ -247,6 +267,9 @@ impl Settings {
             if let Ok(parsed) = match_log_level(&level) {
                 self.logging.level = parsed;
             }
+        }
+        if let Ok(root) = env::var("ALEXANDRIA_FILESYSTEM_ROOT") {
+            self.filesystem.root = root;
         }
     }
 }

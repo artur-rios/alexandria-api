@@ -28,7 +28,10 @@ fn create_request(body: Value) -> Request<Body> {
     Request::builder()
         .method("POST")
         .uri("/v1/reading-lists")
-        .header("authorization", "Bearer test-token")
+        .header(
+            "authorization",
+            format!("Bearer {}", common::TEST_TOKEN).as_str(),
+        )
         .header("content-type", "application/json")
         .body(Body::from(body.to_string()))
         .unwrap()
@@ -133,7 +136,10 @@ async fn given_malformed_json_body_when_posted_then_400_with_error_envelope() {
     let request = Request::builder()
         .method("POST")
         .uri("/v1/reading-lists")
-        .header("authorization", "Bearer test-token")
+        .header(
+            "authorization",
+            format!("Bearer {}", common::TEST_TOKEN).as_str(),
+        )
         .header("content-type", "application/json")
         .body(Body::from("{ not json"))
         .unwrap();
