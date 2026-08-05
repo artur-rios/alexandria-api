@@ -313,3 +313,250 @@ async fn given_no_token_and_malformed_body_when_posted_then_401_not_400() {
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     assert!(bookmark_rows(&test.pool).await.is_empty());
 }
+
+// ==================== UC-16: Update a bookmark ====================
+
+fn update_request(uuid: &str, body: Value) -> Request<Body> {
+    Request::builder()
+        .method("PATCH")
+        .uri(format!("/v1/bookmarks/{uuid}"))
+        .header("authorization", "Bearer test-token")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap()
+}
+
+fn unauthenticated_update_request(uuid: &str, body: Value) -> Request<Body> {
+    Request::builder()
+        .method("PATCH")
+        .uri(format!("/v1/bookmarks/{uuid}"))
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap()
+}
+
+async fn create_bookmark(router: axum::Router, url: &str, title: &str) -> (axum::Router, String) {
+    let response = router
+        .clone()
+        .oneshot(create_request(json!({ "url": url, "title": title })))
+        .await
+        .expect("create bookmark");
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let uuid = body_json(response).await["uuid"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    (router, uuid)
+}
+
+// ---------------- Main flow ----------------
+
+#[tokio::test]
+async fn given_existing_bookmark_when_updated_then_200_with_updated_bookmark_and_row() {
+    let test = test_app().await;
+    let router = app(Settings::default(), test.services.clone());
+    let (router, uuid) = create_bookmark(router, "https://example.com", "Example").await;
+
+    let response = router
+        .oneshot(update_request(
+            &uuid,
+            json!({ "url": "https://example.org", "title": "New title" }),
+        ))
+        .await
+        .expect("update");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_json(response).await;
+    assert_eq!(body["url"], "https://example.org");
+    assert_eq!(body["title"], "New title");
+
+    let rows = bookmark_rows(&test.pool).await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].1, "https://example.org");
+    assert_eq!(rows[0].2, "New title");
+}
+
+#[tokio::test]
+async fn given_bookmark_collection_when_updated_then_row_linked_to_collection() {
+    let test = test_app().await;
+    let router = app(Settings::default(), test.services.clone());
+    let (router, uuid) = create_bookmark(router, "https://example.com", "Example").await;
+    let (router, collection_uuid) = create_bookmark_collection(router, "Reading list").await;
+
+    let response = router
+        .oneshot(update_request(
+            &uuid,
+            json!({
+                "url": "https://example.com",
+                "title": "Example",
+                "collectionUuid": collection_uuid,
+            }),
+        ))
+        .await
+        .expect("update");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(body_json(response).await["collectionUuid"], collection_uuid);
+}
+
+// ---------------- AF-01: invalid input ----------------
+
+#[tokio::test]
+async fn given_empty_url_when_updated_then_400_and_row_unchanged() {
+    let test = test_app().await;
+    let router = app(Settings::default(), test.services.clone());
+    let (router, uuid) = create_bookmark(router, "https://example.com", "Example").await;
+
+    let response = router
+        .oneshot(update_request(
+            &uuid,
+            json!({ "url": "", "title": "Example" }),
+        ))
+        .await
+        .expect("update");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(bookmark_rows(&test.pool).await[0].1, "https://example.com");
+}
+
+// ---------------- Referenced collection ----------------
+
+#[tokio::test]
+async fn given_file_kind_collection_when_updated_then_400_and_row_unchanged() {
+    let test = test_app().await;
+    let router = app(Settings::default(), test.services.clone());
+    let (router, uuid) = create_bookmark(router, "https://example.com", "Example").await;
+    let create_collection_resp = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/collections")
+                .header("authorization", "Bearer test-token")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({ "name": "My files", "kind": "file" }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .expect("create collection");
+    let collection_uuid = body_json(create_collection_resp).await["uuid"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let response = router
+        .oneshot(update_request(
+            &uuid,
+            json!({
+                "url": "https://example.com",
+                "title": "Example",
+                "collectionUuid": collection_uuid,
+            }),
+        ))
+        .await
+        .expect("update");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(bookmark_rows(&test.pool).await[0].3, None);
+}
+
+#[tokio::test]
+async fn given_unknown_collection_uuid_when_updated_then_404() {
+    let test = test_app().await;
+    let router = app(Settings::default(), test.services.clone());
+    let (router, uuid) = create_bookmark(router, "https://example.com", "Example").await;
+
+    let response = router
+        .oneshot(update_request(
+            &uuid,
+            json!({
+                "url": "https://example.com",
+                "title": "Example",
+                "collectionUuid": uuid::Uuid::new_v4().to_string(),
+            }),
+        ))
+        .await
+        .expect("update");
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+// ---------------- AF-02: bookmark does not exist ----------------
+
+#[tokio::test]
+async fn given_unknown_bookmark_uuid_when_updated_then_404() {
+    let test = test_app().await;
+    let router = app(Settings::default(), test.services);
+
+    let response = router
+        .oneshot(update_request(
+            &uuid::Uuid::new_v4().to_string(),
+            json!({ "url": "https://example.com", "title": "Example" }),
+        ))
+        .await
+        .expect("update");
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn given_non_uuid_path_segment_when_updated_then_400() {
+    let test = test_app().await;
+    let router = app(Settings::default(), test.services);
+
+    let response = router
+        .oneshot(update_request(
+            "not-a-uuid",
+            json!({ "url": "https://example.com", "title": "Example" }),
+        ))
+        .await
+        .expect("update");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+// ---------------- Precondition: bookmark must be active ----------------
+
+#[tokio::test]
+async fn given_soft_deleted_bookmark_when_updated_then_409() {
+    let test = test_app().await;
+    let router = app(Settings::default(), test.services.clone());
+    let (router, uuid) = create_bookmark(router, "https://example.com", "Example").await;
+    sqlx::query("UPDATE bookmarks SET state = 'deleted' WHERE uuid = ?")
+        .bind(&uuid)
+        .execute(&test.pool)
+        .await
+        .expect("mark deleted");
+
+    let response = router
+        .oneshot(update_request(
+            &uuid,
+            json!({ "url": "https://example.org", "title": "New title" }),
+        ))
+        .await
+        .expect("update");
+
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+}
+
+// ---------------- AF-03: unauthorized ----------------
+
+#[tokio::test]
+async fn given_no_token_when_updated_then_401_and_row_unchanged() {
+    let test = test_app().await;
+    let router = app(Settings::default(), test.services.clone());
+    let (router, uuid) = create_bookmark(router, "https://example.com", "Example").await;
+
+    let response = router
+        .oneshot(unauthenticated_update_request(
+            &uuid,
+            json!({ "url": "https://example.org", "title": "New title" }),
+        ))
+        .await
+        .expect("update");
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(bookmark_rows(&test.pool).await[0].1, "https://example.com");
+}

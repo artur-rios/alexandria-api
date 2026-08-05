@@ -39,6 +39,20 @@ pub trait BookmarkRepository: Send + Sync {
     /// confirmed the collection exists. Ordered by title.
     async fn list_by_collection(&self, collection_uuid: Uuid)
         -> Result<Vec<Bookmark>, DomainError>;
+
+    /// Replace the url, title, and containing collection of the bookmark
+    /// identified by `uuid` (UC-16 / FR-BM-02), and return the updated
+    /// record. Full replace, not a merge: `collection_uuid = None` clears
+    /// the link. The caller has already validated the url/title and — when
+    /// `collection_uuid` is `Some` — confirmed that collection exists and is
+    /// `kind = bookmark`. `NotFound` when no bookmark carries the uuid.
+    async fn update_bookmark(
+        &self,
+        uuid: Uuid,
+        url: String,
+        title: String,
+        collection_uuid: Option<Uuid>,
+    ) -> Result<Bookmark, DomainError>;
 }
 
 #[derive(Clone)]
@@ -136,6 +150,31 @@ impl BookmarkRepository for SqliteBookmarkRepository {
             .fetch_all(&self.pool)
             .await?;
         rows.into_iter().map(parse_bookmark_row).collect()
+    }
+
+    async fn update_bookmark(
+        &self,
+        uuid: Uuid,
+        url: String,
+        title: String,
+        collection_uuid: Option<Uuid>,
+    ) -> Result<Bookmark, DomainError> {
+        // The collection's existence and kind were already confirmed by the
+        // handler (UC-16 AF-02-style check), so the id is resolved in the
+        // same statement rather than re-read here — a `None` collection_uuid
+        // binds NULL, clearing the link.
+        sqlx::query(
+            "UPDATE bookmarks SET url = ?, title = ?, \
+             collection_id = (SELECT id FROM collections WHERE uuid = ?) WHERE uuid = ?",
+        )
+        .bind(&url)
+        .bind(&title)
+        .bind(collection_uuid.map(|u| u.to_string()))
+        .bind(uuid.to_string())
+        .execute(&self.pool)
+        .await?;
+
+        self.find_by_uuid(uuid).await?.ok_or(DomainError::NotFound)
     }
 }
 

@@ -1405,6 +1405,91 @@ pub extern "C" fn alexandria_bookmark_create(
     }
 }
 
+/// Request body accepted by `alexandria_bookmark_update` — the same JSON
+/// `PATCH /v1/bookmarks/{uuid}` takes:
+/// `{"url":"…","title":"…","collectionUuid":"…"}` (`collectionUuid`
+/// optional/nullable; absent or null clears the link).
+#[derive(Debug)]
+struct UpdateBookmarkBody {
+    url: String,
+    title: String,
+    collection_uuid: Option<uuid::Uuid>,
+}
+
+impl UpdateBookmarkBody {
+    fn from_json_str(s: &str) -> Option<Self> {
+        let value: serde_json::Value = serde_json::from_str(s).ok()?;
+        let obj = value.as_object()?;
+        let url = obj.get("url")?.as_str()?.to_string();
+        let title = obj.get("title")?.as_str()?.to_string();
+        let collection_uuid = match obj.get("collectionUuid") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(v) => Some(uuid::Uuid::parse_str(v.as_str()?).ok()?),
+        };
+        Some(Self {
+            url,
+            title,
+            collection_uuid,
+        })
+    }
+}
+
+/// Update a bookmark's url, title, and containing collection (UC-16 /
+/// FR-BM-02).
+///
+/// `uuid` is the bookmark's public UUID (NUL-terminated string). `json_body`
+/// is the JSON body HTTP would send (`url` + `title` + `collectionUuid`).
+/// The function deserializes it, calls the same `UpdateBookmarkHandler` the
+/// HTTP route uses, and on success serializes the returned `Bookmark` back
+/// to JSON — so the FFI and HTTP surfaces agree byte-for-byte modulo key
+/// ordering (parity, FR-FC-24 / NFR-09). `token` is the bearer auth token.
+#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
+#[no_mangle]
+pub extern "C" fn alexandria_bookmark_update(
+    uuid: *const c_char,
+    json_body: *const c_char,
+    token: *const c_char,
+) -> BookmarkJsonResult {
+    let services = match services_slot().lock().unwrap().clone() {
+        Some(s) => s,
+        None => return BookmarkJsonResult::err(BOOKMARK_ERR_NOT_INITIALIZED),
+    };
+
+    let token = cstr_lossy(token).unwrap_or_default();
+    if !authenticated(&services, &token) {
+        return BookmarkJsonResult::err(BOOKMARK_ERR_UNAUTHORIZED);
+    }
+
+    let uuid = match cstr_lossy(uuid).and_then(|s| uuid::Uuid::parse_str(&s).ok()) {
+        Some(u) => u,
+        None => return BookmarkJsonResult::err(BOOKMARK_ERR_INVALID_INPUT),
+    };
+
+    let body_str = match cstr_lossy(json_body) {
+        Some(s) => s,
+        None => return BookmarkJsonResult::err(BOOKMARK_ERR_INVALID_INPUT),
+    };
+    let body = match UpdateBookmarkBody::from_json_str(&body_str) {
+        Some(b) => b,
+        None => return BookmarkJsonResult::err(BOOKMARK_ERR_INVALID_INPUT),
+    };
+
+    let result = runtime().block_on(async {
+        services
+            .update_bookmark_handler
+            .update(uuid, &body.url, &body.title, body.collection_uuid, &token)
+            .await
+    });
+
+    match result {
+        Ok(bookmark) => {
+            let json = serde_json::to_string(&bookmark).unwrap_or_default();
+            BookmarkJsonResult::ok(json)
+        }
+        Err(err) => map_bookmark_err(err),
+    }
+}
+
 fn parse_file_type(s: &str) -> Option<alexandria_core::catalog::model::FileType> {
     use alexandria_core::catalog::model::FileType;
     match s {

@@ -840,6 +840,9 @@ pub struct FakeBookmarkRepository {
     /// failure in UC-15. There is no on-disk leg to compensate — the handler
     /// merely surfaces the error and nothing is stored.
     failing: Arc<Mutex<bool>>,
+    /// When set, every `update_bookmark` fails, simulating a catalog-write
+    /// failure in UC-16.
+    failing_updates: Arc<Mutex<bool>>,
 }
 
 impl FakeBookmarkRepository {
@@ -866,6 +869,11 @@ impl FakeBookmarkRepository {
     /// Make every `insert_bookmark` return an `Internal` error.
     pub fn fail_inserts(&self) {
         *self.failing.lock().unwrap() = true;
+    }
+
+    /// Make every `update_bookmark` return an `Internal` error.
+    pub fn fail_updates(&self) {
+        *self.failing_updates.lock().unwrap() = true;
     }
 }
 
@@ -922,5 +930,23 @@ impl BookmarkRepository for FakeBookmarkRepository {
             .collect();
         out.sort_by(|a, b| a.title.cmp(&b.title));
         Ok(out)
+    }
+
+    async fn update_bookmark(
+        &self,
+        uuid: Uuid,
+        url: String,
+        title: String,
+        collection_uuid: Option<Uuid>,
+    ) -> Result<Bookmark, DomainError> {
+        if *self.failing_updates.lock().unwrap() {
+            return Err(DomainError::internal("fake update_bookmark failure"));
+        }
+        let mut bookmarks = self.bookmarks.lock().unwrap();
+        let bookmark = bookmarks.get_mut(&uuid).ok_or(DomainError::NotFound)?;
+        bookmark.url = url;
+        bookmark.title = title;
+        bookmark.collection_uuid = collection_uuid;
+        Ok(bookmark.clone())
     }
 }
