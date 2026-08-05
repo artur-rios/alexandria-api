@@ -72,6 +72,11 @@ pub trait WatchlistRepository: Send + Sync {
         watchlist_uuid: Uuid,
         video_uuid: Uuid,
     ) -> Result<(), DomainError>;
+
+    /// Delete the watchlist identified by `uuid`, including every
+    /// WatchProgress entry it holds (UC-25 / FR-WL-07). The VideoFiles
+    /// themselves are untouched — this deletes the tracking rows only.
+    async fn delete_watchlist(&self, uuid: Uuid) -> Result<(), DomainError>;
 }
 
 #[derive(Clone)]
@@ -307,6 +312,30 @@ impl WatchlistRepository for SqliteWatchlistRepository {
         if affected == 0 {
             return Err(DomainError::NotFound);
         }
+        Ok(())
+    }
+
+    async fn delete_watchlist(&self, uuid: Uuid) -> Result<(), DomainError> {
+        let mut tx = self.pool.begin().await?;
+
+        // Delete every WatchProgress entry the watchlist holds before
+        // removing it — a deleted watchlist must not leave orphaned
+        // `watch_progress` rows (UC-25 / FR-WL-07). The VideoFiles
+        // themselves are untouched.
+        sqlx::query(
+            "DELETE FROM watch_progress \
+             WHERE watchlist_id = (SELECT id FROM watchlists WHERE uuid = ?)",
+        )
+        .bind(uuid.to_string())
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query("DELETE FROM watchlists WHERE uuid = ?")
+            .bind(uuid.to_string())
+            .execute(&mut *tx)
+            .await?;
+
+        tx.commit().await?;
         Ok(())
     }
 }

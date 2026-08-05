@@ -2140,6 +2140,51 @@ pub extern "C" fn alexandria_watchlist_remove_video(
     }
 }
 
+/// Delete a watchlist (UC-25 / FR-WL-07).
+///
+/// `uuid` is the watchlist's public UUID (NUL-terminated string). On success
+/// `json` carries the pre-delete `Watchlist` — byte-for-byte the same shape
+/// HTTP returns from `DELETE /v1/watchlists/{uuid}` (parity, FR-FC-24 /
+/// NFR-09). `token` is the bearer auth token.
+#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
+#[no_mangle]
+pub extern "C" fn alexandria_watchlist_delete(
+    uuid: *const c_char,
+    token: *const c_char,
+) -> WatchlistJsonResult {
+    let services = match services_slot().lock().unwrap().clone() {
+        Some(s) => s,
+        None => return WatchlistJsonResult::err(WATCHLIST_ERR_NOT_INITIALIZED),
+    };
+
+    // Deny before touching the payload — an unauthenticated caller must not
+    // learn whether the uuid would have parsed.
+    let token = cstr_lossy(token).unwrap_or_default();
+    if !authenticated(&services, &token) {
+        return WatchlistJsonResult::err(WATCHLIST_ERR_UNAUTHORIZED);
+    }
+
+    let uuid_str = match cstr_lossy(uuid) {
+        Some(s) => s,
+        None => return WatchlistJsonResult::err(WATCHLIST_ERR_INVALID_INPUT),
+    };
+    let uuid = match uuid::Uuid::parse_str(&uuid_str) {
+        Ok(u) => u,
+        Err(_) => return WatchlistJsonResult::err(WATCHLIST_ERR_INVALID_INPUT),
+    };
+
+    let result =
+        runtime().block_on(async { services.delete_watchlist_handler.delete(uuid, &token).await });
+
+    match result {
+        Ok(watchlist) => {
+            let json = serde_json::to_string(&watchlist).unwrap_or_default();
+            WatchlistJsonResult::ok(json)
+        }
+        Err(err) => map_watchlist_err(err),
+    }
+}
+
 fn parse_file_type(s: &str) -> Option<alexandria_core::catalog::model::FileType> {
     use alexandria_core::catalog::model::FileType;
     match s {
