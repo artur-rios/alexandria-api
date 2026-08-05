@@ -553,6 +553,16 @@ struct FakeFsState {
     /// Paths removed by `remove_file` so far, in order. `path_exists` reports
     /// these as gone afterwards.
     removed: Vec<String>,
+    /// Paths where `write_file` must fail, simulating UC-33 AF-02.
+    failing_writes_from: std::collections::HashSet<String>,
+    /// Paths where `write_file` "succeeds" but the bytes actually stored
+    /// differ from what was submitted, simulating UC-33 AF-03 (the
+    /// post-write hash does not match).
+    corrupt_writes_from: std::collections::HashSet<String>,
+    /// Content actually stored by `write_file` so far, keyed by path.
+    /// `read_file` and `content_hash` prefer this over the builder-seeded
+    /// `content_by_path`/`hash_by_path` once a write has happened.
+    written: HashMap<String, String>,
 }
 
 impl FakeFilesystem {
@@ -592,6 +602,33 @@ impl FakeFilesystem {
     /// Count of renames the fake has performed so far.
     pub fn rename_count(&self) -> usize {
         self.state.lock().unwrap().renames.len()
+    }
+
+    /// Make `write_file` at `path` fail with a disk error (UC-33 AF-02).
+    #[allow(dead_code)]
+    pub fn fail_write_to(&mut self, path: &str) {
+        self.state
+            .lock()
+            .unwrap()
+            .failing_writes_from
+            .insert(path.to_string());
+    }
+
+    /// Make `write_file` at `path` silently store different bytes than
+    /// submitted, so the post-write hash never matches (UC-33 AF-03).
+    #[allow(dead_code)]
+    pub fn corrupt_write_to(&mut self, path: &str) {
+        self.state
+            .lock()
+            .unwrap()
+            .corrupt_writes_from
+            .insert(path.to_string());
+    }
+
+    /// The bytes `write_file` most recently stored at `path`, if any.
+    #[allow(dead_code)]
+    pub fn written_content(&self, path: &str) -> Option<String> {
+        self.state.lock().unwrap().written.get(path).cloned()
     }
 
     /// Make `remove_file` at `path` fail with a disk error (UC-09 AF-02).
@@ -695,6 +732,9 @@ impl Filesystem for FakeFilesystem {
         if self.unreadable.contains(path) {
             return Err(DomainError::internal(format!("failed to read {path}")));
         }
+        if let Some(written) = self.state.lock().unwrap().written.get(path) {
+            return Ok(alexandria_core::catalog::fs::sha256_hex(written.as_bytes()));
+        }
         Ok(self
             .hash_by_path
             .get(path)
@@ -737,10 +777,27 @@ impl Filesystem for FakeFilesystem {
         if self.unreadable.contains(path) {
             return Err(DomainError::disk(format!("fake read failure: {path}")));
         }
+        if let Some(written) = self.state.lock().unwrap().written.get(path) {
+            return Ok(written.clone());
+        }
         self.content_by_path
             .get(path)
             .cloned()
             .ok_or_else(|| DomainError::disk(format!("fake file not found: {path}")))
+    }
+
+    async fn write_file(&self, path: &str, content: &str) -> Result<(), DomainError> {
+        let mut state = self.state.lock().unwrap();
+        if state.failing_writes_from.contains(path) {
+            return Err(DomainError::disk(format!("fake write failure: {path:?}")));
+        }
+        let stored = if state.corrupt_writes_from.contains(path) {
+            format!("{content}-corrupted")
+        } else {
+            content.to_string()
+        };
+        state.written.insert(path.to_string(), stored);
+        Ok(())
     }
 }
 

@@ -10,6 +10,7 @@ use crate::bookmarks::commands::update::UpdateBookmarkHandler;
 use crate::bookmarks::queries::browse::BrowseBookmarksHandler;
 use crate::bookmarks::repos::SqliteBookmarkRepository;
 use crate::catalog::clock::SystemClock;
+use crate::catalog::commands::edit_content::EditTextFileContentHandler;
 use crate::catalog::commands::edit_metadata::EditMetadataHandler;
 use crate::catalog::commands::index::IndexHandler;
 use crate::catalog::commands::purge::PurgeFileHandler;
@@ -77,6 +78,13 @@ pub type DefaultBrowseFilesHandler = BrowseFilesHandler<BearerAuthService, Sqlit
 
 pub type DefaultReadTextFileContentHandler =
     ReadTextFileContentHandler<BearerAuthService, SqliteCatalogRepository, StdFilesystem>;
+
+pub type DefaultEditTextFileContentHandler = EditTextFileContentHandler<
+    BearerAuthService,
+    SqliteCatalogRepository,
+    StdFilesystem,
+    SystemClock,
+>;
 
 pub type DefaultCreateCollectionHandler =
     CreateCollectionHandler<BearerAuthService, SqliteCollectionRepository>;
@@ -177,6 +185,7 @@ pub struct Services {
     pub purge_file_on_disk_handler: Arc<DefaultPurgeFileOnDiskHandler>,
     pub browse_files_handler: Arc<DefaultBrowseFilesHandler>,
     pub read_text_file_content_handler: Arc<DefaultReadTextFileContentHandler>,
+    pub edit_text_file_content_handler: Arc<DefaultEditTextFileContentHandler>,
     pub create_collection_handler: Arc<DefaultCreateCollectionHandler>,
     pub rename_collection_handler: Arc<DefaultRenameCollectionHandler>,
     pub delete_collection_handler: Arc<DefaultDeleteCollectionHandler>,
@@ -238,6 +247,12 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
     let browse_files_handler = Arc::new(BrowseFilesHandler::new(auth, repo.clone()));
     let read_text_file_content_handler =
         Arc::new(ReadTextFileContentHandler::new(auth, repo.clone(), fs));
+    let edit_text_file_content_handler = Arc::new(EditTextFileContentHandler::new(
+        auth,
+        repo.clone(),
+        fs,
+        clock,
+    ));
     let create_collection_handler = Arc::new(CreateCollectionHandler::new(
         auth,
         SqliteCollectionRepository::new(pool.clone()),
@@ -348,6 +363,7 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         purge_file_on_disk_handler,
         browse_files_handler,
         read_text_file_content_handler,
+        edit_text_file_content_handler,
         create_collection_handler,
         rename_collection_handler,
         delete_collection_handler,

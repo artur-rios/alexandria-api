@@ -35,6 +35,32 @@ pub trait Filesystem: Send + Sync {
     /// `Disk` when the file is missing, unreadable (permission), or its
     /// bytes are not valid UTF-8 (AF-02).
     async fn read_file(&self, path: &str) -> Result<String, DomainError>;
+    /// Write `content` to `path`, replacing its bytes (UC-33 / FR-TX-02).
+    /// Fails with `Disk` when the write cannot complete (disk full,
+    /// permission denied — AF-02); the caller is responsible for leaving
+    /// the catalog untouched when this fails.
+    async fn write_file(&self, path: &str, content: &str) -> Result<(), DomainError>;
+}
+
+/// SHA-256 of `bytes`, lowercase hex (UC-01/UC-02/UC-33). Extracted so
+/// `StdFilesystem::content_hash` and the UC-33 handler's pre-write hash
+/// computation share one implementation and can never silently diverge —
+/// UC-33 AF-03 relies on comparing this exact output against a post-write
+/// `content_hash` read back from disk.
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    // Lowercase hex, written byte by byte. digest 0.11 returns an `Array`
+    // that no longer implements `LowerHex`, so `{:x}` is unavailable — but
+    // the output must stay identical to what earlier versions produced,
+    // because these hashes are persisted and compared on every re-index.
+    let digest = hasher.finalize();
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write;
+        let _ = write!(hex, "{byte:02x}");
+    }
+    hex
 }
 
 /// Real on-disk filesystem backed by `walkdir` and `sha2`.
@@ -86,19 +112,7 @@ impl Filesystem for StdFilesystem {
     async fn content_hash(&self, path: &str) -> Result<String, DomainError> {
         let bytes = std::fs::read(path)
             .map_err(|e| DomainError::Internal(format!("failed to read {}: {e}", path)))?;
-        let mut hasher = Sha256::new();
-        hasher.update(&bytes);
-        // Lowercase hex, written byte by byte. digest 0.11 returns an `Array`
-        // that no longer implements `LowerHex`, so `{:x}` is unavailable — but
-        // the output must stay identical to what earlier versions produced,
-        // because these hashes are persisted and compared on every re-index.
-        let digest = hasher.finalize();
-        let mut hex = String::with_capacity(digest.len() * 2);
-        for byte in digest {
-            use std::fmt::Write;
-            let _ = write!(hex, "{byte:02x}");
-        }
-        Ok(hex)
+        Ok(sha256_hex(&bytes))
     }
 
     async fn rename(&self, from: &str, to: &str) -> Result<(), DomainError> {
@@ -116,6 +130,11 @@ impl Filesystem for StdFilesystem {
 
     async fn read_file(&self, path: &str) -> Result<String, DomainError> {
         std::fs::read_to_string(path).map_err(|e| DomainError::disk(format!("read {path:?}: {e}")))
+    }
+
+    async fn write_file(&self, path: &str, content: &str) -> Result<(), DomainError> {
+        std::fs::write(path, content.as_bytes())
+            .map_err(|e| DomainError::disk(format!("write {path:?}: {e}")))
     }
 }
 

@@ -4,6 +4,9 @@ mod common;
 #[path = "catalog/browse.rs"]
 mod browse;
 
+#[path = "catalog/edit_content.rs"]
+mod edit_content;
+
 #[path = "catalog/edit_metadata.rs"]
 mod edit_metadata;
 
