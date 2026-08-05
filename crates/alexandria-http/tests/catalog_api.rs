@@ -1670,6 +1670,53 @@ async fn given_missing_disk_file_when_purge_on_disk_then_200_disk_file_present_f
 }
 
 #[tokio::test]
+async fn given_disk_delete_failure_when_purge_on_disk_then_500_disk_error_and_row_kept() {
+    let lib = tempdir().unwrap();
+    let on_disk = common::write_file(&lib, "song.mp3", b"audio bytes");
+    let test = test_app().await;
+    index_library(&lib, &test.pool, &[("song.mp3", b"audio bytes")]).await;
+    let uuid = uuid_for_name(&test.pool, "song.mp3").await;
+
+    let file_id: (i64,) = sqlx::query_as("SELECT id FROM files WHERE uuid = ?")
+        .bind(&uuid)
+        .fetch_one(&test.pool)
+        .await
+        .expect("file id");
+
+    // Replace the indexed file with a directory at the same path so
+    // `std::fs::remove_file` fails with something other than `NotFound`
+    // (AF-02), on both Windows and Unix.
+    std::fs::remove_file(&on_disk).expect("pre-remove indexed file");
+    std::fs::create_dir(&on_disk).expect("create directory in place of indexed file");
+
+    let response = app(Settings::default(), test.services)
+        .oneshot(purge_on_disk_request(&uuid))
+        .await
+        .expect("purge-on-disk one-shot");
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+    let body: Value = serde_json::from_slice(
+        &to_bytes(response.into_body(), usize::MAX).await.unwrap(),
+    )
+    .unwrap();
+    assert_eq!(body["error"], "disk error");
+
+    let remaining: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM files WHERE uuid = ?")
+        .bind(&uuid)
+        .fetch_one(&test.pool)
+        .await
+        .expect("files count");
+    assert_eq!(remaining.0, 1, "AF-02: record kept when the disk delete fails");
+
+    let subtype_remaining: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM audio_files WHERE file_id = ?")
+        .bind(file_id.0)
+        .fetch_one(&test.pool)
+        .await
+        .expect("audio_files count");
+    assert_eq!(subtype_remaining.0, 1, "AF-02: subtype row kept when the disk delete fails");
+}
+
+#[tokio::test]
 async fn given_missing_uuid_when_purge_on_disk_then_404() {
     let test = test_app().await;
     let missing = uuid::Uuid::new_v4().to_string();
