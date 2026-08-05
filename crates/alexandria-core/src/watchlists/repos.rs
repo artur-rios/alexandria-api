@@ -40,6 +40,29 @@ pub trait WatchlistRepository: Send + Sync {
         watchlist_uuid: Uuid,
         video_uuid: Uuid,
     ) -> Result<WatchProgress, DomainError>;
+
+    /// Look up the WatchProgress linking `video_uuid` to `watchlist_uuid`
+    /// (UC-23 AF-02). `None` when the video is not on that watchlist.
+    async fn find_progress(
+        &self,
+        watchlist_uuid: Uuid,
+        video_uuid: Uuid,
+    ) -> Result<Option<WatchProgress>, DomainError>;
+
+    /// Replace the state and episode fields of the WatchProgress linking
+    /// `video_uuid` to `watchlist_uuid` (UC-23 / FR-WL-04, FR-WL-05), and
+    /// return the updated record. Full replace: `current_episode` and
+    /// `total_episodes` are written as given, `None` writes `NULL`. The
+    /// caller has already confirmed the WatchProgress exists and that the
+    /// transition to `state` is valid.
+    async fn update_progress(
+        &self,
+        watchlist_uuid: Uuid,
+        video_uuid: Uuid,
+        state: WatchState,
+        current_episode: Option<i64>,
+        total_episodes: Option<i64>,
+    ) -> Result<WatchProgress, DomainError>;
 }
 
 #[derive(Clone)]
@@ -185,6 +208,73 @@ impl WatchlistRepository for SqliteWatchlistRepository {
             state: WatchState::parse(&state_str).ok_or_else(|| {
                 DomainError::internal(format!("corrupt watch_progress state: {state_str}"))
             })?,
+            current_episode,
+            total_episodes,
+        })
+    }
+
+    async fn find_progress(
+        &self,
+        watchlist_uuid: Uuid,
+        video_uuid: Uuid,
+    ) -> Result<Option<WatchProgress>, DomainError> {
+        let row = sqlx::query(
+            "SELECT wp.state, wp.current_episode, wp.total_episodes \
+             FROM watch_progress wp \
+             JOIN watchlists w ON w.id = wp.watchlist_id \
+             JOIN files f ON f.id = wp.video_file_id \
+             WHERE w.uuid = ? AND f.uuid = ?",
+        )
+        .bind(watchlist_uuid.to_string())
+        .bind(video_uuid.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+
+        let Some(row) = row else {
+            return Ok(None);
+        };
+
+        let state_str: String = row.try_get("state")?;
+        let current_episode: Option<i64> = row.try_get("current_episode")?;
+        let total_episodes: Option<i64> = row.try_get("total_episodes")?;
+
+        Ok(Some(WatchProgress {
+            watchlist_uuid,
+            video_uuid,
+            state: WatchState::parse(&state_str).ok_or_else(|| {
+                DomainError::internal(format!("corrupt watch_progress state: {state_str}"))
+            })?,
+            current_episode,
+            total_episodes,
+        }))
+    }
+
+    async fn update_progress(
+        &self,
+        watchlist_uuid: Uuid,
+        video_uuid: Uuid,
+        state: WatchState,
+        current_episode: Option<i64>,
+        total_episodes: Option<i64>,
+    ) -> Result<WatchProgress, DomainError> {
+        sqlx::query(
+            "UPDATE watch_progress \
+             SET state = ?, current_episode = ?, total_episodes = ? \
+             WHERE watchlist_id = (SELECT id FROM watchlists WHERE uuid = ?) \
+               AND video_file_id = (SELECT id FROM files WHERE uuid = ?)",
+        )
+        .bind(state.as_str())
+        .bind(current_episode)
+        .bind(total_episodes)
+        .bind(watchlist_uuid.to_string())
+        .bind(video_uuid.to_string())
+        .execute(&self.pool)
+        .await?;
+
+        Ok(WatchProgress {
+            watchlist_uuid,
+            video_uuid,
+            state,
             current_episode,
             total_episodes,
         })
