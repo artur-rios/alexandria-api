@@ -67,8 +67,10 @@ fn seeded_deleted_at(
 // ---------------- Main flow ----------------
 
 #[tokio::test]
-async fn given_deleted_file_within_retention_when_restore_then_state_active_deleted_at_cleared_in_result_and_persisted() {
-    let (uuid, repo, _clock, h) = seeded_deleted_at("/lib/song.mp3", RETENTION - Duration::seconds(1000));
+async fn given_deleted_file_within_retention_when_restore_then_state_active_deleted_at_cleared_in_result_and_persisted(
+) {
+    let (uuid, repo, _clock, h) =
+        seeded_deleted_at("/lib/song.mp3", RETENTION - Duration::seconds(1000));
 
     let result = h.restore(uuid, TOKEN).await.expect("restore");
 
@@ -84,7 +86,8 @@ async fn given_deleted_file_within_retention_when_restore_then_state_active_dele
 
 #[tokio::test]
 async fn given_deleted_file_past_retention_when_restore_then_not_found() {
-    let (uuid, repo, _clock, h) = seeded_deleted_at("/lib/song.mp3", RETENTION + Duration::seconds(1));
+    let (uuid, repo, _clock, h) =
+        seeded_deleted_at("/lib/song.mp3", RETENTION + Duration::seconds(1));
 
     let result = h.restore(uuid, TOKEN).await;
 
@@ -102,7 +105,11 @@ async fn given_deleted_file_exactly_on_retention_boundary_when_restore_then_rest
 
     let result = h.restore(uuid, TOKEN).await;
 
-    assert!(result.is_ok(), "exact-boundary restore must succeed: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "exact-boundary restore must succeed: {:?}",
+        result
+    );
     assert_eq!(result.unwrap().state, FileState::Active);
 }
 
@@ -110,7 +117,8 @@ async fn given_deleted_file_exactly_on_retention_boundary_when_restore_then_rest
 
 #[tokio::test]
 async fn given_missing_uuid_when_restore_then_not_found() {
-    let (_uuid, _repo, _clock, h) = seeded_deleted_at("/lib/song.mp3", RETENTION - Duration::seconds(1000));
+    let (_uuid, _repo, _clock, h) =
+        seeded_deleted_at("/lib/song.mp3", RETENTION - Duration::seconds(1000));
     let other_uuid = uuid::Uuid::new_v4();
 
     let result = h.restore(other_uuid, TOKEN).await;
@@ -121,10 +129,18 @@ async fn given_missing_uuid_when_restore_then_not_found() {
 #[tokio::test]
 async fn given_active_file_when_restore_then_invalid_state_and_state_unchanged() {
     let repo = FakeCatalogRepository::new();
-    let file = existing_file("/lib/song.mp3", alexandria_core::catalog::model::FileType::Audio);
+    let file = existing_file(
+        "/lib/song.mp3",
+        alexandria_core::catalog::model::FileType::Audio,
+    );
     let uuid = file.uuid;
     repo.seed(file);
-    let h = handler(FakeAuth::Allowing, repo.clone(), fixed_clock(now()), RETENTION_DAYS);
+    let h = handler(
+        FakeAuth::Allowing,
+        repo.clone(),
+        fixed_clock(now()),
+        RETENTION_DAYS,
+    );
 
     let result = h.restore(uuid, TOKEN).await;
 
@@ -138,8 +154,14 @@ async fn given_active_file_when_restore_then_invalid_state_and_state_unchanged()
 
 #[tokio::test]
 async fn given_unauthenticated_when_restore_then_unauthorized_and_no_state_change() {
-    let (uuid, repo, _clock, _h) = seeded_deleted_at("/lib/song.mp3", RETENTION - Duration::seconds(1000));
-    let h = handler(FakeAuth::Denying, repo.clone(), fixed_clock(now()), RETENTION_DAYS);
+    let (uuid, repo, _clock, _h) =
+        seeded_deleted_at("/lib/song.mp3", RETENTION - Duration::seconds(1000));
+    let h = handler(
+        FakeAuth::Denying,
+        repo.clone(),
+        fixed_clock(now()),
+        RETENTION_DAYS,
+    );
 
     let result = h.restore(uuid, "").await;
 
@@ -153,9 +175,15 @@ async fn given_unauthenticated_when_restore_then_unauthorized_and_no_state_chang
 
 #[tokio::test]
 async fn given_restore_when_repo_write_fails_then_error_propagated_and_state_unchanged() {
-    let (uuid, repo, _clock, _h) = seeded_deleted_at("/lib/song.mp3", RETENTION - Duration::seconds(1000));
+    let (uuid, repo, _clock, _h) =
+        seeded_deleted_at("/lib/song.mp3", RETENTION - Duration::seconds(1000));
     repo.fail_restore(uuid);
-    let h = handler(FakeAuth::Allowing, repo.clone(), fixed_clock(now()), RETENTION_DAYS);
+    let h = handler(
+        FakeAuth::Allowing,
+        repo.clone(),
+        fixed_clock(now()),
+        RETENTION_DAYS,
+    );
 
     let result = h.restore(uuid, TOKEN).await;
 

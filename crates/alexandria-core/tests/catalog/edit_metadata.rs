@@ -13,9 +13,7 @@ use alexandria_core::catalog::model::{
 };
 use alexandria_core::errors::DomainError;
 
-use crate::common::{
-    deleted_file, existing_file_with_hash, FakeAuth, FakeCatalogRepository,
-};
+use crate::common::{deleted_file, existing_file_with_hash, FakeAuth, FakeCatalogRepository};
 
 const TOKEN: &str = "bearer-token";
 
@@ -28,7 +26,9 @@ where
 }
 
 /// Builds an active seeded file and returns (uuid, repo_handle, handler).
-fn seeded(file_type: FileType) -> (
+fn seeded(
+    file_type: FileType,
+) -> (
     Uuid,
     FakeCatalogRepository,
     EditMetadataHandler<FakeAuth, FakeCatalogRepository>,
@@ -60,8 +60,15 @@ async fn given_active_audio_file_when_edit_audio_metadata_then_metadata_replaced
     assert_eq!(result.file.uuid, uuid);
     assert_eq!(result.file.file_type, FileType::Audio);
     assert_eq!(result.file.state, FileState::Active);
-    assert_eq!(result.metadata, metadata, "handler echoes the written metadata");
-    assert_eq!(repo.metadata_for(uuid), Some(metadata), "repo got the metadata");
+    assert_eq!(
+        result.metadata, metadata,
+        "handler echoes the written metadata"
+    );
+    assert_eq!(
+        repo.metadata_for(uuid),
+        Some(metadata),
+        "repo got the metadata"
+    );
 }
 
 // ---------- Video (FR-FC-15) ----------

@@ -70,8 +70,8 @@ async fn given_deleted_file_when_purge_on_disk_then_record_removed() {
 // ---------------- AF-01: no on-disk file present ----------------
 
 #[tokio::test]
-async fn given_missing_disk_file_when_purge_on_disk_then_record_removed_and_disk_file_absent_reported()
-{
+async fn given_missing_disk_file_when_purge_on_disk_then_record_removed_and_disk_file_absent_reported(
+) {
     let repo = FakeCatalogRepository::new();
     let file = existing_file("/lib/song.mp3", FileType::Audio);
     let uuid = file.uuid;
@@ -82,7 +82,10 @@ async fn given_missing_disk_file_when_purge_on_disk_then_record_removed_and_disk
 
     let result = h.purge_on_disk(uuid, TOKEN).await.expect("purge_on_disk");
 
-    assert!(!result.disk_file_present, "AF-01: no on-disk file was present");
+    assert!(
+        !result.disk_file_present,
+        "AF-01: no on-disk file was present"
+    );
     assert!(repo.file_for_uuid(uuid).is_none(), "record still removed");
 }
 

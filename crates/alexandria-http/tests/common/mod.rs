@@ -23,7 +23,8 @@ pub async fn test_app() -> TestApp {
     let pool = migrate_database(db_path.to_str().expect("path"))
         .await
         .expect("migrate");
-    let services = std::sync::Arc::new(services::build_services(&Settings::default(), pool.clone()).await);
+    let services =
+        std::sync::Arc::new(services::build_services(&Settings::default(), pool.clone()).await);
     TestApp {
         services,
         pool,
@@ -65,12 +66,10 @@ pub async fn file_rows(pool: &SqlitePool) -> Vec<(String, String, String, String
 pub async fn file_rows_with_uuid(
     pool: &SqlitePool,
 ) -> Vec<(String, String, String, String, String)> {
-    sqlx::query_as(
-        "SELECT uuid, path, name, type, content_hash FROM files ORDER BY path",
-    )
-    .fetch_all(pool)
-    .await
-    .expect("rows")
+    sqlx::query_as("SELECT uuid, path, name, type, content_hash FROM files ORDER BY path")
+        .fetch_all(pool)
+        .await
+        .expect("rows")
 }
 
 /// `(path, name, type, content_hash, missing_at)` — `missing_at` is NULL when

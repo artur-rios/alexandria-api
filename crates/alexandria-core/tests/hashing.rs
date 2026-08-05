@@ -37,7 +37,8 @@ async fn given_any_input_when_hashed_then_is_64_lowercase_hex_chars() {
     let hash = hash_of(b"anything at all").await;
     assert_eq!(hash.len(), 64, "SHA-256 renders as 64 hex characters");
     assert!(
-        hash.chars().all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)),
+        hash.chars()
+            .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)),
         "lowercase hex only, got {hash}"
     );
 }

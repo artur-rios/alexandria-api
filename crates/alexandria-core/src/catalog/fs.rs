@@ -40,7 +40,10 @@ pub struct StdFilesystem;
 impl StdFilesystem {
     fn collect(root: &Path) -> Vec<FileEntry> {
         let mut entries = Vec::new();
-        for entry in walkdir::WalkDir::new(root).into_iter().filter_map(|e| e.ok()) {
+        for entry in walkdir::WalkDir::new(root)
+            .into_iter()
+            .filter_map(|e| e.ok())
+        {
             if !entry.file_type().is_file() {
                 continue;
             }

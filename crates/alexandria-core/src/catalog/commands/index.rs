@@ -70,7 +70,11 @@ where
     }
 
     /// Validate and start — returns a run id without doing any scanning.
-    pub async fn start(&self, request: IndexRequest, token: &str) -> Result<IndexStarted, DomainError> {
+    pub async fn start(
+        &self,
+        request: IndexRequest,
+        token: &str,
+    ) -> Result<IndexStarted, DomainError> {
         self.auth.authenticate(token).await?;
         if !self.fs.path_exists(&request.root).await {
             return Err(DomainError::InvalidInput("root path does not exist".into()));

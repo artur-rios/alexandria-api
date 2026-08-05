@@ -27,7 +27,9 @@ fn handler(
 }
 
 /// Seed an active cataloged file and return (uuid, repo, clock, handler).
-fn seeded(path: &str) -> (
+fn seeded(
+    path: &str,
+) -> (
     Uuid,
     FakeCatalogRepository,
     FixedClock,
@@ -44,14 +46,20 @@ fn seeded(path: &str) -> (
 
 /// Seed an already-soft-deleted cataloged file (UC-06 invalid-state branch /
 /// the precondition for UC-07 restore).
-fn seeded_deleted(path: &str) -> (
+fn seeded_deleted(
+    path: &str,
+) -> (
     Uuid,
     FakeCatalogRepository,
     FixedClock,
     SoftDeleteFileHandler<FakeAuth, FakeCatalogRepository, FixedClock>,
 ) {
     let repo = FakeCatalogRepository::new();
-    let file = deleted_file(path, "seedy", alexandria_core::catalog::model::FileType::Audio);
+    let file = deleted_file(
+        path,
+        "seedy",
+        alexandria_core::catalog::model::FileType::Audio,
+    );
     let uuid = file.uuid;
     repo.seed(file);
     let clock = fixed_clock(now());
@@ -125,14 +133,15 @@ async fn given_deleted_file_when_soft_delete_then_invalid_state() {
     let result = h.soft_delete(uuid, TOKEN).await;
 
     assert!(matches!(result, Err(DomainError::InvalidState)));
-    let persisted = repo
-        .file_for_uuid(uuid)
-        .expect("file present");
+    let persisted = repo.file_for_uuid(uuid).expect("file present");
     // The row is unchanged: still deleted at its original deleted_at (the
     // soft-delete did not "re-stamp" the retention window).
     assert_eq!(persisted.state, FileState::Deleted);
     assert!(persisted.deleted_at.is_some());
-    assert_eq!(persisted.deleted_at, repo.file_for_uuid(uuid).unwrap().deleted_at);
+    assert_eq!(
+        persisted.deleted_at,
+        repo.file_for_uuid(uuid).unwrap().deleted_at
+    );
 }
 
 // ---------------- Repository write failure ----------------

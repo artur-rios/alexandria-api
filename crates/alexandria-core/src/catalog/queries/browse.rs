@@ -1,7 +1,7 @@
 use uuid::Uuid;
 
 use crate::auth::AuthService;
-use crate::catalog::model::{File, FileView, StateFilter, FileType};
+use crate::catalog::model::{File, FileType, FileView, StateFilter};
 use crate::catalog::repos::CatalogRepository;
 use crate::errors::DomainError;
 
@@ -63,24 +63,18 @@ where
 
     /// List files matching `filter`. The default filter excludes
     /// soft-deleted records (UC-03 main-flow step 2).
-    pub async fn list(
-        &self,
-        filter: FileFilter,
-        token: &str,
-    ) -> Result<Vec<File>, DomainError> {
+    pub async fn list(&self, filter: FileFilter, token: &str) -> Result<Vec<File>, DomainError> {
         // AF-02: the caller must be authenticated.
         self.auth.authenticate(token).await?;
-        self.repo.list_filtered(filter.file_type, filter.state).await
+        self.repo
+            .list_filtered(filter.file_type, filter.state)
+            .await
     }
 
     /// Get a single file by its public UUID, including its stored subtype
     /// metadata when the subtype has one (FR-FC-13). AF-01 when the UUID
     /// does not exist.
-    pub async fn get_by_uuid(
-        &self,
-        uuid: Uuid,
-        token: &str,
-    ) -> Result<FileView, DomainError> {
+    pub async fn get_by_uuid(&self, uuid: Uuid, token: &str) -> Result<FileView, DomainError> {
         // AF-02: the caller must be authenticated.
         self.auth.authenticate(token).await?;
 

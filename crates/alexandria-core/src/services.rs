@@ -45,8 +45,7 @@ pub type DefaultPurgeFileHandler =
 pub type DefaultPurgeFileOnDiskHandler =
     PurgeFileOnDiskHandler<BearerAuthService, SqliteCatalogRepository, StdFilesystem>;
 
-pub type DefaultBrowseFilesHandler =
-    BrowseFilesHandler<BearerAuthService, SqliteCatalogRepository>;
+pub type DefaultBrowseFilesHandler = BrowseFilesHandler<BearerAuthService, SqliteCatalogRepository>;
 
 #[derive(Clone)]
 pub struct Services {
@@ -81,12 +80,19 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
     let edit_metadata_handler = Arc::new(EditMetadataHandler::new(auth, repo.clone()));
     let rename_file_handler = Arc::new(RenameFileHandler::new(auth, repo.clone(), fs));
     let soft_delete_file_handler = Arc::new(SoftDeleteFileHandler::new(auth, repo.clone(), clock));
-    let restore_file_handler =
-        Arc::new(RestoreFileHandler::new(auth, repo.clone(), clock, retention_days));
-    let purge_file_handler =
-        Arc::new(PurgeFileHandler::new(auth, repo.clone(), clock, retention_days));
-    let purge_file_on_disk_handler =
-        Arc::new(PurgeFileOnDiskHandler::new(auth, repo.clone(), fs));
+    let restore_file_handler = Arc::new(RestoreFileHandler::new(
+        auth,
+        repo.clone(),
+        clock,
+        retention_days,
+    ));
+    let purge_file_handler = Arc::new(PurgeFileHandler::new(
+        auth,
+        repo.clone(),
+        clock,
+        retention_days,
+    ));
+    let purge_file_on_disk_handler = Arc::new(PurgeFileOnDiskHandler::new(auth, repo.clone(), fs));
     let browse_files_handler = Arc::new(BrowseFilesHandler::new(auth, repo));
     Services {
         index_handler,

@@ -76,7 +76,9 @@ async fn given_changed_hash_when_execute_then_hash_and_indexedat_refreshed() {
     assert_eq!(outcome.marked_missing, 0);
     assert_eq!(outcome.unchanged, 0);
 
-    let a = repo_handle.file_for("/lib/a.mp3").expect("a still cataloged");
+    let a = repo_handle
+        .file_for("/lib/a.mp3")
+        .expect("a still cataloged");
     assert_eq!(a.content_hash, "new-hash");
     assert_eq!(a.indexed_at, now());
     assert!(a.missing_at.is_none(), "refresh clears missing marker");
@@ -104,7 +106,9 @@ async fn given_unchanged_present_file_when_execute_then_no_write() {
     assert_eq!(outcome.marked_missing, 0);
     assert_eq!(outcome.unchanged, 1);
 
-    let a = repo_handle.file_for("/lib/a.md").expect("a still cataloged");
+    let a = repo_handle
+        .file_for("/lib/a.md")
+        .expect("a still cataloged");
     assert_eq!(a.content_hash, "same-hash", "hash untouched");
 }
 
@@ -140,7 +144,8 @@ async fn given_disk_missing_path_when_execute_then_marked_missing_record_kept() 
 }
 
 #[tokio::test]
-async fn given_missing_file_returned_on_disk_when_execute_then_missing_cleared_and_hash_refreshed() {
+async fn given_missing_file_returned_on_disk_when_execute_then_missing_cleared_and_hash_refreshed()
+{
     let repo = FakeCatalogRepository::new();
     // Already marked missing from a prior re-index, with the old hash; the file
     // has since come back with a new hash.
@@ -164,7 +169,10 @@ async fn given_missing_file_returned_on_disk_when_execute_then_missing_cleared_a
 
     let back = repo_handle.file_for("/lib/back.mp3").expect("record kept");
     assert_eq!(back.content_hash, "returned-hash");
-    assert!(back.missing_at.is_none(), "missing marker cleared on return");
+    assert!(
+        back.missing_at.is_none(),
+        "missing marker cleared on return"
+    );
     assert_eq!(back.indexed_at, now());
 }
 
@@ -191,7 +199,10 @@ async fn given_already_missing_and_still_gone_when_execute_then_left_as_is() {
     assert_eq!(outcome.marked_missing, 0, "no new missing write");
     assert_eq!(outcome.unchanged, 1, "idempotent — left as-is");
     let gone = repo_handle.file_for("/lib/stillgone.mp3").unwrap();
-    assert_eq!(gone.missing_at, prior_missing, "missing timestamp not bumped");
+    assert_eq!(
+        gone.missing_at, prior_missing,
+        "missing timestamp not bumped"
+    );
 }
 
 #[tokio::test]
@@ -228,7 +239,10 @@ async fn given_unreadable_file_when_execute_then_refresh_continues_and_counts_fa
     assert_eq!(outcome.failed, 1);
     assert_eq!(outcome.marked_missing, 0, "b exists — it is not missing");
 
-    assert_eq!(repo_handle.file_for("/lib/a.mp3").unwrap().content_hash, "a-new");
+    assert_eq!(
+        repo_handle.file_for("/lib/a.mp3").unwrap().content_hash,
+        "a-new"
+    );
     assert_eq!(
         repo_handle.file_for("/lib/b.mp3").unwrap().content_hash,
         "b-old",
@@ -322,7 +336,10 @@ async fn given_mixed_cataloged_files_when_execute_then_each_handled_correctly() 
     assert_eq!(outcome.marked_missing, 1);
     assert_eq!(outcome.unchanged, 1);
 
-    assert_eq!(repo_handle.file_for("/lib/a.mp3").unwrap().content_hash, "a-new");
+    assert_eq!(
+        repo_handle.file_for("/lib/a.mp3").unwrap().content_hash,
+        "a-new"
+    );
     assert_eq!(
         repo_handle.file_for("/lib/b.md").unwrap().content_hash,
         "b-hash"
@@ -332,5 +349,4 @@ async fn given_mixed_cataloged_files_when_execute_then_each_handled_correctly() 
         .unwrap()
         .missing_at
         .is_some());
-
 }
