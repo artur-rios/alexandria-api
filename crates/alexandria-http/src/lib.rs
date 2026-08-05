@@ -67,6 +67,7 @@ pub fn app(settings: Settings, services: Arc<Services>) -> Router {
             post(routes::bookmarks::restore),
         )
         .route("/v1/watchlists", post(routes::watchlists::create))
+        .route("/v1/watchlists", get(routes::watchlists::list))
         .route(
             "/v1/watchlists/{uuid}/items",
             post(routes::watchlists::add_video),

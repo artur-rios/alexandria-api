@@ -31,6 +31,7 @@ use crate::collections::repos::SqliteCollectionRepository;
 use crate::config::Settings;
 use crate::watchlists::commands::add_video::AddVideoToWatchlistHandler;
 use crate::watchlists::commands::create::CreateWatchlistHandler;
+use crate::watchlists::queries::browse::BrowseWatchlistsHandler;
 use crate::watchlists::repos::SqliteWatchlistRepository;
 
 /// Concrete index handler wired with the runtime collaborators: the bearer
@@ -117,6 +118,9 @@ pub type DefaultAddVideoToWatchlistHandler = AddVideoToWatchlistHandler<
     SqliteCatalogRepository,
 >;
 
+pub type DefaultBrowseWatchlistsHandler =
+    BrowseWatchlistsHandler<BearerAuthService, SqliteWatchlistRepository>;
+
 #[derive(Clone)]
 pub struct Services {
     pub index_handler: Arc<DefaultIndexHandler>,
@@ -141,6 +145,7 @@ pub struct Services {
     pub list_collection_items_handler: Arc<DefaultListCollectionItemsHandler>,
     pub create_watchlist_handler: Arc<DefaultCreateWatchlistHandler>,
     pub add_video_to_watchlist_handler: Arc<DefaultAddVideoToWatchlistHandler>,
+    pub browse_watchlists_handler: Arc<DefaultBrowseWatchlistsHandler>,
     /// The same auth service the handlers hold, exposed so a transport can
     /// reject an unauthenticated caller *before* it parses a request body or
     /// path (FR-AU-07 / SRD §7). Handlers still authenticate independently —
@@ -238,9 +243,10 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         Arc::new(CreateWatchlistHandler::new(auth, watchlist_repo.clone()));
     let add_video_to_watchlist_handler = Arc::new(AddVideoToWatchlistHandler::new(
         auth,
-        watchlist_repo,
+        watchlist_repo.clone(),
         repo.clone(),
     ));
+    let browse_watchlists_handler = Arc::new(BrowseWatchlistsHandler::new(auth, watchlist_repo));
     Services {
         index_handler,
         refresh_handler,
@@ -264,6 +270,7 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         list_collection_items_handler,
         create_watchlist_handler,
         add_video_to_watchlist_handler,
+        browse_watchlists_handler,
         auth,
         pool,
     }

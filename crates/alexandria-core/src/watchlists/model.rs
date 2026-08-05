@@ -60,3 +60,13 @@ pub struct WatchProgress {
     pub current_episode: Option<i64>,
     pub total_episodes: Option<i64>,
 }
+
+/// A watchlist with the WatchProgress of every video it tracks (UC-21 /
+/// FR-WL-08).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WatchlistWithProgress {
+    pub uuid: Uuid,
+    pub name: String,
+    pub items: Vec<WatchProgress>,
+}

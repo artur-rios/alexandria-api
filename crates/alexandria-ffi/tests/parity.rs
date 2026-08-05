@@ -27,7 +27,7 @@ use alexandria_ffi::{
     alexandria_free_string, alexandria_index_count_files, alexandria_index_count_missing,
     alexandria_index_files_json, alexandria_index_init, alexandria_index_refresh_start,
     alexandria_index_start, alexandria_watchlist_add_video, alexandria_watchlist_create,
-    IndexStartResult,
+    alexandria_watchlists_list, IndexStartResult,
 };
 use alexandria_http::app;
 use axum::body::{to_bytes, Body};
@@ -5705,6 +5705,198 @@ async fn given_unknown_watchlist_when_video_added_via_http_and_ffi_then_both_not
             alexandria_watchlist_add_video(unknown_c.as_ptr(), add_body.as_ptr(), token.as_ptr());
         assert!(add_r.json.is_null());
         add_r.status
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(
+        ffi_status,
+        alexandria_ffi::WATCHLIST_ERR_NOT_FOUND,
+        "ffi must reject an unknown watchlist as not-found (HTTP 404)"
+    );
+}
+
+/// UC-21 parity - browse the same watchlist (with a linked video) over both
+/// transports and assert the returned bodies agree modulo per-database uuids
+/// (Testing Specification section 7.3, FR-WL-08, FR-FC-24).
+#[tokio::test]
+async fn given_same_watchlist_when_browsed_via_http_and_ffi_then_bodies_identical() {
+    let _g = SERIAL.lock().unwrap();
+
+    // ---- HTTP leg ----
+    let http_dir = tempdir().unwrap();
+    let http_db = db_path(&http_dir, "http.sqlite");
+    let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    let http_services =
+        std::sync::Arc::new(build_services(&Settings::default(), http_pool.clone()).await);
+
+    let create_req = Request::builder()
+        .method("POST")
+        .uri("/v1/watchlists")
+        .header("authorization", "Bearer parity")
+        .header("content-type", "application/json")
+        .body(Body::from(json!({ "name": "Weekend movies" }).to_string()))
+        .unwrap();
+    let create_resp = app(Settings::default(), http_services.clone())
+        .oneshot(create_req)
+        .await
+        .expect("http create watchlist");
+    let http_watchlist: serde_json::Value =
+        serde_json::from_slice(&to_bytes(create_resp.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
+    let http_watchlist_uuid = http_watchlist["uuid"].as_str().unwrap().to_string();
+
+    let http_video_uuid = seed_file(&http_pool, "video").await;
+    let add_req = Request::builder()
+        .method("POST")
+        .uri(format!("/v1/watchlists/{http_watchlist_uuid}/items"))
+        .header("authorization", "Bearer parity")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({ "videoUuid": http_video_uuid }).to_string(),
+        ))
+        .unwrap();
+    let add_resp = app(Settings::default(), http_services.clone())
+        .oneshot(add_req)
+        .await
+        .expect("http add video");
+    assert_eq!(add_resp.status(), axum::http::StatusCode::OK);
+
+    let list_req = Request::builder()
+        .method("GET")
+        .uri("/v1/watchlists")
+        .header("authorization", "Bearer parity")
+        .body(Body::empty())
+        .unwrap();
+    let list_resp = app(Settings::default(), http_services)
+        .oneshot(list_req)
+        .await
+        .expect("http list");
+    assert_eq!(list_resp.status(), axum::http::StatusCode::OK);
+    let http_body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(list_resp.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
+
+    // ---- FFI leg ----
+    let ffi_dir = tempdir().unwrap();
+    let ffi_db = db_path(&ffi_dir, "ffi.sqlite");
+    let ffi_db_for_seed = ffi_db.clone();
+
+    let ffi_pool_for_seed = migrate_database(&ffi_db_for_seed).await.expect("ffi open");
+    let ffi_video_uuid = seed_file(&ffi_pool_for_seed, "video").await;
+    ffi_pool_for_seed.close().await;
+
+    let ffi_body: serde_json::Value = tokio::task::spawn_blocking(move || -> serde_json::Value {
+        let cdb = CString::new(ffi_db).unwrap();
+        assert_eq!(
+            alexandria_index_init(cdb.as_ptr()),
+            alexandria_ffi::INDEX_OK
+        );
+
+        let token = CString::new("parity").unwrap();
+        let create_body = CString::new(json!({ "name": "Weekend movies" }).to_string()).unwrap();
+        let create_r = alexandria_watchlist_create(create_body.as_ptr(), token.as_ptr());
+        assert_eq!(create_r.status, alexandria_ffi::WATCHLIST_OK, "ffi create");
+        let watchlist_json = unsafe { CStr::from_ptr(create_r.json) }
+            .to_string_lossy()
+            .into_owned();
+        unsafe {
+            alexandria_free_string(create_r.json);
+        }
+        let watchlist: serde_json::Value = serde_json::from_str(&watchlist_json).unwrap();
+        let watchlist_uuid = watchlist["uuid"].as_str().unwrap().to_string();
+
+        let watchlist_uuid_c = CString::new(watchlist_uuid).unwrap();
+        let add_body = CString::new(json!({ "videoUuid": ffi_video_uuid }).to_string()).unwrap();
+        let add_r = alexandria_watchlist_add_video(
+            watchlist_uuid_c.as_ptr(),
+            add_body.as_ptr(),
+            token.as_ptr(),
+        );
+        assert_eq!(add_r.status, alexandria_ffi::WATCHLIST_OK, "ffi add video");
+        unsafe {
+            alexandria_free_string(add_r.json);
+        }
+
+        let list_r = alexandria_watchlists_list(std::ptr::null(), token.as_ptr());
+        assert_eq!(list_r.status, alexandria_ffi::WATCHLIST_OK, "ffi list");
+        assert!(!list_r.json.is_null());
+        let s = unsafe { CStr::from_ptr(list_r.json) }
+            .to_string_lossy()
+            .into_owned();
+        unsafe {
+            alexandria_free_string(list_r.json);
+        }
+        serde_json::from_str(&s).unwrap()
+    })
+    .await
+    .unwrap();
+
+    // ---- compare ----
+    let http_list = http_body.as_array().unwrap();
+    let ffi_list = ffi_body.as_array().unwrap();
+    assert_eq!(http_list.len(), 1, "http returned one watchlist");
+    assert_eq!(ffi_list.len(), 1, "ffi returned one watchlist");
+
+    for (label, watchlist) in [("http", &http_list[0]), ("ffi", &ffi_list[0])] {
+        assert!(
+            uuid::Uuid::parse_str(watchlist["uuid"].as_str().unwrap_or_default()).is_ok(),
+            "{label} watchlist carries a valid uuid"
+        );
+        assert_eq!(watchlist["name"], "Weekend movies");
+        let items = watchlist["items"].as_array().expect("items array");
+        assert_eq!(items.len(), 1, "{label} watchlist carries one item");
+        assert!(
+            uuid::Uuid::parse_str(items[0]["videoUuid"].as_str().unwrap_or_default()).is_ok(),
+            "{label} item carries a valid video uuid"
+        );
+        assert_eq!(items[0]["state"], "pending");
+    }
+}
+
+/// UC-21 parity - browsing an unknown watchlist uuid is rejected as
+/// not-found on both surfaces (HTTP 404, FFI WATCHLIST_ERR_NOT_FOUND)
+/// (FR-FC-24 / NFR-09).
+#[tokio::test]
+async fn given_unknown_watchlist_when_browsed_via_http_and_ffi_then_both_not_found() {
+    let _g = SERIAL.lock().unwrap();
+
+    // ---- HTTP leg ----
+    let http_dir = tempdir().unwrap();
+    let http_db = db_path(&http_dir, "http.sqlite");
+    let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    let http_services =
+        std::sync::Arc::new(build_services(&Settings::default(), http_pool.clone()).await);
+
+    let unknown = uuid::Uuid::new_v4().to_string();
+    let list_req = Request::builder()
+        .method("GET")
+        .uri(format!("/v1/watchlists?watchlistUuid={unknown}"))
+        .header("authorization", "Bearer parity")
+        .body(Body::empty())
+        .unwrap();
+    let list_resp = app(Settings::default(), http_services)
+        .oneshot(list_req)
+        .await
+        .expect("http list");
+    assert_eq!(list_resp.status(), axum::http::StatusCode::NOT_FOUND);
+
+    // ---- FFI leg ----
+    let ffi_dir = tempdir().unwrap();
+    let ffi_db = db_path(&ffi_dir, "ffi.sqlite");
+    let ffi_status = tokio::task::spawn_blocking(move || -> i32 {
+        let cdb = CString::new(ffi_db).unwrap();
+        assert_eq!(
+            alexandria_index_init(cdb.as_ptr()),
+            alexandria_ffi::INDEX_OK
+        );
+
+        let token = CString::new("parity").unwrap();
+        let unknown = uuid::Uuid::new_v4().to_string();
+        let filter = CString::new(json!({ "watchlistUuid": unknown }).to_string()).unwrap();
+        let list_r = alexandria_watchlists_list(filter.as_ptr(), token.as_ptr());
+        assert!(list_r.json.is_null());
+        list_r.status
     })
     .await
     .unwrap();

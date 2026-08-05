@@ -1037,6 +1037,26 @@ impl WatchlistRepository for FakeWatchlistRepository {
         Ok(self.watchlists.lock().unwrap().get(&uuid).cloned())
     }
 
+    async fn list_all(&self) -> Result<Vec<Watchlist>, DomainError> {
+        let mut watchlists: Vec<Watchlist> =
+            self.watchlists.lock().unwrap().values().cloned().collect();
+        watchlists.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(watchlists)
+    }
+
+    async fn list_progress(&self, watchlist_uuid: Uuid) -> Result<Vec<WatchProgress>, DomainError> {
+        let mut items: Vec<WatchProgress> = self
+            .progress
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|p| p.watchlist_uuid == watchlist_uuid)
+            .cloned()
+            .collect();
+        items.sort_by_key(|a| a.video_uuid);
+        Ok(items)
+    }
+
     async fn add_video(
         &self,
         watchlist_uuid: Uuid,
