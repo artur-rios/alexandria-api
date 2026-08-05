@@ -29,6 +29,8 @@ use alexandria_core::collections::model::{Collection, NewCollection};
 use alexandria_core::collections::repos::CollectionRepository;
 use alexandria_core::config::AuthMode;
 use alexandria_core::errors::DomainError;
+use alexandria_core::reading_lists::model::{NewReadingList, ReadingList};
+use alexandria_core::reading_lists::repos::ReadingListRepository;
 use alexandria_core::watchlists::model::{NewWatchlist, WatchProgress, WatchState, Watchlist};
 use alexandria_core::watchlists::repos::WatchlistRepository;
 
@@ -1133,5 +1135,53 @@ impl WatchlistRepository for FakeWatchlistRepository {
             .unwrap()
             .retain(|(watchlist_uuid, _), _| *watchlist_uuid != uuid);
         Ok(())
+    }
+}
+
+/// In-memory reading lists repository (UC-26).
+#[derive(Debug, Default, Clone)]
+pub struct FakeReadingListRepository {
+    reading_lists: Arc<Mutex<HashMap<Uuid, ReadingList>>>,
+    /// When set, every `insert_reading_list` fails, simulating a
+    /// catalog-write failure in UC-26.
+    failing: Arc<Mutex<bool>>,
+}
+
+impl FakeReadingListRepository {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn count(&self) -> usize {
+        self.reading_lists.lock().unwrap().len()
+    }
+
+    pub fn reading_list_for(&self, uuid: Uuid) -> Option<ReadingList> {
+        self.reading_lists.lock().unwrap().get(&uuid).cloned()
+    }
+
+    /// Make every `insert_reading_list` return an `Internal` error.
+    pub fn fail_inserts(&self) {
+        *self.failing.lock().unwrap() = true;
+    }
+}
+
+impl ReadingListRepository for FakeReadingListRepository {
+    async fn insert_reading_list(
+        &self,
+        new_reading_list: NewReadingList,
+    ) -> Result<ReadingList, DomainError> {
+        if *self.failing.lock().unwrap() {
+            return Err(DomainError::internal("fake insert_reading_list failure"));
+        }
+        let reading_list = ReadingList {
+            uuid: new_reading_list.uuid,
+            name: new_reading_list.name,
+        };
+        self.reading_lists
+            .lock()
+            .unwrap()
+            .insert(reading_list.uuid, reading_list.clone());
+        Ok(reading_list)
     }
 }

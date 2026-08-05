@@ -2264,6 +2264,125 @@ pub extern "C" fn alexandria_index_files_json() -> *mut c_char {
     cstring.into_raw()
 }
 
+/// FFI status codes returned by reading list operations (UC-26+).
+/// Deliberately separate from `WATCHLIST_*` — per the convention above — so
+/// reading-list use cases can grow their own set without colliding;
+/// `READING_LIST_OK == WATCHLIST_OK == 0` by convention.
+pub const READING_LIST_OK: c_int = 0;
+pub const READING_LIST_ERR_INVALID_INPUT: c_int = 1;
+pub const READING_LIST_ERR_UNAUTHORIZED: c_int = 2;
+pub const READING_LIST_ERR_NOT_INITIALIZED: c_int = 3;
+pub const READING_LIST_ERR_NOT_FOUND: c_int = 4;
+pub const READING_LIST_ERR_INVALID_STATE: c_int = 5;
+pub const READING_LIST_ERR_OTHER: c_int = 9;
+
+/// Result of `alexandria_reading_list_create` (UC-26). On success `status`
+/// is `READING_LIST_OK` and `json` is a NUL-terminated JSON string of the
+/// `ReadingList` body — byte-for-byte the same shape HTTP returns from
+/// `POST /v1/reading-lists` (FR-FC-24 / NFR-09). On failure `json` is NULL
+/// and `status` carries the mapped error code. The caller must free `json`
+/// with `alexandria_free_string`.
+#[repr(C)]
+#[derive(Debug)]
+pub struct ReadingListJsonResult {
+    pub status: c_int,
+    pub json: *mut c_char,
+}
+
+impl ReadingListJsonResult {
+    fn err(status: c_int) -> Self {
+        Self {
+            status,
+            json: std::ptr::null_mut(),
+        }
+    }
+
+    fn ok(json: String) -> Self {
+        let cstring = CString::new(json).unwrap_or_default();
+        Self {
+            status: READING_LIST_OK,
+            json: cstring.into_raw(),
+        }
+    }
+}
+
+fn map_reading_list_err(err: DomainError) -> ReadingListJsonResult {
+    match err {
+        DomainError::NotFound => ReadingListJsonResult::err(READING_LIST_ERR_NOT_FOUND),
+        DomainError::Unauthorized => ReadingListJsonResult::err(READING_LIST_ERR_UNAUTHORIZED),
+        DomainError::InvalidInput(_) => ReadingListJsonResult::err(READING_LIST_ERR_INVALID_INPUT),
+        DomainError::InvalidState => ReadingListJsonResult::err(READING_LIST_ERR_INVALID_STATE),
+        _ => ReadingListJsonResult::err(READING_LIST_ERR_OTHER),
+    }
+}
+
+/// Request body accepted by `alexandria_reading_list_create` — the same
+/// JSON `POST /v1/reading-lists` takes: `{"name":"Summer reads"}`. Parsed
+/// field-by-field for the same reason `CreateWatchlistBody` is: this crate
+/// depends on `serde_json` but not `serde`'s derive.
+#[derive(Debug)]
+struct CreateReadingListBody {
+    name: String,
+}
+
+impl CreateReadingListBody {
+    fn from_json_str(s: &str) -> Option<Self> {
+        let value: serde_json::Value = serde_json::from_str(s).ok()?;
+        let obj = value.as_object()?;
+        let name = obj.get("name")?.as_str()?.to_string();
+        Some(Self { name })
+    }
+}
+
+/// Create a named reading list for tracking book/comic consumption (UC-26 /
+/// FR-RL-01).
+///
+/// `json_body` is the JSON body HTTP would send (`name`). The function
+/// deserializes it, calls the same `CreateReadingListHandler` the HTTP
+/// route uses, and on success serializes the returned `ReadingList` back to
+/// JSON — so the FFI and HTTP surfaces agree byte-for-byte modulo key
+/// ordering (parity, FR-FC-24 / NFR-09). `token` is the bearer auth token.
+#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
+#[no_mangle]
+pub extern "C" fn alexandria_reading_list_create(
+    json_body: *const c_char,
+    token: *const c_char,
+) -> ReadingListJsonResult {
+    let services = match services_slot().lock().unwrap().clone() {
+        Some(s) => s,
+        None => return ReadingListJsonResult::err(READING_LIST_ERR_NOT_INITIALIZED),
+    };
+
+    let token = cstr_lossy(token).unwrap_or_default();
+    if !authenticated(&services, &token) {
+        return ReadingListJsonResult::err(READING_LIST_ERR_UNAUTHORIZED);
+    }
+
+    let body_str = match cstr_lossy(json_body) {
+        Some(s) => s,
+        None => return ReadingListJsonResult::err(READING_LIST_ERR_INVALID_INPUT),
+    };
+    let body = match CreateReadingListBody::from_json_str(&body_str) {
+        Some(b) => b,
+        None => return ReadingListJsonResult::err(READING_LIST_ERR_INVALID_INPUT),
+    };
+
+    let result = runtime().block_on(async {
+        services
+            .create_reading_list_handler
+            .create(&body.name, &token)
+            .await
+    });
+
+    match result {
+        Ok(reading_list) => {
+            let json = serde_json::to_string(&reading_list).unwrap_or_default();
+            ReadingListJsonResult::ok(json)
+        }
+        Err(err) => map_reading_list_err(err),
+    }
+}
+
 /// Free a string previously returned by an FFI accessor.
 ///
 /// # Safety
