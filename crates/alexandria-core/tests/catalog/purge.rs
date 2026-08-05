@@ -61,6 +61,7 @@ fn seeded_deleted_at(
 //   within-retention   now - 2_591_000s   (~30 days minus 1000s)
 //   exactly boundary   now - 2_592_000s   (exactly 30 days — inclusive-restorable)
 //   one-past           now - 2_592_001s   (one second past — purgeable)
+//   comfortably past   now - 5_184_000s   (2x retention — the happy-path fixture)
 // (`RETENTION` is defined alongside `RETENTION_DAYS` near the top of this
 // file — the seconds-literal form `30 * 86_400` is const-eval friendly.)
 
@@ -68,7 +69,7 @@ fn seeded_deleted_at(
 
 #[tokio::test]
 async fn given_deleted_file_past_retention_when_purge_then_record_removed_and_file_returned() {
-    let (uuid, repo, _clock, h) = seeded_deleted_at("/lib/song.mp3", RETENTION + Duration::seconds(1));
+    let (uuid, repo, _clock, h) = seeded_deleted_at("/lib/song.mp3", RETENTION * 2);
 
     let result = h.purge(uuid, TOKEN).await.expect("purge");
 
