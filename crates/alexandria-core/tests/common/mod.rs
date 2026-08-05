@@ -389,6 +389,9 @@ pub struct FakeCollectionRepository {
     /// failure in UC-10. There is no on-disk leg to compensate — the handler
     /// merely surfaces the error and nothing is stored.
     failing: Arc<Mutex<bool>>,
+    /// When set, every `rename_collection` fails, simulating a catalog-write
+    /// failure in UC-11.
+    failing_renames: Arc<Mutex<bool>>,
 }
 
 impl FakeCollectionRepository {
@@ -404,9 +407,22 @@ impl FakeCollectionRepository {
         self.collections.lock().unwrap().get(&uuid).cloned()
     }
 
+    /// Seed a collection directly, as if a prior UC-10 call had created it.
+    pub fn seed(&self, collection: Collection) {
+        self.collections
+            .lock()
+            .unwrap()
+            .insert(collection.uuid, collection);
+    }
+
     /// Make every `insert_collection` return an `Internal` error.
     pub fn fail_inserts(&self) {
         *self.failing.lock().unwrap() = true;
+    }
+
+    /// Make every `rename_collection` return an `Internal` error.
+    pub fn fail_renames(&self) {
+        *self.failing_renames.lock().unwrap() = true;
     }
 }
 
@@ -428,6 +444,20 @@ impl CollectionRepository for FakeCollectionRepository {
             .unwrap()
             .insert(collection.uuid, collection.clone());
         Ok(collection)
+    }
+
+    async fn find_by_uuid(&self, uuid: Uuid) -> Result<Option<Collection>, DomainError> {
+        Ok(self.collections.lock().unwrap().get(&uuid).cloned())
+    }
+
+    async fn rename_collection(&self, uuid: Uuid, name: String) -> Result<Collection, DomainError> {
+        if *self.failing_renames.lock().unwrap() {
+            return Err(DomainError::internal("fake rename_collection failure"));
+        }
+        let mut collections = self.collections.lock().unwrap();
+        let collection = collections.get_mut(&uuid).ok_or(DomainError::NotFound)?;
+        collection.name = name;
+        Ok(collection.clone())
     }
 }
 

@@ -231,6 +231,134 @@ async fn given_no_token_when_posted_then_401_and_nothing_persisted() {
     assert!(collection_rows(&test.pool).await.is_empty());
 }
 
+// ==================== UC-11: Rename a collection ====================
+
+fn rename_request(uuid: &str, body: Value) -> Request<Body> {
+    Request::builder()
+        .method("PATCH")
+        .uri(format!("/v1/collections/{uuid}"))
+        .header("authorization", "Bearer test-token")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap()
+}
+
+fn unauthenticated_rename_request(uuid: &str, body: Value) -> Request<Body> {
+    Request::builder()
+        .method("PATCH")
+        .uri(format!("/v1/collections/{uuid}"))
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap()
+}
+
+/// Create a collection via the router and return its uuid.
+async fn create_collection(router: axum::Router, name: &str) -> (axum::Router, String) {
+    let response = router
+        .clone()
+        .oneshot(create_request(json!({ "name": name, "kind": "file" })))
+        .await
+        .expect("create");
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let uuid = body_json(response).await["uuid"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    (router, uuid)
+}
+
+// ---------------- Main flow ----------------
+
+#[tokio::test]
+async fn given_existing_collection_when_renamed_then_200_with_updated_collection_and_row() {
+    let test = test_app().await;
+    let router = app(Settings::default(), test.services);
+    let (router, uuid) = create_collection(router, "Sci-fi novels").await;
+
+    let response = router
+        .oneshot(rename_request(&uuid, json!({ "name": "Sci-fi & fantasy" })))
+        .await
+        .expect("rename");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_json(response).await;
+    assert_eq!(body["uuid"], uuid);
+    assert_eq!(body["name"], "Sci-fi & fantasy");
+
+    let rows = collection_rows(&test.pool).await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].1, "Sci-fi & fantasy");
+}
+
+// ---------------- AF-01: invalid input ----------------
+
+#[tokio::test]
+async fn given_empty_name_when_renamed_then_400_and_name_unchanged() {
+    let test = test_app().await;
+    let router = app(Settings::default(), test.services);
+    let (router, uuid) = create_collection(router, "Sci-fi novels").await;
+
+    let response = router
+        .oneshot(rename_request(&uuid, json!({ "name": "" })))
+        .await
+        .expect("rename");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(body_json(response).await["error"].is_string());
+    assert_eq!(collection_rows(&test.pool).await[0].1, "Sci-fi novels");
+}
+
+// ---------------- AF-02: not found ----------------
+
+#[tokio::test]
+async fn given_unknown_uuid_when_renamed_then_404() {
+    let test = test_app().await;
+    let router = app(Settings::default(), test.services);
+
+    let response = router
+        .oneshot(rename_request(
+            &uuid::Uuid::new_v4().to_string(),
+            json!({ "name": "New name" }),
+        ))
+        .await
+        .expect("rename");
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn given_non_uuid_path_segment_when_renamed_then_400() {
+    let test = test_app().await;
+    let router = app(Settings::default(), test.services);
+
+    let response = router
+        .oneshot(rename_request("not-a-uuid", json!({ "name": "New name" })))
+        .await
+        .expect("rename");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+// ---------------- AF-03: unauthorized ----------------
+
+#[tokio::test]
+async fn given_no_token_when_renamed_then_401_and_name_unchanged() {
+    let test = test_app().await;
+    let router = app(Settings::default(), test.services);
+    let (router, uuid) = create_collection(router, "Sci-fi novels").await;
+
+    let response = router
+        .oneshot(unauthenticated_rename_request(
+            &uuid,
+            json!({ "name": "New name" }),
+        ))
+        .await
+        .expect("rename");
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(collection_rows(&test.pool).await[0].1, "Sci-fi novels");
+}
+
 #[tokio::test]
 async fn given_no_token_and_malformed_body_when_posted_then_401_not_400() {
     // Authentication is evaluated before the body is parsed (FR-AU-07 / SRD

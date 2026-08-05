@@ -953,6 +953,85 @@ fn map_collection_err(err: DomainError) -> CollectionJsonResult {
     }
 }
 
+/// Request body accepted by `alexandria_collection_rename` — the same JSON
+/// `PATCH /v1/collections/{uuid}` takes: `{"name":"Sci-fi novels"}`. Parsed
+/// field-by-field for the same reason `CreateCollectionBody` is: this crate
+/// depends on `serde_json` but not `serde`'s derive.
+#[derive(Debug)]
+struct RenameCollectionBody {
+    name: String,
+}
+
+impl RenameCollectionBody {
+    fn from_json_str(s: &str) -> Option<Self> {
+        let value: serde_json::Value = serde_json::from_str(s).ok()?;
+        let obj = value.as_object()?;
+        let name = obj.get("name")?.as_str()?.to_string();
+        Some(Self { name })
+    }
+}
+
+/// Rename a collection (UC-11 / FR-CO-03).
+///
+/// `uuid` is the collection's public UUID (NUL-terminated string). `json_body`
+/// is the JSON body HTTP would send (`{"name": …}`). The function
+/// deserializes it, calls the same `RenameCollectionHandler` the HTTP route
+/// uses, and on success serializes the returned `Collection` back to JSON —
+/// so the FFI and HTTP surfaces agree byte-for-byte modulo key ordering
+/// (parity, FR-FC-24 / NFR-09). `token` is the bearer auth token.
+#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
+#[no_mangle]
+pub extern "C" fn alexandria_collection_rename(
+    uuid: *const c_char,
+    json_body: *const c_char,
+    token: *const c_char,
+) -> CollectionJsonResult {
+    let services = match services_slot().lock().unwrap().clone() {
+        Some(s) => s,
+        None => return CollectionJsonResult::err(COLLECTION_ERR_NOT_INITIALIZED),
+    };
+
+    // Deny before touching the payload — an unauthenticated caller must not
+    // learn whether its uuid or body would have parsed.
+    let token = cstr_lossy(token).unwrap_or_default();
+    if !authenticated(&services, &token) {
+        return CollectionJsonResult::err(COLLECTION_ERR_UNAUTHORIZED);
+    }
+
+    let uuid_str = match cstr_lossy(uuid) {
+        Some(s) => s,
+        None => return CollectionJsonResult::err(COLLECTION_ERR_INVALID_INPUT),
+    };
+    let uuid = match uuid::Uuid::parse_str(&uuid_str) {
+        Ok(u) => u,
+        Err(_) => return CollectionJsonResult::err(COLLECTION_ERR_INVALID_INPUT),
+    };
+
+    let body_str = match cstr_lossy(json_body) {
+        Some(s) => s,
+        None => return CollectionJsonResult::err(COLLECTION_ERR_INVALID_INPUT),
+    };
+    let body = match RenameCollectionBody::from_json_str(&body_str) {
+        Some(b) => b,
+        None => return CollectionJsonResult::err(COLLECTION_ERR_INVALID_INPUT),
+    };
+
+    let result = runtime().block_on(async {
+        services
+            .rename_collection_handler
+            .rename(uuid, &body.name, &token)
+            .await
+    });
+
+    match result {
+        Ok(collection) => {
+            let json = serde_json::to_string(&collection).unwrap_or_default();
+            CollectionJsonResult::ok(json)
+        }
+        Err(err) => map_collection_err(err),
+    }
+}
+
 fn parse_file_type(s: &str) -> Option<alexandria_core::catalog::model::FileType> {
     use alexandria_core::catalog::model::FileType;
     match s {
