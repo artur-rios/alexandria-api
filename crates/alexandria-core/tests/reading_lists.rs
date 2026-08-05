@@ -12,3 +12,6 @@ mod browse;
 
 #[path = "reading_lists/update_progress.rs"]
 mod update_progress;
+
+#[path = "reading_lists/remove_item.rs"]
+mod remove_item;

@@ -74,6 +74,16 @@ pub trait ReadingListRepository: Send + Sync {
         current_issue: Option<i64>,
         total_issues: Option<i64>,
     ) -> Result<ReadingProgress, DomainError>;
+
+    /// Delete the ReadingProgress linking `item_uuid` to
+    /// `reading_list_uuid` (UC-30 / FR-RL-06). The file itself is
+    /// untouched. Returns `NotFound` when no such ReadingProgress exists
+    /// (AF-01).
+    async fn remove_progress(
+        &self,
+        reading_list_uuid: Uuid,
+        item_uuid: Uuid,
+    ) -> Result<(), DomainError>;
 }
 
 #[derive(Clone)]
@@ -281,5 +291,26 @@ impl ReadingListRepository for SqliteReadingListRepository {
         self.find_progress(reading_list_uuid, item_uuid)
             .await?
             .ok_or(DomainError::NotFound)
+    }
+
+    async fn remove_progress(
+        &self,
+        reading_list_uuid: Uuid,
+        item_uuid: Uuid,
+    ) -> Result<(), DomainError> {
+        let affected = sqlx::query(
+            "DELETE FROM reading_progress \
+             WHERE reading_list_id = (SELECT id FROM reading_lists WHERE uuid = ?) \
+               AND item_file_id = (SELECT id FROM files WHERE uuid = ?)",
+        )
+        .bind(reading_list_uuid.to_string())
+        .bind(item_uuid.to_string())
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        if affected == 0 {
+            return Err(DomainError::NotFound);
+        }
+        Ok(())
     }
 }

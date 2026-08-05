@@ -2649,6 +2649,56 @@ pub extern "C" fn alexandria_reading_list_update_progress(
     }
 }
 
+/// Remove an item from a reading list (UC-30 / FR-RL-06).
+///
+/// `reading_list_uuid` and `item_uuid` are the reading list's and item's
+/// public UUIDs (NUL-terminated strings). On success `json` carries the
+/// `readingListUuid`/`itemUuid` confirmation — byte-for-byte the same shape
+/// HTTP returns from `DELETE /v1/reading-lists/{uuid}/items/{itemUuid}`
+/// (parity, FR-FC-24 / NFR-09). `token` is the bearer auth token.
+#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
+#[no_mangle]
+pub extern "C" fn alexandria_reading_list_remove_item(
+    reading_list_uuid: *const c_char,
+    item_uuid: *const c_char,
+    token: *const c_char,
+) -> ReadingListJsonResult {
+    let services = match services_slot().lock().unwrap().clone() {
+        Some(s) => s,
+        None => return ReadingListJsonResult::err(READING_LIST_ERR_NOT_INITIALIZED),
+    };
+
+    let token = cstr_lossy(token).unwrap_or_default();
+    if !authenticated(&services, &token) {
+        return ReadingListJsonResult::err(READING_LIST_ERR_UNAUTHORIZED);
+    }
+
+    let reading_list_uuid =
+        match cstr_lossy(reading_list_uuid).and_then(|s| uuid::Uuid::parse_str(&s).ok()) {
+            Some(u) => u,
+            None => return ReadingListJsonResult::err(READING_LIST_ERR_INVALID_INPUT),
+        };
+    let item_uuid = match cstr_lossy(item_uuid).and_then(|s| uuid::Uuid::parse_str(&s).ok()) {
+        Some(u) => u,
+        None => return ReadingListJsonResult::err(READING_LIST_ERR_INVALID_INPUT),
+    };
+
+    let result = runtime().block_on(async {
+        services
+            .remove_item_from_reading_list_handler
+            .remove(reading_list_uuid, item_uuid, &token)
+            .await
+    });
+
+    match result {
+        Ok(removed) => {
+            let json = serde_json::to_string(&removed).unwrap_or_default();
+            ReadingListJsonResult::ok(json)
+        }
+        Err(err) => map_reading_list_err(err),
+    }
+}
+
 /// Free a string previously returned by an FFI accessor.
 ///
 /// # Safety

@@ -91,6 +91,15 @@ pub struct ReadingProgress {
     pub total_issues: Option<i64>,
 }
 
+/// Confirmation that an item was removed from a reading list (UC-30 /
+/// FR-RL-06): the ReadingProgress is deleted, the file is untouched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReadingListItemResult {
+    pub reading_list_uuid: Uuid,
+    pub item_uuid: Uuid,
+}
+
 /// A reading list with the ReadingProgress of every item it tracks (UC-27 /
 /// FR-RL-08).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

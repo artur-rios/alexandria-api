@@ -7,7 +7,7 @@ use uuid::Uuid;
 
 use alexandria_core::errors::DomainError;
 use alexandria_core::reading_lists::model::{
-    ReadingList, ReadingListWithProgress, ReadingProgress, ReadingState,
+    ReadingList, ReadingListItemResult, ReadingListWithProgress, ReadingProgress, ReadingState,
 };
 
 use crate::middleware::auth::invalid_input;
@@ -199,6 +199,36 @@ pub async fn update_progress(
             request.total_issues,
             &token,
         )
+        .await
+        .map_err(ApiError)?;
+
+    Ok((StatusCode::OK, Json(result)))
+}
+
+/// `DELETE /v1/reading-lists/{uuid}/items/{itemUuid}` — remove an item from
+/// a reading list (UC-30 / FR-RL-06). Deletes the ReadingProgress entry;
+/// the file itself is preserved. Returns `200` with the
+/// `readingListUuid`/`itemUuid` as confirmation, or `404` (no
+/// ReadingProgress for that item on that reading list, AF-01), or `401`
+/// (unauthenticated). Both the HTTP and FFI surfaces call the same core
+/// handler so the two stay at parity (FR-FC-24 / NFR-09).
+///
+/// The path is taken as a `Result` so its rejection becomes this surface's
+/// `400` + `{"error": …}` envelope rather than axum's bare-text `400`.
+pub async fn remove_item(
+    State(state): State<AppState>,
+    uuids: Result<Path<(Uuid, Uuid)>, PathRejection>,
+    headers: HeaderMap,
+) -> Result<(StatusCode, Json<ReadingListItemResult>), ApiError> {
+    let token = bearer_token(&headers);
+
+    let Path((reading_list_uuid, item_uuid)) =
+        uuids.map_err(|_| invalid_input("path segment is not a valid UUID"))?;
+
+    let result = state
+        .services
+        .remove_item_from_reading_list_handler
+        .remove(reading_list_uuid, item_uuid, &token)
         .await
         .map_err(ApiError)?;
 
