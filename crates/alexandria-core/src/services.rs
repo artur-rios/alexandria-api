@@ -4,6 +4,7 @@ use sqlx::sqlite::SqlitePool;
 
 use crate::auth::BearerAuthService;
 use crate::bookmarks::commands::create::CreateBookmarkHandler;
+use crate::bookmarks::commands::update::UpdateBookmarkHandler;
 use crate::bookmarks::repos::SqliteBookmarkRepository;
 use crate::catalog::clock::SystemClock;
 use crate::catalog::commands::edit_metadata::EditMetadataHandler;
@@ -68,6 +69,9 @@ pub type DefaultDeleteCollectionHandler =
 pub type DefaultCreateBookmarkHandler =
     CreateBookmarkHandler<BearerAuthService, SqliteBookmarkRepository, SqliteCollectionRepository>;
 
+pub type DefaultUpdateBookmarkHandler =
+    UpdateBookmarkHandler<BearerAuthService, SqliteBookmarkRepository, SqliteCollectionRepository>;
+
 pub type DefaultAddItemsToCollectionHandler = AddItemsToCollectionHandler<
     BearerAuthService,
     SqliteCollectionRepository,
@@ -104,6 +108,7 @@ pub struct Services {
     pub rename_collection_handler: Arc<DefaultRenameCollectionHandler>,
     pub delete_collection_handler: Arc<DefaultDeleteCollectionHandler>,
     pub create_bookmark_handler: Arc<DefaultCreateBookmarkHandler>,
+    pub update_bookmark_handler: Arc<DefaultUpdateBookmarkHandler>,
     pub add_items_to_collection_handler: Arc<DefaultAddItemsToCollectionHandler>,
     pub remove_item_from_collection_handler: Arc<DefaultRemoveItemFromCollectionHandler>,
     pub list_collection_items_handler: Arc<DefaultListCollectionItemsHandler>,
@@ -160,6 +165,11 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         SqliteBookmarkRepository::new(pool.clone()),
         SqliteCollectionRepository::new(pool.clone()),
     ));
+    let update_bookmark_handler = Arc::new(UpdateBookmarkHandler::new(
+        auth,
+        SqliteBookmarkRepository::new(pool.clone()),
+        SqliteCollectionRepository::new(pool.clone()),
+    ));
     let add_items_to_collection_handler = Arc::new(AddItemsToCollectionHandler::new(
         auth,
         SqliteCollectionRepository::new(pool.clone()),
@@ -192,6 +202,7 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         rename_collection_handler,
         delete_collection_handler,
         create_bookmark_handler,
+        update_bookmark_handler,
         add_items_to_collection_handler,
         remove_item_from_collection_handler,
         list_collection_items_handler,

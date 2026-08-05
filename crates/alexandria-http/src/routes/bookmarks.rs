@@ -1,5 +1,5 @@
-use axum::extract::rejection::JsonRejection;
-use axum::extract::State;
+use axum::extract::rejection::{JsonRejection, PathRejection};
+use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
 use serde::Deserialize;
@@ -60,4 +60,58 @@ pub async fn create(
         .map_err(ApiError)?;
 
     Ok((StatusCode::CREATED, Json(result)))
+}
+
+/// Request body for `PATCH /v1/bookmarks/{uuid}` (UC-16 / FR-BM-02): the
+/// bookmark's new `url`, `title`, and containing collection. Full replace,
+/// not a merge — a missing or `null` `collectionUuid` clears the link rather
+/// than leaving it untouched, matching `CreateBookmarkRequest`'s shape.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateBookmarkRequest {
+    pub url: String,
+    pub title: String,
+    pub collection_uuid: Option<Uuid>,
+}
+
+/// `PATCH /v1/bookmarks/{uuid}` — update a bookmark's url, title, and
+/// containing collection (UC-16 / FR-BM-02). The body carries `url`,
+/// `title`, and `collectionUuid` (all replaced); the handler validates the
+/// fields and, when a collection is referenced, confirms it exists and is
+/// `kind = bookmark`. Returns `200` with the updated `Bookmark`, or `400`
+/// (invalid url/title, or the collection is not a bookmark collection),
+/// `404` (the bookmark or the referenced collection does not exist), `409`
+/// (the bookmark is soft-deleted — restore via UC-18 first), or `401`
+/// (unauthenticated). Both the HTTP and FFI surfaces call the same core
+/// handler so the two stay at parity (FR-FC-24 / NFR-09).
+///
+/// The path and body are taken as `Result` so their rejections become this
+/// surface's `400` + `{"error": …}` envelope rather than axum's bare-text
+/// `422`/`400`.
+pub async fn update(
+    State(state): State<AppState>,
+    uuid: Result<Path<Uuid>, PathRejection>,
+    headers: HeaderMap,
+    body: Result<Json<UpdateBookmarkRequest>, JsonRejection>,
+) -> Result<(StatusCode, Json<Bookmark>), ApiError> {
+    let token = bearer_token(&headers);
+
+    let Path(uuid) = uuid.map_err(|_| invalid_input("path segment is not a valid UUID"))?;
+    let Json(request) =
+        body.map_err(|err| invalid_input(format!("invalid update bookmark body: {err}")))?;
+
+    let result = state
+        .services
+        .update_bookmark_handler
+        .update(
+            uuid,
+            &request.url,
+            &request.title,
+            request.collection_uuid,
+            &token,
+        )
+        .await
+        .map_err(ApiError)?;
+
+    Ok((StatusCode::OK, Json(result)))
 }
