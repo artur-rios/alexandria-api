@@ -12,10 +12,10 @@ use crate::errors::DomainError;
 ///
 /// Generic over the same three repositories `AddItemsToCollectionHandler`
 /// uses: which one supplies the membership list depends on the collection's
-/// `kind`. Files are read through the same `list_filtered` the UC-03 browse
-/// query uses (state defaults to `Active`, matching UC-03's own default);
-/// bookmarks use their own `list_by_collection`, since bookmark browsing
-/// (UC-17) has not shipped yet.
+/// `kind`. Both repositories' `list_filtered` are used with the default
+/// `StateFilter::Active`, matching UC-03's own default (soft-deleted members
+/// excluded unless explicitly requested — which this read path does not yet
+/// support).
 pub struct ListCollectionItemsHandler<A, CR, CATR, BR> {
     auth: A,
     collection_repo: CR,
@@ -66,7 +66,7 @@ where
             ),
             CollectionKind::Bookmark => CollectionItems::Bookmarks(
                 self.bookmark_repo
-                    .list_by_collection(collection_uuid)
+                    .list_filtered(Some(collection_uuid), StateFilter::Active)
                     .await?,
             ),
         };

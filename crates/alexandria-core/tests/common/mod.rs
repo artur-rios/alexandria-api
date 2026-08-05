@@ -918,14 +918,20 @@ impl BookmarkRepository for FakeBookmarkRepository {
         Ok(())
     }
 
-    async fn list_by_collection(
+    async fn list_filtered(
         &self,
-        collection_uuid: Uuid,
+        collection_uuid: Option<Uuid>,
+        state: StateFilter,
     ) -> Result<Vec<Bookmark>, DomainError> {
         let bookmarks = self.bookmarks.lock().unwrap();
         let mut out: Vec<Bookmark> = bookmarks
             .values()
-            .filter(|b| b.collection_uuid == Some(collection_uuid))
+            .filter(|b| collection_uuid.is_none() || b.collection_uuid == collection_uuid)
+            .filter(|b| match state {
+                StateFilter::Active => b.state == BookmarkState::Active,
+                StateFilter::Deleted => b.state == BookmarkState::Deleted,
+                StateFilter::All => true,
+            })
             .cloned()
             .collect();
         out.sort_by(|a, b| a.title.cmp(&b.title));

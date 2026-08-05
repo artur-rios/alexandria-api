@@ -3,6 +3,7 @@ use sqlx::Row;
 use uuid::Uuid;
 
 use crate::bookmarks::model::{Bookmark, BookmarkState, NewBookmark};
+use crate::catalog::model::StateFilter;
 use crate::errors::DomainError;
 
 /// Bookmarks repository port. The create handler depends on this trait so its
@@ -34,11 +35,17 @@ pub trait BookmarkRepository: Send + Sync {
     /// collection (UC-14 AF-01).
     async fn clear_collection(&self, uuid: Uuid, collection_uuid: Uuid) -> Result<(), DomainError>;
 
-    /// List every bookmark linked to the collection identified by
-    /// `collection_uuid` (UC-14 / FR-CO-07). The caller has already
-    /// confirmed the collection exists. Ordered by title.
-    async fn list_by_collection(&self, collection_uuid: Uuid)
-        -> Result<Vec<Bookmark>, DomainError>;
+    /// List bookmarks filtered by containing collection and lifecycle state
+    /// (UC-14 / FR-CO-07 when `collection_uuid = Some`; UC-17 / FR-BM-06 for
+    /// the general browse). `collection_uuid = None` means no collection
+    /// filter; `state` selects the lifecycle subset the same way
+    /// `CatalogRepository::list_filtered` does. The caller has already
+    /// confirmed a referenced collection exists. Ordered by title.
+    async fn list_filtered(
+        &self,
+        collection_uuid: Option<Uuid>,
+        state: StateFilter,
+    ) -> Result<Vec<Bookmark>, DomainError>;
 
     /// Replace the url, title, and containing collection of the bookmark
     /// identified by `uuid` (UC-16 / FR-BM-02), and return the updated
@@ -137,18 +144,41 @@ impl BookmarkRepository for SqliteBookmarkRepository {
         Ok(())
     }
 
-    async fn list_by_collection(
+    async fn list_filtered(
         &self,
-        collection_uuid: Uuid,
+        collection_uuid: Option<Uuid>,
+        state: StateFilter,
     ) -> Result<Vec<Bookmark>, DomainError> {
-        let sql = format!(
-            "{BOOKMARK_SELECT_JOIN_SQL} WHERE b.collection_id = \
-             (SELECT id FROM collections WHERE uuid = ?) ORDER BY b.title"
-        );
-        let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
-            .bind(collection_uuid.to_string())
-            .fetch_all(&self.pool)
-            .await?;
+        let mut sql = BOOKMARK_SELECT_JOIN_SQL.to_string();
+        let mut conj = " WHERE ";
+        if collection_uuid.is_some() {
+            sql.push_str(conj);
+            sql.push_str("b.collection_id = (SELECT id FROM collections WHERE uuid = ?)");
+            conj = " AND ";
+        }
+        match state {
+            StateFilter::Active => {
+                sql.push_str(conj);
+                sql.push_str("b.state = 'active'");
+            }
+            StateFilter::Deleted => {
+                sql.push_str(conj);
+                sql.push_str("b.state = 'deleted'");
+            }
+            StateFilter::All => {}
+        }
+        sql.push_str(" ORDER BY b.title");
+
+        // sqlx 0.9 requires a runtime-built SQL string to be asserted safe;
+        // `sql` is assembled only from `BOOKMARK_SELECT_JOIN_SQL` and the
+        // literal fragments chosen by `Option<Uuid>` / `StateFilter` above —
+        // no caller input reaches it, and the uuid is still a bound `?`.
+        let query = sqlx::query(sqlx::AssertSqlSafe(sql));
+        let query = match collection_uuid {
+            Some(u) => query.bind(u.to_string()),
+            None => query,
+        };
+        let rows = query.fetch_all(&self.pool).await?;
         rows.into_iter().map(parse_bookmark_row).collect()
     }
 
