@@ -2699,6 +2699,55 @@ pub extern "C" fn alexandria_reading_list_remove_item(
     }
 }
 
+/// Delete a reading list (UC-31 / FR-RL-07).
+///
+/// `uuid` is the reading list's public UUID (NUL-terminated string). On
+/// success `json` carries the pre-delete `ReadingList` — byte-for-byte the
+/// same shape HTTP returns from `DELETE /v1/reading-lists/{uuid}` (parity,
+/// FR-FC-24 / NFR-09). `token` is the bearer auth token.
+#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
+#[no_mangle]
+pub extern "C" fn alexandria_reading_list_delete(
+    uuid: *const c_char,
+    token: *const c_char,
+) -> ReadingListJsonResult {
+    let services = match services_slot().lock().unwrap().clone() {
+        Some(s) => s,
+        None => return ReadingListJsonResult::err(READING_LIST_ERR_NOT_INITIALIZED),
+    };
+
+    // Deny before touching the payload — an unauthenticated caller must not
+    // learn whether the uuid would have parsed.
+    let token = cstr_lossy(token).unwrap_or_default();
+    if !authenticated(&services, &token) {
+        return ReadingListJsonResult::err(READING_LIST_ERR_UNAUTHORIZED);
+    }
+
+    let uuid_str = match cstr_lossy(uuid) {
+        Some(s) => s,
+        None => return ReadingListJsonResult::err(READING_LIST_ERR_INVALID_INPUT),
+    };
+    let uuid = match uuid::Uuid::parse_str(&uuid_str) {
+        Ok(u) => u,
+        Err(_) => return ReadingListJsonResult::err(READING_LIST_ERR_INVALID_INPUT),
+    };
+
+    let result = runtime().block_on(async {
+        services
+            .delete_reading_list_handler
+            .delete(uuid, &token)
+            .await
+    });
+
+    match result {
+        Ok(reading_list) => {
+            let json = serde_json::to_string(&reading_list).unwrap_or_default();
+            ReadingListJsonResult::ok(json)
+        }
+        Err(err) => map_reading_list_err(err),
+    }
+}
+
 /// Free a string previously returned by an FFI accessor.
 ///
 /// # Safety

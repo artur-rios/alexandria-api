@@ -31,9 +31,9 @@ its open/closed state, so the tables stay in sync with the board automatically.
 | [F-05 Collections](https://github.com/artur-rios/alexandria-api/milestone/6) | UC-10 … UC-14 | 5 / 5 |
 | [F-06 Bookmarks](https://github.com/artur-rios/alexandria-api/milestone/7) | UC-15 … UC-19 | 5 / 5 |
 | [F-07 Watchlists](https://github.com/artur-rios/alexandria-api/milestone/8) | UC-20 … UC-25 | 6 / 6 |
-| [F-08 Reading lists](https://github.com/artur-rios/alexandria-api/milestone/9) | UC-26 … UC-31 | 5 / 6 |
+| [F-08 Reading lists](https://github.com/artur-rios/alexandria-api/milestone/9) | UC-26 … UC-31 | 6 / 6 |
 | [F-09 Pluggable authentication](https://github.com/artur-rios/alexandria-api/milestone/10) | UC-34 … UC-36 | 0 / 3 |
-| **Total** | | **31 / 38** |
+| **Total** | | **32 / 38** |
 
 ### F-00 — Foundation & operations
 
@@ -132,7 +132,7 @@ Book and comic consumption tracking, per issue for comic series.
 | [#29](https://github.com/artur-rios/alexandria-api/issues/29) | UC-28 | &#9745; | Add an item to a reading list | FR-RL-02, FR-RL-03, FR-FC-24 |
 | [#30](https://github.com/artur-rios/alexandria-api/issues/30) | UC-29 | &#9745; | Update reading progress | FR-RL-04, FR-RL-05, FR-FC-24 |
 | [#31](https://github.com/artur-rios/alexandria-api/issues/31) | UC-30 | &#9745; | Remove an item from a reading list | FR-RL-06, FR-FC-24 |
-| [#32](https://github.com/artur-rios/alexandria-api/issues/32) | UC-31 | &#9744; | Delete a reading list | FR-RL-07, FR-FC-24 |
+| [#32](https://github.com/artur-rios/alexandria-api/issues/32) | UC-31 | &#9745; | Delete a reading list | FR-RL-07, FR-FC-24 |
 
 ### F-09 — Pluggable authentication
 
