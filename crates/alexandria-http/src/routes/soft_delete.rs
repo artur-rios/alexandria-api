@@ -5,7 +5,7 @@ use axum::Json;
 use serde::Deserialize;
 use uuid::Uuid;
 
-use alexandria_core::catalog::model::File;
+use alexandria_core::catalog::model::{File, PurgeOnDiskOutcome};
 
 use crate::middleware::auth::invalid_input;
 use crate::middleware::error::ApiError;
@@ -13,17 +13,33 @@ use crate::routes::bearer_token;
 use crate::AppState;
 
 /// Query-string parameters for `DELETE /v1/files/{uuid}`. `purge=true`
-/// dispatches to the UC-08 hard-purge handler; anything else (absent,
-/// `purge=false`) is the UC-06 soft-delete. `purge-on-disk` (UC-09) is not
-/// modeled here and is left ignored by serde.
+/// dispatches to the UC-08 hard-purge handler; `purge-on-disk=true`
+/// dispatches to the UC-09 purge-on-disk handler; anything else (absent, or
+/// both `false`) is the UC-06 soft-delete. Setting both `purge` and
+/// `purge-on-disk` to `true` is rejected as invalid input — the two are
+/// distinct operations (BR-11) and the caller must pick one.
 #[derive(Debug, Deserialize)]
 pub struct DeleteQuery {
     pub purge: Option<bool>,
+    #[serde(rename = "purge-on-disk")]
+    pub purge_on_disk: Option<bool>,
+}
+
+/// The success body of [`soft_delete`]. Untagged so the wire shape for
+/// UC-06/UC-08 (a bare `File`) is unchanged; only the UC-09 branch adds the
+/// `diskFilePresent` field via [`PurgeOnDiskOutcome`].
+#[derive(Debug, serde::Serialize)]
+#[serde(untagged)]
+pub enum DeleteResult {
+    File(File),
+    PurgeOnDisk(PurgeOnDiskOutcome),
 }
 
 /// `DELETE /v1/files/{uuid}` — soft-delete a file (UC-06 / FR-FC-20), or,
 /// with `?purge=true`, hard-purge a soft-deleted file's catalog row once its
-/// retention window has elapsed (UC-08 / FR-FC-22).
+/// retention window has elapsed (UC-08 / FR-FC-22), or, with
+/// `?purge-on-disk=true`, delete the on-disk file and remove its catalog row
+/// regardless of retention (UC-09 / FR-FC-23, FR-FC-24).
 ///
 /// Soft-delete marks the catalog row `deleted` and stamps `deleted_at` so
 /// the record is hidden from active views but remains restorable via UC-07;
@@ -36,9 +52,16 @@ pub struct DeleteQuery {
 /// subtype row) instead; the on-disk file is still untouched (NFR-07).
 /// Returns `200` with the pre-delete `File` as confirmation, or `400` (bad
 /// uuid or non-boolean `purge`), `404` (uuid not found), `409` (not
-/// `deleted`, or still within the retention window — AF-01), or `401`. The
-/// `?purge-on-disk=true` query form belongs to UC-09 and is not handled
-/// here — an unrecognized query key is ignored by serde.
+/// `deleted`, or still within the retention window — AF-01), or `401`.
+///
+/// `?purge-on-disk=true` deletes the on-disk file first, then the catalog
+/// row (and its subtype row); there is no retention gate — an `active`
+/// record is purgeable too. Returns `200` with a [`PurgeOnDiskOutcome`]
+/// (the pre-delete `File` plus `diskFilePresent`, `false` when no on-disk
+/// file was there to delete — AF-01, still a success), or `400` (bad uuid,
+/// non-boolean `purge-on-disk`, or both `purge` and `purge-on-disk` set),
+/// `404` (uuid not found — AF-03), `500` (disk error — AF-02, the record is
+/// left untouched), or `401` (AF-04).
 ///
 /// The path and query are each taken as `Result` so a rejection becomes
 /// this surface's `400` + `{"error": …}` envelope rather than axum's
@@ -50,26 +73,46 @@ pub async fn soft_delete(
     uuid: Result<Path<Uuid>, PathRejection>,
     query: Result<Query<DeleteQuery>, QueryRejection>,
     headers: HeaderMap,
-) -> Result<(StatusCode, Json<File>), ApiError> {
+) -> Result<(StatusCode, Json<DeleteResult>), ApiError> {
     let token = bearer_token(&headers);
 
     let Path(uuid) = uuid.map_err(|_| invalid_input("path segment is not a valid UUID"))?;
-    let Query(query) = query.map_err(|_| invalid_input("purge must be true or false"))?;
+    let Query(query) = query
+        .map_err(|_| invalid_input("purge and purge-on-disk must be true or false"))?;
 
-    let result = if query.purge == Some(true) {
-        state
-            .services
-            .purge_file_handler
-            .purge(uuid, &token)
-            .await
-            .map_err(ApiError)?
+    if query.purge == Some(true) && query.purge_on_disk == Some(true) {
+        return Err(invalid_input(
+            "purge and purge-on-disk are distinct operations and cannot both be true",
+        ));
+    }
+
+    let result = if query.purge_on_disk == Some(true) {
+        DeleteResult::PurgeOnDisk(
+            state
+                .services
+                .purge_file_on_disk_handler
+                .purge_on_disk(uuid, &token)
+                .await
+                .map_err(ApiError)?,
+        )
+    } else if query.purge == Some(true) {
+        DeleteResult::File(
+            state
+                .services
+                .purge_file_handler
+                .purge(uuid, &token)
+                .await
+                .map_err(ApiError)?,
+        )
     } else {
-        state
-            .services
-            .soft_delete_file_handler
-            .soft_delete(uuid, &token)
-            .await
-            .map_err(ApiError)?
+        DeleteResult::File(
+            state
+                .services
+                .soft_delete_file_handler
+                .soft_delete(uuid, &token)
+                .await
+                .map_err(ApiError)?,
+        )
     };
 
     Ok((StatusCode::OK, Json(result)))

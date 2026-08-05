@@ -1577,3 +1577,205 @@ async fn given_no_purge_param_when_delete_then_still_soft_deletes() {
     assert!(row.1.is_some(), "deleted_at stamped by no-param delete");
     assert!(on_disk.exists(), "on-disk file preserved");
 }
+
+// ---------------------------------------------------------------------------
+// UC-09: DELETE /v1/files/{uuid}?purge-on-disk=true (FR-FC-23, FR-FC-24)
+// ---------------------------------------------------------------------------
+
+fn purge_on_disk_request(uuid: &str) -> Request<Body> {
+    Request::builder()
+        .method("DELETE")
+        .uri(format!("/v1/files/{uuid}?purge-on-disk=true"))
+        .header("authorization", "Bearer test-token")
+        .body(Body::empty())
+        .unwrap()
+}
+
+#[tokio::test]
+async fn given_active_file_when_purge_on_disk_then_200_and_rows_and_disk_file_removed() {
+    let lib = tempdir().unwrap();
+    let on_disk = common::write_file(&lib, "song.mp3", b"audio bytes");
+    let test = test_app().await;
+    index_library(&lib, &test.pool, &[("song.mp3", b"audio bytes")]).await;
+    let uuid = uuid_for_name(&test.pool, "song.mp3").await;
+
+    // Never soft-deleted (`state = 'active'`) — UC-09 has no retention gate,
+    // unlike UC-08.
+    let file_id: (i64,) = sqlx::query_as("SELECT id FROM files WHERE uuid = ?")
+        .bind(&uuid)
+        .fetch_one(&test.pool)
+        .await
+        .expect("file id");
+
+    let response = app(Settings::default(), test.services)
+        .oneshot(purge_on_disk_request(&uuid))
+        .await
+        .expect("purge-on-disk one-shot");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body: Value = serde_json::from_slice(
+        &to_bytes(response.into_body(), usize::MAX).await.unwrap(),
+    )
+    .unwrap();
+    assert_eq!(body["file"]["uuid"], uuid);
+    assert_eq!(body["file"]["state"], "active", "confirmation echoes the pre-purge state");
+    assert_eq!(body["diskFilePresent"], true);
+
+    let remaining: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM files WHERE uuid = ?")
+        .bind(&uuid)
+        .fetch_one(&test.pool)
+        .await
+        .expect("files count");
+    assert_eq!(remaining.0, 0, "files row removed by purge-on-disk");
+
+    let subtype_remaining: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM audio_files WHERE file_id = ?")
+        .bind(file_id.0)
+        .fetch_one(&test.pool)
+        .await
+        .expect("audio_files count");
+    assert_eq!(subtype_remaining.0, 0, "subtype row removed by purge-on-disk");
+
+    assert!(!on_disk.exists(), "on-disk file deleted by purge-on-disk");
+}
+
+#[tokio::test]
+async fn given_missing_disk_file_when_purge_on_disk_then_200_disk_file_present_false_and_row_removed() {
+    let lib = tempdir().unwrap();
+    let on_disk = common::write_file(&lib, "song.mp3", b"audio bytes");
+    let test = test_app().await;
+    index_library(&lib, &test.pool, &[("song.mp3", b"audio bytes")]).await;
+    let uuid = uuid_for_name(&test.pool, "song.mp3").await;
+
+    // The file was deleted out from under the catalog (AF-01).
+    std::fs::remove_file(&on_disk).expect("pre-remove on-disk file");
+
+    let response = app(Settings::default(), test.services)
+        .oneshot(purge_on_disk_request(&uuid))
+        .await
+        .expect("purge-on-disk one-shot");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body: Value = serde_json::from_slice(
+        &to_bytes(response.into_body(), usize::MAX).await.unwrap(),
+    )
+    .unwrap();
+    assert_eq!(body["diskFilePresent"], false, "AF-01: no on-disk file to delete");
+
+    let remaining: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM files WHERE uuid = ?")
+        .bind(&uuid)
+        .fetch_one(&test.pool)
+        .await
+        .expect("files count");
+    assert_eq!(remaining.0, 0, "record still purged despite absent disk file");
+}
+
+#[tokio::test]
+async fn given_disk_delete_failure_when_purge_on_disk_then_500_disk_error_and_row_kept() {
+    let lib = tempdir().unwrap();
+    let on_disk = common::write_file(&lib, "song.mp3", b"audio bytes");
+    let test = test_app().await;
+    index_library(&lib, &test.pool, &[("song.mp3", b"audio bytes")]).await;
+    let uuid = uuid_for_name(&test.pool, "song.mp3").await;
+
+    let file_id: (i64,) = sqlx::query_as("SELECT id FROM files WHERE uuid = ?")
+        .bind(&uuid)
+        .fetch_one(&test.pool)
+        .await
+        .expect("file id");
+
+    // Replace the indexed file with a directory at the same path so
+    // `std::fs::remove_file` fails with something other than `NotFound`
+    // (AF-02), on both Windows and Unix.
+    std::fs::remove_file(&on_disk).expect("pre-remove indexed file");
+    std::fs::create_dir(&on_disk).expect("create directory in place of indexed file");
+
+    let response = app(Settings::default(), test.services)
+        .oneshot(purge_on_disk_request(&uuid))
+        .await
+        .expect("purge-on-disk one-shot");
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+    let body: Value = serde_json::from_slice(
+        &to_bytes(response.into_body(), usize::MAX).await.unwrap(),
+    )
+    .unwrap();
+    assert_eq!(body["error"], "disk error");
+
+    let remaining: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM files WHERE uuid = ?")
+        .bind(&uuid)
+        .fetch_one(&test.pool)
+        .await
+        .expect("files count");
+    assert_eq!(remaining.0, 1, "AF-02: record kept when the disk delete fails");
+
+    let subtype_remaining: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM audio_files WHERE file_id = ?")
+        .bind(file_id.0)
+        .fetch_one(&test.pool)
+        .await
+        .expect("audio_files count");
+    assert_eq!(subtype_remaining.0, 1, "AF-02: subtype row kept when the disk delete fails");
+}
+
+#[tokio::test]
+async fn given_missing_uuid_when_purge_on_disk_then_404() {
+    let test = test_app().await;
+    let missing = uuid::Uuid::new_v4().to_string();
+    let response = app(Settings::default(), test.services)
+        .oneshot(purge_on_disk_request(&missing))
+        .await
+        .expect("purge-on-disk one-shot");
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn given_no_bearer_when_purge_on_disk_then_401() {
+    let test = test_app().await;
+    let uuid = uuid::Uuid::new_v4().to_string();
+    let request = Request::builder()
+        .method("DELETE")
+        .uri(format!("/v1/files/{uuid}?purge-on-disk=true"))
+        .body(Body::empty())
+        .unwrap();
+    let response = app(Settings::default(), test.services).oneshot(request).await.expect("one-shot");
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn given_purge_and_purge_on_disk_both_true_when_delete_then_400_with_error_envelope() {
+    let test = test_app().await;
+    let uuid = uuid::Uuid::new_v4().to_string();
+    let request = Request::builder()
+        .method("DELETE")
+        .uri(format!("/v1/files/{uuid}?purge=true&purge-on-disk=true"))
+        .header("authorization", "Bearer test-token")
+        .body(Body::empty())
+        .unwrap();
+    let response = app(Settings::default(), test.services).oneshot(request).await.expect("one-shot");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let body: Value = serde_json::from_slice(
+        &to_bytes(response.into_body(), usize::MAX).await.unwrap(),
+    )
+    .unwrap();
+    assert!(body["error"].as_str().is_some(), "error envelope present");
+}
+
+#[tokio::test]
+async fn given_non_boolean_purge_on_disk_query_when_delete_then_400_with_error_envelope() {
+    let test = test_app().await;
+    let uuid = uuid::Uuid::new_v4().to_string();
+    let request = Request::builder()
+        .method("DELETE")
+        .uri(format!("/v1/files/{uuid}?purge-on-disk=notabool"))
+        .header("authorization", "Bearer test-token")
+        .body(Body::empty())
+        .unwrap();
+    let response = app(Settings::default(), test.services).oneshot(request).await.expect("one-shot");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let body: Value = serde_json::from_slice(
+        &to_bytes(response.into_body(), usize::MAX).await.unwrap(),
+    )
+    .unwrap();
+    assert!(body["error"].as_str().is_some(), "error envelope present");
+}

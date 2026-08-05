@@ -284,3 +284,14 @@ pub struct File {
     /// soft-delete lifecycle owned by UC-06/07.
     pub missing_at: Option<DateTime<Utc>>,
 }
+
+/// Response of UC-09 purge-on-disk (FR-FC-23): the pre-delete snapshot of the
+/// record plus whether an on-disk file was actually present to remove.
+/// `disk_file_present: false` is AF-01 — the record is still purged, but the
+/// caller is told there was no file on disk to delete.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PurgeOnDiskOutcome {
+    pub file: File,
+    pub disk_file_present: bool,
+}

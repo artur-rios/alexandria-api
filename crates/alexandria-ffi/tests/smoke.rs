@@ -14,11 +14,11 @@ fn serial() -> std::sync::MutexGuard<'static, ()> {
 }
 
 use alexandria_ffi::{
-    alexandria_file_edit_metadata, alexandria_file_purge, alexandria_file_rename,
-    alexandria_file_restore, alexandria_file_soft_delete, alexandria_free_string,
-    alexandria_index_count_files, alexandria_index_count_missing, alexandria_index_files_json,
-    alexandria_index_init, alexandria_index_refresh_start, alexandria_index_start,
-    FileMetadataResult, IndexStartResult,
+    alexandria_file_edit_metadata, alexandria_file_purge, alexandria_file_purge_on_disk,
+    alexandria_file_rename, alexandria_file_restore, alexandria_file_soft_delete,
+    alexandria_free_string, alexandria_index_count_files, alexandria_index_count_missing,
+    alexandria_index_files_json, alexandria_index_init, alexandria_index_refresh_start,
+    alexandria_index_start, FileMetadataResult, IndexStartResult,
 };
 
 const STATUS_OK: i32 = alexandria_ffi::INDEX_OK;
@@ -1019,4 +1019,204 @@ fn given_ffi_purge_within_retention_then_invalid_state_and_row_kept() {
         count
     });
     assert_eq!(remaining, 1, "row kept when purge is refused");
+}
+
+// ---------------------------------------------------------------------------
+// UC-09: alexandria_file_purge_on_disk (FR-FC-23, FR-FC-24)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn given_active_file_when_ffi_purge_on_disk_then_ok_and_disk_and_rows_removed() {
+    let _g = serial();
+    let (_db_dir, db_path) = init_temp_db();
+    let lib = tempdir().unwrap();
+    std::fs::write(lib.path().join("song.mp3"), b"audio bytes").unwrap();
+
+    let root = c(lib.path().to_str().unwrap());
+    let token = c("bearer");
+    alexandria_index_start(root.as_ptr(), token.as_ptr());
+    wait_for_files(1);
+
+    // No retention gate for UC-09 — an `active` (never soft-deleted) record
+    // is purgeable, unlike UC-08.
+    let uuid = uuid_by_name(&db_path, "song.mp3");
+    let file_id: i64 = with_db(&db_path, {
+        let uuid = uuid.clone();
+        move |pool| async move {
+            let (id,): (i64,) = sqlx::query_as("SELECT id FROM files WHERE uuid = ?")
+                .bind(&uuid)
+                .fetch_one(&pool)
+                .await
+                .expect("file id");
+            id
+        }
+    });
+
+    let result = alexandria_file_purge_on_disk(c(&uuid).as_ptr(), token.as_ptr());
+
+    let json = file_json_ok(result);
+    assert_eq!(json["file"]["uuid"], uuid);
+    assert_eq!(json["diskFilePresent"], true);
+
+    assert!(
+        !lib.path().join("song.mp3").exists(),
+        "on-disk file removed by purge-on-disk"
+    );
+
+    let uuid_for_check = uuid.clone();
+    let (files_remaining, subtype_remaining): (i64, i64) =
+        with_db(&db_path, move |pool| async move {
+            let (files,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM files WHERE uuid = ?")
+                .bind(&uuid_for_check)
+                .fetch_one(&pool)
+                .await
+                .expect("files count");
+            let (subtype,): (i64,) =
+                sqlx::query_as("SELECT COUNT(*) FROM audio_files WHERE file_id = ?")
+                    .bind(file_id)
+                    .fetch_one(&pool)
+                    .await
+                    .expect("audio_files count");
+            (files, subtype)
+        });
+    assert_eq!(files_remaining, 0, "files row removed by purge-on-disk");
+    assert_eq!(subtype_remaining, 0, "subtype row removed by purge-on-disk");
+}
+
+#[test]
+fn given_missing_disk_file_when_ffi_purge_on_disk_then_ok_and_absence_reported() {
+    let _g = serial();
+    let (_db_dir, db_path) = init_temp_db();
+    let lib = tempdir().unwrap();
+    std::fs::write(lib.path().join("song.mp3"), b"audio bytes").unwrap();
+
+    let root = c(lib.path().to_str().unwrap());
+    let token = c("bearer");
+    alexandria_index_start(root.as_ptr(), token.as_ptr());
+    wait_for_files(1);
+
+    let uuid = uuid_by_name(&db_path, "song.mp3");
+
+    // The file vanishes from disk out from under the catalog (AF-01).
+    std::fs::remove_file(lib.path().join("song.mp3")).unwrap();
+
+    let result = alexandria_file_purge_on_disk(c(&uuid).as_ptr(), token.as_ptr());
+
+    let json = file_json_ok(result);
+    assert_eq!(json["file"]["uuid"], uuid);
+    assert_eq!(
+        json["diskFilePresent"], false,
+        "purge-on-disk still succeeds and reports the absence"
+    );
+
+    let uuid_for_check = uuid.clone();
+    let remaining: i64 = with_db(&db_path, move |pool| async move {
+        let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM files WHERE uuid = ?")
+            .bind(uuid_for_check)
+            .fetch_one(&pool)
+            .await
+            .expect("files count");
+        count
+    });
+    assert_eq!(remaining, 0, "row still removed even though disk file was absent");
+}
+
+#[test]
+fn given_disk_delete_failure_when_ffi_purge_on_disk_then_disk_error_and_row_kept() {
+    let _g = serial();
+    let (_db_dir, db_path) = init_temp_db();
+    let lib = tempdir().unwrap();
+    std::fs::write(lib.path().join("song.mp3"), b"audio bytes").unwrap();
+
+    let root = c(lib.path().to_str().unwrap());
+    let token = c("bearer");
+    alexandria_index_start(root.as_ptr(), token.as_ptr());
+    wait_for_files(1);
+
+    let uuid = uuid_by_name(&db_path, "song.mp3");
+    let file_id: i64 = with_db(&db_path, {
+        let uuid = uuid.clone();
+        move |pool| async move {
+            let (id,): (i64,) = sqlx::query_as("SELECT id FROM files WHERE uuid = ?")
+                .bind(&uuid)
+                .fetch_one(&pool)
+                .await
+                .expect("file id");
+            id
+        }
+    });
+
+    // Replace the indexed file with a directory at the same path so the
+    // disk delete fails with something other than `NotFound` (AF-02).
+    std::fs::remove_file(lib.path().join("song.mp3")).expect("pre-remove indexed file");
+    std::fs::create_dir(lib.path().join("song.mp3")).expect("create directory in place of indexed file");
+
+    let result = alexandria_file_purge_on_disk(c(&uuid).as_ptr(), token.as_ptr());
+    assert_eq!(result.status, STATUS_FILE_DISK);
+    assert!(result.json.is_null());
+
+    let uuid_for_check = uuid.clone();
+    let (files_remaining, subtype_remaining): (i64, i64) =
+        with_db(&db_path, move |pool| async move {
+            let (files,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM files WHERE uuid = ?")
+                .bind(&uuid_for_check)
+                .fetch_one(&pool)
+                .await
+                .expect("files count");
+            let (subtype,): (i64,) =
+                sqlx::query_as("SELECT COUNT(*) FROM audio_files WHERE file_id = ?")
+                    .bind(file_id)
+                    .fetch_one(&pool)
+                    .await
+                    .expect("audio_files count");
+            (files, subtype)
+        });
+    assert_eq!(files_remaining, 1, "AF-02: record kept when the disk delete fails");
+    assert_eq!(subtype_remaining, 1, "AF-02: subtype row kept when the disk delete fails");
+}
+
+#[test]
+fn given_ffi_purge_on_disk_missing_uuid_then_not_found() {
+    let _g = serial();
+    let (_db_dir, _db_path) = init_temp_db();
+    let token = c("bearer");
+    let uuid = c("11111111-1111-1111-1111-111111111111");
+    let result = alexandria_file_purge_on_disk(uuid.as_ptr(), token.as_ptr());
+    assert_eq!(result.status, STATUS_FILE_NOT_FOUND);
+    assert!(result.json.is_null());
+}
+
+#[test]
+fn given_ffi_purge_on_disk_no_token_then_unauthorized() {
+    let _g = serial();
+    let (_db_dir, db_path) = init_temp_db();
+    let lib = tempdir().unwrap();
+    std::fs::write(lib.path().join("song.mp3"), b"x").unwrap();
+    let root = c(lib.path().to_str().unwrap());
+    let token = c("bearer");
+    alexandria_index_start(root.as_ptr(), token.as_ptr());
+    wait_for_files(1);
+
+    let uuid = uuid_by_name(&db_path, "song.mp3");
+    let empty = c("");
+    let result = alexandria_file_purge_on_disk(c(&uuid).as_ptr(), empty.as_ptr());
+    assert_eq!(result.status, STATUS_FILE_UNAUTHORIZED);
+    assert!(result.json.is_null());
+
+    // Auth ran before the disk was touched.
+    assert!(
+        lib.path().join("song.mp3").exists(),
+        "on-disk file untouched when auth is denied"
+    );
+}
+
+#[test]
+fn given_ffi_purge_on_disk_malformed_uuid_then_invalid_input() {
+    let _g = serial();
+    let (_db_dir, _db_path) = init_temp_db();
+    let token = c("bearer");
+    let uuid = c("not-a-uuid");
+    let result = alexandria_file_purge_on_disk(uuid.as_ptr(), token.as_ptr());
+    assert_eq!(result.status, STATUS_FILE_INVALID_INPUT);
+    assert!(result.json.is_null());
 }

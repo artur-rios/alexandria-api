@@ -401,6 +401,11 @@ struct FakeFsState {
     /// Completed renames `from -> to`, in order. `path_exists` reports the
     /// `to` path as present (and the `from` path as gone) after a rename.
     renames: Vec<(String, String)>,
+    /// Paths where `remove_file` must fail, simulating UC-09 AF-02.
+    failing_removes_from: std::collections::HashSet<String>,
+    /// Paths removed by `remove_file` so far, in order. `path_exists` reports
+    /// these as gone afterwards.
+    removed: Vec<String>,
 }
 
 impl FakeFilesystem {
@@ -440,6 +445,30 @@ impl FakeFilesystem {
     /// Count of renames the fake has performed so far.
     pub fn rename_count(&self) -> usize {
         self.state.lock().unwrap().renames.len()
+    }
+
+    /// Make `remove_file` at `path` fail with a disk error (UC-09 AF-02).
+    pub fn fail_remove_from(&mut self, path: &str) {
+        self.state
+            .lock()
+            .unwrap()
+            .failing_removes_from
+            .insert(path.to_string());
+    }
+
+    /// `true` once `remove_file` has removed `path`.
+    pub fn removed(&self, path: &str) -> bool {
+        self.state
+            .lock()
+            .unwrap()
+            .removed
+            .iter()
+            .any(|p| p == path)
+    }
+
+    /// Count of successful removals the fake has performed so far.
+    pub fn remove_count(&self) -> usize {
+        self.state.lock().unwrap().removed.len()
     }
 }
 
@@ -501,12 +530,14 @@ impl Filesystem for FakeFilesystem {
                 .any(|(_, t)| t == root);
         let moved_to = state.renames.iter().any(|(_, t)| t == root);
         let disk = state.disk_paths.contains(root);
+        let removed = state.removed.iter().any(|p| p == root);
         drop(state);
-        self.roots.contains(root)
-            || self.hash_by_path.contains_key(root)
-            || self.unreadable.contains(root)
-            || disk
-            || (moved_to && !moved_from)
+        !removed
+            && (self.roots.contains(root)
+                || self.hash_by_path.contains_key(root)
+                || self.unreadable.contains(root)
+                || disk
+                || (moved_to && !moved_from))
     }
 
     async fn list_files(&self, root: &str) -> Result<Vec<FileEntry>, DomainError> {
@@ -537,6 +568,28 @@ impl Filesystem for FakeFilesystem {
         }
         state.renames.push((from.to_string(), to.to_string()));
         Ok(())
+    }
+
+    async fn remove_file(&self, path: &str) -> Result<bool, DomainError> {
+        let mut state = self.state.lock().unwrap();
+        if state.failing_removes_from.contains(path) {
+            return Err(DomainError::disk(format!(
+                "fake remove failure: {path:?}"
+            )));
+        }
+        if state.removed.iter().any(|p| p == path) {
+            return Ok(false);
+        }
+        let present = self.roots.contains(path)
+            || self.hash_by_path.contains_key(path)
+            || self.unreadable.contains(path)
+            || state.disk_paths.contains(path);
+        if present {
+            state.removed.push(path.to_string());
+            Ok(true)
+        } else {
+            Ok(false)
+        }
     }
 }
 
