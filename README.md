@@ -29,11 +29,11 @@ its open/closed state, so the tables stay in sync with the board automatically.
 | [F-03 Renaming & lifecycle management](https://github.com/artur-rios/alexandria-api/milestone/4) | UC-05 … UC-09 | 5 / 5 |
 | [F-04 Text file content editing](https://github.com/artur-rios/alexandria-api/milestone/5) | UC-32 … UC-33 | 0 / 2 |
 | [F-05 Collections](https://github.com/artur-rios/alexandria-api/milestone/6) | UC-10 … UC-14 | 3 / 5 |
-| [F-06 Bookmarks](https://github.com/artur-rios/alexandria-api/milestone/7) | UC-15 … UC-19 | 0 / 5 |
+| [F-06 Bookmarks](https://github.com/artur-rios/alexandria-api/milestone/7) | UC-15 … UC-19 | 1 / 5 |
 | [F-07 Watchlists](https://github.com/artur-rios/alexandria-api/milestone/8) | UC-20 … UC-25 | 0 / 6 |
 | [F-08 Reading lists](https://github.com/artur-rios/alexandria-api/milestone/9) | UC-26 … UC-31 | 0 / 6 |
 | [F-09 Pluggable authentication](https://github.com/artur-rios/alexandria-api/milestone/10) | UC-34 … UC-36 | 0 / 3 |
-| **Total** | | **13 / 38** |
+| **Total** | | **14 / 38** |
 
 ### F-00 — Foundation & operations
 
@@ -102,7 +102,7 @@ Browser bookmarks, with the same two-phase deletion model as files.
 
 | Issue | Use case | Status | Title | Requirements |
 | --- | --- | :---: | --- | --- |
-| [#16](https://github.com/artur-rios/alexandria-api/issues/16) | UC-15 | &#9744; | Create a bookmark | FR-BM-01, FR-FC-24 |
+| [#16](https://github.com/artur-rios/alexandria-api/issues/16) | UC-15 | &#9745; | Create a bookmark | FR-BM-01, FR-FC-24 |
 | [#17](https://github.com/artur-rios/alexandria-api/issues/17) | UC-16 | &#9744; | Update a bookmark | FR-BM-02, FR-FC-24 |
 | [#18](https://github.com/artur-rios/alexandria-api/issues/18) | UC-17 | &#9744; | Browse bookmarks | FR-BM-06, FR-FC-24 |
 | [#19](https://github.com/artur-rios/alexandria-api/issues/19) | UC-18 | &#9744; | Soft-delete and restore a bookmark | FR-BM-03, FR-BM-05, FR-FC-24 |

@@ -1,3 +1,4 @@
+pub mod bookmarks;
 pub mod browse;
 pub mod collections;
 pub mod delete_file;

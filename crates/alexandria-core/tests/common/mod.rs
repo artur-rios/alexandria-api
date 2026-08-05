@@ -17,6 +17,8 @@ use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
 use alexandria_core::auth::{AuthService, Principal};
+use alexandria_core::bookmarks::model::{Bookmark, BookmarkState, NewBookmark};
+use alexandria_core::bookmarks::repos::BookmarkRepository;
 use alexandria_core::catalog::clock::FixedClock;
 use alexandria_core::catalog::fs::{FileEntry, Filesystem};
 use alexandria_core::catalog::model::{
@@ -791,4 +793,57 @@ impl FakeCatalogRepository {
 /// An "earlier" timestamp than `now()` so re-index refreshes `indexed_at`.
 fn earlier() -> DateTime<Utc> {
     DateTime::<Utc>::from_timestamp(1_699_000_000, 0).unwrap()
+}
+
+/// In-memory bookmarks repository (UC-15). Backed by a shared
+/// `Arc<Mutex<…>>` so a test can clone the repo, hand the original to the
+/// handler, and inspect the clone afterwards — the same arrangement
+/// `FakeCollectionRepository` uses.
+#[derive(Debug, Default, Clone)]
+pub struct FakeBookmarkRepository {
+    bookmarks: Arc<Mutex<HashMap<Uuid, Bookmark>>>,
+    /// When set, every `insert_bookmark` fails, simulating a catalog-write
+    /// failure in UC-15. There is no on-disk leg to compensate — the handler
+    /// merely surfaces the error and nothing is stored.
+    failing: Arc<Mutex<bool>>,
+}
+
+impl FakeBookmarkRepository {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn count(&self) -> usize {
+        self.bookmarks.lock().unwrap().len()
+    }
+
+    pub fn bookmark_for(&self, uuid: Uuid) -> Option<Bookmark> {
+        self.bookmarks.lock().unwrap().get(&uuid).cloned()
+    }
+
+    /// Make every `insert_bookmark` return an `Internal` error.
+    pub fn fail_inserts(&self) {
+        *self.failing.lock().unwrap() = true;
+    }
+}
+
+impl BookmarkRepository for FakeBookmarkRepository {
+    async fn insert_bookmark(&self, new_bookmark: NewBookmark) -> Result<Bookmark, DomainError> {
+        if *self.failing.lock().unwrap() {
+            return Err(DomainError::internal("fake insert_bookmark failure"));
+        }
+        let bookmark = Bookmark {
+            uuid: new_bookmark.uuid,
+            url: new_bookmark.url,
+            title: new_bookmark.title,
+            state: BookmarkState::Active,
+            deleted_at: None,
+            collection_uuid: new_bookmark.collection_uuid,
+        };
+        self.bookmarks
+            .lock()
+            .unwrap()
+            .insert(bookmark.uuid, bookmark.clone());
+        Ok(bookmark)
+    }
 }

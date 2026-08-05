@@ -1081,6 +1081,141 @@ pub extern "C" fn alexandria_collection_delete(
     }
 }
 
+/// FFI status codes returned by bookmark operations (UC-15+). Deliberately
+/// separate from `COLLECTION_*` — per the convention above — so bookmark use
+/// cases can grow their own set without colliding; `BOOKMARK_OK ==
+/// COLLECTION_OK == 0` by convention. There is no disk code: a bookmark is
+/// catalog-only metadata with nothing on disk.
+pub const BOOKMARK_OK: c_int = 0;
+pub const BOOKMARK_ERR_INVALID_INPUT: c_int = 1;
+pub const BOOKMARK_ERR_UNAUTHORIZED: c_int = 2;
+pub const BOOKMARK_ERR_NOT_INITIALIZED: c_int = 3;
+pub const BOOKMARK_ERR_NOT_FOUND: c_int = 4;
+pub const BOOKMARK_ERR_INVALID_STATE: c_int = 5;
+pub const BOOKMARK_ERR_OTHER: c_int = 9;
+
+/// Result of `alexandria_bookmark_create` (UC-15). On success `status` is
+/// `BOOKMARK_OK` and `json` is a NUL-terminated JSON string of the `Bookmark`
+/// body — byte-for-byte the same shape HTTP returns from `POST
+/// /v1/bookmarks` (FR-FC-24 / NFR-09). On failure `json` is NULL and `status`
+/// carries the mapped error code. The caller must free `json` with
+/// `alexandria_free_string`.
+#[repr(C)]
+#[derive(Debug)]
+pub struct BookmarkJsonResult {
+    pub status: c_int,
+    pub json: *mut c_char,
+}
+
+impl BookmarkJsonResult {
+    fn err(status: c_int) -> Self {
+        Self {
+            status,
+            json: std::ptr::null_mut(),
+        }
+    }
+
+    fn ok(json: String) -> Self {
+        let cstring = CString::new(json).unwrap_or_default();
+        Self {
+            status: BOOKMARK_OK,
+            json: cstring.into_raw(),
+        }
+    }
+}
+
+fn map_bookmark_err(err: DomainError) -> BookmarkJsonResult {
+    match err {
+        DomainError::NotFound => BookmarkJsonResult::err(BOOKMARK_ERR_NOT_FOUND),
+        DomainError::Unauthorized => BookmarkJsonResult::err(BOOKMARK_ERR_UNAUTHORIZED),
+        DomainError::InvalidInput(_) => BookmarkJsonResult::err(BOOKMARK_ERR_INVALID_INPUT),
+        DomainError::InvalidState => BookmarkJsonResult::err(BOOKMARK_ERR_INVALID_STATE),
+        _ => BookmarkJsonResult::err(BOOKMARK_ERR_OTHER),
+    }
+}
+
+/// Request body accepted by `alexandria_bookmark_create` — the same JSON
+/// `POST /v1/bookmarks` takes: `{"url":"…","title":"…","collectionUuid":"…"}`
+/// (`collectionUuid` optional/nullable). Parsed field-by-field for the same
+/// reason `CreateCollectionBody` is: this crate depends on `serde_json` but
+/// not `serde`'s derive.
+#[derive(Debug)]
+struct CreateBookmarkBody {
+    url: String,
+    title: String,
+    collection_uuid: Option<uuid::Uuid>,
+}
+
+impl CreateBookmarkBody {
+    fn from_json_str(s: &str) -> Option<Self> {
+        let value: serde_json::Value = serde_json::from_str(s).ok()?;
+        let obj = value.as_object()?;
+        let url = obj.get("url")?.as_str()?.to_string();
+        let title = obj.get("title")?.as_str()?.to_string();
+        let collection_uuid = match obj.get("collectionUuid") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(v) => Some(uuid::Uuid::parse_str(v.as_str()?).ok()?),
+        };
+        Some(Self {
+            url,
+            title,
+            collection_uuid,
+        })
+    }
+}
+
+/// Create a browser bookmark, optionally in an existing bookmark collection
+/// (UC-15 / FR-BM-01).
+///
+/// `json_body` is the JSON body HTTP would send (`url` + `title` +
+/// `collectionUuid`). The function deserializes it, calls the same
+/// `CreateBookmarkHandler` the HTTP route uses, and on success serializes the
+/// returned `Bookmark` back to JSON — so the FFI and HTTP surfaces agree
+/// byte-for-byte modulo key ordering (parity, FR-FC-24 / NFR-09). `token` is
+/// the bearer auth token.
+#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
+#[no_mangle]
+pub extern "C" fn alexandria_bookmark_create(
+    json_body: *const c_char,
+    token: *const c_char,
+) -> BookmarkJsonResult {
+    let services = match services_slot().lock().unwrap().clone() {
+        Some(s) => s,
+        None => return BookmarkJsonResult::err(BOOKMARK_ERR_NOT_INITIALIZED),
+    };
+
+    // Deny before touching the payload — an unauthenticated caller must not
+    // learn whether its body would have parsed.
+    let token = cstr_lossy(token).unwrap_or_default();
+    if !authenticated(&services, &token) {
+        return BookmarkJsonResult::err(BOOKMARK_ERR_UNAUTHORIZED);
+    }
+
+    let body_str = match cstr_lossy(json_body) {
+        Some(s) => s,
+        None => return BookmarkJsonResult::err(BOOKMARK_ERR_INVALID_INPUT),
+    };
+    let body = match CreateBookmarkBody::from_json_str(&body_str) {
+        Some(b) => b,
+        None => return BookmarkJsonResult::err(BOOKMARK_ERR_INVALID_INPUT),
+    };
+
+    let result = runtime().block_on(async {
+        services
+            .create_bookmark_handler
+            .create(&body.url, &body.title, body.collection_uuid, &token)
+            .await
+    });
+
+    match result {
+        Ok(bookmark) => {
+            let json = serde_json::to_string(&bookmark).unwrap_or_default();
+            BookmarkJsonResult::ok(json)
+        }
+        Err(err) => map_bookmark_err(err),
+    }
+}
+
 fn parse_file_type(s: &str) -> Option<alexandria_core::catalog::model::FileType> {
     use alexandria_core::catalog::model::FileType;
     match s {
