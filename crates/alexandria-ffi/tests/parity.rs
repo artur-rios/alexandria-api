@@ -26,7 +26,7 @@ use alexandria_ffi::{
     alexandria_file_restore, alexandria_file_soft_delete, alexandria_files_list,
     alexandria_free_string, alexandria_index_count_files, alexandria_index_count_missing,
     alexandria_index_files_json, alexandria_index_init, alexandria_index_refresh_start,
-    alexandria_index_start, IndexStartResult,
+    alexandria_index_start, alexandria_watchlist_create, IndexStartResult,
 };
 use alexandria_http::app;
 use axum::body::{to_bytes, Body};
@@ -5356,5 +5356,141 @@ async fn given_unknown_uuid_when_bookmark_purged_via_http_and_ffi_then_both_not_
         ffi_status,
         alexandria_ffi::BOOKMARK_ERR_NOT_FOUND,
         "ffi must reject an unknown uuid as not-found (HTTP 404)"
+    );
+}
+
+/// UC-20 parity - create the same watchlist over both transports and assert
+/// the returned bodies agree (modulo the per-database uuid) and that each
+/// database holds the same single row (Testing Specification section 7.3,
+/// FR-WL-01, FR-FC-24).
+#[tokio::test]
+async fn given_same_watchlist_when_created_via_http_and_ffi_then_bodies_and_rows_identical() {
+    let _g = SERIAL.lock().unwrap();
+
+    // ---- HTTP leg ----
+    let http_dir = tempdir().unwrap();
+    let http_db = db_path(&http_dir, "http.sqlite");
+    let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    let http_services =
+        std::sync::Arc::new(build_services(&Settings::default(), http_pool.clone()).await);
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/watchlists")
+        .header("authorization", "Bearer parity")
+        .header("content-type", "application/json")
+        .body(Body::from(json!({ "name": "Weekend movies" }).to_string()))
+        .unwrap();
+    let resp = app(Settings::default(), http_services)
+        .oneshot(req)
+        .await
+        .expect("http create");
+    assert_eq!(resp.status(), axum::http::StatusCode::CREATED);
+    let http_body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
+
+    let http_rows: Vec<(String, String)> = sqlx::query_as("SELECT uuid, name FROM watchlists")
+        .fetch_all(&http_pool)
+        .await
+        .unwrap();
+
+    // ---- FFI leg ----
+    let ffi_dir = tempdir().unwrap();
+    let ffi_db = db_path(&ffi_dir, "ffi.sqlite");
+    let ffi_db_for_rows = ffi_db.clone();
+    let ffi_body: serde_json::Value = tokio::task::spawn_blocking(move || -> serde_json::Value {
+        let cdb = CString::new(ffi_db).unwrap();
+        assert_eq!(
+            alexandria_index_init(cdb.as_ptr()),
+            alexandria_ffi::INDEX_OK
+        );
+
+        let body = CString::new(json!({ "name": "Weekend movies" }).to_string()).unwrap();
+        let token = CString::new("parity").unwrap();
+        let r = alexandria_watchlist_create(body.as_ptr(), token.as_ptr());
+        assert_eq!(r.status, alexandria_ffi::WATCHLIST_OK, "ffi create");
+        assert!(!r.json.is_null());
+        let s = unsafe { CStr::from_ptr(r.json) }
+            .to_string_lossy()
+            .into_owned();
+        unsafe {
+            alexandria_free_string(r.json);
+        }
+        serde_json::from_str(&s).unwrap()
+    })
+    .await
+    .unwrap();
+
+    let ffi_pool = migrate_database(&ffi_db_for_rows).await.expect("ffi open");
+    let ffi_rows: Vec<(String, String)> = sqlx::query_as("SELECT uuid, name FROM watchlists")
+        .fetch_all(&ffi_pool)
+        .await
+        .unwrap();
+
+    // ---- compare ----
+    for (label, body) in [("http", &http_body), ("ffi", &ffi_body)] {
+        let uuid = body["uuid"].as_str().unwrap_or_default();
+        assert!(
+            uuid::Uuid::parse_str(uuid).is_ok(),
+            "{label} body carries a valid uuid"
+        );
+        assert_eq!(body["name"], "Weekend movies");
+    }
+    assert_eq!(http_rows.len(), 1, "http persisted one watchlist");
+    assert_eq!(ffi_rows.len(), 1, "ffi persisted one watchlist");
+    assert_eq!(http_rows[0].1, "Weekend movies");
+    assert_eq!(ffi_rows[0].1, "Weekend movies");
+
+    ffi_pool.close().await;
+}
+
+/// UC-20 parity - an unauthenticated caller is rejected before its payload
+/// is parsed, on both surfaces (HTTP 401, FFI WATCHLIST_ERR_UNAUTHORIZED)
+/// (FR-AU-07 / SRD section 7, FR-FC-24 / NFR-09).
+#[tokio::test]
+async fn given_no_token_when_watchlist_created_via_http_and_ffi_then_both_unauthorized() {
+    let _g = SERIAL.lock().unwrap();
+
+    // ---- HTTP leg ----
+    let http_dir = tempdir().unwrap();
+    let http_db = db_path(&http_dir, "http.sqlite");
+    let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    let http_services =
+        std::sync::Arc::new(build_services(&Settings::default(), http_pool.clone()).await);
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/watchlists")
+        .header("content-type", "application/json")
+        .body(Body::from("{ not json"))
+        .unwrap();
+    let resp = app(Settings::default(), http_services)
+        .oneshot(req)
+        .await
+        .expect("http create");
+    assert_eq!(resp.status(), axum::http::StatusCode::UNAUTHORIZED);
+
+    // ---- FFI leg ----
+    let ffi_dir = tempdir().unwrap();
+    let ffi_db = db_path(&ffi_dir, "ffi.sqlite");
+    let ffi_status = tokio::task::spawn_blocking(move || -> i32 {
+        let cdb = CString::new(ffi_db).unwrap();
+        assert_eq!(
+            alexandria_index_init(cdb.as_ptr()),
+            alexandria_ffi::INDEX_OK
+        );
+
+        let bad = CString::new("{ not json").unwrap();
+        let r = alexandria_watchlist_create(bad.as_ptr(), std::ptr::null());
+        assert!(r.json.is_null());
+        r.status
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(
+        ffi_status,
+        alexandria_ffi::WATCHLIST_ERR_UNAUTHORIZED,
+        "create must deny before parsing the body"
     );
 }

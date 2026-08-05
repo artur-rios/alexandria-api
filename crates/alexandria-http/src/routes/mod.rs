@@ -8,6 +8,7 @@ pub mod index;
 pub mod refresh;
 pub mod rename;
 pub mod restore;
+pub mod watchlists;
 
 use axum::http::HeaderMap;
 

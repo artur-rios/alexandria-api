@@ -1711,6 +1711,125 @@ pub extern "C" fn alexandria_bookmark_purge(
     }
 }
 
+/// FFI status codes returned by watchlist operations (UC-20+). Deliberately
+/// separate from `BOOKMARK_*` — per the convention above — so watchlist use
+/// cases can grow their own set without colliding; `WATCHLIST_OK ==
+/// BOOKMARK_OK == 0` by convention.
+pub const WATCHLIST_OK: c_int = 0;
+pub const WATCHLIST_ERR_INVALID_INPUT: c_int = 1;
+pub const WATCHLIST_ERR_UNAUTHORIZED: c_int = 2;
+pub const WATCHLIST_ERR_NOT_INITIALIZED: c_int = 3;
+pub const WATCHLIST_ERR_NOT_FOUND: c_int = 4;
+pub const WATCHLIST_ERR_INVALID_STATE: c_int = 5;
+pub const WATCHLIST_ERR_OTHER: c_int = 9;
+
+/// Result of `alexandria_watchlist_create` (UC-20). On success `status` is
+/// `WATCHLIST_OK` and `json` is a NUL-terminated JSON string of the
+/// `Watchlist` body — byte-for-byte the same shape HTTP returns from `POST
+/// /v1/watchlists` (FR-FC-24 / NFR-09). On failure `json` is NULL and
+/// `status` carries the mapped error code. The caller must free `json` with
+/// `alexandria_free_string`.
+#[repr(C)]
+#[derive(Debug)]
+pub struct WatchlistJsonResult {
+    pub status: c_int,
+    pub json: *mut c_char,
+}
+
+impl WatchlistJsonResult {
+    fn err(status: c_int) -> Self {
+        Self {
+            status,
+            json: std::ptr::null_mut(),
+        }
+    }
+
+    fn ok(json: String) -> Self {
+        let cstring = CString::new(json).unwrap_or_default();
+        Self {
+            status: WATCHLIST_OK,
+            json: cstring.into_raw(),
+        }
+    }
+}
+
+fn map_watchlist_err(err: DomainError) -> WatchlistJsonResult {
+    match err {
+        DomainError::NotFound => WatchlistJsonResult::err(WATCHLIST_ERR_NOT_FOUND),
+        DomainError::Unauthorized => WatchlistJsonResult::err(WATCHLIST_ERR_UNAUTHORIZED),
+        DomainError::InvalidInput(_) => WatchlistJsonResult::err(WATCHLIST_ERR_INVALID_INPUT),
+        DomainError::InvalidState => WatchlistJsonResult::err(WATCHLIST_ERR_INVALID_STATE),
+        _ => WatchlistJsonResult::err(WATCHLIST_ERR_OTHER),
+    }
+}
+
+/// Request body accepted by `alexandria_watchlist_create` — the same JSON
+/// `POST /v1/watchlists` takes: `{"name":"Weekend movies"}`. Parsed
+/// field-by-field for the same reason `CreateCollectionBody` is: this crate
+/// depends on `serde_json` but not `serde`'s derive.
+#[derive(Debug)]
+struct CreateWatchlistBody {
+    name: String,
+}
+
+impl CreateWatchlistBody {
+    fn from_json_str(s: &str) -> Option<Self> {
+        let value: serde_json::Value = serde_json::from_str(s).ok()?;
+        let obj = value.as_object()?;
+        let name = obj.get("name")?.as_str()?.to_string();
+        Some(Self { name })
+    }
+}
+
+/// Create a named watchlist for tracking video consumption (UC-20 /
+/// FR-WL-01).
+///
+/// `json_body` is the JSON body HTTP would send (`name`). The function
+/// deserializes it, calls the same `CreateWatchlistHandler` the HTTP route
+/// uses, and on success serializes the returned `Watchlist` back to JSON —
+/// so the FFI and HTTP surfaces agree byte-for-byte modulo key ordering
+/// (parity, FR-FC-24 / NFR-09). `token` is the bearer auth token.
+#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
+#[no_mangle]
+pub extern "C" fn alexandria_watchlist_create(
+    json_body: *const c_char,
+    token: *const c_char,
+) -> WatchlistJsonResult {
+    let services = match services_slot().lock().unwrap().clone() {
+        Some(s) => s,
+        None => return WatchlistJsonResult::err(WATCHLIST_ERR_NOT_INITIALIZED),
+    };
+
+    let token = cstr_lossy(token).unwrap_or_default();
+    if !authenticated(&services, &token) {
+        return WatchlistJsonResult::err(WATCHLIST_ERR_UNAUTHORIZED);
+    }
+
+    let body_str = match cstr_lossy(json_body) {
+        Some(s) => s,
+        None => return WatchlistJsonResult::err(WATCHLIST_ERR_INVALID_INPUT),
+    };
+    let body = match CreateWatchlistBody::from_json_str(&body_str) {
+        Some(b) => b,
+        None => return WatchlistJsonResult::err(WATCHLIST_ERR_INVALID_INPUT),
+    };
+
+    let result = runtime().block_on(async {
+        services
+            .create_watchlist_handler
+            .create(&body.name, &token)
+            .await
+    });
+
+    match result {
+        Ok(watchlist) => {
+            let json = serde_json::to_string(&watchlist).unwrap_or_default();
+            WatchlistJsonResult::ok(json)
+        }
+        Err(err) => map_watchlist_err(err),
+    }
+}
+
 fn parse_file_type(s: &str) -> Option<alexandria_core::catalog::model::FileType> {
     use alexandria_core::catalog::model::FileType;
     match s {
