@@ -295,3 +295,11 @@ pub struct PurgeOnDiskOutcome {
     pub file: File,
     pub disk_file_present: bool,
 }
+
+/// A TextFile's current on-disk content (UC-32 / FR-TX-01).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileContent {
+    pub uuid: Uuid,
+    pub content: String,
+}

@@ -530,6 +530,8 @@ pub struct FakeFilesystem {
     /// denied). `content_hash` fails for these, simulating the single bad file
     /// that must not abort a whole index or refresh run.
     unreadable: std::collections::HashSet<String>,
+    /// Text content readable via `read_file` (UC-32), keyed by path.
+    content_by_path: HashMap<String, String>,
     /// Interior-mutable post-construction state for the `rename` port
     /// (UC-05): the trait takes `&self`, so a rename that would move the
     /// recorded hash and update `path_exists` must do so through a lock.
@@ -650,6 +652,15 @@ impl FakeFilesystemBuilder {
         self
     }
 
+    /// A file whose `read_file` (UC-32) returns `content`.
+    #[allow(dead_code)]
+    pub fn with_text_content(mut self, path: &str, content: &str) -> Self {
+        self.fs
+            .content_by_path
+            .insert(path.to_string(), content.to_string());
+        self
+    }
+
     pub fn build(self) -> FakeFilesystem {
         self.fs
     }
@@ -720,6 +731,16 @@ impl Filesystem for FakeFilesystem {
         } else {
             Ok(false)
         }
+    }
+
+    async fn read_file(&self, path: &str) -> Result<String, DomainError> {
+        if self.unreadable.contains(path) {
+            return Err(DomainError::disk(format!("fake read failure: {path}")));
+        }
+        self.content_by_path
+            .get(path)
+            .cloned()
+            .ok_or_else(|| DomainError::disk(format!("fake file not found: {path}")))
     }
 }
 

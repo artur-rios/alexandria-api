@@ -31,6 +31,10 @@ pub trait Filesystem: Send + Sync {
     /// caller still removes the record and reports the absence. `Err(Disk)` —
     /// the delete failed (permission denied, AF-02); nothing was removed.
     async fn remove_file(&self, path: &str) -> Result<bool, DomainError>;
+    /// Read the file at `path` as UTF-8 text (UC-32 / FR-TX-01). Fails with
+    /// `Disk` when the file is missing, unreadable (permission), or its
+    /// bytes are not valid UTF-8 (AF-02).
+    async fn read_file(&self, path: &str) -> Result<String, DomainError>;
 }
 
 /// Real on-disk filesystem backed by `walkdir` and `sha2`.
@@ -108,6 +112,10 @@ impl Filesystem for StdFilesystem {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
             Err(e) => Err(DomainError::disk(format!("remove {path:?}: {e}"))),
         }
+    }
+
+    async fn read_file(&self, path: &str) -> Result<String, DomainError> {
+        std::fs::read_to_string(path).map_err(|e| DomainError::disk(format!("read {path:?}: {e}")))
     }
 }
 
