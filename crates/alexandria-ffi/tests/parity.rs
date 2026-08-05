@@ -4,21 +4,27 @@
 //! hash). The start contract shape is also asserted (HTTP 202 `{runId}` and
 //! the FFI `IndexStartResult` both carry a valid UUID on success).
 
+// Every test here holds `SERIAL` across its awaits on purpose: the FFI side
+// is a process-global services slot, so two parity tests running concurrently
+// would init over each other's database. The guard has to span the whole
+// test, awaits included — that is exactly what it is for.
+#![allow(clippy::await_holding_lock)]
+
 use std::ffi::{CStr, CString};
 use std::sync::Mutex;
 
 use alexandria_core::config::Settings;
 use alexandria_core::migrate::migrate_database;
 use alexandria_core::services::build_services;
-use alexandria_http::app;
 use alexandria_ffi::{
     alexandria_file_edit_metadata, alexandria_file_get_by_uuid, alexandria_file_purge,
     alexandria_file_purge_on_disk, alexandria_file_rename, alexandria_file_restore,
-    alexandria_file_soft_delete,
-    alexandria_files_list, alexandria_free_string, alexandria_index_count_files,
-    alexandria_index_count_missing, alexandria_index_files_json, alexandria_index_init,
-    alexandria_index_refresh_start, alexandria_index_start, IndexStartResult,
+    alexandria_file_soft_delete, alexandria_files_list, alexandria_free_string,
+    alexandria_index_count_files, alexandria_index_count_missing, alexandria_index_files_json,
+    alexandria_index_init, alexandria_index_refresh_start, alexandria_index_start,
+    IndexStartResult,
 };
+use alexandria_http::app;
 use axum::body::{to_bytes, Body};
 use axum::http::Request;
 use serde_json::json;
@@ -30,14 +36,36 @@ use tower::ServiceExt;
 // more are added).
 static SERIAL: Mutex<()> = Mutex::new(());
 
+/// The editable columns of an `audio_files` row, in the order every
+/// assertion here selects them: title, artist, album, year, genre, track.
+type AudioMetadataRow = (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<i64>,
+    Option<String>,
+    Option<i64>,
+);
+
+/// `(path, type, content_hash)` triples — the shape a `files` table is
+/// reduced to whenever the two legs' catalogs are compared.
+type FileTriples = Vec<(String, String, String)>;
+
 fn db_path(dir: &TempDir, name: &str) -> String {
     dir.path().join(name).to_str().unwrap().to_string()
 }
 
 fn run_id_string(r: &IndexStartResult) -> String {
-    let n = r.run_id.iter().position(|&ch| ch == 0).unwrap_or(r.run_id.len());
+    let n = r
+        .run_id
+        .iter()
+        .position(|&ch| ch == 0)
+        .unwrap_or(r.run_id.len());
     String::from_utf8_lossy(
-        &r.run_id[..n].iter().map(|&ch| ch as u8).collect::<Vec<u8>>(),
+        &r.run_id[..n]
+            .iter()
+            .map(|&ch| ch as u8)
+            .collect::<Vec<u8>>(),
     )
     .into_owned()
 }
@@ -57,7 +85,8 @@ async fn given_same_lib_when_indexed_via_http_and_ffi_then_files_rows_identical(
     let http_dir = tempdir().unwrap();
     let http_db = db_path(&http_dir, "http.sqlite");
     let http_pool = migrate_database(&http_db).await.expect("http migrate");
-    let http_services = std::sync::Arc::new(build_services(&Settings::default(), http_pool.clone()).await);
+    let http_services =
+        std::sync::Arc::new(build_services(&Settings::default(), http_pool.clone()).await);
     let router = app(Settings::default(), http_services);
 
     let request = Request::builder()
@@ -103,7 +132,10 @@ async fn given_same_lib_when_indexed_via_http_and_ffi_then_files_rows_identical(
     let lib_for_ffi = lib_path.clone();
     let ffi_json: String = tokio::task::spawn_blocking(move || -> String {
         let cdb = CString::new(ffi_db).unwrap();
-        assert_eq!(alexandria_index_init(cdb.as_ptr()), alexandria_ffi::INDEX_OK);
+        assert_eq!(
+            alexandria_index_init(cdb.as_ptr()),
+            alexandria_ffi::INDEX_OK
+        );
 
         let root = CString::new(lib_for_ffi).unwrap();
         let token = CString::new("parity").unwrap();
@@ -128,7 +160,9 @@ async fn given_same_lib_when_indexed_via_http_and_ffi_then_files_rows_identical(
         // SAFETY: returned by the FFI accessor as a NUL-terminated string.
         let json = unsafe { CStr::from_ptr(raw) }.to_str().unwrap().to_string();
         // SAFETY: pointer came from this library and is freed once.
-        unsafe { alexandria_free_string(raw); }
+        unsafe {
+            alexandria_free_string(raw);
+        }
         json
     })
     .await
@@ -181,16 +215,22 @@ async fn given_same_lib_when_refreshed_via_http_and_ffi_then_rows_and_missing_ma
     let http_dir = tempdir().unwrap();
     let http_db = db_path(&http_dir, "http.sqlite");
     let http_pool = migrate_database(&http_db).await.expect("http migrate");
-    let http_services = std::sync::Arc::new(build_services(&Settings::default(), http_pool.clone()).await);
+    let http_services =
+        std::sync::Arc::new(build_services(&Settings::default(), http_pool.clone()).await);
 
     let index_req = Request::builder()
         .method("POST")
         .uri("/v1/index")
         .header("authorization", "Bearer parity")
         .header("content-type", "application/json")
-        .body(Body::from(json!({ "root": http_lib.path().to_str().unwrap() }).to_string()))
+        .body(Body::from(
+            json!({ "root": http_lib.path().to_str().unwrap() }).to_string(),
+        ))
         .unwrap();
-    let resp = app(Settings::default(), http_services.clone()).oneshot(index_req).await.expect("http index");
+    let resp = app(Settings::default(), http_services.clone())
+        .oneshot(index_req)
+        .await
+        .expect("http index");
     assert_eq!(resp.status(), axum::http::StatusCode::ACCEPTED);
 
     wait_for_http_files(&http_pool, 2).await;
@@ -203,16 +243,20 @@ async fn given_same_lib_when_refreshed_via_http_and_ffi_then_rows_and_missing_ma
         .header("authorization", "Bearer parity")
         .body(Body::empty())
         .unwrap();
-    let refresh_resp = app(Settings::default(), http_services.clone()).oneshot(refresh_req).await.expect("http refresh");
+    let refresh_resp = app(Settings::default(), http_services.clone())
+        .oneshot(refresh_req)
+        .await
+        .expect("http refresh");
     assert_eq!(refresh_resp.status(), axum::http::StatusCode::ACCEPTED);
 
     wait_for_http_missing(&http_pool, 1).await;
 
-    let http_rows: Vec<(String, String, String, String, Option<String>)> =
-        sqlx::query_as("SELECT path, name, type, content_hash, missing_at FROM files ORDER BY path")
-            .fetch_all(&http_pool)
-            .await
-            .unwrap();
+    let http_rows: Vec<(String, String, String, String, Option<String>)> = sqlx::query_as(
+        "SELECT path, name, type, content_hash, missing_at FROM files ORDER BY path",
+    )
+    .fetch_all(&http_pool)
+    .await
+    .unwrap();
 
     // ---- FFI leg (own identical lib) ----
     let ffi_lib = seed_lib();
@@ -220,44 +264,51 @@ async fn given_same_lib_when_refreshed_via_http_and_ffi_then_rows_and_missing_ma
     let ffi_db = db_path(&ffi_dir, "ffi.sqlite");
     let ffi_lib_path = ffi_lib.path().to_str().unwrap().to_string();
     let ffi_rows: Vec<(String, String, String, String, Option<String>)> =
-        tokio::task::spawn_blocking(move || -> Vec<(String,String,String,String,Option<String>)> {
-            let cdb = CString::new(ffi_db).unwrap();
-            assert_eq!(alexandria_index_init(cdb.as_ptr()), alexandria_ffi::INDEX_OK);
+        tokio::task::spawn_blocking(
+            move || -> Vec<(String, String, String, String, Option<String>)> {
+                let cdb = CString::new(ffi_db).unwrap();
+                assert_eq!(
+                    alexandria_index_init(cdb.as_ptr()),
+                    alexandria_ffi::INDEX_OK
+                );
 
-            let root = CString::new(ffi_lib_path.clone()).unwrap();
-            let token = CString::new("parity").unwrap();
-            let started = alexandria_index_start(root.as_ptr(), token.as_ptr());
-            assert_eq!(started.status, alexandria_ffi::INDEX_OK);
-            wait_for_ffi_files(2);
+                let root = CString::new(ffi_lib_path.clone()).unwrap();
+                let token = CString::new("parity").unwrap();
+                let started = alexandria_index_start(root.as_ptr(), token.as_ptr());
+                assert_eq!(started.status, alexandria_ffi::INDEX_OK);
+                wait_for_ffi_files(2);
 
-            // identical mutation on disk
-            std::fs::write(ffi_lib.path().join("a.mp3"), b"audio-v2-CHANGED").unwrap();
-            std::fs::remove_file(ffi_lib.path().join("b.md")).unwrap();
+                // identical mutation on disk
+                std::fs::write(ffi_lib.path().join("a.mp3"), b"audio-v2-CHANGED").unwrap();
+                std::fs::remove_file(ffi_lib.path().join("b.md")).unwrap();
 
-            let refresh = alexandria_index_refresh_start(token.as_ptr());
-            assert_eq!(refresh.status, alexandria_ffi::INDEX_OK);
-            wait_for_ffi_missing(1);
+                let refresh = alexandria_index_refresh_start(token.as_ptr());
+                assert_eq!(refresh.status, alexandria_ffi::INDEX_OK);
+                wait_for_ffi_missing(1);
 
-            let raw = alexandria_index_files_json();
-            assert!(!raw.is_null());
-            let json = unsafe { CStr::from_ptr(raw) }.to_str().unwrap().to_string();
-            // SAFETY: pointer came from this library and is freed once.
-            unsafe { alexandria_free_string(raw); }
-            let v: serde_json::Value = serde_json::from_str(&json).unwrap();
-            v.as_array()
-                .unwrap()
-                .iter()
-                .map(|o| {
-                    (
-                        o["path"].as_str().unwrap().to_string(),
-                        o["name"].as_str().unwrap().to_string(),
-                        o["type"].as_str().unwrap().to_string(),
-                        o["hash"].as_str().unwrap().to_string(),
-                        o["missingAt"].as_str().map(|s| s.to_string()),
-                    )
-                })
-                .collect()
-        })
+                let raw = alexandria_index_files_json();
+                assert!(!raw.is_null());
+                let json = unsafe { CStr::from_ptr(raw) }.to_str().unwrap().to_string();
+                // SAFETY: pointer came from this library and is freed once.
+                unsafe {
+                    alexandria_free_string(raw);
+                }
+                let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+                v.as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|o| {
+                        (
+                            o["path"].as_str().unwrap().to_string(),
+                            o["name"].as_str().unwrap().to_string(),
+                            o["type"].as_str().unwrap().to_string(),
+                            o["hash"].as_str().unwrap().to_string(),
+                            o["missingAt"].as_str().map(|s| s.to_string()),
+                        )
+                    })
+                    .collect()
+            },
+        )
         .await
         .unwrap();
 
@@ -266,16 +317,21 @@ async fn given_same_lib_when_refreshed_via_http_and_ffi_then_rows_and_missing_ma
     // timestamp fires at different wall-clock instants on the two surfaces
     // (like a random run id), so parity asserts the marker's *presence*, not
     // its value.
-    let norm = |rows: &[(String, String, String, String, Option<String>)]| -> Vec<(String,String,bool)> {
-        let mut v: Vec<(String,String,bool)> = rows.iter()
-            .map(|r| (r.1.clone(), r.3.clone(), r.4.is_some()))
-            .collect();
-        v.sort();
-        v
-    };
+    let norm =
+        |rows: &[(String, String, String, String, Option<String>)]| -> Vec<(String, String, bool)> {
+            let mut v: Vec<(String, String, bool)> = rows
+                .iter()
+                .map(|r| (r.1.clone(), r.3.clone(), r.4.is_some()))
+                .collect();
+            v.sort();
+            v
+        };
     let http_n = norm(&http_rows);
     let ffi_n = norm(&ffi_rows);
-    assert_eq!(http_n, ffi_n, "refreshed rows + missing markers differ across surfaces");
+    assert_eq!(
+        http_n, ffi_n,
+        "refreshed rows + missing markers differ across surfaces"
+    );
 
     // Both sides: a present & refreshed (missingAt null), b marked missing.
     let by_name = |rows: &[(String, String, String, String, Option<String>)]| -> std::collections::BTreeMap<String,(String,bool)> {
@@ -288,13 +344,23 @@ async fn given_same_lib_when_refreshed_via_http_and_ffi_then_rows_and_missing_ma
     assert_eq!(h["a.mp3"].0, f["a.mp3"].0, "a refreshed hash parity");
 }
 
-fn wait_for_http_files(pool: &sqlx::sqlite::SqlitePool, expected: i64) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+fn wait_for_http_files(
+    pool: &sqlx::sqlite::SqlitePool,
+    expected: i64,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
     Box::pin(async move {
         let dl = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
-            let (c,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM files").fetch_one(pool).await.unwrap();
-            if c >= expected { return; }
-            if std::time::Instant::now() > dl { panic!("http never had {expected} files"); }
+            let (c,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM files")
+                .fetch_one(pool)
+                .await
+                .unwrap();
+            if c >= expected {
+                return;
+            }
+            if std::time::Instant::now() > dl {
+                panic!("http never had {expected} files");
+            }
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
     })
@@ -303,10 +369,17 @@ fn wait_for_http_files(pool: &sqlx::sqlite::SqlitePool, expected: i64) -> std::p
 async fn wait_for_http_missing(pool: &sqlx::sqlite::SqlitePool, expected: i64) {
     let dl = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
-        let (c,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM files WHERE missing_at IS NOT NULL")
-            .fetch_one(pool).await.unwrap();
-        if c >= expected { return; }
-        if std::time::Instant::now() > dl { panic!("http never had {expected} missing"); }
+        let (c,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM files WHERE missing_at IS NOT NULL")
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        if c >= expected {
+            return;
+        }
+        if std::time::Instant::now() > dl {
+            panic!("http never had {expected} missing");
+        }
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
 }
@@ -314,8 +387,12 @@ async fn wait_for_http_missing(pool: &sqlx::sqlite::SqlitePool, expected: i64) {
 fn wait_for_ffi_files(expected: i64) {
     let dl = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
-        if alexandria_index_count_files() >= expected { return; }
-        if std::time::Instant::now() > dl { panic!("ffi never had {expected} files"); }
+        if alexandria_index_count_files() >= expected {
+            return;
+        }
+        if std::time::Instant::now() > dl {
+            panic!("ffi never had {expected} files");
+        }
         std::thread::sleep(std::time::Duration::from_millis(25));
     }
 }
@@ -323,8 +400,12 @@ fn wait_for_ffi_files(expected: i64) {
 fn wait_for_ffi_missing(expected: i64) {
     let dl = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
-        if alexandria_index_count_missing() >= expected { return; }
-        if std::time::Instant::now() > dl { panic!("ffi never had {expected} missing"); }
+        if alexandria_index_count_missing() >= expected {
+            return;
+        }
+        if std::time::Instant::now() > dl {
+            panic!("ffi never had {expected} missing");
+        }
         std::thread::sleep(std::time::Duration::from_millis(25));
     }
 }
@@ -334,7 +415,8 @@ fn wait_for_ffi_missing(expected: i64) {
 /// file's UUID, which is per-database) and the persisted `audio_files` rows
 /// match across both databases (Testing Specification §7.3, FR-FC-24).
 #[tokio::test]
-async fn given_same_audio_file_when_metadata_edited_via_http_and_ffi_then_responses_and_rows_identical() {
+async fn given_same_audio_file_when_metadata_edited_via_http_and_ffi_then_responses_and_rows_identical(
+) {
     let _g = SERIAL.lock().unwrap();
 
     let patch_json = r#"{"type":"audio","title":"Parity Title","artist":"Artist","album":"Album","year":2001,"genre":"Rock","track":3}"#;
@@ -347,9 +429,8 @@ async fn given_same_audio_file_when_metadata_edited_via_http_and_ffi_then_respon
     let http_dir = tempdir().unwrap();
     let http_db = db_path(&http_dir, "http.sqlite");
     let http_pool = migrate_database(&http_db).await.expect("http migrate");
-    let http_services = std::sync::Arc::new(
-        build_services(&Settings::default(), http_pool.clone()).await,
-    );
+    let http_services =
+        std::sync::Arc::new(build_services(&Settings::default(), http_pool.clone()).await);
 
     let index_req = Request::builder()
         .method("POST")
@@ -384,19 +465,11 @@ async fn given_same_audio_file_when_metadata_edited_via_http_and_ffi_then_respon
         .await
         .expect("http patch");
     assert_eq!(http_resp.status(), axum::http::StatusCode::OK);
-    let http_body: serde_json::Value = serde_json::from_slice(
-        &to_bytes(http_resp.into_body(), usize::MAX).await.unwrap(),
-    )
-    .unwrap();
+    let http_body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(http_resp.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
 
-    let http_audio_row: (
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<i64>,
-        Option<String>,
-        Option<i64>,
-    ) = sqlx::query_as(
+    let http_audio_row: AudioMetadataRow = sqlx::query_as(
         "SELECT title, artist, album, year, genre, track FROM audio_files \
          JOIN files ON files.id = audio_files.file_id WHERE files.uuid = ?",
     )
@@ -412,10 +485,13 @@ async fn given_same_audio_file_when_metadata_edited_via_http_and_ffi_then_respon
     let ffi_db = db_path(&ffi_dir, "ffi.sqlite");
     let ffi_lib_path = ffi_lib.path().to_str().unwrap().to_string();
     let patch_for_ffi = patch_json.to_string();
-    let ffi_payload: (String, serde_json::Value, (Option<String>, Option<String>, Option<String>, Option<i64>, Option<String>, Option<i64>)) =
+    let ffi_payload: (String, serde_json::Value, AudioMetadataRow) =
         tokio::task::spawn_blocking(move || {
             let cdb = CString::new(ffi_db).unwrap();
-            assert_eq!(alexandria_index_init(cdb.as_ptr()), alexandria_ffi::INDEX_OK);
+            assert_eq!(
+                alexandria_index_init(cdb.as_ptr()),
+                alexandria_ffi::INDEX_OK
+            );
 
             let root = CString::new(ffi_lib_path).unwrap();
             let token = CString::new("parity").unwrap();
@@ -466,14 +542,16 @@ async fn given_same_audio_file_when_metadata_edited_via_http_and_ffi_then_respon
                 .unwrap()
                 .to_string();
             // SAFETY: pointer came from this library and is freed once.
-            unsafe { alexandria_free_string(result.json); }
+            unsafe {
+                alexandria_free_string(result.json);
+            }
             let ffi_value: serde_json::Value = serde_json::from_str(&json_str).unwrap();
 
             // Persisted audio row from the FFI db.
             let ffi_audio_row = std::thread::spawn({
                 let ffi_dir = ffi_dir.path().to_path_buf();
                 let ffi_uuid = ffi_uuid.clone();
-                move || -> (Option<String>, Option<String>, Option<String>, Option<i64>, Option<String>, Option<i64>) {
+                move || -> AudioMetadataRow {
                     let rt = tokio::runtime::Builder::new_current_thread()
                         .enable_all()
                         .build()
@@ -486,15 +564,14 @@ async fn given_same_audio_file_when_metadata_edited_via_http_and_ffi_then_respon
                             .connect(&format!("{url}?mode=rw"))
                             .await
                             .unwrap();
-                        let row: (Option<String>, Option<String>, Option<String>, Option<i64>, Option<String>, Option<i64>) =
-                            sqlx::query_as(
-                                "SELECT title, artist, album, year, genre, track FROM audio_files \
+                        let row: AudioMetadataRow = sqlx::query_as(
+                            "SELECT title, artist, album, year, genre, track FROM audio_files \
                                  JOIN files ON files.id = audio_files.file_id WHERE files.uuid = ?",
-                            )
-                            .bind(ffi_uuid)
-                            .fetch_one(&pool)
-                            .await
-                            .unwrap();
+                        )
+                        .bind(ffi_uuid)
+                        .fetch_one(&pool)
+                        .await
+                        .unwrap();
                         row
                     })
                 }
@@ -543,7 +620,10 @@ async fn given_same_audio_file_when_metadata_edited_via_http_and_ffi_then_respon
 
     // Also confirm the patch we sent equals the metadata we got back (the
     // handler echoes the written metadata).
-    assert_eq!(http_body["metadata"], patch_value, "metadata must echo patch");
+    assert_eq!(
+        http_body["metadata"], patch_value,
+        "metadata must echo patch"
+    );
 }
 
 /// UC-03 parity — list files through both transports with identical filters
@@ -563,9 +643,8 @@ async fn given_same_lib_when_files_listed_via_http_and_ffi_then_arrays_identical
     let http_dir = tempdir().unwrap();
     let http_db = db_path(&http_dir, "http.sqlite");
     let http_pool = migrate_database(&http_db).await.expect("http migrate");
-    let http_services = std::sync::Arc::new(
-        build_services(&Settings::default(), http_pool.clone()).await,
-    );
+    let http_services =
+        std::sync::Arc::new(build_services(&Settings::default(), http_pool.clone()).await);
 
     let index_req = Request::builder()
         .method("POST")
@@ -584,12 +663,11 @@ async fn given_same_lib_when_files_listed_via_http_and_ffi_then_arrays_identical
 
     // Soft-delete one record so we can exercise the default-excludes-deleted
     // behavior and the state=all filter on both surfaces.
-    let (del_uuid,): (String,) =
-        sqlx::query_as("SELECT uuid FROM files WHERE name = ?")
-            .bind("song.mp3")
-            .fetch_one(&http_pool)
-            .await
-            .unwrap();
+    let (del_uuid,): (String,) = sqlx::query_as("SELECT uuid FROM files WHERE name = ?")
+        .bind("song.mp3")
+        .fetch_one(&http_pool)
+        .await
+        .unwrap();
     sqlx::query("UPDATE files SET state='deleted', deleted_at=? WHERE uuid=?")
         .bind("2024-01-01T00:00:00Z")
         .bind(&del_uuid)
@@ -629,7 +707,9 @@ async fn given_same_lib_when_files_listed_via_http_and_ffi_then_arrays_identical
         .expect("http list");
     assert_eq!(default_resp.status(), axum::http::StatusCode::OK);
     let http_default: serde_json::Value = serde_json::from_slice(
-        &to_bytes(default_resp.into_body(), usize::MAX).await.unwrap(),
+        &to_bytes(default_resp.into_body(), usize::MAX)
+            .await
+            .unwrap(),
     )
     .unwrap();
     let http_default_n = norm(http_default);
@@ -646,10 +726,8 @@ async fn given_same_lib_when_files_listed_via_http_and_ffi_then_arrays_identical
         .oneshot(all_req)
         .await
         .expect("http list all");
-    let http_all: serde_json::Value = serde_json::from_slice(
-        &to_bytes(all_resp.into_body(), usize::MAX).await.unwrap(),
-    )
-    .unwrap();
+    let http_all: serde_json::Value =
+        serde_json::from_slice(&to_bytes(all_resp.into_body(), usize::MAX).await.unwrap()).unwrap();
     let http_all_n = norm(http_all);
     assert_eq!(http_all_n.len(), 3, "state=all returns everything (http)");
 
@@ -664,10 +742,9 @@ async fn given_same_lib_when_files_listed_via_http_and_ffi_then_arrays_identical
         .oneshot(audio_req)
         .await
         .expect("http list audio");
-    let http_audio: serde_json::Value = serde_json::from_slice(
-        &to_bytes(audio_resp.into_body(), usize::MAX).await.unwrap(),
-    )
-    .unwrap();
+    let http_audio: serde_json::Value =
+        serde_json::from_slice(&to_bytes(audio_resp.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
     let http_audio_n = norm(http_audio);
     assert_eq!(http_audio_n.len(), 1);
     assert_eq!(http_audio_n[0].0, "song.mp3");
@@ -683,9 +760,12 @@ async fn given_same_lib_when_files_listed_via_http_and_ffi_then_arrays_identical
     let ffi_lib_path = ffi_lib.path().to_str().unwrap().to_string();
 
     let (ffi_default_n, ffi_all_n, ffi_audio_n) =
-        tokio::task::spawn_blocking(move || -> (Vec<(String,String,String)>, Vec<(String,String,String)>, Vec<(String,String,String)>) {
+        tokio::task::spawn_blocking(move || -> (FileTriples, FileTriples, FileTriples) {
             let cdb = CString::new(ffi_db).unwrap();
-            assert_eq!(alexandria_index_init(cdb.as_ptr()), alexandria_ffi::INDEX_OK);
+            assert_eq!(
+                alexandria_index_init(cdb.as_ptr()),
+                alexandria_ffi::INDEX_OK
+            );
 
             let root = CString::new(ffi_lib_path).unwrap();
             let token = CString::new("parity").unwrap();
@@ -700,22 +780,34 @@ async fn given_same_lib_when_files_listed_via_http_and_ffi_then_arrays_identical
                 let ffi_db_path = ffi_db_path.clone();
                 move || -> String {
                     let rt = tokio::runtime::Builder::new_current_thread()
-                        .enable_all().build().unwrap();
+                        .enable_all()
+                        .build()
+                        .unwrap();
                     rt.block_on(async move {
                         let url = format!("sqlite://{}", ffi_db_path.to_str().unwrap());
                         let pool = sqlx::sqlite::SqlitePoolOptions::new()
                             .max_connections(1)
-                            .connect(&format!("{url}?mode=rw")).await.unwrap();
+                            .connect(&format!("{url}?mode=rw"))
+                            .await
+                            .unwrap();
                         sqlx::query("UPDATE files SET state='deleted', deleted_at=? WHERE name=?")
                             .bind("2024-01-01T00:00:00Z")
                             .bind("song.mp3")
-                            .execute(&pool).await.unwrap();
-                        let (uuid,): (String,) = sqlx::query_as("SELECT uuid FROM files WHERE name=?")
-                            .bind("song.mp3").fetch_one(&pool).await.unwrap();
+                            .execute(&pool)
+                            .await
+                            .unwrap();
+                        let (uuid,): (String,) =
+                            sqlx::query_as("SELECT uuid FROM files WHERE name=?")
+                                .bind("song.mp3")
+                                .fetch_one(&pool)
+                                .await
+                                .unwrap();
                         uuid
                     })
                 }
-            }).join().unwrap();
+            })
+            .join()
+            .unwrap();
             let _ = ffi_uuid; // not used by FFI list, but confirms the delete landed
 
             let ffi_list = |filters: &str| -> serde_json::Value {
@@ -723,9 +815,14 @@ async fn given_same_lib_when_files_listed_via_http_and_ffi_then_arrays_identical
                 let r = alexandria_files_list(f.as_ptr(), token.as_ptr());
                 assert_eq!(r.status, alexandria_ffi::FILE_OK, "ffi list failed");
                 assert!(!r.json.is_null());
-                let s = unsafe { CStr::from_ptr(r.json) }.to_str().unwrap().to_string();
+                let s = unsafe { CStr::from_ptr(r.json) }
+                    .to_str()
+                    .unwrap()
+                    .to_string();
                 // SAFETY: pointer came from this library and is freed once.
-                unsafe { alexandria_free_string(r.json); }
+                unsafe {
+                    alexandria_free_string(r.json);
+                }
                 serde_json::from_str(&s).unwrap()
             };
 
@@ -738,9 +835,18 @@ async fn given_same_lib_when_files_listed_via_http_and_ffi_then_arrays_identical
         .unwrap();
 
     // ---- compare ----
-    assert_eq!(http_default_n, ffi_default_n, "default list diverges across surfaces");
-    assert_eq!(http_all_n, ffi_all_n, "state=all list diverges across surfaces");
-    assert_eq!(http_audio_n, ffi_audio_n, "type+state list diverges across surfaces");
+    assert_eq!(
+        http_default_n, ffi_default_n,
+        "default list diverges across surfaces"
+    );
+    assert_eq!(
+        http_all_n, ffi_all_n,
+        "state=all list diverges across surfaces"
+    );
+    assert_eq!(
+        http_audio_n, ffi_audio_n,
+        "type+state list diverges across surfaces"
+    );
 }
 
 /// UC-03 parity — get a single file by UUID through both transports and
@@ -758,9 +864,8 @@ async fn given_same_file_when_fetched_via_http_and_ffi_then_file_view_bodies_ide
     let http_dir = tempdir().unwrap();
     let http_db = db_path(&http_dir, "http.sqlite");
     let http_pool = migrate_database(&http_db).await.expect("http migrate");
-    let http_services = std::sync::Arc::new(
-        build_services(&Settings::default(), http_pool.clone()).await,
-    );
+    let http_services =
+        std::sync::Arc::new(build_services(&Settings::default(), http_pool.clone()).await);
 
     let index_req = Request::builder()
         .method("POST")
@@ -807,10 +912,8 @@ async fn given_same_file_when_fetched_via_http_and_ffi_then_file_view_bodies_ide
         .await
         .expect("http get");
     assert_eq!(get_resp.status(), axum::http::StatusCode::OK);
-    let http_body: serde_json::Value = serde_json::from_slice(
-        &to_bytes(get_resp.into_body(), usize::MAX).await.unwrap(),
-    )
-    .unwrap();
+    let http_body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(get_resp.into_body(), usize::MAX).await.unwrap()).unwrap();
 
     // ---- FFI leg (own identical lib + db) ----
     let ffi_lib = tempdir().unwrap();
@@ -819,59 +922,83 @@ async fn given_same_file_when_fetched_via_http_and_ffi_then_file_view_bodies_ide
     let ffi_db = db_path(&ffi_dir, "ffi.sqlite");
     let ffi_lib_path = ffi_lib.path().to_str().unwrap().to_string();
 
-    let ffi_body: serde_json::Value =
-        tokio::task::spawn_blocking(move || -> serde_json::Value {
-            let cdb = CString::new(ffi_db).unwrap();
-            assert_eq!(alexandria_index_init(cdb.as_ptr()), alexandria_ffi::INDEX_OK);
+    let ffi_body: serde_json::Value = tokio::task::spawn_blocking(move || -> serde_json::Value {
+        let cdb = CString::new(ffi_db).unwrap();
+        assert_eq!(
+            alexandria_index_init(cdb.as_ptr()),
+            alexandria_ffi::INDEX_OK
+        );
 
-            let root = CString::new(ffi_lib_path).unwrap();
-            let token = CString::new("parity").unwrap();
-            let started = alexandria_index_start(root.as_ptr(), token.as_ptr());
-            assert_eq!(started.status, alexandria_ffi::INDEX_OK);
-            wait_for_ffi_files(1);
+        let root = CString::new(ffi_lib_path).unwrap();
+        let token = CString::new("parity").unwrap();
+        let started = alexandria_index_start(root.as_ptr(), token.as_ptr());
+        assert_eq!(started.status, alexandria_ffi::INDEX_OK);
+        wait_for_ffi_files(1);
 
-            // Write the same metadata on the FFI db via a direct SQL update.
-            let ffi_dir_path = ffi_dir.path().to_path_buf();
-            let ffi_uuid = std::thread::spawn({
-                let ffi_dir_path = ffi_dir_path.clone();
-                move || -> String {
-                    let rt = tokio::runtime::Builder::new_current_thread()
-                        .enable_all().build().unwrap();
-                    rt.block_on(async move {
-                        let path = ffi_dir_path.join("ffi.sqlite");
-                        let url = format!("sqlite://{}", path.to_str().unwrap());
-                        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-                            .max_connections(1)
-                            .connect(&format!("{url}?mode=rw")).await.unwrap();
-                        sqlx::query(
-                            "UPDATE audio_files SET title=?, artist=?, year=? \
+        // Write the same metadata on the FFI db via a direct SQL update.
+        let ffi_dir_path = ffi_dir.path().to_path_buf();
+        let ffi_uuid = std::thread::spawn({
+            let ffi_dir_path = ffi_dir_path.clone();
+            move || -> String {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                rt.block_on(async move {
+                    let path = ffi_dir_path.join("ffi.sqlite");
+                    let url = format!("sqlite://{}", path.to_str().unwrap());
+                    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+                        .max_connections(1)
+                        .connect(&format!("{url}?mode=rw"))
+                        .await
+                        .unwrap();
+                    sqlx::query(
+                        "UPDATE audio_files SET title=?, artist=?, year=? \
                              FROM files WHERE audio_files.file_id = files.id AND files.name = ?",
-                        )
-                        .bind("T").bind("A").bind(2001i64).bind("song.mp3")
-                        .execute(&pool).await.unwrap();
-                        let (uuid,): (String,) = sqlx::query_as("SELECT uuid FROM files WHERE name=?")
-                            .bind("song.mp3").fetch_one(&pool).await.unwrap();
-                        uuid
-                    })
-                }
-            }).join().unwrap();
-
-            let uuid_c = CString::new(ffi_uuid).unwrap();
-            let r = alexandria_file_get_by_uuid(uuid_c.as_ptr(), token.as_ptr());
-            assert_eq!(r.status, alexandria_ffi::FILE_OK, "ffi get failed");
-            assert!(!r.json.is_null());
-            let s = unsafe { CStr::from_ptr(r.json) }.to_str().unwrap().to_string();
-            // SAFETY: pointer came from this library and is freed once.
-            unsafe { alexandria_free_string(r.json); }
-            serde_json::from_str(&s).unwrap()
+                    )
+                    .bind("T")
+                    .bind("A")
+                    .bind(2001i64)
+                    .bind("song.mp3")
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+                    let (uuid,): (String,) = sqlx::query_as("SELECT uuid FROM files WHERE name=?")
+                        .bind("song.mp3")
+                        .fetch_one(&pool)
+                        .await
+                        .unwrap();
+                    uuid
+                })
+            }
         })
-        .await
+        .join()
         .unwrap();
+
+        let uuid_c = CString::new(ffi_uuid).unwrap();
+        let r = alexandria_file_get_by_uuid(uuid_c.as_ptr(), token.as_ptr());
+        assert_eq!(r.status, alexandria_ffi::FILE_OK, "ffi get failed");
+        assert!(!r.json.is_null());
+        let s = unsafe { CStr::from_ptr(r.json) }
+            .to_str()
+            .unwrap()
+            .to_string();
+        // SAFETY: pointer came from this library and is freed once.
+        unsafe {
+            alexandria_free_string(r.json);
+        }
+        serde_json::from_str(&s).unwrap()
+    })
+    .await
+    .unwrap();
 
     // ---- compare ----
     // `metadata` is fully server-derived from the written row and must agree
     // byte-for-byte across surfaces.
-    assert_eq!(http_body["metadata"], ffi_body["metadata"], "metadata diverges");
+    assert_eq!(
+        http_body["metadata"], ffi_body["metadata"],
+        "metadata diverges"
+    );
 
     // `file` matches field-for-field except per-database values: `uuid`,
     // `path`, `indexedAt`.
@@ -884,7 +1011,11 @@ async fn given_same_file_when_fetched_via_http_and_ffi_then_file_view_bodies_ide
         }
         f
     };
-    assert_eq!(norm_file(&http_body), norm_file(&ffi_body), "file body diverges");
+    assert_eq!(
+        norm_file(&http_body),
+        norm_file(&ffi_body),
+        "file body diverges"
+    );
 }
 
 /// UC-03 parity — AF-01 (not-found) maps to the same status on both
@@ -899,9 +1030,8 @@ async fn given_missing_uuid_when_fetched_via_http_and_ffi_then_both_not_found() 
     let http_dir = tempdir().unwrap();
     let http_db = db_path(&http_dir, "http.sqlite");
     let http_pool = migrate_database(&http_db).await.expect("http migrate");
-    let http_services = std::sync::Arc::new(
-        build_services(&Settings::default(), http_pool.clone()).await,
-    );
+    let http_services =
+        std::sync::Arc::new(build_services(&Settings::default(), http_pool.clone()).await);
 
     let req = Request::builder()
         .method("GET")
@@ -921,7 +1051,10 @@ async fn given_missing_uuid_when_fetched_via_http_and_ffi_then_both_not_found() 
     let missing_str = missing.to_string();
     let ffi_status = tokio::task::spawn_blocking(move || -> i32 {
         let cdb = CString::new(ffi_db).unwrap();
-        assert_eq!(alexandria_index_init(cdb.as_ptr()), alexandria_ffi::INDEX_OK);
+        assert_eq!(
+            alexandria_index_init(cdb.as_ptr()),
+            alexandria_ffi::INDEX_OK
+        );
         let token = CString::new("parity").unwrap();
         let uuid_c = CString::new(missing_str).unwrap();
         let r = alexandria_file_get_by_uuid(uuid_c.as_ptr(), token.as_ptr());
@@ -1003,7 +1136,10 @@ async fn given_unknown_filter_values_when_listed_via_http_and_ffi_then_both_reje
     let (bad_type, bad_state, empty_values) =
         tokio::task::spawn_blocking(move || -> (i32, i32, i32) {
             let cdb = CString::new(ffi_db).unwrap();
-            assert_eq!(alexandria_index_init(cdb.as_ptr()), alexandria_ffi::INDEX_OK);
+            assert_eq!(
+                alexandria_index_init(cdb.as_ptr()),
+                alexandria_ffi::INDEX_OK
+            );
 
             let root = CString::new(ffi_lib_path).unwrap();
             let token = CString::new("parity").unwrap();
@@ -1016,7 +1152,9 @@ async fn given_unknown_filter_values_when_listed_via_http_and_ffi_then_both_reje
                 let r = alexandria_files_list(f.as_ptr(), token.as_ptr());
                 if !r.json.is_null() {
                     // SAFETY: pointer came from this library and is freed once.
-                    unsafe { alexandria_free_string(r.json); }
+                    unsafe {
+                        alexandria_free_string(r.json);
+                    }
                 }
                 r.status
             };
@@ -1058,9 +1196,8 @@ async fn given_no_token_when_files_listed_via_http_and_ffi_then_both_unauthorize
     let http_dir = tempdir().unwrap();
     let http_db = db_path(&http_dir, "http.sqlite");
     let http_pool = migrate_database(&http_db).await.expect("http migrate");
-    let http_services = std::sync::Arc::new(
-        build_services(&Settings::default(), http_pool.clone()).await,
-    );
+    let http_services =
+        std::sync::Arc::new(build_services(&Settings::default(), http_pool.clone()).await);
 
     let req = Request::builder()
         .method("GET")
@@ -1077,7 +1214,10 @@ async fn given_no_token_when_files_listed_via_http_and_ffi_then_both_unauthorize
     let ffi_db = db_path(&ffi_dir, "ffi.sqlite");
     let ffi_status = tokio::task::spawn_blocking(move || -> i32 {
         let cdb = CString::new(ffi_db).unwrap();
-        assert_eq!(alexandria_index_init(cdb.as_ptr()), alexandria_ffi::INDEX_OK);
+        assert_eq!(
+            alexandria_index_init(cdb.as_ptr()),
+            alexandria_ffi::INDEX_OK
+        );
         let empty_filters = CString::new("").unwrap();
         // Null token pointer → cstr_lossy returns None → empty token.
         let r = alexandria_files_list(empty_filters.as_ptr(), std::ptr::null());
@@ -1095,7 +1235,8 @@ async fn given_no_token_when_files_listed_via_http_and_ffi_then_both_unauthorize
 /// parsed before the auth check), so a caller with no credentials could learn
 /// whether its body was well-formed (FR-AU-07 / SRD §7).
 #[tokio::test]
-async fn given_no_token_and_malformed_payload_when_edited_via_http_and_ffi_then_both_unauthorized() {
+async fn given_no_token_and_malformed_payload_when_edited_via_http_and_ffi_then_both_unauthorized()
+{
     let _g = SERIAL.lock().unwrap();
 
     // ---- HTTP leg ----
@@ -1123,7 +1264,10 @@ async fn given_no_token_and_malformed_payload_when_edited_via_http_and_ffi_then_
     let (edit_status, get_status, list_status) =
         tokio::task::spawn_blocking(move || -> (i32, i32, i32) {
             let cdb = CString::new(ffi_db).unwrap();
-            assert_eq!(alexandria_index_init(cdb.as_ptr()), alexandria_ffi::INDEX_OK);
+            assert_eq!(
+                alexandria_index_init(cdb.as_ptr()),
+                alexandria_ffi::INDEX_OK
+            );
 
             // Null token => empty token => unauthenticated, paired with a
             // payload that would otherwise fail to parse first.
@@ -1137,20 +1281,26 @@ async fn given_no_token_and_malformed_payload_when_edited_via_http_and_ffi_then_
             );
             if !edit.json.is_null() {
                 // SAFETY: pointer came from this library and is freed once.
-                unsafe { alexandria_free_string(edit.json); }
+                unsafe {
+                    alexandria_free_string(edit.json);
+                }
             }
 
             let get = alexandria_file_get_by_uuid(bad_uuid.as_ptr(), std::ptr::null());
             if !get.json.is_null() {
                 // SAFETY: pointer came from this library and is freed once.
-                unsafe { alexandria_free_string(get.json); }
+                unsafe {
+                    alexandria_free_string(get.json);
+                }
             }
 
             let bad_filters = CString::new(r#"{"type":"banana"}"#).unwrap();
             let list = alexandria_files_list(bad_filters.as_ptr(), std::ptr::null());
             if !list.json.is_null() {
                 // SAFETY: pointer came from this library and is freed once.
-                unsafe { alexandria_free_string(list.json); }
+                unsafe {
+                    alexandria_free_string(list.json);
+                }
             }
 
             (edit.status, get.status, list.status)
@@ -1193,9 +1343,8 @@ async fn given_same_file_when_renamed_via_http_and_ffi_then_file_bodies_and_disk
     let http_dir = tempdir().unwrap();
     let http_db = db_path(&http_dir, "http.sqlite");
     let http_pool = migrate_database(&http_db).await.expect("http migrate");
-    let http_services = std::sync::Arc::new(
-        build_services(&Settings::default(), http_pool.clone()).await,
-    );
+    let http_services =
+        std::sync::Arc::new(build_services(&Settings::default(), http_pool.clone()).await);
 
     let index_req = Request::builder()
         .method("POST")
@@ -1230,10 +1379,9 @@ async fn given_same_file_when_renamed_via_http_and_ffi_then_file_bodies_and_disk
         .await
         .expect("http rename");
     assert_eq!(http_resp.status(), axum::http::StatusCode::OK);
-    let http_body: serde_json::Value = serde_json::from_slice(
-        &to_bytes(http_resp.into_body(), usize::MAX).await.unwrap(),
-    )
-    .unwrap();
+    let http_body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(http_resp.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
 
     // ---- FFI leg (own identical lib + db) ----
     let ffi_lib = tempdir().unwrap();
@@ -1243,51 +1391,70 @@ async fn given_same_file_when_renamed_via_http_and_ffi_then_file_bodies_and_disk
     let ffi_lib_path = ffi_lib.path().to_str().unwrap().to_string();
     let new_name_for_ffi = new_name.to_string();
 
-    let (ffi_uuid, ffi_body) = tokio::task::spawn_blocking(move || -> (String, serde_json::Value) {
-        let cdb = CString::new(ffi_db).unwrap();
-        assert_eq!(alexandria_index_init(cdb.as_ptr()), alexandria_ffi::INDEX_OK);
+    let (ffi_uuid, ffi_body) =
+        tokio::task::spawn_blocking(move || -> (String, serde_json::Value) {
+            let cdb = CString::new(ffi_db).unwrap();
+            assert_eq!(
+                alexandria_index_init(cdb.as_ptr()),
+                alexandria_ffi::INDEX_OK
+            );
 
-        let root = CString::new(ffi_lib_path).unwrap();
-        let token = CString::new("parity").unwrap();
-        let started = alexandria_index_start(root.as_ptr(), token.as_ptr());
-        assert_eq!(started.status, alexandria_ffi::INDEX_OK);
-        wait_for_ffi_files(1);
+            let root = CString::new(ffi_lib_path).unwrap();
+            let token = CString::new("parity").unwrap();
+            let started = alexandria_index_start(root.as_ptr(), token.as_ptr());
+            assert_eq!(started.status, alexandria_ffi::INDEX_OK);
+            wait_for_ffi_files(1);
 
-        // Resolve the file's uuid via a dedicated read connection to the FFI db.
-        let ffi_db_path = std::path::PathBuf::from(ffi_dir.path()).join("ffi.sqlite");
-        let ffi_uuid = std::thread::spawn({
-            let ffi_db_path = ffi_db_path.clone();
-            move || -> String {
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all().build().unwrap();
-                rt.block_on(async move {
-                    let url = format!("sqlite://{}", ffi_db_path.to_str().unwrap());
-                    let pool = sqlx::sqlite::SqlitePoolOptions::new()
-                        .max_connections(1)
-                        .connect(&format!("{url}?mode=rw")).await.unwrap();
-                    let (uuid,): (String,) = sqlx::query_as("SELECT uuid FROM files WHERE name=?")
-                        .bind("song.mp3").fetch_one(&pool).await.unwrap();
-                    uuid
-                })
+            // Resolve the file's uuid via a dedicated read connection to the FFI db.
+            let ffi_db_path = std::path::PathBuf::from(ffi_dir.path()).join("ffi.sqlite");
+            let ffi_uuid = std::thread::spawn({
+                let ffi_db_path = ffi_db_path.clone();
+                move || -> String {
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .unwrap();
+                    rt.block_on(async move {
+                        let url = format!("sqlite://{}", ffi_db_path.to_str().unwrap());
+                        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+                            .max_connections(1)
+                            .connect(&format!("{url}?mode=rw"))
+                            .await
+                            .unwrap();
+                        let (uuid,): (String,) =
+                            sqlx::query_as("SELECT uuid FROM files WHERE name=?")
+                                .bind("song.mp3")
+                                .fetch_one(&pool)
+                                .await
+                                .unwrap();
+                        uuid
+                    })
+                }
+            })
+            .join()
+            .unwrap();
+
+            let name_c = CString::new(new_name_for_ffi).unwrap();
+            let result = alexandria_file_rename(
+                CString::new(ffi_uuid.clone()).unwrap().as_ptr(),
+                name_c.as_ptr(),
+                token.as_ptr(),
+            );
+            assert_eq!(result.status, alexandria_ffi::FILE_OK, "ffi rename failed");
+            assert!(!result.json.is_null());
+            let s = unsafe { CStr::from_ptr(result.json) }
+                .to_str()
+                .unwrap()
+                .to_string();
+            // SAFETY: pointer came from this library and is freed once.
+            unsafe {
+                alexandria_free_string(result.json);
             }
-        }).join().unwrap();
-
-        let name_c = CString::new(new_name_for_ffi).unwrap();
-        let result = alexandria_file_rename(
-            CString::new(ffi_uuid.clone()).unwrap().as_ptr(),
-            name_c.as_ptr(),
-            token.as_ptr(),
-        );
-        assert_eq!(result.status, alexandria_ffi::FILE_OK, "ffi rename failed");
-        assert!(!result.json.is_null());
-        let s = unsafe { CStr::from_ptr(result.json) }.to_str().unwrap().to_string();
-        // SAFETY: pointer came from this library and is freed once.
-        unsafe { alexandria_free_string(result.json); }
-        let ffi_body: serde_json::Value = serde_json::from_str(&s).unwrap();
-        (ffi_uuid, ffi_body)
-    })
-    .await
-    .unwrap();
+            let ffi_body: serde_json::Value = serde_json::from_str(&s).unwrap();
+            (ffi_uuid, ffi_body)
+        })
+        .await
+        .unwrap();
 
     // ---- compare ----
     // `file` matches field-for-field except the per-database values `uuid`,
@@ -1301,7 +1468,11 @@ async fn given_same_file_when_renamed_via_http_and_ffi_then_file_bodies_and_disk
         }
         f
     };
-    assert_eq!(norm(&http_body), norm(&ffi_body), "File body diverges across surfaces");
+    assert_eq!(
+        norm(&http_body),
+        norm(&ffi_body),
+        "File body diverges across surfaces"
+    );
 
     // The names agree and both files have moved to the same relative path.
     assert_eq!(http_body["name"], ffi_body["name"]);
@@ -1314,8 +1485,14 @@ async fn given_same_file_when_renamed_via_http_and_ffi_then_file_bodies_and_disk
         "renamed on-disk files must agree byte-for-byte across surfaces"
     );
     // And the old path is gone on both.
-    assert!(!http_lib.path().join("song.mp3").exists(), "http old path gone");
-    assert!(!ffi_lib.path().join("song.mp3").exists(), "ffi old path gone");
+    assert!(
+        !http_lib.path().join("song.mp3").exists(),
+        "http old path gone"
+    );
+    assert!(
+        !ffi_lib.path().join("song.mp3").exists(),
+        "ffi old path gone"
+    );
 
     // Suppress unused warning while keeping the per-leg uuid visible.
     let _ = (http_uuid, ffi_uuid);
@@ -1332,9 +1509,8 @@ async fn given_no_token_when_renamed_via_http_and_ffi_then_both_unauthorized() {
     let http_dir = tempdir().unwrap();
     let http_db = db_path(&http_dir, "http.sqlite");
     let http_pool = migrate_database(&http_db).await.expect("http migrate");
-    let http_services = std::sync::Arc::new(
-        build_services(&Settings::default(), http_pool.clone()).await,
-    );
+    let http_services =
+        std::sync::Arc::new(build_services(&Settings::default(), http_pool.clone()).await);
 
     let req = Request::builder()
         .method("POST")
@@ -1351,40 +1527,49 @@ async fn given_no_token_when_renamed_via_http_and_ffi_then_both_unauthorized() {
     // ---- FFI leg ----
     let ffi_dir = tempdir().unwrap();
     let ffi_db = db_path(&ffi_dir, "ffi.sqlite");
-    let (rename_status, bad_payload_status) =
-        tokio::task::spawn_blocking(move || -> (i32, i32) {
-            let cdb = CString::new(ffi_db).unwrap();
-            assert_eq!(alexandria_index_init(cdb.as_ptr()), alexandria_ffi::INDEX_OK);
+    let (rename_status, bad_payload_status) = tokio::task::spawn_blocking(move || -> (i32, i32) {
+        let cdb = CString::new(ffi_db).unwrap();
+        assert_eq!(
+            alexandria_index_init(cdb.as_ptr()),
+            alexandria_ffi::INDEX_OK
+        );
 
-            // Null token => empty token => unauthenticated. Pair it with a
-            // payload that would otherwise fail to parse first (a bad uuid and
-            // an empty name) so the auth check must fire before either is read.
-            let bad_uuid = CString::new("not-a-uuid").unwrap();
-            let bad_name = CString::new("").unwrap();
-            let r = alexandria_file_rename(bad_uuid.as_ptr(), bad_name.as_ptr(), std::ptr::null());
-            if !r.json.is_null() {
-                // SAFETY: pointer came from this library and is freed once.
-                unsafe { alexandria_free_string(r.json); }
+        // Null token => empty token => unauthenticated. Pair it with a
+        // payload that would otherwise fail to parse first (a bad uuid and
+        // an empty name) so the auth check must fire before either is read.
+        let bad_uuid = CString::new("not-a-uuid").unwrap();
+        let bad_name = CString::new("").unwrap();
+        let r = alexandria_file_rename(bad_uuid.as_ptr(), bad_name.as_ptr(), std::ptr::null());
+        if !r.json.is_null() {
+            // SAFETY: pointer came from this library and is freed once.
+            unsafe {
+                alexandria_free_string(r.json);
             }
-            let clean_status = alexandria_ffi::FILE_ERR_UNAUTHORIZED;
-            // A second call with a clean uuid but no token still denies.
-            let ok_uuid = CString::new("11111111-1111-1111-1111-111111111111").unwrap();
-            let name = CString::new("new.mp3").unwrap();
-            let r2 = alexandria_file_rename(ok_uuid.as_ptr(), name.as_ptr(), std::ptr::null());
-            if !r2.json.is_null() {
-                unsafe { alexandria_free_string(r2.json); }
+        }
+        let clean_status = alexandria_ffi::FILE_ERR_UNAUTHORIZED;
+        // A second call with a clean uuid but no token still denies.
+        let ok_uuid = CString::new("11111111-1111-1111-1111-111111111111").unwrap();
+        let name = CString::new("new.mp3").unwrap();
+        let r2 = alexandria_file_rename(ok_uuid.as_ptr(), name.as_ptr(), std::ptr::null());
+        if !r2.json.is_null() {
+            unsafe {
+                alexandria_free_string(r2.json);
             }
-            (r.status, if r2.status == clean_status { 1 } else { 0 })
-        })
-        .await
-        .unwrap();
+        }
+        (r.status, if r2.status == clean_status { 1 } else { 0 })
+    })
+    .await
+    .unwrap();
 
     assert_eq!(
         rename_status,
         alexandria_ffi::FILE_ERR_UNAUTHORIZED,
         "rename must deny before parsing the uuid or name"
     );
-    assert_eq!(bad_payload_status, 1, "clean-uuid rename with no token also denies");
+    assert_eq!(
+        bad_payload_status, 1,
+        "clean-uuid rename with no token also denies"
+    );
 }
 
 /// UC-06 parity — soft-delete a file over both transports with identical
@@ -1405,9 +1590,8 @@ async fn given_same_file_when_soft_deleted_via_http_and_ffi_then_file_bodies_ide
     let http_dir = tempdir().unwrap();
     let http_db = db_path(&http_dir, "http.sqlite");
     let http_pool = migrate_database(&http_db).await.expect("http migrate");
-    let http_services = std::sync::Arc::new(
-        build_services(&Settings::default(), http_pool.clone()).await,
-    );
+    let http_services =
+        std::sync::Arc::new(build_services(&Settings::default(), http_pool.clone()).await);
 
     let index_req = Request::builder()
         .method("POST")
@@ -1441,10 +1625,9 @@ async fn given_same_file_when_soft_deleted_via_http_and_ffi_then_file_bodies_ide
         .await
         .expect("http soft-delete");
     assert_eq!(http_resp.status(), axum::http::StatusCode::OK);
-    let http_body: serde_json::Value = serde_json::from_slice(
-        &to_bytes(http_resp.into_body(), usize::MAX).await.unwrap(),
-    )
-    .unwrap();
+    let http_body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(http_resp.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
 
     // ---- FFI leg (own identical lib + db) ----
     let ffi_lib = tempdir().unwrap();
@@ -1453,49 +1636,72 @@ async fn given_same_file_when_soft_deleted_via_http_and_ffi_then_file_bodies_ide
     let ffi_db = db_path(&ffi_dir, "ffi.sqlite");
     let ffi_lib_path = ffi_lib.path().to_str().unwrap().to_string();
 
-    let (ffi_uuid, ffi_body) = tokio::task::spawn_blocking(move || -> (String, serde_json::Value) {
-        let cdb = CString::new(ffi_db).unwrap();
-        assert_eq!(alexandria_index_init(cdb.as_ptr()), alexandria_ffi::INDEX_OK);
+    let (ffi_uuid, ffi_body) =
+        tokio::task::spawn_blocking(move || -> (String, serde_json::Value) {
+            let cdb = CString::new(ffi_db).unwrap();
+            assert_eq!(
+                alexandria_index_init(cdb.as_ptr()),
+                alexandria_ffi::INDEX_OK
+            );
 
-        let root = CString::new(ffi_lib_path).unwrap();
-        let token = CString::new("parity").unwrap();
-        let started = alexandria_index_start(root.as_ptr(), token.as_ptr());
-        assert_eq!(started.status, alexandria_ffi::INDEX_OK);
-        wait_for_ffi_files(1);
+            let root = CString::new(ffi_lib_path).unwrap();
+            let token = CString::new("parity").unwrap();
+            let started = alexandria_index_start(root.as_ptr(), token.as_ptr());
+            assert_eq!(started.status, alexandria_ffi::INDEX_OK);
+            wait_for_ffi_files(1);
 
-        // Resolve the file's uuid via a dedicated read connection to the FFI db.
-        let ffi_db_path = std::path::PathBuf::from(ffi_dir.path()).join("ffi.sqlite");
-        let ffi_uuid = std::thread::spawn({
-            let ffi_db_path = ffi_db_path.clone();
-            move || -> String {
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all().build().unwrap();
-                rt.block_on(async move {
-                    let url = format!("sqlite://{}", ffi_db_path.to_str().unwrap());
-                    let pool = sqlx::sqlite::SqlitePoolOptions::new()
-                        .max_connections(1)
-                        .connect(&format!("{url}?mode=rw")).await.unwrap();
-                    let (uuid,): (String,) = sqlx::query_as("SELECT uuid FROM files WHERE name=?")
-                        .bind("song.mp3").fetch_one(&pool).await.unwrap();
-                    uuid
-                })
+            // Resolve the file's uuid via a dedicated read connection to the FFI db.
+            let ffi_db_path = std::path::PathBuf::from(ffi_dir.path()).join("ffi.sqlite");
+            let ffi_uuid = std::thread::spawn({
+                let ffi_db_path = ffi_db_path.clone();
+                move || -> String {
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .unwrap();
+                    rt.block_on(async move {
+                        let url = format!("sqlite://{}", ffi_db_path.to_str().unwrap());
+                        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+                            .max_connections(1)
+                            .connect(&format!("{url}?mode=rw"))
+                            .await
+                            .unwrap();
+                        let (uuid,): (String,) =
+                            sqlx::query_as("SELECT uuid FROM files WHERE name=?")
+                                .bind("song.mp3")
+                                .fetch_one(&pool)
+                                .await
+                                .unwrap();
+                        uuid
+                    })
+                }
+            })
+            .join()
+            .unwrap();
+
+            let result = alexandria_file_soft_delete(
+                CString::new(ffi_uuid.clone()).unwrap().as_ptr(),
+                token.as_ptr(),
+            );
+            assert_eq!(
+                result.status,
+                alexandria_ffi::FILE_OK,
+                "ffi soft_delete failed"
+            );
+            assert!(!result.json.is_null());
+            let s = unsafe { CStr::from_ptr(result.json) }
+                .to_str()
+                .unwrap()
+                .to_string();
+            // SAFETY: pointer came from this library and is freed once.
+            unsafe {
+                alexandria_free_string(result.json);
             }
-        }).join().unwrap();
-
-        let result = alexandria_file_soft_delete(
-            CString::new(ffi_uuid.clone()).unwrap().as_ptr(),
-            token.as_ptr(),
-        );
-        assert_eq!(result.status, alexandria_ffi::FILE_OK, "ffi soft_delete failed");
-        assert!(!result.json.is_null());
-        let s = unsafe { CStr::from_ptr(result.json) }.to_str().unwrap().to_string();
-        // SAFETY: pointer came from this library and is freed once.
-        unsafe { alexandria_free_string(result.json); }
-        let ffi_body: serde_json::Value = serde_json::from_str(&s).unwrap();
-        (ffi_uuid, ffi_body)
-    })
-    .await
-    .unwrap();
+            let ffi_body: serde_json::Value = serde_json::from_str(&s).unwrap();
+            (ffi_uuid, ffi_body)
+        })
+        .await
+        .unwrap();
 
     // ---- compare ----
     // `state` agrees on both surfaces (the soft-delete took effect).
@@ -1526,12 +1732,22 @@ async fn given_same_file_when_soft_deleted_via_http_and_ffi_then_file_bodies_ide
         }
         f
     };
-    assert_eq!(norm(&http_body), norm(&ffi_body), "File body diverges across surfaces");
+    assert_eq!(
+        norm(&http_body),
+        norm(&ffi_body),
+        "File body diverges across surfaces"
+    );
 
     // On-disk parity: the file is untouched on both legs (UC-06 does not
     // remove the on-disk file; purge-on-disk is UC-09).
-    assert!(http_lib.path().join("song.mp3").exists(), "http on-disk file preserved");
-    assert!(ffi_lib.path().join("song.mp3").exists(), "ffi on-disk file preserved");
+    assert!(
+        http_lib.path().join("song.mp3").exists(),
+        "http on-disk file preserved"
+    );
+    assert!(
+        ffi_lib.path().join("song.mp3").exists(),
+        "ffi on-disk file preserved"
+    );
     assert_eq!(
         std::fs::read(http_lib.path().join("song.mp3")).unwrap(),
         std::fs::read(ffi_lib.path().join("song.mp3")).unwrap(),
@@ -1553,9 +1769,8 @@ async fn given_no_token_when_soft_deleted_via_http_and_ffi_then_both_unauthorize
     let http_dir = tempdir().unwrap();
     let http_db = db_path(&http_dir, "http.sqlite");
     let http_pool = migrate_database(&http_db).await.expect("http migrate");
-    let http_services = std::sync::Arc::new(
-        build_services(&Settings::default(), http_pool.clone()).await,
-    );
+    let http_services =
+        std::sync::Arc::new(build_services(&Settings::default(), http_pool.clone()).await);
 
     let req = Request::builder()
         .method("DELETE")
@@ -1574,7 +1789,10 @@ async fn given_no_token_when_soft_deleted_via_http_and_ffi_then_both_unauthorize
     let (soft_delete_status, clean_uuid_status) =
         tokio::task::spawn_blocking(move || -> (i32, i32) {
             let cdb = CString::new(ffi_db).unwrap();
-            assert_eq!(alexandria_index_init(cdb.as_ptr()), alexandria_ffi::INDEX_OK);
+            assert_eq!(
+                alexandria_index_init(cdb.as_ptr()),
+                alexandria_ffi::INDEX_OK
+            );
 
             // Null token => empty token => unauthenticated. Pair it with a
             // payload that would otherwise fail to parse first (a bad uuid)
@@ -1583,14 +1801,18 @@ async fn given_no_token_when_soft_deleted_via_http_and_ffi_then_both_unauthorize
             let r = alexandria_file_soft_delete(bad_uuid.as_ptr(), std::ptr::null());
             if !r.json.is_null() {
                 // SAFETY: pointer came from this library and is freed once.
-                unsafe { alexandria_free_string(r.json); }
+                unsafe {
+                    alexandria_free_string(r.json);
+                }
             }
             let clean_status = alexandria_ffi::FILE_ERR_UNAUTHORIZED;
             // A second call with a clean uuid but no token still denies.
             let ok_uuid = CString::new("11111111-1111-1111-1111-111111111111").unwrap();
             let r2 = alexandria_file_soft_delete(ok_uuid.as_ptr(), std::ptr::null());
             if !r2.json.is_null() {
-                unsafe { alexandria_free_string(r2.json); }
+                unsafe {
+                    alexandria_free_string(r2.json);
+                }
             }
             (r.status, if r2.status == clean_status { 1 } else { 0 })
         })
@@ -1602,7 +1824,10 @@ async fn given_no_token_when_soft_deleted_via_http_and_ffi_then_both_unauthorize
         alexandria_ffi::FILE_ERR_UNAUTHORIZED,
         "soft_delete must deny before parsing the uuid"
     );
-    assert_eq!(clean_uuid_status, 1, "clean-uuid soft_delete with no token also denies");
+    assert_eq!(
+        clean_uuid_status, 1,
+        "clean-uuid soft_delete with no token also denies"
+    );
 }
 
 /// UC-07 parity — restore a soft-deleted file over both transports with
@@ -1628,9 +1853,8 @@ async fn given_soft_deleted_file_when_restored_via_http_and_ffi_then_file_bodies
     let http_dir = tempdir().unwrap();
     let http_db = db_path(&http_dir, "http.sqlite");
     let http_pool = migrate_database(&http_db).await.expect("http migrate");
-    let http_services = std::sync::Arc::new(
-        build_services(&Settings::default(), http_pool.clone()).await,
-    );
+    let http_services =
+        std::sync::Arc::new(build_services(&Settings::default(), http_pool.clone()).await);
 
     let index_req = Request::builder()
         .method("POST")
@@ -1672,10 +1896,9 @@ async fn given_soft_deleted_file_when_restored_via_http_and_ffi_then_file_bodies
         .await
         .expect("http restore");
     assert_eq!(http_resp.status(), axum::http::StatusCode::OK);
-    let http_body: serde_json::Value = serde_json::from_slice(
-        &to_bytes(http_resp.into_body(), usize::MAX).await.unwrap(),
-    )
-    .unwrap();
+    let http_body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(http_resp.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
 
     // ---- FFI leg (own identical lib + db) ----
     let ffi_lib = tempdir().unwrap();
@@ -1685,55 +1908,78 @@ async fn given_soft_deleted_file_when_restored_via_http_and_ffi_then_file_bodies
     let ffi_lib_path = ffi_lib.path().to_str().unwrap().to_string();
     let deleted_at_for_seed = deleted_at;
 
-    let (ffi_uuid, ffi_body) = tokio::task::spawn_blocking(move || -> (String, serde_json::Value) {
-        let cdb = CString::new(ffi_db).unwrap();
-        assert_eq!(alexandria_index_init(cdb.as_ptr()), alexandria_ffi::INDEX_OK);
+    let (ffi_uuid, ffi_body) =
+        tokio::task::spawn_blocking(move || -> (String, serde_json::Value) {
+            let cdb = CString::new(ffi_db).unwrap();
+            assert_eq!(
+                alexandria_index_init(cdb.as_ptr()),
+                alexandria_ffi::INDEX_OK
+            );
 
-        let root = CString::new(ffi_lib_path).unwrap();
-        let token = CString::new("parity").unwrap();
-        let started = alexandria_index_start(root.as_ptr(), token.as_ptr());
-        assert_eq!(started.status, alexandria_ffi::INDEX_OK);
-        wait_for_ffi_files(1);
+            let root = CString::new(ffi_lib_path).unwrap();
+            let token = CString::new("parity").unwrap();
+            let started = alexandria_index_start(root.as_ptr(), token.as_ptr());
+            assert_eq!(started.status, alexandria_ffi::INDEX_OK);
+            wait_for_ffi_files(1);
 
-        // Resolve the uuid and seed the soft-deleted row via a dedicated read
-        // connection to the FFI db (the FFI services hold their own pool).
-        let ffi_db_path = std::path::PathBuf::from(ffi_dir.path()).join("ffi.sqlite");
-        let ffi_uuid = std::thread::spawn({
-            let ffi_db_path = ffi_db_path.clone();
-            let deleted_at_for_seed = deleted_at_for_seed;
-            move || -> String {
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all().build().unwrap();
-                rt.block_on(async move {
-                    let url = format!("sqlite://{}", ffi_db_path.to_str().unwrap());
-                    let pool = sqlx::sqlite::SqlitePoolOptions::new()
-                        .max_connections(1)
-                        .connect(&format!("{url}?mode=rw")).await.unwrap();
-                    let (uuid,): (String,) = sqlx::query_as("SELECT uuid FROM files WHERE name=?")
-                        .bind("song.mp3").fetch_one(&pool).await.unwrap();
-                    sqlx::query("UPDATE files SET state = 'deleted', deleted_at = ? WHERE uuid = ?")
+            // Resolve the uuid and seed the soft-deleted row via a dedicated read
+            // connection to the FFI db (the FFI services hold their own pool).
+            let ffi_db_path = std::path::PathBuf::from(ffi_dir.path()).join("ffi.sqlite");
+            let ffi_uuid = std::thread::spawn({
+                let ffi_db_path = ffi_db_path.clone();
+                let deleted_at_for_seed = deleted_at_for_seed;
+                move || -> String {
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .unwrap();
+                    rt.block_on(async move {
+                        let url = format!("sqlite://{}", ffi_db_path.to_str().unwrap());
+                        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+                            .max_connections(1)
+                            .connect(&format!("{url}?mode=rw"))
+                            .await
+                            .unwrap();
+                        let (uuid,): (String,) =
+                            sqlx::query_as("SELECT uuid FROM files WHERE name=?")
+                                .bind("song.mp3")
+                                .fetch_one(&pool)
+                                .await
+                                .unwrap();
+                        sqlx::query(
+                            "UPDATE files SET state = 'deleted', deleted_at = ? WHERE uuid = ?",
+                        )
                         .bind(deleted_at_for_seed.to_rfc3339())
                         .bind(&uuid)
-                        .execute(&pool).await.unwrap();
-                    uuid
-                })
-            }
-        }).join().unwrap();
+                        .execute(&pool)
+                        .await
+                        .unwrap();
+                        uuid
+                    })
+                }
+            })
+            .join()
+            .unwrap();
 
-        let result = alexandria_file_restore(
-            CString::new(ffi_uuid.clone()).unwrap().as_ptr(),
-            token.as_ptr(),
-        );
-        assert_eq!(result.status, alexandria_ffi::FILE_OK, "ffi restore failed");
-        assert!(!result.json.is_null());
-        let s = unsafe { CStr::from_ptr(result.json) }.to_str().unwrap().to_string();
-        // SAFETY: pointer came from this library and is freed once.
-        unsafe { alexandria_free_string(result.json); }
-        let ffi_body: serde_json::Value = serde_json::from_str(&s).unwrap();
-        (ffi_uuid, ffi_body)
-    })
-    .await
-    .unwrap();
+            let result = alexandria_file_restore(
+                CString::new(ffi_uuid.clone()).unwrap().as_ptr(),
+                token.as_ptr(),
+            );
+            assert_eq!(result.status, alexandria_ffi::FILE_OK, "ffi restore failed");
+            assert!(!result.json.is_null());
+            let s = unsafe { CStr::from_ptr(result.json) }
+                .to_str()
+                .unwrap()
+                .to_string();
+            // SAFETY: pointer came from this library and is freed once.
+            unsafe {
+                alexandria_free_string(result.json);
+            }
+            let ffi_body: serde_json::Value = serde_json::from_str(&s).unwrap();
+            (ffi_uuid, ffi_body)
+        })
+        .await
+        .unwrap();
 
     // ---- compare ----
     // `state` agrees on both surfaces (the restore took effect).
@@ -1764,12 +2010,22 @@ async fn given_soft_deleted_file_when_restored_via_http_and_ffi_then_file_bodies
         }
         f
     };
-    assert_eq!(norm(&http_body), norm(&ffi_body), "File body diverges across surfaces");
+    assert_eq!(
+        norm(&http_body),
+        norm(&ffi_body),
+        "File body diverges across surfaces"
+    );
 
     // On-disk parity: the file is untouched on both legs (UC-07 does not
     // remove the on-disk file; purge-on-disk is UC-09).
-    assert!(http_lib.path().join("song.mp3").exists(), "http on-disk file preserved");
-    assert!(ffi_lib.path().join("song.mp3").exists(), "ffi on-disk file preserved");
+    assert!(
+        http_lib.path().join("song.mp3").exists(),
+        "http on-disk file preserved"
+    );
+    assert!(
+        ffi_lib.path().join("song.mp3").exists(),
+        "ffi on-disk file preserved"
+    );
 
     // Suppress unused warning while keeping the per-leg uuid visible.
     let _ = (http_uuid, ffi_uuid);
@@ -1786,9 +2042,8 @@ async fn given_no_token_when_restored_via_http_and_ffi_then_both_unauthorized() 
     let http_dir = tempdir().unwrap();
     let http_db = db_path(&http_dir, "http.sqlite");
     let http_pool = migrate_database(&http_db).await.expect("http migrate");
-    let http_services = std::sync::Arc::new(
-        build_services(&Settings::default(), http_pool.clone()).await,
-    );
+    let http_services =
+        std::sync::Arc::new(build_services(&Settings::default(), http_pool.clone()).await);
 
     let req = Request::builder()
         .method("POST")
@@ -1804,38 +2059,47 @@ async fn given_no_token_when_restored_via_http_and_ffi_then_both_unauthorized() 
     // ---- FFI leg ----
     let ffi_dir = tempdir().unwrap();
     let ffi_db = db_path(&ffi_dir, "ffi.sqlite");
-    let (restore_status, clean_uuid_status) =
-        tokio::task::spawn_blocking(move || -> (i32, i32) {
-            let cdb = CString::new(ffi_db).unwrap();
-            assert_eq!(alexandria_index_init(cdb.as_ptr()), alexandria_ffi::INDEX_OK);
+    let (restore_status, clean_uuid_status) = tokio::task::spawn_blocking(move || -> (i32, i32) {
+        let cdb = CString::new(ffi_db).unwrap();
+        assert_eq!(
+            alexandria_index_init(cdb.as_ptr()),
+            alexandria_ffi::INDEX_OK
+        );
 
-            // Null token => empty token => unauthenticated. Pair it with a
-            // payload that would otherwise fail to parse first (a bad uuid)
-            // so the auth check must fire before it is read.
-            let bad_uuid = CString::new("not-a-uuid").unwrap();
-            let r = alexandria_file_restore(bad_uuid.as_ptr(), std::ptr::null());
-            if !r.json.is_null() {
-                // SAFETY: pointer came from this library and is freed once.
-                unsafe { alexandria_free_string(r.json); }
+        // Null token => empty token => unauthenticated. Pair it with a
+        // payload that would otherwise fail to parse first (a bad uuid)
+        // so the auth check must fire before it is read.
+        let bad_uuid = CString::new("not-a-uuid").unwrap();
+        let r = alexandria_file_restore(bad_uuid.as_ptr(), std::ptr::null());
+        if !r.json.is_null() {
+            // SAFETY: pointer came from this library and is freed once.
+            unsafe {
+                alexandria_free_string(r.json);
             }
-            let clean_status = alexandria_ffi::FILE_ERR_UNAUTHORIZED;
-            // A second call with a clean uuid but no token still denies.
-            let ok_uuid = CString::new("11111111-1111-1111-1111-111111111111").unwrap();
-            let r2 = alexandria_file_restore(ok_uuid.as_ptr(), std::ptr::null());
-            if !r2.json.is_null() {
-                unsafe { alexandria_free_string(r2.json); }
+        }
+        let clean_status = alexandria_ffi::FILE_ERR_UNAUTHORIZED;
+        // A second call with a clean uuid but no token still denies.
+        let ok_uuid = CString::new("11111111-1111-1111-1111-111111111111").unwrap();
+        let r2 = alexandria_file_restore(ok_uuid.as_ptr(), std::ptr::null());
+        if !r2.json.is_null() {
+            unsafe {
+                alexandria_free_string(r2.json);
             }
-            (r.status, if r2.status == clean_status { 1 } else { 0 })
-        })
-        .await
-        .unwrap();
+        }
+        (r.status, if r2.status == clean_status { 1 } else { 0 })
+    })
+    .await
+    .unwrap();
 
     assert_eq!(
         restore_status,
         alexandria_ffi::FILE_ERR_UNAUTHORIZED,
         "restore must deny before parsing the uuid"
     );
-    assert_eq!(clean_uuid_status, 1, "clean-uuid restore with no token also denies");
+    assert_eq!(
+        clean_uuid_status, 1,
+        "clean-uuid restore with no token also denies"
+    );
 }
 
 /// UC-08 parity — hard-purge a soft-deleted, past-retention file over both
@@ -1859,9 +2123,8 @@ async fn given_purgeable_file_when_purged_via_http_and_ffi_then_file_bodies_iden
     let http_dir = tempdir().unwrap();
     let http_db = db_path(&http_dir, "http.sqlite");
     let http_pool = migrate_database(&http_db).await.expect("http migrate");
-    let http_services = std::sync::Arc::new(
-        build_services(&Settings::default(), http_pool.clone()).await,
-    );
+    let http_services =
+        std::sync::Arc::new(build_services(&Settings::default(), http_pool.clone()).await);
 
     let index_req = Request::builder()
         .method("POST")
@@ -1903,10 +2166,9 @@ async fn given_purgeable_file_when_purged_via_http_and_ffi_then_file_bodies_iden
         .await
         .expect("http purge");
     assert_eq!(http_resp.status(), axum::http::StatusCode::OK);
-    let http_body: serde_json::Value = serde_json::from_slice(
-        &to_bytes(http_resp.into_body(), usize::MAX).await.unwrap(),
-    )
-    .unwrap();
+    let http_body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(http_resp.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
 
     let http_files_remaining: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM files WHERE uuid = ?")
         .bind(&http_uuid)
@@ -1927,10 +2189,13 @@ async fn given_purgeable_file_when_purged_via_http_and_ffi_then_file_bodies_iden
     let ffi_db = db_path(&ffi_dir, "ffi.sqlite");
     let ffi_lib_path = ffi_lib.path().to_str().unwrap().to_string();
 
-    let (ffi_body, ffi_files_remaining, ffi_subtype_remaining) = tokio::task::spawn_blocking(
-        move || -> (serde_json::Value, i64, i64) {
+    let (ffi_body, ffi_files_remaining, ffi_subtype_remaining) =
+        tokio::task::spawn_blocking(move || -> (serde_json::Value, i64, i64) {
             let cdb = CString::new(ffi_db).unwrap();
-            assert_eq!(alexandria_index_init(cdb.as_ptr()), alexandria_ffi::INDEX_OK);
+            assert_eq!(
+                alexandria_index_init(cdb.as_ptr()),
+                alexandria_ffi::INDEX_OK
+            );
 
             let root = CString::new(ffi_lib_path).unwrap();
             let token = CString::new("parity").unwrap();
@@ -1943,23 +2208,36 @@ async fn given_purgeable_file_when_purged_via_http_and_ffi_then_file_bodies_iden
                 let ffi_db_path = ffi_db_path.clone();
                 move || -> (String, i64) {
                     let rt = tokio::runtime::Builder::new_current_thread()
-                        .enable_all().build().unwrap();
+                        .enable_all()
+                        .build()
+                        .unwrap();
                     rt.block_on(async move {
                         let url = format!("sqlite://{}", ffi_db_path.to_str().unwrap());
                         let pool = sqlx::sqlite::SqlitePoolOptions::new()
                             .max_connections(1)
-                            .connect(&format!("{url}?mode=rw")).await.unwrap();
+                            .connect(&format!("{url}?mode=rw"))
+                            .await
+                            .unwrap();
                         let (uuid, id): (String, i64) =
                             sqlx::query_as("SELECT uuid, id FROM files WHERE name=?")
-                                .bind("song.mp3").fetch_one(&pool).await.unwrap();
-                        sqlx::query("UPDATE files SET state = 'deleted', deleted_at = ? WHERE uuid = ?")
-                            .bind(deleted_at)
-                            .bind(&uuid)
-                            .execute(&pool).await.unwrap();
+                                .bind("song.mp3")
+                                .fetch_one(&pool)
+                                .await
+                                .unwrap();
+                        sqlx::query(
+                            "UPDATE files SET state = 'deleted', deleted_at = ? WHERE uuid = ?",
+                        )
+                        .bind(deleted_at)
+                        .bind(&uuid)
+                        .execute(&pool)
+                        .await
+                        .unwrap();
                         (uuid, id)
                     })
                 }
-            }).join().unwrap();
+            })
+            .join()
+            .unwrap();
 
             let result = alexandria_file_purge(
                 CString::new(ffi_uuid.clone()).unwrap().as_ptr(),
@@ -1967,41 +2245,63 @@ async fn given_purgeable_file_when_purged_via_http_and_ffi_then_file_bodies_iden
             );
             assert_eq!(result.status, alexandria_ffi::FILE_OK, "ffi purge failed");
             assert!(!result.json.is_null());
-            let s = unsafe { CStr::from_ptr(result.json) }.to_str().unwrap().to_string();
+            let s = unsafe { CStr::from_ptr(result.json) }
+                .to_str()
+                .unwrap()
+                .to_string();
             // SAFETY: pointer came from this library and is freed once.
-            unsafe { alexandria_free_string(result.json); }
+            unsafe {
+                alexandria_free_string(result.json);
+            }
             let ffi_body: serde_json::Value = serde_json::from_str(&s).unwrap();
 
             let (files_remaining, subtype_remaining) = std::thread::spawn({
                 let ffi_db_path = ffi_db_path.clone();
                 move || -> (i64, i64) {
                     let rt = tokio::runtime::Builder::new_current_thread()
-                        .enable_all().build().unwrap();
+                        .enable_all()
+                        .build()
+                        .unwrap();
                     rt.block_on(async move {
                         let url = format!("sqlite://{}", ffi_db_path.to_str().unwrap());
                         let pool = sqlx::sqlite::SqlitePoolOptions::new()
                             .max_connections(1)
-                            .connect(&format!("{url}?mode=rw")).await.unwrap();
+                            .connect(&format!("{url}?mode=rw"))
+                            .await
+                            .unwrap();
                         let (files,): (i64,) =
                             sqlx::query_as("SELECT COUNT(*) FROM files WHERE uuid = ?")
-                                .bind(&ffi_uuid).fetch_one(&pool).await.unwrap();
+                                .bind(&ffi_uuid)
+                                .fetch_one(&pool)
+                                .await
+                                .unwrap();
                         let (subtype,): (i64,) =
                             sqlx::query_as("SELECT COUNT(*) FROM audio_files WHERE file_id = ?")
-                                .bind(ffi_file_id).fetch_one(&pool).await.unwrap();
+                                .bind(ffi_file_id)
+                                .fetch_one(&pool)
+                                .await
+                                .unwrap();
                         (files, subtype)
                     })
                 }
-            }).join().unwrap();
+            })
+            .join()
+            .unwrap();
 
             (ffi_body, files_remaining, subtype_remaining)
-        },
-    )
-    .await
-    .unwrap();
+        })
+        .await
+        .unwrap();
 
     // ---- compare ----
-    assert_eq!(http_body["state"], "deleted", "http confirmation echoes pre-purge state");
-    assert_eq!(ffi_body["state"], "deleted", "ffi confirmation echoes pre-purge state");
+    assert_eq!(
+        http_body["state"], "deleted",
+        "http confirmation echoes pre-purge state"
+    );
+    assert_eq!(
+        ffi_body["state"], "deleted",
+        "ffi confirmation echoes pre-purge state"
+    );
 
     let norm = |v: &serde_json::Value| -> serde_json::Value {
         let mut f = v.clone();
@@ -2013,17 +2313,30 @@ async fn given_purgeable_file_when_purged_via_http_and_ffi_then_file_bodies_iden
         }
         f
     };
-    assert_eq!(norm(&http_body), norm(&ffi_body), "File body diverges across surfaces");
+    assert_eq!(
+        norm(&http_body),
+        norm(&ffi_body),
+        "File body diverges across surfaces"
+    );
 
     assert_eq!(http_files_remaining.0, 0, "http files row removed by purge");
     assert_eq!(ffi_files_remaining, 0, "ffi files row removed by purge");
-    assert_eq!(http_subtype_remaining.0, 0, "http subtype row removed by purge");
+    assert_eq!(
+        http_subtype_remaining.0, 0,
+        "http subtype row removed by purge"
+    );
     assert_eq!(ffi_subtype_remaining, 0, "ffi subtype row removed by purge");
 
     // On-disk parity: the file is untouched on both legs (NFR-07;
     // purge-on-disk is UC-09).
-    assert!(http_lib.path().join("song.mp3").exists(), "http on-disk file preserved");
-    assert!(ffi_lib.path().join("song.mp3").exists(), "ffi on-disk file preserved");
+    assert!(
+        http_lib.path().join("song.mp3").exists(),
+        "http on-disk file preserved"
+    );
+    assert!(
+        ffi_lib.path().join("song.mp3").exists(),
+        "ffi on-disk file preserved"
+    );
 }
 
 /// UC-08 parity — an unauthenticated caller is rejected before its payload
@@ -2037,9 +2350,8 @@ async fn given_no_token_when_purged_via_http_and_ffi_then_both_unauthorized() {
     let http_dir = tempdir().unwrap();
     let http_db = db_path(&http_dir, "http.sqlite");
     let http_pool = migrate_database(&http_db).await.expect("http migrate");
-    let http_services = std::sync::Arc::new(
-        build_services(&Settings::default(), http_pool.clone()).await,
-    );
+    let http_services =
+        std::sync::Arc::new(build_services(&Settings::default(), http_pool.clone()).await);
 
     let req = Request::builder()
         .method("DELETE")
@@ -2055,38 +2367,47 @@ async fn given_no_token_when_purged_via_http_and_ffi_then_both_unauthorized() {
     // ---- FFI leg ----
     let ffi_dir = tempdir().unwrap();
     let ffi_db = db_path(&ffi_dir, "ffi.sqlite");
-    let (purge_status, clean_uuid_status) =
-        tokio::task::spawn_blocking(move || -> (i32, i32) {
-            let cdb = CString::new(ffi_db).unwrap();
-            assert_eq!(alexandria_index_init(cdb.as_ptr()), alexandria_ffi::INDEX_OK);
+    let (purge_status, clean_uuid_status) = tokio::task::spawn_blocking(move || -> (i32, i32) {
+        let cdb = CString::new(ffi_db).unwrap();
+        assert_eq!(
+            alexandria_index_init(cdb.as_ptr()),
+            alexandria_ffi::INDEX_OK
+        );
 
-            // Null token => empty token => unauthenticated. Pair it with a
-            // payload that would otherwise fail to parse first (a bad uuid)
-            // so the auth check must fire before it is read.
-            let bad_uuid = CString::new("not-a-uuid").unwrap();
-            let r = alexandria_file_purge(bad_uuid.as_ptr(), std::ptr::null());
-            if !r.json.is_null() {
-                // SAFETY: pointer came from this library and is freed once.
-                unsafe { alexandria_free_string(r.json); }
+        // Null token => empty token => unauthenticated. Pair it with a
+        // payload that would otherwise fail to parse first (a bad uuid)
+        // so the auth check must fire before it is read.
+        let bad_uuid = CString::new("not-a-uuid").unwrap();
+        let r = alexandria_file_purge(bad_uuid.as_ptr(), std::ptr::null());
+        if !r.json.is_null() {
+            // SAFETY: pointer came from this library and is freed once.
+            unsafe {
+                alexandria_free_string(r.json);
             }
-            let clean_status = alexandria_ffi::FILE_ERR_UNAUTHORIZED;
-            // A second call with a clean uuid but no token still denies.
-            let ok_uuid = CString::new("11111111-1111-1111-1111-111111111111").unwrap();
-            let r2 = alexandria_file_purge(ok_uuid.as_ptr(), std::ptr::null());
-            if !r2.json.is_null() {
-                unsafe { alexandria_free_string(r2.json); }
+        }
+        let clean_status = alexandria_ffi::FILE_ERR_UNAUTHORIZED;
+        // A second call with a clean uuid but no token still denies.
+        let ok_uuid = CString::new("11111111-1111-1111-1111-111111111111").unwrap();
+        let r2 = alexandria_file_purge(ok_uuid.as_ptr(), std::ptr::null());
+        if !r2.json.is_null() {
+            unsafe {
+                alexandria_free_string(r2.json);
             }
-            (r.status, if r2.status == clean_status { 1 } else { 0 })
-        })
-        .await
-        .unwrap();
+        }
+        (r.status, if r2.status == clean_status { 1 } else { 0 })
+    })
+    .await
+    .unwrap();
 
     assert_eq!(
         purge_status,
         alexandria_ffi::FILE_ERR_UNAUTHORIZED,
         "purge must deny before parsing the uuid"
     );
-    assert_eq!(clean_uuid_status, 1, "clean-uuid purge with no token also denies");
+    assert_eq!(
+        clean_uuid_status, 1,
+        "clean-uuid purge with no token also denies"
+    );
 }
 
 /// UC-09 parity — purge an `active` file's on-disk copy and its catalog
@@ -2108,9 +2429,8 @@ async fn given_active_file_when_purged_on_disk_via_http_and_ffi_then_file_bodies
     let http_dir = tempdir().unwrap();
     let http_db = db_path(&http_dir, "http.sqlite");
     let http_pool = migrate_database(&http_db).await.expect("http migrate");
-    let http_services = std::sync::Arc::new(
-        build_services(&Settings::default(), http_pool.clone()).await,
-    );
+    let http_services =
+        std::sync::Arc::new(build_services(&Settings::default(), http_pool.clone()).await);
 
     let index_req = Request::builder()
         .method("POST")
@@ -2145,10 +2465,9 @@ async fn given_active_file_when_purged_on_disk_via_http_and_ffi_then_file_bodies
         .await
         .expect("http purge-on-disk");
     assert_eq!(http_resp.status(), axum::http::StatusCode::OK);
-    let http_body: serde_json::Value = serde_json::from_slice(
-        &to_bytes(http_resp.into_body(), usize::MAX).await.unwrap(),
-    )
-    .unwrap();
+    let http_body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(http_resp.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
 
     let http_files_remaining: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM files WHERE uuid = ?")
         .bind(&http_uuid)
@@ -2169,10 +2488,13 @@ async fn given_active_file_when_purged_on_disk_via_http_and_ffi_then_file_bodies
     let ffi_db = db_path(&ffi_dir, "ffi.sqlite");
     let ffi_lib_path = ffi_lib.path().to_str().unwrap().to_string();
 
-    let (ffi_body, ffi_files_remaining, ffi_subtype_remaining) = tokio::task::spawn_blocking(
-        move || -> (serde_json::Value, i64, i64) {
+    let (ffi_body, ffi_files_remaining, ffi_subtype_remaining) =
+        tokio::task::spawn_blocking(move || -> (serde_json::Value, i64, i64) {
             let cdb = CString::new(ffi_db).unwrap();
-            assert_eq!(alexandria_index_init(cdb.as_ptr()), alexandria_ffi::INDEX_OK);
+            assert_eq!(
+                alexandria_index_init(cdb.as_ptr()),
+                alexandria_ffi::INDEX_OK
+            );
 
             let root = CString::new(ffi_lib_path).unwrap();
             let token = CString::new("parity").unwrap();
@@ -2185,63 +2507,104 @@ async fn given_active_file_when_purged_on_disk_via_http_and_ffi_then_file_bodies
                 let ffi_db_path = ffi_db_path.clone();
                 move || -> (String, i64) {
                     let rt = tokio::runtime::Builder::new_current_thread()
-                        .enable_all().build().unwrap();
+                        .enable_all()
+                        .build()
+                        .unwrap();
                     rt.block_on(async move {
                         let url = format!("sqlite://{}", ffi_db_path.to_str().unwrap());
                         let pool = sqlx::sqlite::SqlitePoolOptions::new()
                             .max_connections(1)
-                            .connect(&format!("{url}?mode=rw")).await.unwrap();
+                            .connect(&format!("{url}?mode=rw"))
+                            .await
+                            .unwrap();
                         let (uuid, id): (String, i64) =
                             sqlx::query_as("SELECT uuid, id FROM files WHERE name=?")
-                                .bind("song.mp3").fetch_one(&pool).await.unwrap();
+                                .bind("song.mp3")
+                                .fetch_one(&pool)
+                                .await
+                                .unwrap();
                         (uuid, id)
                     })
                 }
-            }).join().unwrap();
+            })
+            .join()
+            .unwrap();
 
             let result = alexandria_file_purge_on_disk(
                 CString::new(ffi_uuid.clone()).unwrap().as_ptr(),
                 token.as_ptr(),
             );
-            assert_eq!(result.status, alexandria_ffi::FILE_OK, "ffi purge-on-disk failed");
+            assert_eq!(
+                result.status,
+                alexandria_ffi::FILE_OK,
+                "ffi purge-on-disk failed"
+            );
             assert!(!result.json.is_null());
-            let s = unsafe { CStr::from_ptr(result.json) }.to_str().unwrap().to_string();
+            let s = unsafe { CStr::from_ptr(result.json) }
+                .to_str()
+                .unwrap()
+                .to_string();
             // SAFETY: pointer came from this library and is freed once.
-            unsafe { alexandria_free_string(result.json); }
+            unsafe {
+                alexandria_free_string(result.json);
+            }
             let ffi_body: serde_json::Value = serde_json::from_str(&s).unwrap();
 
             let (files_remaining, subtype_remaining) = std::thread::spawn({
                 let ffi_db_path = ffi_db_path.clone();
                 move || -> (i64, i64) {
                     let rt = tokio::runtime::Builder::new_current_thread()
-                        .enable_all().build().unwrap();
+                        .enable_all()
+                        .build()
+                        .unwrap();
                     rt.block_on(async move {
                         let url = format!("sqlite://{}", ffi_db_path.to_str().unwrap());
                         let pool = sqlx::sqlite::SqlitePoolOptions::new()
                             .max_connections(1)
-                            .connect(&format!("{url}?mode=rw")).await.unwrap();
+                            .connect(&format!("{url}?mode=rw"))
+                            .await
+                            .unwrap();
                         let (files,): (i64,) =
                             sqlx::query_as("SELECT COUNT(*) FROM files WHERE uuid = ?")
-                                .bind(&ffi_uuid).fetch_one(&pool).await.unwrap();
+                                .bind(&ffi_uuid)
+                                .fetch_one(&pool)
+                                .await
+                                .unwrap();
                         let (subtype,): (i64,) =
                             sqlx::query_as("SELECT COUNT(*) FROM audio_files WHERE file_id = ?")
-                                .bind(ffi_file_id).fetch_one(&pool).await.unwrap();
+                                .bind(ffi_file_id)
+                                .fetch_one(&pool)
+                                .await
+                                .unwrap();
                         (files, subtype)
                     })
                 }
-            }).join().unwrap();
+            })
+            .join()
+            .unwrap();
 
             (ffi_body, files_remaining, subtype_remaining)
-        },
-    )
-    .await
-    .unwrap();
+        })
+        .await
+        .unwrap();
 
     // ---- compare ----
-    assert_eq!(http_body["file"]["state"], "active", "http confirmation echoes pre-purge state");
-    assert_eq!(ffi_body["file"]["state"], "active", "ffi confirmation echoes pre-purge state");
-    assert_eq!(http_body["diskFilePresent"], true, "http reports the on-disk file was present");
-    assert_eq!(ffi_body["diskFilePresent"], true, "ffi reports the on-disk file was present");
+    assert_eq!(
+        http_body["file"]["state"], "active",
+        "http confirmation echoes pre-purge state"
+    );
+    assert_eq!(
+        ffi_body["file"]["state"], "active",
+        "ffi confirmation echoes pre-purge state"
+    );
+    assert_eq!(
+        http_body["diskFilePresent"], true,
+        "http reports the on-disk file was present"
+    );
+    assert_eq!(
+        ffi_body["diskFilePresent"], true,
+        "ffi reports the on-disk file was present"
+    );
 
     let norm = |v: &serde_json::Value| -> serde_json::Value {
         let mut f = v["file"].clone();
@@ -2252,16 +2615,38 @@ async fn given_active_file_when_purged_on_disk_via_http_and_ffi_then_file_bodies
         }
         f
     };
-    assert_eq!(norm(&http_body), norm(&ffi_body), "File body diverges across surfaces");
+    assert_eq!(
+        norm(&http_body),
+        norm(&ffi_body),
+        "File body diverges across surfaces"
+    );
 
-    assert_eq!(http_files_remaining.0, 0, "http files row removed by purge-on-disk");
-    assert_eq!(ffi_files_remaining, 0, "ffi files row removed by purge-on-disk");
-    assert_eq!(http_subtype_remaining.0, 0, "http subtype row removed by purge-on-disk");
-    assert_eq!(ffi_subtype_remaining, 0, "ffi subtype row removed by purge-on-disk");
+    assert_eq!(
+        http_files_remaining.0, 0,
+        "http files row removed by purge-on-disk"
+    );
+    assert_eq!(
+        ffi_files_remaining, 0,
+        "ffi files row removed by purge-on-disk"
+    );
+    assert_eq!(
+        http_subtype_remaining.0, 0,
+        "http subtype row removed by purge-on-disk"
+    );
+    assert_eq!(
+        ffi_subtype_remaining, 0,
+        "ffi subtype row removed by purge-on-disk"
+    );
 
     // On-disk parity: the file is gone on both legs.
-    assert!(!http_lib.path().join("song.mp3").exists(), "http on-disk file removed");
-    assert!(!ffi_lib.path().join("song.mp3").exists(), "ffi on-disk file removed");
+    assert!(
+        !http_lib.path().join("song.mp3").exists(),
+        "http on-disk file removed"
+    );
+    assert!(
+        !ffi_lib.path().join("song.mp3").exists(),
+        "ffi on-disk file removed"
+    );
 }
 
 /// UC-09 parity — an unauthenticated caller is rejected before its payload
@@ -2276,13 +2661,15 @@ async fn given_no_token_when_purged_on_disk_via_http_and_ffi_then_both_unauthori
     let http_dir = tempdir().unwrap();
     let http_db = db_path(&http_dir, "http.sqlite");
     let http_pool = migrate_database(&http_db).await.expect("http migrate");
-    let http_services = std::sync::Arc::new(
-        build_services(&Settings::default(), http_pool.clone()).await,
-    );
+    let http_services =
+        std::sync::Arc::new(build_services(&Settings::default(), http_pool.clone()).await);
 
     let req = Request::builder()
         .method("DELETE")
-        .uri(format!("/v1/files/{}?purge-on-disk=true", uuid::Uuid::new_v4()))
+        .uri(format!(
+            "/v1/files/{}?purge-on-disk=true",
+            uuid::Uuid::new_v4()
+        ))
         .body(Body::empty())
         .unwrap();
     let resp = app(Settings::default(), http_services)
@@ -2294,36 +2681,503 @@ async fn given_no_token_when_purged_on_disk_via_http_and_ffi_then_both_unauthori
     // ---- FFI leg ----
     let ffi_dir = tempdir().unwrap();
     let ffi_db = db_path(&ffi_dir, "ffi.sqlite");
-    let (purge_status, clean_uuid_status) =
-        tokio::task::spawn_blocking(move || -> (i32, i32) {
-            let cdb = CString::new(ffi_db).unwrap();
-            assert_eq!(alexandria_index_init(cdb.as_ptr()), alexandria_ffi::INDEX_OK);
+    let (purge_status, clean_uuid_status) = tokio::task::spawn_blocking(move || -> (i32, i32) {
+        let cdb = CString::new(ffi_db).unwrap();
+        assert_eq!(
+            alexandria_index_init(cdb.as_ptr()),
+            alexandria_ffi::INDEX_OK
+        );
 
-            // Null token => empty token => unauthenticated. Pair it with a
-            // payload that would otherwise fail to parse first (a bad uuid)
-            // so the auth check must fire before it is read.
-            let bad_uuid = CString::new("not-a-uuid").unwrap();
-            let r = alexandria_file_purge_on_disk(bad_uuid.as_ptr(), std::ptr::null());
-            if !r.json.is_null() {
-                // SAFETY: pointer came from this library and is freed once.
-                unsafe { alexandria_free_string(r.json); }
+        // Null token => empty token => unauthenticated. Pair it with a
+        // payload that would otherwise fail to parse first (a bad uuid)
+        // so the auth check must fire before it is read.
+        let bad_uuid = CString::new("not-a-uuid").unwrap();
+        let r = alexandria_file_purge_on_disk(bad_uuid.as_ptr(), std::ptr::null());
+        if !r.json.is_null() {
+            // SAFETY: pointer came from this library and is freed once.
+            unsafe {
+                alexandria_free_string(r.json);
             }
-            let clean_status = alexandria_ffi::FILE_ERR_UNAUTHORIZED;
-            // A second call with a clean uuid but no token still denies.
-            let ok_uuid = CString::new("11111111-1111-1111-1111-111111111111").unwrap();
-            let r2 = alexandria_file_purge_on_disk(ok_uuid.as_ptr(), std::ptr::null());
-            if !r2.json.is_null() {
-                unsafe { alexandria_free_string(r2.json); }
+        }
+        let clean_status = alexandria_ffi::FILE_ERR_UNAUTHORIZED;
+        // A second call with a clean uuid but no token still denies.
+        let ok_uuid = CString::new("11111111-1111-1111-1111-111111111111").unwrap();
+        let r2 = alexandria_file_purge_on_disk(ok_uuid.as_ptr(), std::ptr::null());
+        if !r2.json.is_null() {
+            unsafe {
+                alexandria_free_string(r2.json);
             }
-            (r.status, if r2.status == clean_status { 1 } else { 0 })
-        })
-        .await
-        .unwrap();
+        }
+        (r.status, if r2.status == clean_status { 1 } else { 0 })
+    })
+    .await
+    .unwrap();
 
     assert_eq!(
         purge_status,
         alexandria_ffi::FILE_ERR_UNAUTHORIZED,
         "purge-on-disk must deny before parsing the uuid"
     );
-    assert_eq!(clean_uuid_status, 1, "clean-uuid purge-on-disk with no token also denies");
+    assert_eq!(
+        clean_uuid_status, 1,
+        "clean-uuid purge-on-disk with no token also denies"
+    );
+}
+
+/// UC-09 AF-01 parity — purge-on-disk a record whose on-disk file has already
+/// vanished, over both transports. Both surfaces must treat the absence as a
+/// success, report it identically (`diskFilePresent: false`), and still
+/// remove the catalog rows (Testing Specification §7.3, FR-FC-23, FR-FC-24).
+#[tokio::test]
+async fn given_missing_disk_file_when_purged_on_disk_via_http_and_ffi_then_both_report_absence() {
+    let _g = SERIAL.lock().unwrap();
+
+    // ---- HTTP leg ----
+    let http_lib = tempdir().unwrap();
+    std::fs::write(http_lib.path().join("song.mp3"), b"parity-audio").unwrap();
+
+    let http_dir = tempdir().unwrap();
+    let http_db = db_path(&http_dir, "http.sqlite");
+    let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    let http_services =
+        std::sync::Arc::new(build_services(&Settings::default(), http_pool.clone()).await);
+
+    let index_req = Request::builder()
+        .method("POST")
+        .uri("/v1/index")
+        .header("authorization", "Bearer parity")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({ "root": http_lib.path().to_str().unwrap() }).to_string(),
+        ))
+        .unwrap();
+    let _ = app(Settings::default(), http_services.clone())
+        .oneshot(index_req)
+        .await
+        .expect("http index");
+    wait_for_http_files(&http_pool, 1).await;
+
+    let (http_uuid, http_file_id): (String, i64) =
+        sqlx::query_as("SELECT uuid, id FROM files WHERE name = ?")
+            .bind("song.mp3")
+            .fetch_one(&http_pool)
+            .await
+            .unwrap();
+
+    // The file is deleted out from under the catalog, exactly as AF-01
+    // describes, *after* indexing so the row still points at the path.
+    std::fs::remove_file(http_lib.path().join("song.mp3")).expect("http pre-remove");
+
+    let purge_req = Request::builder()
+        .method("DELETE")
+        .uri(format!("/v1/files/{http_uuid}?purge-on-disk=true"))
+        .header("authorization", "Bearer parity")
+        .body(Body::empty())
+        .unwrap();
+    let http_resp = app(Settings::default(), http_services.clone())
+        .oneshot(purge_req)
+        .await
+        .expect("http purge-on-disk");
+    assert_eq!(http_resp.status(), axum::http::StatusCode::OK);
+    let http_body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(http_resp.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
+
+    let http_files_remaining: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM files WHERE uuid = ?")
+        .bind(&http_uuid)
+        .fetch_one(&http_pool)
+        .await
+        .unwrap();
+    let http_subtype_remaining: (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM audio_files WHERE file_id = ?")
+            .bind(http_file_id)
+            .fetch_one(&http_pool)
+            .await
+            .unwrap();
+
+    // ---- FFI leg (own identical lib + db) ----
+    let ffi_lib = tempdir().unwrap();
+    std::fs::write(ffi_lib.path().join("song.mp3"), b"parity-audio").unwrap();
+    let ffi_dir = tempdir().unwrap();
+    let ffi_db = db_path(&ffi_dir, "ffi.sqlite");
+    let ffi_lib_path = ffi_lib.path().to_str().unwrap().to_string();
+    let ffi_disk_file = ffi_lib.path().join("song.mp3");
+
+    let (ffi_body, ffi_files_remaining, ffi_subtype_remaining) =
+        tokio::task::spawn_blocking(move || -> (serde_json::Value, i64, i64) {
+            let cdb = CString::new(ffi_db).unwrap();
+            assert_eq!(
+                alexandria_index_init(cdb.as_ptr()),
+                alexandria_ffi::INDEX_OK
+            );
+
+            let root = CString::new(ffi_lib_path).unwrap();
+            let token = CString::new("parity").unwrap();
+            let started = alexandria_index_start(root.as_ptr(), token.as_ptr());
+            assert_eq!(started.status, alexandria_ffi::INDEX_OK);
+            wait_for_ffi_files(1);
+
+            let ffi_db_path = std::path::PathBuf::from(ffi_dir.path()).join("ffi.sqlite");
+            let (ffi_uuid, ffi_file_id) = std::thread::spawn({
+                let ffi_db_path = ffi_db_path.clone();
+                move || -> (String, i64) {
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .unwrap();
+                    rt.block_on(async move {
+                        let url = format!("sqlite://{}", ffi_db_path.to_str().unwrap());
+                        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+                            .max_connections(1)
+                            .connect(&format!("{url}?mode=rw"))
+                            .await
+                            .unwrap();
+                        let (uuid, id): (String, i64) =
+                            sqlx::query_as("SELECT uuid, id FROM files WHERE name=?")
+                                .bind("song.mp3")
+                                .fetch_one(&pool)
+                                .await
+                                .unwrap();
+                        (uuid, id)
+                    })
+                }
+            })
+            .join()
+            .unwrap();
+
+            // Same AF-01 setup as the HTTP leg: remove the file after indexing.
+            std::fs::remove_file(&ffi_disk_file).expect("ffi pre-remove");
+
+            let result = alexandria_file_purge_on_disk(
+                CString::new(ffi_uuid.clone()).unwrap().as_ptr(),
+                token.as_ptr(),
+            );
+            assert_eq!(
+                result.status,
+                alexandria_ffi::FILE_OK,
+                "ffi purge-on-disk with an absent file is still a success (AF-01)"
+            );
+            assert!(!result.json.is_null());
+            let s = unsafe { CStr::from_ptr(result.json) }
+                .to_str()
+                .unwrap()
+                .to_string();
+            // SAFETY: pointer came from this library and is freed once.
+            unsafe {
+                alexandria_free_string(result.json);
+            }
+            let ffi_body: serde_json::Value = serde_json::from_str(&s).unwrap();
+
+            let (files_remaining, subtype_remaining) = std::thread::spawn({
+                let ffi_db_path = ffi_db_path.clone();
+                move || -> (i64, i64) {
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .unwrap();
+                    rt.block_on(async move {
+                        let url = format!("sqlite://{}", ffi_db_path.to_str().unwrap());
+                        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+                            .max_connections(1)
+                            .connect(&format!("{url}?mode=rw"))
+                            .await
+                            .unwrap();
+                        let (files,): (i64,) =
+                            sqlx::query_as("SELECT COUNT(*) FROM files WHERE uuid = ?")
+                                .bind(&ffi_uuid)
+                                .fetch_one(&pool)
+                                .await
+                                .unwrap();
+                        let (subtype,): (i64,) =
+                            sqlx::query_as("SELECT COUNT(*) FROM audio_files WHERE file_id = ?")
+                                .bind(ffi_file_id)
+                                .fetch_one(&pool)
+                                .await
+                                .unwrap();
+                        (files, subtype)
+                    })
+                }
+            })
+            .join()
+            .unwrap();
+
+            (ffi_body, files_remaining, subtype_remaining)
+        })
+        .await
+        .unwrap();
+
+    // ---- compare ----
+    assert_eq!(
+        http_body["diskFilePresent"], false,
+        "http reports the absent on-disk file (AF-01)"
+    );
+    assert_eq!(
+        ffi_body["diskFilePresent"], false,
+        "ffi reports the absent on-disk file (AF-01)"
+    );
+
+    let norm = |v: &serde_json::Value| -> serde_json::Value {
+        let mut f = v.clone();
+        if let Some(file) = f.get_mut("file").and_then(|f| f.as_object_mut()) {
+            file.remove("uuid");
+            file.remove("path");
+            file.remove("indexedAt");
+        }
+        f
+    };
+    assert_eq!(
+        norm(&http_body),
+        norm(&ffi_body),
+        "PurgeOnDiskOutcome body diverges across surfaces"
+    );
+
+    assert_eq!(
+        http_files_remaining.0, 0,
+        "http record purged despite the absent disk file"
+    );
+    assert_eq!(
+        ffi_files_remaining, 0,
+        "ffi record purged despite the absent disk file"
+    );
+    assert_eq!(http_subtype_remaining.0, 0, "http subtype row removed");
+    assert_eq!(ffi_subtype_remaining, 0, "ffi subtype row removed");
+}
+
+/// UC-08 / UC-09 parity — an unknown uuid is a not-found on both surfaces
+/// (HTTP 404, FFI `FILE_ERR_NOT_FOUND`) for both the hard purge and the
+/// purge-on-disk (AF-02 / AF-03, FR-FC-24 / NFR-09). No library is indexed:
+/// the catalogs are empty on both legs, so every uuid is unknown.
+#[tokio::test]
+async fn given_unknown_uuid_when_purged_via_http_and_ffi_then_both_not_found() {
+    let _g = SERIAL.lock().unwrap();
+
+    let uuid = uuid::Uuid::new_v4().to_string();
+
+    // ---- HTTP leg ----
+    let http_dir = tempdir().unwrap();
+    let http_db = db_path(&http_dir, "http.sqlite");
+    let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    let http_services =
+        std::sync::Arc::new(build_services(&Settings::default(), http_pool.clone()).await);
+
+    for query in ["purge=true", "purge-on-disk=true"] {
+        let req = Request::builder()
+            .method("DELETE")
+            .uri(format!("/v1/files/{uuid}?{query}"))
+            .header("authorization", "Bearer parity")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app(Settings::default(), http_services.clone())
+            .oneshot(req)
+            .await
+            .expect("http delete");
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::NOT_FOUND,
+            "http {query} on an unknown uuid must be 404"
+        );
+    }
+
+    // ---- FFI leg ----
+    let ffi_dir = tempdir().unwrap();
+    let ffi_db = db_path(&ffi_dir, "ffi.sqlite");
+    let ffi_uuid = uuid.clone();
+    let (purge_status, purge_on_disk_status) =
+        tokio::task::spawn_blocking(move || -> (i32, i32) {
+            let cdb = CString::new(ffi_db).unwrap();
+            assert_eq!(
+                alexandria_index_init(cdb.as_ptr()),
+                alexandria_ffi::INDEX_OK
+            );
+
+            let token = CString::new("parity").unwrap();
+            let uuid = CString::new(ffi_uuid).unwrap();
+
+            let purge = alexandria_file_purge(uuid.as_ptr(), token.as_ptr());
+            if !purge.json.is_null() {
+                // SAFETY: pointer came from this library and is freed once.
+                unsafe {
+                    alexandria_free_string(purge.json);
+                }
+            }
+            let purge_on_disk = alexandria_file_purge_on_disk(uuid.as_ptr(), token.as_ptr());
+            if !purge_on_disk.json.is_null() {
+                // SAFETY: pointer came from this library and is freed once.
+                unsafe {
+                    alexandria_free_string(purge_on_disk.json);
+                }
+            }
+            (purge.status, purge_on_disk.status)
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        purge_status,
+        alexandria_ffi::FILE_ERR_NOT_FOUND,
+        "ffi purge on an unknown uuid must map to FILE_ERR_NOT_FOUND"
+    );
+    assert_eq!(
+        purge_on_disk_status,
+        alexandria_ffi::FILE_ERR_NOT_FOUND,
+        "ffi purge-on-disk on an unknown uuid must map to FILE_ERR_NOT_FOUND"
+    );
+}
+
+/// UC-08 AF-01 parity — hard-purging a record that was never soft-deleted is
+/// a state conflict on both surfaces (HTTP 409, FFI
+/// `FILE_ERR_INVALID_STATE`), and leaves the row in place on both legs
+/// (FR-FC-22, NFR-07, FR-FC-24 / NFR-09).
+#[tokio::test]
+async fn given_active_file_when_purged_via_http_and_ffi_then_both_invalid_state() {
+    let _g = SERIAL.lock().unwrap();
+
+    // ---- HTTP leg ----
+    let http_lib = tempdir().unwrap();
+    std::fs::write(http_lib.path().join("song.mp3"), b"parity-audio").unwrap();
+
+    let http_dir = tempdir().unwrap();
+    let http_db = db_path(&http_dir, "http.sqlite");
+    let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    let http_services =
+        std::sync::Arc::new(build_services(&Settings::default(), http_pool.clone()).await);
+
+    let index_req = Request::builder()
+        .method("POST")
+        .uri("/v1/index")
+        .header("authorization", "Bearer parity")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({ "root": http_lib.path().to_str().unwrap() }).to_string(),
+        ))
+        .unwrap();
+    let _ = app(Settings::default(), http_services.clone())
+        .oneshot(index_req)
+        .await
+        .expect("http index");
+    wait_for_http_files(&http_pool, 1).await;
+
+    let (http_uuid,): (String,) = sqlx::query_as("SELECT uuid FROM files WHERE name = ?")
+        .bind("song.mp3")
+        .fetch_one(&http_pool)
+        .await
+        .unwrap();
+
+    // Never soft-deleted — the record is `active`, so the retention window
+    // never started and the hard purge must be refused.
+    let purge_req = Request::builder()
+        .method("DELETE")
+        .uri(format!("/v1/files/{http_uuid}?purge=true"))
+        .header("authorization", "Bearer parity")
+        .body(Body::empty())
+        .unwrap();
+    let http_resp = app(Settings::default(), http_services.clone())
+        .oneshot(purge_req)
+        .await
+        .expect("http purge");
+    assert_eq!(http_resp.status(), axum::http::StatusCode::CONFLICT);
+
+    let http_remaining: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM files WHERE uuid = ?")
+        .bind(&http_uuid)
+        .fetch_one(&http_pool)
+        .await
+        .unwrap();
+
+    // ---- FFI leg (own identical lib + db) ----
+    let ffi_lib = tempdir().unwrap();
+    std::fs::write(ffi_lib.path().join("song.mp3"), b"parity-audio").unwrap();
+    let ffi_dir = tempdir().unwrap();
+    let ffi_db = db_path(&ffi_dir, "ffi.sqlite");
+    let ffi_lib_path = ffi_lib.path().to_str().unwrap().to_string();
+
+    let (ffi_status, ffi_remaining) = tokio::task::spawn_blocking(move || -> (i32, i64) {
+        let cdb = CString::new(ffi_db).unwrap();
+        assert_eq!(
+            alexandria_index_init(cdb.as_ptr()),
+            alexandria_ffi::INDEX_OK
+        );
+
+        let root = CString::new(ffi_lib_path).unwrap();
+        let token = CString::new("parity").unwrap();
+        let started = alexandria_index_start(root.as_ptr(), token.as_ptr());
+        assert_eq!(started.status, alexandria_ffi::INDEX_OK);
+        wait_for_ffi_files(1);
+
+        let ffi_db_path = std::path::PathBuf::from(ffi_dir.path()).join("ffi.sqlite");
+        let ffi_uuid = std::thread::spawn({
+            let ffi_db_path = ffi_db_path.clone();
+            move || -> String {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                rt.block_on(async move {
+                    let url = format!("sqlite://{}", ffi_db_path.to_str().unwrap());
+                    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+                        .max_connections(1)
+                        .connect(&format!("{url}?mode=rw"))
+                        .await
+                        .unwrap();
+                    let (uuid,): (String,) = sqlx::query_as("SELECT uuid FROM files WHERE name=?")
+                        .bind("song.mp3")
+                        .fetch_one(&pool)
+                        .await
+                        .unwrap();
+                    uuid
+                })
+            }
+        })
+        .join()
+        .unwrap();
+
+        let result = alexandria_file_purge(
+            CString::new(ffi_uuid.clone()).unwrap().as_ptr(),
+            token.as_ptr(),
+        );
+        if !result.json.is_null() {
+            // SAFETY: pointer came from this library and is freed once.
+            unsafe {
+                alexandria_free_string(result.json);
+            }
+        }
+
+        let remaining = std::thread::spawn({
+            let ffi_db_path = ffi_db_path.clone();
+            move || -> i64 {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                rt.block_on(async move {
+                    let url = format!("sqlite://{}", ffi_db_path.to_str().unwrap());
+                    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+                        .max_connections(1)
+                        .connect(&format!("{url}?mode=rw"))
+                        .await
+                        .unwrap();
+                    let (files,): (i64,) =
+                        sqlx::query_as("SELECT COUNT(*) FROM files WHERE uuid = ?")
+                            .bind(&ffi_uuid)
+                            .fetch_one(&pool)
+                            .await
+                            .unwrap();
+                    files
+                })
+            }
+        })
+        .join()
+        .unwrap();
+
+        (result.status, remaining)
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(
+        ffi_status,
+        alexandria_ffi::FILE_ERR_INVALID_STATE,
+        "ffi purge of an active record must map to FILE_ERR_INVALID_STATE (HTTP 409)"
+    );
+    assert_eq!(http_remaining.0, 1, "http row kept by the rejected purge");
+    assert_eq!(ffi_remaining, 1, "ffi row kept by the rejected purge");
 }
