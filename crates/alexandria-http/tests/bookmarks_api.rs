@@ -933,3 +933,134 @@ async fn given_no_token_when_restored_then_401() {
         .unwrap();
     assert_eq!(state, "deleted");
 }
+
+// ==================== UC-19: Hard-purge a bookmark ====================
+
+fn purge_request(uuid: &str) -> Request<Body> {
+    Request::builder()
+        .method("DELETE")
+        .uri(format!("/v1/bookmarks/{uuid}?purge=true"))
+        .header("authorization", "Bearer test-token")
+        .body(Body::empty())
+        .unwrap()
+}
+
+/// Mark `uuid` deleted with a `deleted_at` well past the default 30-day
+/// retention window.
+async fn mark_deleted_past_retention(pool: &sqlx::sqlite::SqlitePool, uuid: &str) {
+    sqlx::query("UPDATE bookmarks SET state = 'deleted', deleted_at = ? WHERE uuid = ?")
+        .bind("2024-01-01T00:00:00Z")
+        .bind(uuid)
+        .execute(pool)
+        .await
+        .expect("past-retention seed");
+}
+
+// ---------------- Main flow ----------------
+
+#[tokio::test]
+async fn given_deleted_bookmark_past_retention_when_purged_then_200_and_row_removed() {
+    let test = test_app().await;
+    let router = app(Settings::default(), test.services.clone());
+    let (router, uuid) = create_bookmark(router, "https://example.com", "Example").await;
+    mark_deleted_past_retention(&test.pool, &uuid).await;
+
+    let response = router.oneshot(purge_request(&uuid)).await.expect("purge");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_json(response).await;
+    assert_eq!(body["uuid"], uuid);
+    assert_eq!(
+        body["state"], "deleted",
+        "confirmation echoes pre-purge state"
+    );
+
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM bookmarks WHERE uuid = ?")
+        .bind(&uuid)
+        .fetch_one(&test.pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
+}
+
+// ---------------- AF-01: retention window not elapsed ----------------
+
+#[tokio::test]
+async fn given_active_bookmark_when_purged_then_409_and_row_kept() {
+    let test = test_app().await;
+    let router = app(Settings::default(), test.services.clone());
+    let (router, uuid) = create_bookmark(router, "https://example.com", "Example").await;
+
+    let response = router.oneshot(purge_request(&uuid)).await.expect("purge");
+
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM bookmarks WHERE uuid = ?")
+        .bind(&uuid)
+        .fetch_one(&test.pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 1);
+}
+
+#[tokio::test]
+async fn given_deleted_bookmark_within_retention_when_purged_then_409_and_row_kept() {
+    let test = test_app().await;
+    let router = app(Settings::default(), test.services.clone());
+    let (router, uuid) = create_bookmark(router, "https://example.com", "Example").await;
+    let resp = router
+        .clone()
+        .oneshot(soft_delete_request(&uuid))
+        .await
+        .expect("delete");
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let response = router.oneshot(purge_request(&uuid)).await.expect("purge");
+
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM bookmarks WHERE uuid = ?")
+        .bind(&uuid)
+        .fetch_one(&test.pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 1);
+}
+
+// ---------------- AF-02: bookmark does not exist ----------------
+
+#[tokio::test]
+async fn given_unknown_uuid_when_purged_then_404() {
+    let test = test_app().await;
+    let router = app(Settings::default(), test.services);
+
+    let response = router
+        .oneshot(purge_request(&uuid::Uuid::new_v4().to_string()))
+        .await
+        .expect("purge");
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+// ---------------- AF-03: unauthorized ----------------
+
+#[tokio::test]
+async fn given_no_token_when_purged_then_401_and_row_kept() {
+    let test = test_app().await;
+    let router = app(Settings::default(), test.services.clone());
+    let (router, uuid) = create_bookmark(router, "https://example.com", "Example").await;
+    mark_deleted_past_retention(&test.pool, &uuid).await;
+
+    let request = Request::builder()
+        .method("DELETE")
+        .uri(format!("/v1/bookmarks/{uuid}?purge=true"))
+        .body(Body::empty())
+        .unwrap();
+    let response = router.oneshot(request).await.expect("purge");
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM bookmarks WHERE uuid = ?")
+        .bind(&uuid)
+        .fetch_one(&test.pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 1);
+}

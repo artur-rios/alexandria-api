@@ -5,6 +5,7 @@ use sqlx::sqlite::SqlitePool;
 use crate::auth::BearerAuthService;
 use crate::bookmarks::commands::create::CreateBookmarkHandler;
 use crate::bookmarks::commands::lifecycle::BookmarkLifecycleHandler;
+use crate::bookmarks::commands::purge::PurgeBookmarkHandler;
 use crate::bookmarks::commands::update::UpdateBookmarkHandler;
 use crate::bookmarks::queries::browse::BrowseBookmarksHandler;
 use crate::bookmarks::repos::SqliteBookmarkRepository;
@@ -80,6 +81,9 @@ pub type DefaultBrowseBookmarksHandler =
 pub type DefaultBookmarkLifecycleHandler =
     BookmarkLifecycleHandler<BearerAuthService, SqliteBookmarkRepository, SystemClock>;
 
+pub type DefaultPurgeBookmarkHandler =
+    PurgeBookmarkHandler<BearerAuthService, SqliteBookmarkRepository, SystemClock>;
+
 pub type DefaultAddItemsToCollectionHandler = AddItemsToCollectionHandler<
     BearerAuthService,
     SqliteCollectionRepository,
@@ -119,6 +123,7 @@ pub struct Services {
     pub update_bookmark_handler: Arc<DefaultUpdateBookmarkHandler>,
     pub browse_bookmarks_handler: Arc<DefaultBrowseBookmarksHandler>,
     pub bookmark_lifecycle_handler: Arc<DefaultBookmarkLifecycleHandler>,
+    pub purge_bookmark_handler: Arc<DefaultPurgeBookmarkHandler>,
     pub add_items_to_collection_handler: Arc<DefaultAddItemsToCollectionHandler>,
     pub remove_item_from_collection_handler: Arc<DefaultRemoveItemFromCollectionHandler>,
     pub list_collection_items_handler: Arc<DefaultListCollectionItemsHandler>,
@@ -190,6 +195,12 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         SqliteBookmarkRepository::new(pool.clone()),
         clock,
     ));
+    let purge_bookmark_handler = Arc::new(PurgeBookmarkHandler::new(
+        auth,
+        SqliteBookmarkRepository::new(pool.clone()),
+        clock,
+        retention_days,
+    ));
     let add_items_to_collection_handler = Arc::new(AddItemsToCollectionHandler::new(
         auth,
         SqliteCollectionRepository::new(pool.clone()),
@@ -225,6 +236,7 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         update_bookmark_handler,
         browse_bookmarks_handler,
         bookmark_lifecycle_handler,
+        purge_bookmark_handler,
         add_items_to_collection_handler,
         remove_item_from_collection_handler,
         list_collection_items_handler,

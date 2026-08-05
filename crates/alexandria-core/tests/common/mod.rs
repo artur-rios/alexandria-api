@@ -975,4 +975,10 @@ impl BookmarkRepository for FakeBookmarkRepository {
         bookmark.deleted_at = None;
         Ok(bookmark.clone())
     }
+
+    async fn purge(&self, uuid: Uuid) -> Result<(), DomainError> {
+        let mut bookmarks = self.bookmarks.lock().unwrap();
+        bookmarks.remove(&uuid).ok_or(DomainError::NotFound)?;
+        Ok(())
+    }
 }

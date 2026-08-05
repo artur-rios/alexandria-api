@@ -174,29 +174,58 @@ pub async fn list(
     Ok(Json(bookmarks))
 }
 
-/// `DELETE /v1/bookmarks/{uuid}` — soft-delete a bookmark (UC-18 / FR-BM-03).
-/// Marks the record `deleted` and stamps `deleted_at`; restorable via
-/// `POST /v1/bookmarks/{uuid}/restore`. Returns `200` with the updated
-/// `Bookmark`, or `404` (uuid not found, AF-01), `409` (already deleted), or
-/// `401` (unauthenticated).
+/// Query-string parameters for `DELETE /v1/bookmarks/{uuid}`. `purge=true`
+/// dispatches to the UC-19 hard-purge handler; anything else (absent, or
+/// `false`) is the UC-18 soft-delete — mirroring `DeleteQuery` on the files
+/// surface.
+#[derive(Debug, Deserialize)]
+pub struct DeleteBookmarkQuery {
+    pub purge: Option<bool>,
+}
+
+/// `DELETE /v1/bookmarks/{uuid}` — soft-delete a bookmark (UC-18 / FR-BM-03),
+/// or, with `?purge=true`, hard-purge a soft-deleted bookmark's record once
+/// its retention window has elapsed (UC-19 / FR-BM-04).
 ///
-/// The path is taken as a `Result` so its rejection becomes this surface's
-/// `400` + `{"error": …}` envelope rather than axum's bare-text `400`.
-pub async fn soft_delete(
+/// Soft-delete marks the record `deleted` and stamps `deleted_at`;
+/// restorable via `POST /v1/bookmarks/{uuid}/restore`. Returns `200` with
+/// the updated `Bookmark`, or `404` (uuid not found, AF-01), `409` (already
+/// deleted), or `401` (unauthenticated).
+///
+/// `?purge=true` permanently removes the record instead. Returns `200` with
+/// the pre-purge `Bookmark` as confirmation, or `400` (bad uuid or
+/// non-boolean `purge`), `404` (uuid not found), `409` (not `deleted`, or
+/// still within the retention window — AF-01), or `401`.
+///
+/// The path and query are each taken as a `Result` so a rejection becomes
+/// this surface's `400` + `{"error": …}` envelope rather than axum's
+/// bare-text `400`/`422`.
+pub async fn delete(
     State(state): State<AppState>,
     uuid: Result<Path<Uuid>, PathRejection>,
+    query: Result<Query<DeleteBookmarkQuery>, QueryRejection>,
     headers: HeaderMap,
 ) -> Result<(StatusCode, Json<Bookmark>), ApiError> {
     let token = bearer_token(&headers);
 
     let Path(uuid) = uuid.map_err(|_| invalid_input("path segment is not a valid UUID"))?;
+    let Query(query) = query.map_err(|_| invalid_input("purge must be true or false"))?;
 
-    let result = state
-        .services
-        .bookmark_lifecycle_handler
-        .soft_delete(uuid, &token)
-        .await
-        .map_err(ApiError)?;
+    let result = if query.purge.unwrap_or(false) {
+        state
+            .services
+            .purge_bookmark_handler
+            .purge(uuid, &token)
+            .await
+            .map_err(ApiError)?
+    } else {
+        state
+            .services
+            .bookmark_lifecycle_handler
+            .soft_delete(uuid, &token)
+            .await
+            .map_err(ApiError)?
+    };
 
     Ok((StatusCode::OK, Json(result)))
 }

@@ -61,10 +61,7 @@ pub fn app(settings: Settings, services: Arc<Services>) -> Router {
         .route("/v1/bookmarks", post(routes::bookmarks::create))
         .route("/v1/bookmarks", get(routes::bookmarks::list))
         .route("/v1/bookmarks/{uuid}", patch(routes::bookmarks::update))
-        .route(
-            "/v1/bookmarks/{uuid}",
-            delete(routes::bookmarks::soft_delete),
-        )
+        .route("/v1/bookmarks/{uuid}", delete(routes::bookmarks::delete))
         .route(
             "/v1/bookmarks/{uuid}/restore",
             post(routes::bookmarks::restore),

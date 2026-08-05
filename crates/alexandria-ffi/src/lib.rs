@@ -1672,6 +1672,45 @@ pub extern "C" fn alexandria_bookmark_restore(
     }
 }
 
+/// Hard-purge a bookmark (UC-19 / FR-BM-04).
+///
+/// `uuid` is the bookmark's public UUID (NUL-terminated string). On success
+/// `json` carries the pre-purge `Bookmark` as confirmation — byte-for-byte
+/// the same shape HTTP returns from `DELETE /v1/bookmarks/{uuid}?purge=true`
+/// (parity, FR-FC-24 / NFR-09). `token` is the bearer auth token.
+#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
+#[no_mangle]
+pub extern "C" fn alexandria_bookmark_purge(
+    uuid: *const c_char,
+    token: *const c_char,
+) -> BookmarkJsonResult {
+    let services = match services_slot().lock().unwrap().clone() {
+        Some(s) => s,
+        None => return BookmarkJsonResult::err(BOOKMARK_ERR_NOT_INITIALIZED),
+    };
+
+    let token = cstr_lossy(token).unwrap_or_default();
+    if !authenticated(&services, &token) {
+        return BookmarkJsonResult::err(BOOKMARK_ERR_UNAUTHORIZED);
+    }
+
+    let uuid = match cstr_lossy(uuid).and_then(|s| uuid::Uuid::parse_str(&s).ok()) {
+        Some(u) => u,
+        None => return BookmarkJsonResult::err(BOOKMARK_ERR_INVALID_INPUT),
+    };
+
+    let result =
+        runtime().block_on(async { services.purge_bookmark_handler.purge(uuid, &token).await });
+
+    match result {
+        Ok(bookmark) => {
+            let json = serde_json::to_string(&bookmark).unwrap_or_default();
+            BookmarkJsonResult::ok(json)
+        }
+        Err(err) => map_bookmark_err(err),
+    }
+}
+
 fn parse_file_type(s: &str) -> Option<alexandria_core::catalog::model::FileType> {
     use alexandria_core::catalog::model::FileType;
     match s {
