@@ -12,3 +12,6 @@ mod browse;
 
 #[path = "watchlists/update_progress.rs"]
 mod update_progress;
+
+#[path = "watchlists/remove_video.rs"]
+mod remove_video;

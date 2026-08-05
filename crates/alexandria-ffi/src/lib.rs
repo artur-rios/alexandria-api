@@ -2090,6 +2090,56 @@ pub extern "C" fn alexandria_watchlist_update_progress(
     }
 }
 
+/// Remove a video from a watchlist (UC-24 / FR-WL-06).
+///
+/// `watchlist_uuid` and `video_uuid` are the watchlist's and video's public
+/// UUIDs (NUL-terminated strings). On success `json` carries the
+/// `watchlistUuid`/`videoUuid` confirmation — byte-for-byte the same shape
+/// HTTP returns from `DELETE /v1/watchlists/{uuid}/items/{videoUuid}`
+/// (parity, FR-FC-24 / NFR-09). `token` is the bearer auth token.
+#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
+#[no_mangle]
+pub extern "C" fn alexandria_watchlist_remove_video(
+    watchlist_uuid: *const c_char,
+    video_uuid: *const c_char,
+    token: *const c_char,
+) -> WatchlistJsonResult {
+    let services = match services_slot().lock().unwrap().clone() {
+        Some(s) => s,
+        None => return WatchlistJsonResult::err(WATCHLIST_ERR_NOT_INITIALIZED),
+    };
+
+    let token = cstr_lossy(token).unwrap_or_default();
+    if !authenticated(&services, &token) {
+        return WatchlistJsonResult::err(WATCHLIST_ERR_UNAUTHORIZED);
+    }
+
+    let watchlist_uuid =
+        match cstr_lossy(watchlist_uuid).and_then(|s| uuid::Uuid::parse_str(&s).ok()) {
+            Some(u) => u,
+            None => return WatchlistJsonResult::err(WATCHLIST_ERR_INVALID_INPUT),
+        };
+    let video_uuid = match cstr_lossy(video_uuid).and_then(|s| uuid::Uuid::parse_str(&s).ok()) {
+        Some(u) => u,
+        None => return WatchlistJsonResult::err(WATCHLIST_ERR_INVALID_INPUT),
+    };
+
+    let result = runtime().block_on(async {
+        services
+            .remove_video_from_watchlist_handler
+            .remove(watchlist_uuid, video_uuid, &token)
+            .await
+    });
+
+    match result {
+        Ok(removed) => {
+            let json = serde_json::to_string(&removed).unwrap_or_default();
+            WatchlistJsonResult::ok(json)
+        }
+        Err(err) => map_watchlist_err(err),
+    }
+}
+
 fn parse_file_type(s: &str) -> Option<alexandria_core::catalog::model::FileType> {
     use alexandria_core::catalog::model::FileType;
     match s {

@@ -1109,4 +1109,20 @@ impl WatchlistRepository for FakeWatchlistRepository {
             .insert((watchlist_uuid, video_uuid), updated.clone());
         Ok(updated)
     }
+
+    async fn remove_progress(
+        &self,
+        watchlist_uuid: Uuid,
+        video_uuid: Uuid,
+    ) -> Result<(), DomainError> {
+        let removed = self
+            .progress
+            .lock()
+            .unwrap()
+            .remove(&(watchlist_uuid, video_uuid));
+        match removed {
+            Some(_) => Ok(()),
+            None => Err(DomainError::NotFound),
+        }
+    }
 }

@@ -31,6 +31,7 @@ use crate::collections::repos::SqliteCollectionRepository;
 use crate::config::Settings;
 use crate::watchlists::commands::add_video::AddVideoToWatchlistHandler;
 use crate::watchlists::commands::create::CreateWatchlistHandler;
+use crate::watchlists::commands::remove_video::RemoveVideoFromWatchlistHandler;
 use crate::watchlists::commands::update_progress::UpdateWatchProgressHandler;
 use crate::watchlists::queries::browse::BrowseWatchlistsHandler;
 use crate::watchlists::repos::SqliteWatchlistRepository;
@@ -125,6 +126,9 @@ pub type DefaultBrowseWatchlistsHandler =
 pub type DefaultUpdateWatchProgressHandler =
     UpdateWatchProgressHandler<BearerAuthService, SqliteWatchlistRepository>;
 
+pub type DefaultRemoveVideoFromWatchlistHandler =
+    RemoveVideoFromWatchlistHandler<BearerAuthService, SqliteWatchlistRepository>;
+
 #[derive(Clone)]
 pub struct Services {
     pub index_handler: Arc<DefaultIndexHandler>,
@@ -151,6 +155,7 @@ pub struct Services {
     pub add_video_to_watchlist_handler: Arc<DefaultAddVideoToWatchlistHandler>,
     pub browse_watchlists_handler: Arc<DefaultBrowseWatchlistsHandler>,
     pub update_watch_progress_handler: Arc<DefaultUpdateWatchProgressHandler>,
+    pub remove_video_from_watchlist_handler: Arc<DefaultRemoveVideoFromWatchlistHandler>,
     /// The same auth service the handlers hold, exposed so a transport can
     /// reject an unauthenticated caller *before* it parses a request body or
     /// path (FR-AU-07 / SRD §7). Handlers still authenticate independently —
@@ -253,8 +258,12 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
     ));
     let browse_watchlists_handler =
         Arc::new(BrowseWatchlistsHandler::new(auth, watchlist_repo.clone()));
-    let update_watch_progress_handler =
-        Arc::new(UpdateWatchProgressHandler::new(auth, watchlist_repo));
+    let update_watch_progress_handler = Arc::new(UpdateWatchProgressHandler::new(
+        auth,
+        watchlist_repo.clone(),
+    ));
+    let remove_video_from_watchlist_handler =
+        Arc::new(RemoveVideoFromWatchlistHandler::new(auth, watchlist_repo));
     Services {
         index_handler,
         refresh_handler,
@@ -280,6 +289,7 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         add_video_to_watchlist_handler,
         browse_watchlists_handler,
         update_watch_progress_handler,
+        remove_video_from_watchlist_handler,
         auth,
         pool,
     }
