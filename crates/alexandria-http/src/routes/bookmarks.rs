@@ -173,3 +173,55 @@ pub async fn list(
 
     Ok(Json(bookmarks))
 }
+
+/// `DELETE /v1/bookmarks/{uuid}` — soft-delete a bookmark (UC-18 / FR-BM-03).
+/// Marks the record `deleted` and stamps `deleted_at`; restorable via
+/// `POST /v1/bookmarks/{uuid}/restore`. Returns `200` with the updated
+/// `Bookmark`, or `404` (uuid not found, AF-01), `409` (already deleted), or
+/// `401` (unauthenticated).
+///
+/// The path is taken as a `Result` so its rejection becomes this surface's
+/// `400` + `{"error": …}` envelope rather than axum's bare-text `400`.
+pub async fn soft_delete(
+    State(state): State<AppState>,
+    uuid: Result<Path<Uuid>, PathRejection>,
+    headers: HeaderMap,
+) -> Result<(StatusCode, Json<Bookmark>), ApiError> {
+    let token = bearer_token(&headers);
+
+    let Path(uuid) = uuid.map_err(|_| invalid_input("path segment is not a valid UUID"))?;
+
+    let result = state
+        .services
+        .bookmark_lifecycle_handler
+        .soft_delete(uuid, &token)
+        .await
+        .map_err(ApiError)?;
+
+    Ok((StatusCode::OK, Json(result)))
+}
+
+/// `POST /v1/bookmarks/{uuid}/restore` — restore a soft-deleted bookmark
+/// (UC-18 / FR-BM-05). Returns the record to `active` and clears
+/// `deleted_at`. Returns `200` with the restored `Bookmark`, or `404` (uuid
+/// not found, AF-01), `409` (not currently deleted), or `401`
+/// (unauthenticated). Restore takes no body — a parameterless state
+/// transition — so there is no body extractor.
+pub async fn restore(
+    State(state): State<AppState>,
+    uuid: Result<Path<Uuid>, PathRejection>,
+    headers: HeaderMap,
+) -> Result<(StatusCode, Json<Bookmark>), ApiError> {
+    let token = bearer_token(&headers);
+
+    let Path(uuid) = uuid.map_err(|_| invalid_input("path segment is not a valid UUID"))?;
+
+    let result = state
+        .services
+        .bookmark_lifecycle_handler
+        .restore(uuid, &token)
+        .await
+        .map_err(ApiError)?;
+
+    Ok((StatusCode::OK, Json(result)))
+}

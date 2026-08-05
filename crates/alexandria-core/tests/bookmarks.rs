@@ -9,3 +9,6 @@ mod update;
 
 #[path = "bookmarks/browse.rs"]
 mod browse;
+
+#[path = "bookmarks/lifecycle.rs"]
+mod lifecycle;

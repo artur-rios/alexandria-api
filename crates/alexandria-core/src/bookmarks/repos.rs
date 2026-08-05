@@ -1,3 +1,4 @@
+use chrono::{DateTime, Utc};
 use sqlx::sqlite::{SqlitePool, SqliteRow};
 use sqlx::Row;
 use uuid::Uuid;
@@ -60,6 +61,20 @@ pub trait BookmarkRepository: Send + Sync {
         title: String,
         collection_uuid: Option<Uuid>,
     ) -> Result<Bookmark, DomainError>;
+
+    /// Mark the bookmark identified by `uuid` `deleted` and stamp
+    /// `deleted_at` (UC-18 / FR-BM-03). Returns the updated record.
+    /// `NotFound` when no bookmark carries the uuid.
+    async fn soft_delete(
+        &self,
+        uuid: Uuid,
+        deleted_at: DateTime<Utc>,
+    ) -> Result<Bookmark, DomainError>;
+
+    /// Restore the bookmark identified by `uuid` to `active` and clear
+    /// `deleted_at` (UC-18 / FR-BM-05). Returns the updated record.
+    /// `NotFound` when no bookmark carries the uuid.
+    async fn restore(&self, uuid: Uuid) -> Result<Bookmark, DomainError>;
 }
 
 #[derive(Clone)]
@@ -203,6 +218,29 @@ impl BookmarkRepository for SqliteBookmarkRepository {
         .bind(uuid.to_string())
         .execute(&self.pool)
         .await?;
+
+        self.find_by_uuid(uuid).await?.ok_or(DomainError::NotFound)
+    }
+
+    async fn soft_delete(
+        &self,
+        uuid: Uuid,
+        deleted_at: DateTime<Utc>,
+    ) -> Result<Bookmark, DomainError> {
+        sqlx::query("UPDATE bookmarks SET state = 'deleted', deleted_at = ? WHERE uuid = ?")
+            .bind(deleted_at.to_rfc3339())
+            .bind(uuid.to_string())
+            .execute(&self.pool)
+            .await?;
+
+        self.find_by_uuid(uuid).await?.ok_or(DomainError::NotFound)
+    }
+
+    async fn restore(&self, uuid: Uuid) -> Result<Bookmark, DomainError> {
+        sqlx::query("UPDATE bookmarks SET state = 'active', deleted_at = NULL WHERE uuid = ?")
+            .bind(uuid.to_string())
+            .execute(&self.pool)
+            .await?;
 
         self.find_by_uuid(uuid).await?.ok_or(DomainError::NotFound)
     }

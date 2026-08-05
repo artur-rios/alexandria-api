@@ -722,3 +722,214 @@ async fn given_no_token_when_listed_then_401() {
 
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 }
+
+// ==================== UC-18: Soft-delete and restore a bookmark ====================
+
+fn soft_delete_request(uuid: &str) -> Request<Body> {
+    Request::builder()
+        .method("DELETE")
+        .uri(format!("/v1/bookmarks/{uuid}"))
+        .header("authorization", "Bearer test-token")
+        .body(Body::empty())
+        .unwrap()
+}
+
+fn unauthenticated_soft_delete_request(uuid: &str) -> Request<Body> {
+    Request::builder()
+        .method("DELETE")
+        .uri(format!("/v1/bookmarks/{uuid}"))
+        .body(Body::empty())
+        .unwrap()
+}
+
+fn restore_request(uuid: &str) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri(format!("/v1/bookmarks/{uuid}/restore"))
+        .header("authorization", "Bearer test-token")
+        .body(Body::empty())
+        .unwrap()
+}
+
+fn unauthenticated_restore_request(uuid: &str) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri(format!("/v1/bookmarks/{uuid}/restore"))
+        .body(Body::empty())
+        .unwrap()
+}
+
+// ---------------- Main flow: soft-delete ----------------
+
+#[tokio::test]
+async fn given_active_bookmark_when_soft_deleted_then_200_and_state_deleted_in_row() {
+    let test = test_app().await;
+    let router = app(Settings::default(), test.services.clone());
+    let (router, uuid) = create_bookmark(router, "https://example.com", "Example").await;
+
+    let response = router
+        .oneshot(soft_delete_request(&uuid))
+        .await
+        .expect("soft delete");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_json(response).await;
+    assert_eq!(body["state"], "deleted");
+    assert!(!body["deletedAt"].is_null());
+
+    let (state,): (String,) = sqlx::query_as("SELECT state FROM bookmarks WHERE uuid = ?")
+        .bind(&uuid)
+        .fetch_one(&test.pool)
+        .await
+        .unwrap();
+    assert_eq!(state, "deleted");
+}
+
+#[tokio::test]
+async fn given_deleted_bookmark_when_soft_deleted_again_then_409() {
+    let test = test_app().await;
+    let router = app(Settings::default(), test.services);
+    let (router, uuid) = create_bookmark(router, "https://example.com", "Example").await;
+    let router = {
+        let resp = router
+            .clone()
+            .oneshot(soft_delete_request(&uuid))
+            .await
+            .expect("first delete");
+        assert_eq!(resp.status(), StatusCode::OK);
+        router
+    };
+
+    let response = router
+        .oneshot(soft_delete_request(&uuid))
+        .await
+        .expect("second delete");
+
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+}
+
+// ---------------- AF-01 (soft-delete): not found ----------------
+
+#[tokio::test]
+async fn given_unknown_uuid_when_soft_deleted_then_404() {
+    let test = test_app().await;
+    let router = app(Settings::default(), test.services);
+
+    let response = router
+        .oneshot(soft_delete_request(&uuid::Uuid::new_v4().to_string()))
+        .await
+        .expect("soft delete");
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+// ---------------- AF-02 (soft-delete): unauthorized ----------------
+
+#[tokio::test]
+async fn given_no_token_when_soft_deleted_then_401() {
+    let test = test_app().await;
+    let router = app(Settings::default(), test.services.clone());
+    let (router, uuid) = create_bookmark(router, "https://example.com", "Example").await;
+
+    let response = router
+        .oneshot(unauthenticated_soft_delete_request(&uuid))
+        .await
+        .expect("soft delete");
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let (state,): (String,) = sqlx::query_as("SELECT state FROM bookmarks WHERE uuid = ?")
+        .bind(&uuid)
+        .fetch_one(&test.pool)
+        .await
+        .unwrap();
+    assert_eq!(state, "active");
+}
+
+// ---------------- Main flow: restore ----------------
+
+#[tokio::test]
+async fn given_deleted_bookmark_when_restored_then_200_and_state_active_in_row() {
+    let test = test_app().await;
+    let router = app(Settings::default(), test.services.clone());
+    let (router, uuid) = create_bookmark(router, "https://example.com", "Example").await;
+    let resp = router
+        .clone()
+        .oneshot(soft_delete_request(&uuid))
+        .await
+        .expect("delete first");
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let response = router
+        .oneshot(restore_request(&uuid))
+        .await
+        .expect("restore");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_json(response).await;
+    assert_eq!(body["state"], "active");
+    assert!(body["deletedAt"].is_null());
+
+    let (state,): (String,) = sqlx::query_as("SELECT state FROM bookmarks WHERE uuid = ?")
+        .bind(&uuid)
+        .fetch_one(&test.pool)
+        .await
+        .unwrap();
+    assert_eq!(state, "active");
+}
+
+#[tokio::test]
+async fn given_active_bookmark_when_restored_then_409() {
+    let test = test_app().await;
+    let router = app(Settings::default(), test.services);
+    let (router, uuid) = create_bookmark(router, "https://example.com", "Example").await;
+
+    let response = router
+        .oneshot(restore_request(&uuid))
+        .await
+        .expect("restore");
+
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+}
+
+// ---------------- AF-01 (restore): not found ----------------
+
+#[tokio::test]
+async fn given_unknown_uuid_when_restored_then_404() {
+    let test = test_app().await;
+    let router = app(Settings::default(), test.services);
+
+    let response = router
+        .oneshot(restore_request(&uuid::Uuid::new_v4().to_string()))
+        .await
+        .expect("restore");
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+// ---------------- AF-02 (restore): unauthorized ----------------
+
+#[tokio::test]
+async fn given_no_token_when_restored_then_401() {
+    let test = test_app().await;
+    let router = app(Settings::default(), test.services.clone());
+    let (router, uuid) = create_bookmark(router, "https://example.com", "Example").await;
+    let resp = router
+        .clone()
+        .oneshot(soft_delete_request(&uuid))
+        .await
+        .expect("delete first");
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let response = router
+        .oneshot(unauthenticated_restore_request(&uuid))
+        .await
+        .expect("restore");
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let (state,): (String,) = sqlx::query_as("SELECT state FROM bookmarks WHERE uuid = ?")
+        .bind(&uuid)
+        .fetch_one(&test.pool)
+        .await
+        .unwrap();
+    assert_eq!(state, "deleted");
+}
