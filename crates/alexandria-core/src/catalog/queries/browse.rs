@@ -5,16 +5,23 @@ use crate::catalog::model::{File, FileType, FileView, StateFilter};
 use crate::catalog::repos::CatalogRepository;
 use crate::errors::DomainError;
 
-/// Filter for the browse-files list query (UC-03 / FR-FC-12): type and
-/// lifecycle state. The default (`file_type = None`, `state = Active`)
-/// excludes soft-deleted records per the use case's main-flow step 2.
+/// Filter for the browse-files list query (UC-03 / FR-FC-12): type,
+/// lifecycle state, and containing collection. The default (`file_type =
+/// None`, `state = Active`, `collection_uuid = None`) excludes soft-deleted
+/// records per the use case's main-flow step 2 and applies no collection
+/// filter.
 ///
-/// The collection filter is deferred until the Collections table lands
-/// (UC-10+); only type and state filters are supported today.
+/// A `collection_uuid` that does not resolve to any collection matches no
+/// files (an empty list) rather than an error — the same way a `file_type`
+/// that matches no rows returns empty, not a rejection. Unlike `file_type`
+/// and `state`, a collection UUID is a reference rather than an enum, so
+/// there is nothing to validate as "recognised" the way UC-03 AF-03 checks
+/// those two.
 #[derive(Debug, Clone, Default)]
 pub struct FileFilter {
     pub file_type: Option<FileType>,
     pub state: StateFilter,
+    pub collection_uuid: Option<Uuid>,
 }
 
 impl FileFilter {
@@ -29,6 +36,11 @@ impl FileFilter {
 
     pub fn with_state(mut self, state: StateFilter) -> Self {
         self.state = state;
+        self
+    }
+
+    pub fn with_collection(mut self, collection_uuid: Uuid) -> Self {
+        self.collection_uuid = Some(collection_uuid);
         self
     }
 }
@@ -67,7 +79,7 @@ where
         // AF-02: the caller must be authenticated.
         self.auth.authenticate(token).await?;
         self.repo
-            .list_filtered(filter.file_type, filter.state)
+            .list_filtered(filter.file_type, filter.state, filter.collection_uuid)
             .await
     }
 

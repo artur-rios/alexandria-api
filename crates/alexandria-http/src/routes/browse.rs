@@ -14,15 +14,20 @@ use crate::AppState;
 /// Query-string parameters for `GET /v1/files` (UC-03 / FR-FC-12). All
 /// optional: an omitted or empty `type` means no type filter; an omitted or
 /// empty `state` defaults to `active` (excludes soft-deleted records per the
-/// use case's main-flow step 2). An unrecognised value for either is rejected
-/// as `400` invalid input rather than silently ignored — the FFI surface
-/// rejects the same inputs identically (FR-FC-24 / NFR-09).
+/// use case's main-flow step 2); an omitted or empty `collectionUuid` means
+/// no collection filter. An unrecognised `type` or `state` is rejected as
+/// `400` invalid input rather than silently ignored — the FFI surface
+/// rejects the same inputs identically (FR-FC-24 / NFR-09). A malformed
+/// `collectionUuid` is likewise `400`; a well-formed one that matches no
+/// collection returns an empty list rather than an error (UC-14 / FR-CO-05).
 #[derive(Debug, Default, Deserialize)]
 pub struct FileListParams {
     #[serde(rename = "type", default)]
     pub file_type: Option<String>,
     #[serde(rename = "state", default)]
     pub state: Option<String>,
+    #[serde(rename = "collectionUuid", default)]
+    pub collection_uuid: Option<String>,
 }
 
 /// Map a state query value to the `StateFilter`, defaulting to `Active` per
@@ -58,6 +63,14 @@ pub async fn list_files(
             )))
         })?;
         filter = filter.with_type(file_type);
+    }
+    if let Some(c) = params.collection_uuid.as_deref().filter(|s| !s.is_empty()) {
+        let collection_uuid = Uuid::parse_str(c).map_err(|_| {
+            ApiError(alexandria_core::errors::DomainError::InvalidInput(format!(
+                "invalid collectionUuid: {c}"
+            )))
+        })?;
+        filter = filter.with_collection(collection_uuid);
     }
 
     let files = state

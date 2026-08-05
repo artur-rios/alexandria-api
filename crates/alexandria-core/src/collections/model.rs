@@ -1,6 +1,9 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::bookmarks::model::Bookmark;
+use crate::catalog::model::File;
+
 /// What a collection may hold (SRD §4.3). A collection is either a grouping of
 /// files or a grouping of bookmarks; the discriminator is fixed at creation
 /// (UC-10 / FR-CO-01, FR-CO-02) and decides which items UC-13 will accept.
@@ -60,13 +63,45 @@ pub struct Collection {
     pub kind: CollectionKind,
 }
 
-/// Result of UC-13 (add items) / UC-14 (remove items): the collection and
-/// the item uuids the request just linked or unlinked, echoing the request
-/// rather than the collection's full membership — listing full membership is
-/// UC-14's own read path (FR-CO-07), not this write's job.
+/// Result of UC-13 (add items): the collection and the item uuids the
+/// request just linked, echoing the request rather than the collection's
+/// full membership — listing full membership is UC-14's read path
+/// (FR-CO-07), not this write's job.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CollectionItemsResult {
     pub collection_uuid: Uuid,
     pub item_uuids: Vec<Uuid>,
+}
+
+/// Result of UC-14's remove (FR-CO-06): the collection and the single item
+/// uuid the request just unlinked. The interface is per-item
+/// (`DELETE /v1/collections/{uuid}/items/{itemUuid}`, SRD §5.4), unlike
+/// UC-13's batch add.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CollectionItemResult {
+    pub collection_uuid: Uuid,
+    pub item_uuid: Uuid,
+}
+
+/// The members of a collection (UC-14 list / FR-CO-07): either files or
+/// bookmarks, depending on the collection's `kind`. Untagged so the wire
+/// shape is a bare array under `items` — the `kind` field alongside it is
+/// what a client uses to know which shape to expect.
+#[derive(Debug, Clone, Serialize)]
+#[serde(untagged)]
+pub enum CollectionItems {
+    Files(Vec<File>),
+    Bookmarks(Vec<Bookmark>),
+}
+
+/// Result of UC-14's list (FR-CO-07): the collection's uuid, its `kind`, and
+/// its current members.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CollectionMembersResult {
+    pub collection_uuid: Uuid,
+    pub kind: CollectionKind,
+    pub items: CollectionItems,
 }

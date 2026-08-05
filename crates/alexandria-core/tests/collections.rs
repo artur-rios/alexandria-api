@@ -12,3 +12,9 @@ mod delete;
 
 #[path = "collections/add_items.rs"]
 mod add_items;
+
+#[path = "collections/remove_item.rs"]
+mod remove_item;
+
+#[path = "collections/list_items.rs"]
+mod list_items;

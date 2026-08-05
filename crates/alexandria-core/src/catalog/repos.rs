@@ -44,14 +44,18 @@ pub trait CatalogRepository: Send + Sync {
         metadata: &SubtypeMetadata,
     ) -> Result<(), DomainError>;
 
-    /// List files filtered by type and lifecycle state (UC-03 / FR-FC-12).
-    /// `file_type = None` means no type filter; `state` selects the lifecycle
-    /// subset (`Active` excludes `deleted`, `Deleted` only deleted, `All`
-    /// both). Ordered by path. Uses `idx_files_type` / `idx_files_state`.
+    /// List files filtered by type, lifecycle state, and containing
+    /// collection (UC-03 / FR-FC-12; the collection filter arrived with
+    /// UC-14). `file_type = None` means no type filter; `state` selects the
+    /// lifecycle subset (`Active` excludes `deleted`, `Deleted` only deleted,
+    /// `All` both); `collection_uuid = None` means no collection filter, and
+    /// a uuid that resolves to no collection matches no files. Ordered by
+    /// path. Uses `idx_files_type` / `idx_files_state`.
     async fn list_filtered(
         &self,
         file_type: Option<FileType>,
         state: StateFilter,
+        collection_uuid: Option<Uuid>,
     ) -> Result<Vec<File>, DomainError>;
 
     /// Read the stored subtype metadata for the file identified by `uuid`
@@ -115,6 +119,13 @@ pub trait CatalogRepository: Send + Sync {
     /// `collection_uuid` (UC-13 / FR-CO-05). The caller has already confirmed
     /// both exist and that the collection is `kind = file`.
     async fn set_collection(&self, uuid: Uuid, collection_uuid: Uuid) -> Result<(), DomainError>;
+
+    /// Unlink the file identified by `uuid` from the collection identified by
+    /// `collection_uuid` (UC-14 / FR-CO-06). `NotFound` when the file does
+    /// not exist or is not currently linked to that collection (UC-14
+    /// AF-01) — the two cases are indistinguishable from the caller's
+    /// perspective and the specification maps both to the same error.
+    async fn clear_collection(&self, uuid: Uuid, collection_uuid: Uuid) -> Result<(), DomainError>;
 }
 
 #[derive(Clone)]
@@ -437,10 +448,12 @@ impl CatalogRepository for SqliteCatalogRepository {
         &self,
         file_type: Option<FileType>,
         state: StateFilter,
+        collection_uuid: Option<Uuid>,
     ) -> Result<Vec<File>, DomainError> {
         // Build the query dynamically based on which filters are active. The
         // filters are enumerated (not user strings) so there is no SQL
-        // injection surface; `?` placeholders bind the type discriminator.
+        // injection surface; `?` placeholders bind the type discriminator and
+        // the collection uuid.
         let base = "SELECT uuid, path, name, type, content_hash, state, deleted_at, \
                     indexed_at, missing_at FROM files";
         let mut sql = String::from(base);
@@ -454,22 +467,33 @@ impl CatalogRepository for SqliteCatalogRepository {
             StateFilter::Active => {
                 sql.push_str(conj);
                 sql.push_str("state = 'active'");
+                conj = " AND ";
             }
             StateFilter::Deleted => {
                 sql.push_str(conj);
                 sql.push_str("state = 'deleted'");
+                conj = " AND ";
             }
             StateFilter::All => {}
+        }
+        if collection_uuid.is_some() {
+            sql.push_str(conj);
+            sql.push_str("collection_id = (SELECT id FROM collections WHERE uuid = ?)");
         }
         sql.push_str(" ORDER BY path");
 
         // sqlx 0.9 refuses a runtime-built SQL string unless the caller asserts
         // it was audited. `sql` is assembled only from string literals chosen by
-        // the `Option<FileType>` / `StateFilter` enums above — no caller input
-        // reaches it, and the type discriminator is still a bound `?` parameter.
+        // the `Option<FileType>` / `StateFilter` / `Option<Uuid>` parameters
+        // above — no caller input reaches it, and every value is still a
+        // bound `?` parameter.
         let query = sqlx::query_as::<_, FileRow>(sqlx::AssertSqlSafe(sql));
         let query = match file_type {
             Some(t) => query.bind(t.as_str()),
+            None => query,
+        };
+        let query = match collection_uuid {
+            Some(u) => query.bind(u.to_string()),
             None => query,
         };
 
@@ -786,6 +810,22 @@ impl CatalogRepository for SqliteCatalogRepository {
         )
         .bind(collection_uuid.to_string())
         .bind(uuid.to_string())
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        if affected == 0 {
+            return Err(DomainError::NotFound);
+        }
+        Ok(())
+    }
+
+    async fn clear_collection(&self, uuid: Uuid, collection_uuid: Uuid) -> Result<(), DomainError> {
+        let affected = sqlx::query(
+            "UPDATE files SET collection_id = NULL \
+             WHERE uuid = ? AND collection_id = (SELECT id FROM collections WHERE uuid = ?)",
+        )
+        .bind(uuid.to_string())
+        .bind(collection_uuid.to_string())
         .execute(&self.pool)
         .await?
         .rows_affected();

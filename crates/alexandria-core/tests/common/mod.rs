@@ -272,8 +272,10 @@ impl CatalogRepository for FakeCatalogRepository {
         &self,
         file_type: Option<FileType>,
         state: StateFilter,
+        collection_uuid: Option<Uuid>,
     ) -> Result<Vec<File>, DomainError> {
         let files = self.files.lock().unwrap();
+        let links = self.collection_links.lock().unwrap();
         let mut out: Vec<File> = files
             .values()
             .filter(|f| file_type.is_none() || Some(f.file_type) == file_type)
@@ -281,6 +283,10 @@ impl CatalogRepository for FakeCatalogRepository {
                 StateFilter::Active => f.state == FileState::Active,
                 StateFilter::Deleted => f.state == FileState::Deleted,
                 StateFilter::All => true,
+            })
+            .filter(|f| match collection_uuid {
+                Some(c) => links.get(&f.uuid) == Some(&c),
+                None => true,
             })
             .cloned()
             .collect();
@@ -395,6 +401,15 @@ impl CatalogRepository for FakeCatalogRepository {
             .lock()
             .unwrap()
             .insert(uuid, collection_uuid);
+        Ok(())
+    }
+
+    async fn clear_collection(&self, uuid: Uuid, collection_uuid: Uuid) -> Result<(), DomainError> {
+        let mut links = self.collection_links.lock().unwrap();
+        if links.get(&uuid) != Some(&collection_uuid) {
+            return Err(DomainError::NotFound);
+        }
+        links.remove(&uuid);
         Ok(())
     }
 }
@@ -883,5 +898,29 @@ impl BookmarkRepository for FakeBookmarkRepository {
         let bookmark = bookmarks.get_mut(&uuid).ok_or(DomainError::NotFound)?;
         bookmark.collection_uuid = Some(collection_uuid);
         Ok(())
+    }
+
+    async fn clear_collection(&self, uuid: Uuid, collection_uuid: Uuid) -> Result<(), DomainError> {
+        let mut bookmarks = self.bookmarks.lock().unwrap();
+        let bookmark = bookmarks.get_mut(&uuid).ok_or(DomainError::NotFound)?;
+        if bookmark.collection_uuid != Some(collection_uuid) {
+            return Err(DomainError::NotFound);
+        }
+        bookmark.collection_uuid = None;
+        Ok(())
+    }
+
+    async fn list_by_collection(
+        &self,
+        collection_uuid: Uuid,
+    ) -> Result<Vec<Bookmark>, DomainError> {
+        let bookmarks = self.bookmarks.lock().unwrap();
+        let mut out: Vec<Bookmark> = bookmarks
+            .values()
+            .filter(|b| b.collection_uuid == Some(collection_uuid))
+            .cloned()
+            .collect();
+        out.sort_by(|a, b| a.title.cmp(&b.title));
+        Ok(out)
     }
 }

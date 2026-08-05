@@ -1,4 +1,4 @@
-use sqlx::sqlite::SqlitePool;
+use sqlx::sqlite::{SqlitePool, SqliteRow};
 use sqlx::Row;
 use uuid::Uuid;
 
@@ -27,6 +27,18 @@ pub trait BookmarkRepository: Send + Sync {
     /// `collection_uuid` (UC-13 / FR-CO-05). The caller has already confirmed
     /// both exist and that the collection is `kind = bookmark`.
     async fn set_collection(&self, uuid: Uuid, collection_uuid: Uuid) -> Result<(), DomainError>;
+
+    /// Unlink the bookmark identified by `uuid` from the collection
+    /// identified by `collection_uuid` (UC-14 / FR-CO-06). `NotFound` when
+    /// the bookmark does not exist or is not currently linked to that
+    /// collection (UC-14 AF-01).
+    async fn clear_collection(&self, uuid: Uuid, collection_uuid: Uuid) -> Result<(), DomainError>;
+
+    /// List every bookmark linked to the collection identified by
+    /// `collection_uuid` (UC-14 / FR-CO-07). The caller has already
+    /// confirmed the collection exists. Ordered by title.
+    async fn list_by_collection(&self, collection_uuid: Uuid)
+        -> Result<Vec<Bookmark>, DomainError>;
 }
 
 #[derive(Clone)]
@@ -67,51 +79,16 @@ impl BookmarkRepository for SqliteBookmarkRepository {
     }
 
     async fn find_by_uuid(&self, uuid: Uuid) -> Result<Option<Bookmark>, DomainError> {
-        let row = sqlx::query(
-            "SELECT b.uuid, b.url, b.title, b.state, b.deleted_at, c.uuid AS collection_uuid \
-             FROM bookmarks b LEFT JOIN collections c ON c.id = b.collection_id \
-             WHERE b.uuid = ?",
-        )
-        .bind(uuid.to_string())
-        .fetch_optional(&self.pool)
-        .await?;
+        // sqlx 0.9 requires a runtime-built SQL string to be asserted safe;
+        // `sql` is assembled only from the `BOOKMARK_SELECT_JOIN_SQL`
+        // constant — no caller input reaches it.
+        let sql = format!("{BOOKMARK_SELECT_JOIN_SQL} WHERE b.uuid = ?");
+        let row = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(uuid.to_string())
+            .fetch_optional(&self.pool)
+            .await?;
 
-        let Some(row) = row else {
-            return Ok(None);
-        };
-
-        let uuid_str: String = row.try_get("uuid")?;
-        let url: String = row.try_get("url")?;
-        let title: String = row.try_get("title")?;
-        let state_str: String = row.try_get("state")?;
-        let deleted_at_str: Option<String> = row.try_get("deleted_at")?;
-        let collection_uuid_str: Option<String> = row.try_get("collection_uuid")?;
-
-        Ok(Some(Bookmark {
-            uuid: Uuid::parse_str(&uuid_str)
-                .map_err(|err| DomainError::internal(format!("corrupt bookmark uuid: {err}")))?,
-            url,
-            title,
-            state: BookmarkState::parse(&state_str).ok_or_else(|| {
-                DomainError::internal(format!("corrupt bookmark state: {state_str}"))
-            })?,
-            deleted_at: deleted_at_str
-                .map(|s| {
-                    chrono::DateTime::parse_from_rfc3339(&s)
-                        .map(|dt| dt.with_timezone(&chrono::Utc))
-                        .map_err(|err| {
-                            DomainError::internal(format!("corrupt bookmark deleted_at: {err}"))
-                        })
-                })
-                .transpose()?,
-            collection_uuid: collection_uuid_str
-                .map(|s| {
-                    Uuid::parse_str(&s).map_err(|err| {
-                        DomainError::internal(format!("corrupt bookmark collection_uuid: {err}"))
-                    })
-                })
-                .transpose()?,
-        }))
+        row.map(parse_bookmark_row).transpose()
     }
 
     async fn set_collection(&self, uuid: Uuid, collection_uuid: Uuid) -> Result<(), DomainError> {
@@ -129,4 +106,79 @@ impl BookmarkRepository for SqliteBookmarkRepository {
         }
         Ok(())
     }
+
+    async fn clear_collection(&self, uuid: Uuid, collection_uuid: Uuid) -> Result<(), DomainError> {
+        let affected = sqlx::query(
+            "UPDATE bookmarks SET collection_id = NULL \
+             WHERE uuid = ? AND collection_id = (SELECT id FROM collections WHERE uuid = ?)",
+        )
+        .bind(uuid.to_string())
+        .bind(collection_uuid.to_string())
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        if affected == 0 {
+            return Err(DomainError::NotFound);
+        }
+        Ok(())
+    }
+
+    async fn list_by_collection(
+        &self,
+        collection_uuid: Uuid,
+    ) -> Result<Vec<Bookmark>, DomainError> {
+        let sql = format!(
+            "{BOOKMARK_SELECT_JOIN_SQL} WHERE b.collection_id = \
+             (SELECT id FROM collections WHERE uuid = ?) ORDER BY b.title"
+        );
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(collection_uuid.to_string())
+            .fetch_all(&self.pool)
+            .await?;
+        rows.into_iter().map(parse_bookmark_row).collect()
+    }
+}
+
+/// Shared `SELECT … FROM … LEFT JOIN …` for a bookmark row plus its
+/// collection's public uuid (via the internal `collection_id` FK). Callers
+/// append their own `WHERE` clause.
+const BOOKMARK_SELECT_JOIN_SQL: &str =
+    "SELECT b.uuid, b.url, b.title, b.state, b.deleted_at, c.uuid AS collection_uuid \
+     FROM bookmarks b LEFT JOIN collections c ON c.id = b.collection_id";
+
+/// Build a `Bookmark` from a joined bookmarks/collections row. A value the
+/// domain cannot represent (unparseable uuid, timestamp, or state) means the
+/// row is corrupt — see `parse_file_row`'s note on the same tradeoff.
+fn parse_bookmark_row(row: SqliteRow) -> Result<Bookmark, DomainError> {
+    let uuid_str: String = row.try_get("uuid")?;
+    let url: String = row.try_get("url")?;
+    let title: String = row.try_get("title")?;
+    let state_str: String = row.try_get("state")?;
+    let deleted_at_str: Option<String> = row.try_get("deleted_at")?;
+    let collection_uuid_str: Option<String> = row.try_get("collection_uuid")?;
+
+    Ok(Bookmark {
+        uuid: Uuid::parse_str(&uuid_str)
+            .map_err(|err| DomainError::internal(format!("corrupt bookmark uuid: {err}")))?,
+        url,
+        title,
+        state: BookmarkState::parse(&state_str)
+            .ok_or_else(|| DomainError::internal(format!("corrupt bookmark state: {state_str}")))?,
+        deleted_at: deleted_at_str
+            .map(|s| {
+                chrono::DateTime::parse_from_rfc3339(&s)
+                    .map(|dt| dt.with_timezone(&chrono::Utc))
+                    .map_err(|err| {
+                        DomainError::internal(format!("corrupt bookmark deleted_at: {err}"))
+                    })
+            })
+            .transpose()?,
+        collection_uuid: collection_uuid_str
+            .map(|s| {
+                Uuid::parse_str(&s).map_err(|err| {
+                    DomainError::internal(format!("corrupt bookmark collection_uuid: {err}"))
+                })
+            })
+            .transpose()?,
+    })
 }
