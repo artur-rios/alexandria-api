@@ -1125,4 +1125,13 @@ impl WatchlistRepository for FakeWatchlistRepository {
             None => Err(DomainError::NotFound),
         }
     }
+
+    async fn delete_watchlist(&self, uuid: Uuid) -> Result<(), DomainError> {
+        self.watchlists.lock().unwrap().remove(&uuid);
+        self.progress
+            .lock()
+            .unwrap()
+            .retain(|(watchlist_uuid, _), _| *watchlist_uuid != uuid);
+        Ok(())
+    }
 }

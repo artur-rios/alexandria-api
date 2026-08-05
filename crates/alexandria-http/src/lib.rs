@@ -80,6 +80,7 @@ pub fn app(settings: Settings, services: Arc<Services>) -> Router {
             "/v1/watchlists/{uuid}/items/{video_uuid}",
             delete(routes::watchlists::remove_video),
         )
+        .route("/v1/watchlists/{uuid}", delete(routes::watchlists::delete))
         .route_layer(from_fn_with_state(
             state.clone(),
             middleware::auth::require_auth,

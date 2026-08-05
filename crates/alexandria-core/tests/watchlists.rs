@@ -15,3 +15,6 @@ mod update_progress;
 
 #[path = "watchlists/remove_video.rs"]
 mod remove_video;
+
+#[path = "watchlists/delete.rs"]
+mod delete;
