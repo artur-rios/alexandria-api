@@ -30,6 +30,11 @@ pub trait CollectionRepository: Send + Sync {
     /// The caller has already confirmed the collection exists and validated
     /// the new name.
     async fn rename_collection(&self, uuid: Uuid, name: String) -> Result<Collection, DomainError>;
+
+    /// Delete a collection, unlinking (not deleting) every item it contains
+    /// (UC-12 / FR-CO-04). The caller has already confirmed the collection
+    /// exists.
+    async fn delete_collection(&self, uuid: Uuid) -> Result<(), DomainError>;
 }
 
 #[derive(Clone)]
@@ -95,5 +100,30 @@ impl CollectionRepository for SqliteCollectionRepository {
             .await?;
 
         self.find_by_uuid(uuid).await?.ok_or(DomainError::NotFound)
+    }
+
+    async fn delete_collection(&self, uuid: Uuid) -> Result<(), DomainError> {
+        let mut tx = self.pool.begin().await?;
+
+        // Unlink every file the collection holds before removing it — a
+        // deleted collection must not leave `files.collection_id` pointing at
+        // a row that no longer exists (UC-12 / FR-CO-04). Bookmarks get the
+        // same treatment once UC-15 introduces a `bookmarks` table; there is
+        // nothing to unlink there yet.
+        sqlx::query(
+            "UPDATE files SET collection_id = NULL \
+             WHERE collection_id = (SELECT id FROM collections WHERE uuid = ?)",
+        )
+        .bind(uuid.to_string())
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query("DELETE FROM collections WHERE uuid = ?")
+            .bind(uuid.to_string())
+            .execute(&mut *tx)
+            .await?;
+
+        tx.commit().await?;
+        Ok(())
     }
 }

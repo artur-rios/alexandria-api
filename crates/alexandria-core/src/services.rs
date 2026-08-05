@@ -16,6 +16,7 @@ use crate::catalog::fs::StdFilesystem;
 use crate::catalog::queries::browse::BrowseFilesHandler;
 use crate::catalog::repos::SqliteCatalogRepository;
 use crate::collections::commands::create::CreateCollectionHandler;
+use crate::collections::commands::delete::DeleteCollectionHandler;
 use crate::collections::commands::rename::RenameCollectionHandler;
 use crate::collections::repos::SqliteCollectionRepository;
 use crate::config::Settings;
@@ -56,6 +57,9 @@ pub type DefaultCreateCollectionHandler =
 pub type DefaultRenameCollectionHandler =
     RenameCollectionHandler<BearerAuthService, SqliteCollectionRepository>;
 
+pub type DefaultDeleteCollectionHandler =
+    DeleteCollectionHandler<BearerAuthService, SqliteCollectionRepository>;
+
 #[derive(Clone)]
 pub struct Services {
     pub index_handler: Arc<DefaultIndexHandler>,
@@ -69,6 +73,7 @@ pub struct Services {
     pub browse_files_handler: Arc<DefaultBrowseFilesHandler>,
     pub create_collection_handler: Arc<DefaultCreateCollectionHandler>,
     pub rename_collection_handler: Arc<DefaultRenameCollectionHandler>,
+    pub delete_collection_handler: Arc<DefaultDeleteCollectionHandler>,
     /// The same auth service the handlers hold, exposed so a transport can
     /// reject an unauthenticated caller *before* it parses a request body or
     /// path (FR-AU-07 / SRD §7). Handlers still authenticate independently —
@@ -113,6 +118,10 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         auth,
         SqliteCollectionRepository::new(pool.clone()),
     ));
+    let delete_collection_handler = Arc::new(DeleteCollectionHandler::new(
+        auth,
+        SqliteCollectionRepository::new(pool.clone()),
+    ));
     Services {
         index_handler,
         refresh_handler,
@@ -125,6 +134,7 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         browse_files_handler,
         create_collection_handler,
         rename_collection_handler,
+        delete_collection_handler,
         auth,
         pool,
     }
