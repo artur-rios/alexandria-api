@@ -10,6 +10,9 @@ mod edit_metadata;
 #[path = "catalog/index.rs"]
 mod index;
 
+#[path = "catalog/purge.rs"]
+mod purge;
+
 #[path = "catalog/refresh.rs"]
 mod refresh;
 
