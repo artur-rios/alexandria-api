@@ -9,3 +9,6 @@ mod rename;
 
 #[path = "collections/delete.rs"]
 mod delete;
+
+#[path = "collections/add_items.rs"]
+mod add_items;

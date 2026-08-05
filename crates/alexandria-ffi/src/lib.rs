@@ -1081,6 +1081,90 @@ pub extern "C" fn alexandria_collection_delete(
     }
 }
 
+/// Request body accepted by `alexandria_collection_add_items` — the same
+/// JSON `POST /v1/collections/{uuid}/items` takes:
+/// `{"itemUuids":["…","…"]}`. Parsed field-by-field for the same reason
+/// `CreateCollectionBody` is: this crate depends on `serde_json` but not
+/// `serde`'s derive.
+#[derive(Debug)]
+struct AddItemsBody {
+    item_uuids: Vec<uuid::Uuid>,
+}
+
+impl AddItemsBody {
+    fn from_json_str(s: &str) -> Option<Self> {
+        let value: serde_json::Value = serde_json::from_str(s).ok()?;
+        let obj = value.as_object()?;
+        let raw = obj.get("itemUuids")?.as_array()?;
+        let mut item_uuids = Vec::with_capacity(raw.len());
+        for v in raw {
+            item_uuids.push(uuid::Uuid::parse_str(v.as_str()?).ok()?);
+        }
+        Some(Self { item_uuids })
+    }
+}
+
+/// Add items to a collection (UC-13 / FR-CO-05).
+///
+/// `uuid` is the collection's public UUID (NUL-terminated string). `json_body`
+/// is the JSON body HTTP would send (`itemUuids`). The function deserializes
+/// it, calls the same `AddItemsToCollectionHandler` the HTTP route uses, and
+/// on success serializes the returned `CollectionItemsResult` back to JSON —
+/// so the FFI and HTTP surfaces agree byte-for-byte modulo key ordering
+/// (parity, FR-FC-24 / NFR-09). `token` is the bearer auth token.
+#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
+#[no_mangle]
+pub extern "C" fn alexandria_collection_add_items(
+    uuid: *const c_char,
+    json_body: *const c_char,
+    token: *const c_char,
+) -> CollectionJsonResult {
+    let services = match services_slot().lock().unwrap().clone() {
+        Some(s) => s,
+        None => return CollectionJsonResult::err(COLLECTION_ERR_NOT_INITIALIZED),
+    };
+
+    // Deny before touching the payload — an unauthenticated caller must not
+    // learn whether its uuid or body would have parsed.
+    let token = cstr_lossy(token).unwrap_or_default();
+    if !authenticated(&services, &token) {
+        return CollectionJsonResult::err(COLLECTION_ERR_UNAUTHORIZED);
+    }
+
+    let uuid_str = match cstr_lossy(uuid) {
+        Some(s) => s,
+        None => return CollectionJsonResult::err(COLLECTION_ERR_INVALID_INPUT),
+    };
+    let uuid = match uuid::Uuid::parse_str(&uuid_str) {
+        Ok(u) => u,
+        Err(_) => return CollectionJsonResult::err(COLLECTION_ERR_INVALID_INPUT),
+    };
+
+    let body_str = match cstr_lossy(json_body) {
+        Some(s) => s,
+        None => return CollectionJsonResult::err(COLLECTION_ERR_INVALID_INPUT),
+    };
+    let body = match AddItemsBody::from_json_str(&body_str) {
+        Some(b) if !b.item_uuids.is_empty() => b,
+        _ => return CollectionJsonResult::err(COLLECTION_ERR_INVALID_INPUT),
+    };
+
+    let result = runtime().block_on(async {
+        services
+            .add_items_to_collection_handler
+            .add(uuid, body.item_uuids, &token)
+            .await
+    });
+
+    match result {
+        Ok(added) => {
+            let json = serde_json::to_string(&added).unwrap_or_default();
+            CollectionJsonResult::ok(json)
+        }
+        Err(err) => map_collection_err(err),
+    }
+}
+
 /// FFI status codes returned by bookmark operations (UC-15+). Deliberately
 /// separate from `COLLECTION_*` — per the convention above — so bookmark use
 /// cases can grow their own set without colliding; `BOOKMARK_OK ==

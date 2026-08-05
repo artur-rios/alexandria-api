@@ -17,6 +17,7 @@ use crate::catalog::commands::soft_delete::SoftDeleteFileHandler;
 use crate::catalog::fs::StdFilesystem;
 use crate::catalog::queries::browse::BrowseFilesHandler;
 use crate::catalog::repos::SqliteCatalogRepository;
+use crate::collections::commands::add_items::AddItemsToCollectionHandler;
 use crate::collections::commands::create::CreateCollectionHandler;
 use crate::collections::commands::delete::DeleteCollectionHandler;
 use crate::collections::commands::rename::RenameCollectionHandler;
@@ -65,6 +66,13 @@ pub type DefaultDeleteCollectionHandler =
 pub type DefaultCreateBookmarkHandler =
     CreateBookmarkHandler<BearerAuthService, SqliteBookmarkRepository, SqliteCollectionRepository>;
 
+pub type DefaultAddItemsToCollectionHandler = AddItemsToCollectionHandler<
+    BearerAuthService,
+    SqliteCollectionRepository,
+    SqliteCatalogRepository,
+    SqliteBookmarkRepository,
+>;
+
 #[derive(Clone)]
 pub struct Services {
     pub index_handler: Arc<DefaultIndexHandler>,
@@ -80,6 +88,7 @@ pub struct Services {
     pub rename_collection_handler: Arc<DefaultRenameCollectionHandler>,
     pub delete_collection_handler: Arc<DefaultDeleteCollectionHandler>,
     pub create_bookmark_handler: Arc<DefaultCreateBookmarkHandler>,
+    pub add_items_to_collection_handler: Arc<DefaultAddItemsToCollectionHandler>,
     /// The same auth service the handlers hold, exposed so a transport can
     /// reject an unauthenticated caller *before* it parses a request body or
     /// path (FR-AU-07 / SRD §7). Handlers still authenticate independently —
@@ -115,7 +124,7 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         retention_days,
     ));
     let purge_file_on_disk_handler = Arc::new(PurgeFileOnDiskHandler::new(auth, repo.clone(), fs));
-    let browse_files_handler = Arc::new(BrowseFilesHandler::new(auth, repo));
+    let browse_files_handler = Arc::new(BrowseFilesHandler::new(auth, repo.clone()));
     let create_collection_handler = Arc::new(CreateCollectionHandler::new(
         auth,
         SqliteCollectionRepository::new(pool.clone()),
@@ -133,6 +142,12 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         SqliteBookmarkRepository::new(pool.clone()),
         SqliteCollectionRepository::new(pool.clone()),
     ));
+    let add_items_to_collection_handler = Arc::new(AddItemsToCollectionHandler::new(
+        auth,
+        SqliteCollectionRepository::new(pool.clone()),
+        repo.clone(),
+        SqliteBookmarkRepository::new(pool.clone()),
+    ));
     Services {
         index_handler,
         refresh_handler,
@@ -147,6 +162,7 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         rename_collection_handler,
         delete_collection_handler,
         create_bookmark_handler,
+        add_items_to_collection_handler,
         auth,
         pool,
     }

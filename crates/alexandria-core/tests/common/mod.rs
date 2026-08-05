@@ -85,6 +85,8 @@ pub struct FakeCatalogRepository {
     /// and the catalog row is left `deleted` because the fake never removed
     /// it).
     failing_purge_uuids: Arc<Mutex<std::collections::HashSet<Uuid>>>,
+    /// File uuid -> collection uuid, as written by `set_collection` (UC-13).
+    collection_links: Arc<Mutex<HashMap<Uuid, Uuid>>>,
 }
 
 impl FakeCatalogRepository {
@@ -168,6 +170,12 @@ impl FakeCatalogRepository {
     /// row stays present.
     pub fn fail_purge(&self, uuid: Uuid) {
         self.failing_purge_uuids.lock().unwrap().insert(uuid);
+    }
+
+    /// The collection uuid last linked to a file uuid via `set_collection`
+    /// (UC-13). `None` when never linked.
+    pub fn collection_for_file(&self, uuid: Uuid) -> Option<Uuid> {
+        self.collection_links.lock().unwrap().get(&uuid).copied()
     }
 }
 
@@ -376,6 +384,17 @@ impl CatalogRepository for FakeCatalogRepository {
             return Err(DomainError::internal("fake purge failure"));
         }
         files.remove(&file.path);
+        Ok(())
+    }
+
+    async fn set_collection(&self, uuid: Uuid, collection_uuid: Uuid) -> Result<(), DomainError> {
+        if self.file_for_uuid(uuid).is_none() {
+            return Err(DomainError::NotFound);
+        }
+        self.collection_links
+            .lock()
+            .unwrap()
+            .insert(uuid, collection_uuid);
         Ok(())
     }
 }
@@ -821,6 +840,14 @@ impl FakeBookmarkRepository {
         self.bookmarks.lock().unwrap().get(&uuid).cloned()
     }
 
+    /// Seed a bookmark directly, as if a prior UC-15 call had created it.
+    pub fn seed(&self, bookmark: Bookmark) {
+        self.bookmarks
+            .lock()
+            .unwrap()
+            .insert(bookmark.uuid, bookmark);
+    }
+
     /// Make every `insert_bookmark` return an `Internal` error.
     pub fn fail_inserts(&self) {
         *self.failing.lock().unwrap() = true;
@@ -845,5 +872,16 @@ impl BookmarkRepository for FakeBookmarkRepository {
             .unwrap()
             .insert(bookmark.uuid, bookmark.clone());
         Ok(bookmark)
+    }
+
+    async fn find_by_uuid(&self, uuid: Uuid) -> Result<Option<Bookmark>, DomainError> {
+        Ok(self.bookmarks.lock().unwrap().get(&uuid).cloned())
+    }
+
+    async fn set_collection(&self, uuid: Uuid, collection_uuid: Uuid) -> Result<(), DomainError> {
+        let mut bookmarks = self.bookmarks.lock().unwrap();
+        let bookmark = bookmarks.get_mut(&uuid).ok_or(DomainError::NotFound)?;
+        bookmark.collection_uuid = Some(collection_uuid);
+        Ok(())
     }
 }

@@ -110,6 +110,11 @@ pub trait CatalogRepository: Send + Sync {
     /// its retention window (the handler enforces both, rejecting otherwise
     /// with `InvalidState`); the repository defends the `NotFound` invariant.
     async fn purge(&self, uuid: Uuid) -> Result<(), DomainError>;
+
+    /// Link the file identified by `uuid` to the collection identified by
+    /// `collection_uuid` (UC-13 / FR-CO-05). The caller has already confirmed
+    /// both exist and that the collection is `kind = file`.
+    async fn set_collection(&self, uuid: Uuid, collection_uuid: Uuid) -> Result<(), DomainError>;
 }
 
 #[derive(Clone)]
@@ -771,6 +776,22 @@ impl CatalogRepository for SqliteCatalogRepository {
         }
 
         tx.commit().await?;
+        Ok(())
+    }
+
+    async fn set_collection(&self, uuid: Uuid, collection_uuid: Uuid) -> Result<(), DomainError> {
+        let affected = sqlx::query(
+            "UPDATE files SET collection_id = (SELECT id FROM collections WHERE uuid = ?) \
+             WHERE uuid = ?",
+        )
+        .bind(collection_uuid.to_string())
+        .bind(uuid.to_string())
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        if affected == 0 {
+            return Err(DomainError::NotFound);
+        }
         Ok(())
     }
 }

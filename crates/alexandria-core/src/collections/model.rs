@@ -59,3 +59,14 @@ pub struct Collection {
     pub name: String,
     pub kind: CollectionKind,
 }
+
+/// Result of UC-13 (add items) / UC-14 (remove items): the collection and
+/// the item uuids the request just linked or unlinked, echoing the request
+/// rather than the collection's full membership — listing full membership is
+/// UC-14's own read path (FR-CO-07), not this write's job.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CollectionItemsResult {
+    pub collection_uuid: Uuid,
+    pub item_uuids: Vec<Uuid>,
+}
