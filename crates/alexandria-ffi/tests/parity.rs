@@ -17,13 +17,13 @@ use alexandria_core::config::Settings;
 use alexandria_core::migrate::migrate_database;
 use alexandria_core::services::build_services;
 use alexandria_ffi::{
-    alexandria_collection_create, alexandria_collection_delete, alexandria_collection_rename,
-    alexandria_file_edit_metadata, alexandria_file_get_by_uuid, alexandria_file_purge,
-    alexandria_file_purge_on_disk, alexandria_file_rename, alexandria_file_restore,
-    alexandria_file_soft_delete, alexandria_files_list, alexandria_free_string,
-    alexandria_index_count_files, alexandria_index_count_missing, alexandria_index_files_json,
-    alexandria_index_init, alexandria_index_refresh_start, alexandria_index_start,
-    IndexStartResult,
+    alexandria_bookmark_create, alexandria_collection_create, alexandria_collection_delete,
+    alexandria_collection_rename, alexandria_file_edit_metadata, alexandria_file_get_by_uuid,
+    alexandria_file_purge, alexandria_file_purge_on_disk, alexandria_file_rename,
+    alexandria_file_restore, alexandria_file_soft_delete, alexandria_files_list,
+    alexandria_free_string, alexandria_index_count_files, alexandria_index_count_missing,
+    alexandria_index_files_json, alexandria_index_init, alexandria_index_refresh_start,
+    alexandria_index_start, IndexStartResult,
 };
 use alexandria_http::app;
 use axum::body::{to_bytes, Body};
@@ -3777,4 +3777,188 @@ async fn given_unknown_uuid_when_deleted_via_http_and_ffi_then_both_not_found() 
         alexandria_ffi::COLLECTION_ERR_NOT_FOUND,
         "ffi must reject an unknown uuid as not-found (HTTP 404)"
     );
+}
+
+/// UC-15 parity — create the same bookmark over both transports and assert
+/// the returned bodies agree (modulo the per-database `uuid`) and that each
+/// catalog holds the same single row (Testing Specification §7.3, FR-BM-01,
+/// FR-FC-24).
+#[tokio::test]
+async fn given_same_bookmark_when_created_via_http_and_ffi_then_bodies_and_rows_identical() {
+    let _g = SERIAL.lock().unwrap();
+
+    // ---- HTTP leg ----
+    let http_dir = tempdir().unwrap();
+    let http_db = db_path(&http_dir, "http.sqlite");
+    let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    let http_services =
+        std::sync::Arc::new(build_services(&Settings::default(), http_pool.clone()).await);
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/bookmarks")
+        .header("authorization", "Bearer parity")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({ "url": "https://example.com", "title": "Example" }).to_string(),
+        ))
+        .unwrap();
+    let resp = app(Settings::default(), http_services)
+        .oneshot(req)
+        .await
+        .expect("http create");
+    assert_eq!(resp.status(), axum::http::StatusCode::CREATED);
+    let http_body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
+
+    let http_rows: Vec<(String, String, String)> =
+        sqlx::query_as("SELECT uuid, url, title FROM bookmarks ORDER BY title")
+            .fetch_all(&http_pool)
+            .await
+            .unwrap();
+
+    // ---- FFI leg ----
+    let ffi_dir = tempdir().unwrap();
+    let ffi_db = db_path(&ffi_dir, "ffi.sqlite");
+    let ffi_db_for_rows = ffi_db.clone();
+    let ffi_body: serde_json::Value = tokio::task::spawn_blocking(move || -> serde_json::Value {
+        let cdb = CString::new(ffi_db).unwrap();
+        assert_eq!(
+            alexandria_index_init(cdb.as_ptr()),
+            alexandria_ffi::INDEX_OK
+        );
+
+        let body =
+            CString::new(json!({ "url": "https://example.com", "title": "Example" }).to_string())
+                .unwrap();
+        let token = CString::new("parity").unwrap();
+        let r = alexandria_bookmark_create(body.as_ptr(), token.as_ptr());
+        assert_eq!(r.status, alexandria_ffi::BOOKMARK_OK, "ffi create");
+        assert!(!r.json.is_null());
+        // SAFETY: pointer came from this library and is freed once below.
+        let s = unsafe { CStr::from_ptr(r.json) }
+            .to_string_lossy()
+            .into_owned();
+        unsafe {
+            alexandria_free_string(r.json);
+        }
+        serde_json::from_str(&s).unwrap()
+    })
+    .await
+    .unwrap();
+
+    let ffi_pool = migrate_database(&ffi_db_for_rows).await.expect("ffi open");
+    let ffi_rows: Vec<(String, String, String)> =
+        sqlx::query_as("SELECT uuid, url, title FROM bookmarks ORDER BY title")
+            .fetch_all(&ffi_pool)
+            .await
+            .unwrap();
+
+    // ---- compare ----
+    for (label, body) in [("http", &http_body), ("ffi", &ffi_body)] {
+        let uuid = body["uuid"].as_str().unwrap_or_default();
+        assert!(
+            uuid::Uuid::parse_str(uuid).is_ok(),
+            "{label} body carries a valid uuid"
+        );
+    }
+    let norm = |v: &serde_json::Value| -> serde_json::Value {
+        let mut c = v.clone();
+        if let Some(obj) = c.as_object_mut() {
+            obj.remove("uuid");
+        }
+        c
+    };
+    assert_eq!(
+        norm(&http_body),
+        norm(&ffi_body),
+        "Bookmark body diverges across surfaces"
+    );
+
+    assert_eq!(http_rows.len(), 1, "http persisted one bookmark");
+    assert_eq!(ffi_rows.len(), 1, "ffi persisted one bookmark");
+    assert_eq!(http_rows[0].0, http_body["uuid"].as_str().unwrap());
+    assert_eq!(ffi_rows[0].0, ffi_body["uuid"].as_str().unwrap());
+    assert_eq!(
+        (http_rows[0].1.as_str(), http_rows[0].2.as_str()),
+        (ffi_rows[0].1.as_str(), ffi_rows[0].2.as_str()),
+        "persisted url/title diverge across surfaces"
+    );
+
+    ffi_pool.close().await;
+}
+
+/// UC-15 parity — an unknown referenced collection is rejected as not-found
+/// on both surfaces (HTTP 404, FFI `BOOKMARK_ERR_NOT_FOUND`) (AF-02,
+/// FR-FC-24 / NFR-09).
+#[tokio::test]
+async fn given_unknown_collection_when_bookmark_created_via_http_and_ffi_then_both_not_found() {
+    let _g = SERIAL.lock().unwrap();
+    let unknown = uuid::Uuid::new_v4();
+
+    // ---- HTTP leg ----
+    let http_dir = tempdir().unwrap();
+    let http_db = db_path(&http_dir, "http.sqlite");
+    let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    let http_services =
+        std::sync::Arc::new(build_services(&Settings::default(), http_pool.clone()).await);
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/bookmarks")
+        .header("authorization", "Bearer parity")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({ "url": "https://example.com", "title": "Example", "collectionUuid": unknown })
+                .to_string(),
+        ))
+        .unwrap();
+    let resp = app(Settings::default(), http_services)
+        .oneshot(req)
+        .await
+        .expect("http create");
+    assert_eq!(resp.status(), axum::http::StatusCode::NOT_FOUND);
+    let (http_count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM bookmarks")
+        .fetch_one(&http_pool)
+        .await
+        .unwrap();
+
+    // ---- FFI leg ----
+    let ffi_dir = tempdir().unwrap();
+    let ffi_db = db_path(&ffi_dir, "ffi.sqlite");
+    let ffi_db_for_rows = ffi_db.clone();
+    let ffi_status = tokio::task::spawn_blocking(move || -> i32 {
+        let cdb = CString::new(ffi_db).unwrap();
+        assert_eq!(
+            alexandria_index_init(cdb.as_ptr()),
+            alexandria_ffi::INDEX_OK
+        );
+
+        let body = CString::new(
+            json!({ "url": "https://example.com", "title": "Example", "collectionUuid": unknown })
+                .to_string(),
+        )
+        .unwrap();
+        let token = CString::new("parity").unwrap();
+        let r = alexandria_bookmark_create(body.as_ptr(), token.as_ptr());
+        assert!(r.json.is_null(), "a rejected create returns no body");
+        r.status
+    })
+    .await
+    .unwrap();
+
+    let ffi_pool = migrate_database(&ffi_db_for_rows).await.expect("ffi open");
+    let (ffi_count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM bookmarks")
+        .fetch_one(&ffi_pool)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        ffi_status,
+        alexandria_ffi::BOOKMARK_ERR_NOT_FOUND,
+        "ffi must reject an unknown collection as not-found (HTTP 404)"
+    );
+    assert_eq!(http_count, 0, "http persisted nothing");
+    assert_eq!(ffi_count, 0, "ffi persisted nothing");
+
+    ffi_pool.close().await;
 }
