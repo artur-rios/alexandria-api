@@ -29,7 +29,10 @@ fn create_request(body: Value) -> Request<Body> {
     Request::builder()
         .method("POST")
         .uri("/v1/bookmarks")
-        .header("authorization", "Bearer test-token")
+        .header(
+            "authorization",
+            format!("Bearer {}", common::TEST_TOKEN).as_str(),
+        )
         .header("content-type", "application/json")
         .body(Body::from(body.to_string()))
         .unwrap()
@@ -58,7 +61,10 @@ async fn create_bookmark_collection(router: axum::Router, name: &str) -> (axum::
             Request::builder()
                 .method("POST")
                 .uri("/v1/collections")
-                .header("authorization", "Bearer test-token")
+                .header(
+                    "authorization",
+                    format!("Bearer {}", common::TEST_TOKEN).as_str(),
+                )
                 .header("content-type", "application/json")
                 .body(Body::from(
                     json!({ "name": name, "kind": "bookmark" }).to_string(),
@@ -205,7 +211,10 @@ async fn given_malformed_json_body_when_posted_then_400_with_error_envelope() {
     let request = Request::builder()
         .method("POST")
         .uri("/v1/bookmarks")
-        .header("authorization", "Bearer test-token")
+        .header(
+            "authorization",
+            format!("Bearer {}", common::TEST_TOKEN).as_str(),
+        )
         .header("content-type", "application/json")
         .body(Body::from("{ not json"))
         .unwrap();
@@ -231,7 +240,10 @@ async fn given_file_kind_collection_when_posted_then_400_and_nothing_persisted()
             Request::builder()
                 .method("POST")
                 .uri("/v1/collections")
-                .header("authorization", "Bearer test-token")
+                .header(
+                    "authorization",
+                    format!("Bearer {}", common::TEST_TOKEN).as_str(),
+                )
                 .header("content-type", "application/json")
                 .body(Body::from(
                     json!({ "name": "My files", "kind": "file" }).to_string(),
@@ -320,7 +332,10 @@ fn update_request(uuid: &str, body: Value) -> Request<Body> {
     Request::builder()
         .method("PATCH")
         .uri(format!("/v1/bookmarks/{uuid}"))
-        .header("authorization", "Bearer test-token")
+        .header(
+            "authorization",
+            format!("Bearer {}", common::TEST_TOKEN).as_str(),
+        )
         .header("content-type", "application/json")
         .body(Body::from(body.to_string()))
         .unwrap()
@@ -432,7 +447,10 @@ async fn given_file_kind_collection_when_updated_then_400_and_row_unchanged() {
             Request::builder()
                 .method("POST")
                 .uri("/v1/collections")
-                .header("authorization", "Bearer test-token")
+                .header(
+                    "authorization",
+                    format!("Bearer {}", common::TEST_TOKEN).as_str(),
+                )
                 .header("content-type", "application/json")
                 .body(Body::from(
                     json!({ "name": "My files", "kind": "file" }).to_string(),
@@ -567,7 +585,10 @@ fn list_request(uri: &str) -> Request<Body> {
     Request::builder()
         .method("GET")
         .uri(uri)
-        .header("authorization", "Bearer test-token")
+        .header(
+            "authorization",
+            format!("Bearer {}", common::TEST_TOKEN).as_str(),
+        )
         .body(Body::empty())
         .unwrap()
 }
@@ -729,7 +750,10 @@ fn soft_delete_request(uuid: &str) -> Request<Body> {
     Request::builder()
         .method("DELETE")
         .uri(format!("/v1/bookmarks/{uuid}"))
-        .header("authorization", "Bearer test-token")
+        .header(
+            "authorization",
+            format!("Bearer {}", common::TEST_TOKEN).as_str(),
+        )
         .body(Body::empty())
         .unwrap()
 }
@@ -746,7 +770,10 @@ fn restore_request(uuid: &str) -> Request<Body> {
     Request::builder()
         .method("POST")
         .uri(format!("/v1/bookmarks/{uuid}/restore"))
-        .header("authorization", "Bearer test-token")
+        .header(
+            "authorization",
+            format!("Bearer {}", common::TEST_TOKEN).as_str(),
+        )
         .body(Body::empty())
         .unwrap()
 }
@@ -940,7 +967,10 @@ fn purge_request(uuid: &str) -> Request<Body> {
     Request::builder()
         .method("DELETE")
         .uri(format!("/v1/bookmarks/{uuid}?purge=true"))
-        .header("authorization", "Bearer test-token")
+        .header(
+            "authorization",
+            format!("Bearer {}", common::TEST_TOKEN).as_str(),
+        )
         .body(Body::empty())
         .unwrap()
 }

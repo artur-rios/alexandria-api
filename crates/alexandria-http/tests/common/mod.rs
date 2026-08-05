@@ -11,7 +11,7 @@
 
 use std::time::Duration;
 
-use alexandria_core::config::Settings;
+use alexandria_core::config::{AuthMode, Settings};
 use alexandria_core::migrate::migrate_database;
 use alexandria_core::services::{self, Services};
 use sqlx::sqlite::SqlitePool;
@@ -24,19 +24,43 @@ pub struct TestApp {
     _db_dir: TempDir,
 }
 
+/// Bearer token every integration test authenticates with. A valid UUID: the
+/// active auth mode is local (below), so it must parse as a session id
+/// (`LocalAuthService::authenticate`). A matching session is seeded in
+/// `test_app()` so it always validates.
+pub const TEST_TOKEN: &str = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+
 pub async fn test_app() -> TestApp {
     let dir = tempfile::tempdir().expect("tempdir");
     let db_path = dir.path().join("alexandria.sqlite");
     let pool = migrate_database(db_path.to_str().expect("path"))
         .await
         .expect("migrate");
-    let services =
-        std::sync::Arc::new(services::build_services(&Settings::default(), pool.clone()).await);
+    seed_session(&pool, TEST_TOKEN).await;
+
+    let mut settings = Settings::default();
+    settings.auth.mode = AuthMode::Local;
+
+    let services = std::sync::Arc::new(services::build_services(&settings, pool.clone()).await);
     TestApp {
         services,
         pool,
         _db_dir: dir,
     }
+}
+
+/// Insert a session valid for the next 24h, so `token` authenticates every
+/// request an integration test makes under local auth mode.
+async fn seed_session(pool: &SqlitePool, token: &str) {
+    let now = chrono::Utc::now();
+    let expires_at = now + chrono::Duration::hours(24);
+    sqlx::query("INSERT INTO sessions (id, created_at, expires_at) VALUES (?, ?, ?)")
+        .bind(token)
+        .bind(now.to_rfc3339())
+        .bind(expires_at.to_rfc3339())
+        .execute(pool)
+        .await
+        .expect("seed session");
 }
 
 /// Poll the `files` table until it contains `expected` rows, or time out.

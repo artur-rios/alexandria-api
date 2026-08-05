@@ -20,6 +20,9 @@ impl IntoResponse for ApiError {
             DomainError::InvalidState => (StatusCode::CONFLICT, "invalid state"),
             DomainError::Disk(_) => (StatusCode::INTERNAL_SERVER_ERROR, "disk error"),
             DomainError::Integrity(_) => (StatusCode::INTERNAL_SERVER_ERROR, "integrity error"),
+            DomainError::ServiceUnavailable(_) => {
+                (StatusCode::SERVICE_UNAVAILABLE, "service unavailable")
+            }
             DomainError::Database(_) | DomainError::Migration(_) => {
                 (StatusCode::INTERNAL_SERVER_ERROR, "database error")
             }

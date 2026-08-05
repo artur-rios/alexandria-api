@@ -1,3 +1,4 @@
+pub mod auth;
 pub mod bookmarks;
 pub mod browse;
 pub mod collections;

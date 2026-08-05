@@ -17,17 +17,17 @@ use alexandria_core::config::Settings;
 use alexandria_core::migrate::migrate_database;
 use alexandria_core::services::build_services;
 use alexandria_ffi::{
-    alexandria_bookmark_create, alexandria_bookmark_purge, alexandria_bookmark_restore,
-    alexandria_bookmark_soft_delete, alexandria_bookmark_update, alexandria_bookmarks_list,
-    alexandria_collection_add_items, alexandria_collection_create, alexandria_collection_delete,
-    alexandria_collection_list_items, alexandria_collection_remove_item,
-    alexandria_collection_rename, alexandria_file_edit_content, alexandria_file_edit_metadata,
-    alexandria_file_get_by_uuid, alexandria_file_purge, alexandria_file_purge_on_disk,
-    alexandria_file_read_content, alexandria_file_rename, alexandria_file_restore,
-    alexandria_file_soft_delete, alexandria_files_list, alexandria_free_string,
-    alexandria_index_count_files, alexandria_index_count_missing, alexandria_index_files_json,
-    alexandria_index_init, alexandria_index_refresh_start, alexandria_index_start,
-    alexandria_reading_list_add_item, alexandria_reading_list_create,
+    alexandria_auth_local_login, alexandria_auth_local_set_credentials, alexandria_bookmark_create,
+    alexandria_bookmark_purge, alexandria_bookmark_restore, alexandria_bookmark_soft_delete,
+    alexandria_bookmark_update, alexandria_bookmarks_list, alexandria_collection_add_items,
+    alexandria_collection_create, alexandria_collection_delete, alexandria_collection_list_items,
+    alexandria_collection_remove_item, alexandria_collection_rename, alexandria_file_edit_content,
+    alexandria_file_edit_metadata, alexandria_file_get_by_uuid, alexandria_file_purge,
+    alexandria_file_purge_on_disk, alexandria_file_read_content, alexandria_file_rename,
+    alexandria_file_restore, alexandria_file_soft_delete, alexandria_files_list,
+    alexandria_free_string, alexandria_index_count_files, alexandria_index_count_missing,
+    alexandria_index_files_json, alexandria_index_init, alexandria_index_refresh_start,
+    alexandria_index_start, alexandria_reading_list_add_item, alexandria_reading_list_create,
     alexandria_reading_list_delete, alexandria_reading_list_remove_item,
     alexandria_reading_list_update_progress, alexandria_reading_lists_list,
     alexandria_watchlist_add_video, alexandria_watchlist_create, alexandria_watchlist_delete,
@@ -65,6 +65,45 @@ fn db_path(dir: &TempDir, name: &str) -> String {
     dir.path().join(name).to_str().unwrap().to_string()
 }
 
+/// Bearer token every parity test authenticates with. A valid UUID: the
+/// active auth mode is local (below), so it must parse as a session id
+/// (`LocalAuthService::authenticate`). A matching session is seeded into
+/// each leg's database so it always validates.
+const TEST_TOKEN: &str = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+
+fn local_settings() -> Settings {
+    let mut settings = Settings::default();
+    settings.auth.mode = alexandria_core::config::AuthMode::Local;
+    settings
+}
+
+async fn seed_session(pool: &sqlx::sqlite::SqlitePool, token: &str) {
+    let now = chrono::Utc::now();
+    let expires_at = now + chrono::Duration::hours(24);
+    sqlx::query("INSERT INTO sessions (id, created_at, expires_at) VALUES (?, ?, ?)")
+        .bind(token)
+        .bind(now.to_rfc3339())
+        .bind(expires_at.to_rfc3339())
+        .execute(pool)
+        .await
+        .expect("seed session");
+}
+
+/// Pre-migrate the FFI leg's database and seed a session before
+/// `alexandria_index_init` opens it. `alexandria_index_init` loads settings
+/// via `load_settings()` (`ALEXANDRIA_*` env, not a `Settings` value the test
+/// controls directly), so this also flips the process-wide auth mode env var
+/// to local — safe across tests since `SERIAL` guards this whole file and the
+/// value never differs between them.
+async fn setup_ffi_db(dir: &TempDir, name: &str, token: &str) -> String {
+    std::env::set_var("ALEXANDRIA_AUTH_MODE", "local");
+    let path = db_path(dir, name);
+    let pool = migrate_database(&path).await.expect("ffi pre-migrate");
+    seed_session(&pool, token).await;
+    pool.close().await;
+    path
+}
+
 fn run_id_string(r: &IndexStartResult) -> String {
     let n = r
         .run_id
@@ -95,14 +134,15 @@ async fn given_same_lib_when_indexed_via_http_and_ffi_then_files_rows_identical(
     let http_dir = tempdir().unwrap();
     let http_db = db_path(&http_dir, "http.sqlite");
     let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    seed_session(&http_pool, TEST_TOKEN).await;
     let http_services =
-        std::sync::Arc::new(build_services(&Settings::default(), http_pool.clone()).await);
+        std::sync::Arc::new(build_services(&local_settings(), http_pool.clone()).await);
     let router = app(Settings::default(), http_services);
 
     let request = Request::builder()
         .method("POST")
         .uri("/v1/index")
-        .header("authorization", "Bearer parity")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .header("content-type", "application/json")
         .body(Body::from(json!({ "root": lib_path }).to_string()))
         .unwrap();
@@ -138,7 +178,7 @@ async fn given_same_lib_when_indexed_via_http_and_ffi_then_files_rows_identical(
 
     // ---- FFI leg (off the tokio thread: FFI block_on its own runtime) ----
     let ffi_dir = tempdir().unwrap();
-    let ffi_db = db_path(&ffi_dir, "ffi.sqlite");
+    let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
     let lib_for_ffi = lib_path.clone();
     let ffi_json: String = tokio::task::spawn_blocking(move || -> String {
         let cdb = CString::new(ffi_db).unwrap();
@@ -148,7 +188,7 @@ async fn given_same_lib_when_indexed_via_http_and_ffi_then_files_rows_identical(
         );
 
         let root = CString::new(lib_for_ffi).unwrap();
-        let token = CString::new("parity").unwrap();
+        let token = CString::new(TEST_TOKEN).unwrap();
         let result = alexandria_index_start(root.as_ptr(), token.as_ptr());
         assert_eq!(result.status, alexandria_ffi::INDEX_OK, "ffi start failed");
         assert!(!run_id_string(&result).is_empty());
@@ -225,13 +265,14 @@ async fn given_same_lib_when_refreshed_via_http_and_ffi_then_rows_and_missing_ma
     let http_dir = tempdir().unwrap();
     let http_db = db_path(&http_dir, "http.sqlite");
     let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    seed_session(&http_pool, TEST_TOKEN).await;
     let http_services =
-        std::sync::Arc::new(build_services(&Settings::default(), http_pool.clone()).await);
+        std::sync::Arc::new(build_services(&local_settings(), http_pool.clone()).await);
 
     let index_req = Request::builder()
         .method("POST")
         .uri("/v1/index")
-        .header("authorization", "Bearer parity")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .header("content-type", "application/json")
         .body(Body::from(
             json!({ "root": http_lib.path().to_str().unwrap() }).to_string(),
@@ -250,7 +291,7 @@ async fn given_same_lib_when_refreshed_via_http_and_ffi_then_rows_and_missing_ma
     let refresh_req = Request::builder()
         .method("POST")
         .uri("/v1/index/refresh")
-        .header("authorization", "Bearer parity")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .body(Body::empty())
         .unwrap();
     let refresh_resp = app(Settings::default(), http_services.clone())
@@ -271,7 +312,7 @@ async fn given_same_lib_when_refreshed_via_http_and_ffi_then_rows_and_missing_ma
     // ---- FFI leg (own identical lib) ----
     let ffi_lib = seed_lib();
     let ffi_dir = tempdir().unwrap();
-    let ffi_db = db_path(&ffi_dir, "ffi.sqlite");
+    let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
     let ffi_lib_path = ffi_lib.path().to_str().unwrap().to_string();
     let ffi_rows: Vec<(String, String, String, String, Option<String>)> =
         tokio::task::spawn_blocking(
@@ -283,7 +324,7 @@ async fn given_same_lib_when_refreshed_via_http_and_ffi_then_rows_and_missing_ma
                 );
 
                 let root = CString::new(ffi_lib_path.clone()).unwrap();
-                let token = CString::new("parity").unwrap();
+                let token = CString::new(TEST_TOKEN).unwrap();
                 let started = alexandria_index_start(root.as_ptr(), token.as_ptr());
                 assert_eq!(started.status, alexandria_ffi::INDEX_OK);
                 wait_for_ffi_files(2);
@@ -439,13 +480,14 @@ async fn given_same_audio_file_when_metadata_edited_via_http_and_ffi_then_respon
     let http_dir = tempdir().unwrap();
     let http_db = db_path(&http_dir, "http.sqlite");
     let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    seed_session(&http_pool, TEST_TOKEN).await;
     let http_services =
-        std::sync::Arc::new(build_services(&Settings::default(), http_pool.clone()).await);
+        std::sync::Arc::new(build_services(&local_settings(), http_pool.clone()).await);
 
     let index_req = Request::builder()
         .method("POST")
         .uri("/v1/index")
-        .header("authorization", "Bearer parity")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .header("content-type", "application/json")
         .body(Body::from(
             json!({ "root": http_lib.path().to_str().unwrap() }).to_string(),
@@ -466,7 +508,7 @@ async fn given_same_audio_file_when_metadata_edited_via_http_and_ffi_then_respon
     let patch_req = Request::builder()
         .method("PATCH")
         .uri(format!("/v1/files/{http_uuid}/metadata"))
-        .header("authorization", "Bearer parity")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .header("content-type", "application/json")
         .body(Body::from(patch_json.to_string()))
         .unwrap();
@@ -492,7 +534,7 @@ async fn given_same_audio_file_when_metadata_edited_via_http_and_ffi_then_respon
     let ffi_lib = tempdir().unwrap();
     std::fs::write(ffi_lib.path().join("song.mp3"), b"parity-audio").unwrap();
     let ffi_dir = tempdir().unwrap();
-    let ffi_db = db_path(&ffi_dir, "ffi.sqlite");
+    let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
     let ffi_lib_path = ffi_lib.path().to_str().unwrap().to_string();
     let patch_for_ffi = patch_json.to_string();
     let ffi_payload: (String, serde_json::Value, AudioMetadataRow) =
@@ -504,7 +546,7 @@ async fn given_same_audio_file_when_metadata_edited_via_http_and_ffi_then_respon
             );
 
             let root = CString::new(ffi_lib_path).unwrap();
-            let token = CString::new("parity").unwrap();
+            let token = CString::new(TEST_TOKEN).unwrap();
             let started = alexandria_index_start(root.as_ptr(), token.as_ptr());
             assert_eq!(started.status, alexandria_ffi::INDEX_OK);
             wait_for_ffi_files(1);
@@ -653,13 +695,14 @@ async fn given_same_lib_when_files_listed_via_http_and_ffi_then_arrays_identical
     let http_dir = tempdir().unwrap();
     let http_db = db_path(&http_dir, "http.sqlite");
     let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    seed_session(&http_pool, TEST_TOKEN).await;
     let http_services =
-        std::sync::Arc::new(build_services(&Settings::default(), http_pool.clone()).await);
+        std::sync::Arc::new(build_services(&local_settings(), http_pool.clone()).await);
 
     let index_req = Request::builder()
         .method("POST")
         .uri("/v1/index")
-        .header("authorization", "Bearer parity")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .header("content-type", "application/json")
         .body(Body::from(
             json!({ "root": http_lib.path().to_str().unwrap() }).to_string(),
@@ -708,7 +751,7 @@ async fn given_same_lib_when_files_listed_via_http_and_ffi_then_arrays_identical
     let default_req = Request::builder()
         .method("GET")
         .uri("/v1/files")
-        .header("authorization", "Bearer parity")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .body(Body::empty())
         .unwrap();
     let default_resp = app(Settings::default(), http_services.clone())
@@ -729,7 +772,7 @@ async fn given_same_lib_when_files_listed_via_http_and_ffi_then_arrays_identical
     let all_req = Request::builder()
         .method("GET")
         .uri("/v1/files?state=all")
-        .header("authorization", "Bearer parity")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .body(Body::empty())
         .unwrap();
     let all_resp = app(Settings::default(), http_services.clone())
@@ -745,7 +788,7 @@ async fn given_same_lib_when_files_listed_via_http_and_ffi_then_arrays_identical
     let audio_req = Request::builder()
         .method("GET")
         .uri("/v1/files?type=audio&state=all")
-        .header("authorization", "Bearer parity")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .body(Body::empty())
         .unwrap();
     let audio_resp = app(Settings::default(), http_services.clone())
@@ -766,7 +809,7 @@ async fn given_same_lib_when_files_listed_via_http_and_ffi_then_arrays_identical
     std::fs::write(ffi_lib.path().join("notes.md"), b"# h").unwrap();
     std::fs::write(ffi_lib.path().join("clip.mkv"), b"video").unwrap();
     let ffi_dir = tempdir().unwrap();
-    let ffi_db = db_path(&ffi_dir, "ffi.sqlite");
+    let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
     let ffi_lib_path = ffi_lib.path().to_str().unwrap().to_string();
 
     let (ffi_default_n, ffi_all_n, ffi_audio_n) =
@@ -778,7 +821,7 @@ async fn given_same_lib_when_files_listed_via_http_and_ffi_then_arrays_identical
             );
 
             let root = CString::new(ffi_lib_path).unwrap();
-            let token = CString::new("parity").unwrap();
+            let token = CString::new(TEST_TOKEN).unwrap();
             let started = alexandria_index_start(root.as_ptr(), token.as_ptr());
             assert_eq!(started.status, alexandria_ffi::INDEX_OK);
             wait_for_ffi_files(3);
@@ -874,13 +917,14 @@ async fn given_same_file_when_fetched_via_http_and_ffi_then_file_view_bodies_ide
     let http_dir = tempdir().unwrap();
     let http_db = db_path(&http_dir, "http.sqlite");
     let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    seed_session(&http_pool, TEST_TOKEN).await;
     let http_services =
-        std::sync::Arc::new(build_services(&Settings::default(), http_pool.clone()).await);
+        std::sync::Arc::new(build_services(&local_settings(), http_pool.clone()).await);
 
     let index_req = Request::builder()
         .method("POST")
         .uri("/v1/index")
-        .header("authorization", "Bearer parity")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .header("content-type", "application/json")
         .body(Body::from(
             json!({ "root": http_lib.path().to_str().unwrap() }).to_string(),
@@ -914,7 +958,7 @@ async fn given_same_file_when_fetched_via_http_and_ffi_then_file_view_bodies_ide
     let get_req = Request::builder()
         .method("GET")
         .uri(format!("/v1/files/{http_uuid}"))
-        .header("authorization", "Bearer parity")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .body(Body::empty())
         .unwrap();
     let get_resp = app(Settings::default(), http_services.clone())
@@ -929,7 +973,7 @@ async fn given_same_file_when_fetched_via_http_and_ffi_then_file_view_bodies_ide
     let ffi_lib = tempdir().unwrap();
     std::fs::write(ffi_lib.path().join("song.mp3"), b"parity-audio").unwrap();
     let ffi_dir = tempdir().unwrap();
-    let ffi_db = db_path(&ffi_dir, "ffi.sqlite");
+    let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
     let ffi_lib_path = ffi_lib.path().to_str().unwrap().to_string();
 
     let ffi_body: serde_json::Value = tokio::task::spawn_blocking(move || -> serde_json::Value {
@@ -940,7 +984,7 @@ async fn given_same_file_when_fetched_via_http_and_ffi_then_file_view_bodies_ide
         );
 
         let root = CString::new(ffi_lib_path).unwrap();
-        let token = CString::new("parity").unwrap();
+        let token = CString::new(TEST_TOKEN).unwrap();
         let started = alexandria_index_start(root.as_ptr(), token.as_ptr());
         assert_eq!(started.status, alexandria_ffi::INDEX_OK);
         wait_for_ffi_files(1);
@@ -1040,13 +1084,14 @@ async fn given_missing_uuid_when_fetched_via_http_and_ffi_then_both_not_found() 
     let http_dir = tempdir().unwrap();
     let http_db = db_path(&http_dir, "http.sqlite");
     let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    seed_session(&http_pool, TEST_TOKEN).await;
     let http_services =
-        std::sync::Arc::new(build_services(&Settings::default(), http_pool.clone()).await);
+        std::sync::Arc::new(build_services(&local_settings(), http_pool.clone()).await);
 
     let req = Request::builder()
         .method("GET")
         .uri(format!("/v1/files/{missing}"))
-        .header("authorization", "Bearer parity")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .body(Body::empty())
         .unwrap();
     let resp = app(Settings::default(), http_services.clone())
@@ -1057,7 +1102,7 @@ async fn given_missing_uuid_when_fetched_via_http_and_ffi_then_both_not_found() 
 
     // ---- FFI leg ----
     let ffi_dir = tempdir().unwrap();
-    let ffi_db = db_path(&ffi_dir, "ffi.sqlite");
+    let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
     let missing_str = missing.to_string();
     let ffi_status = tokio::task::spawn_blocking(move || -> i32 {
         let cdb = CString::new(ffi_db).unwrap();
@@ -1065,7 +1110,7 @@ async fn given_missing_uuid_when_fetched_via_http_and_ffi_then_both_not_found() 
             alexandria_index_init(cdb.as_ptr()),
             alexandria_ffi::INDEX_OK
         );
-        let token = CString::new("parity").unwrap();
+        let token = CString::new(TEST_TOKEN).unwrap();
         let uuid_c = CString::new(missing_str).unwrap();
         let r = alexandria_file_get_by_uuid(uuid_c.as_ptr(), token.as_ptr());
         r.status
@@ -1092,13 +1137,14 @@ async fn given_unknown_filter_values_when_listed_via_http_and_ffi_then_both_reje
     let http_dir = tempdir().unwrap();
     let http_db = db_path(&http_dir, "http.sqlite");
     let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    seed_session(&http_pool, TEST_TOKEN).await;
     let http_services =
-        std::sync::Arc::new(build_services(&Settings::default(), http_pool.clone()).await);
+        std::sync::Arc::new(build_services(&local_settings(), http_pool.clone()).await);
 
     let index_req = Request::builder()
         .method("POST")
         .uri("/v1/index")
-        .header("authorization", "Bearer parity")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .header("content-type", "application/json")
         .body(Body::from(
             json!({ "root": http_lib.path().to_str().unwrap() }).to_string(),
@@ -1116,7 +1162,7 @@ async fn given_unknown_filter_values_when_listed_via_http_and_ffi_then_both_reje
             let req = Request::builder()
                 .method("GET")
                 .uri(uri)
-                .header("authorization", "Bearer parity")
+                .header("authorization", &format!("Bearer {TEST_TOKEN}"))
                 .body(Body::empty())
                 .unwrap();
             app(Settings::default(), services)
@@ -1140,7 +1186,7 @@ async fn given_unknown_filter_values_when_listed_via_http_and_ffi_then_both_reje
     let ffi_lib = tempdir().unwrap();
     std::fs::write(ffi_lib.path().join("song.mp3"), b"audio").unwrap();
     let ffi_dir = tempdir().unwrap();
-    let ffi_db = db_path(&ffi_dir, "ffi.sqlite");
+    let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
     let ffi_lib_path = ffi_lib.path().to_str().unwrap().to_string();
 
     let (bad_type, bad_state, empty_values) =
@@ -1152,7 +1198,7 @@ async fn given_unknown_filter_values_when_listed_via_http_and_ffi_then_both_reje
             );
 
             let root = CString::new(ffi_lib_path).unwrap();
-            let token = CString::new("parity").unwrap();
+            let token = CString::new(TEST_TOKEN).unwrap();
             let started = alexandria_index_start(root.as_ptr(), token.as_ptr());
             assert_eq!(started.status, alexandria_ffi::INDEX_OK);
             wait_for_ffi_files(1);
@@ -1206,8 +1252,9 @@ async fn given_no_token_when_files_listed_via_http_and_ffi_then_both_unauthorize
     let http_dir = tempdir().unwrap();
     let http_db = db_path(&http_dir, "http.sqlite");
     let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    seed_session(&http_pool, TEST_TOKEN).await;
     let http_services =
-        std::sync::Arc::new(build_services(&Settings::default(), http_pool.clone()).await);
+        std::sync::Arc::new(build_services(&local_settings(), http_pool.clone()).await);
 
     let req = Request::builder()
         .method("GET")
@@ -1221,7 +1268,7 @@ async fn given_no_token_when_files_listed_via_http_and_ffi_then_both_unauthorize
     assert_eq!(resp.status(), axum::http::StatusCode::UNAUTHORIZED);
 
     let ffi_dir = tempdir().unwrap();
-    let ffi_db = db_path(&ffi_dir, "ffi.sqlite");
+    let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
     let ffi_status = tokio::task::spawn_blocking(move || -> i32 {
         let cdb = CString::new(ffi_db).unwrap();
         assert_eq!(
@@ -1253,8 +1300,9 @@ async fn given_no_token_and_malformed_payload_when_edited_via_http_and_ffi_then_
     let http_dir = tempdir().unwrap();
     let http_db = db_path(&http_dir, "http.sqlite");
     let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    seed_session(&http_pool, TEST_TOKEN).await;
     let http_services =
-        std::sync::Arc::new(build_services(&Settings::default(), http_pool.clone()).await);
+        std::sync::Arc::new(build_services(&local_settings(), http_pool.clone()).await);
 
     let req = Request::builder()
         .method("PATCH")
@@ -1270,7 +1318,7 @@ async fn given_no_token_and_malformed_payload_when_edited_via_http_and_ffi_then_
 
     // ---- FFI leg ----
     let ffi_dir = tempdir().unwrap();
-    let ffi_db = db_path(&ffi_dir, "ffi.sqlite");
+    let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
     let (edit_status, get_status, list_status) =
         tokio::task::spawn_blocking(move || -> (i32, i32, i32) {
             let cdb = CString::new(ffi_db).unwrap();
@@ -1353,13 +1401,14 @@ async fn given_same_file_when_renamed_via_http_and_ffi_then_file_bodies_and_disk
     let http_dir = tempdir().unwrap();
     let http_db = db_path(&http_dir, "http.sqlite");
     let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    seed_session(&http_pool, TEST_TOKEN).await;
     let http_services =
-        std::sync::Arc::new(build_services(&Settings::default(), http_pool.clone()).await);
+        std::sync::Arc::new(build_services(&local_settings(), http_pool.clone()).await);
 
     let index_req = Request::builder()
         .method("POST")
         .uri("/v1/index")
-        .header("authorization", "Bearer parity")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .header("content-type", "application/json")
         .body(Body::from(
             json!({ "root": http_lib.path().to_str().unwrap() }).to_string(),
@@ -1380,7 +1429,7 @@ async fn given_same_file_when_renamed_via_http_and_ffi_then_file_bodies_and_disk
     let rename_req = Request::builder()
         .method("POST")
         .uri(format!("/v1/files/{http_uuid}/rename"))
-        .header("authorization", "Bearer parity")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .header("content-type", "application/json")
         .body(Body::from(json!({ "name": new_name }).to_string()))
         .unwrap();
@@ -1397,7 +1446,7 @@ async fn given_same_file_when_renamed_via_http_and_ffi_then_file_bodies_and_disk
     let ffi_lib = tempdir().unwrap();
     std::fs::write(ffi_lib.path().join("song.mp3"), b"parity-audio").unwrap();
     let ffi_dir = tempdir().unwrap();
-    let ffi_db = db_path(&ffi_dir, "ffi.sqlite");
+    let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
     let ffi_lib_path = ffi_lib.path().to_str().unwrap().to_string();
     let new_name_for_ffi = new_name.to_string();
 
@@ -1410,7 +1459,7 @@ async fn given_same_file_when_renamed_via_http_and_ffi_then_file_bodies_and_disk
             );
 
             let root = CString::new(ffi_lib_path).unwrap();
-            let token = CString::new("parity").unwrap();
+            let token = CString::new(TEST_TOKEN).unwrap();
             let started = alexandria_index_start(root.as_ptr(), token.as_ptr());
             assert_eq!(started.status, alexandria_ffi::INDEX_OK);
             wait_for_ffi_files(1);
@@ -1519,8 +1568,9 @@ async fn given_no_token_when_renamed_via_http_and_ffi_then_both_unauthorized() {
     let http_dir = tempdir().unwrap();
     let http_db = db_path(&http_dir, "http.sqlite");
     let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    seed_session(&http_pool, TEST_TOKEN).await;
     let http_services =
-        std::sync::Arc::new(build_services(&Settings::default(), http_pool.clone()).await);
+        std::sync::Arc::new(build_services(&local_settings(), http_pool.clone()).await);
 
     let req = Request::builder()
         .method("POST")
@@ -1536,7 +1586,7 @@ async fn given_no_token_when_renamed_via_http_and_ffi_then_both_unauthorized() {
 
     // ---- FFI leg ----
     let ffi_dir = tempdir().unwrap();
-    let ffi_db = db_path(&ffi_dir, "ffi.sqlite");
+    let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
     let (rename_status, bad_payload_status) = tokio::task::spawn_blocking(move || -> (i32, i32) {
         let cdb = CString::new(ffi_db).unwrap();
         assert_eq!(
@@ -1600,13 +1650,14 @@ async fn given_same_file_when_soft_deleted_via_http_and_ffi_then_file_bodies_ide
     let http_dir = tempdir().unwrap();
     let http_db = db_path(&http_dir, "http.sqlite");
     let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    seed_session(&http_pool, TEST_TOKEN).await;
     let http_services =
-        std::sync::Arc::new(build_services(&Settings::default(), http_pool.clone()).await);
+        std::sync::Arc::new(build_services(&local_settings(), http_pool.clone()).await);
 
     let index_req = Request::builder()
         .method("POST")
         .uri("/v1/index")
-        .header("authorization", "Bearer parity")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .header("content-type", "application/json")
         .body(Body::from(
             json!({ "root": http_lib.path().to_str().unwrap() }).to_string(),
@@ -1627,7 +1678,7 @@ async fn given_same_file_when_soft_deleted_via_http_and_ffi_then_file_bodies_ide
     let delete_req = Request::builder()
         .method("DELETE")
         .uri(format!("/v1/files/{http_uuid}"))
-        .header("authorization", "Bearer parity")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .body(Body::empty())
         .unwrap();
     let http_resp = app(Settings::default(), http_services.clone())
@@ -1643,7 +1694,7 @@ async fn given_same_file_when_soft_deleted_via_http_and_ffi_then_file_bodies_ide
     let ffi_lib = tempdir().unwrap();
     std::fs::write(ffi_lib.path().join("song.mp3"), b"parity-audio").unwrap();
     let ffi_dir = tempdir().unwrap();
-    let ffi_db = db_path(&ffi_dir, "ffi.sqlite");
+    let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
     let ffi_lib_path = ffi_lib.path().to_str().unwrap().to_string();
 
     let (ffi_uuid, ffi_body) =
@@ -1655,7 +1706,7 @@ async fn given_same_file_when_soft_deleted_via_http_and_ffi_then_file_bodies_ide
             );
 
             let root = CString::new(ffi_lib_path).unwrap();
-            let token = CString::new("parity").unwrap();
+            let token = CString::new(TEST_TOKEN).unwrap();
             let started = alexandria_index_start(root.as_ptr(), token.as_ptr());
             assert_eq!(started.status, alexandria_ffi::INDEX_OK);
             wait_for_ffi_files(1);
@@ -1779,8 +1830,9 @@ async fn given_no_token_when_soft_deleted_via_http_and_ffi_then_both_unauthorize
     let http_dir = tempdir().unwrap();
     let http_db = db_path(&http_dir, "http.sqlite");
     let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    seed_session(&http_pool, TEST_TOKEN).await;
     let http_services =
-        std::sync::Arc::new(build_services(&Settings::default(), http_pool.clone()).await);
+        std::sync::Arc::new(build_services(&local_settings(), http_pool.clone()).await);
 
     let req = Request::builder()
         .method("DELETE")
@@ -1795,7 +1847,7 @@ async fn given_no_token_when_soft_deleted_via_http_and_ffi_then_both_unauthorize
 
     // ---- FFI leg ----
     let ffi_dir = tempdir().unwrap();
-    let ffi_db = db_path(&ffi_dir, "ffi.sqlite");
+    let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
     let (soft_delete_status, clean_uuid_status) =
         tokio::task::spawn_blocking(move || -> (i32, i32) {
             let cdb = CString::new(ffi_db).unwrap();
@@ -1863,13 +1915,14 @@ async fn given_soft_deleted_file_when_restored_via_http_and_ffi_then_file_bodies
     let http_dir = tempdir().unwrap();
     let http_db = db_path(&http_dir, "http.sqlite");
     let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    seed_session(&http_pool, TEST_TOKEN).await;
     let http_services =
-        std::sync::Arc::new(build_services(&Settings::default(), http_pool.clone()).await);
+        std::sync::Arc::new(build_services(&local_settings(), http_pool.clone()).await);
 
     let index_req = Request::builder()
         .method("POST")
         .uri("/v1/index")
-        .header("authorization", "Bearer parity")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .header("content-type", "application/json")
         .body(Body::from(
             json!({ "root": http_lib.path().to_str().unwrap() }).to_string(),
@@ -1898,7 +1951,7 @@ async fn given_soft_deleted_file_when_restored_via_http_and_ffi_then_file_bodies
     let restore_req = Request::builder()
         .method("POST")
         .uri(format!("/v1/files/{http_uuid}/restore"))
-        .header("authorization", "Bearer parity")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .body(Body::empty())
         .unwrap();
     let http_resp = app(Settings::default(), http_services.clone())
@@ -1914,7 +1967,7 @@ async fn given_soft_deleted_file_when_restored_via_http_and_ffi_then_file_bodies
     let ffi_lib = tempdir().unwrap();
     std::fs::write(ffi_lib.path().join("song.mp3"), b"parity-audio").unwrap();
     let ffi_dir = tempdir().unwrap();
-    let ffi_db = db_path(&ffi_dir, "ffi.sqlite");
+    let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
     let ffi_lib_path = ffi_lib.path().to_str().unwrap().to_string();
     let deleted_at_for_seed = deleted_at;
 
@@ -1927,7 +1980,7 @@ async fn given_soft_deleted_file_when_restored_via_http_and_ffi_then_file_bodies
             );
 
             let root = CString::new(ffi_lib_path).unwrap();
-            let token = CString::new("parity").unwrap();
+            let token = CString::new(TEST_TOKEN).unwrap();
             let started = alexandria_index_start(root.as_ptr(), token.as_ptr());
             assert_eq!(started.status, alexandria_ffi::INDEX_OK);
             wait_for_ffi_files(1);
@@ -2052,8 +2105,9 @@ async fn given_no_token_when_restored_via_http_and_ffi_then_both_unauthorized() 
     let http_dir = tempdir().unwrap();
     let http_db = db_path(&http_dir, "http.sqlite");
     let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    seed_session(&http_pool, TEST_TOKEN).await;
     let http_services =
-        std::sync::Arc::new(build_services(&Settings::default(), http_pool.clone()).await);
+        std::sync::Arc::new(build_services(&local_settings(), http_pool.clone()).await);
 
     let req = Request::builder()
         .method("POST")
@@ -2068,7 +2122,7 @@ async fn given_no_token_when_restored_via_http_and_ffi_then_both_unauthorized() 
 
     // ---- FFI leg ----
     let ffi_dir = tempdir().unwrap();
-    let ffi_db = db_path(&ffi_dir, "ffi.sqlite");
+    let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
     let (restore_status, clean_uuid_status) = tokio::task::spawn_blocking(move || -> (i32, i32) {
         let cdb = CString::new(ffi_db).unwrap();
         assert_eq!(
@@ -2133,13 +2187,14 @@ async fn given_purgeable_file_when_purged_via_http_and_ffi_then_file_bodies_iden
     let http_dir = tempdir().unwrap();
     let http_db = db_path(&http_dir, "http.sqlite");
     let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    seed_session(&http_pool, TEST_TOKEN).await;
     let http_services =
-        std::sync::Arc::new(build_services(&Settings::default(), http_pool.clone()).await);
+        std::sync::Arc::new(build_services(&local_settings(), http_pool.clone()).await);
 
     let index_req = Request::builder()
         .method("POST")
         .uri("/v1/index")
-        .header("authorization", "Bearer parity")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .header("content-type", "application/json")
         .body(Body::from(
             json!({ "root": http_lib.path().to_str().unwrap() }).to_string(),
@@ -2168,7 +2223,7 @@ async fn given_purgeable_file_when_purged_via_http_and_ffi_then_file_bodies_iden
     let purge_req = Request::builder()
         .method("DELETE")
         .uri(format!("/v1/files/{http_uuid}?purge=true"))
-        .header("authorization", "Bearer parity")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .body(Body::empty())
         .unwrap();
     let http_resp = app(Settings::default(), http_services.clone())
@@ -2196,7 +2251,7 @@ async fn given_purgeable_file_when_purged_via_http_and_ffi_then_file_bodies_iden
     let ffi_lib = tempdir().unwrap();
     std::fs::write(ffi_lib.path().join("song.mp3"), b"parity-audio").unwrap();
     let ffi_dir = tempdir().unwrap();
-    let ffi_db = db_path(&ffi_dir, "ffi.sqlite");
+    let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
     let ffi_lib_path = ffi_lib.path().to_str().unwrap().to_string();
 
     let (ffi_body, ffi_files_remaining, ffi_subtype_remaining) =
@@ -2208,7 +2263,7 @@ async fn given_purgeable_file_when_purged_via_http_and_ffi_then_file_bodies_iden
             );
 
             let root = CString::new(ffi_lib_path).unwrap();
-            let token = CString::new("parity").unwrap();
+            let token = CString::new(TEST_TOKEN).unwrap();
             let started = alexandria_index_start(root.as_ptr(), token.as_ptr());
             assert_eq!(started.status, alexandria_ffi::INDEX_OK);
             wait_for_ffi_files(1);
@@ -2360,8 +2415,9 @@ async fn given_no_token_when_purged_via_http_and_ffi_then_both_unauthorized() {
     let http_dir = tempdir().unwrap();
     let http_db = db_path(&http_dir, "http.sqlite");
     let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    seed_session(&http_pool, TEST_TOKEN).await;
     let http_services =
-        std::sync::Arc::new(build_services(&Settings::default(), http_pool.clone()).await);
+        std::sync::Arc::new(build_services(&local_settings(), http_pool.clone()).await);
 
     let req = Request::builder()
         .method("DELETE")
@@ -2376,7 +2432,7 @@ async fn given_no_token_when_purged_via_http_and_ffi_then_both_unauthorized() {
 
     // ---- FFI leg ----
     let ffi_dir = tempdir().unwrap();
-    let ffi_db = db_path(&ffi_dir, "ffi.sqlite");
+    let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
     let (purge_status, clean_uuid_status) = tokio::task::spawn_blocking(move || -> (i32, i32) {
         let cdb = CString::new(ffi_db).unwrap();
         assert_eq!(
@@ -2439,13 +2495,14 @@ async fn given_active_file_when_purged_on_disk_via_http_and_ffi_then_file_bodies
     let http_dir = tempdir().unwrap();
     let http_db = db_path(&http_dir, "http.sqlite");
     let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    seed_session(&http_pool, TEST_TOKEN).await;
     let http_services =
-        std::sync::Arc::new(build_services(&Settings::default(), http_pool.clone()).await);
+        std::sync::Arc::new(build_services(&local_settings(), http_pool.clone()).await);
 
     let index_req = Request::builder()
         .method("POST")
         .uri("/v1/index")
-        .header("authorization", "Bearer parity")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .header("content-type", "application/json")
         .body(Body::from(
             json!({ "root": http_lib.path().to_str().unwrap() }).to_string(),
@@ -2467,7 +2524,7 @@ async fn given_active_file_when_purged_on_disk_via_http_and_ffi_then_file_bodies
     let purge_req = Request::builder()
         .method("DELETE")
         .uri(format!("/v1/files/{http_uuid}?purge-on-disk=true"))
-        .header("authorization", "Bearer parity")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .body(Body::empty())
         .unwrap();
     let http_resp = app(Settings::default(), http_services.clone())
@@ -2495,7 +2552,7 @@ async fn given_active_file_when_purged_on_disk_via_http_and_ffi_then_file_bodies
     let ffi_lib = tempdir().unwrap();
     std::fs::write(ffi_lib.path().join("song.mp3"), b"parity-audio").unwrap();
     let ffi_dir = tempdir().unwrap();
-    let ffi_db = db_path(&ffi_dir, "ffi.sqlite");
+    let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
     let ffi_lib_path = ffi_lib.path().to_str().unwrap().to_string();
 
     let (ffi_body, ffi_files_remaining, ffi_subtype_remaining) =
@@ -2507,7 +2564,7 @@ async fn given_active_file_when_purged_on_disk_via_http_and_ffi_then_file_bodies
             );
 
             let root = CString::new(ffi_lib_path).unwrap();
-            let token = CString::new("parity").unwrap();
+            let token = CString::new(TEST_TOKEN).unwrap();
             let started = alexandria_index_start(root.as_ptr(), token.as_ptr());
             assert_eq!(started.status, alexandria_ffi::INDEX_OK);
             wait_for_ffi_files(1);
@@ -2671,8 +2728,9 @@ async fn given_no_token_when_purged_on_disk_via_http_and_ffi_then_both_unauthori
     let http_dir = tempdir().unwrap();
     let http_db = db_path(&http_dir, "http.sqlite");
     let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    seed_session(&http_pool, TEST_TOKEN).await;
     let http_services =
-        std::sync::Arc::new(build_services(&Settings::default(), http_pool.clone()).await);
+        std::sync::Arc::new(build_services(&local_settings(), http_pool.clone()).await);
 
     let req = Request::builder()
         .method("DELETE")
@@ -2690,7 +2748,7 @@ async fn given_no_token_when_purged_on_disk_via_http_and_ffi_then_both_unauthori
 
     // ---- FFI leg ----
     let ffi_dir = tempdir().unwrap();
-    let ffi_db = db_path(&ffi_dir, "ffi.sqlite");
+    let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
     let (purge_status, clean_uuid_status) = tokio::task::spawn_blocking(move || -> (i32, i32) {
         let cdb = CString::new(ffi_db).unwrap();
         assert_eq!(
@@ -2749,13 +2807,14 @@ async fn given_missing_disk_file_when_purged_on_disk_via_http_and_ffi_then_both_
     let http_dir = tempdir().unwrap();
     let http_db = db_path(&http_dir, "http.sqlite");
     let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    seed_session(&http_pool, TEST_TOKEN).await;
     let http_services =
-        std::sync::Arc::new(build_services(&Settings::default(), http_pool.clone()).await);
+        std::sync::Arc::new(build_services(&local_settings(), http_pool.clone()).await);
 
     let index_req = Request::builder()
         .method("POST")
         .uri("/v1/index")
-        .header("authorization", "Bearer parity")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .header("content-type", "application/json")
         .body(Body::from(
             json!({ "root": http_lib.path().to_str().unwrap() }).to_string(),
@@ -2781,7 +2840,7 @@ async fn given_missing_disk_file_when_purged_on_disk_via_http_and_ffi_then_both_
     let purge_req = Request::builder()
         .method("DELETE")
         .uri(format!("/v1/files/{http_uuid}?purge-on-disk=true"))
-        .header("authorization", "Bearer parity")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .body(Body::empty())
         .unwrap();
     let http_resp = app(Settings::default(), http_services.clone())
@@ -2809,7 +2868,7 @@ async fn given_missing_disk_file_when_purged_on_disk_via_http_and_ffi_then_both_
     let ffi_lib = tempdir().unwrap();
     std::fs::write(ffi_lib.path().join("song.mp3"), b"parity-audio").unwrap();
     let ffi_dir = tempdir().unwrap();
-    let ffi_db = db_path(&ffi_dir, "ffi.sqlite");
+    let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
     let ffi_lib_path = ffi_lib.path().to_str().unwrap().to_string();
     let ffi_disk_file = ffi_lib.path().join("song.mp3");
 
@@ -2822,7 +2881,7 @@ async fn given_missing_disk_file_when_purged_on_disk_via_http_and_ffi_then_both_
             );
 
             let root = CString::new(ffi_lib_path).unwrap();
-            let token = CString::new("parity").unwrap();
+            let token = CString::new(TEST_TOKEN).unwrap();
             let started = alexandria_index_start(root.as_ptr(), token.as_ptr());
             assert_eq!(started.status, alexandria_ffi::INDEX_OK);
             wait_for_ffi_files(1);
@@ -2967,14 +3026,15 @@ async fn given_unknown_uuid_when_purged_via_http_and_ffi_then_both_not_found() {
     let http_dir = tempdir().unwrap();
     let http_db = db_path(&http_dir, "http.sqlite");
     let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    seed_session(&http_pool, TEST_TOKEN).await;
     let http_services =
-        std::sync::Arc::new(build_services(&Settings::default(), http_pool.clone()).await);
+        std::sync::Arc::new(build_services(&local_settings(), http_pool.clone()).await);
 
     for query in ["purge=true", "purge-on-disk=true"] {
         let req = Request::builder()
             .method("DELETE")
             .uri(format!("/v1/files/{uuid}?{query}"))
-            .header("authorization", "Bearer parity")
+            .header("authorization", &format!("Bearer {TEST_TOKEN}"))
             .body(Body::empty())
             .unwrap();
         let resp = app(Settings::default(), http_services.clone())
@@ -2990,7 +3050,7 @@ async fn given_unknown_uuid_when_purged_via_http_and_ffi_then_both_not_found() {
 
     // ---- FFI leg ----
     let ffi_dir = tempdir().unwrap();
-    let ffi_db = db_path(&ffi_dir, "ffi.sqlite");
+    let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
     let ffi_uuid = uuid.clone();
     let (purge_status, purge_on_disk_status) =
         tokio::task::spawn_blocking(move || -> (i32, i32) {
@@ -3000,7 +3060,7 @@ async fn given_unknown_uuid_when_purged_via_http_and_ffi_then_both_not_found() {
                 alexandria_ffi::INDEX_OK
             );
 
-            let token = CString::new("parity").unwrap();
+            let token = CString::new(TEST_TOKEN).unwrap();
             let uuid = CString::new(ffi_uuid).unwrap();
 
             let purge = alexandria_file_purge(uuid.as_ptr(), token.as_ptr());
@@ -3049,13 +3109,14 @@ async fn given_active_file_when_purged_via_http_and_ffi_then_both_invalid_state(
     let http_dir = tempdir().unwrap();
     let http_db = db_path(&http_dir, "http.sqlite");
     let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    seed_session(&http_pool, TEST_TOKEN).await;
     let http_services =
-        std::sync::Arc::new(build_services(&Settings::default(), http_pool.clone()).await);
+        std::sync::Arc::new(build_services(&local_settings(), http_pool.clone()).await);
 
     let index_req = Request::builder()
         .method("POST")
         .uri("/v1/index")
-        .header("authorization", "Bearer parity")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .header("content-type", "application/json")
         .body(Body::from(
             json!({ "root": http_lib.path().to_str().unwrap() }).to_string(),
@@ -3078,7 +3139,7 @@ async fn given_active_file_when_purged_via_http_and_ffi_then_both_invalid_state(
     let purge_req = Request::builder()
         .method("DELETE")
         .uri(format!("/v1/files/{http_uuid}?purge=true"))
-        .header("authorization", "Bearer parity")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .body(Body::empty())
         .unwrap();
     let http_resp = app(Settings::default(), http_services.clone())
@@ -3097,7 +3158,7 @@ async fn given_active_file_when_purged_via_http_and_ffi_then_both_invalid_state(
     let ffi_lib = tempdir().unwrap();
     std::fs::write(ffi_lib.path().join("song.mp3"), b"parity-audio").unwrap();
     let ffi_dir = tempdir().unwrap();
-    let ffi_db = db_path(&ffi_dir, "ffi.sqlite");
+    let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
     let ffi_lib_path = ffi_lib.path().to_str().unwrap().to_string();
 
     let (ffi_status, ffi_remaining) = tokio::task::spawn_blocking(move || -> (i32, i64) {
@@ -3108,7 +3169,7 @@ async fn given_active_file_when_purged_via_http_and_ffi_then_both_invalid_state(
         );
 
         let root = CString::new(ffi_lib_path).unwrap();
-        let token = CString::new("parity").unwrap();
+        let token = CString::new(TEST_TOKEN).unwrap();
         let started = alexandria_index_start(root.as_ptr(), token.as_ptr());
         assert_eq!(started.status, alexandria_ffi::INDEX_OK);
         wait_for_ffi_files(1);
@@ -3204,13 +3265,14 @@ async fn given_same_collection_when_created_via_http_and_ffi_then_bodies_and_row
     let http_dir = tempdir().unwrap();
     let http_db = db_path(&http_dir, "http.sqlite");
     let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    seed_session(&http_pool, TEST_TOKEN).await;
     let http_services =
-        std::sync::Arc::new(build_services(&Settings::default(), http_pool.clone()).await);
+        std::sync::Arc::new(build_services(&local_settings(), http_pool.clone()).await);
 
     let req = Request::builder()
         .method("POST")
         .uri("/v1/collections")
-        .header("authorization", "Bearer parity")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .header("content-type", "application/json")
         .body(Body::from(
             json!({ "name": "Sci-fi novels", "kind": "file" }).to_string(),
@@ -3232,7 +3294,7 @@ async fn given_same_collection_when_created_via_http_and_ffi_then_bodies_and_row
 
     // ---- FFI leg (off the tokio thread: FFI block_on its own runtime) ----
     let ffi_dir = tempdir().unwrap();
-    let ffi_db = db_path(&ffi_dir, "ffi.sqlite");
+    let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
     let ffi_db_for_rows = ffi_db.clone();
     let ffi_body: serde_json::Value = tokio::task::spawn_blocking(move || -> serde_json::Value {
         let cdb = CString::new(ffi_db).unwrap();
@@ -3243,7 +3305,7 @@ async fn given_same_collection_when_created_via_http_and_ffi_then_bodies_and_row
 
         let body =
             CString::new(json!({ "name": "Sci-fi novels", "kind": "file" }).to_string()).unwrap();
-        let token = CString::new("parity").unwrap();
+        let token = CString::new(TEST_TOKEN).unwrap();
         let r = alexandria_collection_create(body.as_ptr(), token.as_ptr());
         assert_eq!(r.status, alexandria_ffi::COLLECTION_OK, "ffi create");
         assert!(!r.json.is_null());
@@ -3314,13 +3376,14 @@ async fn given_unrecognised_kind_when_created_via_http_and_ffi_then_both_reject(
     let http_dir = tempdir().unwrap();
     let http_db = db_path(&http_dir, "http.sqlite");
     let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    seed_session(&http_pool, TEST_TOKEN).await;
     let http_services =
-        std::sync::Arc::new(build_services(&Settings::default(), http_pool.clone()).await);
+        std::sync::Arc::new(build_services(&local_settings(), http_pool.clone()).await);
 
     let req = Request::builder()
         .method("POST")
         .uri("/v1/collections")
-        .header("authorization", "Bearer parity")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .header("content-type", "application/json")
         .body(Body::from(
             json!({ "name": "Mixed bag", "kind": "playlist" }).to_string(),
@@ -3338,7 +3401,7 @@ async fn given_unrecognised_kind_when_created_via_http_and_ffi_then_both_reject(
 
     // ---- FFI leg ----
     let ffi_dir = tempdir().unwrap();
-    let ffi_db = db_path(&ffi_dir, "ffi.sqlite");
+    let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
     let ffi_db_for_rows = ffi_db.clone();
     let ffi_status = tokio::task::spawn_blocking(move || -> i32 {
         let cdb = CString::new(ffi_db).unwrap();
@@ -3349,7 +3412,7 @@ async fn given_unrecognised_kind_when_created_via_http_and_ffi_then_both_reject(
 
         let body =
             CString::new(json!({ "name": "Mixed bag", "kind": "playlist" }).to_string()).unwrap();
-        let token = CString::new("parity").unwrap();
+        let token = CString::new(TEST_TOKEN).unwrap();
         let r = alexandria_collection_create(body.as_ptr(), token.as_ptr());
         assert!(r.json.is_null(), "a rejected create returns no body");
         r.status
@@ -3385,8 +3448,9 @@ async fn given_no_token_when_collection_created_via_http_and_ffi_then_both_unaut
     let http_dir = tempdir().unwrap();
     let http_db = db_path(&http_dir, "http.sqlite");
     let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    seed_session(&http_pool, TEST_TOKEN).await;
     let http_services =
-        std::sync::Arc::new(build_services(&Settings::default(), http_pool.clone()).await);
+        std::sync::Arc::new(build_services(&local_settings(), http_pool.clone()).await);
 
     // A body that would otherwise fail to parse, so the auth check must fire
     // before it is read.
@@ -3404,7 +3468,7 @@ async fn given_no_token_when_collection_created_via_http_and_ffi_then_both_unaut
 
     // ---- FFI leg ----
     let ffi_dir = tempdir().unwrap();
-    let ffi_db = db_path(&ffi_dir, "ffi.sqlite");
+    let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
     let (malformed_status, clean_status) = tokio::task::spawn_blocking(move || -> (i32, i32) {
         let cdb = CString::new(ffi_db).unwrap();
         assert_eq!(
@@ -3451,14 +3515,15 @@ async fn given_same_collection_when_renamed_via_http_and_ffi_then_bodies_and_row
     let http_dir = tempdir().unwrap();
     let http_db = db_path(&http_dir, "http.sqlite");
     let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    seed_session(&http_pool, TEST_TOKEN).await;
     let http_services =
-        std::sync::Arc::new(build_services(&Settings::default(), http_pool.clone()).await);
+        std::sync::Arc::new(build_services(&local_settings(), http_pool.clone()).await);
     let router = app(Settings::default(), http_services);
 
     let create_req = Request::builder()
         .method("POST")
         .uri("/v1/collections")
-        .header("authorization", "Bearer parity")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .header("content-type", "application/json")
         .body(Body::from(
             json!({ "name": "Sci-fi novels", "kind": "file" }).to_string(),
@@ -3478,7 +3543,7 @@ async fn given_same_collection_when_renamed_via_http_and_ffi_then_bodies_and_row
     let rename_req = Request::builder()
         .method("PATCH")
         .uri(format!("/v1/collections/{http_uuid}"))
-        .header("authorization", "Bearer parity")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .header("content-type", "application/json")
         .body(Body::from(
             json!({ "name": "Sci-fi & fantasy" }).to_string(),
@@ -3498,7 +3563,7 @@ async fn given_same_collection_when_renamed_via_http_and_ffi_then_bodies_and_row
 
     // ---- FFI leg ----
     let ffi_dir = tempdir().unwrap();
-    let ffi_db = db_path(&ffi_dir, "ffi.sqlite");
+    let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
     let ffi_db_for_rows = ffi_db.clone();
     let ffi_body: serde_json::Value = tokio::task::spawn_blocking(move || -> serde_json::Value {
         let cdb = CString::new(ffi_db).unwrap();
@@ -3509,7 +3574,7 @@ async fn given_same_collection_when_renamed_via_http_and_ffi_then_bodies_and_row
 
         let create_body =
             CString::new(json!({ "name": "Sci-fi novels", "kind": "file" }).to_string()).unwrap();
-        let token = CString::new("parity").unwrap();
+        let token = CString::new(TEST_TOKEN).unwrap();
         let created = alexandria_collection_create(create_body.as_ptr(), token.as_ptr());
         assert_eq!(created.status, alexandria_ffi::COLLECTION_OK, "ffi create");
         // SAFETY: pointer came from this library and is freed once below.
@@ -3576,13 +3641,14 @@ async fn given_unknown_uuid_when_renamed_via_http_and_ffi_then_both_not_found() 
     let http_dir = tempdir().unwrap();
     let http_db = db_path(&http_dir, "http.sqlite");
     let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    seed_session(&http_pool, TEST_TOKEN).await;
     let http_services =
-        std::sync::Arc::new(build_services(&Settings::default(), http_pool.clone()).await);
+        std::sync::Arc::new(build_services(&local_settings(), http_pool.clone()).await);
     let unknown = uuid::Uuid::new_v4();
     let req = Request::builder()
         .method("PATCH")
         .uri(format!("/v1/collections/{unknown}"))
-        .header("authorization", "Bearer parity")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .header("content-type", "application/json")
         .body(Body::from(json!({ "name": "New name" }).to_string()))
         .unwrap();
@@ -3594,7 +3660,7 @@ async fn given_unknown_uuid_when_renamed_via_http_and_ffi_then_both_not_found() 
 
     // ---- FFI leg ----
     let ffi_dir = tempdir().unwrap();
-    let ffi_db = db_path(&ffi_dir, "ffi.sqlite");
+    let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
     let ffi_status = tokio::task::spawn_blocking(move || -> i32 {
         let cdb = CString::new(ffi_db).unwrap();
         assert_eq!(
@@ -3604,7 +3670,7 @@ async fn given_unknown_uuid_when_renamed_via_http_and_ffi_then_both_not_found() 
 
         let uuid_c = CString::new(unknown.to_string()).unwrap();
         let body = CString::new(json!({ "name": "New name" }).to_string()).unwrap();
-        let token = CString::new("parity").unwrap();
+        let token = CString::new(TEST_TOKEN).unwrap();
         let r = alexandria_collection_rename(uuid_c.as_ptr(), body.as_ptr(), token.as_ptr());
         assert!(r.json.is_null(), "a rejected rename returns no body");
         r.status
@@ -3630,14 +3696,15 @@ async fn given_same_collection_when_deleted_via_http_and_ffi_then_bodies_and_row
     let http_dir = tempdir().unwrap();
     let http_db = db_path(&http_dir, "http.sqlite");
     let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    seed_session(&http_pool, TEST_TOKEN).await;
     let http_services =
-        std::sync::Arc::new(build_services(&Settings::default(), http_pool.clone()).await);
+        std::sync::Arc::new(build_services(&local_settings(), http_pool.clone()).await);
     let router = app(Settings::default(), http_services);
 
     let create_req = Request::builder()
         .method("POST")
         .uri("/v1/collections")
-        .header("authorization", "Bearer parity")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .header("content-type", "application/json")
         .body(Body::from(
             json!({ "name": "Sci-fi novels", "kind": "file" }).to_string(),
@@ -3657,7 +3724,7 @@ async fn given_same_collection_when_deleted_via_http_and_ffi_then_bodies_and_row
     let delete_req = Request::builder()
         .method("DELETE")
         .uri(format!("/v1/collections/{http_uuid}"))
-        .header("authorization", "Bearer parity")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .body(Body::empty())
         .unwrap();
     let delete_resp = router.oneshot(delete_req).await.expect("http delete");
@@ -3673,7 +3740,7 @@ async fn given_same_collection_when_deleted_via_http_and_ffi_then_bodies_and_row
 
     // ---- FFI leg ----
     let ffi_dir = tempdir().unwrap();
-    let ffi_db = db_path(&ffi_dir, "ffi.sqlite");
+    let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
     let ffi_db_for_rows = ffi_db.clone();
     let ffi_body: serde_json::Value = tokio::task::spawn_blocking(move || -> serde_json::Value {
         let cdb = CString::new(ffi_db).unwrap();
@@ -3684,7 +3751,7 @@ async fn given_same_collection_when_deleted_via_http_and_ffi_then_bodies_and_row
 
         let create_body =
             CString::new(json!({ "name": "Sci-fi novels", "kind": "file" }).to_string()).unwrap();
-        let token = CString::new("parity").unwrap();
+        let token = CString::new(TEST_TOKEN).unwrap();
         let created = alexandria_collection_create(create_body.as_ptr(), token.as_ptr());
         assert_eq!(created.status, alexandria_ffi::COLLECTION_OK, "ffi create");
         // SAFETY: pointer came from this library and is freed once below.
@@ -3747,13 +3814,14 @@ async fn given_unknown_uuid_when_deleted_via_http_and_ffi_then_both_not_found() 
     let http_dir = tempdir().unwrap();
     let http_db = db_path(&http_dir, "http.sqlite");
     let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    seed_session(&http_pool, TEST_TOKEN).await;
     let http_services =
-        std::sync::Arc::new(build_services(&Settings::default(), http_pool.clone()).await);
+        std::sync::Arc::new(build_services(&local_settings(), http_pool.clone()).await);
     let unknown = uuid::Uuid::new_v4();
     let req = Request::builder()
         .method("DELETE")
         .uri(format!("/v1/collections/{unknown}"))
-        .header("authorization", "Bearer parity")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .body(Body::empty())
         .unwrap();
     let resp = app(Settings::default(), http_services)
@@ -3764,7 +3832,7 @@ async fn given_unknown_uuid_when_deleted_via_http_and_ffi_then_both_not_found() 
 
     // ---- FFI leg ----
     let ffi_dir = tempdir().unwrap();
-    let ffi_db = db_path(&ffi_dir, "ffi.sqlite");
+    let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
     let ffi_status = tokio::task::spawn_blocking(move || -> i32 {
         let cdb = CString::new(ffi_db).unwrap();
         assert_eq!(
@@ -3773,7 +3841,7 @@ async fn given_unknown_uuid_when_deleted_via_http_and_ffi_then_both_not_found() 
         );
 
         let uuid_c = CString::new(unknown.to_string()).unwrap();
-        let token = CString::new("parity").unwrap();
+        let token = CString::new(TEST_TOKEN).unwrap();
         let r = alexandria_collection_delete(uuid_c.as_ptr(), token.as_ptr());
         assert!(r.json.is_null(), "a rejected delete returns no body");
         r.status
@@ -3800,13 +3868,14 @@ async fn given_same_bookmark_when_created_via_http_and_ffi_then_bodies_and_rows_
     let http_dir = tempdir().unwrap();
     let http_db = db_path(&http_dir, "http.sqlite");
     let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    seed_session(&http_pool, TEST_TOKEN).await;
     let http_services =
-        std::sync::Arc::new(build_services(&Settings::default(), http_pool.clone()).await);
+        std::sync::Arc::new(build_services(&local_settings(), http_pool.clone()).await);
 
     let req = Request::builder()
         .method("POST")
         .uri("/v1/bookmarks")
-        .header("authorization", "Bearer parity")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .header("content-type", "application/json")
         .body(Body::from(
             json!({ "url": "https://example.com", "title": "Example" }).to_string(),
@@ -3828,7 +3897,7 @@ async fn given_same_bookmark_when_created_via_http_and_ffi_then_bodies_and_rows_
 
     // ---- FFI leg ----
     let ffi_dir = tempdir().unwrap();
-    let ffi_db = db_path(&ffi_dir, "ffi.sqlite");
+    let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
     let ffi_db_for_rows = ffi_db.clone();
     let ffi_body: serde_json::Value = tokio::task::spawn_blocking(move || -> serde_json::Value {
         let cdb = CString::new(ffi_db).unwrap();
@@ -3840,7 +3909,7 @@ async fn given_same_bookmark_when_created_via_http_and_ffi_then_bodies_and_rows_
         let body =
             CString::new(json!({ "url": "https://example.com", "title": "Example" }).to_string())
                 .unwrap();
-        let token = CString::new("parity").unwrap();
+        let token = CString::new(TEST_TOKEN).unwrap();
         let r = alexandria_bookmark_create(body.as_ptr(), token.as_ptr());
         assert_eq!(r.status, alexandria_ffi::BOOKMARK_OK, "ffi create");
         assert!(!r.json.is_null());
@@ -3909,12 +3978,13 @@ async fn given_unknown_collection_when_bookmark_created_via_http_and_ffi_then_bo
     let http_dir = tempdir().unwrap();
     let http_db = db_path(&http_dir, "http.sqlite");
     let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    seed_session(&http_pool, TEST_TOKEN).await;
     let http_services =
-        std::sync::Arc::new(build_services(&Settings::default(), http_pool.clone()).await);
+        std::sync::Arc::new(build_services(&local_settings(), http_pool.clone()).await);
     let req = Request::builder()
         .method("POST")
         .uri("/v1/bookmarks")
-        .header("authorization", "Bearer parity")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .header("content-type", "application/json")
         .body(Body::from(
             json!({ "url": "https://example.com", "title": "Example", "collectionUuid": unknown })
@@ -3933,7 +4003,7 @@ async fn given_unknown_collection_when_bookmark_created_via_http_and_ffi_then_bo
 
     // ---- FFI leg ----
     let ffi_dir = tempdir().unwrap();
-    let ffi_db = db_path(&ffi_dir, "ffi.sqlite");
+    let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
     let ffi_db_for_rows = ffi_db.clone();
     let ffi_status = tokio::task::spawn_blocking(move || -> i32 {
         let cdb = CString::new(ffi_db).unwrap();
@@ -3947,7 +4017,7 @@ async fn given_unknown_collection_when_bookmark_created_via_http_and_ffi_then_bo
                 .to_string(),
         )
         .unwrap();
-        let token = CString::new("parity").unwrap();
+        let token = CString::new(TEST_TOKEN).unwrap();
         let r = alexandria_bookmark_create(body.as_ptr(), token.as_ptr());
         assert!(r.json.is_null(), "a rejected create returns no body");
         r.status
@@ -3984,6 +4054,7 @@ async fn given_same_file_when_added_to_collection_via_http_and_ffi_then_bodies_a
     let http_dir = tempdir().unwrap();
     let http_db = db_path(&http_dir, "http.sqlite");
     let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    seed_session(&http_pool, TEST_TOKEN).await;
     let http_file_uuid = uuid::Uuid::new_v4().to_string();
     sqlx::query(
         "INSERT INTO files (uuid, path, name, type, content_hash, indexed_at) \
@@ -3997,13 +4068,13 @@ async fn given_same_file_when_added_to_collection_via_http_and_ffi_then_bodies_a
     .await
     .unwrap();
     let http_services =
-        std::sync::Arc::new(build_services(&Settings::default(), http_pool.clone()).await);
+        std::sync::Arc::new(build_services(&local_settings(), http_pool.clone()).await);
     let router = app(Settings::default(), http_services);
 
     let create_req = Request::builder()
         .method("POST")
         .uri("/v1/collections")
-        .header("authorization", "Bearer parity")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .header("content-type", "application/json")
         .body(Body::from(
             json!({ "name": "My files", "kind": "file" }).to_string(),
@@ -4023,7 +4094,7 @@ async fn given_same_file_when_added_to_collection_via_http_and_ffi_then_bodies_a
     let add_req = Request::builder()
         .method("POST")
         .uri(format!("/v1/collections/{http_collection_uuid}/items"))
-        .header("authorization", "Bearer parity")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .header("content-type", "application/json")
         .body(Body::from(
             json!({ "itemUuids": [http_file_uuid] }).to_string(),
@@ -4043,7 +4114,7 @@ async fn given_same_file_when_added_to_collection_via_http_and_ffi_then_bodies_a
 
     // ---- FFI leg ----
     let ffi_dir = tempdir().unwrap();
-    let ffi_db = db_path(&ffi_dir, "ffi.sqlite");
+    let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
     let ffi_pool_pre = migrate_database(&ffi_db).await.expect("ffi pre-migrate");
     let ffi_file_uuid = uuid::Uuid::new_v4().to_string();
     sqlx::query(
@@ -4070,7 +4141,7 @@ async fn given_same_file_when_added_to_collection_via_http_and_ffi_then_bodies_a
 
         let create_body =
             CString::new(json!({ "name": "My files", "kind": "file" }).to_string()).unwrap();
-        let token = CString::new("parity").unwrap();
+        let token = CString::new(TEST_TOKEN).unwrap();
         let created = alexandria_collection_create(create_body.as_ptr(), token.as_ptr());
         assert_eq!(created.status, alexandria_ffi::COLLECTION_OK, "ffi create");
         let created_json = unsafe { CStr::from_ptr(created.json) }
@@ -4132,14 +4203,15 @@ async fn given_unknown_item_when_added_via_http_and_ffi_then_both_not_found() {
     let http_dir = tempdir().unwrap();
     let http_db = db_path(&http_dir, "http.sqlite");
     let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    seed_session(&http_pool, TEST_TOKEN).await;
     let http_services =
-        std::sync::Arc::new(build_services(&Settings::default(), http_pool.clone()).await);
+        std::sync::Arc::new(build_services(&local_settings(), http_pool.clone()).await);
     let router = app(Settings::default(), http_services);
 
     let create_req = Request::builder()
         .method("POST")
         .uri("/v1/collections")
-        .header("authorization", "Bearer parity")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .header("content-type", "application/json")
         .body(Body::from(
             json!({ "name": "My files", "kind": "file" }).to_string(),
@@ -4158,7 +4230,7 @@ async fn given_unknown_item_when_added_via_http_and_ffi_then_both_not_found() {
     let add_req = Request::builder()
         .method("POST")
         .uri(format!("/v1/collections/{collection_uuid}/items"))
-        .header("authorization", "Bearer parity")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .header("content-type", "application/json")
         .body(Body::from(json!({ "itemUuids": [unknown] }).to_string()))
         .unwrap();
@@ -4167,7 +4239,7 @@ async fn given_unknown_item_when_added_via_http_and_ffi_then_both_not_found() {
 
     // ---- FFI leg ----
     let ffi_dir = tempdir().unwrap();
-    let ffi_db = db_path(&ffi_dir, "ffi.sqlite");
+    let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
     let ffi_status = tokio::task::spawn_blocking(move || -> i32 {
         let cdb = CString::new(ffi_db).unwrap();
         assert_eq!(
@@ -4177,7 +4249,7 @@ async fn given_unknown_item_when_added_via_http_and_ffi_then_both_not_found() {
 
         let create_body =
             CString::new(json!({ "name": "My files", "kind": "file" }).to_string()).unwrap();
-        let token = CString::new("parity").unwrap();
+        let token = CString::new(TEST_TOKEN).unwrap();
         let created = alexandria_collection_create(create_body.as_ptr(), token.as_ptr());
         let created_json = unsafe { CStr::from_ptr(created.json) }
             .to_string_lossy()
@@ -4219,6 +4291,7 @@ async fn given_same_linked_file_when_removed_via_http_and_ffi_then_bodies_and_li
     let http_dir = tempdir().unwrap();
     let http_db = db_path(&http_dir, "http.sqlite");
     let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    seed_session(&http_pool, TEST_TOKEN).await;
     let http_file_uuid = uuid::Uuid::new_v4().to_string();
     sqlx::query(
         "INSERT INTO files (uuid, path, name, type, content_hash, indexed_at) \
@@ -4232,13 +4305,13 @@ async fn given_same_linked_file_when_removed_via_http_and_ffi_then_bodies_and_li
     .await
     .unwrap();
     let http_services =
-        std::sync::Arc::new(build_services(&Settings::default(), http_pool.clone()).await);
+        std::sync::Arc::new(build_services(&local_settings(), http_pool.clone()).await);
     let router = app(Settings::default(), http_services);
 
     let create_req = Request::builder()
         .method("POST")
         .uri("/v1/collections")
-        .header("authorization", "Bearer parity")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .header("content-type", "application/json")
         .body(Body::from(
             json!({ "name": "My files", "kind": "file" }).to_string(),
@@ -4263,7 +4336,7 @@ async fn given_same_linked_file_when_removed_via_http_and_ffi_then_bodies_and_li
     let add_req = Request::builder()
         .method("POST")
         .uri(format!("/v1/collections/{http_collection_uuid}/items"))
-        .header("authorization", "Bearer parity")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .header("content-type", "application/json")
         .body(Body::from(
             json!({ "itemUuids": [http_file_uuid] }).to_string(),
@@ -4277,7 +4350,7 @@ async fn given_same_linked_file_when_removed_via_http_and_ffi_then_bodies_and_li
         .uri(format!(
             "/v1/collections/{http_collection_uuid}/items/{http_file_uuid}"
         ))
-        .header("authorization", "Bearer parity")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .body(Body::empty())
         .unwrap();
     let remove_resp = router.oneshot(remove_req).await.expect("http remove");
@@ -4295,7 +4368,7 @@ async fn given_same_linked_file_when_removed_via_http_and_ffi_then_bodies_and_li
 
     // ---- FFI leg ----
     let ffi_dir = tempdir().unwrap();
-    let ffi_db = db_path(&ffi_dir, "ffi.sqlite");
+    let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
     let ffi_pool_pre = migrate_database(&ffi_db).await.expect("ffi pre-migrate");
     let ffi_file_uuid = uuid::Uuid::new_v4().to_string();
     sqlx::query(
@@ -4322,7 +4395,7 @@ async fn given_same_linked_file_when_removed_via_http_and_ffi_then_bodies_and_li
 
         let create_body =
             CString::new(json!({ "name": "My files", "kind": "file" }).to_string()).unwrap();
-        let token = CString::new("parity").unwrap();
+        let token = CString::new(TEST_TOKEN).unwrap();
         let created = alexandria_collection_create(create_body.as_ptr(), token.as_ptr());
         let created_json = unsafe { CStr::from_ptr(created.json) }
             .to_string_lossy()
@@ -4395,14 +4468,15 @@ async fn given_unlinked_item_when_removed_via_http_and_ffi_then_both_not_found()
     let http_dir = tempdir().unwrap();
     let http_db = db_path(&http_dir, "http.sqlite");
     let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    seed_session(&http_pool, TEST_TOKEN).await;
     let http_services =
-        std::sync::Arc::new(build_services(&Settings::default(), http_pool.clone()).await);
+        std::sync::Arc::new(build_services(&local_settings(), http_pool.clone()).await);
     let router = app(Settings::default(), http_services);
 
     let create_req = Request::builder()
         .method("POST")
         .uri("/v1/collections")
-        .header("authorization", "Bearer parity")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .header("content-type", "application/json")
         .body(Body::from(
             json!({ "name": "My files", "kind": "file" }).to_string(),
@@ -4430,7 +4504,7 @@ async fn given_unlinked_item_when_removed_via_http_and_ffi_then_both_not_found()
         .uri(format!(
             "/v1/collections/{collection_uuid}/items/{unlinked_item}"
         ))
-        .header("authorization", "Bearer parity")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .body(Body::empty())
         .unwrap();
     let remove_resp = router.oneshot(remove_req).await.expect("http remove");
@@ -4438,7 +4512,7 @@ async fn given_unlinked_item_when_removed_via_http_and_ffi_then_both_not_found()
 
     // ---- FFI leg ----
     let ffi_dir = tempdir().unwrap();
-    let ffi_db = db_path(&ffi_dir, "ffi.sqlite");
+    let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
     let ffi_status = tokio::task::spawn_blocking(move || -> i32 {
         let cdb = CString::new(ffi_db).unwrap();
         assert_eq!(
@@ -4448,7 +4522,7 @@ async fn given_unlinked_item_when_removed_via_http_and_ffi_then_both_not_found()
 
         let create_body =
             CString::new(json!({ "name": "My files", "kind": "file" }).to_string()).unwrap();
-        let token = CString::new("parity").unwrap();
+        let token = CString::new(TEST_TOKEN).unwrap();
         let created = alexandria_collection_create(create_body.as_ptr(), token.as_ptr());
         let created_json = unsafe { CStr::from_ptr(created.json) }
             .to_string_lossy()
@@ -4490,6 +4564,7 @@ async fn given_same_collection_when_items_listed_via_http_and_ffi_then_bodies_id
     let http_dir = tempdir().unwrap();
     let http_db = db_path(&http_dir, "http.sqlite");
     let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    seed_session(&http_pool, TEST_TOKEN).await;
     let http_file_uuid = uuid::Uuid::new_v4().to_string();
     sqlx::query(
         "INSERT INTO files (uuid, path, name, type, content_hash, indexed_at) \
@@ -4503,13 +4578,13 @@ async fn given_same_collection_when_items_listed_via_http_and_ffi_then_bodies_id
     .await
     .unwrap();
     let http_services =
-        std::sync::Arc::new(build_services(&Settings::default(), http_pool.clone()).await);
+        std::sync::Arc::new(build_services(&local_settings(), http_pool.clone()).await);
     let router = app(Settings::default(), http_services);
 
     let create_req = Request::builder()
         .method("POST")
         .uri("/v1/collections")
-        .header("authorization", "Bearer parity")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .header("content-type", "application/json")
         .body(Body::from(
             json!({ "name": "My files", "kind": "file" }).to_string(),
@@ -4534,7 +4609,7 @@ async fn given_same_collection_when_items_listed_via_http_and_ffi_then_bodies_id
     let add_req = Request::builder()
         .method("POST")
         .uri(format!("/v1/collections/{http_collection_uuid}/items"))
-        .header("authorization", "Bearer parity")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .header("content-type", "application/json")
         .body(Body::from(
             json!({ "itemUuids": [http_file_uuid] }).to_string(),
@@ -4548,7 +4623,7 @@ async fn given_same_collection_when_items_listed_via_http_and_ffi_then_bodies_id
     let list_req = Request::builder()
         .method("GET")
         .uri(format!("/v1/collections/{http_collection_uuid}/items"))
-        .header("authorization", "Bearer parity")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .body(Body::empty())
         .unwrap();
     let list_resp = router.oneshot(list_req).await.expect("http list");
@@ -4559,7 +4634,7 @@ async fn given_same_collection_when_items_listed_via_http_and_ffi_then_bodies_id
 
     // ---- FFI leg ----
     let ffi_dir = tempdir().unwrap();
-    let ffi_db = db_path(&ffi_dir, "ffi.sqlite");
+    let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
     let ffi_pool_pre = migrate_database(&ffi_db).await.expect("ffi pre-migrate");
     let ffi_file_uuid = uuid::Uuid::new_v4().to_string();
     sqlx::query(
@@ -4586,7 +4661,7 @@ async fn given_same_collection_when_items_listed_via_http_and_ffi_then_bodies_id
 
         let create_body =
             CString::new(json!({ "name": "My files", "kind": "file" }).to_string()).unwrap();
-        let token = CString::new("parity").unwrap();
+        let token = CString::new(TEST_TOKEN).unwrap();
         let created = alexandria_collection_create(create_body.as_ptr(), token.as_ptr());
         let created_json = unsafe { CStr::from_ptr(created.json) }
             .to_string_lossy()
@@ -4650,14 +4725,15 @@ async fn given_same_bookmark_when_updated_via_http_and_ffi_then_bodies_and_rows_
     let http_dir = tempdir().unwrap();
     let http_db = db_path(&http_dir, "http.sqlite");
     let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    seed_session(&http_pool, TEST_TOKEN).await;
     let http_services =
-        std::sync::Arc::new(build_services(&Settings::default(), http_pool.clone()).await);
+        std::sync::Arc::new(build_services(&local_settings(), http_pool.clone()).await);
     let router = app(Settings::default(), http_services);
 
     let create_req = Request::builder()
         .method("POST")
         .uri("/v1/bookmarks")
-        .header("authorization", "Bearer parity")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .header("content-type", "application/json")
         .body(Body::from(
             json!({ "url": "https://example.com", "title": "Example" }).to_string(),
@@ -4682,7 +4758,7 @@ async fn given_same_bookmark_when_updated_via_http_and_ffi_then_bodies_and_rows_
     let update_req = Request::builder()
         .method("PATCH")
         .uri(format!("/v1/bookmarks/{http_uuid}"))
-        .header("authorization", "Bearer parity")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .header("content-type", "application/json")
         .body(Body::from(
             json!({ "url": "https://example.org", "title": "New title" }).to_string(),
@@ -4703,7 +4779,7 @@ async fn given_same_bookmark_when_updated_via_http_and_ffi_then_bodies_and_rows_
 
     // ---- FFI leg ----
     let ffi_dir = tempdir().unwrap();
-    let ffi_db = db_path(&ffi_dir, "ffi.sqlite");
+    let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
     let ffi_db_for_rows = ffi_db.clone();
     let ffi_body: serde_json::Value = tokio::task::spawn_blocking(move || -> serde_json::Value {
         let cdb = CString::new(ffi_db).unwrap();
@@ -4715,7 +4791,7 @@ async fn given_same_bookmark_when_updated_via_http_and_ffi_then_bodies_and_rows_
         let create_body =
             CString::new(json!({ "url": "https://example.com", "title": "Example" }).to_string())
                 .unwrap();
-        let token = CString::new("parity").unwrap();
+        let token = CString::new(TEST_TOKEN).unwrap();
         let created = alexandria_bookmark_create(create_body.as_ptr(), token.as_ptr());
         assert_eq!(created.status, alexandria_ffi::BOOKMARK_OK, "ffi create");
         let created_json = unsafe { CStr::from_ptr(created.json) }
@@ -4783,13 +4859,14 @@ async fn given_unknown_uuid_when_bookmark_updated_via_http_and_ffi_then_both_not
     let http_dir = tempdir().unwrap();
     let http_db = db_path(&http_dir, "http.sqlite");
     let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    seed_session(&http_pool, TEST_TOKEN).await;
     let http_services =
-        std::sync::Arc::new(build_services(&Settings::default(), http_pool.clone()).await);
+        std::sync::Arc::new(build_services(&local_settings(), http_pool.clone()).await);
     let unknown = uuid::Uuid::new_v4();
     let req = Request::builder()
         .method("PATCH")
         .uri(format!("/v1/bookmarks/{unknown}"))
-        .header("authorization", "Bearer parity")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .header("content-type", "application/json")
         .body(Body::from(
             json!({ "url": "https://example.com", "title": "Example" }).to_string(),
@@ -4803,7 +4880,7 @@ async fn given_unknown_uuid_when_bookmark_updated_via_http_and_ffi_then_both_not
 
     // ---- FFI leg ----
     let ffi_dir = tempdir().unwrap();
-    let ffi_db = db_path(&ffi_dir, "ffi.sqlite");
+    let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
     let ffi_status = tokio::task::spawn_blocking(move || -> i32 {
         let cdb = CString::new(ffi_db).unwrap();
         assert_eq!(
@@ -4815,7 +4892,7 @@ async fn given_unknown_uuid_when_bookmark_updated_via_http_and_ffi_then_both_not
         let body =
             CString::new(json!({ "url": "https://example.com", "title": "Example" }).to_string())
                 .unwrap();
-        let token = CString::new("parity").unwrap();
+        let token = CString::new(TEST_TOKEN).unwrap();
         let r = alexandria_bookmark_update(uuid_c.as_ptr(), body.as_ptr(), token.as_ptr());
         assert!(r.json.is_null(), "a rejected update returns no body");
         r.status
@@ -4841,14 +4918,15 @@ async fn given_same_bookmarks_when_listed_via_http_and_ffi_then_bodies_identical
     let http_dir = tempdir().unwrap();
     let http_db = db_path(&http_dir, "http.sqlite");
     let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    seed_session(&http_pool, TEST_TOKEN).await;
     let http_services =
-        std::sync::Arc::new(build_services(&Settings::default(), http_pool.clone()).await);
+        std::sync::Arc::new(build_services(&local_settings(), http_pool.clone()).await);
     let router = app(Settings::default(), http_services);
 
     let create_req = Request::builder()
         .method("POST")
         .uri("/v1/bookmarks")
-        .header("authorization", "Bearer parity")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .header("content-type", "application/json")
         .body(Body::from(
             json!({ "url": "https://example.com", "title": "Example" }).to_string(),
@@ -4862,7 +4940,7 @@ async fn given_same_bookmarks_when_listed_via_http_and_ffi_then_bodies_identical
     let list_req = Request::builder()
         .method("GET")
         .uri("/v1/bookmarks")
-        .header("authorization", "Bearer parity")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .body(Body::empty())
         .unwrap();
     let list_resp = router.oneshot(list_req).await.expect("http list");
@@ -4873,7 +4951,7 @@ async fn given_same_bookmarks_when_listed_via_http_and_ffi_then_bodies_identical
 
     // ---- FFI leg ----
     let ffi_dir = tempdir().unwrap();
-    let ffi_db = db_path(&ffi_dir, "ffi.sqlite");
+    let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
     let ffi_body: serde_json::Value = tokio::task::spawn_blocking(move || -> serde_json::Value {
         let cdb = CString::new(ffi_db).unwrap();
         assert_eq!(
@@ -4884,7 +4962,7 @@ async fn given_same_bookmarks_when_listed_via_http_and_ffi_then_bodies_identical
         let create_body =
             CString::new(json!({ "url": "https://example.com", "title": "Example" }).to_string())
                 .unwrap();
-        let token = CString::new("parity").unwrap();
+        let token = CString::new(TEST_TOKEN).unwrap();
         let created = alexandria_bookmark_create(create_body.as_ptr(), token.as_ptr());
         assert_eq!(created.status, alexandria_ffi::BOOKMARK_OK, "ffi create");
         unsafe {
@@ -4927,12 +5005,13 @@ async fn given_unknown_collection_when_bookmarks_listed_via_http_and_ffi_then_bo
     let http_dir = tempdir().unwrap();
     let http_db = db_path(&http_dir, "http.sqlite");
     let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    seed_session(&http_pool, TEST_TOKEN).await;
     let http_services =
-        std::sync::Arc::new(build_services(&Settings::default(), http_pool.clone()).await);
+        std::sync::Arc::new(build_services(&local_settings(), http_pool.clone()).await);
     let req = Request::builder()
         .method("GET")
         .uri(format!("/v1/bookmarks?collectionUuid={unknown}"))
-        .header("authorization", "Bearer parity")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .body(Body::empty())
         .unwrap();
     let resp = app(Settings::default(), http_services)
@@ -4943,7 +5022,7 @@ async fn given_unknown_collection_when_bookmarks_listed_via_http_and_ffi_then_bo
 
     // ---- FFI leg ----
     let ffi_dir = tempdir().unwrap();
-    let ffi_db = db_path(&ffi_dir, "ffi.sqlite");
+    let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
     let ffi_status = tokio::task::spawn_blocking(move || -> i32 {
         let cdb = CString::new(ffi_db).unwrap();
         assert_eq!(
@@ -4952,7 +5031,7 @@ async fn given_unknown_collection_when_bookmarks_listed_via_http_and_ffi_then_bo
         );
 
         let filter = CString::new(json!({ "collectionUuid": unknown }).to_string()).unwrap();
-        let token = CString::new("parity").unwrap();
+        let token = CString::new(TEST_TOKEN).unwrap();
         let r = alexandria_bookmarks_list(filter.as_ptr(), token.as_ptr());
         assert!(r.json.is_null(), "a rejected list returns no body");
         r.status
@@ -4979,14 +5058,15 @@ async fn given_same_bookmark_when_deleted_and_restored_via_http_and_ffi_then_bod
     let http_dir = tempdir().unwrap();
     let http_db = db_path(&http_dir, "http.sqlite");
     let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    seed_session(&http_pool, TEST_TOKEN).await;
     let http_services =
-        std::sync::Arc::new(build_services(&Settings::default(), http_pool.clone()).await);
+        std::sync::Arc::new(build_services(&local_settings(), http_pool.clone()).await);
     let router = app(Settings::default(), http_services);
 
     let create_req = Request::builder()
         .method("POST")
         .uri("/v1/bookmarks")
-        .header("authorization", "Bearer parity")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .header("content-type", "application/json")
         .body(Body::from(
             json!({ "url": "https://example.com", "title": "Example" }).to_string(),
@@ -5011,7 +5091,7 @@ async fn given_same_bookmark_when_deleted_and_restored_via_http_and_ffi_then_bod
     let delete_req = Request::builder()
         .method("DELETE")
         .uri(format!("/v1/bookmarks/{http_uuid}"))
-        .header("authorization", "Bearer parity")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .body(Body::empty())
         .unwrap();
     let delete_resp = router
@@ -5024,7 +5104,7 @@ async fn given_same_bookmark_when_deleted_and_restored_via_http_and_ffi_then_bod
     let restore_req = Request::builder()
         .method("POST")
         .uri(format!("/v1/bookmarks/{http_uuid}/restore"))
-        .header("authorization", "Bearer parity")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .body(Body::empty())
         .unwrap();
     let restore_resp = router.oneshot(restore_req).await.expect("http restore");
@@ -5044,7 +5124,7 @@ async fn given_same_bookmark_when_deleted_and_restored_via_http_and_ffi_then_bod
 
     // ---- FFI leg ----
     let ffi_dir = tempdir().unwrap();
-    let ffi_db = db_path(&ffi_dir, "ffi.sqlite");
+    let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
     let ffi_db_for_rows = ffi_db.clone();
     let ffi_body: serde_json::Value = tokio::task::spawn_blocking(move || -> serde_json::Value {
         let cdb = CString::new(ffi_db).unwrap();
@@ -5056,7 +5136,7 @@ async fn given_same_bookmark_when_deleted_and_restored_via_http_and_ffi_then_bod
         let create_body =
             CString::new(json!({ "url": "https://example.com", "title": "Example" }).to_string())
                 .unwrap();
-        let token = CString::new("parity").unwrap();
+        let token = CString::new(TEST_TOKEN).unwrap();
         let created = alexandria_bookmark_create(create_body.as_ptr(), token.as_ptr());
         assert_eq!(created.status, alexandria_ffi::BOOKMARK_OK, "ffi create");
         let created_json = unsafe { CStr::from_ptr(created.json) }
@@ -5125,13 +5205,14 @@ async fn given_unknown_uuid_when_bookmark_soft_deleted_via_http_and_ffi_then_bot
     let http_dir = tempdir().unwrap();
     let http_db = db_path(&http_dir, "http.sqlite");
     let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    seed_session(&http_pool, TEST_TOKEN).await;
     let http_services =
-        std::sync::Arc::new(build_services(&Settings::default(), http_pool.clone()).await);
+        std::sync::Arc::new(build_services(&local_settings(), http_pool.clone()).await);
     let unknown = uuid::Uuid::new_v4();
     let req = Request::builder()
         .method("DELETE")
         .uri(format!("/v1/bookmarks/{unknown}"))
-        .header("authorization", "Bearer parity")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .body(Body::empty())
         .unwrap();
     let resp = app(Settings::default(), http_services)
@@ -5142,7 +5223,7 @@ async fn given_unknown_uuid_when_bookmark_soft_deleted_via_http_and_ffi_then_bot
 
     // ---- FFI leg ----
     let ffi_dir = tempdir().unwrap();
-    let ffi_db = db_path(&ffi_dir, "ffi.sqlite");
+    let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
     let ffi_status = tokio::task::spawn_blocking(move || -> i32 {
         let cdb = CString::new(ffi_db).unwrap();
         assert_eq!(
@@ -5151,7 +5232,7 @@ async fn given_unknown_uuid_when_bookmark_soft_deleted_via_http_and_ffi_then_bot
         );
 
         let uuid_c = CString::new(unknown.to_string()).unwrap();
-        let token = CString::new("parity").unwrap();
+        let token = CString::new(TEST_TOKEN).unwrap();
         let r = alexandria_bookmark_soft_delete(uuid_c.as_ptr(), token.as_ptr());
         assert!(r.json.is_null(), "a rejected delete returns no body");
         r.status
@@ -5179,14 +5260,15 @@ async fn given_purgeable_bookmark_when_purged_via_http_and_ffi_then_bodies_and_r
     let http_dir = tempdir().unwrap();
     let http_db = db_path(&http_dir, "http.sqlite");
     let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    seed_session(&http_pool, TEST_TOKEN).await;
     let http_services =
-        std::sync::Arc::new(build_services(&Settings::default(), http_pool.clone()).await);
+        std::sync::Arc::new(build_services(&local_settings(), http_pool.clone()).await);
     let router = app(Settings::default(), http_services);
 
     let create_req = Request::builder()
         .method("POST")
         .uri("/v1/bookmarks")
-        .header("authorization", "Bearer parity")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .header("content-type", "application/json")
         .body(Body::from(
             json!({ "url": "https://example.com", "title": "Example" }).to_string(),
@@ -5218,7 +5300,7 @@ async fn given_purgeable_bookmark_when_purged_via_http_and_ffi_then_bodies_and_r
     let purge_req = Request::builder()
         .method("DELETE")
         .uri(format!("/v1/bookmarks/{http_uuid}?purge=true"))
-        .header("authorization", "Bearer parity")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .body(Body::empty())
         .unwrap();
     let purge_resp = router.oneshot(purge_req).await.expect("http purge");
@@ -5235,7 +5317,7 @@ async fn given_purgeable_bookmark_when_purged_via_http_and_ffi_then_bodies_and_r
 
     // ---- FFI leg ----
     let ffi_dir = tempdir().unwrap();
-    let ffi_db = db_path(&ffi_dir, "ffi.sqlite");
+    let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
 
     let ffi_body: serde_json::Value = tokio::task::spawn_blocking(move || -> serde_json::Value {
         let cdb = CString::new(ffi_db.clone()).unwrap();
@@ -5244,7 +5326,7 @@ async fn given_purgeable_bookmark_when_purged_via_http_and_ffi_then_bodies_and_r
             alexandria_ffi::INDEX_OK
         );
 
-        let token = CString::new("parity").unwrap();
+        let token = CString::new(TEST_TOKEN).unwrap();
         let create_body =
             CString::new(json!({ "url": "https://example.com", "title": "Example" }).to_string())
                 .unwrap();
@@ -5324,13 +5406,14 @@ async fn given_unknown_uuid_when_bookmark_purged_via_http_and_ffi_then_both_not_
     let http_dir = tempdir().unwrap();
     let http_db = db_path(&http_dir, "http.sqlite");
     let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    seed_session(&http_pool, TEST_TOKEN).await;
     let http_services =
-        std::sync::Arc::new(build_services(&Settings::default(), http_pool.clone()).await);
+        std::sync::Arc::new(build_services(&local_settings(), http_pool.clone()).await);
     let unknown = uuid::Uuid::new_v4();
     let req = Request::builder()
         .method("DELETE")
         .uri(format!("/v1/bookmarks/{unknown}?purge=true"))
-        .header("authorization", "Bearer parity")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .body(Body::empty())
         .unwrap();
     let resp = app(Settings::default(), http_services)
@@ -5341,7 +5424,7 @@ async fn given_unknown_uuid_when_bookmark_purged_via_http_and_ffi_then_both_not_
 
     // ---- FFI leg ----
     let ffi_dir = tempdir().unwrap();
-    let ffi_db = db_path(&ffi_dir, "ffi.sqlite");
+    let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
     let ffi_status = tokio::task::spawn_blocking(move || -> i32 {
         let cdb = CString::new(ffi_db).unwrap();
         assert_eq!(
@@ -5350,7 +5433,7 @@ async fn given_unknown_uuid_when_bookmark_purged_via_http_and_ffi_then_both_not_
         );
 
         let uuid_c = CString::new(unknown.to_string()).unwrap();
-        let token = CString::new("parity").unwrap();
+        let token = CString::new(TEST_TOKEN).unwrap();
         let r = alexandria_bookmark_purge(uuid_c.as_ptr(), token.as_ptr());
         assert!(r.json.is_null(), "a rejected purge returns no body");
         r.status
@@ -5377,13 +5460,14 @@ async fn given_same_watchlist_when_created_via_http_and_ffi_then_bodies_and_rows
     let http_dir = tempdir().unwrap();
     let http_db = db_path(&http_dir, "http.sqlite");
     let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    seed_session(&http_pool, TEST_TOKEN).await;
     let http_services =
-        std::sync::Arc::new(build_services(&Settings::default(), http_pool.clone()).await);
+        std::sync::Arc::new(build_services(&local_settings(), http_pool.clone()).await);
 
     let req = Request::builder()
         .method("POST")
         .uri("/v1/watchlists")
-        .header("authorization", "Bearer parity")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .header("content-type", "application/json")
         .body(Body::from(json!({ "name": "Weekend movies" }).to_string()))
         .unwrap();
@@ -5402,7 +5486,7 @@ async fn given_same_watchlist_when_created_via_http_and_ffi_then_bodies_and_rows
 
     // ---- FFI leg ----
     let ffi_dir = tempdir().unwrap();
-    let ffi_db = db_path(&ffi_dir, "ffi.sqlite");
+    let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
     let ffi_db_for_rows = ffi_db.clone();
     let ffi_body: serde_json::Value = tokio::task::spawn_blocking(move || -> serde_json::Value {
         let cdb = CString::new(ffi_db).unwrap();
@@ -5412,7 +5496,7 @@ async fn given_same_watchlist_when_created_via_http_and_ffi_then_bodies_and_rows
         );
 
         let body = CString::new(json!({ "name": "Weekend movies" }).to_string()).unwrap();
-        let token = CString::new("parity").unwrap();
+        let token = CString::new(TEST_TOKEN).unwrap();
         let r = alexandria_watchlist_create(body.as_ptr(), token.as_ptr());
         assert_eq!(r.status, alexandria_ffi::WATCHLIST_OK, "ffi create");
         assert!(!r.json.is_null());
@@ -5461,8 +5545,9 @@ async fn given_no_token_when_watchlist_created_via_http_and_ffi_then_both_unauth
     let http_dir = tempdir().unwrap();
     let http_db = db_path(&http_dir, "http.sqlite");
     let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    seed_session(&http_pool, TEST_TOKEN).await;
     let http_services =
-        std::sync::Arc::new(build_services(&Settings::default(), http_pool.clone()).await);
+        std::sync::Arc::new(build_services(&local_settings(), http_pool.clone()).await);
 
     let req = Request::builder()
         .method("POST")
@@ -5478,7 +5563,7 @@ async fn given_no_token_when_watchlist_created_via_http_and_ffi_then_both_unauth
 
     // ---- FFI leg ----
     let ffi_dir = tempdir().unwrap();
-    let ffi_db = db_path(&ffi_dir, "ffi.sqlite");
+    let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
     let ffi_status = tokio::task::spawn_blocking(move || -> i32 {
         let cdb = CString::new(ffi_db).unwrap();
         assert_eq!(
@@ -5533,13 +5618,14 @@ async fn given_same_video_when_added_via_http_and_ffi_then_bodies_and_rows_ident
     let http_dir = tempdir().unwrap();
     let http_db = db_path(&http_dir, "http.sqlite");
     let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    seed_session(&http_pool, TEST_TOKEN).await;
     let http_services =
-        std::sync::Arc::new(build_services(&Settings::default(), http_pool.clone()).await);
+        std::sync::Arc::new(build_services(&local_settings(), http_pool.clone()).await);
 
     let create_req = Request::builder()
         .method("POST")
         .uri("/v1/watchlists")
-        .header("authorization", "Bearer parity")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .header("content-type", "application/json")
         .body(Body::from(json!({ "name": "Weekend movies" }).to_string()))
         .unwrap();
@@ -5557,7 +5643,7 @@ async fn given_same_video_when_added_via_http_and_ffi_then_bodies_and_rows_ident
     let add_req = Request::builder()
         .method("POST")
         .uri(format!("/v1/watchlists/{http_watchlist_uuid}/items"))
-        .header("authorization", "Bearer parity")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .header("content-type", "application/json")
         .body(Body::from(
             json!({ "videoUuid": http_video_uuid }).to_string(),
@@ -5578,7 +5664,7 @@ async fn given_same_video_when_added_via_http_and_ffi_then_bodies_and_rows_ident
 
     // ---- FFI leg ----
     let ffi_dir = tempdir().unwrap();
-    let ffi_db = db_path(&ffi_dir, "ffi.sqlite");
+    let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
     let ffi_db_for_seed = ffi_db.clone();
     let ffi_db_for_rows = ffi_db.clone();
 
@@ -5593,7 +5679,7 @@ async fn given_same_video_when_added_via_http_and_ffi_then_bodies_and_rows_ident
             alexandria_ffi::INDEX_OK
         );
 
-        let token = CString::new("parity").unwrap();
+        let token = CString::new(TEST_TOKEN).unwrap();
         let create_body = CString::new(json!({ "name": "Weekend movies" }).to_string()).unwrap();
         let create_r = alexandria_watchlist_create(create_body.as_ptr(), token.as_ptr());
         assert_eq!(create_r.status, alexandria_ffi::WATCHLIST_OK, "ffi create");
@@ -5665,8 +5751,9 @@ async fn given_unknown_watchlist_when_video_added_via_http_and_ffi_then_both_not
     let http_dir = tempdir().unwrap();
     let http_db = db_path(&http_dir, "http.sqlite");
     let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    seed_session(&http_pool, TEST_TOKEN).await;
     let http_services =
-        std::sync::Arc::new(build_services(&Settings::default(), http_pool.clone()).await);
+        std::sync::Arc::new(build_services(&local_settings(), http_pool.clone()).await);
 
     let http_video_uuid = seed_file(&http_pool, "video").await;
     let unknown = uuid::Uuid::new_v4().to_string();
@@ -5674,7 +5761,7 @@ async fn given_unknown_watchlist_when_video_added_via_http_and_ffi_then_both_not
     let add_req = Request::builder()
         .method("POST")
         .uri(format!("/v1/watchlists/{unknown}/items"))
-        .header("authorization", "Bearer parity")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .header("content-type", "application/json")
         .body(Body::from(
             json!({ "videoUuid": http_video_uuid }).to_string(),
@@ -5688,7 +5775,7 @@ async fn given_unknown_watchlist_when_video_added_via_http_and_ffi_then_both_not
 
     // ---- FFI leg ----
     let ffi_dir = tempdir().unwrap();
-    let ffi_db = db_path(&ffi_dir, "ffi.sqlite");
+    let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
     let ffi_db_for_seed = ffi_db.clone();
 
     let ffi_pool_for_seed = migrate_database(&ffi_db_for_seed).await.expect("ffi open");
@@ -5702,7 +5789,7 @@ async fn given_unknown_watchlist_when_video_added_via_http_and_ffi_then_both_not
             alexandria_ffi::INDEX_OK
         );
 
-        let token = CString::new("parity").unwrap();
+        let token = CString::new(TEST_TOKEN).unwrap();
         let unknown = uuid::Uuid::new_v4().to_string();
         let unknown_c = CString::new(unknown).unwrap();
         let add_body = CString::new(json!({ "videoUuid": ffi_video_uuid }).to_string()).unwrap();
@@ -5732,13 +5819,14 @@ async fn given_same_watchlist_when_browsed_via_http_and_ffi_then_bodies_identica
     let http_dir = tempdir().unwrap();
     let http_db = db_path(&http_dir, "http.sqlite");
     let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    seed_session(&http_pool, TEST_TOKEN).await;
     let http_services =
-        std::sync::Arc::new(build_services(&Settings::default(), http_pool.clone()).await);
+        std::sync::Arc::new(build_services(&local_settings(), http_pool.clone()).await);
 
     let create_req = Request::builder()
         .method("POST")
         .uri("/v1/watchlists")
-        .header("authorization", "Bearer parity")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .header("content-type", "application/json")
         .body(Body::from(json!({ "name": "Weekend movies" }).to_string()))
         .unwrap();
@@ -5755,7 +5843,7 @@ async fn given_same_watchlist_when_browsed_via_http_and_ffi_then_bodies_identica
     let add_req = Request::builder()
         .method("POST")
         .uri(format!("/v1/watchlists/{http_watchlist_uuid}/items"))
-        .header("authorization", "Bearer parity")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .header("content-type", "application/json")
         .body(Body::from(
             json!({ "videoUuid": http_video_uuid }).to_string(),
@@ -5770,7 +5858,7 @@ async fn given_same_watchlist_when_browsed_via_http_and_ffi_then_bodies_identica
     let list_req = Request::builder()
         .method("GET")
         .uri("/v1/watchlists")
-        .header("authorization", "Bearer parity")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .body(Body::empty())
         .unwrap();
     let list_resp = app(Settings::default(), http_services)
@@ -5784,7 +5872,7 @@ async fn given_same_watchlist_when_browsed_via_http_and_ffi_then_bodies_identica
 
     // ---- FFI leg ----
     let ffi_dir = tempdir().unwrap();
-    let ffi_db = db_path(&ffi_dir, "ffi.sqlite");
+    let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
     let ffi_db_for_seed = ffi_db.clone();
 
     let ffi_pool_for_seed = migrate_database(&ffi_db_for_seed).await.expect("ffi open");
@@ -5798,7 +5886,7 @@ async fn given_same_watchlist_when_browsed_via_http_and_ffi_then_bodies_identica
             alexandria_ffi::INDEX_OK
         );
 
-        let token = CString::new("parity").unwrap();
+        let token = CString::new(TEST_TOKEN).unwrap();
         let create_body = CString::new(json!({ "name": "Weekend movies" }).to_string()).unwrap();
         let create_r = alexandria_watchlist_create(create_body.as_ptr(), token.as_ptr());
         assert_eq!(create_r.status, alexandria_ffi::WATCHLIST_OK, "ffi create");
@@ -5870,14 +5958,15 @@ async fn given_unknown_watchlist_when_browsed_via_http_and_ffi_then_both_not_fou
     let http_dir = tempdir().unwrap();
     let http_db = db_path(&http_dir, "http.sqlite");
     let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    seed_session(&http_pool, TEST_TOKEN).await;
     let http_services =
-        std::sync::Arc::new(build_services(&Settings::default(), http_pool.clone()).await);
+        std::sync::Arc::new(build_services(&local_settings(), http_pool.clone()).await);
 
     let unknown = uuid::Uuid::new_v4().to_string();
     let list_req = Request::builder()
         .method("GET")
         .uri(format!("/v1/watchlists?watchlistUuid={unknown}"))
-        .header("authorization", "Bearer parity")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .body(Body::empty())
         .unwrap();
     let list_resp = app(Settings::default(), http_services)
@@ -5888,7 +5977,7 @@ async fn given_unknown_watchlist_when_browsed_via_http_and_ffi_then_both_not_fou
 
     // ---- FFI leg ----
     let ffi_dir = tempdir().unwrap();
-    let ffi_db = db_path(&ffi_dir, "ffi.sqlite");
+    let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
     let ffi_status = tokio::task::spawn_blocking(move || -> i32 {
         let cdb = CString::new(ffi_db).unwrap();
         assert_eq!(
@@ -5896,7 +5985,7 @@ async fn given_unknown_watchlist_when_browsed_via_http_and_ffi_then_both_not_fou
             alexandria_ffi::INDEX_OK
         );
 
-        let token = CString::new("parity").unwrap();
+        let token = CString::new(TEST_TOKEN).unwrap();
         let unknown = uuid::Uuid::new_v4().to_string();
         let filter = CString::new(json!({ "watchlistUuid": unknown }).to_string()).unwrap();
         let list_r = alexandria_watchlists_list(filter.as_ptr(), token.as_ptr());
@@ -5924,13 +6013,14 @@ async fn given_same_transition_when_updated_via_http_and_ffi_then_bodies_and_row
     let http_dir = tempdir().unwrap();
     let http_db = db_path(&http_dir, "http.sqlite");
     let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    seed_session(&http_pool, TEST_TOKEN).await;
     let http_services =
-        std::sync::Arc::new(build_services(&Settings::default(), http_pool.clone()).await);
+        std::sync::Arc::new(build_services(&local_settings(), http_pool.clone()).await);
 
     let create_req = Request::builder()
         .method("POST")
         .uri("/v1/watchlists")
-        .header("authorization", "Bearer parity")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .header("content-type", "application/json")
         .body(Body::from(json!({ "name": "Weekend movies" }).to_string()))
         .unwrap();
@@ -5950,7 +6040,7 @@ async fn given_same_transition_when_updated_via_http_and_ffi_then_bodies_and_row
     let add_req = Request::builder()
         .method("POST")
         .uri(format!("/v1/watchlists/{http_watchlist_uuid}/items"))
-        .header("authorization", "Bearer parity")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .header("content-type", "application/json")
         .body(Body::from(
             json!({ "videoUuid": http_video_uuid }).to_string(),
@@ -5967,7 +6057,7 @@ async fn given_same_transition_when_updated_via_http_and_ffi_then_bodies_and_row
         .uri(format!(
             "/v1/watchlists/{http_watchlist_uuid}/items/{http_video_uuid}"
         ))
-        .header("authorization", "Bearer parity")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .header("content-type", "application/json")
         .body(Body::from(
             json!({ "state": "watching", "currentEpisode": 3, "totalEpisodes": 12 }).to_string(),
@@ -5990,7 +6080,7 @@ async fn given_same_transition_when_updated_via_http_and_ffi_then_bodies_and_row
 
     // ---- FFI leg ----
     let ffi_dir = tempdir().unwrap();
-    let ffi_db = db_path(&ffi_dir, "ffi.sqlite");
+    let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
     let ffi_db_for_seed = ffi_db.clone();
     let ffi_db_for_rows = ffi_db.clone();
 
@@ -6005,7 +6095,7 @@ async fn given_same_transition_when_updated_via_http_and_ffi_then_bodies_and_row
             alexandria_ffi::INDEX_OK
         );
 
-        let token = CString::new("parity").unwrap();
+        let token = CString::new(TEST_TOKEN).unwrap();
         let create_body = CString::new(json!({ "name": "Weekend movies" }).to_string()).unwrap();
         let create_r = alexandria_watchlist_create(create_body.as_ptr(), token.as_ptr());
         assert_eq!(create_r.status, alexandria_ffi::WATCHLIST_OK, "ffi create");
@@ -6093,13 +6183,14 @@ async fn given_invalid_transition_when_updated_via_http_and_ffi_then_both_confli
     let http_dir = tempdir().unwrap();
     let http_db = db_path(&http_dir, "http.sqlite");
     let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    seed_session(&http_pool, TEST_TOKEN).await;
     let http_services =
-        std::sync::Arc::new(build_services(&Settings::default(), http_pool.clone()).await);
+        std::sync::Arc::new(build_services(&local_settings(), http_pool.clone()).await);
 
     let create_req = Request::builder()
         .method("POST")
         .uri("/v1/watchlists")
-        .header("authorization", "Bearer parity")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .header("content-type", "application/json")
         .body(Body::from(json!({ "name": "Weekend movies" }).to_string()))
         .unwrap();
@@ -6119,7 +6210,7 @@ async fn given_invalid_transition_when_updated_via_http_and_ffi_then_both_confli
     let add_req = Request::builder()
         .method("POST")
         .uri(format!("/v1/watchlists/{http_watchlist_uuid}/items"))
-        .header("authorization", "Bearer parity")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .header("content-type", "application/json")
         .body(Body::from(
             json!({ "videoUuid": http_video_uuid }).to_string(),
@@ -6137,7 +6228,7 @@ async fn given_invalid_transition_when_updated_via_http_and_ffi_then_both_confli
         .uri(format!(
             "/v1/watchlists/{http_watchlist_uuid}/items/{http_video_uuid}"
         ))
-        .header("authorization", "Bearer parity")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .header("content-type", "application/json")
         .body(Body::from(json!({ "state": "watched" }).to_string()))
         .unwrap();
@@ -6149,7 +6240,7 @@ async fn given_invalid_transition_when_updated_via_http_and_ffi_then_both_confli
 
     // ---- FFI leg ----
     let ffi_dir = tempdir().unwrap();
-    let ffi_db = db_path(&ffi_dir, "ffi.sqlite");
+    let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
     let ffi_db_for_seed = ffi_db.clone();
     let ffi_pool_for_seed = migrate_database(&ffi_db_for_seed).await.expect("ffi open");
     let ffi_video_uuid = seed_file(&ffi_pool_for_seed, "video").await;
@@ -6162,7 +6253,7 @@ async fn given_invalid_transition_when_updated_via_http_and_ffi_then_both_confli
             alexandria_ffi::INDEX_OK
         );
 
-        let token = CString::new("parity").unwrap();
+        let token = CString::new(TEST_TOKEN).unwrap();
         let create_body = CString::new(json!({ "name": "Weekend movies" }).to_string()).unwrap();
         let create_r = alexandria_watchlist_create(create_body.as_ptr(), token.as_ptr());
         assert_eq!(create_r.status, alexandria_ffi::WATCHLIST_OK, "ffi create");
@@ -6225,13 +6316,14 @@ async fn given_same_video_when_removed_via_http_and_ffi_then_bodies_and_rows_ide
     let http_dir = tempdir().unwrap();
     let http_db = db_path(&http_dir, "http.sqlite");
     let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    seed_session(&http_pool, TEST_TOKEN).await;
     let http_services =
-        std::sync::Arc::new(build_services(&Settings::default(), http_pool.clone()).await);
+        std::sync::Arc::new(build_services(&local_settings(), http_pool.clone()).await);
 
     let create_req = Request::builder()
         .method("POST")
         .uri("/v1/watchlists")
-        .header("authorization", "Bearer parity")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .header("content-type", "application/json")
         .body(Body::from(json!({ "name": "Weekend movies" }).to_string()))
         .unwrap();
@@ -6251,7 +6343,7 @@ async fn given_same_video_when_removed_via_http_and_ffi_then_bodies_and_rows_ide
     let add_req = Request::builder()
         .method("POST")
         .uri(format!("/v1/watchlists/{http_watchlist_uuid}/items"))
-        .header("authorization", "Bearer parity")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .header("content-type", "application/json")
         .body(Body::from(
             json!({ "videoUuid": http_video_uuid }).to_string(),
@@ -6268,7 +6360,7 @@ async fn given_same_video_when_removed_via_http_and_ffi_then_bodies_and_rows_ide
         .uri(format!(
             "/v1/watchlists/{http_watchlist_uuid}/items/{http_video_uuid}"
         ))
-        .header("authorization", "Bearer parity")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .body(Body::empty())
         .unwrap();
     let remove_resp = app(Settings::default(), http_services)
@@ -6292,7 +6384,7 @@ async fn given_same_video_when_removed_via_http_and_ffi_then_bodies_and_rows_ide
 
     // ---- FFI leg ----
     let ffi_dir = tempdir().unwrap();
-    let ffi_db = db_path(&ffi_dir, "ffi.sqlite");
+    let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
     let ffi_db_for_seed = ffi_db.clone();
     let ffi_db_for_rows = ffi_db.clone();
 
@@ -6308,7 +6400,7 @@ async fn given_same_video_when_removed_via_http_and_ffi_then_bodies_and_rows_ide
             alexandria_ffi::INDEX_OK
         );
 
-        let token = CString::new("parity").unwrap();
+        let token = CString::new(TEST_TOKEN).unwrap();
         let create_body = CString::new(json!({ "name": "Weekend movies" }).to_string()).unwrap();
         let create_r = alexandria_watchlist_create(create_body.as_ptr(), token.as_ptr());
         assert_eq!(create_r.status, alexandria_ffi::WATCHLIST_OK, "ffi create");
@@ -6401,13 +6493,14 @@ async fn given_video_not_on_watchlist_when_removed_via_http_and_ffi_then_both_no
     let http_dir = tempdir().unwrap();
     let http_db = db_path(&http_dir, "http.sqlite");
     let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    seed_session(&http_pool, TEST_TOKEN).await;
     let http_services =
-        std::sync::Arc::new(build_services(&Settings::default(), http_pool.clone()).await);
+        std::sync::Arc::new(build_services(&local_settings(), http_pool.clone()).await);
 
     let create_req = Request::builder()
         .method("POST")
         .uri("/v1/watchlists")
-        .header("authorization", "Bearer parity")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .header("content-type", "application/json")
         .body(Body::from(json!({ "name": "Weekend movies" }).to_string()))
         .unwrap();
@@ -6429,7 +6522,7 @@ async fn given_video_not_on_watchlist_when_removed_via_http_and_ffi_then_both_no
         .uri(format!(
             "/v1/watchlists/{http_watchlist_uuid}/items/{unknown_video}"
         ))
-        .header("authorization", "Bearer parity")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .body(Body::empty())
         .unwrap();
     let remove_resp = app(Settings::default(), http_services)
@@ -6440,7 +6533,7 @@ async fn given_video_not_on_watchlist_when_removed_via_http_and_ffi_then_both_no
 
     // ---- FFI leg ----
     let ffi_dir = tempdir().unwrap();
-    let ffi_db = db_path(&ffi_dir, "ffi.sqlite");
+    let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
     let ffi_status = tokio::task::spawn_blocking(move || -> i32 {
         let cdb = CString::new(ffi_db).unwrap();
         assert_eq!(
@@ -6448,7 +6541,7 @@ async fn given_video_not_on_watchlist_when_removed_via_http_and_ffi_then_both_no
             alexandria_ffi::INDEX_OK
         );
 
-        let token = CString::new("parity").unwrap();
+        let token = CString::new(TEST_TOKEN).unwrap();
         let create_body = CString::new(json!({ "name": "Weekend movies" }).to_string()).unwrap();
         let create_r = alexandria_watchlist_create(create_body.as_ptr(), token.as_ptr());
         assert_eq!(create_r.status, alexandria_ffi::WATCHLIST_OK, "ffi create");
@@ -6498,13 +6591,14 @@ async fn given_same_watchlist_when_deleted_via_http_and_ffi_then_bodies_and_rows
     let http_dir = tempdir().unwrap();
     let http_db = db_path(&http_dir, "http.sqlite");
     let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    seed_session(&http_pool, TEST_TOKEN).await;
     let http_services =
-        std::sync::Arc::new(build_services(&Settings::default(), http_pool.clone()).await);
+        std::sync::Arc::new(build_services(&local_settings(), http_pool.clone()).await);
 
     let create_req = Request::builder()
         .method("POST")
         .uri("/v1/watchlists")
-        .header("authorization", "Bearer parity")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .header("content-type", "application/json")
         .body(Body::from(json!({ "name": "Weekend movies" }).to_string()))
         .unwrap();
@@ -6524,7 +6618,7 @@ async fn given_same_watchlist_when_deleted_via_http_and_ffi_then_bodies_and_rows
     let add_req = Request::builder()
         .method("POST")
         .uri(format!("/v1/watchlists/{http_watchlist_uuid}/items"))
-        .header("authorization", "Bearer parity")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .header("content-type", "application/json")
         .body(Body::from(
             json!({ "videoUuid": http_video_uuid }).to_string(),
@@ -6539,7 +6633,7 @@ async fn given_same_watchlist_when_deleted_via_http_and_ffi_then_bodies_and_rows
     let delete_req = Request::builder()
         .method("DELETE")
         .uri(format!("/v1/watchlists/{http_watchlist_uuid}"))
-        .header("authorization", "Bearer parity")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .body(Body::empty())
         .unwrap();
     let delete_resp = app(Settings::default(), http_services)
@@ -6567,7 +6661,7 @@ async fn given_same_watchlist_when_deleted_via_http_and_ffi_then_bodies_and_rows
 
     // ---- FFI leg ----
     let ffi_dir = tempdir().unwrap();
-    let ffi_db = db_path(&ffi_dir, "ffi.sqlite");
+    let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
     let ffi_db_for_seed = ffi_db.clone();
     let ffi_db_for_rows = ffi_db.clone();
 
@@ -6583,7 +6677,7 @@ async fn given_same_watchlist_when_deleted_via_http_and_ffi_then_bodies_and_rows
             alexandria_ffi::INDEX_OK
         );
 
-        let token = CString::new("parity").unwrap();
+        let token = CString::new(TEST_TOKEN).unwrap();
         let create_body = CString::new(json!({ "name": "Weekend movies" }).to_string()).unwrap();
         let create_r = alexandria_watchlist_create(create_body.as_ptr(), token.as_ptr());
         assert_eq!(create_r.status, alexandria_ffi::WATCHLIST_OK, "ffi create");
@@ -6674,14 +6768,15 @@ async fn given_unknown_watchlist_when_deleted_via_http_and_ffi_then_both_not_fou
     let http_dir = tempdir().unwrap();
     let http_db = db_path(&http_dir, "http.sqlite");
     let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    seed_session(&http_pool, TEST_TOKEN).await;
     let http_services =
-        std::sync::Arc::new(build_services(&Settings::default(), http_pool.clone()).await);
+        std::sync::Arc::new(build_services(&local_settings(), http_pool.clone()).await);
 
     let unknown = uuid::Uuid::new_v4().to_string();
     let delete_req = Request::builder()
         .method("DELETE")
         .uri(format!("/v1/watchlists/{unknown}"))
-        .header("authorization", "Bearer parity")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .body(Body::empty())
         .unwrap();
     let delete_resp = app(Settings::default(), http_services)
@@ -6692,7 +6787,7 @@ async fn given_unknown_watchlist_when_deleted_via_http_and_ffi_then_both_not_fou
 
     // ---- FFI leg ----
     let ffi_dir = tempdir().unwrap();
-    let ffi_db = db_path(&ffi_dir, "ffi.sqlite");
+    let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
     let ffi_status = tokio::task::spawn_blocking(move || -> i32 {
         let cdb = CString::new(ffi_db).unwrap();
         assert_eq!(
@@ -6700,7 +6795,7 @@ async fn given_unknown_watchlist_when_deleted_via_http_and_ffi_then_both_not_fou
             alexandria_ffi::INDEX_OK
         );
 
-        let token = CString::new("parity").unwrap();
+        let token = CString::new(TEST_TOKEN).unwrap();
         let unknown = uuid::Uuid::new_v4().to_string();
         let unknown_c = CString::new(unknown).unwrap();
         let delete_r = alexandria_watchlist_delete(unknown_c.as_ptr(), token.as_ptr());
@@ -6729,13 +6824,14 @@ async fn given_same_reading_list_when_created_via_http_and_ffi_then_bodies_and_r
     let http_dir = tempdir().unwrap();
     let http_db = db_path(&http_dir, "http.sqlite");
     let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    seed_session(&http_pool, TEST_TOKEN).await;
     let http_services =
-        std::sync::Arc::new(build_services(&Settings::default(), http_pool.clone()).await);
+        std::sync::Arc::new(build_services(&local_settings(), http_pool.clone()).await);
 
     let req = Request::builder()
         .method("POST")
         .uri("/v1/reading-lists")
-        .header("authorization", "Bearer parity")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .header("content-type", "application/json")
         .body(Body::from(json!({ "name": "Summer reads" }).to_string()))
         .unwrap();
@@ -6754,7 +6850,7 @@ async fn given_same_reading_list_when_created_via_http_and_ffi_then_bodies_and_r
 
     // ---- FFI leg ----
     let ffi_dir = tempdir().unwrap();
-    let ffi_db = db_path(&ffi_dir, "ffi.sqlite");
+    let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
     let ffi_db_for_rows = ffi_db.clone();
     let ffi_body: serde_json::Value = tokio::task::spawn_blocking(move || -> serde_json::Value {
         let cdb = CString::new(ffi_db).unwrap();
@@ -6764,7 +6860,7 @@ async fn given_same_reading_list_when_created_via_http_and_ffi_then_bodies_and_r
         );
 
         let body = CString::new(json!({ "name": "Summer reads" }).to_string()).unwrap();
-        let token = CString::new("parity").unwrap();
+        let token = CString::new(TEST_TOKEN).unwrap();
         let r = alexandria_reading_list_create(body.as_ptr(), token.as_ptr());
         assert_eq!(r.status, alexandria_ffi::READING_LIST_OK, "ffi create");
         assert!(!r.json.is_null());
@@ -6813,8 +6909,9 @@ async fn given_no_token_when_reading_list_created_via_http_and_ffi_then_both_una
     let http_dir = tempdir().unwrap();
     let http_db = db_path(&http_dir, "http.sqlite");
     let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    seed_session(&http_pool, TEST_TOKEN).await;
     let http_services =
-        std::sync::Arc::new(build_services(&Settings::default(), http_pool.clone()).await);
+        std::sync::Arc::new(build_services(&local_settings(), http_pool.clone()).await);
 
     let req = Request::builder()
         .method("POST")
@@ -6830,7 +6927,7 @@ async fn given_no_token_when_reading_list_created_via_http_and_ffi_then_both_una
 
     // ---- FFI leg ----
     let ffi_dir = tempdir().unwrap();
-    let ffi_db = db_path(&ffi_dir, "ffi.sqlite");
+    let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
     let ffi_status = tokio::task::spawn_blocking(move || -> i32 {
         let cdb = CString::new(ffi_db).unwrap();
         assert_eq!(
@@ -6865,13 +6962,14 @@ async fn given_same_item_when_added_via_http_and_ffi_then_bodies_and_rows_identi
     let http_dir = tempdir().unwrap();
     let http_db = db_path(&http_dir, "http.sqlite");
     let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    seed_session(&http_pool, TEST_TOKEN).await;
     let http_services =
-        std::sync::Arc::new(build_services(&Settings::default(), http_pool.clone()).await);
+        std::sync::Arc::new(build_services(&local_settings(), http_pool.clone()).await);
 
     let create_req = Request::builder()
         .method("POST")
         .uri("/v1/reading-lists")
-        .header("authorization", "Bearer parity")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .header("content-type", "application/json")
         .body(Body::from(json!({ "name": "Summer reads" }).to_string()))
         .unwrap();
@@ -6892,7 +6990,7 @@ async fn given_same_item_when_added_via_http_and_ffi_then_bodies_and_rows_identi
     let add_req = Request::builder()
         .method("POST")
         .uri(format!("/v1/reading-lists/{http_reading_list_uuid}/items"))
-        .header("authorization", "Bearer parity")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .header("content-type", "application/json")
         .body(Body::from(
             json!({ "itemUuid": http_item_uuid }).to_string(),
@@ -6913,7 +7011,7 @@ async fn given_same_item_when_added_via_http_and_ffi_then_bodies_and_rows_identi
 
     // ---- FFI leg ----
     let ffi_dir = tempdir().unwrap();
-    let ffi_db = db_path(&ffi_dir, "ffi.sqlite");
+    let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
     let ffi_db_for_seed = ffi_db.clone();
     let ffi_db_for_rows = ffi_db.clone();
 
@@ -6928,7 +7026,7 @@ async fn given_same_item_when_added_via_http_and_ffi_then_bodies_and_rows_identi
             alexandria_ffi::INDEX_OK
         );
 
-        let token = CString::new("parity").unwrap();
+        let token = CString::new(TEST_TOKEN).unwrap();
         let create_body = CString::new(json!({ "name": "Summer reads" }).to_string()).unwrap();
         let create_r = alexandria_reading_list_create(create_body.as_ptr(), token.as_ptr());
         assert_eq!(
@@ -7016,8 +7114,9 @@ async fn given_unknown_reading_list_when_item_added_via_http_and_ffi_then_both_n
     let http_dir = tempdir().unwrap();
     let http_db = db_path(&http_dir, "http.sqlite");
     let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    seed_session(&http_pool, TEST_TOKEN).await;
     let http_services =
-        std::sync::Arc::new(build_services(&Settings::default(), http_pool.clone()).await);
+        std::sync::Arc::new(build_services(&local_settings(), http_pool.clone()).await);
 
     let http_item_uuid = seed_file(&http_pool, "document").await;
     let unknown = uuid::Uuid::new_v4().to_string();
@@ -7025,7 +7124,7 @@ async fn given_unknown_reading_list_when_item_added_via_http_and_ffi_then_both_n
     let add_req = Request::builder()
         .method("POST")
         .uri(format!("/v1/reading-lists/{unknown}/items"))
-        .header("authorization", "Bearer parity")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .header("content-type", "application/json")
         .body(Body::from(
             json!({ "itemUuid": http_item_uuid }).to_string(),
@@ -7039,7 +7138,7 @@ async fn given_unknown_reading_list_when_item_added_via_http_and_ffi_then_both_n
 
     // ---- FFI leg ----
     let ffi_dir = tempdir().unwrap();
-    let ffi_db = db_path(&ffi_dir, "ffi.sqlite");
+    let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
     let ffi_db_for_seed = ffi_db.clone();
 
     let ffi_pool_for_seed = migrate_database(&ffi_db_for_seed).await.expect("ffi open");
@@ -7053,7 +7152,7 @@ async fn given_unknown_reading_list_when_item_added_via_http_and_ffi_then_both_n
             alexandria_ffi::INDEX_OK
         );
 
-        let token = CString::new("parity").unwrap();
+        let token = CString::new(TEST_TOKEN).unwrap();
         let unknown = uuid::Uuid::new_v4().to_string();
         let unknown_c = CString::new(unknown).unwrap();
         let add_body = CString::new(json!({ "itemUuid": ffi_item_uuid }).to_string()).unwrap();
@@ -7083,13 +7182,14 @@ async fn given_same_reading_list_when_browsed_via_http_and_ffi_then_bodies_ident
     let http_dir = tempdir().unwrap();
     let http_db = db_path(&http_dir, "http.sqlite");
     let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    seed_session(&http_pool, TEST_TOKEN).await;
     let http_services =
-        std::sync::Arc::new(build_services(&Settings::default(), http_pool.clone()).await);
+        std::sync::Arc::new(build_services(&local_settings(), http_pool.clone()).await);
 
     let create_req = Request::builder()
         .method("POST")
         .uri("/v1/reading-lists")
-        .header("authorization", "Bearer parity")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .header("content-type", "application/json")
         .body(Body::from(json!({ "name": "Summer reads" }).to_string()))
         .unwrap();
@@ -7109,7 +7209,7 @@ async fn given_same_reading_list_when_browsed_via_http_and_ffi_then_bodies_ident
     let add_req = Request::builder()
         .method("POST")
         .uri(format!("/v1/reading-lists/{http_reading_list_uuid}/items"))
-        .header("authorization", "Bearer parity")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .header("content-type", "application/json")
         .body(Body::from(
             json!({ "itemUuid": http_item_uuid }).to_string(),
@@ -7124,7 +7224,7 @@ async fn given_same_reading_list_when_browsed_via_http_and_ffi_then_bodies_ident
     let list_req = Request::builder()
         .method("GET")
         .uri("/v1/reading-lists")
-        .header("authorization", "Bearer parity")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .body(Body::empty())
         .unwrap();
     let list_resp = app(Settings::default(), http_services)
@@ -7138,7 +7238,7 @@ async fn given_same_reading_list_when_browsed_via_http_and_ffi_then_bodies_ident
 
     // ---- FFI leg ----
     let ffi_dir = tempdir().unwrap();
-    let ffi_db = db_path(&ffi_dir, "ffi.sqlite");
+    let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
     let ffi_db_for_seed = ffi_db.clone();
 
     let ffi_pool_for_seed = migrate_database(&ffi_db_for_seed).await.expect("ffi open");
@@ -7152,7 +7252,7 @@ async fn given_same_reading_list_when_browsed_via_http_and_ffi_then_bodies_ident
             alexandria_ffi::INDEX_OK
         );
 
-        let token = CString::new("parity").unwrap();
+        let token = CString::new(TEST_TOKEN).unwrap();
         let create_body = CString::new(json!({ "name": "Summer reads" }).to_string()).unwrap();
         let create_r = alexandria_reading_list_create(create_body.as_ptr(), token.as_ptr());
         assert_eq!(
@@ -7236,14 +7336,15 @@ async fn given_unknown_reading_list_when_browsed_via_http_and_ffi_then_both_not_
     let http_dir = tempdir().unwrap();
     let http_db = db_path(&http_dir, "http.sqlite");
     let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    seed_session(&http_pool, TEST_TOKEN).await;
     let http_services =
-        std::sync::Arc::new(build_services(&Settings::default(), http_pool.clone()).await);
+        std::sync::Arc::new(build_services(&local_settings(), http_pool.clone()).await);
 
     let unknown = uuid::Uuid::new_v4().to_string();
     let list_req = Request::builder()
         .method("GET")
         .uri(format!("/v1/reading-lists?readingListUuid={unknown}"))
-        .header("authorization", "Bearer parity")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .body(Body::empty())
         .unwrap();
     let list_resp = app(Settings::default(), http_services)
@@ -7254,7 +7355,7 @@ async fn given_unknown_reading_list_when_browsed_via_http_and_ffi_then_both_not_
 
     // ---- FFI leg ----
     let ffi_dir = tempdir().unwrap();
-    let ffi_db = db_path(&ffi_dir, "ffi.sqlite");
+    let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
     let ffi_status = tokio::task::spawn_blocking(move || -> i32 {
         let cdb = CString::new(ffi_db).unwrap();
         assert_eq!(
@@ -7262,7 +7363,7 @@ async fn given_unknown_reading_list_when_browsed_via_http_and_ffi_then_both_not_
             alexandria_ffi::INDEX_OK
         );
 
-        let token = CString::new("parity").unwrap();
+        let token = CString::new(TEST_TOKEN).unwrap();
         let unknown = uuid::Uuid::new_v4().to_string();
         let filter = CString::new(json!({ "readingListUuid": unknown }).to_string()).unwrap();
         let list_r = alexandria_reading_lists_list(filter.as_ptr(), token.as_ptr());
@@ -7291,13 +7392,14 @@ async fn given_same_reading_transition_when_updated_via_http_and_ffi_then_bodies
     let http_dir = tempdir().unwrap();
     let http_db = db_path(&http_dir, "http.sqlite");
     let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    seed_session(&http_pool, TEST_TOKEN).await;
     let http_services =
-        std::sync::Arc::new(build_services(&Settings::default(), http_pool.clone()).await);
+        std::sync::Arc::new(build_services(&local_settings(), http_pool.clone()).await);
 
     let create_req = Request::builder()
         .method("POST")
         .uri("/v1/reading-lists")
-        .header("authorization", "Bearer parity")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .header("content-type", "application/json")
         .body(Body::from(json!({ "name": "Summer reads" }).to_string()))
         .unwrap();
@@ -7317,7 +7419,7 @@ async fn given_same_reading_transition_when_updated_via_http_and_ffi_then_bodies
     let add_req = Request::builder()
         .method("POST")
         .uri(format!("/v1/reading-lists/{http_reading_list_uuid}/items"))
-        .header("authorization", "Bearer parity")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .header("content-type", "application/json")
         .body(Body::from(
             json!({ "itemUuid": http_item_uuid }).to_string(),
@@ -7334,7 +7436,7 @@ async fn given_same_reading_transition_when_updated_via_http_and_ffi_then_bodies
         .uri(format!(
             "/v1/reading-lists/{http_reading_list_uuid}/items/{http_item_uuid}"
         ))
-        .header("authorization", "Bearer parity")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .header("content-type", "application/json")
         .body(Body::from(
             json!({ "state": "reading", "currentIssue": 3, "totalIssues": 12 }).to_string(),
@@ -7357,7 +7459,7 @@ async fn given_same_reading_transition_when_updated_via_http_and_ffi_then_bodies
 
     // ---- FFI leg ----
     let ffi_dir = tempdir().unwrap();
-    let ffi_db = db_path(&ffi_dir, "ffi.sqlite");
+    let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
     let ffi_db_for_seed = ffi_db.clone();
     let ffi_db_for_rows = ffi_db.clone();
 
@@ -7372,7 +7474,7 @@ async fn given_same_reading_transition_when_updated_via_http_and_ffi_then_bodies
             alexandria_ffi::INDEX_OK
         );
 
-        let token = CString::new("parity").unwrap();
+        let token = CString::new(TEST_TOKEN).unwrap();
         let create_body = CString::new(json!({ "name": "Summer reads" }).to_string()).unwrap();
         let create_r = alexandria_reading_list_create(create_body.as_ptr(), token.as_ptr());
         assert_eq!(
@@ -7468,13 +7570,14 @@ async fn given_invalid_reading_transition_when_updated_via_http_and_ffi_then_bot
     let http_dir = tempdir().unwrap();
     let http_db = db_path(&http_dir, "http.sqlite");
     let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    seed_session(&http_pool, TEST_TOKEN).await;
     let http_services =
-        std::sync::Arc::new(build_services(&Settings::default(), http_pool.clone()).await);
+        std::sync::Arc::new(build_services(&local_settings(), http_pool.clone()).await);
 
     let create_req = Request::builder()
         .method("POST")
         .uri("/v1/reading-lists")
-        .header("authorization", "Bearer parity")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .header("content-type", "application/json")
         .body(Body::from(json!({ "name": "Summer reads" }).to_string()))
         .unwrap();
@@ -7494,7 +7597,7 @@ async fn given_invalid_reading_transition_when_updated_via_http_and_ffi_then_bot
     let add_req = Request::builder()
         .method("POST")
         .uri(format!("/v1/reading-lists/{http_reading_list_uuid}/items"))
-        .header("authorization", "Bearer parity")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .header("content-type", "application/json")
         .body(Body::from(
             json!({ "itemUuid": http_item_uuid }).to_string(),
@@ -7512,7 +7615,7 @@ async fn given_invalid_reading_transition_when_updated_via_http_and_ffi_then_bot
         .uri(format!(
             "/v1/reading-lists/{http_reading_list_uuid}/items/{http_item_uuid}"
         ))
-        .header("authorization", "Bearer parity")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .header("content-type", "application/json")
         .body(Body::from(json!({ "state": "read" }).to_string()))
         .unwrap();
@@ -7524,7 +7627,7 @@ async fn given_invalid_reading_transition_when_updated_via_http_and_ffi_then_bot
 
     // ---- FFI leg ----
     let ffi_dir = tempdir().unwrap();
-    let ffi_db = db_path(&ffi_dir, "ffi.sqlite");
+    let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
     let ffi_db_for_seed = ffi_db.clone();
     let ffi_pool_for_seed = migrate_database(&ffi_db_for_seed).await.expect("ffi open");
     let ffi_item_uuid = seed_file(&ffi_pool_for_seed, "comic").await;
@@ -7537,7 +7640,7 @@ async fn given_invalid_reading_transition_when_updated_via_http_and_ffi_then_bot
             alexandria_ffi::INDEX_OK
         );
 
-        let token = CString::new("parity").unwrap();
+        let token = CString::new(TEST_TOKEN).unwrap();
         let create_body = CString::new(json!({ "name": "Summer reads" }).to_string()).unwrap();
         let create_r = alexandria_reading_list_create(create_body.as_ptr(), token.as_ptr());
         assert_eq!(
@@ -7608,13 +7711,14 @@ async fn given_same_item_when_removed_via_http_and_ffi_then_bodies_and_rows_iden
     let http_dir = tempdir().unwrap();
     let http_db = db_path(&http_dir, "http.sqlite");
     let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    seed_session(&http_pool, TEST_TOKEN).await;
     let http_services =
-        std::sync::Arc::new(build_services(&Settings::default(), http_pool.clone()).await);
+        std::sync::Arc::new(build_services(&local_settings(), http_pool.clone()).await);
 
     let create_req = Request::builder()
         .method("POST")
         .uri("/v1/reading-lists")
-        .header("authorization", "Bearer parity")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .header("content-type", "application/json")
         .body(Body::from(json!({ "name": "Summer reads" }).to_string()))
         .unwrap();
@@ -7634,7 +7738,7 @@ async fn given_same_item_when_removed_via_http_and_ffi_then_bodies_and_rows_iden
     let add_req = Request::builder()
         .method("POST")
         .uri(format!("/v1/reading-lists/{http_reading_list_uuid}/items"))
-        .header("authorization", "Bearer parity")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .header("content-type", "application/json")
         .body(Body::from(
             json!({ "itemUuid": http_item_uuid }).to_string(),
@@ -7651,7 +7755,7 @@ async fn given_same_item_when_removed_via_http_and_ffi_then_bodies_and_rows_iden
         .uri(format!(
             "/v1/reading-lists/{http_reading_list_uuid}/items/{http_item_uuid}"
         ))
-        .header("authorization", "Bearer parity")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .body(Body::empty())
         .unwrap();
     let remove_resp = app(Settings::default(), http_services)
@@ -7675,7 +7779,7 @@ async fn given_same_item_when_removed_via_http_and_ffi_then_bodies_and_rows_iden
 
     // ---- FFI leg ----
     let ffi_dir = tempdir().unwrap();
-    let ffi_db = db_path(&ffi_dir, "ffi.sqlite");
+    let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
     let ffi_db_for_seed = ffi_db.clone();
     let ffi_db_for_rows = ffi_db.clone();
 
@@ -7691,7 +7795,7 @@ async fn given_same_item_when_removed_via_http_and_ffi_then_bodies_and_rows_iden
             alexandria_ffi::INDEX_OK
         );
 
-        let token = CString::new("parity").unwrap();
+        let token = CString::new(TEST_TOKEN).unwrap();
         let create_body = CString::new(json!({ "name": "Summer reads" }).to_string()).unwrap();
         let create_r = alexandria_reading_list_create(create_body.as_ptr(), token.as_ptr());
         assert_eq!(
@@ -7792,13 +7896,14 @@ async fn given_item_not_on_reading_list_when_removed_via_http_and_ffi_then_both_
     let http_dir = tempdir().unwrap();
     let http_db = db_path(&http_dir, "http.sqlite");
     let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    seed_session(&http_pool, TEST_TOKEN).await;
     let http_services =
-        std::sync::Arc::new(build_services(&Settings::default(), http_pool.clone()).await);
+        std::sync::Arc::new(build_services(&local_settings(), http_pool.clone()).await);
 
     let create_req = Request::builder()
         .method("POST")
         .uri("/v1/reading-lists")
-        .header("authorization", "Bearer parity")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .header("content-type", "application/json")
         .body(Body::from(json!({ "name": "Summer reads" }).to_string()))
         .unwrap();
@@ -7820,7 +7925,7 @@ async fn given_item_not_on_reading_list_when_removed_via_http_and_ffi_then_both_
         .uri(format!(
             "/v1/reading-lists/{http_reading_list_uuid}/items/{unknown_item}"
         ))
-        .header("authorization", "Bearer parity")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .body(Body::empty())
         .unwrap();
     let remove_resp = app(Settings::default(), http_services)
@@ -7831,7 +7936,7 @@ async fn given_item_not_on_reading_list_when_removed_via_http_and_ffi_then_both_
 
     // ---- FFI leg ----
     let ffi_dir = tempdir().unwrap();
-    let ffi_db = db_path(&ffi_dir, "ffi.sqlite");
+    let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
     let ffi_status = tokio::task::spawn_blocking(move || -> i32 {
         let cdb = CString::new(ffi_db).unwrap();
         assert_eq!(
@@ -7839,7 +7944,7 @@ async fn given_item_not_on_reading_list_when_removed_via_http_and_ffi_then_both_
             alexandria_ffi::INDEX_OK
         );
 
-        let token = CString::new("parity").unwrap();
+        let token = CString::new(TEST_TOKEN).unwrap();
         let create_body = CString::new(json!({ "name": "Summer reads" }).to_string()).unwrap();
         let create_r = alexandria_reading_list_create(create_body.as_ptr(), token.as_ptr());
         assert_eq!(
@@ -7893,13 +7998,14 @@ async fn given_same_reading_list_when_deleted_via_http_and_ffi_then_bodies_and_r
     let http_dir = tempdir().unwrap();
     let http_db = db_path(&http_dir, "http.sqlite");
     let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    seed_session(&http_pool, TEST_TOKEN).await;
     let http_services =
-        std::sync::Arc::new(build_services(&Settings::default(), http_pool.clone()).await);
+        std::sync::Arc::new(build_services(&local_settings(), http_pool.clone()).await);
 
     let create_req = Request::builder()
         .method("POST")
         .uri("/v1/reading-lists")
-        .header("authorization", "Bearer parity")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .header("content-type", "application/json")
         .body(Body::from(json!({ "name": "Summer reads" }).to_string()))
         .unwrap();
@@ -7919,7 +8025,7 @@ async fn given_same_reading_list_when_deleted_via_http_and_ffi_then_bodies_and_r
     let add_req = Request::builder()
         .method("POST")
         .uri(format!("/v1/reading-lists/{http_reading_list_uuid}/items"))
-        .header("authorization", "Bearer parity")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .header("content-type", "application/json")
         .body(Body::from(
             json!({ "itemUuid": http_item_uuid }).to_string(),
@@ -7934,7 +8040,7 @@ async fn given_same_reading_list_when_deleted_via_http_and_ffi_then_bodies_and_r
     let delete_req = Request::builder()
         .method("DELETE")
         .uri(format!("/v1/reading-lists/{http_reading_list_uuid}"))
-        .header("authorization", "Bearer parity")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .body(Body::empty())
         .unwrap();
     let delete_resp = app(Settings::default(), http_services)
@@ -7962,7 +8068,7 @@ async fn given_same_reading_list_when_deleted_via_http_and_ffi_then_bodies_and_r
 
     // ---- FFI leg ----
     let ffi_dir = tempdir().unwrap();
-    let ffi_db = db_path(&ffi_dir, "ffi.sqlite");
+    let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
     let ffi_db_for_seed = ffi_db.clone();
     let ffi_db_for_rows = ffi_db.clone();
 
@@ -7978,7 +8084,7 @@ async fn given_same_reading_list_when_deleted_via_http_and_ffi_then_bodies_and_r
             alexandria_ffi::INDEX_OK
         );
 
-        let token = CString::new("parity").unwrap();
+        let token = CString::new(TEST_TOKEN).unwrap();
         let create_body = CString::new(json!({ "name": "Summer reads" }).to_string()).unwrap();
         let create_r = alexandria_reading_list_create(create_body.as_ptr(), token.as_ptr());
         assert_eq!(
@@ -8083,14 +8189,15 @@ async fn given_unknown_reading_list_when_deleted_via_http_and_ffi_then_both_not_
     let http_dir = tempdir().unwrap();
     let http_db = db_path(&http_dir, "http.sqlite");
     let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    seed_session(&http_pool, TEST_TOKEN).await;
     let http_services =
-        std::sync::Arc::new(build_services(&Settings::default(), http_pool.clone()).await);
+        std::sync::Arc::new(build_services(&local_settings(), http_pool.clone()).await);
 
     let unknown = uuid::Uuid::new_v4().to_string();
     let delete_req = Request::builder()
         .method("DELETE")
         .uri(format!("/v1/reading-lists/{unknown}"))
-        .header("authorization", "Bearer parity")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .body(Body::empty())
         .unwrap();
     let delete_resp = app(Settings::default(), http_services)
@@ -8101,7 +8208,7 @@ async fn given_unknown_reading_list_when_deleted_via_http_and_ffi_then_both_not_
 
     // ---- FFI leg ----
     let ffi_dir = tempdir().unwrap();
-    let ffi_db = db_path(&ffi_dir, "ffi.sqlite");
+    let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
     let ffi_status = tokio::task::spawn_blocking(move || -> i32 {
         let cdb = CString::new(ffi_db).unwrap();
         assert_eq!(
@@ -8109,7 +8216,7 @@ async fn given_unknown_reading_list_when_deleted_via_http_and_ffi_then_both_not_
             alexandria_ffi::INDEX_OK
         );
 
-        let token = CString::new("parity").unwrap();
+        let token = CString::new(TEST_TOKEN).unwrap();
         let unknown = uuid::Uuid::new_v4().to_string();
         let unknown_c = CString::new(unknown).unwrap();
         let delete_r = alexandria_reading_list_delete(unknown_c.as_ptr(), token.as_ptr());
@@ -8163,15 +8270,16 @@ async fn given_same_text_file_when_read_via_http_and_ffi_then_bodies_identical()
     let http_dir = tempdir().unwrap();
     let http_db = db_path(&http_dir, "http.sqlite");
     let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    seed_session(&http_pool, TEST_TOKEN).await;
     let http_services =
-        std::sync::Arc::new(build_services(&Settings::default(), http_pool.clone()).await);
+        std::sync::Arc::new(build_services(&local_settings(), http_pool.clone()).await);
 
     let http_uuid = seed_file_at_path(&http_pool, "text", &file_path).await;
 
     let req = Request::builder()
         .method("GET")
         .uri(format!("/v1/files/{http_uuid}/content"))
-        .header("authorization", "Bearer parity")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .body(Body::empty())
         .unwrap();
     let resp = app(Settings::default(), http_services)
@@ -8184,7 +8292,7 @@ async fn given_same_text_file_when_read_via_http_and_ffi_then_bodies_identical()
 
     // ---- FFI leg ----
     let ffi_dir = tempdir().unwrap();
-    let ffi_db = db_path(&ffi_dir, "ffi.sqlite");
+    let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
     let ffi_pool = migrate_database(&ffi_db).await.expect("ffi migrate");
     let ffi_uuid = seed_file_at_path(&ffi_pool, "text", &file_path).await;
     ffi_pool.close().await;
@@ -8196,7 +8304,7 @@ async fn given_same_text_file_when_read_via_http_and_ffi_then_bodies_identical()
             alexandria_ffi::INDEX_OK
         );
 
-        let token = CString::new("parity").unwrap();
+        let token = CString::new(TEST_TOKEN).unwrap();
         let uuid_c = CString::new(ffi_uuid).unwrap();
         let r = alexandria_file_read_content(uuid_c.as_ptr(), token.as_ptr());
         assert_eq!(r.status, alexandria_ffi::FILE_OK, "ffi read content");
@@ -8238,15 +8346,16 @@ async fn given_non_text_file_when_read_via_http_and_ffi_then_both_invalid_input(
     let http_dir = tempdir().unwrap();
     let http_db = db_path(&http_dir, "http.sqlite");
     let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    seed_session(&http_pool, TEST_TOKEN).await;
     let http_services =
-        std::sync::Arc::new(build_services(&Settings::default(), http_pool.clone()).await);
+        std::sync::Arc::new(build_services(&local_settings(), http_pool.clone()).await);
 
     let http_uuid = seed_file_at_path(&http_pool, "audio", &file_path).await;
 
     let req = Request::builder()
         .method("GET")
         .uri(format!("/v1/files/{http_uuid}/content"))
-        .header("authorization", "Bearer parity")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .body(Body::empty())
         .unwrap();
     let resp = app(Settings::default(), http_services)
@@ -8257,7 +8366,7 @@ async fn given_non_text_file_when_read_via_http_and_ffi_then_both_invalid_input(
 
     // ---- FFI leg ----
     let ffi_dir = tempdir().unwrap();
-    let ffi_db = db_path(&ffi_dir, "ffi.sqlite");
+    let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
     let ffi_pool = migrate_database(&ffi_db).await.expect("ffi migrate");
     let ffi_uuid = seed_file_at_path(&ffi_pool, "audio", &file_path).await;
     ffi_pool.close().await;
@@ -8269,7 +8378,7 @@ async fn given_non_text_file_when_read_via_http_and_ffi_then_both_invalid_input(
             alexandria_ffi::INDEX_OK
         );
 
-        let token = CString::new("parity").unwrap();
+        let token = CString::new(TEST_TOKEN).unwrap();
         let uuid_c = CString::new(ffi_uuid).unwrap();
         let r = alexandria_file_read_content(uuid_c.as_ptr(), token.as_ptr());
         assert!(r.json.is_null());
@@ -8308,15 +8417,16 @@ async fn given_same_content_when_edited_via_http_and_ffi_then_bodies_and_disk_id
     let http_dir = tempdir().unwrap();
     let http_db = db_path(&http_dir, "http.sqlite");
     let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    seed_session(&http_pool, TEST_TOKEN).await;
     let http_services =
-        std::sync::Arc::new(build_services(&Settings::default(), http_pool.clone()).await);
+        std::sync::Arc::new(build_services(&local_settings(), http_pool.clone()).await);
 
     let http_uuid = seed_file_at_path(&http_pool, "text", &http_file_path).await;
 
     let req = Request::builder()
         .method("PUT")
         .uri(format!("/v1/files/{http_uuid}/content"))
-        .header("authorization", "Bearer parity")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .header("content-type", "application/json")
         .body(Body::from(json!({ "content": "new content" }).to_string()))
         .unwrap();
@@ -8332,7 +8442,7 @@ async fn given_same_content_when_edited_via_http_and_ffi_then_bodies_and_disk_id
 
     // ---- FFI leg ----
     let ffi_dir = tempdir().unwrap();
-    let ffi_db = db_path(&ffi_dir, "ffi.sqlite");
+    let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
     let ffi_pool = migrate_database(&ffi_db).await.expect("ffi migrate");
     let ffi_uuid = seed_file_at_path(&ffi_pool, "text", &ffi_file_path).await;
     ffi_pool.close().await;
@@ -8344,7 +8454,7 @@ async fn given_same_content_when_edited_via_http_and_ffi_then_bodies_and_disk_id
             alexandria_ffi::INDEX_OK
         );
 
-        let token = CString::new("parity").unwrap();
+        let token = CString::new(TEST_TOKEN).unwrap();
         let uuid_c = CString::new(ffi_uuid).unwrap();
         let body = CString::new(json!({ "content": "new content" }).to_string()).unwrap();
         let r = alexandria_file_edit_content(uuid_c.as_ptr(), body.as_ptr(), token.as_ptr());
@@ -8395,15 +8505,16 @@ async fn given_non_text_file_when_edited_via_http_and_ffi_then_both_invalid_inpu
     let http_dir = tempdir().unwrap();
     let http_db = db_path(&http_dir, "http.sqlite");
     let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    seed_session(&http_pool, TEST_TOKEN).await;
     let http_services =
-        std::sync::Arc::new(build_services(&Settings::default(), http_pool.clone()).await);
+        std::sync::Arc::new(build_services(&local_settings(), http_pool.clone()).await);
 
     let http_uuid = seed_file_at_path(&http_pool, "audio", &file_path).await;
 
     let req = Request::builder()
         .method("PUT")
         .uri(format!("/v1/files/{http_uuid}/content"))
-        .header("authorization", "Bearer parity")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .header("content-type", "application/json")
         .body(Body::from(json!({ "content": "new content" }).to_string()))
         .unwrap();
@@ -8415,7 +8526,7 @@ async fn given_non_text_file_when_edited_via_http_and_ffi_then_both_invalid_inpu
 
     // ---- FFI leg ----
     let ffi_dir = tempdir().unwrap();
-    let ffi_db = db_path(&ffi_dir, "ffi.sqlite");
+    let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
     let ffi_pool = migrate_database(&ffi_db).await.expect("ffi migrate");
     let ffi_uuid = seed_file_at_path(&ffi_pool, "audio", &file_path).await;
     ffi_pool.close().await;
@@ -8427,7 +8538,7 @@ async fn given_non_text_file_when_edited_via_http_and_ffi_then_both_invalid_inpu
             alexandria_ffi::INDEX_OK
         );
 
-        let token = CString::new("parity").unwrap();
+        let token = CString::new(TEST_TOKEN).unwrap();
         let uuid_c = CString::new(ffi_uuid).unwrap();
         let body = CString::new(json!({ "content": "new content" }).to_string()).unwrap();
         let r = alexandria_file_edit_content(uuid_c.as_ptr(), body.as_ptr(), token.as_ptr());
@@ -8442,4 +8553,113 @@ async fn given_non_text_file_when_edited_via_http_and_ffi_then_both_invalid_inpu
         alexandria_ffi::FILE_ERR_INVALID_INPUT,
         "ffi must reject a non-text file as invalid input (HTTP 400)"
     );
+}
+
+/// UC-34/UC-35 parity — set local credentials then log in through both
+/// transports and assert identical response shapes (Testing Specification
+/// §7.3). Session ids differ by construction (independent databases), so
+/// parity asserts each is present and well-formed rather than equal.
+#[tokio::test]
+async fn given_same_local_credentials_when_set_and_logged_in_via_http_and_ffi_then_bodies_match() {
+    let _g = SERIAL.lock().unwrap();
+
+    // ---- HTTP leg ----
+    let http_dir = tempdir().unwrap();
+    let http_db = db_path(&http_dir, "http.sqlite");
+    let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    seed_session(&http_pool, TEST_TOKEN).await;
+    let http_services =
+        std::sync::Arc::new(build_services(&local_settings(), http_pool.clone()).await);
+    let router = app(Settings::default(), http_services);
+
+    let set_req = Request::builder()
+        .method("POST")
+        .uri("/v1/auth/local/credentials")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({ "email": "owner@example.com", "password": "hunter2" }).to_string(),
+        ))
+        .unwrap();
+    let set_resp = router.clone().oneshot(set_req).await.expect("http set");
+    assert_eq!(set_resp.status(), axum::http::StatusCode::OK);
+    let http_set_body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(set_resp.into_body(), usize::MAX).await.unwrap()).unwrap();
+
+    let login_req = Request::builder()
+        .method("POST")
+        .uri("/v1/auth/local/login")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({ "email": "owner@example.com", "password": "hunter2" }).to_string(),
+        ))
+        .unwrap();
+    let login_resp = router.oneshot(login_req).await.expect("http login");
+    assert_eq!(login_resp.status(), axum::http::StatusCode::OK);
+    let http_login_body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(login_resp.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
+
+    // ---- FFI leg ----
+    let ffi_dir = tempdir().unwrap();
+    let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
+    let (ffi_set_json, ffi_login_json): (String, String) =
+        tokio::task::spawn_blocking(move || -> (String, String) {
+            let cdb = CString::new(ffi_db).unwrap();
+            assert_eq!(
+                alexandria_index_init(cdb.as_ptr()),
+                alexandria_ffi::INDEX_OK
+            );
+
+            let body = CString::new(
+                json!({ "email": "owner@example.com", "password": "hunter2" }).to_string(),
+            )
+            .unwrap();
+            let empty_token = CString::new("").unwrap();
+            let set_result =
+                alexandria_auth_local_set_credentials(body.as_ptr(), empty_token.as_ptr());
+            assert_eq!(set_result.status, alexandria_ffi::AUTH_OK, "ffi set failed");
+            assert!(!set_result.json.is_null());
+            let set_json = unsafe { CStr::from_ptr(set_result.json) }
+                .to_str()
+                .unwrap()
+                .to_string();
+            unsafe {
+                alexandria_free_string(set_result.json);
+            }
+
+            let login_result = alexandria_auth_local_login(body.as_ptr());
+            assert_eq!(
+                login_result.status,
+                alexandria_ffi::AUTH_OK,
+                "ffi login failed"
+            );
+            assert!(!login_result.json.is_null());
+            let login_json = unsafe { CStr::from_ptr(login_result.json) }
+                .to_str()
+                .unwrap()
+                .to_string();
+            unsafe {
+                alexandria_free_string(login_result.json);
+            }
+
+            (set_json, login_json)
+        })
+        .await
+        .unwrap();
+
+    let ffi_set_body: serde_json::Value = serde_json::from_str(&ffi_set_json).unwrap();
+    let ffi_login_body: serde_json::Value = serde_json::from_str(&ffi_login_json).unwrap();
+
+    // ---- compare ----
+    assert_eq!(http_set_body, ffi_set_body, "set-credentials body parity");
+
+    assert_eq!(http_login_body["success"], ffi_login_body["success"]);
+    assert_eq!(http_login_body["success"], serde_json::json!(true));
+    for body in [&http_login_body, &ffi_login_body] {
+        let session_id = body["sessionId"].as_str().expect("sessionId");
+        assert!(
+            uuid::Uuid::parse_str(session_id).is_ok(),
+            "sessionId is a uuid: {session_id}"
+        );
+    }
 }

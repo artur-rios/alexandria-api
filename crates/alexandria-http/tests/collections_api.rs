@@ -28,7 +28,10 @@ fn create_request(body: Value) -> Request<Body> {
     Request::builder()
         .method("POST")
         .uri("/v1/collections")
-        .header("authorization", "Bearer test-token")
+        .header(
+            "authorization",
+            format!("Bearer {}", common::TEST_TOKEN).as_str(),
+        )
         .header("content-type", "application/json")
         .body(Body::from(body.to_string()))
         .unwrap()
@@ -199,7 +202,10 @@ async fn given_malformed_json_body_when_posted_then_400_with_error_envelope() {
     let request = Request::builder()
         .method("POST")
         .uri("/v1/collections")
-        .header("authorization", "Bearer test-token")
+        .header(
+            "authorization",
+            format!("Bearer {}", common::TEST_TOKEN).as_str(),
+        )
         .header("content-type", "application/json")
         .body(Body::from("{ not json"))
         .unwrap();
@@ -237,7 +243,10 @@ fn rename_request(uuid: &str, body: Value) -> Request<Body> {
     Request::builder()
         .method("PATCH")
         .uri(format!("/v1/collections/{uuid}"))
-        .header("authorization", "Bearer test-token")
+        .header(
+            "authorization",
+            format!("Bearer {}", common::TEST_TOKEN).as_str(),
+        )
         .header("content-type", "application/json")
         .body(Body::from(body.to_string()))
         .unwrap()
@@ -385,7 +394,10 @@ fn delete_request(uuid: &str) -> Request<Body> {
     Request::builder()
         .method("DELETE")
         .uri(format!("/v1/collections/{uuid}"))
-        .header("authorization", "Bearer test-token")
+        .header(
+            "authorization",
+            format!("Bearer {}", common::TEST_TOKEN).as_str(),
+        )
         .body(Body::empty())
         .unwrap()
 }
@@ -511,7 +523,10 @@ fn add_items_request(uuid: &str, body: Value) -> Request<Body> {
     Request::builder()
         .method("POST")
         .uri(format!("/v1/collections/{uuid}/items"))
-        .header("authorization", "Bearer test-token")
+        .header(
+            "authorization",
+            format!("Bearer {}", common::TEST_TOKEN).as_str(),
+        )
         .header("content-type", "application/json")
         .body(Body::from(body.to_string()))
         .unwrap()
@@ -566,7 +581,10 @@ async fn create_bookmark(router: axum::Router, url: &str, title: &str) -> (axum:
             Request::builder()
                 .method("POST")
                 .uri("/v1/bookmarks")
-                .header("authorization", "Bearer test-token")
+                .header(
+                    "authorization",
+                    format!("Bearer {}", common::TEST_TOKEN).as_str(),
+                )
                 .header("content-type", "application/json")
                 .body(Body::from(
                     json!({ "url": url, "title": title }).to_string(),
@@ -757,7 +775,10 @@ fn remove_item_request(collection_uuid: &str, item_uuid: &str) -> Request<Body> 
         .uri(format!(
             "/v1/collections/{collection_uuid}/items/{item_uuid}"
         ))
-        .header("authorization", "Bearer test-token")
+        .header(
+            "authorization",
+            format!("Bearer {}", common::TEST_TOKEN).as_str(),
+        )
         .body(Body::empty())
         .unwrap()
 }
@@ -776,7 +797,10 @@ fn list_items_request(collection_uuid: &str) -> Request<Body> {
     Request::builder()
         .method("GET")
         .uri(format!("/v1/collections/{collection_uuid}/items"))
-        .header("authorization", "Bearer test-token")
+        .header(
+            "authorization",
+            format!("Bearer {}", common::TEST_TOKEN).as_str(),
+        )
         .body(Body::empty())
         .unwrap()
 }
