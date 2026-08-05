@@ -16,9 +16,8 @@ use crate::AppState;
 /// dispatches to the UC-08 hard-purge handler; anything else (absent,
 /// `purge=false`) is the UC-06 soft-delete. `purge-on-disk` (UC-09) is not
 /// modeled here and is left ignored by serde.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Deserialize)]
 pub struct DeleteQuery {
-    #[serde(default)]
     pub purge: Option<bool>,
 }
 
