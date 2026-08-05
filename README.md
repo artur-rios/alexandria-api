@@ -23,7 +23,7 @@ its open/closed state, so the tables stay in sync with the board automatically.
 
 | Milestone | Scope | Progress |
 | --- | --- | :---: |
-| [F-00 Foundation & operations](https://github.com/artur-rios/alexandria-api/milestone/1) | Scaffold, config, migrations, health | 1 / 2 |
+| [F-00 Foundation & operations](https://github.com/artur-rios/alexandria-api/milestone/1) | Scaffold, config, migrations, health | 2 / 2 |
 | [F-01 File indexing](https://github.com/artur-rios/alexandria-api/milestone/2) | UC-01 … UC-02 | 2 / 2 |
 | [F-02 Catalog browsing & metadata editing](https://github.com/artur-rios/alexandria-api/milestone/3) | UC-03 … UC-04 | 2 / 2 |
 | [F-03 Renaming & lifecycle management](https://github.com/artur-rios/alexandria-api/milestone/4) | UC-05 … UC-09 | 5 / 5 |
@@ -33,7 +33,7 @@ its open/closed state, so the tables stay in sync with the board automatically.
 | [F-07 Watchlists](https://github.com/artur-rios/alexandria-api/milestone/8) | UC-20 … UC-25 | 6 / 6 |
 | [F-08 Reading lists](https://github.com/artur-rios/alexandria-api/milestone/9) | UC-26 … UC-31 | 6 / 6 |
 | [F-09 Pluggable authentication](https://github.com/artur-rios/alexandria-api/milestone/10) | UC-34 … UC-36 | 3 / 3 |
-| **Total** | | **37 / 38** |
+| **Total** | | **38 / 38** |
 
 ### F-00 — Foundation & operations
 
@@ -42,7 +42,7 @@ Workspace scaffold, configuration, migrations, logging, and the health surface.
 | Issue | Use case | Status | Title | Requirements |
 | --- | --- | :---: | --- | --- |
 | [#1](https://github.com/artur-rios/alexandria-api/issues/1) | — | &#9745; | Scaffold and initial infrastructure | IR-01 … IR-06 |
-| [#38](https://github.com/artur-rios/alexandria-api/issues/38) | UC-37 | &#9744; | Health check | IR-03, IR-04, IR-05 |
+| [#38](https://github.com/artur-rios/alexandria-api/issues/38) | UC-37 | &#9745; | Health check | IR-03, IR-04, IR-05 |
 
 ### F-01 — File indexing
 
