@@ -29,6 +29,8 @@ use alexandria_core::collections::model::{Collection, NewCollection};
 use alexandria_core::collections::repos::CollectionRepository;
 use alexandria_core::config::AuthMode;
 use alexandria_core::errors::DomainError;
+use alexandria_core::watchlists::model::{NewWatchlist, Watchlist};
+use alexandria_core::watchlists::repos::WatchlistRepository;
 
 /// Fake auth service. `Denying` rejects every caller (AF-02); `Allowing`
 /// authenticates any token as the owner.
@@ -980,5 +982,53 @@ impl BookmarkRepository for FakeBookmarkRepository {
         let mut bookmarks = self.bookmarks.lock().unwrap();
         bookmarks.remove(&uuid).ok_or(DomainError::NotFound)?;
         Ok(())
+    }
+}
+
+/// In-memory watchlists repository (UC-20).
+#[derive(Debug, Default, Clone)]
+pub struct FakeWatchlistRepository {
+    watchlists: Arc<Mutex<HashMap<Uuid, Watchlist>>>,
+    /// When set, every `insert_watchlist` fails, simulating a catalog-write
+    /// failure in UC-20.
+    failing: Arc<Mutex<bool>>,
+}
+
+impl FakeWatchlistRepository {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn count(&self) -> usize {
+        self.watchlists.lock().unwrap().len()
+    }
+
+    pub fn watchlist_for(&self, uuid: Uuid) -> Option<Watchlist> {
+        self.watchlists.lock().unwrap().get(&uuid).cloned()
+    }
+
+    /// Make every `insert_watchlist` return an `Internal` error.
+    pub fn fail_inserts(&self) {
+        *self.failing.lock().unwrap() = true;
+    }
+}
+
+impl WatchlistRepository for FakeWatchlistRepository {
+    async fn insert_watchlist(
+        &self,
+        new_watchlist: NewWatchlist,
+    ) -> Result<Watchlist, DomainError> {
+        if *self.failing.lock().unwrap() {
+            return Err(DomainError::internal("fake insert_watchlist failure"));
+        }
+        let watchlist = Watchlist {
+            uuid: new_watchlist.uuid,
+            name: new_watchlist.name,
+        };
+        self.watchlists
+            .lock()
+            .unwrap()
+            .insert(watchlist.uuid, watchlist.clone());
+        Ok(watchlist)
     }
 }

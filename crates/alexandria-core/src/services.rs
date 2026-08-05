@@ -29,6 +29,8 @@ use crate::collections::commands::rename::RenameCollectionHandler;
 use crate::collections::queries::list_items::ListCollectionItemsHandler;
 use crate::collections::repos::SqliteCollectionRepository;
 use crate::config::Settings;
+use crate::watchlists::commands::create::CreateWatchlistHandler;
+use crate::watchlists::repos::SqliteWatchlistRepository;
 
 /// Concrete index handler wired with the runtime collaborators: the bearer
 /// auth stub, the Sqlite catalog repository, the on-disk filesystem, and the
@@ -105,6 +107,9 @@ pub type DefaultListCollectionItemsHandler = ListCollectionItemsHandler<
     SqliteBookmarkRepository,
 >;
 
+pub type DefaultCreateWatchlistHandler =
+    CreateWatchlistHandler<BearerAuthService, SqliteWatchlistRepository>;
+
 #[derive(Clone)]
 pub struct Services {
     pub index_handler: Arc<DefaultIndexHandler>,
@@ -127,6 +132,7 @@ pub struct Services {
     pub add_items_to_collection_handler: Arc<DefaultAddItemsToCollectionHandler>,
     pub remove_item_from_collection_handler: Arc<DefaultRemoveItemFromCollectionHandler>,
     pub list_collection_items_handler: Arc<DefaultListCollectionItemsHandler>,
+    pub create_watchlist_handler: Arc<DefaultCreateWatchlistHandler>,
     /// The same auth service the handlers hold, exposed so a transport can
     /// reject an unauthenticated caller *before* it parses a request body or
     /// path (FR-AU-07 / SRD §7). Handlers still authenticate independently —
@@ -219,6 +225,10 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         repo.clone(),
         SqliteBookmarkRepository::new(pool.clone()),
     ));
+    let create_watchlist_handler = Arc::new(CreateWatchlistHandler::new(
+        auth,
+        SqliteWatchlistRepository::new(pool.clone()),
+    ));
     Services {
         index_handler,
         refresh_handler,
@@ -240,6 +250,7 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         add_items_to_collection_handler,
         remove_item_from_collection_handler,
         list_collection_items_handler,
+        create_watchlist_handler,
         auth,
         pool,
     }

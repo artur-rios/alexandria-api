@@ -8,3 +8,4 @@ pub mod config;
 pub mod errors;
 pub mod migrate;
 pub mod services;
+pub mod watchlists;
