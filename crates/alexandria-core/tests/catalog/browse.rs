@@ -12,6 +12,7 @@ use alexandria_core::catalog::model::{
     FileState, FileType, FormatKind, MediaKind, StateFilter, SubtypeMetadata,
 };
 use alexandria_core::catalog::queries::browse::{BrowseFilesHandler, FileFilter};
+use alexandria_core::catalog::repos::CatalogRepository;
 use alexandria_core::errors::DomainError;
 
 use crate::common::{deleted_file, existing_file_with_hash, FakeAuth, FakeCatalogRepository};
@@ -149,6 +150,47 @@ async fn given_files_when_list_type_and_state_combined_then_filter_applied() {
     assert_eq!(files.len(), 1);
     assert_eq!(files[0].name, "b");
     assert_eq!(files[0].state, FileState::Deleted);
+}
+
+// UC-14 / FR-FC-12: collection filter (deferred from UC-03 until UC-14).
+
+#[tokio::test]
+async fn given_files_when_list_filtered_by_collection_then_only_linked_files_returned() {
+    let repo = FakeCatalogRepository::new();
+    let a = existing_file_with_hash("/lib/a.mp3", "a", FileType::Audio, "h");
+    let b = existing_file_with_hash("/lib/b.mp3", "b", FileType::Audio, "h");
+    let a_uuid = a.uuid;
+    repo.seed(a);
+    repo.seed(b);
+
+    let collection_uuid = Uuid::new_v4();
+    repo.set_collection(a_uuid, collection_uuid)
+        .await
+        .expect("link a");
+
+    let h = handler(FakeAuth::Allowing, repo);
+    let filter = FileFilter::new().with_collection(collection_uuid);
+    let files = h.list(filter, TOKEN).await.expect("list");
+
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0].uuid, a_uuid);
+}
+
+#[tokio::test]
+async fn given_unknown_collection_uuid_when_list_filtered_then_empty_list_not_error() {
+    let repo = FakeCatalogRepository::new();
+    repo.seed(existing_file_with_hash(
+        "/lib/a.mp3",
+        "a",
+        FileType::Audio,
+        "h",
+    ));
+
+    let h = handler(FakeAuth::Allowing, repo);
+    let filter = FileFilter::new().with_collection(Uuid::new_v4());
+    let files = h.list(filter, TOKEN).await.expect("list");
+
+    assert!(files.is_empty());
 }
 
 #[tokio::test]

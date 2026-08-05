@@ -18,7 +18,8 @@ use alexandria_core::migrate::migrate_database;
 use alexandria_core::services::build_services;
 use alexandria_ffi::{
     alexandria_bookmark_create, alexandria_collection_add_items, alexandria_collection_create,
-    alexandria_collection_delete, alexandria_collection_rename, alexandria_file_edit_metadata,
+    alexandria_collection_delete, alexandria_collection_list_items,
+    alexandria_collection_remove_item, alexandria_collection_rename, alexandria_file_edit_metadata,
     alexandria_file_get_by_uuid, alexandria_file_purge, alexandria_file_purge_on_disk,
     alexandria_file_rename, alexandria_file_restore, alexandria_file_soft_delete,
     alexandria_files_list, alexandria_free_string, alexandria_index_count_files,
@@ -4197,4 +4198,435 @@ async fn given_unknown_item_when_added_via_http_and_ffi_then_both_not_found() {
         alexandria_ffi::COLLECTION_ERR_NOT_FOUND,
         "ffi must reject an unknown item as not-found (HTTP 404)"
     );
+}
+
+/// UC-14 parity — remove the same linked file from the same collection over
+/// both transports and assert the returned bodies agree and each `files` row
+/// is unlinked (Testing Specification §7.3, FR-CO-06, FR-FC-24).
+#[tokio::test]
+async fn given_same_linked_file_when_removed_via_http_and_ffi_then_bodies_and_links_identical() {
+    let _g = SERIAL.lock().unwrap();
+
+    // ---- HTTP leg ----
+    let http_dir = tempdir().unwrap();
+    let http_db = db_path(&http_dir, "http.sqlite");
+    let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    let http_file_uuid = uuid::Uuid::new_v4().to_string();
+    sqlx::query(
+        "INSERT INTO files (uuid, path, name, type, content_hash, indexed_at) \
+         VALUES (?, ?, ?, 'text', 'hash', ?)",
+    )
+    .bind(&http_file_uuid)
+    .bind(format!("/lib/{http_file_uuid}.txt"))
+    .bind("note.txt")
+    .bind(chrono::Utc::now().to_rfc3339())
+    .execute(&http_pool)
+    .await
+    .unwrap();
+    let http_services =
+        std::sync::Arc::new(build_services(&Settings::default(), http_pool.clone()).await);
+    let router = app(Settings::default(), http_services);
+
+    let create_req = Request::builder()
+        .method("POST")
+        .uri("/v1/collections")
+        .header("authorization", "Bearer parity")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({ "name": "My files", "kind": "file" }).to_string(),
+        ))
+        .unwrap();
+    let created: serde_json::Value = serde_json::from_slice(
+        &to_bytes(
+            router
+                .clone()
+                .oneshot(create_req)
+                .await
+                .unwrap()
+                .into_body(),
+            usize::MAX,
+        )
+        .await
+        .unwrap(),
+    )
+    .unwrap();
+    let http_collection_uuid = created["uuid"].as_str().unwrap().to_string();
+
+    let add_req = Request::builder()
+        .method("POST")
+        .uri(format!("/v1/collections/{http_collection_uuid}/items"))
+        .header("authorization", "Bearer parity")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({ "itemUuids": [http_file_uuid] }).to_string(),
+        ))
+        .unwrap();
+    let add_resp = router.clone().oneshot(add_req).await.expect("http add");
+    assert_eq!(add_resp.status(), axum::http::StatusCode::OK);
+
+    let remove_req = Request::builder()
+        .method("DELETE")
+        .uri(format!(
+            "/v1/collections/{http_collection_uuid}/items/{http_file_uuid}"
+        ))
+        .header("authorization", "Bearer parity")
+        .body(Body::empty())
+        .unwrap();
+    let remove_resp = router.oneshot(remove_req).await.expect("http remove");
+    assert_eq!(remove_resp.status(), axum::http::StatusCode::OK);
+    let http_body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(remove_resp.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
+
+    let http_linked: Option<i64> =
+        sqlx::query_scalar("SELECT collection_id FROM files WHERE uuid = ?")
+            .bind(&http_file_uuid)
+            .fetch_one(&http_pool)
+            .await
+            .unwrap();
+
+    // ---- FFI leg ----
+    let ffi_dir = tempdir().unwrap();
+    let ffi_db = db_path(&ffi_dir, "ffi.sqlite");
+    let ffi_pool_pre = migrate_database(&ffi_db).await.expect("ffi pre-migrate");
+    let ffi_file_uuid = uuid::Uuid::new_v4().to_string();
+    sqlx::query(
+        "INSERT INTO files (uuid, path, name, type, content_hash, indexed_at) \
+         VALUES (?, ?, ?, 'text', 'hash', ?)",
+    )
+    .bind(&ffi_file_uuid)
+    .bind(format!("/lib/{ffi_file_uuid}.txt"))
+    .bind("note.txt")
+    .bind(chrono::Utc::now().to_rfc3339())
+    .execute(&ffi_pool_pre)
+    .await
+    .unwrap();
+    ffi_pool_pre.close().await;
+
+    let ffi_db_for_rows = ffi_db.clone();
+    let ffi_file_uuid_for_task = ffi_file_uuid.clone();
+    let ffi_body: serde_json::Value = tokio::task::spawn_blocking(move || -> serde_json::Value {
+        let cdb = CString::new(ffi_db).unwrap();
+        assert_eq!(
+            alexandria_index_init(cdb.as_ptr()),
+            alexandria_ffi::INDEX_OK
+        );
+
+        let create_body =
+            CString::new(json!({ "name": "My files", "kind": "file" }).to_string()).unwrap();
+        let token = CString::new("parity").unwrap();
+        let created = alexandria_collection_create(create_body.as_ptr(), token.as_ptr());
+        let created_json = unsafe { CStr::from_ptr(created.json) }
+            .to_string_lossy()
+            .into_owned();
+        unsafe {
+            alexandria_free_string(created.json);
+        }
+        let created_value: serde_json::Value = serde_json::from_str(&created_json).unwrap();
+        let collection_uuid = created_value["uuid"].as_str().unwrap().to_string();
+
+        let collection_uuid_c = CString::new(collection_uuid.clone()).unwrap();
+        let add_body =
+            CString::new(json!({ "itemUuids": [ffi_file_uuid_for_task.clone()] }).to_string())
+                .unwrap();
+        let added = alexandria_collection_add_items(
+            collection_uuid_c.as_ptr(),
+            add_body.as_ptr(),
+            token.as_ptr(),
+        );
+        assert_eq!(added.status, alexandria_ffi::COLLECTION_OK, "ffi add");
+        unsafe {
+            alexandria_free_string(added.json);
+        }
+
+        let collection_uuid_c2 = CString::new(collection_uuid).unwrap();
+        let item_uuid_c = CString::new(ffi_file_uuid_for_task).unwrap();
+        let r = alexandria_collection_remove_item(
+            collection_uuid_c2.as_ptr(),
+            item_uuid_c.as_ptr(),
+            token.as_ptr(),
+        );
+        assert_eq!(r.status, alexandria_ffi::COLLECTION_OK, "ffi remove");
+        assert!(!r.json.is_null());
+        let s = unsafe { CStr::from_ptr(r.json) }
+            .to_string_lossy()
+            .into_owned();
+        unsafe {
+            alexandria_free_string(r.json);
+        }
+        serde_json::from_str(&s).unwrap()
+    })
+    .await
+    .unwrap();
+
+    let ffi_pool = migrate_database(&ffi_db_for_rows).await.expect("ffi open");
+    let ffi_linked: Option<i64> =
+        sqlx::query_scalar("SELECT collection_id FROM files WHERE uuid = ?")
+            .bind(&ffi_file_uuid)
+            .fetch_one(&ffi_pool)
+            .await
+            .unwrap();
+
+    // ---- compare ----
+    assert_eq!(http_body["itemUuid"], http_file_uuid);
+    assert_eq!(ffi_body["itemUuid"], ffi_file_uuid);
+    assert_eq!(http_linked, None, "http file unlinked");
+    assert_eq!(ffi_linked, None, "ffi file unlinked");
+
+    ffi_pool.close().await;
+}
+
+/// UC-14 parity — an item not currently in the collection is rejected as
+/// not-found on both surfaces (HTTP 404, FFI `COLLECTION_ERR_NOT_FOUND`)
+/// (AF-01, FR-FC-24 / NFR-09).
+#[tokio::test]
+async fn given_unlinked_item_when_removed_via_http_and_ffi_then_both_not_found() {
+    let _g = SERIAL.lock().unwrap();
+
+    // ---- HTTP leg ----
+    let http_dir = tempdir().unwrap();
+    let http_db = db_path(&http_dir, "http.sqlite");
+    let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    let http_services =
+        std::sync::Arc::new(build_services(&Settings::default(), http_pool.clone()).await);
+    let router = app(Settings::default(), http_services);
+
+    let create_req = Request::builder()
+        .method("POST")
+        .uri("/v1/collections")
+        .header("authorization", "Bearer parity")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({ "name": "My files", "kind": "file" }).to_string(),
+        ))
+        .unwrap();
+    let created: serde_json::Value = serde_json::from_slice(
+        &to_bytes(
+            router
+                .clone()
+                .oneshot(create_req)
+                .await
+                .unwrap()
+                .into_body(),
+            usize::MAX,
+        )
+        .await
+        .unwrap(),
+    )
+    .unwrap();
+    let collection_uuid = created["uuid"].as_str().unwrap().to_string();
+    let unlinked_item = uuid::Uuid::new_v4();
+
+    let remove_req = Request::builder()
+        .method("DELETE")
+        .uri(format!(
+            "/v1/collections/{collection_uuid}/items/{unlinked_item}"
+        ))
+        .header("authorization", "Bearer parity")
+        .body(Body::empty())
+        .unwrap();
+    let remove_resp = router.oneshot(remove_req).await.expect("http remove");
+    assert_eq!(remove_resp.status(), axum::http::StatusCode::NOT_FOUND);
+
+    // ---- FFI leg ----
+    let ffi_dir = tempdir().unwrap();
+    let ffi_db = db_path(&ffi_dir, "ffi.sqlite");
+    let ffi_status = tokio::task::spawn_blocking(move || -> i32 {
+        let cdb = CString::new(ffi_db).unwrap();
+        assert_eq!(
+            alexandria_index_init(cdb.as_ptr()),
+            alexandria_ffi::INDEX_OK
+        );
+
+        let create_body =
+            CString::new(json!({ "name": "My files", "kind": "file" }).to_string()).unwrap();
+        let token = CString::new("parity").unwrap();
+        let created = alexandria_collection_create(create_body.as_ptr(), token.as_ptr());
+        let created_json = unsafe { CStr::from_ptr(created.json) }
+            .to_string_lossy()
+            .into_owned();
+        unsafe {
+            alexandria_free_string(created.json);
+        }
+        let created_value: serde_json::Value = serde_json::from_str(&created_json).unwrap();
+        let collection_uuid = created_value["uuid"].as_str().unwrap().to_string();
+
+        let collection_uuid_c = CString::new(collection_uuid).unwrap();
+        let item_uuid_c = CString::new(uuid::Uuid::new_v4().to_string()).unwrap();
+        let r = alexandria_collection_remove_item(
+            collection_uuid_c.as_ptr(),
+            item_uuid_c.as_ptr(),
+            token.as_ptr(),
+        );
+        assert!(r.json.is_null(), "a rejected remove returns no body");
+        r.status
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(
+        ffi_status,
+        alexandria_ffi::COLLECTION_ERR_NOT_FOUND,
+        "ffi must reject an unlinked item as not-found (HTTP 404)"
+    );
+}
+
+/// UC-14 parity — list the members of the same collection over both
+/// transports and assert the returned bodies agree (Testing Specification
+/// §7.3, FR-CO-07, FR-FC-24).
+#[tokio::test]
+async fn given_same_collection_when_items_listed_via_http_and_ffi_then_bodies_identical() {
+    let _g = SERIAL.lock().unwrap();
+
+    // ---- HTTP leg ----
+    let http_dir = tempdir().unwrap();
+    let http_db = db_path(&http_dir, "http.sqlite");
+    let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    let http_file_uuid = uuid::Uuid::new_v4().to_string();
+    sqlx::query(
+        "INSERT INTO files (uuid, path, name, type, content_hash, indexed_at) \
+         VALUES (?, ?, ?, 'text', 'hash', ?)",
+    )
+    .bind(&http_file_uuid)
+    .bind(format!("/lib/{http_file_uuid}.txt"))
+    .bind("note.txt")
+    .bind(chrono::Utc::now().to_rfc3339())
+    .execute(&http_pool)
+    .await
+    .unwrap();
+    let http_services =
+        std::sync::Arc::new(build_services(&Settings::default(), http_pool.clone()).await);
+    let router = app(Settings::default(), http_services);
+
+    let create_req = Request::builder()
+        .method("POST")
+        .uri("/v1/collections")
+        .header("authorization", "Bearer parity")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({ "name": "My files", "kind": "file" }).to_string(),
+        ))
+        .unwrap();
+    let created: serde_json::Value = serde_json::from_slice(
+        &to_bytes(
+            router
+                .clone()
+                .oneshot(create_req)
+                .await
+                .unwrap()
+                .into_body(),
+            usize::MAX,
+        )
+        .await
+        .unwrap(),
+    )
+    .unwrap();
+    let http_collection_uuid = created["uuid"].as_str().unwrap().to_string();
+
+    let add_req = Request::builder()
+        .method("POST")
+        .uri(format!("/v1/collections/{http_collection_uuid}/items"))
+        .header("authorization", "Bearer parity")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({ "itemUuids": [http_file_uuid] }).to_string(),
+        ))
+        .unwrap();
+    assert_eq!(
+        router.clone().oneshot(add_req).await.unwrap().status(),
+        axum::http::StatusCode::OK
+    );
+
+    let list_req = Request::builder()
+        .method("GET")
+        .uri(format!("/v1/collections/{http_collection_uuid}/items"))
+        .header("authorization", "Bearer parity")
+        .body(Body::empty())
+        .unwrap();
+    let list_resp = router.oneshot(list_req).await.expect("http list");
+    assert_eq!(list_resp.status(), axum::http::StatusCode::OK);
+    let http_body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(list_resp.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
+
+    // ---- FFI leg ----
+    let ffi_dir = tempdir().unwrap();
+    let ffi_db = db_path(&ffi_dir, "ffi.sqlite");
+    let ffi_pool_pre = migrate_database(&ffi_db).await.expect("ffi pre-migrate");
+    let ffi_file_uuid = uuid::Uuid::new_v4().to_string();
+    sqlx::query(
+        "INSERT INTO files (uuid, path, name, type, content_hash, indexed_at) \
+         VALUES (?, ?, ?, 'text', 'hash', ?)",
+    )
+    .bind(&ffi_file_uuid)
+    .bind(format!("/lib/{ffi_file_uuid}.txt"))
+    .bind("note.txt")
+    .bind(chrono::Utc::now().to_rfc3339())
+    .execute(&ffi_pool_pre)
+    .await
+    .unwrap();
+    ffi_pool_pre.close().await;
+
+    let ffi_db_for_rows = ffi_db.clone();
+    let ffi_file_uuid_for_task = ffi_file_uuid.clone();
+    let ffi_body: serde_json::Value = tokio::task::spawn_blocking(move || -> serde_json::Value {
+        let cdb = CString::new(ffi_db).unwrap();
+        assert_eq!(
+            alexandria_index_init(cdb.as_ptr()),
+            alexandria_ffi::INDEX_OK
+        );
+
+        let create_body =
+            CString::new(json!({ "name": "My files", "kind": "file" }).to_string()).unwrap();
+        let token = CString::new("parity").unwrap();
+        let created = alexandria_collection_create(create_body.as_ptr(), token.as_ptr());
+        let created_json = unsafe { CStr::from_ptr(created.json) }
+            .to_string_lossy()
+            .into_owned();
+        unsafe {
+            alexandria_free_string(created.json);
+        }
+        let created_value: serde_json::Value = serde_json::from_str(&created_json).unwrap();
+        let collection_uuid = created_value["uuid"].as_str().unwrap().to_string();
+
+        let collection_uuid_c = CString::new(collection_uuid.clone()).unwrap();
+        let add_body =
+            CString::new(json!({ "itemUuids": [ffi_file_uuid_for_task] }).to_string()).unwrap();
+        let added = alexandria_collection_add_items(
+            collection_uuid_c.as_ptr(),
+            add_body.as_ptr(),
+            token.as_ptr(),
+        );
+        assert_eq!(added.status, alexandria_ffi::COLLECTION_OK, "ffi add");
+        unsafe {
+            alexandria_free_string(added.json);
+        }
+
+        let collection_uuid_c2 = CString::new(collection_uuid).unwrap();
+        let r = alexandria_collection_list_items(collection_uuid_c2.as_ptr(), token.as_ptr());
+        assert_eq!(r.status, alexandria_ffi::COLLECTION_OK, "ffi list");
+        assert!(!r.json.is_null());
+        let s = unsafe { CStr::from_ptr(r.json) }
+            .to_string_lossy()
+            .into_owned();
+        unsafe {
+            alexandria_free_string(r.json);
+        }
+        serde_json::from_str(&s).unwrap()
+    })
+    .await
+    .unwrap();
+
+    let ffi_pool = migrate_database(&ffi_db_for_rows).await.expect("ffi open");
+    ffi_pool.close().await;
+
+    // ---- compare ----
+    assert_eq!(http_body["kind"], "file");
+    assert_eq!(ffi_body["kind"], "file");
+    let http_items = http_body["items"].as_array().unwrap();
+    let ffi_items = ffi_body["items"].as_array().unwrap();
+    assert_eq!(http_items.len(), 1, "http lists one member");
+    assert_eq!(ffi_items.len(), 1, "ffi lists one member");
+    assert_eq!(http_items[0]["uuid"], http_file_uuid);
+    assert_eq!(ffi_items[0]["uuid"], ffi_file_uuid);
 }

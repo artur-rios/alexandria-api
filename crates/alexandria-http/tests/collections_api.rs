@@ -748,3 +748,264 @@ async fn given_no_token_when_posted_items_then_401() {
 
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 }
+
+// ==================== UC-14: Remove and list items in a collection ====================
+
+fn remove_item_request(collection_uuid: &str, item_uuid: &str) -> Request<Body> {
+    Request::builder()
+        .method("DELETE")
+        .uri(format!(
+            "/v1/collections/{collection_uuid}/items/{item_uuid}"
+        ))
+        .header("authorization", "Bearer test-token")
+        .body(Body::empty())
+        .unwrap()
+}
+
+fn unauthenticated_remove_item_request(collection_uuid: &str, item_uuid: &str) -> Request<Body> {
+    Request::builder()
+        .method("DELETE")
+        .uri(format!(
+            "/v1/collections/{collection_uuid}/items/{item_uuid}"
+        ))
+        .body(Body::empty())
+        .unwrap()
+}
+
+fn list_items_request(collection_uuid: &str) -> Request<Body> {
+    Request::builder()
+        .method("GET")
+        .uri(format!("/v1/collections/{collection_uuid}/items"))
+        .header("authorization", "Bearer test-token")
+        .body(Body::empty())
+        .unwrap()
+}
+
+async fn add_items(router: axum::Router, collection_uuid: &str, item_uuid: &str) -> axum::Router {
+    let response = router
+        .clone()
+        .oneshot(add_items_request(
+            collection_uuid,
+            json!({ "itemUuids": [item_uuid] }),
+        ))
+        .await
+        .expect("add items");
+    assert_eq!(response.status(), StatusCode::OK);
+    router
+}
+
+// ---------------- Main flow: remove ----------------
+
+#[tokio::test]
+async fn given_linked_file_when_removed_then_200_and_unlinked() {
+    let test = test_app().await;
+    let router = app(Settings::default(), test.services.clone());
+    let (router, collection_uuid) = create_collection(router, "My files").await;
+    let file_uuid = seed_standalone_file(&test.pool).await;
+    let router = add_items(router, &collection_uuid, &file_uuid).await;
+
+    let response = router
+        .oneshot(remove_item_request(&collection_uuid, &file_uuid))
+        .await
+        .expect("remove item");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_json(response).await;
+    assert_eq!(body["collectionUuid"], collection_uuid);
+    assert_eq!(body["itemUuid"], file_uuid);
+
+    let linked: Option<i64> = sqlx::query_scalar("SELECT collection_id FROM files WHERE uuid = ?")
+        .bind(&file_uuid)
+        .fetch_one(&test.pool)
+        .await
+        .unwrap();
+    assert_eq!(linked, None);
+}
+
+#[tokio::test]
+async fn given_linked_bookmark_when_removed_then_200_and_unlinked() {
+    let test = test_app().await;
+    let router = app(Settings::default(), test.services.clone());
+    let (router, collection_uuid) = create_bookmark_collection(router, "Reading list").await;
+    let (router, bookmark_uuid) = create_bookmark(router, "https://example.com", "Example").await;
+    let router = add_items(router, &collection_uuid, &bookmark_uuid).await;
+
+    let response = router
+        .oneshot(remove_item_request(&collection_uuid, &bookmark_uuid))
+        .await
+        .expect("remove item");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let linked: Option<i64> =
+        sqlx::query_scalar("SELECT collection_id FROM bookmarks WHERE uuid = ?")
+            .bind(&bookmark_uuid)
+            .fetch_one(&test.pool)
+            .await
+            .unwrap();
+    assert_eq!(linked, None);
+}
+
+// ---------------- AF-01: item unknown or not in the collection ----------------
+
+#[tokio::test]
+async fn given_unknown_item_when_removed_then_404() {
+    let test = test_app().await;
+    let router = app(Settings::default(), test.services);
+    let (router, collection_uuid) = create_collection(router, "My files").await;
+
+    let response = router
+        .oneshot(remove_item_request(
+            &collection_uuid,
+            &uuid::Uuid::new_v4().to_string(),
+        ))
+        .await
+        .expect("remove item");
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn given_item_not_linked_when_removed_then_404() {
+    let test = test_app().await;
+    let router = app(Settings::default(), test.services.clone());
+    let (router, collection_uuid) = create_collection(router, "My files").await;
+    let file_uuid = seed_standalone_file(&test.pool).await;
+
+    let response = router
+        .oneshot(remove_item_request(&collection_uuid, &file_uuid))
+        .await
+        .expect("remove item");
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+// ---------------- AF-02: collection does not exist ----------------
+
+#[tokio::test]
+async fn given_unknown_collection_when_removed_then_404() {
+    let test = test_app().await;
+    let router = app(Settings::default(), test.services);
+
+    let response = router
+        .oneshot(remove_item_request(
+            &uuid::Uuid::new_v4().to_string(),
+            &uuid::Uuid::new_v4().to_string(),
+        ))
+        .await
+        .expect("remove item");
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+// ---------------- AF-03: unauthorized ----------------
+
+#[tokio::test]
+async fn given_no_token_when_removed_then_401() {
+    let test = test_app().await;
+    let router = app(Settings::default(), test.services);
+    let (router, collection_uuid) = create_collection(router, "My files").await;
+
+    let response = router
+        .oneshot(unauthenticated_remove_item_request(
+            &collection_uuid,
+            &uuid::Uuid::new_v4().to_string(),
+        ))
+        .await
+        .expect("remove item");
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+// ---------------- Main flow: list ----------------
+
+#[tokio::test]
+async fn given_file_collection_with_member_when_listed_then_200_with_files() {
+    let test = test_app().await;
+    let router = app(Settings::default(), test.services.clone());
+    let (router, collection_uuid) = create_collection(router, "My files").await;
+    let file_uuid = seed_standalone_file(&test.pool).await;
+    let router = add_items(router, &collection_uuid, &file_uuid).await;
+
+    let response = router
+        .oneshot(list_items_request(&collection_uuid))
+        .await
+        .expect("list items");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_json(response).await;
+    assert_eq!(body["collectionUuid"], collection_uuid);
+    assert_eq!(body["kind"], "file");
+    let items = body["items"].as_array().expect("array");
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["uuid"], file_uuid);
+}
+
+#[tokio::test]
+async fn given_bookmark_collection_with_member_when_listed_then_200_with_bookmarks() {
+    let test = test_app().await;
+    let router = app(Settings::default(), test.services.clone());
+    let (router, collection_uuid) = create_bookmark_collection(router, "Reading list").await;
+    let (router, bookmark_uuid) = create_bookmark(router, "https://example.com", "Example").await;
+    let router = add_items(router, &collection_uuid, &bookmark_uuid).await;
+
+    let response = router
+        .oneshot(list_items_request(&collection_uuid))
+        .await
+        .expect("list items");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_json(response).await;
+    assert_eq!(body["kind"], "bookmark");
+    let items = body["items"].as_array().expect("array");
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["uuid"], bookmark_uuid);
+}
+
+#[tokio::test]
+async fn given_empty_collection_when_listed_then_200_with_empty_array() {
+    let test = test_app().await;
+    let router = app(Settings::default(), test.services);
+    let (router, collection_uuid) = create_collection(router, "My files").await;
+
+    let response = router
+        .oneshot(list_items_request(&collection_uuid))
+        .await
+        .expect("list items");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_json(response).await;
+    assert_eq!(body["items"].as_array().unwrap().len(), 0);
+}
+
+// ---------------- AF-01 (list): collection does not exist ----------------
+
+#[tokio::test]
+async fn given_unknown_collection_when_listed_then_404() {
+    let test = test_app().await;
+    let router = app(Settings::default(), test.services);
+
+    let response = router
+        .oneshot(list_items_request(&uuid::Uuid::new_v4().to_string()))
+        .await
+        .expect("list items");
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+// ---------------- AF-02 (list): unauthorized ----------------
+
+#[tokio::test]
+async fn given_no_token_when_listed_then_401() {
+    let test = test_app().await;
+    let router = app(Settings::default(), test.services);
+    let (router, collection_uuid) = create_collection(router, "My files").await;
+
+    let request = Request::builder()
+        .method("GET")
+        .uri(format!("/v1/collections/{collection_uuid}/items"))
+        .body(Body::empty())
+        .unwrap();
+    let response = router.oneshot(request).await.expect("list items");
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}

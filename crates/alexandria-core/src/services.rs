@@ -20,7 +20,9 @@ use crate::catalog::repos::SqliteCatalogRepository;
 use crate::collections::commands::add_items::AddItemsToCollectionHandler;
 use crate::collections::commands::create::CreateCollectionHandler;
 use crate::collections::commands::delete::DeleteCollectionHandler;
+use crate::collections::commands::remove_item::RemoveItemFromCollectionHandler;
 use crate::collections::commands::rename::RenameCollectionHandler;
+use crate::collections::queries::list_items::ListCollectionItemsHandler;
 use crate::collections::repos::SqliteCollectionRepository;
 use crate::config::Settings;
 
@@ -73,6 +75,20 @@ pub type DefaultAddItemsToCollectionHandler = AddItemsToCollectionHandler<
     SqliteBookmarkRepository,
 >;
 
+pub type DefaultRemoveItemFromCollectionHandler = RemoveItemFromCollectionHandler<
+    BearerAuthService,
+    SqliteCollectionRepository,
+    SqliteCatalogRepository,
+    SqliteBookmarkRepository,
+>;
+
+pub type DefaultListCollectionItemsHandler = ListCollectionItemsHandler<
+    BearerAuthService,
+    SqliteCollectionRepository,
+    SqliteCatalogRepository,
+    SqliteBookmarkRepository,
+>;
+
 #[derive(Clone)]
 pub struct Services {
     pub index_handler: Arc<DefaultIndexHandler>,
@@ -89,6 +105,8 @@ pub struct Services {
     pub delete_collection_handler: Arc<DefaultDeleteCollectionHandler>,
     pub create_bookmark_handler: Arc<DefaultCreateBookmarkHandler>,
     pub add_items_to_collection_handler: Arc<DefaultAddItemsToCollectionHandler>,
+    pub remove_item_from_collection_handler: Arc<DefaultRemoveItemFromCollectionHandler>,
+    pub list_collection_items_handler: Arc<DefaultListCollectionItemsHandler>,
     /// The same auth service the handlers hold, exposed so a transport can
     /// reject an unauthenticated caller *before* it parses a request body or
     /// path (FR-AU-07 / SRD §7). Handlers still authenticate independently —
@@ -148,6 +166,18 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         repo.clone(),
         SqliteBookmarkRepository::new(pool.clone()),
     ));
+    let remove_item_from_collection_handler = Arc::new(RemoveItemFromCollectionHandler::new(
+        auth,
+        SqliteCollectionRepository::new(pool.clone()),
+        repo.clone(),
+        SqliteBookmarkRepository::new(pool.clone()),
+    ));
+    let list_collection_items_handler = Arc::new(ListCollectionItemsHandler::new(
+        auth,
+        SqliteCollectionRepository::new(pool.clone()),
+        repo.clone(),
+        SqliteBookmarkRepository::new(pool.clone()),
+    ));
     Services {
         index_handler,
         refresh_handler,
@@ -163,6 +193,8 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         delete_collection_handler,
         create_bookmark_handler,
         add_items_to_collection_handler,
+        remove_item_from_collection_handler,
+        list_collection_items_handler,
         auth,
         pool,
     }

@@ -536,6 +536,100 @@ async fn given_indexed_files_when_get_files_with_type_filter_then_only_matching_
 }
 
 #[tokio::test]
+async fn given_indexed_files_when_get_files_with_collection_filter_then_only_linked_returned() {
+    let lib = tempdir().unwrap();
+    let test = test_app().await;
+    index_library(&lib, &test.pool, &[("a.mp3", b"x"), ("b.mp4", b"y")]).await;
+    let router = app(Settings::default(), test.services.clone());
+
+    let create_resp = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/collections")
+                .header("authorization", "Bearer test-token")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({ "name": "My files", "kind": "file" }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .expect("create collection");
+    let collection_uuid = {
+        let body: Value =
+            serde_json::from_slice(&to_bytes(create_resp.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        body["uuid"].as_str().unwrap().to_string()
+    };
+
+    let (a_uuid,): (String,) = sqlx::query_as("SELECT uuid FROM files WHERE name = 'a.mp3'")
+        .fetch_one(&test.pool)
+        .await
+        .unwrap();
+
+    let add_resp = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/v1/collections/{collection_uuid}/items"))
+                .header("authorization", "Bearer test-token")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({ "itemUuids": [a_uuid.clone()] }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .expect("add items");
+    assert_eq!(add_resp.status(), StatusCode::OK);
+
+    let response = router
+        .oneshot(get_files(&format!(
+            "/v1/files?collectionUuid={collection_uuid}"
+        )))
+        .await
+        .expect("list one-shot");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let arr = body.as_array().expect("array");
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["uuid"], a_uuid);
+}
+
+#[tokio::test]
+async fn given_unknown_collection_uuid_when_get_files_filtered_then_empty_array_not_error() {
+    let lib = tempdir().unwrap();
+    let test = test_app().await;
+    index_library(&lib, &test.pool, &[("a.mp3", b"x")]).await;
+
+    let response = app(Settings::default(), test.services)
+        .oneshot(get_files(&format!(
+            "/v1/files?collectionUuid={}",
+            uuid::Uuid::new_v4()
+        )))
+        .await
+        .expect("list one-shot");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert!(body.as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn given_malformed_collection_uuid_when_get_files_filtered_then_400() {
+    let test = test_app().await;
+    let response = app(Settings::default(), test.services)
+        .oneshot(get_files("/v1/files?collectionUuid=not-a-uuid"))
+        .await
+        .expect("list one-shot");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
 async fn given_unknown_type_when_get_files_then_400() {
     let test = test_app().await;
     let response = app(Settings::default(), test.services)

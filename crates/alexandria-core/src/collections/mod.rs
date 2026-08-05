@@ -6,4 +6,5 @@
 //! call the same decision logic (FR-FC-24 / NFR-09).
 pub mod commands;
 pub mod model;
+pub mod queries;
 pub mod repos;

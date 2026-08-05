@@ -5,7 +5,10 @@ use axum::Json;
 use serde::Deserialize;
 use uuid::Uuid;
 
-use alexandria_core::collections::model::{Collection, CollectionItemsResult, CollectionKind};
+use alexandria_core::collections::model::{
+    Collection, CollectionItemResult, CollectionItemsResult, CollectionKind,
+    CollectionMembersResult,
+};
 use alexandria_core::errors::DomainError;
 
 use crate::middleware::auth::invalid_input;
@@ -169,6 +172,61 @@ pub async fn add_items(
         .services
         .add_items_to_collection_handler
         .add(uuid, request.item_uuids, &token)
+        .await
+        .map_err(ApiError)?;
+
+    Ok((StatusCode::OK, Json(result)))
+}
+
+/// `DELETE /v1/collections/{uuid}/items/{itemUuid}` — remove an item from a
+/// collection (UC-14 / FR-CO-06). Unlinks the item without deleting it.
+/// Returns `200` with the `collectionUuid`/`itemUuid` as confirmation, or
+/// `404` (the collection does not exist, or the item does not exist or is
+/// not currently in the collection), or `401` (unauthenticated). Both the
+/// HTTP and FFI surfaces call the same core handler so the two stay at
+/// parity (FR-FC-24 / NFR-09).
+///
+/// The path is taken as a `Result` so its rejection becomes this surface's
+/// `400` + `{"error": …}` envelope rather than axum's bare-text `400`.
+pub async fn remove_item(
+    State(state): State<AppState>,
+    uuids: Result<Path<(Uuid, Uuid)>, PathRejection>,
+    headers: HeaderMap,
+) -> Result<(StatusCode, Json<CollectionItemResult>), ApiError> {
+    let token = bearer_token(&headers);
+
+    let Path((collection_uuid, item_uuid)) =
+        uuids.map_err(|_| invalid_input("path segment is not a valid UUID"))?;
+
+    let result = state
+        .services
+        .remove_item_from_collection_handler
+        .remove(collection_uuid, item_uuid, &token)
+        .await
+        .map_err(ApiError)?;
+
+    Ok((StatusCode::OK, Json(result)))
+}
+
+/// `GET /v1/collections/{uuid}/items` — list the items in a collection
+/// (UC-14 / FR-CO-07). Returns `200` with the collection's `kind` and its
+/// current members (files or bookmarks, depending on `kind`), or `404` (the
+/// collection does not exist), or `401` (unauthenticated). Both the HTTP and
+/// FFI surfaces call the same core handler so the two stay at parity
+/// (FR-FC-24 / NFR-09).
+pub async fn list_items(
+    State(state): State<AppState>,
+    uuid: Result<Path<Uuid>, PathRejection>,
+    headers: HeaderMap,
+) -> Result<(StatusCode, Json<CollectionMembersResult>), ApiError> {
+    let token = bearer_token(&headers);
+
+    let Path(uuid) = uuid.map_err(|_| invalid_input("path segment is not a valid UUID"))?;
+
+    let result = state
+        .services
+        .list_collection_items_handler
+        .list(uuid, &token)
         .await
         .map_err(ApiError)?;
 
