@@ -62,6 +62,19 @@ The work is reviewed before it advances. Therefore:
   Review, merge, and branch deletion are human actions. An agent may *prepare and
   push* the pull request.
 
+### 4.1 Batch development carve-out
+
+The pause gates above are the default for implementing **one use case at a time**.
+When a human has explicitly authorized an **unattended batch run** covering several
+use cases in one sitting, the agent running that batch may merge its own pull
+requests, close their issues, and delete their branches **without per-use-case
+approval**, provided every other requirement in this document still holds for each
+use case: its own branch, its own issue, its own pull request, the full test suite
+green, and the Definition of Done (§6) met before merging. CI (when configured)
+must be green before a batch merge. This carve-out applies only to a run the human
+explicitly authorized as a batch; it does not relax the pause gates for ordinary,
+single-use-case work.
+
 ## 5. Step-by-step
 
 ### Step 1 — Branch from the main branch
@@ -151,7 +164,8 @@ A use case is done only when **all** of the following hold:
 - [ ] Main flow and every alternative flow from the specification are implemented.
 - [ ] Tests cover it per the Testing Specification (main flow + each `AF-xx` + a parity assertion).
 - [ ] The full test suite passes (`cargo test`).
-- [ ] A pull request was reviewed by a human and merged.
+- [ ] A pull request was merged into `main` — reviewed by a human, unless merged
+      under the batch carve-out (§4.1).
 - [ ] The branch was deleted.
 - [ ] The issue is in **Done** and closed.
 

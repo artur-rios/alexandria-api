@@ -1,6 +1,8 @@
 use sqlx::sqlite::SqlitePool;
+use sqlx::Row;
+use uuid::Uuid;
 
-use crate::collections::model::{Collection, NewCollection};
+use crate::collections::model::{Collection, CollectionKind, NewCollection};
 use crate::errors::DomainError;
 
 /// Collections repository port. The create handler depends on this trait so
@@ -8,8 +10,7 @@ use crate::errors::DomainError;
 /// in-memory fake with no database (Testing Specification §6.2). The Sqlite
 /// implementation persists `collections` rows.
 ///
-/// Only the write UC-10 needs lives here; renaming (UC-11), deletion (UC-12),
-/// and item management (UC-13/14) add their own methods when they ship.
+/// Item management (UC-13/14) adds its own methods when it ships.
 #[allow(async_fn_in_trait)]
 pub trait CollectionRepository: Send + Sync {
     /// Persist a new collection and return the stored record (UC-10 /
@@ -20,6 +21,15 @@ pub trait CollectionRepository: Send + Sync {
         &self,
         new_collection: NewCollection,
     ) -> Result<Collection, DomainError>;
+
+    /// Look a collection up by its public uuid (UC-11 AF-02, UC-12 AF-01).
+    /// `None` when no such collection exists.
+    async fn find_by_uuid(&self, uuid: Uuid) -> Result<Option<Collection>, DomainError>;
+
+    /// Rename a collection and return the updated record (UC-11 / FR-CO-03).
+    /// The caller has already confirmed the collection exists and validated
+    /// the new name.
+    async fn rename_collection(&self, uuid: Uuid, name: String) -> Result<Collection, DomainError>;
 }
 
 #[derive(Clone)]
@@ -50,5 +60,40 @@ impl CollectionRepository for SqliteCollectionRepository {
             name: new_collection.name,
             kind: new_collection.kind,
         })
+    }
+
+    async fn find_by_uuid(&self, uuid: Uuid) -> Result<Option<Collection>, DomainError> {
+        let row = sqlx::query("SELECT uuid, name, kind FROM collections WHERE uuid = ?")
+            .bind(uuid.to_string())
+            .fetch_optional(&self.pool)
+            .await?;
+
+        Ok(match row {
+            Some(row) => {
+                let uuid: String = row.try_get("uuid")?;
+                let name: String = row.try_get("name")?;
+                let kind: String = row.try_get("kind")?;
+                Some(Collection {
+                    uuid: Uuid::parse_str(&uuid).map_err(|err| {
+                        DomainError::internal(format!("corrupt collection uuid: {err}"))
+                    })?,
+                    name,
+                    kind: CollectionKind::parse(&kind).ok_or_else(|| {
+                        DomainError::internal(format!("corrupt collection kind: {kind}"))
+                    })?,
+                })
+            }
+            None => None,
+        })
+    }
+
+    async fn rename_collection(&self, uuid: Uuid, name: String) -> Result<Collection, DomainError> {
+        sqlx::query("UPDATE collections SET name = ? WHERE uuid = ?")
+            .bind(&name)
+            .bind(uuid.to_string())
+            .execute(&self.pool)
+            .await?;
+
+        self.find_by_uuid(uuid).await?.ok_or(DomainError::NotFound)
     }
 }

@@ -1,8 +1,9 @@
-use axum::extract::rejection::JsonRejection;
-use axum::extract::State;
+use axum::extract::rejection::{JsonRejection, PathRejection};
+use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
 use serde::Deserialize;
+use uuid::Uuid;
 
 use alexandria_core::collections::model::{Collection, CollectionKind};
 
@@ -53,4 +54,45 @@ pub async fn create(
         .map_err(ApiError)?;
 
     Ok((StatusCode::CREATED, Json(result)))
+}
+
+/// Request body for `PATCH /v1/collections/{uuid}` (UC-11 / FR-CO-03): the
+/// collection's new `name`. Required — an absent or empty field is rejected
+/// as invalid input, matching the FFI surface's handling of the same payload
+/// (FR-FC-24 / NFR-09).
+#[derive(Debug, Deserialize)]
+pub struct RenameCollectionRequest {
+    pub name: String,
+}
+
+/// `PATCH /v1/collections/{uuid}` — rename a collection (UC-11 / FR-CO-03).
+/// The body carries the new `name`; the handler validates it and updates the
+/// record. Returns `200` with the updated `Collection`, or `400` (invalid
+/// name), `404` (uuid), or `401` (unauthenticated). Both the HTTP and FFI
+/// surfaces call the same core handler so the two stay at parity
+/// (FR-FC-24 / NFR-09).
+///
+/// The path and body are taken as `Result` so their rejections become this
+/// surface's `400` + `{"error": …}` envelope rather than axum's bare-text
+/// `422`/`400`.
+pub async fn rename(
+    State(state): State<AppState>,
+    uuid: Result<Path<Uuid>, PathRejection>,
+    headers: HeaderMap,
+    body: Result<Json<RenameCollectionRequest>, JsonRejection>,
+) -> Result<(StatusCode, Json<Collection>), ApiError> {
+    let token = bearer_token(&headers);
+
+    let Path(uuid) = uuid.map_err(|_| invalid_input("path segment is not a valid UUID"))?;
+    let Json(request) =
+        body.map_err(|err| invalid_input(format!("invalid rename collection body: {err}")))?;
+
+    let result = state
+        .services
+        .rename_collection_handler
+        .rename(uuid, &request.name, &token)
+        .await
+        .map_err(ApiError)?;
+
+    Ok((StatusCode::OK, Json(result)))
 }

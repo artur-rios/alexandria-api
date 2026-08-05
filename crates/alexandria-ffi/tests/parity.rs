@@ -17,12 +17,12 @@ use alexandria_core::config::Settings;
 use alexandria_core::migrate::migrate_database;
 use alexandria_core::services::build_services;
 use alexandria_ffi::{
-    alexandria_collection_create, alexandria_file_edit_metadata, alexandria_file_get_by_uuid,
-    alexandria_file_purge, alexandria_file_purge_on_disk, alexandria_file_rename,
-    alexandria_file_restore, alexandria_file_soft_delete, alexandria_files_list,
-    alexandria_free_string, alexandria_index_count_files, alexandria_index_count_missing,
-    alexandria_index_files_json, alexandria_index_init, alexandria_index_refresh_start,
-    alexandria_index_start, IndexStartResult,
+    alexandria_collection_create, alexandria_collection_rename, alexandria_file_edit_metadata,
+    alexandria_file_get_by_uuid, alexandria_file_purge, alexandria_file_purge_on_disk,
+    alexandria_file_rename, alexandria_file_restore, alexandria_file_soft_delete,
+    alexandria_files_list, alexandria_free_string, alexandria_index_count_files,
+    alexandria_index_count_missing, alexandria_index_files_json, alexandria_index_init,
+    alexandria_index_refresh_start, alexandria_index_start, IndexStartResult,
 };
 use alexandria_http::app;
 use axum::body::{to_bytes, Body};
@@ -3427,5 +3427,184 @@ async fn given_no_token_when_collection_created_via_http_and_ffi_then_both_unaut
         clean_status,
         alexandria_ffi::COLLECTION_ERR_UNAUTHORIZED,
         "a well-formed body with no token also denies"
+    );
+}
+
+/// UC-11 parity — rename the same collection over both transports and assert
+/// the returned bodies agree and each catalog holds the same renamed row
+/// (Testing Specification §7.3, FR-CO-03, FR-FC-24).
+#[tokio::test]
+async fn given_same_collection_when_renamed_via_http_and_ffi_then_bodies_and_rows_identical() {
+    let _g = SERIAL.lock().unwrap();
+
+    // ---- HTTP leg ----
+    let http_dir = tempdir().unwrap();
+    let http_db = db_path(&http_dir, "http.sqlite");
+    let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    let http_services =
+        std::sync::Arc::new(build_services(&Settings::default(), http_pool.clone()).await);
+    let router = app(Settings::default(), http_services);
+
+    let create_req = Request::builder()
+        .method("POST")
+        .uri("/v1/collections")
+        .header("authorization", "Bearer parity")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({ "name": "Sci-fi novels", "kind": "file" }).to_string(),
+        ))
+        .unwrap();
+    let create_resp = router
+        .clone()
+        .oneshot(create_req)
+        .await
+        .expect("http create");
+    assert_eq!(create_resp.status(), axum::http::StatusCode::CREATED);
+    let created: serde_json::Value =
+        serde_json::from_slice(&to_bytes(create_resp.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
+    let http_uuid = created["uuid"].as_str().unwrap().to_string();
+
+    let rename_req = Request::builder()
+        .method("PATCH")
+        .uri(format!("/v1/collections/{http_uuid}"))
+        .header("authorization", "Bearer parity")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({ "name": "Sci-fi & fantasy" }).to_string(),
+        ))
+        .unwrap();
+    let rename_resp = router.oneshot(rename_req).await.expect("http rename");
+    assert_eq!(rename_resp.status(), axum::http::StatusCode::OK);
+    let http_body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(rename_resp.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
+
+    let http_rows: Vec<(String, String, String)> =
+        sqlx::query_as("SELECT uuid, name, kind FROM collections ORDER BY name")
+            .fetch_all(&http_pool)
+            .await
+            .unwrap();
+
+    // ---- FFI leg ----
+    let ffi_dir = tempdir().unwrap();
+    let ffi_db = db_path(&ffi_dir, "ffi.sqlite");
+    let ffi_db_for_rows = ffi_db.clone();
+    let ffi_body: serde_json::Value = tokio::task::spawn_blocking(move || -> serde_json::Value {
+        let cdb = CString::new(ffi_db).unwrap();
+        assert_eq!(
+            alexandria_index_init(cdb.as_ptr()),
+            alexandria_ffi::INDEX_OK
+        );
+
+        let create_body =
+            CString::new(json!({ "name": "Sci-fi novels", "kind": "file" }).to_string()).unwrap();
+        let token = CString::new("parity").unwrap();
+        let created = alexandria_collection_create(create_body.as_ptr(), token.as_ptr());
+        assert_eq!(created.status, alexandria_ffi::COLLECTION_OK, "ffi create");
+        // SAFETY: pointer came from this library and is freed once below.
+        let created_json = unsafe { CStr::from_ptr(created.json) }
+            .to_string_lossy()
+            .into_owned();
+        unsafe {
+            alexandria_free_string(created.json);
+        }
+        let created_value: serde_json::Value = serde_json::from_str(&created_json).unwrap();
+        let uuid = created_value["uuid"].as_str().unwrap().to_string();
+
+        let uuid_c = CString::new(uuid).unwrap();
+        let rename_body = CString::new(json!({ "name": "Sci-fi & fantasy" }).to_string()).unwrap();
+        let r = alexandria_collection_rename(uuid_c.as_ptr(), rename_body.as_ptr(), token.as_ptr());
+        assert_eq!(r.status, alexandria_ffi::COLLECTION_OK, "ffi rename");
+        assert!(!r.json.is_null());
+        let s = unsafe { CStr::from_ptr(r.json) }
+            .to_string_lossy()
+            .into_owned();
+        unsafe {
+            alexandria_free_string(r.json);
+        }
+        serde_json::from_str(&s).unwrap()
+    })
+    .await
+    .unwrap();
+
+    let ffi_pool = migrate_database(&ffi_db_for_rows).await.expect("ffi open");
+    let ffi_rows: Vec<(String, String, String)> =
+        sqlx::query_as("SELECT uuid, name, kind FROM collections ORDER BY name")
+            .fetch_all(&ffi_pool)
+            .await
+            .unwrap();
+
+    // ---- compare ----
+    for (label, body) in [("http", &http_body), ("ffi", &ffi_body)] {
+        let uuid = body["uuid"].as_str().unwrap_or_default();
+        assert!(
+            uuid::Uuid::parse_str(uuid).is_ok(),
+            "{label} body carries a valid uuid"
+        );
+        assert_eq!(
+            body["name"], "Sci-fi & fantasy",
+            "{label} body has new name"
+        );
+    }
+
+    assert_eq!(http_rows.len(), 1, "http persisted one collection");
+    assert_eq!(ffi_rows.len(), 1, "ffi persisted one collection");
+    assert_eq!(http_rows[0].1, "Sci-fi & fantasy");
+    assert_eq!(ffi_rows[0].1, "Sci-fi & fantasy");
+
+    ffi_pool.close().await;
+}
+
+/// UC-11 parity — an unknown uuid is rejected as not-found on both surfaces
+/// (HTTP 404, FFI `COLLECTION_ERR_NOT_FOUND`) (AF-02, FR-FC-24 / NFR-09).
+#[tokio::test]
+async fn given_unknown_uuid_when_renamed_via_http_and_ffi_then_both_not_found() {
+    let _g = SERIAL.lock().unwrap();
+
+    // ---- HTTP leg ----
+    let http_dir = tempdir().unwrap();
+    let http_db = db_path(&http_dir, "http.sqlite");
+    let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    let http_services =
+        std::sync::Arc::new(build_services(&Settings::default(), http_pool.clone()).await);
+    let unknown = uuid::Uuid::new_v4();
+    let req = Request::builder()
+        .method("PATCH")
+        .uri(format!("/v1/collections/{unknown}"))
+        .header("authorization", "Bearer parity")
+        .header("content-type", "application/json")
+        .body(Body::from(json!({ "name": "New name" }).to_string()))
+        .unwrap();
+    let resp = app(Settings::default(), http_services)
+        .oneshot(req)
+        .await
+        .expect("http rename");
+    assert_eq!(resp.status(), axum::http::StatusCode::NOT_FOUND);
+
+    // ---- FFI leg ----
+    let ffi_dir = tempdir().unwrap();
+    let ffi_db = db_path(&ffi_dir, "ffi.sqlite");
+    let ffi_status = tokio::task::spawn_blocking(move || -> i32 {
+        let cdb = CString::new(ffi_db).unwrap();
+        assert_eq!(
+            alexandria_index_init(cdb.as_ptr()),
+            alexandria_ffi::INDEX_OK
+        );
+
+        let uuid_c = CString::new(unknown.to_string()).unwrap();
+        let body = CString::new(json!({ "name": "New name" }).to_string()).unwrap();
+        let token = CString::new("parity").unwrap();
+        let r = alexandria_collection_rename(uuid_c.as_ptr(), body.as_ptr(), token.as_ptr());
+        assert!(r.json.is_null(), "a rejected rename returns no body");
+        r.status
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(
+        ffi_status,
+        alexandria_ffi::COLLECTION_ERR_NOT_FOUND,
+        "ffi must reject an unknown uuid as not-found (HTTP 404)"
     );
 }
