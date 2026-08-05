@@ -22,16 +22,16 @@ use alexandria_ffi::{
     alexandria_collection_add_items, alexandria_collection_create, alexandria_collection_delete,
     alexandria_collection_list_items, alexandria_collection_remove_item,
     alexandria_collection_rename, alexandria_file_edit_metadata, alexandria_file_get_by_uuid,
-    alexandria_file_purge, alexandria_file_purge_on_disk, alexandria_file_rename,
-    alexandria_file_restore, alexandria_file_soft_delete, alexandria_files_list,
-    alexandria_free_string, alexandria_index_count_files, alexandria_index_count_missing,
-    alexandria_index_files_json, alexandria_index_init, alexandria_index_refresh_start,
-    alexandria_index_start, alexandria_reading_list_add_item, alexandria_reading_list_create,
-    alexandria_reading_list_delete, alexandria_reading_list_remove_item,
-    alexandria_reading_list_update_progress, alexandria_reading_lists_list,
-    alexandria_watchlist_add_video, alexandria_watchlist_create, alexandria_watchlist_delete,
-    alexandria_watchlist_remove_video, alexandria_watchlist_update_progress,
-    alexandria_watchlists_list, IndexStartResult,
+    alexandria_file_purge, alexandria_file_purge_on_disk, alexandria_file_read_content,
+    alexandria_file_rename, alexandria_file_restore, alexandria_file_soft_delete,
+    alexandria_files_list, alexandria_free_string, alexandria_index_count_files,
+    alexandria_index_count_missing, alexandria_index_files_json, alexandria_index_init,
+    alexandria_index_refresh_start, alexandria_index_start, alexandria_reading_list_add_item,
+    alexandria_reading_list_create, alexandria_reading_list_delete,
+    alexandria_reading_list_remove_item, alexandria_reading_list_update_progress,
+    alexandria_reading_lists_list, alexandria_watchlist_add_video, alexandria_watchlist_create,
+    alexandria_watchlist_delete, alexandria_watchlist_remove_video,
+    alexandria_watchlist_update_progress, alexandria_watchlists_list, IndexStartResult,
 };
 use alexandria_http::app;
 use axum::body::{to_bytes, Body};
@@ -8122,5 +8122,164 @@ async fn given_unknown_reading_list_when_deleted_via_http_and_ffi_then_both_not_
         ffi_status,
         alexandria_ffi::READING_LIST_ERR_NOT_FOUND,
         "ffi must reject an unknown reading list as not-found (HTTP 404)"
+    );
+}
+
+/// Insert a minimal `files` row of the given `file_type` at `path`, and
+/// return its uuid. Used by the UC-32 parity tests, which need a row whose
+/// path resolves to a real on-disk file — unlike `seed_file` above, which
+/// bypasses the indexer for handlers that never touch the filesystem.
+async fn seed_file_at_path(pool: &sqlx::sqlite::SqlitePool, file_type: &str, path: &str) -> String {
+    let file_uuid = uuid::Uuid::new_v4().to_string();
+    sqlx::query(
+        "INSERT INTO files (uuid, path, name, type, content_hash, indexed_at) \
+         VALUES (?, ?, ?, ?, 'hash', ?)",
+    )
+    .bind(&file_uuid)
+    .bind(path)
+    .bind("seeded")
+    .bind(file_type)
+    .bind(chrono::Utc::now().to_rfc3339())
+    .execute(pool)
+    .await
+    .unwrap();
+    file_uuid
+}
+
+/// UC-32 parity - read the same on-disk TextFile's content over both
+/// transports and assert the returned bodies agree modulo per-database
+/// uuids (Testing Specification section 7.3, FR-TX-01, FR-FC-24).
+#[tokio::test]
+async fn given_same_text_file_when_read_via_http_and_ffi_then_bodies_identical() {
+    let _g = SERIAL.lock().unwrap();
+
+    let lib = tempdir().unwrap();
+    let file_path = lib.path().join("notes.txt");
+    std::fs::write(&file_path, "hello world").unwrap();
+    let file_path = file_path.to_str().unwrap().to_string();
+
+    // ---- HTTP leg ----
+    let http_dir = tempdir().unwrap();
+    let http_db = db_path(&http_dir, "http.sqlite");
+    let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    let http_services =
+        std::sync::Arc::new(build_services(&Settings::default(), http_pool.clone()).await);
+
+    let http_uuid = seed_file_at_path(&http_pool, "text", &file_path).await;
+
+    let req = Request::builder()
+        .method("GET")
+        .uri(format!("/v1/files/{http_uuid}/content"))
+        .header("authorization", "Bearer parity")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app(Settings::default(), http_services)
+        .oneshot(req)
+        .await
+        .expect("http read content");
+    assert_eq!(resp.status(), axum::http::StatusCode::OK);
+    let http_body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
+
+    // ---- FFI leg ----
+    let ffi_dir = tempdir().unwrap();
+    let ffi_db = db_path(&ffi_dir, "ffi.sqlite");
+    let ffi_pool = migrate_database(&ffi_db).await.expect("ffi migrate");
+    let ffi_uuid = seed_file_at_path(&ffi_pool, "text", &file_path).await;
+    ffi_pool.close().await;
+
+    let ffi_body: serde_json::Value = tokio::task::spawn_blocking(move || -> serde_json::Value {
+        let cdb = CString::new(ffi_db).unwrap();
+        assert_eq!(
+            alexandria_index_init(cdb.as_ptr()),
+            alexandria_ffi::INDEX_OK
+        );
+
+        let token = CString::new("parity").unwrap();
+        let uuid_c = CString::new(ffi_uuid).unwrap();
+        let r = alexandria_file_read_content(uuid_c.as_ptr(), token.as_ptr());
+        assert_eq!(r.status, alexandria_ffi::FILE_OK, "ffi read content");
+        assert!(!r.json.is_null());
+        let s = unsafe { CStr::from_ptr(r.json) }
+            .to_string_lossy()
+            .into_owned();
+        unsafe {
+            alexandria_free_string(r.json);
+        }
+        serde_json::from_str(&s).unwrap()
+    })
+    .await
+    .unwrap();
+
+    // ---- compare ----
+    for (label, body) in [("http", &http_body), ("ffi", &ffi_body)] {
+        assert!(
+            uuid::Uuid::parse_str(body["uuid"].as_str().unwrap_or_default()).is_ok(),
+            "{label} body carries a valid uuid"
+        );
+        assert_eq!(body["content"], "hello world", "{label} content");
+    }
+}
+
+/// UC-32 parity - reading a non-TextFile's content is rejected as invalid
+/// input on both surfaces (HTTP 400, FFI FILE_ERR_INVALID_INPUT)
+/// (FR-FC-24 / NFR-09).
+#[tokio::test]
+async fn given_non_text_file_when_read_via_http_and_ffi_then_both_invalid_input() {
+    let _g = SERIAL.lock().unwrap();
+
+    let lib = tempdir().unwrap();
+    let file_path = lib.path().join("song.mp3");
+    std::fs::write(&file_path, b"audio bytes").unwrap();
+    let file_path = file_path.to_str().unwrap().to_string();
+
+    // ---- HTTP leg ----
+    let http_dir = tempdir().unwrap();
+    let http_db = db_path(&http_dir, "http.sqlite");
+    let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    let http_services =
+        std::sync::Arc::new(build_services(&Settings::default(), http_pool.clone()).await);
+
+    let http_uuid = seed_file_at_path(&http_pool, "audio", &file_path).await;
+
+    let req = Request::builder()
+        .method("GET")
+        .uri(format!("/v1/files/{http_uuid}/content"))
+        .header("authorization", "Bearer parity")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app(Settings::default(), http_services)
+        .oneshot(req)
+        .await
+        .expect("http read content");
+    assert_eq!(resp.status(), axum::http::StatusCode::BAD_REQUEST);
+
+    // ---- FFI leg ----
+    let ffi_dir = tempdir().unwrap();
+    let ffi_db = db_path(&ffi_dir, "ffi.sqlite");
+    let ffi_pool = migrate_database(&ffi_db).await.expect("ffi migrate");
+    let ffi_uuid = seed_file_at_path(&ffi_pool, "audio", &file_path).await;
+    ffi_pool.close().await;
+
+    let ffi_status = tokio::task::spawn_blocking(move || -> i32 {
+        let cdb = CString::new(ffi_db).unwrap();
+        assert_eq!(
+            alexandria_index_init(cdb.as_ptr()),
+            alexandria_ffi::INDEX_OK
+        );
+
+        let token = CString::new("parity").unwrap();
+        let uuid_c = CString::new(ffi_uuid).unwrap();
+        let r = alexandria_file_read_content(uuid_c.as_ptr(), token.as_ptr());
+        assert!(r.json.is_null());
+        r.status
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(
+        ffi_status,
+        alexandria_ffi::FILE_ERR_INVALID_INPUT,
+        "ffi must reject a non-text file as invalid input (HTTP 400)"
     );
 }

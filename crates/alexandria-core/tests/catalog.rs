@@ -16,6 +16,9 @@ mod purge;
 #[path = "catalog/purge_on_disk.rs"]
 mod purge_on_disk;
 
+#[path = "catalog/read_content.rs"]
+mod read_content;
+
 #[path = "catalog/refresh.rs"]
 mod refresh;
 

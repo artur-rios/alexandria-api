@@ -20,6 +20,7 @@ use crate::catalog::commands::restore::RestoreFileHandler;
 use crate::catalog::commands::soft_delete::SoftDeleteFileHandler;
 use crate::catalog::fs::StdFilesystem;
 use crate::catalog::queries::browse::BrowseFilesHandler;
+use crate::catalog::queries::read_content::ReadTextFileContentHandler;
 use crate::catalog::repos::SqliteCatalogRepository;
 use crate::collections::commands::add_items::AddItemsToCollectionHandler;
 use crate::collections::commands::create::CreateCollectionHandler;
@@ -73,6 +74,9 @@ pub type DefaultPurgeFileOnDiskHandler =
     PurgeFileOnDiskHandler<BearerAuthService, SqliteCatalogRepository, StdFilesystem>;
 
 pub type DefaultBrowseFilesHandler = BrowseFilesHandler<BearerAuthService, SqliteCatalogRepository>;
+
+pub type DefaultReadTextFileContentHandler =
+    ReadTextFileContentHandler<BearerAuthService, SqliteCatalogRepository, StdFilesystem>;
 
 pub type DefaultCreateCollectionHandler =
     CreateCollectionHandler<BearerAuthService, SqliteCollectionRepository>;
@@ -172,6 +176,7 @@ pub struct Services {
     pub purge_file_handler: Arc<DefaultPurgeFileHandler>,
     pub purge_file_on_disk_handler: Arc<DefaultPurgeFileOnDiskHandler>,
     pub browse_files_handler: Arc<DefaultBrowseFilesHandler>,
+    pub read_text_file_content_handler: Arc<DefaultReadTextFileContentHandler>,
     pub create_collection_handler: Arc<DefaultCreateCollectionHandler>,
     pub rename_collection_handler: Arc<DefaultRenameCollectionHandler>,
     pub delete_collection_handler: Arc<DefaultDeleteCollectionHandler>,
@@ -231,6 +236,8 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
     ));
     let purge_file_on_disk_handler = Arc::new(PurgeFileOnDiskHandler::new(auth, repo.clone(), fs));
     let browse_files_handler = Arc::new(BrowseFilesHandler::new(auth, repo.clone()));
+    let read_text_file_content_handler =
+        Arc::new(ReadTextFileContentHandler::new(auth, repo.clone(), fs));
     let create_collection_handler = Arc::new(CreateCollectionHandler::new(
         auth,
         SqliteCollectionRepository::new(pool.clone()),
@@ -340,6 +347,7 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         purge_file_handler,
         purge_file_on_disk_handler,
         browse_files_handler,
+        read_text_file_content_handler,
         create_collection_handler,
         rename_collection_handler,
         delete_collection_handler,

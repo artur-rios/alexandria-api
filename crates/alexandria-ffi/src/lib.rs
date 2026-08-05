@@ -577,6 +577,55 @@ pub extern "C" fn alexandria_file_get_by_uuid(
     }
 }
 
+/// Read a TextFile's content from disk (UC-32 / FR-TX-01).
+///
+/// `uuid` is the file's public UUID (NUL-terminated string). On success
+/// `json` carries the `FileContent` — byte-for-byte the same shape HTTP
+/// returns from `GET /v1/files/{uuid}/content` (parity, FR-FC-24 / NFR-09).
+/// `token` is the bearer auth token.
+#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
+#[no_mangle]
+pub extern "C" fn alexandria_file_read_content(
+    uuid: *const c_char,
+    token: *const c_char,
+) -> FileJsonResult {
+    let services = match services_slot().lock().unwrap().clone() {
+        Some(s) => s,
+        None => return FileJsonResult::err(FILE_ERR_NOT_INITIALIZED),
+    };
+
+    // Deny before touching the payload — an unauthenticated caller must
+    // not learn whether its uuid would have parsed.
+    let token = cstr_lossy(token).unwrap_or_default();
+    if !authenticated(&services, &token) {
+        return FileJsonResult::err(FILE_ERR_UNAUTHORIZED);
+    }
+
+    let uuid_str = match cstr_lossy(uuid) {
+        Some(s) => s,
+        None => return FileJsonResult::err(FILE_ERR_INVALID_INPUT),
+    };
+    let uuid = match uuid::Uuid::parse_str(&uuid_str) {
+        Ok(u) => u,
+        Err(_) => return FileJsonResult::err(FILE_ERR_INVALID_INPUT),
+    };
+
+    let result = runtime().block_on(async {
+        services
+            .read_text_file_content_handler
+            .read(uuid, &token)
+            .await
+    });
+
+    match result {
+        Ok(content) => {
+            let json = serde_json::to_string(&content).unwrap_or_default();
+            FileJsonResult::ok(json)
+        }
+        Err(err) => map_file_err(err),
+    }
+}
+
 /// Rename a file (and its on-disk file) (UC-05 / FR-FC-19).
 ///
 /// `uuid` is the file's public UUID string; `name` is the new file name. The

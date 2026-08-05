@@ -27,13 +27,13 @@ its open/closed state, so the tables stay in sync with the board automatically.
 | [F-01 File indexing](https://github.com/artur-rios/alexandria-api/milestone/2) | UC-01 … UC-02 | 2 / 2 |
 | [F-02 Catalog browsing & metadata editing](https://github.com/artur-rios/alexandria-api/milestone/3) | UC-03 … UC-04 | 2 / 2 |
 | [F-03 Renaming & lifecycle management](https://github.com/artur-rios/alexandria-api/milestone/4) | UC-05 … UC-09 | 5 / 5 |
-| [F-04 Text file content editing](https://github.com/artur-rios/alexandria-api/milestone/5) | UC-32 … UC-33 | 0 / 2 |
+| [F-04 Text file content editing](https://github.com/artur-rios/alexandria-api/milestone/5) | UC-32 … UC-33 | 1 / 2 |
 | [F-05 Collections](https://github.com/artur-rios/alexandria-api/milestone/6) | UC-10 … UC-14 | 5 / 5 |
 | [F-06 Bookmarks](https://github.com/artur-rios/alexandria-api/milestone/7) | UC-15 … UC-19 | 5 / 5 |
 | [F-07 Watchlists](https://github.com/artur-rios/alexandria-api/milestone/8) | UC-20 … UC-25 | 6 / 6 |
 | [F-08 Reading lists](https://github.com/artur-rios/alexandria-api/milestone/9) | UC-26 … UC-31 | 6 / 6 |
 | [F-09 Pluggable authentication](https://github.com/artur-rios/alexandria-api/milestone/10) | UC-34 … UC-36 | 0 / 3 |
-| **Total** | | **32 / 38** |
+| **Total** | | **33 / 38** |
 
 ### F-00 — Foundation & operations
 
@@ -81,7 +81,7 @@ Read and write TextFile content on disk, refreshing the content hash.
 
 | Issue | Use case | Status | Title | Requirements |
 | --- | --- | :---: | --- | --- |
-| [#33](https://github.com/artur-rios/alexandria-api/issues/33) | UC-32 | &#9744; | Read text file content | FR-TX-01, FR-FC-24 |
+| [#33](https://github.com/artur-rios/alexandria-api/issues/33) | UC-32 | &#9745; | Read text file content | FR-TX-01, FR-FC-24 |
 | [#34](https://github.com/artur-rios/alexandria-api/issues/34) | UC-33 | &#9744; | Edit text file content | FR-TX-02, FR-TX-03, FR-FC-24 |
 
 ### F-05 — Collections

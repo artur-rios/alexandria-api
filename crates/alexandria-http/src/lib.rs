@@ -37,6 +37,10 @@ pub fn app(settings: Settings, services: Arc<Services>) -> Router {
         )
         .route("/v1/files/{uuid}/rename", post(routes::rename::rename))
         .route("/v1/files", get(routes::browse::list_files))
+        .route(
+            "/v1/files/{uuid}/content",
+            get(routes::text_content::get_content),
+        )
         .route("/v1/files/{uuid}", get(routes::browse::get_file))
         .route("/v1/files/{uuid}", delete(routes::delete_file::delete_file))
         .route("/v1/files/{uuid}/restore", post(routes::restore::restore))
