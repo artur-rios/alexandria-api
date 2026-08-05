@@ -2,6 +2,13 @@
 //! SQLite database wired through `build_services`, and a poll helper that
 //! waits for the spawned indexing task to persist rows.
 
+// This module is included by more than one test target (`catalog_api.rs`,
+// `collections_api.rs`), and each uses only the helpers its own feature area
+// needs — so the rest is dead code as far as the *other* target's compilation
+// is concerned. The allow is module-wide rather than per item because the set
+// of "unused here" helpers changes with every target that includes the file.
+#![allow(dead_code)]
+
 use std::time::Duration;
 
 use alexandria_core::config::Settings;

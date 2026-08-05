@@ -2,6 +2,7 @@
 
 pub mod auth;
 pub mod catalog;
+pub mod collections;
 pub mod config;
 pub mod errors;
 pub mod migrate;

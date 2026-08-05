@@ -1,6 +1,14 @@
 //! Shared test doubles for alexandria-core integration tests (Testing
-//! Specification §6.2): hand-written fakes implementing the catalog
-//! collaborators with no real database, filesystem, or auth service.
+//! Specification §6.2): hand-written fakes implementing the catalog and
+//! collections collaborators with no real database, filesystem, or auth
+//! service.
+
+// This module is included by more than one test target (`catalog.rs`,
+// `collections.rs`), and each uses only the fakes for its own feature area —
+// so every helper is dead code as far as the *other* target's compilation is
+// concerned. The allow is module-wide rather than per item because the set of
+// "unused here" helpers changes with every target that includes the file.
+#![allow(dead_code)]
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -15,6 +23,8 @@ use alexandria_core::catalog::model::{
     File, FileState, FileType, NewFile, StateFilter, SubtypeMetadata,
 };
 use alexandria_core::catalog::repos::CatalogRepository;
+use alexandria_core::collections::model::{Collection, NewCollection};
+use alexandria_core::collections::repos::CollectionRepository;
 use alexandria_core::config::AuthMode;
 use alexandria_core::errors::DomainError;
 
@@ -365,6 +375,59 @@ impl CatalogRepository for FakeCatalogRepository {
         }
         files.remove(&file.path);
         Ok(())
+    }
+}
+
+/// In-memory collections repository (UC-10). Backed by a shared
+/// `Arc<Mutex<…>>` so a test can clone the repo, hand the original to the
+/// handler, and inspect the clone afterwards — the same arrangement
+/// `FakeCatalogRepository` uses.
+#[derive(Debug, Default, Clone)]
+pub struct FakeCollectionRepository {
+    collections: Arc<Mutex<HashMap<Uuid, Collection>>>,
+    /// When set, every `insert_collection` fails, simulating a catalog-write
+    /// failure in UC-10. There is no on-disk leg to compensate — the handler
+    /// merely surfaces the error and nothing is stored.
+    failing: Arc<Mutex<bool>>,
+}
+
+impl FakeCollectionRepository {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn count(&self) -> usize {
+        self.collections.lock().unwrap().len()
+    }
+
+    pub fn collection_for(&self, uuid: Uuid) -> Option<Collection> {
+        self.collections.lock().unwrap().get(&uuid).cloned()
+    }
+
+    /// Make every `insert_collection` return an `Internal` error.
+    pub fn fail_inserts(&self) {
+        *self.failing.lock().unwrap() = true;
+    }
+}
+
+impl CollectionRepository for FakeCollectionRepository {
+    async fn insert_collection(
+        &self,
+        new_collection: NewCollection,
+    ) -> Result<Collection, DomainError> {
+        if *self.failing.lock().unwrap() {
+            return Err(DomainError::internal("fake insert_collection failure"));
+        }
+        let collection = Collection {
+            uuid: new_collection.uuid,
+            name: new_collection.name,
+            kind: new_collection.kind,
+        };
+        self.collections
+            .lock()
+            .unwrap()
+            .insert(collection.uuid, collection.clone());
+        Ok(collection)
     }
 }
 

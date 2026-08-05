@@ -37,6 +37,19 @@ pub const FILE_ERR_INVALID_STATE: c_int = 5;
 pub const FILE_ERR_DISK: c_int = 6;
 pub const FILE_ERR_OTHER: c_int = 9;
 
+/// FFI status codes returned by collection operations (UC-10+). Deliberately
+/// separate from `INDEX_*` and `FILE_*` — per the convention above — so the
+/// Collections use cases can grow their own set without colliding;
+/// `COLLECTION_OK == FILE_OK == 0` by convention. There is no disk code: a
+/// collection is catalog-only metadata with nothing on disk.
+pub const COLLECTION_OK: c_int = 0;
+pub const COLLECTION_ERR_INVALID_INPUT: c_int = 1;
+pub const COLLECTION_ERR_UNAUTHORIZED: c_int = 2;
+pub const COLLECTION_ERR_NOT_INITIALIZED: c_int = 3;
+pub const COLLECTION_ERR_NOT_FOUND: c_int = 4;
+pub const COLLECTION_ERR_INVALID_STATE: c_int = 5;
+pub const COLLECTION_ERR_OTHER: c_int = 9;
+
 fn runtime() -> &'static Runtime {
     RUNTIME.get_or_init(|| {
         Builder::new_multi_thread()
@@ -816,6 +829,127 @@ pub extern "C" fn alexandria_file_purge_on_disk(
             FileJsonResult::ok(json)
         }
         Err(err) => map_file_err(err),
+    }
+}
+
+/// Result of `alexandria_collection_create` (UC-10). On success `status` is
+/// `COLLECTION_OK` and `json` is a NUL-terminated JSON string of the
+/// `Collection` body — byte-for-byte the same shape HTTP returns from
+/// `POST /v1/collections` (FR-FC-24 / NFR-09). On failure `json` is NULL and
+/// `status` carries the mapped error code. The caller must free `json` with
+/// `alexandria_free_string`.
+#[repr(C)]
+#[derive(Debug)]
+pub struct CollectionJsonResult {
+    pub status: c_int,
+    pub json: *mut c_char,
+}
+
+impl CollectionJsonResult {
+    fn err(status: c_int) -> Self {
+        Self {
+            status,
+            json: std::ptr::null_mut(),
+        }
+    }
+
+    fn ok(json: String) -> Self {
+        let cstring = CString::new(json).unwrap_or_default();
+        Self {
+            status: COLLECTION_OK,
+            json: cstring.into_raw(),
+        }
+    }
+}
+
+/// Request body accepted by `alexandria_collection_create` — the same JSON
+/// `POST /v1/collections` takes: `{"name":"Sci-fi novels","kind":"file"}`.
+/// Parsing here is what rejects a missing field or an unrecognised `kind` as
+/// `COLLECTION_ERR_INVALID_INPUT`, matching the HTTP surface's `400`
+/// (FR-FC-24 / NFR-09).
+///
+/// Parsed field-by-field off a `serde_json::Value` rather than by `derive`,
+/// like `FilesListFilter` above: this crate depends on `serde_json` but not on
+/// `serde` itself. Both fields are required and must be strings, and unknown
+/// fields are ignored — the same three decisions axum's `Json` extractor makes
+/// for the HTTP body.
+#[derive(Debug)]
+struct CreateCollectionBody {
+    name: String,
+    kind: alexandria_core::collections::model::CollectionKind,
+}
+
+impl CreateCollectionBody {
+    fn from_json_str(s: &str) -> Option<Self> {
+        let value: serde_json::Value = serde_json::from_str(s).ok()?;
+        let obj = value.as_object()?;
+        let name = obj.get("name")?.as_str()?.to_string();
+        let kind =
+            alexandria_core::collections::model::CollectionKind::parse(obj.get("kind")?.as_str()?)?;
+        Some(Self { name, kind })
+    }
+}
+
+/// Create a flat file or bookmark collection (UC-10 / FR-CO-01, FR-CO-02).
+///
+/// `json_body` is the JSON body HTTP would send (`name` + `kind`). The
+/// function deserializes it, calls the same `CreateCollectionHandler` the HTTP
+/// route uses, and on success serializes the returned `Collection` back to
+/// JSON — so the FFI and HTTP surfaces agree byte-for-byte modulo key ordering
+/// (parity, FR-FC-24 / NFR-09). `token` is the bearer auth token.
+#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
+#[no_mangle]
+pub extern "C" fn alexandria_collection_create(
+    json_body: *const c_char,
+    token: *const c_char,
+) -> CollectionJsonResult {
+    let services = match services_slot().lock().unwrap().clone() {
+        Some(s) => s,
+        None => return CollectionJsonResult::err(COLLECTION_ERR_NOT_INITIALIZED),
+    };
+
+    // Deny before touching the payload — an unauthenticated caller must not
+    // learn whether its body would have parsed.
+    let token = cstr_lossy(token).unwrap_or_default();
+    if !authenticated(&services, &token) {
+        return CollectionJsonResult::err(COLLECTION_ERR_UNAUTHORIZED);
+    }
+
+    let body_str = match cstr_lossy(json_body) {
+        Some(s) => s,
+        None => return CollectionJsonResult::err(COLLECTION_ERR_INVALID_INPUT),
+    };
+    let body = match CreateCollectionBody::from_json_str(&body_str) {
+        Some(b) => b,
+        None => return CollectionJsonResult::err(COLLECTION_ERR_INVALID_INPUT),
+    };
+    // An empty or otherwise invalid name is rejected by the handler's
+    // validator, so it surfaces as `COLLECTION_ERR_INVALID_INPUT` —
+    // consistent with the HTTP `400`.
+
+    let result = runtime().block_on(async {
+        services
+            .create_collection_handler
+            .create(&body.name, body.kind, &token)
+            .await
+    });
+
+    match result {
+        Ok(collection) => {
+            let json = serde_json::to_string(&collection).unwrap_or_default();
+            CollectionJsonResult::ok(json)
+        }
+        Err(err) => map_collection_err(err),
+    }
+}
+
+fn map_collection_err(err: DomainError) -> CollectionJsonResult {
+    match err {
+        DomainError::NotFound => CollectionJsonResult::err(COLLECTION_ERR_NOT_FOUND),
+        DomainError::Unauthorized => CollectionJsonResult::err(COLLECTION_ERR_UNAUTHORIZED),
+        DomainError::InvalidInput(_) => CollectionJsonResult::err(COLLECTION_ERR_INVALID_INPUT),
+        DomainError::InvalidState => CollectionJsonResult::err(COLLECTION_ERR_INVALID_STATE),
+        _ => CollectionJsonResult::err(COLLECTION_ERR_OTHER),
     }
 }
 
