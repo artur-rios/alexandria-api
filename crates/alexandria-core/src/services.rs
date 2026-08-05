@@ -29,6 +29,7 @@ use crate::collections::commands::rename::RenameCollectionHandler;
 use crate::collections::queries::list_items::ListCollectionItemsHandler;
 use crate::collections::repos::SqliteCollectionRepository;
 use crate::config::Settings;
+use crate::watchlists::commands::add_video::AddVideoToWatchlistHandler;
 use crate::watchlists::commands::create::CreateWatchlistHandler;
 use crate::watchlists::repos::SqliteWatchlistRepository;
 
@@ -110,6 +111,12 @@ pub type DefaultListCollectionItemsHandler = ListCollectionItemsHandler<
 pub type DefaultCreateWatchlistHandler =
     CreateWatchlistHandler<BearerAuthService, SqliteWatchlistRepository>;
 
+pub type DefaultAddVideoToWatchlistHandler = AddVideoToWatchlistHandler<
+    BearerAuthService,
+    SqliteWatchlistRepository,
+    SqliteCatalogRepository,
+>;
+
 #[derive(Clone)]
 pub struct Services {
     pub index_handler: Arc<DefaultIndexHandler>,
@@ -133,6 +140,7 @@ pub struct Services {
     pub remove_item_from_collection_handler: Arc<DefaultRemoveItemFromCollectionHandler>,
     pub list_collection_items_handler: Arc<DefaultListCollectionItemsHandler>,
     pub create_watchlist_handler: Arc<DefaultCreateWatchlistHandler>,
+    pub add_video_to_watchlist_handler: Arc<DefaultAddVideoToWatchlistHandler>,
     /// The same auth service the handlers hold, exposed so a transport can
     /// reject an unauthenticated caller *before* it parses a request body or
     /// path (FR-AU-07 / SRD §7). Handlers still authenticate independently —
@@ -225,9 +233,13 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         repo.clone(),
         SqliteBookmarkRepository::new(pool.clone()),
     ));
-    let create_watchlist_handler = Arc::new(CreateWatchlistHandler::new(
+    let watchlist_repo = SqliteWatchlistRepository::new(pool.clone());
+    let create_watchlist_handler =
+        Arc::new(CreateWatchlistHandler::new(auth, watchlist_repo.clone()));
+    let add_video_to_watchlist_handler = Arc::new(AddVideoToWatchlistHandler::new(
         auth,
-        SqliteWatchlistRepository::new(pool.clone()),
+        watchlist_repo,
+        repo.clone(),
     ));
     Services {
         index_handler,
@@ -251,6 +263,7 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         remove_item_from_collection_handler,
         list_collection_items_handler,
         create_watchlist_handler,
+        add_video_to_watchlist_handler,
         auth,
         pool,
     }
