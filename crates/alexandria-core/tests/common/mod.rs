@@ -955,4 +955,24 @@ impl BookmarkRepository for FakeBookmarkRepository {
         bookmark.collection_uuid = collection_uuid;
         Ok(bookmark.clone())
     }
+
+    async fn soft_delete(
+        &self,
+        uuid: Uuid,
+        deleted_at: DateTime<Utc>,
+    ) -> Result<Bookmark, DomainError> {
+        let mut bookmarks = self.bookmarks.lock().unwrap();
+        let bookmark = bookmarks.get_mut(&uuid).ok_or(DomainError::NotFound)?;
+        bookmark.state = BookmarkState::Deleted;
+        bookmark.deleted_at = Some(deleted_at);
+        Ok(bookmark.clone())
+    }
+
+    async fn restore(&self, uuid: Uuid) -> Result<Bookmark, DomainError> {
+        let mut bookmarks = self.bookmarks.lock().unwrap();
+        let bookmark = bookmarks.get_mut(&uuid).ok_or(DomainError::NotFound)?;
+        bookmark.state = BookmarkState::Active;
+        bookmark.deleted_at = None;
+        Ok(bookmark.clone())
+    }
 }

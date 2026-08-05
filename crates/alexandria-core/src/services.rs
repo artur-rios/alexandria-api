@@ -4,6 +4,7 @@ use sqlx::sqlite::SqlitePool;
 
 use crate::auth::BearerAuthService;
 use crate::bookmarks::commands::create::CreateBookmarkHandler;
+use crate::bookmarks::commands::lifecycle::BookmarkLifecycleHandler;
 use crate::bookmarks::commands::update::UpdateBookmarkHandler;
 use crate::bookmarks::queries::browse::BrowseBookmarksHandler;
 use crate::bookmarks::repos::SqliteBookmarkRepository;
@@ -76,6 +77,9 @@ pub type DefaultUpdateBookmarkHandler =
 pub type DefaultBrowseBookmarksHandler =
     BrowseBookmarksHandler<BearerAuthService, SqliteBookmarkRepository, SqliteCollectionRepository>;
 
+pub type DefaultBookmarkLifecycleHandler =
+    BookmarkLifecycleHandler<BearerAuthService, SqliteBookmarkRepository, SystemClock>;
+
 pub type DefaultAddItemsToCollectionHandler = AddItemsToCollectionHandler<
     BearerAuthService,
     SqliteCollectionRepository,
@@ -114,6 +118,7 @@ pub struct Services {
     pub create_bookmark_handler: Arc<DefaultCreateBookmarkHandler>,
     pub update_bookmark_handler: Arc<DefaultUpdateBookmarkHandler>,
     pub browse_bookmarks_handler: Arc<DefaultBrowseBookmarksHandler>,
+    pub bookmark_lifecycle_handler: Arc<DefaultBookmarkLifecycleHandler>,
     pub add_items_to_collection_handler: Arc<DefaultAddItemsToCollectionHandler>,
     pub remove_item_from_collection_handler: Arc<DefaultRemoveItemFromCollectionHandler>,
     pub list_collection_items_handler: Arc<DefaultListCollectionItemsHandler>,
@@ -180,6 +185,11 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         SqliteBookmarkRepository::new(pool.clone()),
         SqliteCollectionRepository::new(pool.clone()),
     ));
+    let bookmark_lifecycle_handler = Arc::new(BookmarkLifecycleHandler::new(
+        auth,
+        SqliteBookmarkRepository::new(pool.clone()),
+        clock,
+    ));
     let add_items_to_collection_handler = Arc::new(AddItemsToCollectionHandler::new(
         auth,
         SqliteCollectionRepository::new(pool.clone()),
@@ -214,6 +224,7 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         create_bookmark_handler,
         update_bookmark_handler,
         browse_bookmarks_handler,
+        bookmark_lifecycle_handler,
         add_items_to_collection_handler,
         remove_item_from_collection_handler,
         list_collection_items_handler,
