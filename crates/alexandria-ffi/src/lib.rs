@@ -700,6 +700,57 @@ pub extern "C" fn alexandria_file_restore(
     }
 }
 
+/// Hard-purge a soft-deleted file's catalog row (UC-08 / FR-FC-22).
+///
+/// `uuid` is the file's public UUID string; `token` is the bearer auth
+/// token. The function calls the same `PurgeFileHandler` the HTTP route
+/// uses (`DELETE /v1/files/{uuid}?purge=true`) and on success serializes
+/// the pre-delete `File` back to JSON as confirmation — the same shape
+/// HTTP returns, so the FFI and HTTP surfaces agree byte-for-byte modulo
+/// key ordering (parity, FR-FC-24 / NFR-09). Only the catalog row (and its
+/// subtype row) is removed; the on-disk file is untouched (NFR-07). The
+/// retention window (default 30 days, NFR-10) is enforced: a record still
+/// within it, or not `deleted`, is reported as `FILE_ERR_INVALID_STATE`.
+#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
+#[no_mangle]
+pub extern "C" fn alexandria_file_purge(
+    uuid: *const c_char,
+    token: *const c_char,
+) -> FileJsonResult {
+    let services = match services_slot().lock().unwrap().clone() {
+        Some(s) => s,
+        None => return FileJsonResult::err(FILE_ERR_NOT_INITIALIZED),
+    };
+
+    // Deny before touching the payload — an unauthenticated caller must not
+    // learn whether its uuid would have parsed.
+    let token = cstr_lossy(token).unwrap_or_default();
+    if !authenticated(&services, &token) {
+        return FileJsonResult::err(FILE_ERR_UNAUTHORIZED);
+    }
+
+    let uuid_str = match cstr_lossy(uuid) {
+        Some(s) => s,
+        None => return FileJsonResult::err(FILE_ERR_INVALID_INPUT),
+    };
+    let uuid = match uuid::Uuid::parse_str(&uuid_str) {
+        Ok(u) => u,
+        Err(_) => return FileJsonResult::err(FILE_ERR_INVALID_INPUT),
+    };
+
+    let result = runtime().block_on(async {
+        services.purge_file_handler.purge(uuid, &token).await
+    });
+
+    match result {
+        Ok(file) => {
+            let json = serde_json::to_string(&file).unwrap_or_default();
+            FileJsonResult::ok(json)
+        }
+        Err(err) => map_file_err(err),
+    }
+}
+
 fn parse_file_type(s: &str) -> Option<alexandria_core::catalog::model::FileType> {
     use alexandria_core::catalog::model::FileType;
     match s {
