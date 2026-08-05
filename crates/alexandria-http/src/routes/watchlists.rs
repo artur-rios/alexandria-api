@@ -1,11 +1,12 @@
-use axum::extract::rejection::{JsonRejection, PathRejection};
-use axum::extract::{Path, State};
+use axum::extract::rejection::{JsonRejection, PathRejection, QueryRejection};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
 use serde::Deserialize;
 use uuid::Uuid;
 
-use alexandria_core::watchlists::model::{WatchProgress, Watchlist};
+use alexandria_core::errors::DomainError;
+use alexandria_core::watchlists::model::{WatchProgress, Watchlist, WatchlistWithProgress};
 
 use crate::middleware::auth::invalid_input;
 use crate::middleware::error::ApiError;
@@ -92,4 +93,47 @@ pub async fn add_video(
         .map_err(ApiError)?;
 
     Ok((StatusCode::OK, Json(result)))
+}
+
+/// Query-string parameters for `GET /v1/watchlists` (UC-21 / FR-WL-08). An
+/// omitted or empty `watchlistUuid` means every watchlist is returned; a
+/// malformed value is rejected as `400` invalid input, matching the FFI
+/// surface (FR-FC-24 / NFR-09).
+#[derive(Debug, Default, Deserialize)]
+pub struct WatchlistListParams {
+    #[serde(rename = "watchlistUuid", default)]
+    pub watchlist_uuid: Option<String>,
+}
+
+/// `GET /v1/watchlists` — browse watchlists and their items' watch progress
+/// (UC-21 / FR-WL-08), optionally filtered to a single watchlist. Returns
+/// `200` with a JSON array of `WatchlistWithProgress` records, or `400`
+/// (malformed `watchlistUuid`), `404` (the referenced watchlist does not
+/// exist), or `401` (unauthenticated).
+pub async fn list(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    params: Result<Query<WatchlistListParams>, QueryRejection>,
+) -> Result<Json<Vec<WatchlistWithProgress>>, ApiError> {
+    let token = bearer_token(&headers);
+
+    let Query(params) = params.map_err(|err| invalid_input(format!("invalid query: {err}")))?;
+
+    let watchlist_uuid = match params.watchlist_uuid.as_deref().filter(|s| !s.is_empty()) {
+        None => None,
+        Some(v) => Some(Uuid::parse_str(v).map_err(|_| {
+            ApiError(DomainError::InvalidInput(format!(
+                "invalid watchlistUuid: {v}"
+            )))
+        })?),
+    };
+
+    let result = state
+        .services
+        .browse_watchlists_handler
+        .list(watchlist_uuid, &token)
+        .await
+        .map_err(ApiError)?;
+
+    Ok(Json(result))
 }

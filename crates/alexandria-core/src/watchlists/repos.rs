@@ -22,6 +22,13 @@ pub trait WatchlistRepository: Send + Sync {
     /// such watchlist exists.
     async fn find_by_uuid(&self, uuid: Uuid) -> Result<Option<Watchlist>, DomainError>;
 
+    /// Every persisted watchlist, ordered by name (UC-21 / FR-WL-08).
+    async fn list_all(&self) -> Result<Vec<Watchlist>, DomainError>;
+
+    /// Every WatchProgress row for the watchlist identified by `watchlist_uuid`,
+    /// ordered by video uuid (UC-21 / FR-WL-08).
+    async fn list_progress(&self, watchlist_uuid: Uuid) -> Result<Vec<WatchProgress>, DomainError>;
+
     /// Link the video identified by `video_uuid` to the watchlist identified
     /// by `watchlist_uuid`, creating a `Pending` WatchProgress (UC-22 /
     /// FR-WL-02), and return it. Idempotent: if the pair is already linked,
@@ -82,6 +89,58 @@ impl WatchlistRepository for SqliteWatchlistRepository {
             }
             None => None,
         })
+    }
+
+    async fn list_all(&self) -> Result<Vec<Watchlist>, DomainError> {
+        let rows = sqlx::query("SELECT uuid, name FROM watchlists ORDER BY name")
+            .fetch_all(&self.pool)
+            .await?;
+
+        rows.into_iter()
+            .map(|row| {
+                let uuid: String = row.try_get("uuid")?;
+                let name: String = row.try_get("name")?;
+                Ok(Watchlist {
+                    uuid: Uuid::parse_str(&uuid).map_err(|err| {
+                        DomainError::internal(format!("corrupt watchlist uuid: {err}"))
+                    })?,
+                    name,
+                })
+            })
+            .collect()
+    }
+
+    async fn list_progress(&self, watchlist_uuid: Uuid) -> Result<Vec<WatchProgress>, DomainError> {
+        let rows = sqlx::query(
+            "SELECT f.uuid AS video_uuid, wp.state, wp.current_episode, wp.total_episodes \
+             FROM watch_progress wp \
+             JOIN files f ON f.id = wp.video_file_id \
+             WHERE wp.watchlist_id = (SELECT id FROM watchlists WHERE uuid = ?) \
+             ORDER BY f.uuid",
+        )
+        .bind(watchlist_uuid.to_string())
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter()
+            .map(|row| {
+                let video_uuid: String = row.try_get("video_uuid")?;
+                let state_str: String = row.try_get("state")?;
+                let current_episode: Option<i64> = row.try_get("current_episode")?;
+                let total_episodes: Option<i64> = row.try_get("total_episodes")?;
+                Ok(WatchProgress {
+                    watchlist_uuid,
+                    video_uuid: Uuid::parse_str(&video_uuid).map_err(|err| {
+                        DomainError::internal(format!("corrupt video uuid: {err}"))
+                    })?,
+                    state: WatchState::parse(&state_str).ok_or_else(|| {
+                        DomainError::internal(format!("corrupt watch_progress state: {state_str}"))
+                    })?,
+                    current_episode,
+                    total_episodes,
+                })
+            })
+            .collect()
     }
 
     async fn add_video(

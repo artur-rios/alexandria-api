@@ -1907,6 +1907,86 @@ pub extern "C" fn alexandria_watchlist_add_video(
     }
 }
 
+/// Filter accepted by `alexandria_watchlists_list` — the same JSON `GET
+/// /v1/watchlists?watchlistUuid=…` takes: `{"watchlistUuid":"…"}`. An empty
+/// or absent `watchlistUuid` means every watchlist.
+#[derive(Debug, Default)]
+struct WatchlistsListFilter {
+    watchlist_uuid: Option<String>,
+}
+
+impl WatchlistsListFilter {
+    fn from_json_str(s: &str) -> Option<Self> {
+        if s.trim().is_empty() {
+            return Some(Self::default());
+        }
+        let value: serde_json::Value = serde_json::from_str(s).ok()?;
+        if value.is_null() {
+            return Some(Self::default());
+        }
+        let obj = value.as_object()?;
+        Some(Self {
+            watchlist_uuid: obj
+                .get("watchlistUuid")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+        })
+    }
+}
+
+/// Browse watchlists and their items' watch progress (UC-21 / FR-WL-08).
+///
+/// `json_filters` is the JSON filter HTTP would build from its query string
+/// (`watchlistUuid`); an empty string or `null` means every watchlist. On
+/// success `json` carries a JSON array of `WatchlistWithProgress` — byte-for-
+/// byte the same shape HTTP returns from `GET /v1/watchlists` (parity,
+/// FR-FC-24 / NFR-09). `token` is the bearer auth token.
+#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
+#[no_mangle]
+pub extern "C" fn alexandria_watchlists_list(
+    json_filters: *const c_char,
+    token: *const c_char,
+) -> WatchlistJsonResult {
+    let services = match services_slot().lock().unwrap().clone() {
+        Some(s) => s,
+        None => return WatchlistJsonResult::err(WATCHLIST_ERR_NOT_INITIALIZED),
+    };
+
+    let token = cstr_lossy(token).unwrap_or_default();
+    if !authenticated(&services, &token) {
+        return WatchlistJsonResult::err(WATCHLIST_ERR_UNAUTHORIZED);
+    }
+
+    let filter_str = cstr_lossy(json_filters).unwrap_or_default();
+    let parsed = match WatchlistsListFilter::from_json_str(&filter_str) {
+        Some(f) => f,
+        None => return WatchlistJsonResult::err(WATCHLIST_ERR_INVALID_INPUT),
+    };
+
+    let watchlist_uuid = match parsed.watchlist_uuid.as_deref().filter(|s| !s.is_empty()) {
+        None => None,
+        Some(v) => match uuid::Uuid::parse_str(v) {
+            Ok(u) => Some(u),
+            Err(_) => return WatchlistJsonResult::err(WATCHLIST_ERR_INVALID_INPUT),
+        },
+    };
+
+    let result = runtime().block_on(async {
+        services
+            .browse_watchlists_handler
+            .list(watchlist_uuid, &token)
+            .await
+    });
+
+    match result {
+        Ok(watchlists) => {
+            let json = serde_json::to_string(&watchlists).unwrap_or_default();
+            WatchlistJsonResult::ok(json)
+        }
+        Err(err) => map_watchlist_err(err),
+    }
+}
+
 fn parse_file_type(s: &str) -> Option<alexandria_core::catalog::model::FileType> {
     use alexandria_core::catalog::model::FileType;
     match s {
