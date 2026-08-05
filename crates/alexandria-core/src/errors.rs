@@ -15,6 +15,10 @@ pub enum DomainError {
     /// caller is told the disk operation failed and nothing was committed.
     #[error("disk error: {0}")]
     Disk(String),
+    /// A write succeeded but the post-write content hash does not match the
+    /// submitted bytes, even after one retry (UC-33 AF-03).
+    #[error("integrity error: {0}")]
+    Integrity(String),
     #[error("database error: {0}")]
     Database(#[from] sqlx::Error),
     #[error("database migration error: {0}")]
@@ -36,5 +40,9 @@ impl DomainError {
 
     pub fn disk(message: impl Into<String>) -> Self {
         Self::Disk(message.into())
+    }
+
+    pub fn integrity(message: impl Into<String>) -> Self {
+        Self::Integrity(message.into())
     }
 }

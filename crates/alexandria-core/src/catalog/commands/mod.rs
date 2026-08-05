@@ -1,3 +1,4 @@
+pub mod edit_content;
 pub mod edit_metadata;
 pub mod index;
 pub mod purge;

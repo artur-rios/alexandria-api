@@ -6,7 +6,7 @@ pub mod routes;
 use std::sync::Arc;
 
 use axum::middleware::from_fn_with_state;
-use axum::routing::{delete, get, patch, post};
+use axum::routing::{delete, get, patch, post, put};
 use axum::Router;
 use tower_http::trace::TraceLayer;
 
@@ -40,6 +40,10 @@ pub fn app(settings: Settings, services: Arc<Services>) -> Router {
         .route(
             "/v1/files/{uuid}/content",
             get(routes::text_content::get_content),
+        )
+        .route(
+            "/v1/files/{uuid}/content",
+            put(routes::text_content::edit_content),
         )
         .route("/v1/files/{uuid}", get(routes::browse::get_file))
         .route("/v1/files/{uuid}", delete(routes::delete_file::delete_file))

@@ -35,6 +35,7 @@ pub const FILE_ERR_NOT_INITIALIZED: c_int = 3;
 pub const FILE_ERR_NOT_FOUND: c_int = 4;
 pub const FILE_ERR_INVALID_STATE: c_int = 5;
 pub const FILE_ERR_DISK: c_int = 6;
+pub const FILE_ERR_INTEGRITY: c_int = 7;
 pub const FILE_ERR_OTHER: c_int = 9;
 
 /// FFI status codes returned by collection operations (UC-10+). Deliberately
@@ -620,6 +621,82 @@ pub extern "C" fn alexandria_file_read_content(
     match result {
         Ok(content) => {
             let json = serde_json::to_string(&content).unwrap_or_default();
+            FileJsonResult::ok(json)
+        }
+        Err(err) => map_file_err(err),
+    }
+}
+
+/// Request body accepted by `alexandria_file_edit_content` — the same JSON
+/// `PUT /v1/files/{uuid}/content` takes: `{"content":"…"}`.
+#[derive(Debug)]
+struct EditContentBody {
+    content: String,
+}
+
+impl EditContentBody {
+    fn from_json_str(s: &str) -> Option<Self> {
+        let value: serde_json::Value = serde_json::from_str(s).ok()?;
+        let obj = value.as_object()?;
+        let content = obj.get("content")?.as_str()?.to_string();
+        Some(Self { content })
+    }
+}
+
+/// Write edited content back to a TextFile on disk (UC-33 / FR-TX-02,
+/// FR-TX-03).
+///
+/// `uuid` is the file's public UUID (NUL-terminated string). `json_body` is
+/// the JSON body HTTP would send (`content`). The function deserializes it,
+/// calls the same `EditTextFileContentHandler` the HTTP route uses, and on
+/// success serializes the returned `File` back to JSON — so the FFI and
+/// HTTP surfaces agree byte-for-byte modulo key ordering (parity,
+/// FR-FC-24 / NFR-09). `token` is the bearer auth token.
+#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
+#[no_mangle]
+pub extern "C" fn alexandria_file_edit_content(
+    uuid: *const c_char,
+    json_body: *const c_char,
+    token: *const c_char,
+) -> FileJsonResult {
+    let services = match services_slot().lock().unwrap().clone() {
+        Some(s) => s,
+        None => return FileJsonResult::err(FILE_ERR_NOT_INITIALIZED),
+    };
+
+    let token = cstr_lossy(token).unwrap_or_default();
+    if !authenticated(&services, &token) {
+        return FileJsonResult::err(FILE_ERR_UNAUTHORIZED);
+    }
+
+    let uuid_str = match cstr_lossy(uuid) {
+        Some(s) => s,
+        None => return FileJsonResult::err(FILE_ERR_INVALID_INPUT),
+    };
+    let uuid = match uuid::Uuid::parse_str(&uuid_str) {
+        Ok(u) => u,
+        Err(_) => return FileJsonResult::err(FILE_ERR_INVALID_INPUT),
+    };
+
+    let body_str = match cstr_lossy(json_body) {
+        Some(s) => s,
+        None => return FileJsonResult::err(FILE_ERR_INVALID_INPUT),
+    };
+    let body = match EditContentBody::from_json_str(&body_str) {
+        Some(b) => b,
+        None => return FileJsonResult::err(FILE_ERR_INVALID_INPUT),
+    };
+
+    let result = runtime().block_on(async {
+        services
+            .edit_text_file_content_handler
+            .edit(uuid, body.content, &token)
+            .await
+    });
+
+    match result {
+        Ok(file) => {
+            let json = serde_json::to_string(&file).unwrap_or_default();
             FileJsonResult::ok(json)
         }
         Err(err) => map_file_err(err),
@@ -2255,6 +2332,7 @@ fn map_file_err(err: DomainError) -> FileJsonResult {
         DomainError::InvalidInput(_) => FileJsonResult::err(FILE_ERR_INVALID_INPUT),
         DomainError::InvalidState => FileJsonResult::err(FILE_ERR_INVALID_STATE),
         DomainError::Disk(_) => FileJsonResult::err(FILE_ERR_DISK),
+        DomainError::Integrity(_) => FileJsonResult::err(FILE_ERR_INTEGRITY),
         _ => FileJsonResult::err(FILE_ERR_OTHER),
     }
 }
