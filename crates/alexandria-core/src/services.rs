@@ -15,6 +15,8 @@ use crate::catalog::commands::soft_delete::SoftDeleteFileHandler;
 use crate::catalog::fs::StdFilesystem;
 use crate::catalog::queries::browse::BrowseFilesHandler;
 use crate::catalog::repos::SqliteCatalogRepository;
+use crate::collections::commands::create::CreateCollectionHandler;
+use crate::collections::repos::SqliteCollectionRepository;
 use crate::config::Settings;
 
 /// Concrete index handler wired with the runtime collaborators: the bearer
@@ -47,6 +49,9 @@ pub type DefaultPurgeFileOnDiskHandler =
 
 pub type DefaultBrowseFilesHandler = BrowseFilesHandler<BearerAuthService, SqliteCatalogRepository>;
 
+pub type DefaultCreateCollectionHandler =
+    CreateCollectionHandler<BearerAuthService, SqliteCollectionRepository>;
+
 #[derive(Clone)]
 pub struct Services {
     pub index_handler: Arc<DefaultIndexHandler>,
@@ -58,6 +63,7 @@ pub struct Services {
     pub purge_file_handler: Arc<DefaultPurgeFileHandler>,
     pub purge_file_on_disk_handler: Arc<DefaultPurgeFileOnDiskHandler>,
     pub browse_files_handler: Arc<DefaultBrowseFilesHandler>,
+    pub create_collection_handler: Arc<DefaultCreateCollectionHandler>,
     /// The same auth service the handlers hold, exposed so a transport can
     /// reject an unauthenticated caller *before* it parses a request body or
     /// path (FR-AU-07 / SRD §7). Handlers still authenticate independently —
@@ -94,6 +100,10 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
     ));
     let purge_file_on_disk_handler = Arc::new(PurgeFileOnDiskHandler::new(auth, repo.clone(), fs));
     let browse_files_handler = Arc::new(BrowseFilesHandler::new(auth, repo));
+    let create_collection_handler = Arc::new(CreateCollectionHandler::new(
+        auth,
+        SqliteCollectionRepository::new(pool.clone()),
+    ));
     Services {
         index_handler,
         refresh_handler,
@@ -104,6 +114,7 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         purge_file_handler,
         purge_file_on_disk_handler,
         browse_files_handler,
+        create_collection_handler,
         auth,
         pool,
     }
