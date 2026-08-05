@@ -25,7 +25,7 @@ pub struct DeleteQuery {
     pub purge_on_disk: Option<bool>,
 }
 
-/// The success body of [`soft_delete`]. Untagged so the wire shape for
+/// The success body of [`delete_file`]. Untagged so the wire shape for
 /// UC-06/UC-08 (a bare `File`) is unchanged; only the UC-09 branch adds the
 /// `diskFilePresent` field via [`PurgeOnDiskOutcome`].
 #[derive(Debug, serde::Serialize)]
@@ -63,12 +63,21 @@ pub enum DeleteResult {
 /// `404` (uuid not found — AF-03), `500` (disk error — AF-02, the record is
 /// left untouched), or `401` (AF-04).
 ///
+/// One `500` on the `?purge-on-disk=true` branch is not what it looks like:
+/// when the on-disk delete succeeds but the catalog write then fails, the
+/// error renders as the generic `{"error": "database error"}` even though the
+/// file is already gone from disk. The response is indistinguishable from
+/// "nothing happened", so a client must not read it as such. Retrying the
+/// same call is safe and is the intended recovery — the second attempt finds
+/// no on-disk file (AF-01), removes the now-orphaned row, and returns `200`
+/// with `diskFilePresent: false`.
+///
 /// The path and query are each taken as `Result` so a rejection becomes
 /// this surface's `400` + `{"error": …}` envelope rather than axum's
 /// bare-text `422`. Authentication has already happened in `require_auth`,
 /// so reaching this point means the caller is the owner. Neither operation
 /// takes a body — both are parameterless state transitions.
-pub async fn soft_delete(
+pub async fn delete_file(
     State(state): State<AppState>,
     uuid: Result<Path<Uuid>, PathRejection>,
     query: Result<Query<DeleteQuery>, QueryRejection>,
@@ -77,8 +86,8 @@ pub async fn soft_delete(
     let token = bearer_token(&headers);
 
     let Path(uuid) = uuid.map_err(|_| invalid_input("path segment is not a valid UUID"))?;
-    let Query(query) = query
-        .map_err(|_| invalid_input("purge and purge-on-disk must be true or false"))?;
+    let Query(query) =
+        query.map_err(|_| invalid_input("purge and purge-on-disk must be true or false"))?;
 
     if query.purge == Some(true) && query.purge_on_disk == Some(true) {
         return Err(invalid_input(
