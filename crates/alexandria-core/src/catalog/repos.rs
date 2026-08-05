@@ -29,8 +29,7 @@ pub trait CatalogRepository: Send + Sync {
     ) -> Result<(), DomainError>;
     /// Mark a cataloged path's disk file as gone (UC-02 AF-01). Sets
     /// `missing_at`; leaves `state` (soft-delete is UC-06) and `deleted_at`.
-    async fn mark_missing(&self, path: &str, missing_at: DateTime<Utc>)
-        -> Result<(), DomainError>;
+    async fn mark_missing(&self, path: &str, missing_at: DateTime<Utc>) -> Result<(), DomainError>;
     /// Replace the editable subtype columns of the file identified by `uuid`
     /// (UC-04 / FR-FC-14..18). Full replace: every editable column listed in
     /// `SubtypeMetadata` is written, `None` writes `NULL`. Non-editable
@@ -91,11 +90,8 @@ pub trait CatalogRepository: Send + Sync {
     ///
     /// Returns the re-read `File` (so the caller sees the exact persisted
     /// `state`/`deleted_at`) or `NotFound` when no row carries the UUID.
-    async fn soft_delete(
-        &self,
-        uuid: Uuid,
-        deleted_at: DateTime<Utc>,
-    ) -> Result<File, DomainError>;
+    async fn soft_delete(&self, uuid: Uuid, deleted_at: DateTime<Utc>)
+        -> Result<File, DomainError>;
 
     /// Restore a soft-deleted file (UC-07 / FR-FC-21). Sets the row's `state`
     /// back to `'active'` and clears `deleted_at`; the on-disk file is
@@ -516,16 +512,22 @@ impl CatalogRepository for SqliteCatalogRepository {
                         && genre.is_none()
                         && track.is_none();
                     (!all_none).then_some(SubtypeMetadata::Audio {
-                        title, artist, album, year, genre, track,
+                        title,
+                        artist,
+                        album,
+                        year,
+                        genre,
+                        track,
                     })
                 })
             }
             FileType::Video => {
-                let r: Option<VideoRow> =
-                    sqlx::query_as("SELECT title, year, resolution, media_kind FROM video_files WHERE file_id = ?")
-                        .bind(id)
-                        .fetch_optional(&self.pool)
-                        .await?;
+                let r: Option<VideoRow> = sqlx::query_as(
+                    "SELECT title, year, resolution, media_kind FROM video_files WHERE file_id = ?",
+                )
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await?;
                 r.and_then(|(title, year, resolution, media_kind)| {
                     let all_none = title.is_none()
                         && year.is_none()
@@ -540,11 +542,12 @@ impl CatalogRepository for SqliteCatalogRepository {
                 })
             }
             FileType::Document => {
-                let r: Option<DocumentRow> =
-                    sqlx::query_as("SELECT title, author, year, format_kind FROM documents WHERE file_id = ?")
-                        .bind(id)
-                        .fetch_optional(&self.pool)
-                        .await?;
+                let r: Option<DocumentRow> = sqlx::query_as(
+                    "SELECT title, author, year, format_kind FROM documents WHERE file_id = ?",
+                )
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await?;
                 r.and_then(|(title, author, year, format_kind)| {
                     let all_none = title.is_none()
                         && author.is_none()
@@ -559,14 +562,14 @@ impl CatalogRepository for SqliteCatalogRepository {
                 })
             }
             FileType::Comic => {
-                let r: Option<ComicRow> =
-                    sqlx::query_as("SELECT title, series, issue_number FROM comic_books WHERE file_id = ?")
-                        .bind(id)
-                        .fetch_optional(&self.pool)
-                        .await?;
+                let r: Option<ComicRow> = sqlx::query_as(
+                    "SELECT title, series, issue_number FROM comic_books WHERE file_id = ?",
+                )
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await?;
                 r.and_then(|(title, series, issue_number)| {
-                    let all_none =
-                        title.is_none() && series.is_none() && issue_number.is_none();
+                    let all_none = title.is_none() && series.is_none() && issue_number.is_none();
                     (!all_none).then_some(SubtypeMetadata::Comic {
                         title,
                         series,
@@ -664,12 +667,13 @@ impl CatalogRepository for SqliteCatalogRepository {
             .await?
             .ok_or(DomainError::NotFound)?;
 
-        let affected = sqlx::query("UPDATE files SET state = 'deleted', deleted_at = ? WHERE id = ?")
-            .bind(deleted_at.to_rfc3339())
-            .bind(id)
-            .execute(&mut *tx)
-            .await?
-            .rows_affected();
+        let affected =
+            sqlx::query("UPDATE files SET state = 'deleted', deleted_at = ? WHERE id = ?")
+                .bind(deleted_at.to_rfc3339())
+                .bind(id)
+                .execute(&mut *tx)
+                .await?
+                .rows_affected();
         if affected == 0 {
             return Err(DomainError::internal(format!(
                 "soft_delete matched zero rows for uuid {uuid}"
@@ -702,11 +706,12 @@ impl CatalogRepository for SqliteCatalogRepository {
             .await?
             .ok_or(DomainError::NotFound)?;
 
-        let affected = sqlx::query("UPDATE files SET state = 'active', deleted_at = NULL WHERE id = ?")
-            .bind(id)
-            .execute(&mut *tx)
-            .await?
-            .rows_affected();
+        let affected =
+            sqlx::query("UPDATE files SET state = 'active', deleted_at = NULL WHERE id = ?")
+                .bind(id)
+                .execute(&mut *tx)
+                .await?
+                .rows_affected();
         if affected == 0 {
             return Err(DomainError::internal(format!(
                 "restore matched zero rows for uuid {uuid}"
@@ -742,6 +747,13 @@ impl CatalogRepository for SqliteCatalogRepository {
 
         let file_type = parse_type_str(&type_str)?;
 
+        // Unlike `update_metadata`, a zero-row subtype DELETE is *not* an
+        // error here. `update_metadata` needs the row to exist because it is
+        // writing to it — a missing row means the edit silently went nowhere.
+        // Purge only needs the row *gone*, which a zero-row DELETE already
+        // guarantees. Failing here would leave the `files` row behind and
+        // make the operation permanently unretryable for the very rows whose
+        // subtype is already missing.
         sqlx::query(Self::delete_subtype_sql(file_type))
             .bind(id)
             .execute(&mut *tx)
@@ -785,7 +797,9 @@ fn parse_file_row(row: FileRow) -> Result<File, DomainError> {
     ) = row;
 
     let uuid = Uuid::parse_str(&uuid_str).map_err(|_| {
-        DomainError::internal(format!("corrupt catalog row: unparseable uuid {uuid_str:?}"))
+        DomainError::internal(format!(
+            "corrupt catalog row: unparseable uuid {uuid_str:?}"
+        ))
     })?;
     let file_type = parse_type_str(&type_str)?;
     let state = match state_str.as_str() {
