@@ -71,7 +71,7 @@ pub fn validate_file_name(name: &str) -> Result<String, DomainError> {
 /// parity check; doing the slice entirely in `str` keeps the separator
 /// end-to-end identical over both transports (FR-FC-24 / NFR-09).
 fn sibling_path(old_path: &str, new_name: &str) -> String {
-    match old_path.rfind(|c| c == '/' || c == '\\') {
+    match old_path.rfind(['/', '\\']) {
         Some(i) => {
             let mut s = String::with_capacity(i + 1 + new_name.len());
             s.push_str(&old_path[..=i]);

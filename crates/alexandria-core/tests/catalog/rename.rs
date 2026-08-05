@@ -33,14 +33,22 @@ fn fs_with_file(path: &str) -> FakeFilesystem {
 }
 
 /// Seed an active cataloged file and return (uuid, repo, fs, handler).
-fn seeded(path: &str, name: &str) -> (
+fn seeded(
+    path: &str,
+    name: &str,
+) -> (
     Uuid,
     FakeCatalogRepository,
     FakeFilesystem,
     RenameFileHandler<FakeAuth, FakeCatalogRepository, FakeFilesystem>,
 ) {
     let repo = FakeCatalogRepository::new();
-    let file = existing_file_with_hash(path, name, alexandria_core::catalog::model::FileType::Audio, "h");
+    let file = existing_file_with_hash(
+        path,
+        name,
+        alexandria_core::catalog::model::FileType::Audio,
+        "h",
+    );
     let uuid = file.uuid;
     repo.seed(file);
     let fs = fs_with_file(path);
@@ -51,16 +59,23 @@ fn seeded(path: &str, name: &str) -> (
 // ---------------- Main flow ----------------
 
 #[tokio::test]
-async fn given_active_file_when_rename_then_disk_moved_catalog_updated_returned_file_carries_new_name_and_path() {
+async fn given_active_file_when_rename_then_disk_moved_catalog_updated_returned_file_carries_new_name_and_path(
+) {
     let (uuid, repo, fs, h) = seeded("/lib/song.mp3", "song.mp3");
     let expected_new_path = "/lib/new-name.mp3";
 
-    let result = h.rename(uuid, "new-name.mp3".to_string(), TOKEN).await.expect("rename");
+    let result = h
+        .rename(uuid, "new-name.mp3".to_string(), TOKEN)
+        .await
+        .expect("rename");
 
     assert_eq!(result.uuid, uuid);
     assert_eq!(result.name, "new-name.mp3");
     assert_eq!(result.path, expected_new_path);
-    assert!(fs.renamed_to("/lib/song.mp3", expected_new_path), "on-disk rename recorded");
+    assert!(
+        fs.renamed_to("/lib/song.mp3", expected_new_path),
+        "on-disk rename recorded"
+    );
     assert_eq!(repo.file_for_uuid(uuid).unwrap().name, "new-name.mp3");
     assert_eq!(repo.file_for_uuid(uuid).unwrap().path, expected_new_path);
 }
@@ -86,7 +101,10 @@ async fn given_name_with_path_separator_when_rename_then_invalid_input() {
     let (uuid, _repo, _fs, h) = seeded("/lib/song.mp3", "song.mp3");
     for bad in ["a/b", "a\\b"] {
         let err = h.rename(uuid, bad.to_string(), TOKEN).await;
-        assert!(matches!(err, Err(DomainError::InvalidInput(_))), "name {bad:?} should be rejected");
+        assert!(
+            matches!(err, Err(DomainError::InvalidInput(_))),
+            "name {bad:?} should be rejected"
+        );
     }
 }
 
@@ -105,7 +123,10 @@ async fn given_name_with_reserved_char_when_rename_then_invalid_input() {
     for bad in ['<', '>', ':', '"', '|', '?', '*'] {
         let name = format!("a{bad}b");
         let err = h.rename(uuid, name, TOKEN).await;
-        assert!(matches!(err, Err(DomainError::InvalidInput(_))), "reserved {bad:?} rejected");
+        assert!(
+            matches!(err, Err(DomainError::InvalidInput(_))),
+            "reserved {bad:?} rejected"
+        );
     }
 }
 
@@ -162,8 +183,18 @@ async fn given_disk_rename_fails_when_rename_then_disk_error_and_catalog_unchang
 #[tokio::test]
 async fn given_target_path_cataloged_for_other_file_when_rename_then_disk_error_no_disk_move() {
     let repo = FakeCatalogRepository::new();
-    let a = existing_file_with_hash("/lib/a.mp3", "a.mp3", alexandria_core::catalog::model::FileType::Audio, "h");
-    let b = existing_file_with_hash("/lib/b.mp3", "b.mp3", alexandria_core::catalog::model::FileType::Audio, "h");
+    let a = existing_file_with_hash(
+        "/lib/a.mp3",
+        "a.mp3",
+        alexandria_core::catalog::model::FileType::Audio,
+        "h",
+    );
+    let b = existing_file_with_hash(
+        "/lib/b.mp3",
+        "b.mp3",
+        alexandria_core::catalog::model::FileType::Audio,
+        "h",
+    );
     let uuid_a = a.uuid;
     repo.seed(a);
     repo.seed(b);
@@ -173,7 +204,11 @@ async fn given_target_path_cataloged_for_other_file_when_rename_then_disk_error_
     // Rename a onto b's path would collide with b's cataloged path.
     let result = h.rename(uuid_a, "b.mp3".to_string(), TOKEN).await;
     assert!(matches!(result, Err(DomainError::Disk(_))));
-    assert_eq!(fs.rename_count(), 0, "no disk move attempted when the target is cataloged");
+    assert_eq!(
+        fs.rename_count(),
+        0,
+        "no disk move attempted when the target is cataloged"
+    );
 }
 
 #[tokio::test]
@@ -194,11 +229,16 @@ async fn given_target_path_exists_on_disk_when_rename_then_disk_error_no_disk_mo
 
     let result = h.rename(uuid, "new-name.mp3".to_string(), TOKEN).await;
     assert!(matches!(result, Err(DomainError::Disk(_))));
-    assert_eq!(fs.rename_count(), 0, "no disk move attempted when the target already exists on disk");
+    assert_eq!(
+        fs.rename_count(),
+        0,
+        "no disk move attempted when the target already exists on disk"
+    );
 }
 
 #[tokio::test]
-async fn given_disk_rename_succeeds_but_catalog_fails_when_rename_then_disk_rolled_back_and_catalog_unchanged() {
+async fn given_disk_rename_succeeds_but_catalog_fails_when_rename_then_disk_rolled_back_and_catalog_unchanged(
+) {
     // Arrange a seeded file and tell the fake repo to refuse `rename_file`
     // for it — the on-disk rename succeeds, then the catalog write fails, so
     // the handler must compensate by moving the on-disk file back to its
@@ -226,8 +266,14 @@ async fn given_disk_rename_succeeds_but_catalog_fails_when_rename_then_disk_roll
     assert_eq!(repo.file_for_uuid(uuid).unwrap().name, "song.mp3");
     assert_eq!(repo.file_for_uuid(uuid).unwrap().path, "/lib/song.mp3");
     // The on-disk rename was attempted and then rolled back to the original.
-    assert!(fs.renamed_to("/lib/song.mp3", "/lib/new-name.mp3"), "disk rename happened");
-    assert!(fs.renamed_to("/lib/new-name.mp3", "/lib/song.mp3"), "disk rollback happened");
+    assert!(
+        fs.renamed_to("/lib/song.mp3", "/lib/new-name.mp3"),
+        "disk rename happened"
+    );
+    assert!(
+        fs.renamed_to("/lib/new-name.mp3", "/lib/song.mp3"),
+        "disk rollback happened"
+    );
 }
 
 // ---------------- AF-03: file UUID does not exist ----------------
@@ -248,7 +294,12 @@ async fn given_missing_uuid_when_rename_then_not_found() {
 #[tokio::test]
 async fn given_unauthenticated_when_rename_then_unauthorized_and_no_disk_move() {
     let repo = FakeCatalogRepository::new();
-    let file = existing_file_with_hash("/lib/song.mp3", "song.mp3", alexandria_core::catalog::model::FileType::Audio, "h");
+    let file = existing_file_with_hash(
+        "/lib/song.mp3",
+        "song.mp3",
+        alexandria_core::catalog::model::FileType::Audio,
+        "h",
+    );
     let uuid = file.uuid;
     repo.seed(file);
     let fs = fs_with_file("/lib/song.mp3");
@@ -264,7 +315,11 @@ async fn given_unauthenticated_when_rename_then_unauthorized_and_no_disk_move() 
 #[tokio::test]
 async fn given_deleted_file_when_rename_then_invalid_state() {
     let repo = FakeCatalogRepository::new();
-    let file = deleted_file("/lib/d.mp3", "d.mp3", alexandria_core::catalog::model::FileType::Audio);
+    let file = deleted_file(
+        "/lib/d.mp3",
+        "d.mp3",
+        alexandria_core::catalog::model::FileType::Audio,
+    );
     let uuid = file.uuid;
     repo.seed(file);
     let fs = fs_with_file("/lib/d.mp3");
@@ -283,12 +338,15 @@ async fn given_deleted_file_when_rename_then_invalid_state() {
 async fn given_new_name_equals_current_when_rename_then_no_move_no_write_unchanged_file() {
     let (uuid, repo, fs, h) = seeded("/lib/song.mp3", "song.mp3");
 
-    let result = h.rename(uuid, "song.mp3".to_string(), TOKEN).await.expect("noop");
+    let result = h
+        .rename(uuid, "song.mp3".to_string(), TOKEN)
+        .await
+        .expect("noop");
 
     assert_eq!(result.name, "song.mp3");
     assert_eq!(result.path, "/lib/song.mp3");
     assert_eq!(fs.rename_count(), 0, "no disk move");
-    assert!(fs.renamed_to("/lib/song.mp3", "/lib/song.mp3") == false);
+    assert!(!fs.renamed_to("/lib/song.mp3", "/lib/song.mp3"));
     // Catalog row unchanged.
     assert_eq!(repo.file_for_uuid(uuid).unwrap().name, "song.mp3");
     assert_eq!(repo.file_for_uuid(uuid).unwrap().path, "/lib/song.mp3");

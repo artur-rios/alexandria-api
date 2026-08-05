@@ -13,6 +13,17 @@ fn serial() -> std::sync::MutexGuard<'static, ()> {
     SERIAL.lock().unwrap()
 }
 
+/// The editable columns of an `audio_files` row, in the order every
+/// assertion here selects them: title, artist, album, year, genre, track.
+type AudioMetadataRow = (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<i64>,
+    Option<String>,
+    Option<i64>,
+);
+
 use alexandria_ffi::{
     alexandria_file_edit_metadata, alexandria_file_purge, alexandria_file_purge_on_disk,
     alexandria_file_rename, alexandria_file_restore, alexandria_file_soft_delete,
@@ -48,9 +59,18 @@ fn c(s: &str) -> CString {
 }
 
 fn run_id_string(r: &IndexStartResult) -> String {
-    let n = r.run_id.iter().position(|&ch| ch == 0).unwrap_or(r.run_id.len());
-    String::from_utf8_lossy(&r.run_id[..n].iter().map(|&ch| ch as u8).collect::<Vec<u8>>())
-        .into_owned()
+    let n = r
+        .run_id
+        .iter()
+        .position(|&ch| ch == 0)
+        .unwrap_or(r.run_id.len());
+    String::from_utf8_lossy(
+        &r.run_id[..n]
+            .iter()
+            .map(|&ch| ch as u8)
+            .collect::<Vec<u8>>(),
+    )
+    .into_owned()
 }
 
 fn wait_for_files(expected: i64) -> i64 {
@@ -105,7 +125,9 @@ fn given_supported_files_when_ffi_index_start_then_returns_ok_with_run_id_and_pe
     // SAFETY: returned by the FFI accessor as a NUL-terminated string.
     let json = unsafe { CStr::from_ptr(raw) }.to_str().unwrap().to_string();
     // SAFETY: pointer came from this library and is freed once.
-    unsafe { alexandria_free_string(raw); }
+    unsafe {
+        alexandria_free_string(raw);
+    }
     let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
     assert_eq!(parsed.as_array().unwrap().len(), 2);
     assert_eq!(parsed[0]["type"], "audio");
@@ -151,7 +173,9 @@ fn files_json_value() -> serde_json::Value {
     // SAFETY: returned by the FFI accessor as a NUL-terminated string.
     let json = unsafe { CStr::from_ptr(raw) }.to_str().unwrap().to_string();
     // SAFETY: pointer came from this library and is freed once.
-    unsafe { alexandria_free_string(raw); }
+    unsafe {
+        alexandria_free_string(raw);
+    }
     serde_json::from_str(&json).unwrap()
 }
 
@@ -253,7 +277,9 @@ fn metadata_json(result: FileMetadataResult) -> serde_json::Value {
         .unwrap()
         .to_string();
     // SAFETY: pointer came from this library and is freed once.
-    unsafe { alexandria_free_string(result.json); }
+    unsafe {
+        alexandria_free_string(result.json);
+    }
     serde_json::from_str(&json).expect("FileMetadata json")
 }
 
@@ -315,11 +341,9 @@ fn given_indexed_audio_file_when_ffi_edit_metadata_then_ok_and_row_updated() {
     assert_eq!(wait_for_files(1), 1);
 
     let uuid = uuid_by_name(&db_path, "song.mp3");
-    let patch = c(
-        r#"{"type":"audio","title":"New Title","artist":"Artist","year":2001,"track":3}"#,
-    );
-    let result =
-        alexandria_file_edit_metadata(c(&uuid).as_ptr(), patch.as_ptr(), token.as_ptr());
+    let patch =
+        c(r#"{"type":"audio","title":"New Title","artist":"Artist","year":2001,"track":3}"#);
+    let result = alexandria_file_edit_metadata(c(&uuid).as_ptr(), patch.as_ptr(), token.as_ptr());
 
     let json = metadata_json(result);
     assert_eq!(json["file"]["uuid"], uuid);
@@ -331,14 +355,7 @@ fn given_indexed_audio_file_when_ffi_edit_metadata_then_ok_and_row_updated() {
     // Persisted subtype row reflects the full-replace PATCH.
     let uuid_clone = uuid.clone();
     let row = with_db(&db_path, move |pool| async move {
-        let row: (
-            Option<String>,
-            Option<String>,
-            Option<String>,
-            Option<i64>,
-            Option<String>,
-            Option<i64>,
-        ) = sqlx::query_as(
+        let row: AudioMetadataRow = sqlx::query_as(
             "SELECT title, artist, album, year, genre, track FROM audio_files \
              JOIN files ON files.id = audio_files.file_id WHERE files.uuid = ?",
         )
@@ -371,8 +388,7 @@ fn given_ffi_edit_metadata_variant_mismatch_then_invalid_input() {
 
     let uuid = uuid_by_name(&db_path, "song.mp3");
     let patch = c(r#"{"type":"video","title":"x"}"#);
-    let result =
-        alexandria_file_edit_metadata(c(&uuid).as_ptr(), patch.as_ptr(), token.as_ptr());
+    let result = alexandria_file_edit_metadata(c(&uuid).as_ptr(), patch.as_ptr(), token.as_ptr());
     assert_eq!(result.status, STATUS_FILE_INVALID_INPUT);
     assert!(result.json.is_null());
 }
@@ -390,8 +406,7 @@ fn given_ffi_edit_metadata_bad_patch_json_then_invalid_input() {
 
     let uuid = uuid_by_name(&db_path, "song.mp3");
     let patch = c("not-json-at-all");
-    let result =
-        alexandria_file_edit_metadata(c(&uuid).as_ptr(), patch.as_ptr(), token.as_ptr());
+    let result = alexandria_file_edit_metadata(c(&uuid).as_ptr(), patch.as_ptr(), token.as_ptr());
     assert_eq!(result.status, STATUS_FILE_INVALID_INPUT);
 }
 
@@ -420,8 +435,7 @@ fn given_ffi_edit_metadata_no_token_then_unauthorized() {
     let uuid = uuid_by_name(&db_path, "song.mp3");
     let patch = c(r#"{"type":"audio","title":"x"}"#);
     let empty = c("");
-    let result =
-        alexandria_file_edit_metadata(c(&uuid).as_ptr(), patch.as_ptr(), empty.as_ptr());
+    let result = alexandria_file_edit_metadata(c(&uuid).as_ptr(), patch.as_ptr(), empty.as_ptr());
     assert_eq!(result.status, STATUS_FILE_UNAUTHORIZED);
 }
 
@@ -448,8 +462,7 @@ fn given_ffi_edit_metadata_deleted_file_then_invalid_state() {
     });
 
     let patch = c(r#"{"type":"audio","title":"x"}"#);
-    let result =
-        alexandria_file_edit_metadata(c(&uuid).as_ptr(), patch.as_ptr(), token.as_ptr());
+    let result = alexandria_file_edit_metadata(c(&uuid).as_ptr(), patch.as_ptr(), token.as_ptr());
     assert_eq!(result.status, STATUS_FILE_INVALID_STATE);
 }
 
@@ -474,10 +487,19 @@ fn _ffi_file_status_constants_are_stable() {
 
 /// Result JSON of a `FileJsonResult` on success, parsed. Asserts `FILE_OK`.
 fn file_json_ok(result: alexandria_ffi::FileJsonResult) -> serde_json::Value {
-    assert_eq!(result.status, STATUS_FILE_OK, "expected FILE_OK, got {}", result.status);
+    assert_eq!(
+        result.status, STATUS_FILE_OK,
+        "expected FILE_OK, got {}",
+        result.status
+    );
     assert!(!result.json.is_null(), "success must carry a json pointer");
-    let json = unsafe { CStr::from_ptr(result.json) }.to_str().unwrap().to_string();
-    unsafe { alexandria_free_string(result.json); }
+    let json = unsafe { CStr::from_ptr(result.json) }
+        .to_str()
+        .unwrap()
+        .to_string();
+    unsafe {
+        alexandria_free_string(result.json);
+    }
     serde_json::from_str(&json).expect("File json")
 }
 
@@ -505,19 +527,24 @@ fn given_indexed_file_when_ffi_rename_then_ok_and_disk_and_catalog_updated() {
     assert!(new_path.ends_with("renamed.mp3"));
 
     // On-disk file moved.
-    assert!(!lib.path().join("song.mp3").exists(), "old path gone after rename");
+    assert!(
+        !lib.path().join("song.mp3").exists(),
+        "old path gone after rename"
+    );
     assert!(lib.path().join("renamed.mp3").exists(), "new path present");
-    assert_eq!(std::fs::read(lib.path().join("renamed.mp3")).unwrap(), b"audio bytes");
+    assert_eq!(
+        std::fs::read(lib.path().join("renamed.mp3")).unwrap(),
+        b"audio bytes"
+    );
 
     // Catalog row updated.
-    let (name, path): (String, String) =
-        with_db(&db_path, move |pool| async move {
-            sqlx::query_as("SELECT name, path FROM files WHERE uuid = ?")
-                .bind(&uuid)
-                .fetch_one(&pool)
-                .await
-                .expect("catalog row")
-        });
+    let (name, path): (String, String) = with_db(&db_path, move |pool| async move {
+        sqlx::query_as("SELECT name, path FROM files WHERE uuid = ?")
+            .bind(&uuid)
+            .fetch_one(&pool)
+            .await
+            .expect("catalog row")
+    });
     assert_eq!(name, "renamed.mp3");
     assert!(path.ends_with("renamed.mp3"));
 }
@@ -537,7 +564,10 @@ fn given_ffi_rename_invalid_name_then_invalid_input() {
     for bad in ["/x", "..", "a:b"] {
         let bad = c(bad);
         let result = alexandria_file_rename(c(&uuid).as_ptr(), bad.as_ptr(), token.as_ptr());
-        assert_eq!(result.status, STATUS_FILE_INVALID_INPUT, "bad name rejected");
+        assert_eq!(
+            result.status, STATUS_FILE_INVALID_INPUT,
+            "bad name rejected"
+        );
         assert!(result.json.is_null());
     }
 }
@@ -613,11 +643,17 @@ fn given_ffi_rename_target_owned_by_other_file_then_disk_error() {
     let uuid_a = uuid_by_name(&db_path, "a.mp3");
     let name = c("b.mp3");
     let result = alexandria_file_rename(c(&uuid_a).as_ptr(), name.as_ptr(), token.as_ptr());
-    assert_eq!(result.status, STATUS_FILE_DISK, "target-exists must map to FILE_ERR_DISK");
+    assert_eq!(
+        result.status, STATUS_FILE_DISK,
+        "target-exists must map to FILE_ERR_DISK"
+    );
     assert!(result.json.is_null());
 
     // a.mp3 left untouched on disk.
-    assert!(lib.path().join("a.mp3").exists(), "a.mp3 untouched after refusal");
+    assert!(
+        lib.path().join("a.mp3").exists(),
+        "a.mp3 untouched after refusal"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -648,18 +684,20 @@ fn given_indexed_file_when_ffi_soft_delete_then_ok_and_catalog_deleted() {
     );
 
     // The on-disk file is untouched (UC-06 leaves it; purge-on-disk is UC-09).
-    assert!(lib.path().join("song.mp3").exists(), "on-disk file preserved");
+    assert!(
+        lib.path().join("song.mp3").exists(),
+        "on-disk file preserved"
+    );
 
     // Catalog row carries state=deleted and a stamped deleted_at.
     let uuid_for_row = uuid.clone();
-    let (state, deleted_at): (String, Option<String>) =
-        with_db(&db_path, move |pool| async move {
-            sqlx::query_as("SELECT state, deleted_at FROM files WHERE uuid = ?")
-                .bind(&uuid_for_row)
-                .fetch_one(&pool)
-                .await
-                .expect("catalog row")
-        });
+    let (state, deleted_at): (String, Option<String>) = with_db(&db_path, move |pool| async move {
+        sqlx::query_as("SELECT state, deleted_at FROM files WHERE uuid = ?")
+            .bind(&uuid_for_row)
+            .fetch_one(&pool)
+            .await
+            .expect("catalog row")
+    });
     assert_eq!(state, "deleted");
     assert!(deleted_at.is_some(), "deleted_at stamped in the catalog");
 }
@@ -761,18 +799,20 @@ fn given_soft_deleted_file_when_ffi_restore_then_ok_and_catalog_active() {
     );
 
     // The on-disk file is untouched (UC-07 leaves it; purge-on-disk is UC-09).
-    assert!(lib.path().join("song.mp3").exists(), "on-disk file preserved");
+    assert!(
+        lib.path().join("song.mp3").exists(),
+        "on-disk file preserved"
+    );
 
     // Catalog row carries state=active and a cleared deleted_at.
     let uuid_for_row = uuid.clone();
-    let (state, deleted_at): (String, Option<String>) =
-        with_db(&db_path, move |pool| async move {
-            sqlx::query_as("SELECT state, deleted_at FROM files WHERE uuid = ?")
-                .bind(&uuid_for_row)
-                .fetch_one(&pool)
-                .await
-                .expect("catalog row")
-        });
+    let (state, deleted_at): (String, Option<String>) = with_db(&db_path, move |pool| async move {
+        sqlx::query_as("SELECT state, deleted_at FROM files WHERE uuid = ?")
+            .bind(&uuid_for_row)
+            .fetch_one(&pool)
+            .await
+            .expect("catalog row")
+    });
     assert_eq!(state, "active");
     assert!(deleted_at.is_none(), "deleted_at cleared in the catalog");
 }
@@ -898,7 +938,10 @@ fn given_soft_deleted_file_past_retention_when_ffi_purge_then_ok_and_rows_remove
     );
 
     // The on-disk file is untouched (NFR-07; purge-on-disk is UC-09).
-    assert!(lib.path().join("song.mp3").exists(), "on-disk file preserved");
+    assert!(
+        lib.path().join("song.mp3").exists(),
+        "on-disk file preserved"
+    );
 
     // The `files` row and its subtype row (audio_files) are both gone.
     let uuid_for_check = uuid.clone();
@@ -1118,7 +1161,10 @@ fn given_missing_disk_file_when_ffi_purge_on_disk_then_ok_and_absence_reported()
             .expect("files count");
         count
     });
-    assert_eq!(remaining, 0, "row still removed even though disk file was absent");
+    assert_eq!(
+        remaining, 0,
+        "row still removed even though disk file was absent"
+    );
 }
 
 #[test]
@@ -1149,7 +1195,8 @@ fn given_disk_delete_failure_when_ffi_purge_on_disk_then_disk_error_and_row_kept
     // Replace the indexed file with a directory at the same path so the
     // disk delete fails with something other than `NotFound` (AF-02).
     std::fs::remove_file(lib.path().join("song.mp3")).expect("pre-remove indexed file");
-    std::fs::create_dir(lib.path().join("song.mp3")).expect("create directory in place of indexed file");
+    std::fs::create_dir(lib.path().join("song.mp3"))
+        .expect("create directory in place of indexed file");
 
     let result = alexandria_file_purge_on_disk(c(&uuid).as_ptr(), token.as_ptr());
     assert_eq!(result.status, STATUS_FILE_DISK);
@@ -1171,8 +1218,14 @@ fn given_disk_delete_failure_when_ffi_purge_on_disk_then_disk_error_and_row_kept
                     .expect("audio_files count");
             (files, subtype)
         });
-    assert_eq!(files_remaining, 1, "AF-02: record kept when the disk delete fails");
-    assert_eq!(subtype_remaining, 1, "AF-02: subtype row kept when the disk delete fails");
+    assert_eq!(
+        files_remaining, 1,
+        "AF-02: record kept when the disk delete fails"
+    );
+    assert_eq!(
+        subtype_remaining, 1,
+        "AF-02: subtype row kept when the disk delete fails"
+    );
 }
 
 #[test]
