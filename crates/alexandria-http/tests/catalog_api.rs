@@ -1375,3 +1375,205 @@ async fn given_soft_deleted_file_past_retention_when_restore_file_then_404() {
     assert_eq!(row.0, "deleted");
     assert!(row.1.is_some(), "deleted_at unchanged by past-retention restore");
 }
+
+// ---------------------------------------------------------------------------
+// UC-08: DELETE /v1/files/{uuid}?purge=true (FR-FC-22, FR-FC-24)
+// ---------------------------------------------------------------------------
+
+fn purge_file_request(uuid: &str) -> Request<Body> {
+    Request::builder()
+        .method("DELETE")
+        .uri(format!("/v1/files/{uuid}?purge=true"))
+        .header("authorization", "Bearer test-token")
+        .body(Body::empty())
+        .unwrap()
+}
+
+#[tokio::test]
+async fn given_soft_deleted_file_past_retention_when_purged_then_200_and_rows_removed_and_disk_preserved() {
+    let lib = tempdir().unwrap();
+    let on_disk = common::write_file(&lib, "song.mp3", b"audio bytes");
+    let test = test_app().await;
+    index_library(&lib, &test.pool, &[("song.mp3", b"audio bytes")]).await;
+    let uuid = uuid_for_name(&test.pool, "song.mp3").await;
+
+    // `deleted_at` well past the default 30-day retention window.
+    sqlx::query("UPDATE files SET state = 'deleted', deleted_at = ? WHERE uuid = ?")
+        .bind("2024-01-01T00:00:00Z")
+        .bind(&uuid)
+        .execute(&test.pool)
+        .await
+        .expect("past-retention seed");
+
+    let file_id: (i64,) = sqlx::query_as("SELECT id FROM files WHERE uuid = ?")
+        .bind(&uuid)
+        .fetch_one(&test.pool)
+        .await
+        .expect("file id");
+
+    let response = app(Settings::default(), test.services)
+        .oneshot(purge_file_request(&uuid))
+        .await
+        .expect("purge one-shot");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body: Value = serde_json::from_slice(
+        &to_bytes(response.into_body(), usize::MAX).await.unwrap(),
+    )
+    .unwrap();
+    assert_eq!(body["uuid"], uuid);
+    assert_eq!(body["state"], "deleted", "confirmation echoes the pre-purge state");
+
+    // The `files` row is gone.
+    let remaining: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM files WHERE uuid = ?")
+        .bind(&uuid)
+        .fetch_one(&test.pool)
+        .await
+        .expect("files count");
+    assert_eq!(remaining.0, 0, "files row removed by purge");
+
+    // The subtype row (audio_files) is also gone.
+    let subtype_remaining: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM audio_files WHERE file_id = ?")
+        .bind(file_id.0)
+        .fetch_one(&test.pool)
+        .await
+        .expect("audio_files count");
+    assert_eq!(subtype_remaining.0, 0, "subtype row removed by purge");
+
+    // The on-disk file is untouched (NFR-07; purge-on-disk is UC-09).
+    assert!(on_disk.exists(), "on-disk file preserved by purge");
+}
+
+#[tokio::test]
+async fn given_soft_deleted_file_within_retention_when_purged_then_409_and_row_kept() {
+    let lib = tempdir().unwrap();
+    common::write_file(&lib, "song.mp3", b"x");
+    let test = test_app().await;
+    index_library(&lib, &test.pool, &[("song.mp3", b"x")]).await;
+    let uuid = uuid_for_name(&test.pool, "song.mp3").await;
+
+    // `deleted_at` comfortably within the default 30-day retention window.
+    sqlx::query("UPDATE files SET state = 'deleted', deleted_at = ? WHERE uuid = ?")
+        .bind(chrono::Utc::now() - chrono::Duration::days(1))
+        .bind(&uuid)
+        .execute(&test.pool)
+        .await
+        .expect("soft-delete seed");
+
+    let response = app(Settings::default(), test.services)
+        .oneshot(purge_file_request(&uuid))
+        .await
+        .expect("purge one-shot");
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+
+    let row: (String, Option<String>) =
+        sqlx::query_as("SELECT state, deleted_at FROM files WHERE uuid = ?")
+            .bind(&uuid)
+            .fetch_one(&test.pool)
+            .await
+            .expect("catalog row");
+    assert_eq!(row.0, "deleted");
+    assert!(row.1.is_some(), "row kept, deleted_at unchanged by rejected purge");
+}
+
+#[tokio::test]
+async fn given_active_file_when_purged_then_409() {
+    let lib = tempdir().unwrap();
+    common::write_file(&lib, "song.mp3", b"x");
+    let test = test_app().await;
+    index_library(&lib, &test.pool, &[("song.mp3", b"x")]).await;
+    let uuid = uuid_for_name(&test.pool, "song.mp3").await;
+
+    // Indexed but never soft-deleted — `state = 'active'` (AF-01: never
+    // started a retention window).
+    let response = app(Settings::default(), test.services)
+        .oneshot(purge_file_request(&uuid))
+        .await
+        .expect("purge one-shot");
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn given_missing_uuid_when_purged_then_404() {
+    let test = test_app().await;
+    let missing = uuid::Uuid::new_v4().to_string();
+    let response = app(Settings::default(), test.services)
+        .oneshot(purge_file_request(&missing))
+        .await
+        .expect("purge one-shot");
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn given_no_bearer_when_purged_then_401() {
+    let test = test_app().await;
+    let uuid = uuid::Uuid::new_v4().to_string();
+    let request = Request::builder()
+        .method("DELETE")
+        .uri(format!("/v1/files/{uuid}?purge=true"))
+        .body(Body::empty())
+        .unwrap();
+    let response = app(Settings::default(), test.services).oneshot(request).await.expect("one-shot");
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn given_no_bearer_and_malformed_uuid_when_purged_then_401_not_400() {
+    // Auth must be decided before the path is parsed (FR-AU-07 / SRD §7): a
+    // malformed uuid alone cannot turn a 401 into a 400.
+    let test = test_app().await;
+    let request = Request::builder()
+        .method("DELETE")
+        .uri("/v1/files/not-a-uuid?purge=true")
+        .body(Body::empty())
+        .unwrap();
+    let response = app(Settings::default(), test.services).oneshot(request).await.expect("one-shot");
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn given_non_boolean_purge_query_when_delete_then_400_with_error_envelope() {
+    let test = test_app().await;
+    let uuid = uuid::Uuid::new_v4().to_string();
+    let request = Request::builder()
+        .method("DELETE")
+        .uri(format!("/v1/files/{uuid}?purge=notabool"))
+        .header("authorization", "Bearer test-token")
+        .body(Body::empty())
+        .unwrap();
+    let response = app(Settings::default(), test.services).oneshot(request).await.expect("one-shot");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let body: Value = serde_json::from_slice(
+        &to_bytes(response.into_body(), usize::MAX).await.unwrap(),
+    )
+    .unwrap();
+    assert!(body["error"].as_str().is_some(), "error envelope present");
+}
+
+#[tokio::test]
+async fn given_no_purge_param_when_delete_then_still_soft_deletes() {
+    // Regression guard for UC-06: the bare `DELETE /v1/files/{uuid}` form
+    // (no `purge` query param) must still soft-delete, not hard-purge.
+    let lib = tempdir().unwrap();
+    let on_disk = common::write_file(&lib, "song.mp3", b"audio bytes");
+    let test = test_app().await;
+    index_library(&lib, &test.pool, &[("song.mp3", b"audio bytes")]).await;
+    let uuid = uuid_for_name(&test.pool, "song.mp3").await;
+
+    let response = app(Settings::default(), test.services)
+        .oneshot(delete_file_request(&uuid))
+        .await
+        .expect("delete one-shot");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let row: (String, Option<String>) =
+        sqlx::query_as("SELECT state, deleted_at FROM files WHERE uuid = ?")
+            .bind(&uuid)
+            .fetch_one(&test.pool)
+            .await
+            .expect("catalog row");
+    assert_eq!(row.0, "deleted", "no-param delete still soft-deletes (UC-06)");
+    assert!(row.1.is_some(), "deleted_at stamped by no-param delete");
+    assert!(on_disk.exists(), "on-disk file preserved");
+}
