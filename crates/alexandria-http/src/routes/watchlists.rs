@@ -7,7 +7,7 @@ use uuid::Uuid;
 
 use alexandria_core::errors::DomainError;
 use alexandria_core::watchlists::model::{
-    WatchProgress, WatchState, Watchlist, WatchlistWithProgress,
+    WatchProgress, WatchState, Watchlist, WatchlistItemResult, WatchlistWithProgress,
 };
 
 use crate::middleware::auth::invalid_input;
@@ -194,6 +194,36 @@ pub async fn update_progress(
             request.total_episodes,
             &token,
         )
+        .await
+        .map_err(ApiError)?;
+
+    Ok((StatusCode::OK, Json(result)))
+}
+
+/// `DELETE /v1/watchlists/{uuid}/items/{videoUuid}` — remove a video from a
+/// watchlist (UC-24 / FR-WL-06). Deletes the WatchProgress entry; the
+/// VideoFile itself is preserved. Returns `200` with the
+/// `watchlistUuid`/`videoUuid` as confirmation, or `404` (no WatchProgress
+/// for that video on that watchlist, AF-01), or `401` (unauthenticated).
+/// Both the HTTP and FFI surfaces call the same core handler so the two stay
+/// at parity (FR-FC-24 / NFR-09).
+///
+/// The path is taken as a `Result` so its rejection becomes this surface's
+/// `400` + `{"error": …}` envelope rather than axum's bare-text `400`.
+pub async fn remove_video(
+    State(state): State<AppState>,
+    uuids: Result<Path<(Uuid, Uuid)>, PathRejection>,
+    headers: HeaderMap,
+) -> Result<(StatusCode, Json<WatchlistItemResult>), ApiError> {
+    let token = bearer_token(&headers);
+
+    let Path((watchlist_uuid, video_uuid)) =
+        uuids.map_err(|_| invalid_input("path segment is not a valid UUID"))?;
+
+    let result = state
+        .services
+        .remove_video_from_watchlist_handler
+        .remove(watchlist_uuid, video_uuid, &token)
         .await
         .map_err(ApiError)?;
 

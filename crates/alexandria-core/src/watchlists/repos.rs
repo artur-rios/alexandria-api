@@ -63,6 +63,15 @@ pub trait WatchlistRepository: Send + Sync {
         current_episode: Option<i64>,
         total_episodes: Option<i64>,
     ) -> Result<WatchProgress, DomainError>;
+
+    /// Delete the WatchProgress linking `video_uuid` to `watchlist_uuid`
+    /// (UC-24 / FR-WL-06). The VideoFile itself is untouched. Returns
+    /// `NotFound` when no such WatchProgress exists (AF-01).
+    async fn remove_progress(
+        &self,
+        watchlist_uuid: Uuid,
+        video_uuid: Uuid,
+    ) -> Result<(), DomainError>;
 }
 
 #[derive(Clone)]
@@ -278,5 +287,26 @@ impl WatchlistRepository for SqliteWatchlistRepository {
             current_episode,
             total_episodes,
         })
+    }
+
+    async fn remove_progress(
+        &self,
+        watchlist_uuid: Uuid,
+        video_uuid: Uuid,
+    ) -> Result<(), DomainError> {
+        let affected = sqlx::query(
+            "DELETE FROM watch_progress \
+             WHERE watchlist_id = (SELECT id FROM watchlists WHERE uuid = ?) \
+               AND video_file_id = (SELECT id FROM files WHERE uuid = ?)",
+        )
+        .bind(watchlist_uuid.to_string())
+        .bind(video_uuid.to_string())
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        if affected == 0 {
+            return Err(DomainError::NotFound);
+        }
+        Ok(())
     }
 }

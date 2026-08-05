@@ -61,6 +61,15 @@ pub struct WatchProgress {
     pub total_episodes: Option<i64>,
 }
 
+/// Confirmation that a video was removed from a watchlist (UC-24 /
+/// FR-WL-06): the WatchProgress is deleted, the VideoFile is untouched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WatchlistItemResult {
+    pub watchlist_uuid: Uuid,
+    pub video_uuid: Uuid,
+}
+
 /// A watchlist with the WatchProgress of every video it tracks (UC-21 /
 /// FR-WL-08).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
