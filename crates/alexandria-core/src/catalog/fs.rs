@@ -26,6 +26,11 @@ pub trait Filesystem: Send + Sync {
     /// OS-dependent, so callers also pre-check it). Used by the rename
     /// handler, which leaves the catalog untouched if this fails (AF-02).
     async fn rename(&self, from: &str, to: &str) -> Result<(), DomainError>;
+    /// Delete the file at `path` (UC-09 / FR-FC-23). `Ok(true)` — the file was
+    /// present and is now gone. `Ok(false)` — no file was there (AF-01); the
+    /// caller still removes the record and reports the absence. `Err(Disk)` —
+    /// the delete failed (permission denied, AF-02); nothing was removed.
+    async fn remove_file(&self, path: &str) -> Result<bool, DomainError>;
 }
 
 /// Real on-disk filesystem backed by `walkdir` and `sha2`.
@@ -92,6 +97,14 @@ impl Filesystem for StdFilesystem {
     async fn rename(&self, from: &str, to: &str) -> Result<(), DomainError> {
         std::fs::rename(from, to)
             .map_err(|e| DomainError::disk(format!("rename {from:?} -> {to:?}: {e}")))
+    }
+
+    async fn remove_file(&self, path: &str) -> Result<bool, DomainError> {
+        match std::fs::remove_file(path) {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(DomainError::disk(format!("remove {path:?}: {e}"))),
+        }
     }
 }
 
