@@ -392,6 +392,9 @@ pub struct FakeCollectionRepository {
     /// When set, every `rename_collection` fails, simulating a catalog-write
     /// failure in UC-11.
     failing_renames: Arc<Mutex<bool>>,
+    /// When set, every `delete_collection` fails, simulating a catalog-write
+    /// failure in UC-12.
+    failing_deletes: Arc<Mutex<bool>>,
 }
 
 impl FakeCollectionRepository {
@@ -423,6 +426,11 @@ impl FakeCollectionRepository {
     /// Make every `rename_collection` return an `Internal` error.
     pub fn fail_renames(&self) {
         *self.failing_renames.lock().unwrap() = true;
+    }
+
+    /// Make every `delete_collection` return an `Internal` error.
+    pub fn fail_deletes(&self) {
+        *self.failing_deletes.lock().unwrap() = true;
     }
 }
 
@@ -458,6 +466,14 @@ impl CollectionRepository for FakeCollectionRepository {
         let collection = collections.get_mut(&uuid).ok_or(DomainError::NotFound)?;
         collection.name = name;
         Ok(collection.clone())
+    }
+
+    async fn delete_collection(&self, uuid: Uuid) -> Result<(), DomainError> {
+        if *self.failing_deletes.lock().unwrap() {
+            return Err(DomainError::internal("fake delete_collection failure"));
+        }
+        self.collections.lock().unwrap().remove(&uuid);
+        Ok(())
     }
 }
 

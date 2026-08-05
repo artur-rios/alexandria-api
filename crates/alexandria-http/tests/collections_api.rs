@@ -378,3 +378,128 @@ async fn given_no_token_and_malformed_body_when_posted_then_401_not_400() {
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     assert!(collection_rows(&test.pool).await.is_empty());
 }
+
+// ==================== UC-12: Delete a collection ====================
+
+fn delete_request(uuid: &str) -> Request<Body> {
+    Request::builder()
+        .method("DELETE")
+        .uri(format!("/v1/collections/{uuid}"))
+        .header("authorization", "Bearer test-token")
+        .body(Body::empty())
+        .unwrap()
+}
+
+fn unauthenticated_delete_request(uuid: &str) -> Request<Body> {
+    Request::builder()
+        .method("DELETE")
+        .uri(format!("/v1/collections/{uuid}"))
+        .body(Body::empty())
+        .unwrap()
+}
+
+/// Insert a minimal `files` row linked to the collection identified by
+/// `collection_uuid`, as UC-13 will once it ships. Used to assert UC-12
+/// unlinks rather than deletes contained items.
+async fn seed_linked_file(pool: &SqlitePool, collection_uuid: &str) -> String {
+    let file_uuid = uuid::Uuid::new_v4().to_string();
+    sqlx::query(
+        "INSERT INTO files (uuid, path, name, type, content_hash, indexed_at, collection_id) \
+         VALUES (?, ?, ?, 'text', 'hash', datetime('now'), \
+         (SELECT id FROM collections WHERE uuid = ?))",
+    )
+    .bind(&file_uuid)
+    .bind(format!("/lib/{file_uuid}.txt"))
+    .bind("note.txt")
+    .bind(collection_uuid)
+    .execute(pool)
+    .await
+    .expect("seed linked file");
+    file_uuid
+}
+
+// ---------------- Main flow ----------------
+
+#[tokio::test]
+async fn given_existing_collection_when_deleted_then_200_with_predelete_body_and_row_removed() {
+    let test = test_app().await;
+    let router = app(Settings::default(), test.services);
+    let (router, uuid) = create_collection(router, "Sci-fi novels").await;
+
+    let response = router.oneshot(delete_request(&uuid)).await.expect("delete");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_json(response).await;
+    assert_eq!(body["uuid"], uuid);
+    assert_eq!(body["name"], "Sci-fi novels");
+
+    assert!(collection_rows(&test.pool).await.is_empty());
+}
+
+#[tokio::test]
+async fn given_collection_with_linked_file_when_deleted_then_file_unlinked_not_removed() {
+    let test = test_app().await;
+    let router = app(Settings::default(), test.services);
+    let (router, uuid) = create_collection(router, "Sci-fi novels").await;
+    let file_uuid = seed_linked_file(&test.pool, &uuid).await;
+
+    let response = router.oneshot(delete_request(&uuid)).await.expect("delete");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let (kept_uuid, collection_id): (String, Option<i64>) =
+        sqlx::query_as("SELECT uuid, collection_id FROM files WHERE uuid = ?")
+            .bind(&file_uuid)
+            .fetch_one(&test.pool)
+            .await
+            .expect("file row kept");
+    assert_eq!(kept_uuid, file_uuid, "the file itself is preserved");
+    assert_eq!(
+        collection_id, None,
+        "the file is unlinked from the collection"
+    );
+}
+
+// ---------------- AF-01: not found ----------------
+
+#[tokio::test]
+async fn given_unknown_uuid_when_deleted_then_404() {
+    let test = test_app().await;
+    let router = app(Settings::default(), test.services);
+
+    let response = router
+        .oneshot(delete_request(&uuid::Uuid::new_v4().to_string()))
+        .await
+        .expect("delete");
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn given_non_uuid_path_segment_when_deleted_then_400() {
+    let test = test_app().await;
+    let router = app(Settings::default(), test.services);
+
+    let response = router
+        .oneshot(delete_request("not-a-uuid"))
+        .await
+        .expect("delete");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+// ---------------- AF-02: unauthorized ----------------
+
+#[tokio::test]
+async fn given_no_token_when_deleted_then_401_and_collection_kept() {
+    let test = test_app().await;
+    let router = app(Settings::default(), test.services);
+    let (router, uuid) = create_collection(router, "Sci-fi novels").await;
+
+    let response = router
+        .oneshot(unauthenticated_delete_request(&uuid))
+        .await
+        .expect("delete");
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(collection_rows(&test.pool).await.len(), 1);
+}

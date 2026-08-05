@@ -6,3 +6,6 @@ mod create;
 
 #[path = "collections/rename.rs"]
 mod rename;
+
+#[path = "collections/delete.rs"]
+mod delete;

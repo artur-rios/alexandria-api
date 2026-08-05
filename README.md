@@ -28,12 +28,12 @@ its open/closed state, so the tables stay in sync with the board automatically.
 | [F-02 Catalog browsing & metadata editing](https://github.com/artur-rios/alexandria-api/milestone/3) | UC-03 … UC-04 | 2 / 2 |
 | [F-03 Renaming & lifecycle management](https://github.com/artur-rios/alexandria-api/milestone/4) | UC-05 … UC-09 | 5 / 5 |
 | [F-04 Text file content editing](https://github.com/artur-rios/alexandria-api/milestone/5) | UC-32 … UC-33 | 0 / 2 |
-| [F-05 Collections](https://github.com/artur-rios/alexandria-api/milestone/6) | UC-10 … UC-14 | 2 / 5 |
+| [F-05 Collections](https://github.com/artur-rios/alexandria-api/milestone/6) | UC-10 … UC-14 | 3 / 5 |
 | [F-06 Bookmarks](https://github.com/artur-rios/alexandria-api/milestone/7) | UC-15 … UC-19 | 0 / 5 |
 | [F-07 Watchlists](https://github.com/artur-rios/alexandria-api/milestone/8) | UC-20 … UC-25 | 0 / 6 |
 | [F-08 Reading lists](https://github.com/artur-rios/alexandria-api/milestone/9) | UC-26 … UC-31 | 0 / 6 |
 | [F-09 Pluggable authentication](https://github.com/artur-rios/alexandria-api/milestone/10) | UC-34 … UC-36 | 0 / 3 |
-| **Total** | | **12 / 38** |
+| **Total** | | **13 / 38** |
 
 ### F-00 — Foundation & operations
 
@@ -92,7 +92,7 @@ Flat file and bookmark groupings; deleting a collection preserves its items.
 | --- | --- | :---: | --- | --- |
 | [#11](https://github.com/artur-rios/alexandria-api/issues/11) | UC-10 | &#9745; | Create a collection | FR-CO-01, FR-CO-02, FR-FC-24 |
 | [#12](https://github.com/artur-rios/alexandria-api/issues/12) | UC-11 | &#9745; | Rename a collection | FR-CO-03, FR-FC-24 |
-| [#13](https://github.com/artur-rios/alexandria-api/issues/13) | UC-12 | &#9744; | Delete a collection | FR-CO-04, FR-FC-24 |
+| [#13](https://github.com/artur-rios/alexandria-api/issues/13) | UC-12 | &#9745; | Delete a collection | FR-CO-04, FR-FC-24 |
 | [#14](https://github.com/artur-rios/alexandria-api/issues/14) | UC-13 | &#9744; | Add items to a collection | FR-CO-05, FR-FC-24 |
 | [#15](https://github.com/artur-rios/alexandria-api/issues/15) | UC-14 | &#9744; | Remove and list items in a collection | FR-CO-06, FR-CO-07, FR-FC-12, FR-FC-24 |
 

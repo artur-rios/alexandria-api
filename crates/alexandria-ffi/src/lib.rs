@@ -1032,6 +1032,55 @@ pub extern "C" fn alexandria_collection_rename(
     }
 }
 
+/// Delete a collection, unlinking its items (UC-12 / FR-CO-04).
+///
+/// `uuid` is the collection's public UUID (NUL-terminated string). On success
+/// `json` carries the pre-delete `Collection` as confirmation — byte-for-byte
+/// the same shape HTTP returns from `DELETE /v1/collections/{uuid}` (parity,
+/// FR-FC-24 / NFR-09). `token` is the bearer auth token.
+#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
+#[no_mangle]
+pub extern "C" fn alexandria_collection_delete(
+    uuid: *const c_char,
+    token: *const c_char,
+) -> CollectionJsonResult {
+    let services = match services_slot().lock().unwrap().clone() {
+        Some(s) => s,
+        None => return CollectionJsonResult::err(COLLECTION_ERR_NOT_INITIALIZED),
+    };
+
+    // Deny before touching the payload — an unauthenticated caller must not
+    // learn whether the uuid would have parsed.
+    let token = cstr_lossy(token).unwrap_or_default();
+    if !authenticated(&services, &token) {
+        return CollectionJsonResult::err(COLLECTION_ERR_UNAUTHORIZED);
+    }
+
+    let uuid_str = match cstr_lossy(uuid) {
+        Some(s) => s,
+        None => return CollectionJsonResult::err(COLLECTION_ERR_INVALID_INPUT),
+    };
+    let uuid = match uuid::Uuid::parse_str(&uuid_str) {
+        Ok(u) => u,
+        Err(_) => return CollectionJsonResult::err(COLLECTION_ERR_INVALID_INPUT),
+    };
+
+    let result = runtime().block_on(async {
+        services
+            .delete_collection_handler
+            .delete(uuid, &token)
+            .await
+    });
+
+    match result {
+        Ok(collection) => {
+            let json = serde_json::to_string(&collection).unwrap_or_default();
+            CollectionJsonResult::ok(json)
+        }
+        Err(err) => map_collection_err(err),
+    }
+}
+
 fn parse_file_type(s: &str) -> Option<alexandria_core::catalog::model::FileType> {
     use alexandria_core::catalog::model::FileType;
     match s {

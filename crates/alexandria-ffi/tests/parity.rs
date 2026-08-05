@@ -17,12 +17,13 @@ use alexandria_core::config::Settings;
 use alexandria_core::migrate::migrate_database;
 use alexandria_core::services::build_services;
 use alexandria_ffi::{
-    alexandria_collection_create, alexandria_collection_rename, alexandria_file_edit_metadata,
-    alexandria_file_get_by_uuid, alexandria_file_purge, alexandria_file_purge_on_disk,
-    alexandria_file_rename, alexandria_file_restore, alexandria_file_soft_delete,
-    alexandria_files_list, alexandria_free_string, alexandria_index_count_files,
-    alexandria_index_count_missing, alexandria_index_files_json, alexandria_index_init,
-    alexandria_index_refresh_start, alexandria_index_start, IndexStartResult,
+    alexandria_collection_create, alexandria_collection_delete, alexandria_collection_rename,
+    alexandria_file_edit_metadata, alexandria_file_get_by_uuid, alexandria_file_purge,
+    alexandria_file_purge_on_disk, alexandria_file_rename, alexandria_file_restore,
+    alexandria_file_soft_delete, alexandria_files_list, alexandria_free_string,
+    alexandria_index_count_files, alexandria_index_count_missing, alexandria_index_files_json,
+    alexandria_index_init, alexandria_index_refresh_start, alexandria_index_start,
+    IndexStartResult,
 };
 use alexandria_http::app;
 use axum::body::{to_bytes, Body};
@@ -3597,6 +3598,175 @@ async fn given_unknown_uuid_when_renamed_via_http_and_ffi_then_both_not_found() 
         let token = CString::new("parity").unwrap();
         let r = alexandria_collection_rename(uuid_c.as_ptr(), body.as_ptr(), token.as_ptr());
         assert!(r.json.is_null(), "a rejected rename returns no body");
+        r.status
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(
+        ffi_status,
+        alexandria_ffi::COLLECTION_ERR_NOT_FOUND,
+        "ffi must reject an unknown uuid as not-found (HTTP 404)"
+    );
+}
+
+/// UC-12 parity — delete the same collection over both transports and assert
+/// the returned bodies agree and neither catalog holds the row afterwards
+/// (Testing Specification §7.3, FR-CO-04, FR-FC-24).
+#[tokio::test]
+async fn given_same_collection_when_deleted_via_http_and_ffi_then_bodies_and_rows_identical() {
+    let _g = SERIAL.lock().unwrap();
+
+    // ---- HTTP leg ----
+    let http_dir = tempdir().unwrap();
+    let http_db = db_path(&http_dir, "http.sqlite");
+    let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    let http_services =
+        std::sync::Arc::new(build_services(&Settings::default(), http_pool.clone()).await);
+    let router = app(Settings::default(), http_services);
+
+    let create_req = Request::builder()
+        .method("POST")
+        .uri("/v1/collections")
+        .header("authorization", "Bearer parity")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({ "name": "Sci-fi novels", "kind": "file" }).to_string(),
+        ))
+        .unwrap();
+    let create_resp = router
+        .clone()
+        .oneshot(create_req)
+        .await
+        .expect("http create");
+    assert_eq!(create_resp.status(), axum::http::StatusCode::CREATED);
+    let created: serde_json::Value =
+        serde_json::from_slice(&to_bytes(create_resp.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
+    let http_uuid = created["uuid"].as_str().unwrap().to_string();
+
+    let delete_req = Request::builder()
+        .method("DELETE")
+        .uri(format!("/v1/collections/{http_uuid}"))
+        .header("authorization", "Bearer parity")
+        .body(Body::empty())
+        .unwrap();
+    let delete_resp = router.oneshot(delete_req).await.expect("http delete");
+    assert_eq!(delete_resp.status(), axum::http::StatusCode::OK);
+    let http_body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(delete_resp.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
+
+    let (http_count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM collections")
+        .fetch_one(&http_pool)
+        .await
+        .unwrap();
+
+    // ---- FFI leg ----
+    let ffi_dir = tempdir().unwrap();
+    let ffi_db = db_path(&ffi_dir, "ffi.sqlite");
+    let ffi_db_for_rows = ffi_db.clone();
+    let ffi_body: serde_json::Value = tokio::task::spawn_blocking(move || -> serde_json::Value {
+        let cdb = CString::new(ffi_db).unwrap();
+        assert_eq!(
+            alexandria_index_init(cdb.as_ptr()),
+            alexandria_ffi::INDEX_OK
+        );
+
+        let create_body =
+            CString::new(json!({ "name": "Sci-fi novels", "kind": "file" }).to_string()).unwrap();
+        let token = CString::new("parity").unwrap();
+        let created = alexandria_collection_create(create_body.as_ptr(), token.as_ptr());
+        assert_eq!(created.status, alexandria_ffi::COLLECTION_OK, "ffi create");
+        // SAFETY: pointer came from this library and is freed once below.
+        let created_json = unsafe { CStr::from_ptr(created.json) }
+            .to_string_lossy()
+            .into_owned();
+        unsafe {
+            alexandria_free_string(created.json);
+        }
+        let created_value: serde_json::Value = serde_json::from_str(&created_json).unwrap();
+        let uuid = created_value["uuid"].as_str().unwrap().to_string();
+
+        let uuid_c = CString::new(uuid).unwrap();
+        let r = alexandria_collection_delete(uuid_c.as_ptr(), token.as_ptr());
+        assert_eq!(r.status, alexandria_ffi::COLLECTION_OK, "ffi delete");
+        assert!(!r.json.is_null());
+        let s = unsafe { CStr::from_ptr(r.json) }
+            .to_string_lossy()
+            .into_owned();
+        unsafe {
+            alexandria_free_string(r.json);
+        }
+        serde_json::from_str(&s).unwrap()
+    })
+    .await
+    .unwrap();
+
+    let ffi_pool = migrate_database(&ffi_db_for_rows).await.expect("ffi open");
+    let (ffi_count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM collections")
+        .fetch_one(&ffi_pool)
+        .await
+        .unwrap();
+
+    // ---- compare ----
+    for (label, body) in [("http", &http_body), ("ffi", &ffi_body)] {
+        let uuid = body["uuid"].as_str().unwrap_or_default();
+        assert!(
+            uuid::Uuid::parse_str(uuid).is_ok(),
+            "{label} body carries a valid uuid"
+        );
+        assert_eq!(
+            body["name"], "Sci-fi novels",
+            "{label} body is the pre-delete record"
+        );
+    }
+
+    assert_eq!(http_count, 0, "http removed the collection");
+    assert_eq!(ffi_count, 0, "ffi removed the collection");
+
+    ffi_pool.close().await;
+}
+
+/// UC-12 parity — an unknown uuid is rejected as not-found on both surfaces
+/// (HTTP 404, FFI `COLLECTION_ERR_NOT_FOUND`) (AF-01, FR-FC-24 / NFR-09).
+#[tokio::test]
+async fn given_unknown_uuid_when_deleted_via_http_and_ffi_then_both_not_found() {
+    let _g = SERIAL.lock().unwrap();
+
+    // ---- HTTP leg ----
+    let http_dir = tempdir().unwrap();
+    let http_db = db_path(&http_dir, "http.sqlite");
+    let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    let http_services =
+        std::sync::Arc::new(build_services(&Settings::default(), http_pool.clone()).await);
+    let unknown = uuid::Uuid::new_v4();
+    let req = Request::builder()
+        .method("DELETE")
+        .uri(format!("/v1/collections/{unknown}"))
+        .header("authorization", "Bearer parity")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app(Settings::default(), http_services)
+        .oneshot(req)
+        .await
+        .expect("http delete");
+    assert_eq!(resp.status(), axum::http::StatusCode::NOT_FOUND);
+
+    // ---- FFI leg ----
+    let ffi_dir = tempdir().unwrap();
+    let ffi_db = db_path(&ffi_dir, "ffi.sqlite");
+    let ffi_status = tokio::task::spawn_blocking(move || -> i32 {
+        let cdb = CString::new(ffi_db).unwrap();
+        assert_eq!(
+            alexandria_index_init(cdb.as_ptr()),
+            alexandria_ffi::INDEX_OK
+        );
+
+        let uuid_c = CString::new(unknown.to_string()).unwrap();
+        let token = CString::new("parity").unwrap();
+        let r = alexandria_collection_delete(uuid_c.as_ptr(), token.as_ptr());
+        assert!(r.json.is_null(), "a rejected delete returns no body");
         r.status
     })
     .await

@@ -42,6 +42,10 @@ pub fn app(settings: Settings, services: Arc<Services>) -> Router {
         .route("/v1/files/{uuid}/restore", post(routes::restore::restore))
         .route("/v1/collections", post(routes::collections::create))
         .route("/v1/collections/{uuid}", patch(routes::collections::rename))
+        .route(
+            "/v1/collections/{uuid}",
+            delete(routes::collections::delete),
+        )
         .route_layer(from_fn_with_state(
             state.clone(),
             middleware::auth::require_auth,

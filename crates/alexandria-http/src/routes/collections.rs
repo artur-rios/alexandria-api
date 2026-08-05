@@ -96,3 +96,31 @@ pub async fn rename(
 
     Ok((StatusCode::OK, Json(result)))
 }
+
+/// `DELETE /v1/collections/{uuid}` — delete a collection (UC-12 / FR-CO-04).
+/// Unlinks every item the collection holds without deleting them, then
+/// removes the collection. Returns `200` with the pre-delete `Collection` as
+/// confirmation, or `404` (uuid), or `401` (unauthenticated). Both the HTTP
+/// and FFI surfaces call the same core handler so the two stay at parity
+/// (FR-FC-24 / NFR-09).
+///
+/// The path is taken as a `Result` so its rejection becomes this surface's
+/// `400` + `{"error": …}` envelope rather than axum's bare-text `400`.
+pub async fn delete(
+    State(state): State<AppState>,
+    uuid: Result<Path<Uuid>, PathRejection>,
+    headers: HeaderMap,
+) -> Result<(StatusCode, Json<Collection>), ApiError> {
+    let token = bearer_token(&headers);
+
+    let Path(uuid) = uuid.map_err(|_| invalid_input("path segment is not a valid UUID"))?;
+
+    let result = state
+        .services
+        .delete_collection_handler
+        .delete(uuid, &token)
+        .await
+        .map_err(ApiError)?;
+
+    Ok((StatusCode::OK, Json(result)))
+}
