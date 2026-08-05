@@ -82,6 +82,10 @@ pub fn app(settings: Settings, services: Arc<Services>) -> Router {
         )
         .route("/v1/watchlists/{uuid}", delete(routes::watchlists::delete))
         .route("/v1/reading-lists", post(routes::reading_lists::create))
+        .route(
+            "/v1/reading-lists/{uuid}/items",
+            post(routes::reading_lists::add_item),
+        )
         .route_layer(from_fn_with_state(
             state.clone(),
             middleware::auth::require_auth,

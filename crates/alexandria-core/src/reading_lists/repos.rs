@@ -1,14 +1,19 @@
 use sqlx::sqlite::SqlitePool;
+use sqlx::Row;
+use uuid::Uuid;
 
 use crate::errors::DomainError;
-use crate::reading_lists::model::{NewReadingList, ReadingList};
+use crate::reading_lists::model::{
+    NewReadingList, ReadingList, ReadingProgress, ReadingState, ReadingTargetKind,
+};
 
 /// Reading lists repository port. The create handler depends on this trait
 /// so its decision logic (validation, uuid minting) is unit-tested against
 /// an in-memory fake with no database (Testing Specification §6.2). The
-/// Sqlite implementation persists `reading_lists` rows.
+/// Sqlite implementation persists `reading_lists` and `reading_progress`
+/// rows.
 ///
-/// UC-27..31 add their own methods when they ship.
+/// UC-29..31 add their own methods when they ship.
 #[allow(async_fn_in_trait)]
 pub trait ReadingListRepository: Send + Sync {
     /// Persist a new reading list and return the stored record (UC-26 /
@@ -17,6 +22,24 @@ pub trait ReadingListRepository: Send + Sync {
         &self,
         new_reading_list: NewReadingList,
     ) -> Result<ReadingList, DomainError>;
+
+    /// Look a reading list up by its public uuid (UC-28 AF-02). `None` when
+    /// no such reading list exists.
+    async fn find_by_uuid(&self, uuid: Uuid) -> Result<Option<ReadingList>, DomainError>;
+
+    /// Link the item identified by `item_uuid` (a `target_kind` of
+    /// `Document` or `Comic`) to the reading list identified by
+    /// `reading_list_uuid`, creating a `Pending` ReadingProgress (UC-28 /
+    /// FR-RL-02), and return it. Idempotent: if the pair is already linked,
+    /// the existing ReadingProgress is returned unchanged rather than reset
+    /// to `Pending` — UC-29 may have already advanced it. The caller has
+    /// already confirmed both exist and that the item is read-eligible.
+    async fn add_item(
+        &self,
+        reading_list_uuid: Uuid,
+        item_uuid: Uuid,
+        target_kind: ReadingTargetKind,
+    ) -> Result<ReadingProgress, DomainError>;
 }
 
 #[derive(Clone)]
@@ -27,6 +50,48 @@ pub struct SqliteReadingListRepository {
 impl SqliteReadingListRepository {
     pub fn new(pool: SqlitePool) -> Self {
         Self { pool }
+    }
+
+    async fn find_progress(
+        &self,
+        reading_list_uuid: Uuid,
+        item_uuid: Uuid,
+    ) -> Result<Option<ReadingProgress>, DomainError> {
+        let row = sqlx::query(
+            "SELECT rp.target_kind, rp.state, rp.current_issue, rp.total_issues \
+             FROM reading_progress rp \
+             JOIN reading_lists rl ON rl.id = rp.reading_list_id \
+             JOIN files f ON f.id = rp.item_file_id \
+             WHERE rl.uuid = ? AND f.uuid = ?",
+        )
+        .bind(reading_list_uuid.to_string())
+        .bind(item_uuid.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+
+        let Some(row) = row else {
+            return Ok(None);
+        };
+
+        let target_kind_str: String = row.try_get("target_kind")?;
+        let state_str: String = row.try_get("state")?;
+        let current_issue: Option<i64> = row.try_get("current_issue")?;
+        let total_issues: Option<i64> = row.try_get("total_issues")?;
+
+        Ok(Some(ReadingProgress {
+            reading_list_uuid,
+            item_uuid,
+            target_kind: ReadingTargetKind::parse(&target_kind_str).ok_or_else(|| {
+                DomainError::internal(format!(
+                    "corrupt reading_progress target_kind: {target_kind_str}"
+                ))
+            })?,
+            state: ReadingState::parse(&state_str).ok_or_else(|| {
+                DomainError::internal(format!("corrupt reading_progress state: {state_str}"))
+            })?,
+            current_issue,
+            total_issues,
+        }))
     }
 }
 
@@ -45,5 +110,52 @@ impl ReadingListRepository for SqliteReadingListRepository {
             uuid: new_reading_list.uuid,
             name: new_reading_list.name,
         })
+    }
+
+    async fn find_by_uuid(&self, uuid: Uuid) -> Result<Option<ReadingList>, DomainError> {
+        let row = sqlx::query("SELECT uuid, name FROM reading_lists WHERE uuid = ?")
+            .bind(uuid.to_string())
+            .fetch_optional(&self.pool)
+            .await?;
+
+        Ok(match row {
+            Some(row) => {
+                let uuid: String = row.try_get("uuid")?;
+                let name: String = row.try_get("name")?;
+                Some(ReadingList {
+                    uuid: Uuid::parse_str(&uuid).map_err(|err| {
+                        DomainError::internal(format!("corrupt reading list uuid: {err}"))
+                    })?,
+                    name,
+                })
+            }
+            None => None,
+        })
+    }
+
+    async fn add_item(
+        &self,
+        reading_list_uuid: Uuid,
+        item_uuid: Uuid,
+        target_kind: ReadingTargetKind,
+    ) -> Result<ReadingProgress, DomainError> {
+        sqlx::query(
+            "INSERT INTO reading_progress (reading_list_id, item_file_id, target_kind, state) \
+             VALUES ( \
+                (SELECT id FROM reading_lists WHERE uuid = ?), \
+                (SELECT id FROM files WHERE uuid = ?), \
+                ?, 'pending' \
+             ) \
+             ON CONFLICT (reading_list_id, item_file_id) DO NOTHING",
+        )
+        .bind(reading_list_uuid.to_string())
+        .bind(item_uuid.to_string())
+        .bind(target_kind.as_str())
+        .execute(&self.pool)
+        .await?;
+
+        self.find_progress(reading_list_uuid, item_uuid)
+            .await?
+            .ok_or(DomainError::NotFound)
     }
 }

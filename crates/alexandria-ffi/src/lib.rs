@@ -2383,6 +2383,84 @@ pub extern "C" fn alexandria_reading_list_create(
     }
 }
 
+/// Request body accepted by `alexandria_reading_list_add_item` — the same
+/// JSON `POST /v1/reading-lists/{uuid}/items` takes: `{"itemUuid":"…"}`.
+#[derive(Debug)]
+struct AddItemToReadingListBody {
+    item_uuid: uuid::Uuid,
+}
+
+impl AddItemToReadingListBody {
+    fn from_json_str(s: &str) -> Option<Self> {
+        let value: serde_json::Value = serde_json::from_str(s).ok()?;
+        let obj = value.as_object()?;
+        let raw = obj.get("itemUuid")?.as_str()?;
+        Some(Self {
+            item_uuid: uuid::Uuid::parse_str(raw).ok()?,
+        })
+    }
+}
+
+/// Add a book or comic to a reading list (UC-28 / FR-RL-02, FR-RL-03).
+///
+/// `uuid` is the reading list's public UUID (NUL-terminated string).
+/// `json_body` is the JSON body HTTP would send (`itemUuid`). The function
+/// deserializes it, calls the same `AddItemToReadingListHandler` the HTTP
+/// route uses, and on success serializes the returned `ReadingProgress`
+/// back to JSON — so the FFI and HTTP surfaces agree byte-for-byte modulo
+/// key ordering (parity, FR-FC-24 / NFR-09). `token` is the bearer auth
+/// token.
+#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
+#[no_mangle]
+pub extern "C" fn alexandria_reading_list_add_item(
+    uuid: *const c_char,
+    json_body: *const c_char,
+    token: *const c_char,
+) -> ReadingListJsonResult {
+    let services = match services_slot().lock().unwrap().clone() {
+        Some(s) => s,
+        None => return ReadingListJsonResult::err(READING_LIST_ERR_NOT_INITIALIZED),
+    };
+
+    let token = cstr_lossy(token).unwrap_or_default();
+    if !authenticated(&services, &token) {
+        return ReadingListJsonResult::err(READING_LIST_ERR_UNAUTHORIZED);
+    }
+
+    let uuid_str = match cstr_lossy(uuid) {
+        Some(s) => s,
+        None => return ReadingListJsonResult::err(READING_LIST_ERR_INVALID_INPUT),
+    };
+    let uuid = match uuid::Uuid::parse_str(&uuid_str) {
+        Ok(u) => u,
+        Err(_) => return ReadingListJsonResult::err(READING_LIST_ERR_INVALID_INPUT),
+    };
+
+    let body_str = match cstr_lossy(json_body) {
+        Some(s) => s,
+        None => return ReadingListJsonResult::err(READING_LIST_ERR_INVALID_INPUT),
+    };
+    let body = match AddItemToReadingListBody::from_json_str(&body_str) {
+        Some(b) => b,
+        None => return ReadingListJsonResult::err(READING_LIST_ERR_INVALID_INPUT),
+    };
+
+    let result = runtime().block_on(async {
+        services
+            .add_item_to_reading_list_handler
+            .add(uuid, body.item_uuid, &token)
+            .await
+    });
+
+    match result {
+        Ok(progress) => {
+            let json = serde_json::to_string(&progress).unwrap_or_default();
+            ReadingListJsonResult::ok(json)
+        }
+        Err(err) => map_reading_list_err(err),
+    }
+}
+
 /// Free a string previously returned by an FFI accessor.
 ///
 /// # Safety

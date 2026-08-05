@@ -29,6 +29,7 @@ use crate::collections::commands::rename::RenameCollectionHandler;
 use crate::collections::queries::list_items::ListCollectionItemsHandler;
 use crate::collections::repos::SqliteCollectionRepository;
 use crate::config::Settings;
+use crate::reading_lists::commands::add_item::AddItemToReadingListHandler;
 use crate::reading_lists::commands::create::CreateReadingListHandler;
 use crate::reading_lists::repos::SqliteReadingListRepository;
 use crate::watchlists::commands::add_video::AddVideoToWatchlistHandler;
@@ -138,6 +139,12 @@ pub type DefaultDeleteWatchlistHandler =
 pub type DefaultCreateReadingListHandler =
     CreateReadingListHandler<BearerAuthService, SqliteReadingListRepository>;
 
+pub type DefaultAddItemToReadingListHandler = AddItemToReadingListHandler<
+    BearerAuthService,
+    SqliteReadingListRepository,
+    SqliteCatalogRepository,
+>;
+
 #[derive(Clone)]
 pub struct Services {
     pub index_handler: Arc<DefaultIndexHandler>,
@@ -167,6 +174,7 @@ pub struct Services {
     pub remove_video_from_watchlist_handler: Arc<DefaultRemoveVideoFromWatchlistHandler>,
     pub delete_watchlist_handler: Arc<DefaultDeleteWatchlistHandler>,
     pub create_reading_list_handler: Arc<DefaultCreateReadingListHandler>,
+    pub add_item_to_reading_list_handler: Arc<DefaultAddItemToReadingListHandler>,
     /// The same auth service the handlers hold, exposed so a transport can
     /// reject an unauthenticated caller *before* it parses a request body or
     /// path (FR-AU-07 / SRD §7). Handlers still authenticate independently —
@@ -279,8 +287,15 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
     ));
     let delete_watchlist_handler = Arc::new(DeleteWatchlistHandler::new(auth, watchlist_repo));
     let reading_list_repo = SqliteReadingListRepository::new(pool.clone());
-    let create_reading_list_handler =
-        Arc::new(CreateReadingListHandler::new(auth, reading_list_repo));
+    let create_reading_list_handler = Arc::new(CreateReadingListHandler::new(
+        auth,
+        reading_list_repo.clone(),
+    ));
+    let add_item_to_reading_list_handler = Arc::new(AddItemToReadingListHandler::new(
+        auth,
+        reading_list_repo,
+        repo.clone(),
+    ));
     Services {
         index_handler,
         refresh_handler,
@@ -309,6 +324,7 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         remove_video_from_watchlist_handler,
         delete_watchlist_handler,
         create_reading_list_handler,
+        add_item_to_reading_list_handler,
         auth,
         pool,
     }
