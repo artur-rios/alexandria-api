@@ -1276,4 +1276,20 @@ impl ReadingListRepository for FakeReadingListRepository {
         progress.insert((reading_list_uuid, item_uuid), updated.clone());
         Ok(updated)
     }
+
+    async fn remove_progress(
+        &self,
+        reading_list_uuid: Uuid,
+        item_uuid: Uuid,
+    ) -> Result<(), DomainError> {
+        let removed = self
+            .progress
+            .lock()
+            .unwrap()
+            .remove(&(reading_list_uuid, item_uuid));
+        match removed {
+            Some(_) => Ok(()),
+            None => Err(DomainError::NotFound),
+        }
+    }
 }
