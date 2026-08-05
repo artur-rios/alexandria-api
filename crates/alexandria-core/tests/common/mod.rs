@@ -1239,4 +1239,41 @@ impl ReadingListRepository for FakeReadingListRepository {
             });
         Ok(entry.clone())
     }
+
+    async fn find_progress(
+        &self,
+        reading_list_uuid: Uuid,
+        item_uuid: Uuid,
+    ) -> Result<Option<ReadingProgress>, DomainError> {
+        Ok(self
+            .progress
+            .lock()
+            .unwrap()
+            .get(&(reading_list_uuid, item_uuid))
+            .cloned())
+    }
+
+    async fn update_progress(
+        &self,
+        reading_list_uuid: Uuid,
+        item_uuid: Uuid,
+        state: ReadingState,
+        current_issue: Option<i64>,
+        total_issues: Option<i64>,
+    ) -> Result<ReadingProgress, DomainError> {
+        let mut progress = self.progress.lock().unwrap();
+        let existing = progress
+            .get(&(reading_list_uuid, item_uuid))
+            .ok_or(DomainError::NotFound)?;
+        let updated = ReadingProgress {
+            reading_list_uuid,
+            item_uuid,
+            target_kind: existing.target_kind,
+            state,
+            current_issue,
+            total_issues,
+        };
+        progress.insert((reading_list_uuid, item_uuid), updated.clone());
+        Ok(updated)
+    }
 }

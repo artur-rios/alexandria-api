@@ -31,6 +31,7 @@ use crate::collections::repos::SqliteCollectionRepository;
 use crate::config::Settings;
 use crate::reading_lists::commands::add_item::AddItemToReadingListHandler;
 use crate::reading_lists::commands::create::CreateReadingListHandler;
+use crate::reading_lists::commands::update_progress::UpdateReadingProgressHandler;
 use crate::reading_lists::queries::browse::BrowseReadingListsHandler;
 use crate::reading_lists::repos::SqliteReadingListRepository;
 use crate::watchlists::commands::add_video::AddVideoToWatchlistHandler;
@@ -149,6 +150,9 @@ pub type DefaultAddItemToReadingListHandler = AddItemToReadingListHandler<
 pub type DefaultBrowseReadingListsHandler =
     BrowseReadingListsHandler<BearerAuthService, SqliteReadingListRepository>;
 
+pub type DefaultUpdateReadingProgressHandler =
+    UpdateReadingProgressHandler<BearerAuthService, SqliteReadingListRepository>;
+
 #[derive(Clone)]
 pub struct Services {
     pub index_handler: Arc<DefaultIndexHandler>,
@@ -180,6 +184,7 @@ pub struct Services {
     pub create_reading_list_handler: Arc<DefaultCreateReadingListHandler>,
     pub add_item_to_reading_list_handler: Arc<DefaultAddItemToReadingListHandler>,
     pub browse_reading_lists_handler: Arc<DefaultBrowseReadingListsHandler>,
+    pub update_reading_progress_handler: Arc<DefaultUpdateReadingProgressHandler>,
     /// The same auth service the handlers hold, exposed so a transport can
     /// reject an unauthenticated caller *before* it parses a request body or
     /// path (FR-AU-07 / SRD §7). Handlers still authenticate independently —
@@ -301,8 +306,12 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         reading_list_repo.clone(),
         repo.clone(),
     ));
-    let browse_reading_lists_handler =
-        Arc::new(BrowseReadingListsHandler::new(auth, reading_list_repo));
+    let browse_reading_lists_handler = Arc::new(BrowseReadingListsHandler::new(
+        auth,
+        reading_list_repo.clone(),
+    ));
+    let update_reading_progress_handler =
+        Arc::new(UpdateReadingProgressHandler::new(auth, reading_list_repo));
     Services {
         index_handler,
         refresh_handler,
@@ -333,6 +342,7 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         create_reading_list_handler,
         add_item_to_reading_list_handler,
         browse_reading_lists_handler,
+        update_reading_progress_handler,
         auth,
         pool,
     }

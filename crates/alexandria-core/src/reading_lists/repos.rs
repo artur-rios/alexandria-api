@@ -50,6 +50,30 @@ pub trait ReadingListRepository: Send + Sync {
         item_uuid: Uuid,
         target_kind: ReadingTargetKind,
     ) -> Result<ReadingProgress, DomainError>;
+
+    /// Look up the ReadingProgress linking `item_uuid` to
+    /// `reading_list_uuid` (UC-29 AF-02). `None` when the item is not on
+    /// that reading list.
+    async fn find_progress(
+        &self,
+        reading_list_uuid: Uuid,
+        item_uuid: Uuid,
+    ) -> Result<Option<ReadingProgress>, DomainError>;
+
+    /// Replace the state and issue fields of the ReadingProgress linking
+    /// `item_uuid` to `reading_list_uuid` (UC-29 / FR-RL-04, FR-RL-05), and
+    /// return the updated record. Full replace: `current_issue` and
+    /// `total_issues` are written as given, `None` writes `NULL`. The
+    /// caller has already confirmed the ReadingProgress exists and that the
+    /// transition to `state` is valid.
+    async fn update_progress(
+        &self,
+        reading_list_uuid: Uuid,
+        item_uuid: Uuid,
+        state: ReadingState,
+        current_issue: Option<i64>,
+        total_issues: Option<i64>,
+    ) -> Result<ReadingProgress, DomainError>;
 }
 
 #[derive(Clone)]
@@ -60,48 +84,6 @@ pub struct SqliteReadingListRepository {
 impl SqliteReadingListRepository {
     pub fn new(pool: SqlitePool) -> Self {
         Self { pool }
-    }
-
-    async fn find_progress(
-        &self,
-        reading_list_uuid: Uuid,
-        item_uuid: Uuid,
-    ) -> Result<Option<ReadingProgress>, DomainError> {
-        let row = sqlx::query(
-            "SELECT rp.target_kind, rp.state, rp.current_issue, rp.total_issues \
-             FROM reading_progress rp \
-             JOIN reading_lists rl ON rl.id = rp.reading_list_id \
-             JOIN files f ON f.id = rp.item_file_id \
-             WHERE rl.uuid = ? AND f.uuid = ?",
-        )
-        .bind(reading_list_uuid.to_string())
-        .bind(item_uuid.to_string())
-        .fetch_optional(&self.pool)
-        .await?;
-
-        let Some(row) = row else {
-            return Ok(None);
-        };
-
-        let target_kind_str: String = row.try_get("target_kind")?;
-        let state_str: String = row.try_get("state")?;
-        let current_issue: Option<i64> = row.try_get("current_issue")?;
-        let total_issues: Option<i64> = row.try_get("total_issues")?;
-
-        Ok(Some(ReadingProgress {
-            reading_list_uuid,
-            item_uuid,
-            target_kind: ReadingTargetKind::parse(&target_kind_str).ok_or_else(|| {
-                DomainError::internal(format!(
-                    "corrupt reading_progress target_kind: {target_kind_str}"
-                ))
-            })?,
-            state: ReadingState::parse(&state_str).ok_or_else(|| {
-                DomainError::internal(format!("corrupt reading_progress state: {state_str}"))
-            })?,
-            current_issue,
-            total_issues,
-        }))
     }
 }
 
@@ -224,6 +206,75 @@ impl ReadingListRepository for SqliteReadingListRepository {
         .bind(reading_list_uuid.to_string())
         .bind(item_uuid.to_string())
         .bind(target_kind.as_str())
+        .execute(&self.pool)
+        .await?;
+
+        self.find_progress(reading_list_uuid, item_uuid)
+            .await?
+            .ok_or(DomainError::NotFound)
+    }
+
+    async fn find_progress(
+        &self,
+        reading_list_uuid: Uuid,
+        item_uuid: Uuid,
+    ) -> Result<Option<ReadingProgress>, DomainError> {
+        let row = sqlx::query(
+            "SELECT rp.target_kind, rp.state, rp.current_issue, rp.total_issues \
+             FROM reading_progress rp \
+             JOIN reading_lists rl ON rl.id = rp.reading_list_id \
+             JOIN files f ON f.id = rp.item_file_id \
+             WHERE rl.uuid = ? AND f.uuid = ?",
+        )
+        .bind(reading_list_uuid.to_string())
+        .bind(item_uuid.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+
+        let Some(row) = row else {
+            return Ok(None);
+        };
+
+        let target_kind_str: String = row.try_get("target_kind")?;
+        let state_str: String = row.try_get("state")?;
+        let current_issue: Option<i64> = row.try_get("current_issue")?;
+        let total_issues: Option<i64> = row.try_get("total_issues")?;
+
+        Ok(Some(ReadingProgress {
+            reading_list_uuid,
+            item_uuid,
+            target_kind: ReadingTargetKind::parse(&target_kind_str).ok_or_else(|| {
+                DomainError::internal(format!(
+                    "corrupt reading_progress target_kind: {target_kind_str}"
+                ))
+            })?,
+            state: ReadingState::parse(&state_str).ok_or_else(|| {
+                DomainError::internal(format!("corrupt reading_progress state: {state_str}"))
+            })?,
+            current_issue,
+            total_issues,
+        }))
+    }
+
+    async fn update_progress(
+        &self,
+        reading_list_uuid: Uuid,
+        item_uuid: Uuid,
+        state: ReadingState,
+        current_issue: Option<i64>,
+        total_issues: Option<i64>,
+    ) -> Result<ReadingProgress, DomainError> {
+        sqlx::query(
+            "UPDATE reading_progress \
+             SET state = ?, current_issue = ?, total_issues = ? \
+             WHERE reading_list_id = (SELECT id FROM reading_lists WHERE uuid = ?) \
+               AND item_file_id = (SELECT id FROM files WHERE uuid = ?)",
+        )
+        .bind(state.as_str())
+        .bind(current_issue)
+        .bind(total_issues)
+        .bind(reading_list_uuid.to_string())
+        .bind(item_uuid.to_string())
         .execute(&self.pool)
         .await?;
 

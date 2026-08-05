@@ -2546,6 +2546,109 @@ pub extern "C" fn alexandria_reading_lists_list(
     }
 }
 
+/// Request body accepted by `alexandria_reading_list_update_progress` — the
+/// same JSON `PATCH /v1/reading-lists/{uuid}/items/{itemUuid}` takes:
+/// `{"state":"…","currentIssue":…,"totalIssues":…}` (issue fields
+/// optional/nullable; absent or null clears them).
+#[derive(Debug)]
+struct UpdateReadingProgressBody {
+    state: String,
+    current_issue: Option<i64>,
+    total_issues: Option<i64>,
+}
+
+impl UpdateReadingProgressBody {
+    fn from_json_str(s: &str) -> Option<Self> {
+        let value: serde_json::Value = serde_json::from_str(s).ok()?;
+        let obj = value.as_object()?;
+        Some(Self {
+            state: obj.get("state")?.as_str()?.to_string(),
+            current_issue: obj.get("currentIssue").and_then(|v| v.as_i64()),
+            total_issues: obj.get("totalIssues").and_then(|v| v.as_i64()),
+        })
+    }
+}
+
+/// Update reading progress (UC-29 / FR-RL-04, FR-RL-05).
+///
+/// `reading_list_uuid` and `item_uuid` are the reading list's and item's
+/// public UUIDs (NUL-terminated strings). `json_body` is the JSON body HTTP
+/// would send (`state`, optional `currentIssue`/`totalIssues`). On success
+/// `json` carries the updated `ReadingProgress` — byte-for-byte the same
+/// shape HTTP returns from `PATCH /v1/reading-lists/{uuid}/items/{itemUuid}`
+/// (parity, FR-FC-24 / NFR-09). `token` is the bearer auth token.
+#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
+#[no_mangle]
+pub extern "C" fn alexandria_reading_list_update_progress(
+    reading_list_uuid: *const c_char,
+    item_uuid: *const c_char,
+    json_body: *const c_char,
+    token: *const c_char,
+) -> ReadingListJsonResult {
+    let services = match services_slot().lock().unwrap().clone() {
+        Some(s) => s,
+        None => return ReadingListJsonResult::err(READING_LIST_ERR_NOT_INITIALIZED),
+    };
+
+    let token = cstr_lossy(token).unwrap_or_default();
+    if !authenticated(&services, &token) {
+        return ReadingListJsonResult::err(READING_LIST_ERR_UNAUTHORIZED);
+    }
+
+    let reading_list_uuid_str = match cstr_lossy(reading_list_uuid) {
+        Some(s) => s,
+        None => return ReadingListJsonResult::err(READING_LIST_ERR_INVALID_INPUT),
+    };
+    let reading_list_uuid = match uuid::Uuid::parse_str(&reading_list_uuid_str) {
+        Ok(u) => u,
+        Err(_) => return ReadingListJsonResult::err(READING_LIST_ERR_INVALID_INPUT),
+    };
+
+    let item_uuid_str = match cstr_lossy(item_uuid) {
+        Some(s) => s,
+        None => return ReadingListJsonResult::err(READING_LIST_ERR_INVALID_INPUT),
+    };
+    let item_uuid = match uuid::Uuid::parse_str(&item_uuid_str) {
+        Ok(u) => u,
+        Err(_) => return ReadingListJsonResult::err(READING_LIST_ERR_INVALID_INPUT),
+    };
+
+    let body_str = match cstr_lossy(json_body) {
+        Some(s) => s,
+        None => return ReadingListJsonResult::err(READING_LIST_ERR_INVALID_INPUT),
+    };
+    let body = match UpdateReadingProgressBody::from_json_str(&body_str) {
+        Some(b) => b,
+        None => return ReadingListJsonResult::err(READING_LIST_ERR_INVALID_INPUT),
+    };
+    let new_state = match alexandria_core::reading_lists::model::ReadingState::parse(&body.state) {
+        Some(s) => s,
+        None => return ReadingListJsonResult::err(READING_LIST_ERR_INVALID_INPUT),
+    };
+
+    let result = runtime().block_on(async {
+        services
+            .update_reading_progress_handler
+            .update(
+                reading_list_uuid,
+                item_uuid,
+                new_state,
+                body.current_issue,
+                body.total_issues,
+                &token,
+            )
+            .await
+    });
+
+    match result {
+        Ok(progress) => {
+            let json = serde_json::to_string(&progress).unwrap_or_default();
+            ReadingListJsonResult::ok(json)
+        }
+        Err(err) => map_reading_list_err(err),
+    }
+}
+
 /// Free a string previously returned by an FFI accessor.
 ///
 /// # Safety
