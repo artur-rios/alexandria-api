@@ -87,6 +87,10 @@ pub fn app(settings: Settings, services: Arc<Services>) -> Router {
             post(routes::reading_lists::add_item),
         )
         .route("/v1/reading-lists", get(routes::reading_lists::list))
+        .route(
+            "/v1/reading-lists/{uuid}/items/{item_uuid}",
+            patch(routes::reading_lists::update_progress),
+        )
         .route_layer(from_fn_with_state(
             state.clone(),
             middleware::auth::require_auth,
