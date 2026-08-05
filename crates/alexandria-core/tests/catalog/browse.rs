@@ -14,9 +14,7 @@ use alexandria_core::catalog::model::{
 use alexandria_core::catalog::queries::browse::{BrowseFilesHandler, FileFilter};
 use alexandria_core::errors::DomainError;
 
-use crate::common::{
-    deleted_file, existing_file_with_hash, FakeAuth, FakeCatalogRepository,
-};
+use crate::common::{deleted_file, existing_file_with_hash, FakeAuth, FakeCatalogRepository};
 
 const TOKEN: &str = "bearer-token";
 
@@ -35,8 +33,18 @@ where
 #[tokio::test]
 async fn given_mixed_files_when_list_default_then_active_only_excludes_deleted() {
     let repo = FakeCatalogRepository::new();
-    repo.seed(existing_file_with_hash("/lib/a.mp3", "a", FileType::Audio, "h-a"));
-    repo.seed(existing_file_with_hash("/lib/b.md", "b", FileType::Text, "h-b"));
+    repo.seed(existing_file_with_hash(
+        "/lib/a.mp3",
+        "a",
+        FileType::Audio,
+        "h-a",
+    ));
+    repo.seed(existing_file_with_hash(
+        "/lib/b.md",
+        "b",
+        FileType::Text,
+        "h-b",
+    ));
     repo.seed(deleted_file("/lib/c.mp3", "c", FileType::Audio));
 
     let h = handler(FakeAuth::Allowing, repo.clone());
@@ -44,16 +52,35 @@ async fn given_mixed_files_when_list_default_then_active_only_excludes_deleted()
 
     // Default state filter is Active → c.mp3 (deleted) is excluded.
     let names: Vec<&str> = files.iter().map(|f| f.name.as_str()).collect();
-    assert_eq!(names, vec!["a", "b"], "default list excludes deleted records");
+    assert_eq!(
+        names,
+        vec!["a", "b"],
+        "default list excludes deleted records"
+    );
     assert!(files.iter().all(|f| f.state == FileState::Active));
 }
 
 #[tokio::test]
 async fn given_files_when_list_filtered_by_type_then_only_matching_type_returned() {
     let repo = FakeCatalogRepository::new();
-    repo.seed(existing_file_with_hash("/lib/a.mp3", "a", FileType::Audio, "h"));
-    repo.seed(existing_file_with_hash("/lib/b.mp4", "b", FileType::Video, "h"));
-    repo.seed(existing_file_with_hash("/lib/c.md", "c", FileType::Text, "h"));
+    repo.seed(existing_file_with_hash(
+        "/lib/a.mp3",
+        "a",
+        FileType::Audio,
+        "h",
+    ));
+    repo.seed(existing_file_with_hash(
+        "/lib/b.mp4",
+        "b",
+        FileType::Video,
+        "h",
+    ));
+    repo.seed(existing_file_with_hash(
+        "/lib/c.md",
+        "c",
+        FileType::Text,
+        "h",
+    ));
 
     let h = handler(FakeAuth::Allowing, repo);
     let filter = FileFilter::new().with_type(FileType::Audio);
@@ -66,7 +93,12 @@ async fn given_files_when_list_filtered_by_type_then_only_matching_type_returned
 #[tokio::test]
 async fn given_mixed_files_when_list_state_deleted_then_only_deleted_returned() {
     let repo = FakeCatalogRepository::new();
-    repo.seed(existing_file_with_hash("/lib/a.mp3", "a", FileType::Audio, "h"));
+    repo.seed(existing_file_with_hash(
+        "/lib/a.mp3",
+        "a",
+        FileType::Audio,
+        "h",
+    ));
     repo.seed(deleted_file("/lib/b.mp3", "b", FileType::Audio));
 
     let h = handler(FakeAuth::Allowing, repo);
@@ -81,7 +113,12 @@ async fn given_mixed_files_when_list_state_deleted_then_only_deleted_returned() 
 #[tokio::test]
 async fn given_mixed_files_when_list_state_all_then_both_active_and_deleted_returned() {
     let repo = FakeCatalogRepository::new();
-    repo.seed(existing_file_with_hash("/lib/a.mp3", "a", FileType::Audio, "h"));
+    repo.seed(existing_file_with_hash(
+        "/lib/a.mp3",
+        "a",
+        FileType::Audio,
+        "h",
+    ));
     repo.seed(deleted_file("/lib/b.mp3", "b", FileType::Audio));
 
     let h = handler(FakeAuth::Allowing, repo);
@@ -94,7 +131,12 @@ async fn given_mixed_files_when_list_state_all_then_both_active_and_deleted_retu
 #[tokio::test]
 async fn given_files_when_list_type_and_state_combined_then_filter_applied() {
     let repo = FakeCatalogRepository::new();
-    repo.seed(existing_file_with_hash("/lib/a.mp3", "a", FileType::Audio, "h"));
+    repo.seed(existing_file_with_hash(
+        "/lib/a.mp3",
+        "a",
+        FileType::Audio,
+        "h",
+    ));
     repo.seed(deleted_file("/lib/b.mp3", "b", FileType::Audio));
     repo.seed(deleted_file("/lib/c.mp4", "c", FileType::Video));
 

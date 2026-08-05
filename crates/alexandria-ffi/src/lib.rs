@@ -95,7 +95,10 @@ impl IndexStartResult {
     fn run_id_string(&self) -> String {
         let n = self.run_id.iter().position(|&c| c == 0).unwrap_or(37);
         String::from_utf8_lossy(
-            &self.run_id[..n].iter().map(|&c| c as u8).collect::<Vec<u8>>(),
+            &self.run_id[..n]
+                .iter()
+                .map(|&c| c as u8)
+                .collect::<Vec<u8>>(),
         )
         .into_owned()
     }
@@ -107,7 +110,9 @@ fn cstr_lossy(ptr: *const c_char) -> Option<String> {
         return None;
     }
     // SAFETY: the caller passes a valid NUL-terminated C string.
-    let s = unsafe { CStr::from_ptr(ptr) }.to_string_lossy().into_owned();
+    let s = unsafe { CStr::from_ptr(ptr) }
+        .to_string_lossy()
+        .into_owned();
     Some(s)
 }
 
@@ -229,8 +234,7 @@ pub extern "C" fn alexandria_index_refresh_start(token: *const c_char) -> IndexS
     let token = cstr_lossy(token).unwrap_or_default();
     let rt = runtime();
 
-    let started = rt
-        .block_on(async { services.refresh_handler.start(&token).await });
+    let started = rt.block_on(async { services.refresh_handler.start(&token).await });
 
     match started {
         Ok(s) => {
@@ -260,8 +264,9 @@ pub extern "C" fn alexandria_index_count_files() -> i64 {
         None => return -1,
     };
     runtime().block_on(async {
-        let row: Result<(i64,), _> =
-            sqlx::query_as("SELECT COUNT(*) FROM files").fetch_one(&services.pool).await;
+        let row: Result<(i64,), _> = sqlx::query_as("SELECT COUNT(*) FROM files")
+            .fetch_one(&services.pool)
+            .await;
         row.map(|(c,)| c).unwrap_or(-1)
     })
 }
@@ -422,7 +427,10 @@ impl FilesListFilter {
                 .get("type")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string()),
-            state: obj.get("state").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            state: obj
+                .get("state")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
         })
     }
 }
@@ -477,15 +485,13 @@ pub extern "C" fn alexandria_files_list(
         None => alexandria_core::catalog::model::StateFilter::Active,
     };
 
-    let mut filter =
-        alexandria_core::catalog::queries::browse::FileFilter::new().with_state(state);
+    let mut filter = alexandria_core::catalog::queries::browse::FileFilter::new().with_state(state);
     if let Some(t) = file_type {
         filter = filter.with_type(t);
     }
 
-    let result = runtime().block_on(async {
-        services.browse_files_handler.list(filter, &token).await
-    });
+    let result =
+        runtime().block_on(async { services.browse_files_handler.list(filter, &token).await });
 
     match result {
         Ok(files) => {
@@ -531,7 +537,10 @@ pub extern "C" fn alexandria_file_get_by_uuid(
     };
 
     let result = runtime().block_on(async {
-        services.browse_files_handler.get_by_uuid(uuid, &token).await
+        services
+            .browse_files_handler
+            .get_by_uuid(uuid, &token)
+            .await
     });
 
     match result {
@@ -588,7 +597,10 @@ pub extern "C" fn alexandria_file_rename(
     // surfaces as `FILE_ERR_INVALID_INPUT` — consistent with the HTTP `400`.
 
     let result = runtime().block_on(async {
-        services.rename_file_handler.rename(uuid, name, &token).await
+        services
+            .rename_file_handler
+            .rename(uuid, name, &token)
+            .await
     });
 
     match result {
@@ -637,7 +649,10 @@ pub extern "C" fn alexandria_file_soft_delete(
     };
 
     let result = runtime().block_on(async {
-        services.soft_delete_file_handler.soft_delete(uuid, &token).await
+        services
+            .soft_delete_file_handler
+            .soft_delete(uuid, &token)
+            .await
     });
 
     match result {
@@ -687,9 +702,8 @@ pub extern "C" fn alexandria_file_restore(
         Err(_) => return FileJsonResult::err(FILE_ERR_INVALID_INPUT),
     };
 
-    let result = runtime().block_on(async {
-        services.restore_file_handler.restore(uuid, &token).await
-    });
+    let result =
+        runtime().block_on(async { services.restore_file_handler.restore(uuid, &token).await });
 
     match result {
         Ok(file) => {
@@ -738,9 +752,8 @@ pub extern "C" fn alexandria_file_purge(
         Err(_) => return FileJsonResult::err(FILE_ERR_INVALID_INPUT),
     };
 
-    let result = runtime().block_on(async {
-        services.purge_file_handler.purge(uuid, &token).await
-    });
+    let result =
+        runtime().block_on(async { services.purge_file_handler.purge(uuid, &token).await });
 
     match result {
         Ok(file) => {

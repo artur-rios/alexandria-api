@@ -11,24 +11,21 @@ use uuid::Uuid;
 use alexandria_core::auth::{AuthService, Principal};
 use alexandria_core::catalog::clock::FixedClock;
 use alexandria_core::catalog::fs::{FileEntry, Filesystem};
-use alexandria_core::catalog::model::{File, FileState, FileType, NewFile, StateFilter, SubtypeMetadata};
+use alexandria_core::catalog::model::{
+    File, FileState, FileType, NewFile, StateFilter, SubtypeMetadata,
+};
 use alexandria_core::catalog::repos::CatalogRepository;
 use alexandria_core::config::AuthMode;
 use alexandria_core::errors::DomainError;
 
 /// Fake auth service. `Denying` rejects every caller (AF-02); `Allowing`
 /// authenticates any token as the owner.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub enum FakeAuth {
+    #[default]
     Allowing,
     #[allow(dead_code)]
     Denying,
-}
-
-impl Default for FakeAuth {
-    fn default() -> Self {
-        FakeAuth::Allowing
-    }
 }
 
 impl AuthService for FakeAuth {
@@ -86,10 +83,7 @@ impl FakeCatalogRepository {
     /// Pre-seed an existing file at `path` so the indexer skips it (AF-03).
     pub fn with_existing(file: File) -> Self {
         let repo = Self::new();
-        repo.files
-            .lock()
-            .unwrap()
-            .insert(file.path.clone(), file);
+        repo.files.lock().unwrap().insert(file.path.clone(), file);
         repo
     }
 
@@ -189,7 +183,10 @@ impl CatalogRepository for FakeCatalogRepository {
             indexed_at: new_file.indexed_at,
             missing_at: None,
         };
-        self.files.lock().unwrap().insert(new_file.path, file.clone());
+        self.files
+            .lock()
+            .unwrap()
+            .insert(new_file.path, file.clone());
         Ok(file)
     }
 
@@ -247,10 +244,7 @@ impl CatalogRepository for FakeCatalogRepository {
                 "metadata does not match file subtype".into(),
             ));
         }
-        self.metadata
-            .lock()
-            .unwrap()
-            .insert(uuid, metadata.clone());
+        self.metadata.lock().unwrap().insert(uuid, metadata.clone());
         Ok(())
     }
 
@@ -458,12 +452,7 @@ impl FakeFilesystem {
 
     /// `true` once `remove_file` has removed `path`.
     pub fn removed(&self, path: &str) -> bool {
-        self.state
-            .lock()
-            .unwrap()
-            .removed
-            .iter()
-            .any(|p| p == path)
+        self.state.lock().unwrap().removed.iter().any(|p| p == path)
     }
 
     /// Count of successful removals the fake has performed so far.
@@ -491,7 +480,9 @@ impl FakeFilesystemBuilder {
             .entry(root.to_string())
             .or_default()
             .push(FileEntry::new(path, name));
-        self.fs.hash_by_path.insert(path.to_string(), hash.to_string());
+        self.fs
+            .hash_by_path
+            .insert(path.to_string(), hash.to_string());
         self
     }
 
@@ -520,14 +511,8 @@ impl Filesystem for FakeFilesystem {
         // An unreadable file is still present — it just cannot be hashed.
         // After a rename, the `to` path is present and the `from` path is gone.
         let state = self.state.lock().unwrap();
-        let moved_from = state
-            .renames
-            .iter()
-            .any(|(f, _)| f == root)
-            && !state
-                .renames
-                .iter()
-                .any(|(_, t)| t == root);
+        let moved_from = state.renames.iter().any(|(f, _)| f == root)
+            && !state.renames.iter().any(|(_, t)| t == root);
         let moved_to = state.renames.iter().any(|(_, t)| t == root);
         let disk = state.disk_paths.contains(root);
         let removed = state.removed.iter().any(|p| p == root);
@@ -541,11 +526,7 @@ impl Filesystem for FakeFilesystem {
     }
 
     async fn list_files(&self, root: &str) -> Result<Vec<FileEntry>, DomainError> {
-        Ok(self
-            .entries_by_root
-            .get(root)
-            .cloned()
-            .unwrap_or_default())
+        Ok(self.entries_by_root.get(root).cloned().unwrap_or_default())
     }
 
     async fn content_hash(&self, path: &str) -> Result<String, DomainError> {
@@ -573,9 +554,7 @@ impl Filesystem for FakeFilesystem {
     async fn remove_file(&self, path: &str) -> Result<bool, DomainError> {
         let mut state = self.state.lock().unwrap();
         if state.failing_removes_from.contains(path) {
-            return Err(DomainError::disk(format!(
-                "fake remove failure: {path:?}"
-            )));
+            return Err(DomainError::disk(format!("fake remove failure: {path:?}")));
         }
         if state.removed.iter().any(|p| p == path) {
             return Ok(false);

@@ -8,7 +8,20 @@ use serde_json::{json, Value};
 use tempfile::tempdir;
 use tower::ServiceExt;
 
-use crate::common::{file_rows, file_rows_with_missing, file_rows_with_uuid, test_app, wait_for_files};
+use crate::common::{
+    file_rows, file_rows_with_missing, file_rows_with_uuid, test_app, wait_for_files,
+};
+
+/// The editable columns of an `audio_files` row, in the order every
+/// assertion here selects them: title, artist, album, year, genre, track.
+type AudioMetadataRow = (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<i64>,
+    Option<String>,
+    Option<i64>,
+);
 
 fn index_request(root: &str) -> Request<Body> {
     Request::builder()
@@ -45,7 +58,9 @@ async fn given_supported_files_when_index_posted_then_returns_202_with_run_id() 
 
     assert_eq!(response.status(), StatusCode::ACCEPTED);
 
-    let bytes = to_bytes(response.into_body(), usize::MAX).await.expect("body");
+    let bytes = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
     let json: Value = serde_json::from_slice(&bytes).expect("json");
     let run_id = json["runId"].as_str().expect("runId string");
     assert!(!run_id.is_empty());
@@ -115,7 +130,9 @@ async fn given_no_bearer_when_index_posted_then_returns_401() {
         .method("POST")
         .uri("/v1/index")
         .header("content-type", "application/json")
-        .body(Body::from(json!({ "root": lib.path().to_str().unwrap() }).to_string()))
+        .body(Body::from(
+            json!({ "root": lib.path().to_str().unwrap() }).to_string(),
+        ))
         .unwrap();
 
     let response = router.oneshot(request).await.expect("one-shot");
@@ -153,7 +170,6 @@ async fn given_subtype_rows_when_indexed_then_each_file_has_subtype_row() {
     assert_eq!(audio.0, 1);
     assert_eq!(video.0, 1);
     assert_eq!(document.0, 1);
-
 }
 
 #[tokio::test]
@@ -188,11 +204,14 @@ async fn given_changed_and_deleted_files_when_refresh_posted_then_refreshes_and_
     std::fs::remove_file(lib.path().join("b.md")).unwrap();
 
     let router2 = app(Settings::default(), test.services.clone());
-    let response = router2.oneshot(refresh_request()).await.expect("refresh one-shot");
+    let response = router2
+        .oneshot(refresh_request())
+        .await
+        .expect("refresh one-shot");
     assert_eq!(response.status(), StatusCode::ACCEPTED);
     let body: Value =
         serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
-    assert!(body["runId"].as_str().unwrap().is_empty() == false);
+    assert!(!body["runId"].as_str().unwrap().is_empty());
 
     // Wait for the refresh to settle: a's hash must differ from the old one,
     // and b must have a missing_at set.
@@ -211,9 +230,7 @@ async fn given_changed_and_deleted_files_when_refresh_posted_then_refreshes_and_
             break;
         }
         if std::time::Instant::now() > deadline {
-            panic!(
-                "refresh never settled; a refreshed={a_refreshed}, b marked={b_marked}"
-            );
+            panic!("refresh never settled; a refreshed={a_refreshed}, b marked={b_marked}");
         }
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
@@ -286,7 +303,9 @@ async fn given_indexed_audio_file_when_patch_audio_metadata_then_200_and_row_upd
         .expect("patch one-shot");
     assert_eq!(response.status(), StatusCode::OK);
 
-    let bytes = to_bytes(response.into_body(), usize::MAX).await.expect("body");
+    let bytes = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
     let json: Value = serde_json::from_slice(&bytes).expect("json");
     assert_eq!(json["file"]["uuid"], uuid);
     assert_eq!(json["file"]["fileType"], "audio");
@@ -296,15 +315,14 @@ async fn given_indexed_audio_file_when_patch_audio_metadata_then_200_and_row_upd
     assert_eq!(json["metadata"]["track"], 3);
 
     // Persisted subtype row reflects the full-replace PATCH.
-    let row: (Option<String>, Option<String>, Option<String>, Option<i64>, Option<String>, Option<i64>) =
-        sqlx::query_as(
-            "SELECT title, artist, album, year, genre, track FROM audio_files \
+    let row: AudioMetadataRow = sqlx::query_as(
+        "SELECT title, artist, album, year, genre, track FROM audio_files \
              JOIN files ON files.id = audio_files.file_id WHERE files.uuid = ?",
-        )
-        .bind(&uuid)
-        .fetch_one(&test.pool)
-        .await
-        .expect("audio row");
+    )
+    .bind(&uuid)
+    .fetch_one(&test.pool)
+    .await
+    .expect("audio row");
     assert_eq!(row.0.as_deref(), Some("New Title"));
     assert_eq!(row.1.as_deref(), Some("New Artist"));
     assert_eq!(row.2.as_deref(), Some("New Album"));
@@ -340,10 +358,8 @@ async fn given_indexed_video_file_when_patch_video_metadata_then_200_and_row_upd
         .await
         .expect("patch one-shot");
     assert_eq!(response.status(), StatusCode::OK);
-    let json: Value = serde_json::from_slice(
-        &to_bytes(response.into_body(), usize::MAX).await.unwrap(),
-    )
-    .unwrap();
+    let json: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
     assert_eq!(json["metadata"]["mediaKind"], "movie");
 
     let row: (Option<String>, Option<i64>, Option<String>, Option<String>) = sqlx::query_as(
@@ -474,7 +490,11 @@ fn get_files(uri: &str) -> Request<Body> {
 }
 
 fn get_files_no_auth(uri: &str) -> Request<Body> {
-    Request::builder().method("GET").uri(uri).body(Body::empty()).unwrap()
+    Request::builder()
+        .method("GET")
+        .uri(uri)
+        .body(Body::empty())
+        .unwrap()
 }
 
 #[tokio::test]
@@ -489,14 +509,12 @@ async fn given_indexed_files_when_get_files_then_200_array_excluding_deleted_by_
         .expect("list one-shot");
     assert_eq!(response.status(), StatusCode::OK);
 
-    let body: Value = serde_json::from_slice(
-        &to_bytes(response.into_body(), usize::MAX).await.unwrap(),
-    )
-    .unwrap();
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
     let arr = body.as_array().expect("array");
     assert_eq!(arr.len(), 2);
     // Ordered by path; both are active.
-    assert_eq!(arr.iter().all(|f| f["state"] == "active"), true);
+    assert!(arr.iter().all(|f| f["state"] == "active"));
 }
 
 #[tokio::test]
@@ -510,10 +528,8 @@ async fn given_indexed_files_when_get_files_with_type_filter_then_only_matching_
         .await
         .expect("list one-shot");
     assert_eq!(response.status(), StatusCode::OK);
-    let body: Value = serde_json::from_slice(
-        &to_bytes(response.into_body(), usize::MAX).await.unwrap(),
-    )
-    .unwrap();
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
     let arr = body.as_array().expect("array");
     assert_eq!(arr.len(), 1);
     assert_eq!(arr[0]["fileType"], "audio");
@@ -554,10 +570,8 @@ async fn given_empty_type_and_state_when_get_files_then_treated_as_no_filter() {
         .await
         .expect("list one-shot");
     assert_eq!(response.status(), StatusCode::OK);
-    let body: serde_json::Value = serde_json::from_slice(
-        &to_bytes(response.into_body(), usize::MAX).await.unwrap(),
-    )
-    .unwrap();
+    let body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
     assert_eq!(body.as_array().unwrap().len(), 1);
 }
 
@@ -580,11 +594,13 @@ async fn given_deleted_file_when_get_files_default_then_excluded() {
         .oneshot(get_files("/v1/files"))
         .await
         .expect("list one-shot");
-    let body: Value = serde_json::from_slice(
-        &to_bytes(response.into_body(), usize::MAX).await.unwrap(),
-    )
-    .unwrap();
-    assert_eq!(body.as_array().unwrap().len(), 0, "deleted excluded by default");
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(
+        body.as_array().unwrap().len(),
+        0,
+        "deleted excluded by default"
+    );
 }
 
 #[tokio::test]
@@ -604,10 +620,8 @@ async fn given_deleted_file_when_get_files_state_deleted_then_only_deleted_retur
         .oneshot(get_files("/v1/files?state=deleted"))
         .await
         .expect("list one-shot");
-    let body: Value = serde_json::from_slice(
-        &to_bytes(response.into_body(), usize::MAX).await.unwrap(),
-    )
-    .unwrap();
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
     let arr = body.as_array().unwrap();
     assert_eq!(arr.len(), 1);
     assert_eq!(arr[0]["state"], "deleted");
@@ -631,10 +645,8 @@ async fn given_deleted_file_when_get_files_state_all_then_both_returned() {
         .oneshot(get_files("/v1/files?state=all"))
         .await
         .expect("list one-shot");
-    let body: Value = serde_json::from_slice(
-        &to_bytes(response.into_body(), usize::MAX).await.unwrap(),
-    )
-    .unwrap();
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
     assert_eq!(body.as_array().unwrap().len(), 2);
 }
 
@@ -660,10 +672,8 @@ async fn given_indexed_file_when_get_file_by_uuid_then_200_with_file_view() {
         .await
         .expect("get one-shot");
     assert_eq!(response.status(), StatusCode::OK);
-    let body: Value = serde_json::from_slice(
-        &to_bytes(response.into_body(), usize::MAX).await.unwrap(),
-    )
-    .unwrap();
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
     assert_eq!(body["file"]["uuid"], uuid);
     assert_eq!(body["file"]["fileType"], "audio");
     assert_eq!(body["file"]["state"], "active");
@@ -690,10 +700,8 @@ async fn given_indexed_file_with_written_metadata_when_get_file_by_uuid_then_met
         .oneshot(get_files(&format!("/v1/files/{uuid}")))
         .await
         .expect("get one-shot");
-    let body: Value = serde_json::from_slice(
-        &to_bytes(response.into_body(), usize::MAX).await.unwrap(),
-    )
-    .unwrap();
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
     assert_eq!(body["metadata"]["type"], "audio");
     assert_eq!(body["metadata"]["title"], "T");
     assert_eq!(body["metadata"]["artist"], "A");
@@ -733,10 +741,8 @@ async fn given_indexed_text_file_when_get_file_by_uuid_then_metadata_is_null() {
         .oneshot(get_files(&format!("/v1/files/{uuid}")))
         .await
         .expect("get one-shot");
-    let body: Value = serde_json::from_slice(
-        &to_bytes(response.into_body(), usize::MAX).await.unwrap(),
-    )
-    .unwrap();
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
     assert_eq!(body["file"]["fileType"], "text");
     assert!(body["metadata"].is_null());
 }
@@ -892,7 +898,10 @@ async fn given_missing_subtype_row_when_patch_then_error_not_silent_success() {
         .expect("drop subtype row");
 
     let response = app(Settings::default(), test.services)
-        .oneshot(patch_metadata(&uuid, json!({ "type": "audio", "title": "T" })))
+        .oneshot(patch_metadata(
+            &uuid,
+            json!({ "type": "audio", "title": "T" }),
+        ))
         .await
         .expect("patch one-shot");
 
@@ -957,10 +966,8 @@ async fn given_indexed_file_when_post_rename_then_200_and_on_disk_and_catalog_up
         .expect("rename one-shot");
     assert_eq!(response.status(), StatusCode::OK);
 
-    let body: Value = serde_json::from_slice(
-        &to_bytes(response.into_body(), usize::MAX).await.unwrap(),
-    )
-    .unwrap();
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
     assert_eq!(body["uuid"], uuid);
     assert_eq!(body["name"], "renamed.mp3");
     assert_eq!(body["state"], "active");
@@ -974,12 +981,11 @@ async fn given_indexed_file_when_post_rename_then_200_and_on_disk_and_catalog_up
     assert_eq!(std::fs::read(&renamed_path).unwrap(), b"audio bytes");
 
     // Catalog row carries the new name + path.
-    let row: (String, String) =
-        sqlx::query_as("SELECT name, path FROM files WHERE uuid = ?")
-            .bind(&uuid)
-            .fetch_one(&test.pool)
-            .await
-            .expect("catalog row");
+    let row: (String, String) = sqlx::query_as("SELECT name, path FROM files WHERE uuid = ?")
+        .bind(&uuid)
+        .fetch_one(&test.pool)
+        .await
+        .expect("catalog row");
     assert_eq!(row.0, "renamed.mp3");
     assert!(row.1.ends_with("renamed.mp3"));
 }
@@ -1019,7 +1025,10 @@ async fn given_missing_body_when_post_rename_then_400() {
         .header("authorization", "Bearer test-token")
         .body(Body::empty())
         .unwrap();
-    let response = app(Settings::default(), test.services).oneshot(request).await.expect("one-shot");
+    let response = app(Settings::default(), test.services)
+        .oneshot(request)
+        .await
+        .expect("one-shot");
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
 
@@ -1044,7 +1053,10 @@ async fn given_no_bearer_when_post_rename_then_401() {
         .header("content-type", "application/json")
         .body(Body::from(json!({ "name": "x.mp3" }).to_string()))
         .unwrap();
-    let response = app(Settings::default(), test.services).oneshot(request).await.expect("one-shot");
+    let response = app(Settings::default(), test.services)
+        .oneshot(request)
+        .await
+        .expect("one-shot");
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 }
 
@@ -1085,10 +1097,8 @@ async fn given_target_path_owned_by_other_file_when_post_rename_then_500_disk_er
         .await
         .expect("rename one-shot");
     assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
-    let body: Value = serde_json::from_slice(
-        &to_bytes(response.into_body(), usize::MAX).await.unwrap(),
-    )
-    .unwrap();
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
     assert_eq!(body["error"], "disk error");
 
     let a_path = lib.path().join("a.mp3");
@@ -1104,7 +1114,10 @@ async fn given_no_bearer_and_malformed_body_when_post_rename_then_401_not_400() 
         .header("content-type", "application/json")
         .body(Body::from("{ not json"))
         .unwrap();
-    let response = app(Settings::default(), test.services).oneshot(request).await.expect("one-shot");
+    let response = app(Settings::default(), test.services)
+        .oneshot(request)
+        .await
+        .expect("one-shot");
     assert_eq!(
         response.status(),
         StatusCode::UNAUTHORIZED,
@@ -1139,10 +1152,8 @@ async fn given_indexed_file_when_delete_file_then_200_and_state_deleted_in_catal
         .expect("delete one-shot");
     assert_eq!(response.status(), StatusCode::OK);
 
-    let body: Value = serde_json::from_slice(
-        &to_bytes(response.into_body(), usize::MAX).await.unwrap(),
-    )
-    .unwrap();
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
     assert_eq!(body["uuid"], uuid);
     assert_eq!(body["state"], "deleted");
     assert!(
@@ -1184,7 +1195,10 @@ async fn given_no_bearer_when_delete_file_then_401() {
         .uri(format!("/v1/files/{uuid}"))
         .body(Body::empty())
         .unwrap();
-    let response = app(Settings::default(), test.services).oneshot(request).await.expect("one-shot");
+    let response = app(Settings::default(), test.services)
+        .oneshot(request)
+        .await
+        .expect("one-shot");
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 }
 
@@ -1198,7 +1212,10 @@ async fn given_no_bearer_and_malformed_uuid_when_delete_file_then_401_not_400() 
         .uri("/v1/files/not-a-uuid")
         .body(Body::empty())
         .unwrap();
-    let response = app(Settings::default(), test.services).oneshot(request).await.expect("one-shot");
+    let response = app(Settings::default(), test.services)
+        .oneshot(request)
+        .await
+        .expect("one-shot");
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 }
 
@@ -1261,10 +1278,8 @@ async fn given_soft_deleted_file_when_restore_file_then_200_and_state_active_in_
         .expect("restore one-shot");
     assert_eq!(response.status(), StatusCode::OK);
 
-    let body: Value = serde_json::from_slice(
-        &to_bytes(response.into_body(), usize::MAX).await.unwrap(),
-    )
-    .unwrap();
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
     assert_eq!(body["uuid"], uuid);
     assert_eq!(body["state"], "active");
     assert!(
@@ -1306,7 +1321,10 @@ async fn given_no_bearer_when_restore_file_then_401() {
         .uri(format!("/v1/files/{uuid}/restore"))
         .body(Body::empty())
         .unwrap();
-    let response = app(Settings::default(), test.services).oneshot(request).await.expect("one-shot");
+    let response = app(Settings::default(), test.services)
+        .oneshot(request)
+        .await
+        .expect("one-shot");
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 }
 
@@ -1320,7 +1338,10 @@ async fn given_no_bearer_and_malformed_uuid_when_restore_file_then_401_not_400()
         .uri("/v1/files/not-a-uuid/restore")
         .body(Body::empty())
         .unwrap();
-    let response = app(Settings::default(), test.services).oneshot(request).await.expect("one-shot");
+    let response = app(Settings::default(), test.services)
+        .oneshot(request)
+        .await
+        .expect("one-shot");
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 }
 
@@ -1373,7 +1394,10 @@ async fn given_soft_deleted_file_past_retention_when_restore_file_then_404() {
             .await
             .expect("catalog row");
     assert_eq!(row.0, "deleted");
-    assert!(row.1.is_some(), "deleted_at unchanged by past-retention restore");
+    assert!(
+        row.1.is_some(),
+        "deleted_at unchanged by past-retention restore"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1390,7 +1414,8 @@ fn purge_file_request(uuid: &str) -> Request<Body> {
 }
 
 #[tokio::test]
-async fn given_soft_deleted_file_past_retention_when_purged_then_200_and_rows_removed_and_disk_preserved() {
+async fn given_soft_deleted_file_past_retention_when_purged_then_200_and_rows_removed_and_disk_preserved(
+) {
     let lib = tempdir().unwrap();
     let on_disk = common::write_file(&lib, "song.mp3", b"audio bytes");
     let test = test_app().await;
@@ -1417,12 +1442,13 @@ async fn given_soft_deleted_file_past_retention_when_purged_then_200_and_rows_re
         .expect("purge one-shot");
     assert_eq!(response.status(), StatusCode::OK);
 
-    let body: Value = serde_json::from_slice(
-        &to_bytes(response.into_body(), usize::MAX).await.unwrap(),
-    )
-    .unwrap();
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
     assert_eq!(body["uuid"], uuid);
-    assert_eq!(body["state"], "deleted", "confirmation echoes the pre-purge state");
+    assert_eq!(
+        body["state"], "deleted",
+        "confirmation echoes the pre-purge state"
+    );
 
     // The `files` row is gone.
     let remaining: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM files WHERE uuid = ?")
@@ -1433,11 +1459,12 @@ async fn given_soft_deleted_file_past_retention_when_purged_then_200_and_rows_re
     assert_eq!(remaining.0, 0, "files row removed by purge");
 
     // The subtype row (audio_files) is also gone.
-    let subtype_remaining: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM audio_files WHERE file_id = ?")
-        .bind(file_id.0)
-        .fetch_one(&test.pool)
-        .await
-        .expect("audio_files count");
+    let subtype_remaining: (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM audio_files WHERE file_id = ?")
+            .bind(file_id.0)
+            .fetch_one(&test.pool)
+            .await
+            .expect("audio_files count");
     assert_eq!(subtype_remaining.0, 0, "subtype row removed by purge");
 
     // The on-disk file is untouched (NFR-07; purge-on-disk is UC-09).
@@ -1473,7 +1500,10 @@ async fn given_soft_deleted_file_within_retention_when_purged_then_409_and_row_k
             .await
             .expect("catalog row");
     assert_eq!(row.0, "deleted");
-    assert!(row.1.is_some(), "row kept, deleted_at unchanged by rejected purge");
+    assert!(
+        row.1.is_some(),
+        "row kept, deleted_at unchanged by rejected purge"
+    );
 }
 
 #[tokio::test]
@@ -1513,7 +1543,10 @@ async fn given_no_bearer_when_purged_then_401() {
         .uri(format!("/v1/files/{uuid}?purge=true"))
         .body(Body::empty())
         .unwrap();
-    let response = app(Settings::default(), test.services).oneshot(request).await.expect("one-shot");
+    let response = app(Settings::default(), test.services)
+        .oneshot(request)
+        .await
+        .expect("one-shot");
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 }
 
@@ -1527,7 +1560,10 @@ async fn given_no_bearer_and_malformed_uuid_when_purged_then_401_not_400() {
         .uri("/v1/files/not-a-uuid?purge=true")
         .body(Body::empty())
         .unwrap();
-    let response = app(Settings::default(), test.services).oneshot(request).await.expect("one-shot");
+    let response = app(Settings::default(), test.services)
+        .oneshot(request)
+        .await
+        .expect("one-shot");
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 }
 
@@ -1541,13 +1577,14 @@ async fn given_non_boolean_purge_query_when_delete_then_400_with_error_envelope(
         .header("authorization", "Bearer test-token")
         .body(Body::empty())
         .unwrap();
-    let response = app(Settings::default(), test.services).oneshot(request).await.expect("one-shot");
+    let response = app(Settings::default(), test.services)
+        .oneshot(request)
+        .await
+        .expect("one-shot");
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
-    let body: Value = serde_json::from_slice(
-        &to_bytes(response.into_body(), usize::MAX).await.unwrap(),
-    )
-    .unwrap();
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
     assert!(body["error"].as_str().is_some(), "error envelope present");
 }
 
@@ -1573,7 +1610,10 @@ async fn given_no_purge_param_when_delete_then_still_soft_deletes() {
             .fetch_one(&test.pool)
             .await
             .expect("catalog row");
-    assert_eq!(row.0, "deleted", "no-param delete still soft-deletes (UC-06)");
+    assert_eq!(
+        row.0, "deleted",
+        "no-param delete still soft-deletes (UC-06)"
+    );
     assert!(row.1.is_some(), "deleted_at stamped by no-param delete");
     assert!(on_disk.exists(), "on-disk file preserved");
 }
@@ -1613,12 +1653,13 @@ async fn given_active_file_when_purge_on_disk_then_200_and_rows_and_disk_file_re
         .expect("purge-on-disk one-shot");
     assert_eq!(response.status(), StatusCode::OK);
 
-    let body: Value = serde_json::from_slice(
-        &to_bytes(response.into_body(), usize::MAX).await.unwrap(),
-    )
-    .unwrap();
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
     assert_eq!(body["file"]["uuid"], uuid);
-    assert_eq!(body["file"]["state"], "active", "confirmation echoes the pre-purge state");
+    assert_eq!(
+        body["file"]["state"], "active",
+        "confirmation echoes the pre-purge state"
+    );
     assert_eq!(body["diskFilePresent"], true);
 
     let remaining: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM files WHERE uuid = ?")
@@ -1628,18 +1669,23 @@ async fn given_active_file_when_purge_on_disk_then_200_and_rows_and_disk_file_re
         .expect("files count");
     assert_eq!(remaining.0, 0, "files row removed by purge-on-disk");
 
-    let subtype_remaining: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM audio_files WHERE file_id = ?")
-        .bind(file_id.0)
-        .fetch_one(&test.pool)
-        .await
-        .expect("audio_files count");
-    assert_eq!(subtype_remaining.0, 0, "subtype row removed by purge-on-disk");
+    let subtype_remaining: (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM audio_files WHERE file_id = ?")
+            .bind(file_id.0)
+            .fetch_one(&test.pool)
+            .await
+            .expect("audio_files count");
+    assert_eq!(
+        subtype_remaining.0, 0,
+        "subtype row removed by purge-on-disk"
+    );
 
     assert!(!on_disk.exists(), "on-disk file deleted by purge-on-disk");
 }
 
 #[tokio::test]
-async fn given_missing_disk_file_when_purge_on_disk_then_200_disk_file_present_false_and_row_removed() {
+async fn given_missing_disk_file_when_purge_on_disk_then_200_disk_file_present_false_and_row_removed(
+) {
     let lib = tempdir().unwrap();
     let on_disk = common::write_file(&lib, "song.mp3", b"audio bytes");
     let test = test_app().await;
@@ -1655,18 +1701,22 @@ async fn given_missing_disk_file_when_purge_on_disk_then_200_disk_file_present_f
         .expect("purge-on-disk one-shot");
     assert_eq!(response.status(), StatusCode::OK);
 
-    let body: Value = serde_json::from_slice(
-        &to_bytes(response.into_body(), usize::MAX).await.unwrap(),
-    )
-    .unwrap();
-    assert_eq!(body["diskFilePresent"], false, "AF-01: no on-disk file to delete");
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(
+        body["diskFilePresent"], false,
+        "AF-01: no on-disk file to delete"
+    );
 
     let remaining: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM files WHERE uuid = ?")
         .bind(&uuid)
         .fetch_one(&test.pool)
         .await
         .expect("files count");
-    assert_eq!(remaining.0, 0, "record still purged despite absent disk file");
+    assert_eq!(
+        remaining.0, 0,
+        "record still purged despite absent disk file"
+    );
 }
 
 #[tokio::test]
@@ -1695,10 +1745,8 @@ async fn given_disk_delete_failure_when_purge_on_disk_then_500_disk_error_and_ro
         .expect("purge-on-disk one-shot");
     assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
 
-    let body: Value = serde_json::from_slice(
-        &to_bytes(response.into_body(), usize::MAX).await.unwrap(),
-    )
-    .unwrap();
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
     assert_eq!(body["error"], "disk error");
 
     let remaining: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM files WHERE uuid = ?")
@@ -1706,14 +1754,21 @@ async fn given_disk_delete_failure_when_purge_on_disk_then_500_disk_error_and_ro
         .fetch_one(&test.pool)
         .await
         .expect("files count");
-    assert_eq!(remaining.0, 1, "AF-02: record kept when the disk delete fails");
+    assert_eq!(
+        remaining.0, 1,
+        "AF-02: record kept when the disk delete fails"
+    );
 
-    let subtype_remaining: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM audio_files WHERE file_id = ?")
-        .bind(file_id.0)
-        .fetch_one(&test.pool)
-        .await
-        .expect("audio_files count");
-    assert_eq!(subtype_remaining.0, 1, "AF-02: subtype row kept when the disk delete fails");
+    let subtype_remaining: (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM audio_files WHERE file_id = ?")
+            .bind(file_id.0)
+            .fetch_one(&test.pool)
+            .await
+            .expect("audio_files count");
+    assert_eq!(
+        subtype_remaining.0, 1,
+        "AF-02: subtype row kept when the disk delete fails"
+    );
 }
 
 #[tokio::test]
@@ -1736,7 +1791,10 @@ async fn given_no_bearer_when_purge_on_disk_then_401() {
         .uri(format!("/v1/files/{uuid}?purge-on-disk=true"))
         .body(Body::empty())
         .unwrap();
-    let response = app(Settings::default(), test.services).oneshot(request).await.expect("one-shot");
+    let response = app(Settings::default(), test.services)
+        .oneshot(request)
+        .await
+        .expect("one-shot");
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 }
 
@@ -1750,13 +1808,14 @@ async fn given_purge_and_purge_on_disk_both_true_when_delete_then_400_with_error
         .header("authorization", "Bearer test-token")
         .body(Body::empty())
         .unwrap();
-    let response = app(Settings::default(), test.services).oneshot(request).await.expect("one-shot");
+    let response = app(Settings::default(), test.services)
+        .oneshot(request)
+        .await
+        .expect("one-shot");
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
-    let body: Value = serde_json::from_slice(
-        &to_bytes(response.into_body(), usize::MAX).await.unwrap(),
-    )
-    .unwrap();
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
     assert!(body["error"].as_str().is_some(), "error envelope present");
 }
 
@@ -1770,12 +1829,13 @@ async fn given_non_boolean_purge_on_disk_query_when_delete_then_400_with_error_e
         .header("authorization", "Bearer test-token")
         .body(Body::empty())
         .unwrap();
-    let response = app(Settings::default(), test.services).oneshot(request).await.expect("one-shot");
+    let response = app(Settings::default(), test.services)
+        .oneshot(request)
+        .await
+        .expect("one-shot");
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
-    let body: Value = serde_json::from_slice(
-        &to_bytes(response.into_body(), usize::MAX).await.unwrap(),
-    )
-    .unwrap();
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
     assert!(body["error"].as_str().is_some(), "error envelope present");
 }

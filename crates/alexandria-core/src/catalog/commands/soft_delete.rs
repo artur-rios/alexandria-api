@@ -38,11 +38,7 @@ where
 
     /// Mark `uuid` soft-deleted and return the re-read `File` (carrying the
     /// persisted `state = deleted` and the stamped `deleted_at`).
-    pub async fn soft_delete(
-        &self,
-        uuid: Uuid,
-        token: &str,
-    ) -> Result<File, DomainError> {
+    pub async fn soft_delete(&self, uuid: Uuid, token: &str) -> Result<File, DomainError> {
         // AF-02: the caller must be authenticated. Evaluation happens before
         // any payload is consulted (FR-AU-07 / SRD §7), so an unauthenticated
         // caller learns nothing about whether the uuid exists.

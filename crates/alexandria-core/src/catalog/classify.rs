@@ -22,9 +22,7 @@ pub fn classify_by_extension(name: &str) -> Option<FileType> {
         .map(|e| e.to_ascii_lowercase())?;
 
     Some(match ext.as_str() {
-        "mp3" | "flac" | "wav" | "ogg" | "oga" | "m4a" | "aac" | "opus" | "wma" => {
-            FileType::Audio
-        }
+        "mp3" | "flac" | "wav" | "ogg" | "oga" | "m4a" | "aac" | "opus" | "wma" => FileType::Audio,
         "mp4" | "m4v" | "mkv" | "avi" | "mov" | "webm" | "mpg" | "mpeg" | "wmv" | "flv" => {
             FileType::Video
         }
@@ -32,9 +30,7 @@ pub fn classify_by_extension(name: &str) -> Option<FileType> {
         "md" | "markdown" | "txt" => FileType::Text,
         "pdf" | "epub" | "mobi" | "azw" | "azw3" => FileType::Document,
         "cbr" | "cbz" => FileType::Comic,
-        "jpg" | "jpeg" | "png" | "gif" | "webp" | "bmp" | "tif" | "tiff" | "svg" => {
-            FileType::Image
-        }
+        "jpg" | "jpeg" | "png" | "gif" | "webp" | "bmp" | "tif" | "tiff" | "svg" => FileType::Image,
         _ => return None,
     })
 }

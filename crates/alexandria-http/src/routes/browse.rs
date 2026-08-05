@@ -4,7 +4,7 @@ use axum::Json;
 use serde::Deserialize;
 use uuid::Uuid;
 
-use alexandria_core::catalog::model::{File, FileView, FileType, StateFilter};
+use alexandria_core::catalog::model::{File, FileType, FileView, StateFilter};
 use alexandria_core::catalog::queries::browse::FileFilter;
 
 use crate::middleware::error::ApiError;

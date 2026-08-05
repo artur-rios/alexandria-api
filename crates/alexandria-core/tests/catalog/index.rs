@@ -40,10 +40,20 @@ fn given_supported_extensions_when_classify_then_returns_correct_type() {
 #[tokio::test]
 async fn given_valid_root_and_authenticated_when_start_then_returns_run_id() {
     let fs = FakeFilesystem::builder().with_root(ROOT).build();
-    let handler = handler(FakeAuth::Allowing, FakeCatalogRepository::new(), fs, fixed_clock(now()));
+    let handler = handler(
+        FakeAuth::Allowing,
+        FakeCatalogRepository::new(),
+        fs,
+        fixed_clock(now()),
+    );
 
     let started = handler
-        .start(IndexRequest { root: ROOT.to_string() }, TOKEN)
+        .start(
+            IndexRequest {
+                root: ROOT.to_string(),
+            },
+            TOKEN,
+        )
         .await
         .expect("start");
 
@@ -53,10 +63,20 @@ async fn given_valid_root_and_authenticated_when_start_then_returns_run_id() {
 #[tokio::test]
 async fn given_missing_root_when_start_then_invalid_input() {
     let fs = FakeFilesystem::builder().build();
-    let handler = handler(FakeAuth::Allowing, FakeCatalogRepository::new(), fs, fixed_clock(now()));
+    let handler = handler(
+        FakeAuth::Allowing,
+        FakeCatalogRepository::new(),
+        fs,
+        fixed_clock(now()),
+    );
 
     let result = handler
-        .start(IndexRequest { root: "/nope".to_string() }, TOKEN)
+        .start(
+            IndexRequest {
+                root: "/nope".to_string(),
+            },
+            TOKEN,
+        )
         .await;
 
     assert!(matches!(result, Err(DomainError::InvalidInput(_))));
@@ -65,10 +85,20 @@ async fn given_missing_root_when_start_then_invalid_input() {
 #[tokio::test]
 async fn given_unauthenticated_when_start_then_unauthorized() {
     let fs = FakeFilesystem::builder().with_root(ROOT).build();
-    let handler = handler(FakeAuth::Denying, FakeCatalogRepository::new(), fs, fixed_clock(now()));
+    let handler = handler(
+        FakeAuth::Denying,
+        FakeCatalogRepository::new(),
+        fs,
+        fixed_clock(now()),
+    );
 
     let result = handler
-        .start(IndexRequest { root: ROOT.to_string() }, "")
+        .start(
+            IndexRequest {
+                root: ROOT.to_string(),
+            },
+            "",
+        )
         .await;
 
     assert!(matches!(result, Err(DomainError::Unauthorized)));
@@ -88,12 +118,22 @@ async fn given_already_cataloged_path_when_execute_then_skipped_no_duplicate() {
     let repo_handle = repo.clone();
     let handler = handler(FakeAuth::Allowing, repo, fs, fixed_clock(now()));
 
-    let outcome = handler.execute(ROOT, Uuid::new_v4()).await.expect("execute");
+    let outcome = handler
+        .execute(ROOT, Uuid::new_v4())
+        .await
+        .expect("execute");
 
     assert_eq!(outcome.scanned, 2);
-    assert_eq!(outcome.indexed, 1, "the already-cataloged path must be skipped");
+    assert_eq!(
+        outcome.indexed, 1,
+        "the already-cataloged path must be skipped"
+    );
     assert_eq!(outcome.skipped, 1);
-    assert_eq!(repo_handle.count(), 2, "exactly the existing + one new record");
+    assert_eq!(
+        repo_handle.count(),
+        2,
+        "exactly the existing + one new record"
+    );
     assert!(repo_handle.has_path(existing_path));
     assert!(repo_handle.has_path("/library/b.mp3"));
 }
@@ -108,7 +148,10 @@ async fn given_supported_files_when_execute_then_indexed_with_hash_and_indexedat
     let repo_handle = repo.clone();
     let handler = handler(FakeAuth::Allowing, repo, fs, fixed_clock(now()));
 
-    let outcome = handler.execute(ROOT, Uuid::new_v4()).await.expect("execute");
+    let outcome = handler
+        .execute(ROOT, Uuid::new_v4())
+        .await
+        .expect("execute");
 
     assert_eq!(outcome.scanned, 2);
     assert_eq!(outcome.indexed, 2);
@@ -133,7 +176,10 @@ async fn given_unsupported_extension_when_execute_then_skipped() {
     let repo = FakeCatalogRepository::new();
     let handler = handler(FakeAuth::Allowing, repo, fs, fixed_clock(now()));
 
-    let outcome = handler.execute(ROOT, Uuid::new_v4()).await.expect("execute");
+    let outcome = handler
+        .execute(ROOT, Uuid::new_v4())
+        .await
+        .expect("execute");
 
     assert_eq!(outcome.scanned, 2);
     assert_eq!(outcome.indexed, 0);
@@ -160,7 +206,10 @@ async fn given_unreadable_file_when_execute_then_run_continues_and_counts_failur
 
     assert_eq!(outcome.scanned, 3);
     assert_eq!(outcome.indexed, 2, "the two readable files are indexed");
-    assert_eq!(outcome.failed, 1, "the unreadable file is counted as failed");
+    assert_eq!(
+        outcome.failed, 1,
+        "the unreadable file is counted as failed"
+    );
     assert_eq!(outcome.skipped, 0, "failed is not the same as skipped");
     assert!(repo_handle.has_path("/library/a.mp3"));
     assert!(repo_handle.has_path("/library/c.mp3"));
@@ -201,7 +250,9 @@ async fn given_bearer_auth_when_authenticated_then_principal_owner() {
 
 #[tokio::test]
 async fn given_bearer_auth_when_empty_token_then_unauthorized() {
-    let result = alexandria_core::auth::BearerAuthService.authenticate("  ").await;
+    let result = alexandria_core::auth::BearerAuthService
+        .authenticate("  ")
+        .await;
     assert!(matches!(result, Err(DomainError::Unauthorized)));
 }
 

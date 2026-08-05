@@ -1,11 +1,11 @@
 pub mod browse;
+pub mod delete_file;
 pub mod edit_metadata;
 pub mod health;
 pub mod index;
 pub mod refresh;
 pub mod rename;
 pub mod restore;
-pub mod soft_delete;
 
 use axum::http::HeaderMap;
 
@@ -16,7 +16,10 @@ pub(crate) fn bearer_token(headers: &HeaderMap) -> String {
     headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
-        .and_then(|s| s.strip_prefix("Bearer ").or_else(|| s.strip_prefix("bearer ")))
+        .and_then(|s| {
+            s.strip_prefix("Bearer ")
+                .or_else(|| s.strip_prefix("bearer "))
+        })
         .unwrap_or("")
         .to_string()
 }

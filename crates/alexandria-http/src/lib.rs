@@ -35,20 +35,11 @@ pub fn app(settings: Settings, services: Arc<Services>) -> Router {
             "/v1/files/{uuid}/metadata",
             patch(routes::edit_metadata::edit_metadata),
         )
-        .route(
-            "/v1/files/{uuid}/rename",
-            post(routes::rename::rename),
-        )
+        .route("/v1/files/{uuid}/rename", post(routes::rename::rename))
         .route("/v1/files", get(routes::browse::list_files))
         .route("/v1/files/{uuid}", get(routes::browse::get_file))
-        .route(
-            "/v1/files/{uuid}",
-            delete(routes::soft_delete::soft_delete),
-        )
-        .route(
-            "/v1/files/{uuid}/restore",
-            post(routes::restore::restore),
-        )
+        .route("/v1/files/{uuid}", delete(routes::delete_file::delete_file))
+        .route("/v1/files/{uuid}/restore", post(routes::restore::restore))
         .route_layer(from_fn_with_state(
             state.clone(),
             middleware::auth::require_auth,

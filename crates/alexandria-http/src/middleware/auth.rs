@@ -20,11 +20,7 @@ use crate::AppState;
 /// Applied as a `route_layer` over the `/v1` routes only, so `/health` stays
 /// open. Handlers still call `AuthService` themselves: this is the transport
 /// gate, and the domain check remains unit-testable against trait fakes.
-pub async fn require_auth(
-    State(state): State<AppState>,
-    request: Request,
-    next: Next,
-) -> Response {
+pub async fn require_auth(State(state): State<AppState>, request: Request, next: Next) -> Response {
     let token = bearer_token(request.headers());
     match state.services.auth.authenticate(&token).await {
         Ok(_) => next.run(request).await,
