@@ -2461,6 +2461,91 @@ pub extern "C" fn alexandria_reading_list_add_item(
     }
 }
 
+/// Filter accepted by `alexandria_reading_lists_list` — the same JSON `GET
+/// /v1/reading-lists?readingListUuid=…` takes:
+/// `{"readingListUuid":"…"}`. An empty or absent `readingListUuid` means
+/// every reading list.
+#[derive(Debug, Default)]
+struct ReadingListsListFilter {
+    reading_list_uuid: Option<String>,
+}
+
+impl ReadingListsListFilter {
+    fn from_json_str(s: &str) -> Option<Self> {
+        if s.trim().is_empty() {
+            return Some(Self::default());
+        }
+        let value: serde_json::Value = serde_json::from_str(s).ok()?;
+        if value.is_null() {
+            return Some(Self::default());
+        }
+        let obj = value.as_object()?;
+        Some(Self {
+            reading_list_uuid: obj
+                .get("readingListUuid")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+        })
+    }
+}
+
+/// Browse reading lists and their items' read progress (UC-27 / FR-RL-08).
+///
+/// `json_filters` is the JSON filter HTTP would build from its query string
+/// (`readingListUuid`); an empty string or `null` means every reading list.
+/// On success `json` carries a JSON array of `ReadingListWithProgress` —
+/// byte-for-byte the same shape HTTP returns from `GET /v1/reading-lists`
+/// (parity, FR-FC-24 / NFR-09). `token` is the bearer auth token.
+#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
+#[no_mangle]
+pub extern "C" fn alexandria_reading_lists_list(
+    json_filters: *const c_char,
+    token: *const c_char,
+) -> ReadingListJsonResult {
+    let services = match services_slot().lock().unwrap().clone() {
+        Some(s) => s,
+        None => return ReadingListJsonResult::err(READING_LIST_ERR_NOT_INITIALIZED),
+    };
+
+    let token = cstr_lossy(token).unwrap_or_default();
+    if !authenticated(&services, &token) {
+        return ReadingListJsonResult::err(READING_LIST_ERR_UNAUTHORIZED);
+    }
+
+    let filter_str = cstr_lossy(json_filters).unwrap_or_default();
+    let parsed = match ReadingListsListFilter::from_json_str(&filter_str) {
+        Some(f) => f,
+        None => return ReadingListJsonResult::err(READING_LIST_ERR_INVALID_INPUT),
+    };
+
+    let reading_list_uuid = match parsed
+        .reading_list_uuid
+        .as_deref()
+        .filter(|s| !s.is_empty())
+    {
+        None => None,
+        Some(v) => match uuid::Uuid::parse_str(v) {
+            Ok(u) => Some(u),
+            Err(_) => return ReadingListJsonResult::err(READING_LIST_ERR_INVALID_INPUT),
+        },
+    };
+
+    let result = runtime().block_on(async {
+        services
+            .browse_reading_lists_handler
+            .list(reading_list_uuid, &token)
+            .await
+    });
+
+    match result {
+        Ok(reading_lists) => {
+            let json = serde_json::to_string(&reading_lists).unwrap_or_default();
+            ReadingListJsonResult::ok(json)
+        }
+        Err(err) => map_reading_list_err(err),
+    }
+}
+
 /// Free a string previously returned by an FFI accessor.
 ///
 /// # Safety

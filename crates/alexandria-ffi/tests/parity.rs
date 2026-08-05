@@ -27,9 +27,9 @@ use alexandria_ffi::{
     alexandria_free_string, alexandria_index_count_files, alexandria_index_count_missing,
     alexandria_index_files_json, alexandria_index_init, alexandria_index_refresh_start,
     alexandria_index_start, alexandria_reading_list_add_item, alexandria_reading_list_create,
-    alexandria_watchlist_add_video, alexandria_watchlist_create, alexandria_watchlist_delete,
-    alexandria_watchlist_remove_video, alexandria_watchlist_update_progress,
-    alexandria_watchlists_list, IndexStartResult,
+    alexandria_reading_lists_list, alexandria_watchlist_add_video, alexandria_watchlist_create,
+    alexandria_watchlist_delete, alexandria_watchlist_remove_video,
+    alexandria_watchlist_update_progress, alexandria_watchlists_list, IndexStartResult,
 };
 use alexandria_http::app;
 use axum::body::{to_bytes, Body};
@@ -7058,6 +7058,213 @@ async fn given_unknown_reading_list_when_item_added_via_http_and_ffi_then_both_n
             alexandria_reading_list_add_item(unknown_c.as_ptr(), add_body.as_ptr(), token.as_ptr());
         assert!(add_r.json.is_null());
         add_r.status
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(
+        ffi_status,
+        alexandria_ffi::READING_LIST_ERR_NOT_FOUND,
+        "ffi must reject an unknown reading list as not-found (HTTP 404)"
+    );
+}
+
+/// UC-27 parity - browse the same reading list (with a linked document) over
+/// both transports and assert the returned bodies agree modulo per-database
+/// uuids (Testing Specification section 7.3, FR-RL-08, FR-FC-24).
+#[tokio::test]
+async fn given_same_reading_list_when_browsed_via_http_and_ffi_then_bodies_identical() {
+    let _g = SERIAL.lock().unwrap();
+
+    // ---- HTTP leg ----
+    let http_dir = tempdir().unwrap();
+    let http_db = db_path(&http_dir, "http.sqlite");
+    let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    let http_services =
+        std::sync::Arc::new(build_services(&Settings::default(), http_pool.clone()).await);
+
+    let create_req = Request::builder()
+        .method("POST")
+        .uri("/v1/reading-lists")
+        .header("authorization", "Bearer parity")
+        .header("content-type", "application/json")
+        .body(Body::from(json!({ "name": "Summer reads" }).to_string()))
+        .unwrap();
+    let create_resp = app(Settings::default(), http_services.clone())
+        .oneshot(create_req)
+        .await
+        .expect("http create reading list");
+    let http_reading_list_uuid = serde_json::from_slice::<serde_json::Value>(
+        &to_bytes(create_resp.into_body(), usize::MAX).await.unwrap(),
+    )
+    .unwrap()["uuid"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let http_item_uuid = seed_file(&http_pool, "document").await;
+    let add_req = Request::builder()
+        .method("POST")
+        .uri(format!("/v1/reading-lists/{http_reading_list_uuid}/items"))
+        .header("authorization", "Bearer parity")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({ "itemUuid": http_item_uuid }).to_string(),
+        ))
+        .unwrap();
+    let add_resp = app(Settings::default(), http_services.clone())
+        .oneshot(add_req)
+        .await
+        .expect("http add item");
+    assert_eq!(add_resp.status(), axum::http::StatusCode::OK);
+
+    let list_req = Request::builder()
+        .method("GET")
+        .uri("/v1/reading-lists")
+        .header("authorization", "Bearer parity")
+        .body(Body::empty())
+        .unwrap();
+    let list_resp = app(Settings::default(), http_services)
+        .oneshot(list_req)
+        .await
+        .expect("http list");
+    assert_eq!(list_resp.status(), axum::http::StatusCode::OK);
+    let http_body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(list_resp.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
+
+    // ---- FFI leg ----
+    let ffi_dir = tempdir().unwrap();
+    let ffi_db = db_path(&ffi_dir, "ffi.sqlite");
+    let ffi_db_for_seed = ffi_db.clone();
+
+    let ffi_pool_for_seed = migrate_database(&ffi_db_for_seed).await.expect("ffi open");
+    let ffi_item_uuid = seed_file(&ffi_pool_for_seed, "document").await;
+    ffi_pool_for_seed.close().await;
+
+    let ffi_body: serde_json::Value = tokio::task::spawn_blocking(move || -> serde_json::Value {
+        let cdb = CString::new(ffi_db).unwrap();
+        assert_eq!(
+            alexandria_index_init(cdb.as_ptr()),
+            alexandria_ffi::INDEX_OK
+        );
+
+        let token = CString::new("parity").unwrap();
+        let create_body = CString::new(json!({ "name": "Summer reads" }).to_string()).unwrap();
+        let create_r = alexandria_reading_list_create(create_body.as_ptr(), token.as_ptr());
+        assert_eq!(
+            create_r.status,
+            alexandria_ffi::READING_LIST_OK,
+            "ffi create"
+        );
+        let reading_list_json = unsafe { CStr::from_ptr(create_r.json) }
+            .to_string_lossy()
+            .into_owned();
+        unsafe {
+            alexandria_free_string(create_r.json);
+        }
+        let reading_list_uuid = serde_json::from_str::<serde_json::Value>(&reading_list_json)
+            .unwrap()["uuid"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let reading_list_uuid_c = CString::new(reading_list_uuid).unwrap();
+        let add_body = CString::new(json!({ "itemUuid": ffi_item_uuid }).to_string()).unwrap();
+        let add_r = alexandria_reading_list_add_item(
+            reading_list_uuid_c.as_ptr(),
+            add_body.as_ptr(),
+            token.as_ptr(),
+        );
+        assert_eq!(
+            add_r.status,
+            alexandria_ffi::READING_LIST_OK,
+            "ffi add item"
+        );
+        unsafe {
+            alexandria_free_string(add_r.json);
+        }
+
+        let list_r = alexandria_reading_lists_list(std::ptr::null(), token.as_ptr());
+        assert_eq!(list_r.status, alexandria_ffi::READING_LIST_OK, "ffi list");
+        assert!(!list_r.json.is_null());
+        let s = unsafe { CStr::from_ptr(list_r.json) }
+            .to_string_lossy()
+            .into_owned();
+        unsafe {
+            alexandria_free_string(list_r.json);
+        }
+        serde_json::from_str(&s).unwrap()
+    })
+    .await
+    .unwrap();
+
+    // ---- compare ----
+    let http_list = http_body.as_array().unwrap();
+    let ffi_list = ffi_body.as_array().unwrap();
+    assert_eq!(http_list.len(), 1, "http returned one reading list");
+    assert_eq!(ffi_list.len(), 1, "ffi returned one reading list");
+
+    for (label, reading_list) in [("http", &http_list[0]), ("ffi", &ffi_list[0])] {
+        assert!(
+            uuid::Uuid::parse_str(reading_list["uuid"].as_str().unwrap_or_default()).is_ok(),
+            "{label} reading list carries a valid uuid"
+        );
+        assert_eq!(reading_list["name"], "Summer reads");
+        let items = reading_list["items"].as_array().expect("items array");
+        assert_eq!(items.len(), 1, "{label} reading list carries one item");
+        assert!(
+            uuid::Uuid::parse_str(items[0]["itemUuid"].as_str().unwrap_or_default()).is_ok(),
+            "{label} item carries a valid item uuid"
+        );
+        assert_eq!(items[0]["targetKind"], "document");
+        assert_eq!(items[0]["state"], "pending");
+    }
+}
+
+/// UC-27 parity - browsing an unknown reading list uuid is rejected as
+/// not-found on both surfaces (HTTP 404, FFI READING_LIST_ERR_NOT_FOUND)
+/// (FR-FC-24 / NFR-09).
+#[tokio::test]
+async fn given_unknown_reading_list_when_browsed_via_http_and_ffi_then_both_not_found() {
+    let _g = SERIAL.lock().unwrap();
+
+    // ---- HTTP leg ----
+    let http_dir = tempdir().unwrap();
+    let http_db = db_path(&http_dir, "http.sqlite");
+    let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    let http_services =
+        std::sync::Arc::new(build_services(&Settings::default(), http_pool.clone()).await);
+
+    let unknown = uuid::Uuid::new_v4().to_string();
+    let list_req = Request::builder()
+        .method("GET")
+        .uri(format!("/v1/reading-lists?readingListUuid={unknown}"))
+        .header("authorization", "Bearer parity")
+        .body(Body::empty())
+        .unwrap();
+    let list_resp = app(Settings::default(), http_services)
+        .oneshot(list_req)
+        .await
+        .expect("http list");
+    assert_eq!(list_resp.status(), axum::http::StatusCode::NOT_FOUND);
+
+    // ---- FFI leg ----
+    let ffi_dir = tempdir().unwrap();
+    let ffi_db = db_path(&ffi_dir, "ffi.sqlite");
+    let ffi_status = tokio::task::spawn_blocking(move || -> i32 {
+        let cdb = CString::new(ffi_db).unwrap();
+        assert_eq!(
+            alexandria_index_init(cdb.as_ptr()),
+            alexandria_ffi::INDEX_OK
+        );
+
+        let token = CString::new("parity").unwrap();
+        let unknown = uuid::Uuid::new_v4().to_string();
+        let filter = CString::new(json!({ "readingListUuid": unknown }).to_string()).unwrap();
+        let list_r = alexandria_reading_lists_list(filter.as_ptr(), token.as_ptr());
+        assert!(list_r.json.is_null());
+        list_r.status
     })
     .await
     .unwrap();

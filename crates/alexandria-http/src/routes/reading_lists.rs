@@ -1,11 +1,14 @@
-use axum::extract::rejection::{JsonRejection, PathRejection};
-use axum::extract::{Path, State};
+use axum::extract::rejection::{JsonRejection, PathRejection, QueryRejection};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
 use serde::Deserialize;
 use uuid::Uuid;
 
-use alexandria_core::reading_lists::model::{ReadingList, ReadingProgress};
+use alexandria_core::errors::DomainError;
+use alexandria_core::reading_lists::model::{
+    ReadingList, ReadingListWithProgress, ReadingProgress,
+};
 
 use crate::middleware::auth::invalid_input;
 use crate::middleware::error::ApiError;
@@ -93,4 +96,51 @@ pub async fn add_item(
         .map_err(ApiError)?;
 
     Ok((StatusCode::OK, Json(result)))
+}
+
+/// Query-string parameters for `GET /v1/reading-lists` (UC-27 / FR-RL-08).
+/// An omitted or empty `readingListUuid` means every reading list is
+/// returned; a malformed value is rejected as `400` invalid input, matching
+/// the FFI surface (FR-FC-24 / NFR-09).
+#[derive(Debug, Default, Deserialize)]
+pub struct ReadingListListParams {
+    #[serde(rename = "readingListUuid", default)]
+    pub reading_list_uuid: Option<String>,
+}
+
+/// `GET /v1/reading-lists` — browse reading lists and their items' read
+/// progress (UC-27 / FR-RL-08), optionally filtered to a single reading
+/// list. Returns `200` with a JSON array of `ReadingListWithProgress`
+/// records, or `400` (malformed `readingListUuid`), `404` (the referenced
+/// reading list does not exist), or `401` (unauthenticated).
+pub async fn list(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    params: Result<Query<ReadingListListParams>, QueryRejection>,
+) -> Result<Json<Vec<ReadingListWithProgress>>, ApiError> {
+    let token = bearer_token(&headers);
+
+    let Query(params) = params.map_err(|err| invalid_input(format!("invalid query: {err}")))?;
+
+    let reading_list_uuid = match params
+        .reading_list_uuid
+        .as_deref()
+        .filter(|s| !s.is_empty())
+    {
+        None => None,
+        Some(v) => Some(Uuid::parse_str(v).map_err(|_| {
+            ApiError(DomainError::InvalidInput(format!(
+                "invalid readingListUuid: {v}"
+            )))
+        })?),
+    };
+
+    let result = state
+        .services
+        .browse_reading_lists_handler
+        .list(reading_list_uuid, &token)
+        .await
+        .map_err(ApiError)?;
+
+    Ok(Json(result))
 }

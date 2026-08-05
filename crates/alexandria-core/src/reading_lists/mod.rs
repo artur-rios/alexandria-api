@@ -6,4 +6,5 @@
 //! use case.
 pub mod commands;
 pub mod model;
+pub mod queries;
 pub mod repos;

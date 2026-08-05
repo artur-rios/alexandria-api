@@ -90,3 +90,13 @@ pub struct ReadingProgress {
     pub current_issue: Option<i64>,
     pub total_issues: Option<i64>,
 }
+
+/// A reading list with the ReadingProgress of every item it tracks (UC-27 /
+/// FR-RL-08).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReadingListWithProgress {
+    pub uuid: Uuid,
+    pub name: String,
+    pub items: Vec<ReadingProgress>,
+}
