@@ -29,7 +29,7 @@ use alexandria_core::collections::model::{Collection, NewCollection};
 use alexandria_core::collections::repos::CollectionRepository;
 use alexandria_core::config::AuthMode;
 use alexandria_core::errors::DomainError;
-use alexandria_core::watchlists::model::{NewWatchlist, Watchlist};
+use alexandria_core::watchlists::model::{NewWatchlist, WatchProgress, WatchState, Watchlist};
 use alexandria_core::watchlists::repos::WatchlistRepository;
 
 /// Fake auth service. `Denying` rejects every caller (AF-02); `Allowing`
@@ -992,6 +992,7 @@ pub struct FakeWatchlistRepository {
     /// When set, every `insert_watchlist` fails, simulating a catalog-write
     /// failure in UC-20.
     failing: Arc<Mutex<bool>>,
+    progress: Arc<Mutex<HashMap<(Uuid, Uuid), WatchProgress>>>,
 }
 
 impl FakeWatchlistRepository {
@@ -1030,5 +1031,27 @@ impl WatchlistRepository for FakeWatchlistRepository {
             .unwrap()
             .insert(watchlist.uuid, watchlist.clone());
         Ok(watchlist)
+    }
+
+    async fn find_by_uuid(&self, uuid: Uuid) -> Result<Option<Watchlist>, DomainError> {
+        Ok(self.watchlists.lock().unwrap().get(&uuid).cloned())
+    }
+
+    async fn add_video(
+        &self,
+        watchlist_uuid: Uuid,
+        video_uuid: Uuid,
+    ) -> Result<WatchProgress, DomainError> {
+        let mut progress = self.progress.lock().unwrap();
+        let entry = progress
+            .entry((watchlist_uuid, video_uuid))
+            .or_insert_with(|| WatchProgress {
+                watchlist_uuid,
+                video_uuid,
+                state: WatchState::Pending,
+                current_episode: None,
+                total_episodes: None,
+            });
+        Ok(entry.clone())
     }
 }

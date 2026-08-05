@@ -18,3 +18,45 @@ pub struct Watchlist {
     pub uuid: Uuid,
     pub name: String,
 }
+
+/// A video's watch state (SRD §4.6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WatchState {
+    Pending,
+    Watching,
+    Watched,
+}
+
+impl WatchState {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            WatchState::Pending => "pending",
+            WatchState::Watching => "watching",
+            WatchState::Watched => "watched",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "pending" => Some(WatchState::Pending),
+            "watching" => Some(WatchState::Watching),
+            "watched" => Some(WatchState::Watched),
+            _ => None,
+        }
+    }
+}
+
+/// A persisted WatchProgress (SRD §4.6): links a video to a watchlist and
+/// tracks its watch state, with the current/total episode for series
+/// (UC-23 / FR-WL-05). Both the watchlist and the video are addressed by
+/// their public uuid — the internal FK ids stay inside the repository.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WatchProgress {
+    pub watchlist_uuid: Uuid,
+    pub video_uuid: Uuid,
+    pub state: WatchState,
+    pub current_episode: Option<i64>,
+    pub total_episodes: Option<i64>,
+}
