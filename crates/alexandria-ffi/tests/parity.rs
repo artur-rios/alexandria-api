@@ -17,15 +17,16 @@ use alexandria_core::config::Settings;
 use alexandria_core::migrate::migrate_database;
 use alexandria_core::services::build_services;
 use alexandria_ffi::{
-    alexandria_bookmark_create, alexandria_bookmark_restore, alexandria_bookmark_soft_delete,
-    alexandria_bookmark_update, alexandria_bookmarks_list, alexandria_collection_add_items,
-    alexandria_collection_create, alexandria_collection_delete, alexandria_collection_list_items,
-    alexandria_collection_remove_item, alexandria_collection_rename, alexandria_file_edit_metadata,
-    alexandria_file_get_by_uuid, alexandria_file_purge, alexandria_file_purge_on_disk,
-    alexandria_file_rename, alexandria_file_restore, alexandria_file_soft_delete,
-    alexandria_files_list, alexandria_free_string, alexandria_index_count_files,
-    alexandria_index_count_missing, alexandria_index_files_json, alexandria_index_init,
-    alexandria_index_refresh_start, alexandria_index_start, IndexStartResult,
+    alexandria_bookmark_create, alexandria_bookmark_purge, alexandria_bookmark_restore,
+    alexandria_bookmark_soft_delete, alexandria_bookmark_update, alexandria_bookmarks_list,
+    alexandria_collection_add_items, alexandria_collection_create, alexandria_collection_delete,
+    alexandria_collection_list_items, alexandria_collection_remove_item,
+    alexandria_collection_rename, alexandria_file_edit_metadata, alexandria_file_get_by_uuid,
+    alexandria_file_purge, alexandria_file_purge_on_disk, alexandria_file_rename,
+    alexandria_file_restore, alexandria_file_soft_delete, alexandria_files_list,
+    alexandria_free_string, alexandria_index_count_files, alexandria_index_count_missing,
+    alexandria_index_files_json, alexandria_index_init, alexandria_index_refresh_start,
+    alexandria_index_start, IndexStartResult,
 };
 use alexandria_http::app;
 use axum::body::{to_bytes, Body};
@@ -5147,6 +5148,205 @@ async fn given_unknown_uuid_when_bookmark_soft_deleted_via_http_and_ffi_then_bot
         let token = CString::new("parity").unwrap();
         let r = alexandria_bookmark_soft_delete(uuid_c.as_ptr(), token.as_ptr());
         assert!(r.json.is_null(), "a rejected delete returns no body");
+        r.status
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(
+        ffi_status,
+        alexandria_ffi::BOOKMARK_ERR_NOT_FOUND,
+        "ffi must reject an unknown uuid as not-found (HTTP 404)"
+    );
+}
+
+/// UC-19 parity - hard-purge the same past-retention bookmark over both
+/// transports and assert the returned bodies agree and each row is removed
+/// (Testing Specification section 7.3, FR-BM-04, FR-FC-24).
+#[tokio::test]
+async fn given_purgeable_bookmark_when_purged_via_http_and_ffi_then_bodies_and_rows_identical() {
+    let _g = SERIAL.lock().unwrap();
+
+    let deleted_at = "2024-01-01T00:00:00Z";
+
+    // ---- HTTP leg ----
+    let http_dir = tempdir().unwrap();
+    let http_db = db_path(&http_dir, "http.sqlite");
+    let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    let http_services =
+        std::sync::Arc::new(build_services(&Settings::default(), http_pool.clone()).await);
+    let router = app(Settings::default(), http_services);
+
+    let create_req = Request::builder()
+        .method("POST")
+        .uri("/v1/bookmarks")
+        .header("authorization", "Bearer parity")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({ "url": "https://example.com", "title": "Example" }).to_string(),
+        ))
+        .unwrap();
+    let created: serde_json::Value = serde_json::from_slice(
+        &to_bytes(
+            router
+                .clone()
+                .oneshot(create_req)
+                .await
+                .unwrap()
+                .into_body(),
+            usize::MAX,
+        )
+        .await
+        .unwrap(),
+    )
+    .unwrap();
+    let http_uuid = created["uuid"].as_str().unwrap().to_string();
+
+    sqlx::query("UPDATE bookmarks SET state = 'deleted', deleted_at = ? WHERE uuid = ?")
+        .bind(deleted_at)
+        .bind(&http_uuid)
+        .execute(&http_pool)
+        .await
+        .expect("http soft-delete seed");
+
+    let purge_req = Request::builder()
+        .method("DELETE")
+        .uri(format!("/v1/bookmarks/{http_uuid}?purge=true"))
+        .header("authorization", "Bearer parity")
+        .body(Body::empty())
+        .unwrap();
+    let purge_resp = router.oneshot(purge_req).await.expect("http purge");
+    assert_eq!(purge_resp.status(), axum::http::StatusCode::OK);
+    let http_body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(purge_resp.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
+
+    let http_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM bookmarks WHERE uuid = ?")
+        .bind(&http_uuid)
+        .fetch_one(&http_pool)
+        .await
+        .unwrap();
+
+    // ---- FFI leg ----
+    let ffi_dir = tempdir().unwrap();
+    let ffi_db = db_path(&ffi_dir, "ffi.sqlite");
+
+    let ffi_body: serde_json::Value = tokio::task::spawn_blocking(move || -> serde_json::Value {
+        let cdb = CString::new(ffi_db.clone()).unwrap();
+        assert_eq!(
+            alexandria_index_init(cdb.as_ptr()),
+            alexandria_ffi::INDEX_OK
+        );
+
+        let token = CString::new("parity").unwrap();
+        let create_body =
+            CString::new(json!({ "url": "https://example.com", "title": "Example" }).to_string())
+                .unwrap();
+        let created = alexandria_bookmark_create(create_body.as_ptr(), token.as_ptr());
+        assert_eq!(created.status, alexandria_ffi::BOOKMARK_OK, "ffi create");
+        let created_json = unsafe { CStr::from_ptr(created.json) }
+            .to_string_lossy()
+            .into_owned();
+        unsafe {
+            alexandria_free_string(created.json);
+        }
+        let created_value: serde_json::Value = serde_json::from_str(&created_json).unwrap();
+        let uuid = created_value["uuid"].as_str().unwrap().to_string();
+
+        // Backdate deleted_at past retention via a fresh connection on a
+        // dedicated thread + runtime (the FFI services pool already owns a
+        // connection on this thread's runtime).
+        let ffi_db_for_backdate = ffi_db.clone();
+        let uuid_for_backdate = uuid.clone();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                let url = format!("sqlite://{ffi_db_for_backdate}");
+                let pool = sqlx::sqlite::SqlitePoolOptions::new()
+                    .max_connections(1)
+                    .connect(&format!("{url}?mode=rw"))
+                    .await
+                    .unwrap();
+                sqlx::query(
+                    "UPDATE bookmarks SET state = 'deleted', deleted_at = ? WHERE uuid = ?",
+                )
+                .bind(deleted_at)
+                .bind(&uuid_for_backdate)
+                .execute(&pool)
+                .await
+                .unwrap();
+            });
+        })
+        .join()
+        .unwrap();
+
+        let uuid_c = CString::new(uuid).unwrap();
+        let r = alexandria_bookmark_purge(uuid_c.as_ptr(), token.as_ptr());
+        assert_eq!(r.status, alexandria_ffi::BOOKMARK_OK, "ffi purge");
+        assert!(!r.json.is_null());
+        let s = unsafe { CStr::from_ptr(r.json) }
+            .to_string_lossy()
+            .into_owned();
+        unsafe {
+            alexandria_free_string(r.json);
+        }
+        serde_json::from_str(&s).unwrap()
+    })
+    .await
+    .unwrap();
+
+    // ---- compare ----
+    for (label, body) in [("http", &http_body), ("ffi", &ffi_body)] {
+        assert_eq!(
+            body["state"], "deleted",
+            "{label} confirmation echoes pre-purge state"
+        );
+    }
+    assert_eq!(http_count, 0, "http record removed");
+}
+
+/// UC-19 parity - an unknown uuid is rejected as not-found on both surfaces
+/// (HTTP 404, FFI BOOKMARK_ERR_NOT_FOUND) (AF-02, FR-FC-24 / NFR-09).
+#[tokio::test]
+async fn given_unknown_uuid_when_bookmark_purged_via_http_and_ffi_then_both_not_found() {
+    let _g = SERIAL.lock().unwrap();
+
+    // ---- HTTP leg ----
+    let http_dir = tempdir().unwrap();
+    let http_db = db_path(&http_dir, "http.sqlite");
+    let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    let http_services =
+        std::sync::Arc::new(build_services(&Settings::default(), http_pool.clone()).await);
+    let unknown = uuid::Uuid::new_v4();
+    let req = Request::builder()
+        .method("DELETE")
+        .uri(format!("/v1/bookmarks/{unknown}?purge=true"))
+        .header("authorization", "Bearer parity")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app(Settings::default(), http_services)
+        .oneshot(req)
+        .await
+        .expect("http purge");
+    assert_eq!(resp.status(), axum::http::StatusCode::NOT_FOUND);
+
+    // ---- FFI leg ----
+    let ffi_dir = tempdir().unwrap();
+    let ffi_db = db_path(&ffi_dir, "ffi.sqlite");
+    let ffi_status = tokio::task::spawn_blocking(move || -> i32 {
+        let cdb = CString::new(ffi_db).unwrap();
+        assert_eq!(
+            alexandria_index_init(cdb.as_ptr()),
+            alexandria_ffi::INDEX_OK
+        );
+
+        let uuid_c = CString::new(unknown.to_string()).unwrap();
+        let token = CString::new("parity").unwrap();
+        let r = alexandria_bookmark_purge(uuid_c.as_ptr(), token.as_ptr());
+        assert!(r.json.is_null(), "a rejected purge returns no body");
         r.status
     })
     .await

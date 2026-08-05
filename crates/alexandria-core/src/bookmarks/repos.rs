@@ -75,6 +75,12 @@ pub trait BookmarkRepository: Send + Sync {
     /// `deleted_at` (UC-18 / FR-BM-05). Returns the updated record.
     /// `NotFound` when no bookmark carries the uuid.
     async fn restore(&self, uuid: Uuid) -> Result<Bookmark, DomainError>;
+
+    /// Permanently remove the bookmark identified by `uuid` (UC-19 /
+    /// FR-BM-04). The caller has already confirmed the record is `deleted`
+    /// and past its retention window. `NotFound` when no bookmark carries
+    /// the uuid.
+    async fn purge(&self, uuid: Uuid) -> Result<(), DomainError>;
 }
 
 #[derive(Clone)]
@@ -243,6 +249,18 @@ impl BookmarkRepository for SqliteBookmarkRepository {
             .await?;
 
         self.find_by_uuid(uuid).await?.ok_or(DomainError::NotFound)
+    }
+
+    async fn purge(&self, uuid: Uuid) -> Result<(), DomainError> {
+        let affected = sqlx::query("DELETE FROM bookmarks WHERE uuid = ?")
+            .bind(uuid.to_string())
+            .execute(&self.pool)
+            .await?
+            .rows_affected();
+        if affected == 0 {
+            return Err(DomainError::NotFound);
+        }
+        Ok(())
     }
 }
 

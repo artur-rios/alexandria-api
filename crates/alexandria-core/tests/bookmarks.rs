@@ -12,3 +12,6 @@ mod browse;
 
 #[path = "bookmarks/lifecycle.rs"]
 mod lifecycle;
+
+#[path = "bookmarks/purge.rs"]
+mod purge;
