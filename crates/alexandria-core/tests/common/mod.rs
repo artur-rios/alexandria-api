@@ -1192,6 +1192,34 @@ impl ReadingListRepository for FakeReadingListRepository {
         Ok(self.reading_lists.lock().unwrap().get(&uuid).cloned())
     }
 
+    async fn list_all(&self) -> Result<Vec<ReadingList>, DomainError> {
+        let mut reading_lists: Vec<ReadingList> = self
+            .reading_lists
+            .lock()
+            .unwrap()
+            .values()
+            .cloned()
+            .collect();
+        reading_lists.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(reading_lists)
+    }
+
+    async fn list_progress(
+        &self,
+        reading_list_uuid: Uuid,
+    ) -> Result<Vec<ReadingProgress>, DomainError> {
+        let mut items: Vec<ReadingProgress> = self
+            .progress
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|p| p.reading_list_uuid == reading_list_uuid)
+            .cloned()
+            .collect();
+        items.sort_by_key(|a| a.item_uuid);
+        Ok(items)
+    }
+
     async fn add_item(
         &self,
         reading_list_uuid: Uuid,

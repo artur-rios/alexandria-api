@@ -27,6 +27,16 @@ pub trait ReadingListRepository: Send + Sync {
     /// no such reading list exists.
     async fn find_by_uuid(&self, uuid: Uuid) -> Result<Option<ReadingList>, DomainError>;
 
+    /// Every persisted reading list, ordered by name (UC-27 / FR-RL-08).
+    async fn list_all(&self) -> Result<Vec<ReadingList>, DomainError>;
+
+    /// Every ReadingProgress row for the reading list identified by
+    /// `reading_list_uuid`, ordered by item uuid (UC-27 / FR-RL-08).
+    async fn list_progress(
+        &self,
+        reading_list_uuid: Uuid,
+    ) -> Result<Vec<ReadingProgress>, DomainError>;
+
     /// Link the item identified by `item_uuid` (a `target_kind` of
     /// `Document` or `Comic`) to the reading list identified by
     /// `reading_list_uuid`, creating a `Pending` ReadingProgress (UC-28 /
@@ -131,6 +141,69 @@ impl ReadingListRepository for SqliteReadingListRepository {
             }
             None => None,
         })
+    }
+
+    async fn list_all(&self) -> Result<Vec<ReadingList>, DomainError> {
+        let rows = sqlx::query("SELECT uuid, name FROM reading_lists ORDER BY name")
+            .fetch_all(&self.pool)
+            .await?;
+
+        rows.into_iter()
+            .map(|row| {
+                let uuid: String = row.try_get("uuid")?;
+                let name: String = row.try_get("name")?;
+                Ok(ReadingList {
+                    uuid: Uuid::parse_str(&uuid).map_err(|err| {
+                        DomainError::internal(format!("corrupt reading list uuid: {err}"))
+                    })?,
+                    name,
+                })
+            })
+            .collect()
+    }
+
+    async fn list_progress(
+        &self,
+        reading_list_uuid: Uuid,
+    ) -> Result<Vec<ReadingProgress>, DomainError> {
+        let rows = sqlx::query(
+            "SELECT f.uuid AS item_uuid, rp.target_kind, rp.state, rp.current_issue, rp.total_issues \
+             FROM reading_progress rp \
+             JOIN files f ON f.id = rp.item_file_id \
+             WHERE rp.reading_list_id = (SELECT id FROM reading_lists WHERE uuid = ?) \
+             ORDER BY f.uuid",
+        )
+        .bind(reading_list_uuid.to_string())
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter()
+            .map(|row| {
+                let item_uuid: String = row.try_get("item_uuid")?;
+                let target_kind_str: String = row.try_get("target_kind")?;
+                let state_str: String = row.try_get("state")?;
+                let current_issue: Option<i64> = row.try_get("current_issue")?;
+                let total_issues: Option<i64> = row.try_get("total_issues")?;
+                Ok(ReadingProgress {
+                    reading_list_uuid,
+                    item_uuid: Uuid::parse_str(&item_uuid).map_err(|err| {
+                        DomainError::internal(format!("corrupt item uuid: {err}"))
+                    })?,
+                    target_kind: ReadingTargetKind::parse(&target_kind_str).ok_or_else(|| {
+                        DomainError::internal(format!(
+                            "corrupt reading_progress target_kind: {target_kind_str}"
+                        ))
+                    })?,
+                    state: ReadingState::parse(&state_str).ok_or_else(|| {
+                        DomainError::internal(format!(
+                            "corrupt reading_progress state: {state_str}"
+                        ))
+                    })?,
+                    current_issue,
+                    total_issues,
+                })
+            })
+            .collect()
     }
 
     async fn add_item(

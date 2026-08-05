@@ -6,3 +6,6 @@ mod create;
 
 #[path = "reading_lists/add_item.rs"]
 mod add_item;
+
+#[path = "reading_lists/browse.rs"]
+mod browse;
