@@ -1292,4 +1292,13 @@ impl ReadingListRepository for FakeReadingListRepository {
             None => Err(DomainError::NotFound),
         }
     }
+
+    async fn delete_reading_list(&self, uuid: Uuid) -> Result<(), DomainError> {
+        self.reading_lists.lock().unwrap().remove(&uuid);
+        self.progress
+            .lock()
+            .unwrap()
+            .retain(|(reading_list_uuid, _), _| *reading_list_uuid != uuid);
+        Ok(())
+    }
 }

@@ -84,6 +84,11 @@ pub trait ReadingListRepository: Send + Sync {
         reading_list_uuid: Uuid,
         item_uuid: Uuid,
     ) -> Result<(), DomainError>;
+
+    /// Delete the reading list identified by `uuid`, including every
+    /// ReadingProgress entry it holds (UC-31 / FR-RL-07). The files
+    /// themselves are untouched — this deletes the tracking rows only.
+    async fn delete_reading_list(&self, uuid: Uuid) -> Result<(), DomainError>;
 }
 
 #[derive(Clone)]
@@ -311,6 +316,30 @@ impl ReadingListRepository for SqliteReadingListRepository {
         if affected == 0 {
             return Err(DomainError::NotFound);
         }
+        Ok(())
+    }
+
+    async fn delete_reading_list(&self, uuid: Uuid) -> Result<(), DomainError> {
+        let mut tx = self.pool.begin().await?;
+
+        // Delete every ReadingProgress entry the reading list holds before
+        // removing it — a deleted reading list must not leave orphaned
+        // `reading_progress` rows (UC-31 / FR-RL-07). The files themselves
+        // are untouched.
+        sqlx::query(
+            "DELETE FROM reading_progress \
+             WHERE reading_list_id = (SELECT id FROM reading_lists WHERE uuid = ?)",
+        )
+        .bind(uuid.to_string())
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query("DELETE FROM reading_lists WHERE uuid = ?")
+            .bind(uuid.to_string())
+            .execute(&mut *tx)
+            .await?;
+
+        tx.commit().await?;
         Ok(())
     }
 }

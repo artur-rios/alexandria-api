@@ -15,3 +15,6 @@ mod update_progress;
 
 #[path = "reading_lists/remove_item.rs"]
 mod remove_item;
+
+#[path = "reading_lists/delete.rs"]
+mod delete;

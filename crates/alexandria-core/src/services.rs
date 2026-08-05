@@ -31,6 +31,7 @@ use crate::collections::repos::SqliteCollectionRepository;
 use crate::config::Settings;
 use crate::reading_lists::commands::add_item::AddItemToReadingListHandler;
 use crate::reading_lists::commands::create::CreateReadingListHandler;
+use crate::reading_lists::commands::delete::DeleteReadingListHandler;
 use crate::reading_lists::commands::remove_item::RemoveItemFromReadingListHandler;
 use crate::reading_lists::commands::update_progress::UpdateReadingProgressHandler;
 use crate::reading_lists::queries::browse::BrowseReadingListsHandler;
@@ -157,6 +158,9 @@ pub type DefaultUpdateReadingProgressHandler =
 pub type DefaultRemoveItemFromReadingListHandler =
     RemoveItemFromReadingListHandler<BearerAuthService, SqliteReadingListRepository>;
 
+pub type DefaultDeleteReadingListHandler =
+    DeleteReadingListHandler<BearerAuthService, SqliteReadingListRepository>;
+
 #[derive(Clone)]
 pub struct Services {
     pub index_handler: Arc<DefaultIndexHandler>,
@@ -190,6 +194,7 @@ pub struct Services {
     pub browse_reading_lists_handler: Arc<DefaultBrowseReadingListsHandler>,
     pub update_reading_progress_handler: Arc<DefaultUpdateReadingProgressHandler>,
     pub remove_item_from_reading_list_handler: Arc<DefaultRemoveItemFromReadingListHandler>,
+    pub delete_reading_list_handler: Arc<DefaultDeleteReadingListHandler>,
     /// The same auth service the handlers hold, exposed so a transport can
     /// reject an unauthenticated caller *before* it parses a request body or
     /// path (FR-AU-07 / SRD §7). Handlers still authenticate independently —
@@ -321,8 +326,10 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
     ));
     let remove_item_from_reading_list_handler = Arc::new(RemoveItemFromReadingListHandler::new(
         auth,
-        reading_list_repo,
+        reading_list_repo.clone(),
     ));
+    let delete_reading_list_handler =
+        Arc::new(DeleteReadingListHandler::new(auth, reading_list_repo));
     Services {
         index_handler,
         refresh_handler,
@@ -355,6 +362,7 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         browse_reading_lists_handler,
         update_reading_progress_handler,
         remove_item_from_reading_list_handler,
+        delete_reading_list_handler,
         auth,
         pool,
     }
