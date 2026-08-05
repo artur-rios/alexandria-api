@@ -6,3 +6,6 @@ mod create;
 
 #[path = "bookmarks/update.rs"]
 mod update;
+
+#[path = "bookmarks/browse.rs"]
+mod browse;

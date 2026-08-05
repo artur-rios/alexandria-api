@@ -560,3 +560,165 @@ async fn given_no_token_when_updated_then_401_and_row_unchanged() {
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     assert_eq!(bookmark_rows(&test.pool).await[0].1, "https://example.com");
 }
+
+// ==================== UC-17: Browse bookmarks ====================
+
+fn list_request(uri: &str) -> Request<Body> {
+    Request::builder()
+        .method("GET")
+        .uri(uri)
+        .header("authorization", "Bearer test-token")
+        .body(Body::empty())
+        .unwrap()
+}
+
+fn list_request_no_auth(uri: &str) -> Request<Body> {
+    Request::builder()
+        .method("GET")
+        .uri(uri)
+        .body(Body::empty())
+        .unwrap()
+}
+
+// ---------------- Main flow ----------------
+
+#[tokio::test]
+async fn given_bookmarks_when_listed_default_then_200_array_excluding_deleted_by_default() {
+    let test = test_app().await;
+    let router = app(Settings::default(), test.services.clone());
+    let (router, deleted_uuid) = create_bookmark(router, "https://example.com/a", "A").await;
+    let (router, _kept_uuid) = create_bookmark(router, "https://example.com/b", "B").await;
+    sqlx::query("UPDATE bookmarks SET state = 'deleted' WHERE uuid = ?")
+        .bind(&deleted_uuid)
+        .execute(&test.pool)
+        .await
+        .expect("mark deleted");
+
+    let response = router
+        .oneshot(list_request("/v1/bookmarks"))
+        .await
+        .expect("list");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_json(response).await;
+    let arr = body.as_array().expect("array");
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["title"], "B");
+}
+
+#[tokio::test]
+async fn given_bookmarks_when_listed_filtered_by_collection_then_only_linked_returned() {
+    let test = test_app().await;
+    let router = app(Settings::default(), test.services.clone());
+    let (router, collection_uuid) = create_bookmark_collection(router, "Reading list").await;
+    let (router, _linked_uuid) = {
+        let response = router
+            .clone()
+            .oneshot(create_request(json!({
+                "url": "https://example.com/a",
+                "title": "A",
+                "collectionUuid": collection_uuid,
+            })))
+            .await
+            .expect("create linked");
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let uuid = body_json(response).await["uuid"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        (router, uuid)
+    };
+    let (router, _unlinked) = create_bookmark(router, "https://example.com/b", "B").await;
+
+    let response = router
+        .oneshot(list_request(&format!(
+            "/v1/bookmarks?collectionUuid={collection_uuid}"
+        )))
+        .await
+        .expect("list");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_json(response).await;
+    let arr = body.as_array().expect("array");
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["title"], "A");
+}
+
+#[tokio::test]
+async fn given_deleted_bookmark_when_listed_state_all_then_included() {
+    let test = test_app().await;
+    let router = app(Settings::default(), test.services.clone());
+    let (router, uuid) = create_bookmark(router, "https://example.com", "Example").await;
+    sqlx::query("UPDATE bookmarks SET state = 'deleted' WHERE uuid = ?")
+        .bind(&uuid)
+        .execute(&test.pool)
+        .await
+        .expect("mark deleted");
+
+    let response = router
+        .oneshot(list_request("/v1/bookmarks?state=all"))
+        .await
+        .expect("list");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(body_json(response).await.as_array().unwrap().len(), 1);
+}
+
+// ---------------- AF-01: referenced collection does not exist ----------------
+
+#[tokio::test]
+async fn given_unknown_collection_uuid_when_listed_filtered_then_404() {
+    let test = test_app().await;
+    let router = app(Settings::default(), test.services);
+
+    let response = router
+        .oneshot(list_request(&format!(
+            "/v1/bookmarks?collectionUuid={}",
+            uuid::Uuid::new_v4()
+        )))
+        .await
+        .expect("list");
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn given_malformed_collection_uuid_when_listed_filtered_then_400() {
+    let test = test_app().await;
+    let router = app(Settings::default(), test.services);
+
+    let response = router
+        .oneshot(list_request("/v1/bookmarks?collectionUuid=not-a-uuid"))
+        .await
+        .expect("list");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn given_unknown_state_when_listed_then_400() {
+    let test = test_app().await;
+    let router = app(Settings::default(), test.services);
+
+    let response = router
+        .oneshot(list_request("/v1/bookmarks?state=nonsense"))
+        .await
+        .expect("list");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+// ---------------- AF-02: unauthorized ----------------
+
+#[tokio::test]
+async fn given_no_token_when_listed_then_401() {
+    let test = test_app().await;
+    let router = app(Settings::default(), test.services);
+
+    let response = router
+        .oneshot(list_request_no_auth("/v1/bookmarks"))
+        .await
+        .expect("list");
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}

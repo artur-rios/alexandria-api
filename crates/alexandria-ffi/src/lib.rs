@@ -1490,6 +1490,102 @@ pub extern "C" fn alexandria_bookmark_update(
     }
 }
 
+/// JSON filter body accepted by `alexandria_bookmarks_list` (UC-17 /
+/// FR-BM-06). Both fields optional; an empty/null body, omitted fields, or
+/// empty-string values use the defaults (`collectionUuid = None`, `state =
+/// "active"` — excludes deleted records per the use case's main-flow step
+/// 2). An unrecognised `state` or malformed `collectionUuid` is rejected as
+/// `BOOKMARK_ERR_INVALID_INPUT`, matching the HTTP surface's `400`
+/// (FR-FC-24 / NFR-09).
+#[derive(Debug, Default)]
+struct BookmarksListFilter {
+    collection_uuid: Option<String>,
+    state: Option<String>,
+}
+
+impl BookmarksListFilter {
+    fn from_json_str(s: &str) -> Option<Self> {
+        if s.trim().is_empty() {
+            return Some(Self::default());
+        }
+        let value: serde_json::Value = serde_json::from_str(s).ok()?;
+        if value.is_null() {
+            return Some(Self::default());
+        }
+        let obj = value.as_object()?;
+        Some(Self {
+            collection_uuid: obj
+                .get("collectionUuid")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            state: obj
+                .get("state")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+        })
+    }
+}
+
+/// Browse bookmarks, optionally filtered by containing collection (UC-17 /
+/// FR-BM-06).
+///
+/// `json_filters` is a JSON string `{"collectionUuid":"…","state":"all"}`
+/// (empty string or NULL for defaults). The function deserializes it, calls
+/// the same `BrowseBookmarksHandler` the HTTP route uses, and on success
+/// serializes the returned `Vec<Bookmark>` back to a JSON array — so the FFI
+/// and HTTP surfaces agree byte-for-byte modulo key ordering (parity,
+/// FR-FC-24 / NFR-09). `token` is the bearer auth token.
+#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
+#[no_mangle]
+pub extern "C" fn alexandria_bookmarks_list(
+    json_filters: *const c_char,
+    token: *const c_char,
+) -> BookmarkJsonResult {
+    let services = match services_slot().lock().unwrap().clone() {
+        Some(s) => s,
+        None => return BookmarkJsonResult::err(BOOKMARK_ERR_NOT_INITIALIZED),
+    };
+
+    let token = cstr_lossy(token).unwrap_or_default();
+    if !authenticated(&services, &token) {
+        return BookmarkJsonResult::err(BOOKMARK_ERR_UNAUTHORIZED);
+    }
+
+    let filter_str = cstr_lossy(json_filters).unwrap_or_default();
+    let parsed = match BookmarksListFilter::from_json_str(&filter_str) {
+        Some(f) => f,
+        None => return BookmarkJsonResult::err(BOOKMARK_ERR_INVALID_INPUT),
+    };
+
+    let bookmark_state = match parsed.state.as_deref().filter(|s| !s.is_empty()) {
+        Some(s) => match alexandria_core::catalog::model::StateFilter::parse(s) {
+            Some(st) => st,
+            None => return BookmarkJsonResult::err(BOOKMARK_ERR_INVALID_INPUT),
+        },
+        None => alexandria_core::catalog::model::StateFilter::Active,
+    };
+    let mut filter = alexandria_core::bookmarks::queries::browse::BookmarkFilter::new()
+        .with_state(bookmark_state);
+    if let Some(c) = parsed.collection_uuid.as_deref().filter(|s| !s.is_empty()) {
+        let collection_uuid = match uuid::Uuid::parse_str(c) {
+            Ok(u) => u,
+            Err(_) => return BookmarkJsonResult::err(BOOKMARK_ERR_INVALID_INPUT),
+        };
+        filter = filter.with_collection(collection_uuid);
+    }
+
+    let result =
+        runtime().block_on(async { services.browse_bookmarks_handler.list(filter, &token).await });
+
+    match result {
+        Ok(bookmarks) => {
+            let json = serde_json::to_string(&bookmarks).unwrap_or_default();
+            BookmarkJsonResult::ok(json)
+        }
+        Err(err) => map_bookmark_err(err),
+    }
+}
+
 fn parse_file_type(s: &str) -> Option<alexandria_core::catalog::model::FileType> {
     use alexandria_core::catalog::model::FileType;
     match s {

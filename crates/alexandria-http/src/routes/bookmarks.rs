@@ -1,11 +1,14 @@
-use axum::extract::rejection::{JsonRejection, PathRejection};
-use axum::extract::{Path, State};
+use axum::extract::rejection::{JsonRejection, PathRejection, QueryRejection};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
 use serde::Deserialize;
 use uuid::Uuid;
 
 use alexandria_core::bookmarks::model::Bookmark;
+use alexandria_core::bookmarks::queries::browse::BookmarkFilter;
+use alexandria_core::catalog::model::StateFilter;
+use alexandria_core::errors::DomainError;
 
 use crate::middleware::auth::invalid_input;
 use crate::middleware::error::ApiError;
@@ -114,4 +117,59 @@ pub async fn update(
         .map_err(ApiError)?;
 
     Ok((StatusCode::OK, Json(result)))
+}
+
+/// Query-string parameters for `GET /v1/bookmarks` (UC-17 / FR-BM-06). Both
+/// optional: an omitted or empty `collectionUuid` means no collection
+/// filter; an omitted or empty `state` defaults to `active` (excludes
+/// soft-deleted records per the use case's main-flow step 2). A malformed
+/// `collectionUuid` or an unrecognised `state` is rejected as `400` invalid
+/// input, matching the FFI surface (FR-FC-24 / NFR-09) — unlike UC-03/UC-14's
+/// file-collection filter, an unknown-but-well-formed `collectionUuid` here
+/// is `404` (AF-01), not an empty list, per this use case's own spec.
+#[derive(Debug, Default, Deserialize)]
+pub struct BookmarkListParams {
+    #[serde(rename = "collectionUuid", default)]
+    pub collection_uuid: Option<String>,
+    #[serde(rename = "state", default)]
+    pub state: Option<String>,
+}
+
+/// `GET /v1/bookmarks` — browse bookmarks, optionally filtered by containing
+/// collection (UC-17 / FR-BM-06). Returns `200` with a JSON array of
+/// `Bookmark` records, or `400` (malformed `collectionUuid` or unrecognised
+/// `state`), `404` (the referenced collection does not exist), or `401`
+/// (unauthenticated).
+pub async fn list(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    params: Result<Query<BookmarkListParams>, QueryRejection>,
+) -> Result<Json<Vec<Bookmark>>, ApiError> {
+    let token = bearer_token(&headers);
+
+    let Query(params) = params.map_err(|err| invalid_input(format!("invalid query: {err}")))?;
+
+    let bookmark_state = match params.state.as_deref().filter(|s| !s.is_empty()) {
+        None => StateFilter::Active,
+        Some(v) => StateFilter::parse(v)
+            .ok_or_else(|| ApiError(DomainError::InvalidInput(format!("unknown state: {v}"))))?,
+    };
+    let mut filter = BookmarkFilter::new().with_state(bookmark_state);
+    if let Some(c) = params.collection_uuid.as_deref().filter(|s| !s.is_empty()) {
+        let collection_uuid = Uuid::parse_str(c).map_err(|_| {
+            ApiError(DomainError::InvalidInput(format!(
+                "invalid collectionUuid: {c}"
+            )))
+        })?;
+        filter = filter.with_collection(collection_uuid);
+    }
+
+    let bookmarks = state
+        .services
+        .browse_bookmarks_handler
+        .list(filter, &token)
+        .await
+        .map_err(ApiError)?;
+
+    Ok(Json(bookmarks))
 }

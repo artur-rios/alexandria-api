@@ -5,6 +5,7 @@ use sqlx::sqlite::SqlitePool;
 use crate::auth::BearerAuthService;
 use crate::bookmarks::commands::create::CreateBookmarkHandler;
 use crate::bookmarks::commands::update::UpdateBookmarkHandler;
+use crate::bookmarks::queries::browse::BrowseBookmarksHandler;
 use crate::bookmarks::repos::SqliteBookmarkRepository;
 use crate::catalog::clock::SystemClock;
 use crate::catalog::commands::edit_metadata::EditMetadataHandler;
@@ -72,6 +73,9 @@ pub type DefaultCreateBookmarkHandler =
 pub type DefaultUpdateBookmarkHandler =
     UpdateBookmarkHandler<BearerAuthService, SqliteBookmarkRepository, SqliteCollectionRepository>;
 
+pub type DefaultBrowseBookmarksHandler =
+    BrowseBookmarksHandler<BearerAuthService, SqliteBookmarkRepository, SqliteCollectionRepository>;
+
 pub type DefaultAddItemsToCollectionHandler = AddItemsToCollectionHandler<
     BearerAuthService,
     SqliteCollectionRepository,
@@ -109,6 +113,7 @@ pub struct Services {
     pub delete_collection_handler: Arc<DefaultDeleteCollectionHandler>,
     pub create_bookmark_handler: Arc<DefaultCreateBookmarkHandler>,
     pub update_bookmark_handler: Arc<DefaultUpdateBookmarkHandler>,
+    pub browse_bookmarks_handler: Arc<DefaultBrowseBookmarksHandler>,
     pub add_items_to_collection_handler: Arc<DefaultAddItemsToCollectionHandler>,
     pub remove_item_from_collection_handler: Arc<DefaultRemoveItemFromCollectionHandler>,
     pub list_collection_items_handler: Arc<DefaultListCollectionItemsHandler>,
@@ -170,6 +175,11 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         SqliteBookmarkRepository::new(pool.clone()),
         SqliteCollectionRepository::new(pool.clone()),
     ));
+    let browse_bookmarks_handler = Arc::new(BrowseBookmarksHandler::new(
+        auth,
+        SqliteBookmarkRepository::new(pool.clone()),
+        SqliteCollectionRepository::new(pool.clone()),
+    ));
     let add_items_to_collection_handler = Arc::new(AddItemsToCollectionHandler::new(
         auth,
         SqliteCollectionRepository::new(pool.clone()),
@@ -203,6 +213,7 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         delete_collection_handler,
         create_bookmark_handler,
         update_bookmark_handler,
+        browse_bookmarks_handler,
         add_items_to_collection_handler,
         remove_item_from_collection_handler,
         list_collection_items_handler,

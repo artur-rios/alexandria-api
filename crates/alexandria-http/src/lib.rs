@@ -59,6 +59,7 @@ pub fn app(settings: Settings, services: Arc<Services>) -> Router {
             delete(routes::collections::remove_item),
         )
         .route("/v1/bookmarks", post(routes::bookmarks::create))
+        .route("/v1/bookmarks", get(routes::bookmarks::list))
         .route("/v1/bookmarks/{uuid}", patch(routes::bookmarks::update))
         .route_layer(from_fn_with_state(
             state.clone(),
