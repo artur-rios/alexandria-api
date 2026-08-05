@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Fail the build on any warning rather than letting drift accumulate — the
+  # tree is warning-free as of UC-09, so a new warning is a new regression.
+  RUSTFLAGS: -D warnings
+
+jobs:
+  check:
+    name: fmt, clippy, test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry and build output
+        uses: Swatinem/rust-cache@v2
+
+      # Formatting first: it is the cheapest gate and its failures are the
+      # least interesting to read past.
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      # `--all-targets` so the lint pass covers tests and benches, not just
+      # the libraries — most of the workspace's code lives in its tests.
+      - name: Lint
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace
