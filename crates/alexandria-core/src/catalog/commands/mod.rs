@@ -1,6 +1,7 @@
 pub mod edit_metadata;
 pub mod index;
 pub mod purge;
+pub mod purge_on_disk;
 pub mod refresh;
 pub mod rename;
 pub mod restore;

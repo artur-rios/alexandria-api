@@ -13,6 +13,9 @@ mod index;
 #[path = "catalog/purge.rs"]
 mod purge;
 
+#[path = "catalog/purge_on_disk.rs"]
+mod purge_on_disk;
+
 #[path = "catalog/refresh.rs"]
 mod refresh;
 

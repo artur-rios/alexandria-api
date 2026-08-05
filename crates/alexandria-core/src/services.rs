@@ -7,6 +7,7 @@ use crate::catalog::clock::SystemClock;
 use crate::catalog::commands::edit_metadata::EditMetadataHandler;
 use crate::catalog::commands::index::IndexHandler;
 use crate::catalog::commands::purge::PurgeFileHandler;
+use crate::catalog::commands::purge_on_disk::PurgeFileOnDiskHandler;
 use crate::catalog::commands::refresh::RefreshHandler;
 use crate::catalog::commands::rename::RenameFileHandler;
 use crate::catalog::commands::restore::RestoreFileHandler;
@@ -41,6 +42,9 @@ pub type DefaultRestoreFileHandler =
 pub type DefaultPurgeFileHandler =
     PurgeFileHandler<BearerAuthService, SqliteCatalogRepository, SystemClock>;
 
+pub type DefaultPurgeFileOnDiskHandler =
+    PurgeFileOnDiskHandler<BearerAuthService, SqliteCatalogRepository, StdFilesystem>;
+
 pub type DefaultBrowseFilesHandler =
     BrowseFilesHandler<BearerAuthService, SqliteCatalogRepository>;
 
@@ -53,6 +57,7 @@ pub struct Services {
     pub soft_delete_file_handler: Arc<DefaultSoftDeleteFileHandler>,
     pub restore_file_handler: Arc<DefaultRestoreFileHandler>,
     pub purge_file_handler: Arc<DefaultPurgeFileHandler>,
+    pub purge_file_on_disk_handler: Arc<DefaultPurgeFileOnDiskHandler>,
     pub browse_files_handler: Arc<DefaultBrowseFilesHandler>,
     /// The same auth service the handlers hold, exposed so a transport can
     /// reject an unauthenticated caller *before* it parses a request body or
@@ -80,6 +85,8 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         Arc::new(RestoreFileHandler::new(auth, repo.clone(), clock, retention_days));
     let purge_file_handler =
         Arc::new(PurgeFileHandler::new(auth, repo.clone(), clock, retention_days));
+    let purge_file_on_disk_handler =
+        Arc::new(PurgeFileOnDiskHandler::new(auth, repo.clone(), fs));
     let browse_files_handler = Arc::new(BrowseFilesHandler::new(auth, repo));
     Services {
         index_handler,
@@ -89,6 +96,7 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         soft_delete_file_handler,
         restore_file_handler,
         purge_file_handler,
+        purge_file_on_disk_handler,
         browse_files_handler,
         auth,
         pool,
