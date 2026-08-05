@@ -32,8 +32,8 @@ its open/closed state, so the tables stay in sync with the board automatically.
 | [F-06 Bookmarks](https://github.com/artur-rios/alexandria-api/milestone/7) | UC-15 … UC-19 | 5 / 5 |
 | [F-07 Watchlists](https://github.com/artur-rios/alexandria-api/milestone/8) | UC-20 … UC-25 | 6 / 6 |
 | [F-08 Reading lists](https://github.com/artur-rios/alexandria-api/milestone/9) | UC-26 … UC-31 | 6 / 6 |
-| [F-09 Pluggable authentication](https://github.com/artur-rios/alexandria-api/milestone/10) | UC-34 … UC-36 | 2 / 3 |
-| **Total** | | **36 / 38** |
+| [F-09 Pluggable authentication](https://github.com/artur-rios/alexandria-api/milestone/10) | UC-34 … UC-36 | 3 / 3 |
+| **Total** | | **37 / 38** |
 
 ### F-00 — Foundation & operations
 
@@ -142,7 +142,7 @@ Exactly one active auth mode: external JWT **or** local encrypted login.
 | --- | --- | :---: | --- | --- |
 | [#35](https://github.com/artur-rios/alexandria-api/issues/35) | UC-34 | &#9745; | Local login | FR-AU-01, FR-AU-04, FR-AU-07, FR-AU-08 |
 | [#36](https://github.com/artur-rios/alexandria-api/issues/36) | UC-35 | &#9745; | Set or change local login credentials | FR-AU-05, FR-AU-06, FR-AU-08 |
-| [#37](https://github.com/artur-rios/alexandria-api/issues/37) | UC-36 | &#9744; | Authenticate via external JWT | FR-AU-01, FR-AU-02, FR-AU-03, FR-AU-07, FR-AU-08 |
+| [#37](https://github.com/artur-rios/alexandria-api/issues/37) | UC-36 | &#9745; | Authenticate via external JWT | FR-AU-01, FR-AU-02, FR-AU-03, FR-AU-07, FR-AU-08 |
 
 To update the tables: when an issue closes, flip its marker from **&#9744;** to
 **&#9745;** and bump the milestone's progress count. The issue number references
