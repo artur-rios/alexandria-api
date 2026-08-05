@@ -29,7 +29,9 @@ use alexandria_core::collections::model::{Collection, NewCollection};
 use alexandria_core::collections::repos::CollectionRepository;
 use alexandria_core::config::AuthMode;
 use alexandria_core::errors::DomainError;
-use alexandria_core::reading_lists::model::{NewReadingList, ReadingList};
+use alexandria_core::reading_lists::model::{
+    NewReadingList, ReadingList, ReadingProgress, ReadingState, ReadingTargetKind,
+};
 use alexandria_core::reading_lists::repos::ReadingListRepository;
 use alexandria_core::watchlists::model::{NewWatchlist, WatchProgress, WatchState, Watchlist};
 use alexandria_core::watchlists::repos::WatchlistRepository;
@@ -1145,6 +1147,7 @@ pub struct FakeReadingListRepository {
     /// When set, every `insert_reading_list` fails, simulating a
     /// catalog-write failure in UC-26.
     failing: Arc<Mutex<bool>>,
+    progress: Arc<Mutex<HashMap<(Uuid, Uuid), ReadingProgress>>>,
 }
 
 impl FakeReadingListRepository {
@@ -1183,5 +1186,29 @@ impl ReadingListRepository for FakeReadingListRepository {
             .unwrap()
             .insert(reading_list.uuid, reading_list.clone());
         Ok(reading_list)
+    }
+
+    async fn find_by_uuid(&self, uuid: Uuid) -> Result<Option<ReadingList>, DomainError> {
+        Ok(self.reading_lists.lock().unwrap().get(&uuid).cloned())
+    }
+
+    async fn add_item(
+        &self,
+        reading_list_uuid: Uuid,
+        item_uuid: Uuid,
+        target_kind: ReadingTargetKind,
+    ) -> Result<ReadingProgress, DomainError> {
+        let mut progress = self.progress.lock().unwrap();
+        let entry = progress
+            .entry((reading_list_uuid, item_uuid))
+            .or_insert_with(|| ReadingProgress {
+                reading_list_uuid,
+                item_uuid,
+                target_kind,
+                state: ReadingState::Pending,
+                current_issue: None,
+                total_issues: None,
+            });
+        Ok(entry.clone())
     }
 }
