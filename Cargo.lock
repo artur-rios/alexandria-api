@@ -69,6 +69,7 @@ dependencies = [
  "image",
  "little_exif",
  "lofty",
+ "lopdf",
  "serde_json",
  "sqlx",
  "tempfile",
