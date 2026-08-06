@@ -52,7 +52,10 @@ pub trait AudioMetadataReader: Send + Sync {
 
 /// Real audio-tag reader backed by `lofty`, covering ID3v1/v2 (MP3, WAV),
 /// Vorbis comments (FLAC, OGG/OGA, Opus), and MP4 atoms (M4A, AAC-in-MP4) —
-/// every extension `classify_by_extension` maps to `FileType::Audio`.
+/// all but one (`.wma`, ASF/Windows Media, unsupported by `lofty`) of the
+/// extensions `classify_by_extension` maps to `FileType::Audio`. A `.wma`
+/// file simply gets no extracted metadata, the same graceful degradation as
+/// any unparseable file.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct LoftyAudioMetadataReader;
 
@@ -75,11 +78,23 @@ impl AudioMetadataReader for LoftyAudioMetadataReader {
             .or_else(|| tagged_file.first_tag())?;
 
         let tags = AudioTags {
-            title: tag.title().map(|s| s.to_string()),
-            artist: tag.artist().map(|s| s.to_string()),
-            album: tag.album().map(|s| s.to_string()),
+            title: tag
+                .title()
+                .map(|s| s.to_string())
+                .filter(|s| !s.trim().is_empty()),
+            artist: tag
+                .artist()
+                .map(|s| s.to_string())
+                .filter(|s| !s.trim().is_empty()),
+            album: tag
+                .album()
+                .map(|s| s.to_string())
+                .filter(|s| !s.trim().is_empty()),
             year: tag.year().map(i64::from),
-            genre: tag.genre().map(|s| s.to_string()),
+            genre: tag
+                .genre()
+                .map(|s| s.to_string())
+                .filter(|s| !s.trim().is_empty()),
             track: tag.track().map(i64::from),
         };
 
@@ -200,6 +215,45 @@ mod tests {
         let tags = reader.read(path.to_str().unwrap()).await;
 
         assert!(tags.is_none(), "no tag written, no tag read");
+    }
+
+    /// Write a WAV with a blank (empty-string) title/artist/album/genre but
+    /// a non-blank year, so the frames exist but carry no text.
+    fn write_blank_string_tags(path: &std::path::Path) {
+        use lofty::config::WriteOptions;
+        use lofty::tag::{Accessor, Tag, TagExt, TagType};
+
+        let mut tag = Tag::new(TagType::Id3v2);
+        tag.set_title(String::new());
+        tag.set_artist("   ".to_string());
+        tag.set_album(String::new());
+        tag.set_genre(String::new());
+        tag.set_year(2021);
+        tag.save_to_path(path, WriteOptions::default())
+            .expect("save tag");
+    }
+
+    #[tokio::test]
+    async fn given_blank_string_tags_when_read_then_string_fields_are_none() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("blank.wav");
+        write_minimal_wav(&path);
+        write_blank_string_tags(&path);
+
+        let reader = LoftyAudioMetadataReader;
+        let tags = reader
+            .read(path.to_str().unwrap())
+            .await
+            .expect("year alone is enough to write metadata");
+
+        assert_eq!(tags.title, None, "empty string must not become Some(\"\")");
+        assert_eq!(
+            tags.artist, None,
+            "whitespace-only string must not become Some(\"   \")"
+        );
+        assert_eq!(tags.album, None);
+        assert_eq!(tags.genre, None);
+        assert_eq!(tags.year, Some(2021));
     }
 
     #[tokio::test]

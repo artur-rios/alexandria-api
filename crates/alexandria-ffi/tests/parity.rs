@@ -417,6 +417,36 @@ fn wait_for_http_files(
     })
 }
 
+/// Indexing is two steps: `insert_file` commits the `files` row in its own
+/// transaction first, and only then does `index_entry` call the audio-tag
+/// reader and persist the extracted metadata via a separate `update_metadata`
+/// call. Waiting only on the `files` row (as `wait_for_http_files` does) can
+/// therefore race ahead of extraction — poll the `audio_files` row itself so
+/// callers only proceed once the title has actually landed.
+async fn wait_for_http_audio_title(pool: &sqlx::sqlite::SqlitePool, expected_title: &str) {
+    let dl = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let row: Option<(Option<String>,)> = sqlx::query_as(
+            "SELECT audio_files.title FROM audio_files \
+             JOIN files ON files.id = audio_files.file_id \
+             WHERE files.name = ?",
+        )
+        .bind("song.wav")
+        .fetch_optional(pool)
+        .await
+        .unwrap();
+        if let Some((Some(title),)) = &row {
+            if title == expected_title {
+                return;
+            }
+        }
+        if std::time::Instant::now() > dl {
+            panic!("http never wrote extracted audio title");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+}
+
 async fn wait_for_http_missing(pool: &sqlx::sqlite::SqlitePool, expected: i64) {
     let dl = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
@@ -8737,6 +8767,10 @@ async fn given_tagged_audio_file_when_indexed_via_http_and_ffi_then_extracted_me
         .await
         .expect("http index");
     wait_for_http_files(&http_pool, 1).await;
+    // Wait on the extracted metadata itself, not just the file row —
+    // `insert_file` commits the `files` row before `index_entry` reads the
+    // audio tags and writes `audio_files` in a separate transaction.
+    wait_for_http_audio_title(&http_pool, "Parity Title").await;
 
     let (http_uuid,): (String,) = sqlx::query_as("SELECT uuid FROM files WHERE name = ?")
         .bind("song.wav")
@@ -8797,6 +8831,12 @@ async fn given_tagged_audio_file_when_indexed_via_http_and_ffi_then_extracted_me
         // on its own current-thread runtime, mirroring the established
         // pattern used elsewhere in this file for querying the FFI db from
         // inside a `spawn_blocking` closure.
+        //
+        // The `files` row above is committed by `insert_file` before
+        // `index_entry` extracts audio tags and writes `audio_files` in a
+        // separate transaction, so also poll the `audio_files` row itself —
+        // otherwise this leg can race ahead of extraction just like the
+        // HTTP leg can.
         let ffi_uuid = std::thread::spawn(move || -> String {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -8809,6 +8849,29 @@ async fn given_tagged_audio_file_when_indexed_via_http_and_ffi_then_extracted_me
                     .connect(&format!("{url}?mode=rw"))
                     .await
                     .unwrap();
+
+                let dl = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                loop {
+                    let row: Option<(Option<String>,)> = sqlx::query_as(
+                        "SELECT audio_files.title FROM audio_files \
+                         JOIN files ON files.id = audio_files.file_id \
+                         WHERE files.name = ?",
+                    )
+                    .bind("song.wav")
+                    .fetch_optional(&pool)
+                    .await
+                    .unwrap();
+                    if let Some((Some(title),)) = &row {
+                        if title == "Parity Title" {
+                            break;
+                        }
+                    }
+                    if std::time::Instant::now() > dl {
+                        panic!("ffi never wrote extracted audio title");
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                }
+
                 let (uuid,): (String,) = sqlx::query_as("SELECT uuid FROM files WHERE name = ?")
                     .bind("song.wav")
                     .fetch_one(&pool)
