@@ -342,6 +342,15 @@ impl CatalogRepository for FakeCatalogRepository {
     }
 
     async fn find_image_dimensions(&self, uuid: Uuid) -> Result<Option<(i64, i64)>, DomainError> {
+        let files = self.files.lock().unwrap();
+        let file = match files.values().find(|f| f.uuid == uuid) {
+            Some(f) => f,
+            None => return Ok(None),
+        };
+        if file.file_type != alexandria_core::catalog::model::FileType::Image {
+            return Ok(None);
+        }
+        drop(files);
         Ok(self.dimensions.lock().unwrap().get(&uuid).copied())
     }
 

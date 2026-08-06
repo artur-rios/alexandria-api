@@ -208,6 +208,11 @@ where
                     }
                 }
                 if let Some(title) = tags.title {
+                    // caption: None is safe only because extraction runs
+                    // exactly once, at first index, before an owner could
+                    // have set one via UC-04 — update_metadata is a full
+                    // replace, so reusing this pattern anywhere caption
+                    // might already be set would silently wipe it.
                     let metadata = crate::catalog::model::SubtypeMetadata::Image {
                         title: Some(title),
                         caption: None,

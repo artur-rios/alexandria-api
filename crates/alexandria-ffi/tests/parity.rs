@@ -8940,15 +8940,18 @@ fn write_test_exif(path: &std::path::Path, width: u32, height: u32, description:
     metadata.write_to_file(path).expect("write exif");
 }
 
-/// Poll until `images.width`/`images.height` are both non-NULL for the
-/// named file — proves the extraction write landed, not just that the file
-/// row exists (the audio slice's final review found and fixed exactly this
-/// race for its own parity test; this test avoids repeating it).
-async fn wait_for_http_image_dimensions(pool: &sqlx::sqlite::SqlitePool, name: &str) {
+/// Poll until `images.width`/`images.height`/`images.title` are all
+/// non-NULL for the named file — proves both extraction writes landed
+/// (`IndexHandler`'s image branch commits dimensions and title as two
+/// separate sequential transactions), not just the first of the two, and
+/// not just that the file row exists (the audio slice's final review found
+/// and fixed exactly this race for its own parity test; this test extends
+/// that fix to cover every write it asserts on).
+async fn wait_for_http_image_extraction(pool: &sqlx::sqlite::SqlitePool, name: &str) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
-        let row: Option<(Option<i64>, Option<i64>)> = sqlx::query_as(
-            "SELECT images.width, images.height FROM images \
+        let row: Option<(Option<i64>, Option<i64>, Option<String>)> = sqlx::query_as(
+            "SELECT images.width, images.height, images.title FROM images \
              JOIN files ON files.id = images.file_id \
              WHERE files.name = ?",
         )
@@ -8956,11 +8959,11 @@ async fn wait_for_http_image_dimensions(pool: &sqlx::sqlite::SqlitePool, name: &
         .fetch_optional(pool)
         .await
         .unwrap();
-        if let Some((Some(_), Some(_))) = row {
+        if let Some((Some(_), Some(_), Some(_))) = row {
             return;
         }
         if std::time::Instant::now() > deadline {
-            panic!("http never wrote extracted image dimensions");
+            panic!("http never wrote extracted image dimensions and title");
         }
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
@@ -8999,7 +9002,7 @@ async fn given_tagged_image_file_when_indexed_via_http_and_ffi_then_extracted_me
         .oneshot(index_req)
         .await
         .expect("http index");
-    wait_for_http_image_dimensions(&http_pool, "photo.jpg").await;
+    wait_for_http_image_extraction(&http_pool, "photo.jpg").await;
 
     let (http_uuid,): (String,) = sqlx::query_as("SELECT uuid FROM files WHERE name = ?")
         .bind("photo.jpg")
@@ -9043,8 +9046,11 @@ async fn given_tagged_image_file_when_indexed_via_http_and_ffi_then_extracted_me
         let started = alexandria_index_start(root.as_ptr(), token.as_ptr());
         assert_eq!(started.status, alexandria_ffi::INDEX_OK);
 
-        // Poll the FFI leg's own sqlite file directly for the extraction
-        // write, same as the HTTP leg — not just file-row existence.
+        // Poll the FFI leg's own sqlite file directly for both extraction
+        // writes (dimensions and title), same as the HTTP leg — not just
+        // file-row existence, and not just the first of the two sequential
+        // writes the indexer commits.
+        type FfiImageExtractionRow = (String, Option<i64>, Option<i64>, Option<String>);
         let rt = tokio::runtime::Runtime::new().unwrap();
         let ffi_uuid: String = rt.block_on(async {
             let pool = sqlx::sqlite::SqlitePoolOptions::new()
@@ -9054,8 +9060,8 @@ async fn given_tagged_image_file_when_indexed_via_http_and_ffi_then_extracted_me
                 .unwrap();
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
             loop {
-                let row: Option<(String, Option<i64>, Option<i64>)> = sqlx::query_as(
-                    "SELECT files.uuid, images.width, images.height FROM images \
+                let row: Option<FfiImageExtractionRow> = sqlx::query_as(
+                    "SELECT files.uuid, images.width, images.height, images.title FROM images \
                      JOIN files ON files.id = images.file_id \
                      WHERE files.name = ?",
                 )
@@ -9063,11 +9069,11 @@ async fn given_tagged_image_file_when_indexed_via_http_and_ffi_then_extracted_me
                 .fetch_optional(&pool)
                 .await
                 .unwrap();
-                if let Some((uuid, Some(_), Some(_))) = row {
+                if let Some((uuid, Some(_), Some(_), Some(_))) = row {
                     return uuid;
                 }
                 if std::time::Instant::now() > deadline {
-                    panic!("ffi never wrote extracted image dimensions");
+                    panic!("ffi never wrote extracted image dimensions and title");
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(25)).await;
             }

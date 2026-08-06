@@ -267,7 +267,9 @@ pub struct FileView {
     pub metadata: Option<SubtypeMetadata>,
     /// Extracted pixel dimensions (issue #44 image slice). `None` for every
     /// non-image file, and for an image file whose dimensions haven't been
-    /// extracted yet.
+    /// extracted yet. Raw EXIF dimensions — do not account for `Orientation`;
+    /// a rotated image's stored width/height may be transposed relative to
+    /// how it displays.
     pub width: Option<i64>,
     pub height: Option<i64>,
 }

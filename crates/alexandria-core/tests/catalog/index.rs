@@ -519,6 +519,98 @@ async fn given_image_with_dimensions_but_no_title_when_execute_then_only_dimensi
 }
 
 #[tokio::test]
+async fn given_image_with_title_but_no_dimensions_when_execute_then_only_title_written() {
+    let fs = FakeFilesystem::builder()
+        .with_file(ROOT, "/library/a.jpg", "a.jpg", "h-a")
+        .build();
+    let repo = FakeCatalogRepository::new();
+    let repo_handle = repo.clone();
+    let image_tags = FakeImageMetadataReader::new();
+    image_tags.seed(
+        "/library/a.jpg",
+        ImageTags {
+            width: None,
+            height: None,
+            title: Some("A Photo".to_string()),
+        },
+    );
+    let handler = handler(
+        FakeAuth::Allowing,
+        repo,
+        fs,
+        fixed_clock(now()),
+        FakeAudioMetadataReader::new(),
+        image_tags,
+    );
+
+    let outcome = handler
+        .execute(ROOT, Uuid::new_v4())
+        .await
+        .expect("execute");
+
+    assert_eq!(outcome.indexed, 1);
+    let a = repo_handle.file_for("/library/a.jpg").expect("indexed");
+    assert_eq!(
+        repo_handle.dimensions_for(a.uuid),
+        None,
+        "no width/height extracted means set_image_dimensions is never called"
+    );
+    let metadata = repo_handle
+        .metadata_for(a.uuid)
+        .expect("title written from extracted tags");
+    assert_eq!(
+        metadata,
+        alexandria_core::catalog::model::SubtypeMetadata::Image {
+            title: Some("A Photo".to_string()),
+            caption: None,
+        }
+    );
+}
+
+#[tokio::test]
+async fn given_image_with_partial_dimensions_when_execute_then_dimensions_write_skipped() {
+    let fs = FakeFilesystem::builder()
+        .with_file(ROOT, "/library/a.jpg", "a.jpg", "h-a")
+        .build();
+    let repo = FakeCatalogRepository::new();
+    let repo_handle = repo.clone();
+    let image_tags = FakeImageMetadataReader::new();
+    image_tags.seed(
+        "/library/a.jpg",
+        ImageTags {
+            width: Some(800),
+            height: None,
+            title: None,
+        },
+    );
+    let handler = handler(
+        FakeAuth::Allowing,
+        repo,
+        fs,
+        fixed_clock(now()),
+        FakeAudioMetadataReader::new(),
+        image_tags,
+    );
+
+    let outcome = handler
+        .execute(ROOT, Uuid::new_v4())
+        .await
+        .expect("execute");
+
+    assert_eq!(outcome.indexed, 1);
+    let a = repo_handle.file_for("/library/a.jpg").expect("indexed");
+    assert_eq!(
+        repo_handle.dimensions_for(a.uuid),
+        None,
+        "only one of width/height present must skip the dimensions write"
+    );
+    assert!(
+        repo_handle.metadata_for(a.uuid).is_none(),
+        "no title extracted means update_metadata is never called"
+    );
+}
+
+#[tokio::test]
 async fn given_untagged_image_file_when_execute_then_neither_write_happens() {
     let fs = FakeFilesystem::builder()
         .with_file(ROOT, "/library/a.jpg", "a.jpg", "h-a")
