@@ -7,6 +7,7 @@ use crate::catalog::audio_tags::AudioMetadataReader;
 use crate::catalog::classify::classify_by_extension;
 use crate::catalog::clock::Clock;
 use crate::catalog::fs::{FileEntry, Filesystem};
+use crate::catalog::image_tags::ImageMetadataReader;
 use crate::catalog::model::{FileType, NewFile};
 use crate::catalog::repos::CatalogRepository;
 use crate::errors::DomainError;
@@ -47,29 +48,32 @@ pub struct IndexOutcome {
 /// against trait fakes (no real DB, filesystem, or auth service in unit
 /// tests), then wired with the concrete Sqlite/StdFilesystem/Bearer/services
 /// at runtime.
-pub struct IndexHandler<A, R, F, C, M> {
+pub struct IndexHandler<A, R, F, C, M, N> {
     auth: A,
     repo: R,
     fs: F,
     clock: C,
     audio_tags: M,
+    image_tags: N,
 }
 
-impl<A, R, F, C, M> IndexHandler<A, R, F, C, M>
+impl<A, R, F, C, M, N> IndexHandler<A, R, F, C, M, N>
 where
     A: AuthService,
     R: CatalogRepository,
     F: Filesystem,
     C: Clock,
     M: AudioMetadataReader,
+    N: ImageMetadataReader,
 {
-    pub fn new(auth: A, repo: R, fs: F, clock: C, audio_tags: M) -> Self {
+    pub fn new(auth: A, repo: R, fs: F, clock: C, audio_tags: M, image_tags: N) -> Self {
         Self {
             auth,
             repo,
             fs,
             clock,
             audio_tags,
+            image_tags,
         }
     }
 
@@ -179,6 +183,42 @@ where
                         error = %err,
                         "indexed but failed to write extracted audio tags"
                     );
+                }
+            }
+        }
+
+        // Best-effort image EXIF prefill (issue #44 image slice). Two
+        // independent writes: dimensions (outside SubtypeMetadata, via
+        // set_image_dimensions) and title (via the shared update_metadata,
+        // same as audio). Neither write's failure blocks the other or fails
+        // indexing.
+        if file_type == FileType::Image {
+            if let Some(tags) = self.image_tags.read(&entry.path).await {
+                if let (Some(width), Some(height)) = (tags.width, tags.height) {
+                    if let Err(err) = self
+                        .repo
+                        .set_image_dimensions(file.uuid, width, height)
+                        .await
+                    {
+                        tracing::warn!(
+                            path = %entry.path,
+                            error = %err,
+                            "indexed but failed to write extracted image dimensions"
+                        );
+                    }
+                }
+                if let Some(title) = tags.title {
+                    let metadata = crate::catalog::model::SubtypeMetadata::Image {
+                        title: Some(title),
+                        caption: None,
+                    };
+                    if let Err(err) = self.repo.update_metadata(file.uuid, &metadata).await {
+                        tracing::warn!(
+                            path = %entry.path,
+                            error = %err,
+                            "indexed but failed to write extracted image title"
+                        );
+                    }
                 }
             }
         }

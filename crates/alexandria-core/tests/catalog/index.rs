@@ -6,33 +6,36 @@ use alexandria_core::catalog::classify::classify_by_extension;
 use alexandria_core::catalog::clock::Clock;
 use alexandria_core::catalog::commands::index::{IndexHandler, IndexRequest};
 use alexandria_core::catalog::fs::Filesystem;
+use alexandria_core::catalog::image_tags::{ImageMetadataReader, ImageTags};
 use alexandria_core::catalog::model::{FileType, SubtypeMetadata};
 use alexandria_core::catalog::repos::CatalogRepository;
 use alexandria_core::errors::DomainError;
 
 use crate::common::{
     existing_file, fixed_clock, now, FakeAudioMetadataReader, FakeAuth, FakeCatalogRepository,
-    FakeFilesystem,
+    FakeFilesystem, FakeImageMetadataReader,
 };
 
 const ROOT: &str = "/library";
 const TOKEN: &str = "bearer-token";
 
-fn handler<A, R, F, C, M>(
+fn handler<A, R, F, C, M, N>(
     auth: A,
     repo: R,
     fs: F,
     clock: C,
     audio_tags: M,
-) -> IndexHandler<A, R, F, C, M>
+    image_tags: N,
+) -> IndexHandler<A, R, F, C, M, N>
 where
     A: AuthService,
     R: CatalogRepository,
     F: Filesystem,
     C: Clock,
     M: AudioMetadataReader,
+    N: ImageMetadataReader,
 {
-    IndexHandler::new(auth, repo, fs, clock, audio_tags)
+    IndexHandler::new(auth, repo, fs, clock, audio_tags, image_tags)
 }
 
 #[test]
@@ -55,6 +58,7 @@ async fn given_valid_root_and_authenticated_when_start_then_returns_run_id() {
         fs,
         fixed_clock(now()),
         FakeAudioMetadataReader::new(),
+        FakeImageMetadataReader::new(),
     );
 
     let started = handler
@@ -79,6 +83,7 @@ async fn given_missing_root_when_start_then_invalid_input() {
         fs,
         fixed_clock(now()),
         FakeAudioMetadataReader::new(),
+        FakeImageMetadataReader::new(),
     );
 
     let result = handler
@@ -102,6 +107,7 @@ async fn given_unauthenticated_when_start_then_unauthorized() {
         fs,
         fixed_clock(now()),
         FakeAudioMetadataReader::new(),
+        FakeImageMetadataReader::new(),
     );
 
     let result = handler
@@ -134,6 +140,7 @@ async fn given_already_cataloged_path_when_execute_then_skipped_no_duplicate() {
         fs,
         fixed_clock(now()),
         FakeAudioMetadataReader::new(),
+        FakeImageMetadataReader::new(),
     );
 
     let outcome = handler
@@ -170,6 +177,7 @@ async fn given_supported_files_when_execute_then_indexed_with_hash_and_indexedat
         fs,
         fixed_clock(now()),
         FakeAudioMetadataReader::new(),
+        FakeImageMetadataReader::new(),
     );
 
     let outcome = handler
@@ -204,6 +212,7 @@ async fn given_unsupported_extension_when_execute_then_skipped() {
         fs,
         fixed_clock(now()),
         FakeAudioMetadataReader::new(),
+        FakeImageMetadataReader::new(),
     );
 
     let outcome = handler
@@ -233,6 +242,7 @@ async fn given_unreadable_file_when_execute_then_run_continues_and_counts_failur
         fs,
         fixed_clock(now()),
         FakeAudioMetadataReader::new(),
+        FakeImageMetadataReader::new(),
     );
 
     let outcome = handler
@@ -269,6 +279,7 @@ async fn given_failing_repository_write_when_execute_then_run_continues_and_coun
         fs,
         fixed_clock(now()),
         FakeAudioMetadataReader::new(),
+        FakeImageMetadataReader::new(),
     );
 
     let outcome = handler
@@ -323,7 +334,14 @@ async fn given_tagged_audio_file_when_execute_then_subtype_metadata_written() {
             track: Some(4),
         },
     );
-    let handler = handler(FakeAuth::Allowing, repo, fs, fixed_clock(now()), audio_tags);
+    let handler = handler(
+        FakeAuth::Allowing,
+        repo,
+        fs,
+        fixed_clock(now()),
+        audio_tags,
+        FakeImageMetadataReader::new(),
+    );
 
     let outcome = handler
         .execute(ROOT, Uuid::new_v4())
@@ -363,6 +381,7 @@ async fn given_untagged_audio_file_when_execute_then_subtype_metadata_stays_empt
         fs,
         fixed_clock(now()),
         FakeAudioMetadataReader::new(),
+        FakeImageMetadataReader::new(),
     );
 
     let outcome = handler
@@ -387,7 +406,14 @@ async fn given_non_audio_file_when_execute_then_reader_never_consulted() {
     let repo_handle = repo.clone();
     let audio_tags = FakeAudioMetadataReader::new();
     let audio_tags_handle = audio_tags.clone();
-    let handler = handler(FakeAuth::Allowing, repo, fs, fixed_clock(now()), audio_tags);
+    let handler = handler(
+        FakeAuth::Allowing,
+        repo,
+        fs,
+        fixed_clock(now()),
+        audio_tags,
+        FakeImageMetadataReader::new(),
+    );
 
     let outcome = handler
         .execute(ROOT, Uuid::new_v4())
@@ -405,5 +431,147 @@ async fn given_non_audio_file_when_execute_then_reader_never_consulted() {
     assert!(
         repo_handle.metadata_for(notes.uuid).is_none(),
         "Text has no SubtypeMetadata variant; extraction must not run for it"
+    );
+}
+
+#[tokio::test]
+async fn given_tagged_image_file_when_execute_then_dimensions_and_title_written() {
+    let fs = FakeFilesystem::builder()
+        .with_file(ROOT, "/library/a.jpg", "a.jpg", "h-a")
+        .build();
+    let repo = FakeCatalogRepository::new();
+    let repo_handle = repo.clone();
+    let image_tags = FakeImageMetadataReader::new();
+    image_tags.seed(
+        "/library/a.jpg",
+        ImageTags {
+            width: Some(800),
+            height: Some(600),
+            title: Some("A Photo".to_string()),
+        },
+    );
+    let handler = handler(
+        FakeAuth::Allowing,
+        repo,
+        fs,
+        fixed_clock(now()),
+        FakeAudioMetadataReader::new(),
+        image_tags,
+    );
+
+    let outcome = handler
+        .execute(ROOT, Uuid::new_v4())
+        .await
+        .expect("execute");
+
+    assert_eq!(outcome.indexed, 1);
+    let a = repo_handle.file_for("/library/a.jpg").expect("indexed");
+    assert_eq!(repo_handle.dimensions_for(a.uuid), Some((800, 600)));
+    let metadata = repo_handle
+        .metadata_for(a.uuid)
+        .expect("title written from extracted tags");
+    assert_eq!(
+        metadata,
+        alexandria_core::catalog::model::SubtypeMetadata::Image {
+            title: Some("A Photo".to_string()),
+            caption: None,
+        }
+    );
+}
+
+#[tokio::test]
+async fn given_image_with_dimensions_but_no_title_when_execute_then_only_dimensions_written() {
+    let fs = FakeFilesystem::builder()
+        .with_file(ROOT, "/library/a.jpg", "a.jpg", "h-a")
+        .build();
+    let repo = FakeCatalogRepository::new();
+    let repo_handle = repo.clone();
+    let image_tags = FakeImageMetadataReader::new();
+    image_tags.seed(
+        "/library/a.jpg",
+        ImageTags {
+            width: Some(800),
+            height: Some(600),
+            title: None,
+        },
+    );
+    let handler = handler(
+        FakeAuth::Allowing,
+        repo,
+        fs,
+        fixed_clock(now()),
+        FakeAudioMetadataReader::new(),
+        image_tags,
+    );
+
+    let outcome = handler
+        .execute(ROOT, Uuid::new_v4())
+        .await
+        .expect("execute");
+
+    assert_eq!(outcome.indexed, 1);
+    let a = repo_handle.file_for("/library/a.jpg").expect("indexed");
+    assert_eq!(repo_handle.dimensions_for(a.uuid), Some((800, 600)));
+    assert!(
+        repo_handle.metadata_for(a.uuid).is_none(),
+        "no title extracted means update_metadata is never called"
+    );
+}
+
+#[tokio::test]
+async fn given_untagged_image_file_when_execute_then_neither_write_happens() {
+    let fs = FakeFilesystem::builder()
+        .with_file(ROOT, "/library/a.jpg", "a.jpg", "h-a")
+        .build();
+    let repo = FakeCatalogRepository::new();
+    let repo_handle = repo.clone();
+    let handler = handler(
+        FakeAuth::Allowing,
+        repo,
+        fs,
+        fixed_clock(now()),
+        FakeAudioMetadataReader::new(),
+        FakeImageMetadataReader::new(),
+    );
+
+    let outcome = handler
+        .execute(ROOT, Uuid::new_v4())
+        .await
+        .expect("execute");
+
+    assert_eq!(outcome.indexed, 1);
+    let a = repo_handle.file_for("/library/a.jpg").expect("indexed");
+    assert_eq!(repo_handle.dimensions_for(a.uuid), None);
+    assert!(repo_handle.metadata_for(a.uuid).is_none());
+}
+
+#[tokio::test]
+async fn given_non_image_file_when_execute_then_image_reader_never_consulted() {
+    let fs = FakeFilesystem::builder()
+        .with_file(ROOT, "/library/notes.md", "notes.md", "h-a")
+        .build();
+    let repo = FakeCatalogRepository::new();
+    let audio_tags = FakeAudioMetadataReader::new();
+    let image_tags = FakeImageMetadataReader::new();
+    let image_tags_handle = image_tags.clone();
+    let handler = handler(
+        FakeAuth::Allowing,
+        repo,
+        fs,
+        fixed_clock(now()),
+        audio_tags,
+        image_tags,
+    );
+
+    let outcome = handler
+        .execute(ROOT, Uuid::new_v4())
+        .await
+        .expect("execute");
+
+    assert_eq!(outcome.indexed, 1);
+    assert_eq!(
+        image_tags_handle.call_count(),
+        0,
+        "the image reader must not be consulted at all for a non-image file"
     );
 }
