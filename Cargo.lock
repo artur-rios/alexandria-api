@@ -67,6 +67,7 @@ dependencies = [
  "axum",
  "cbindgen",
  "chrono",
+ "ffmpeg-next",
  "image",
  "little_exif",
  "lofty",

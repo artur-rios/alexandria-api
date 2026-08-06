@@ -9320,3 +9320,226 @@ async fn given_tagged_pdf_file_when_indexed_via_http_and_ffi_then_extracted_meta
     assert_eq!(http_body["metadata"]["author"], "Parity Author");
     assert_eq!(http_body["metadata"]["formatKind"], "book");
 }
+
+/// Build a minimal valid MP4 with `ffmpeg-next` — mirrors the identical
+/// helper in `alexandria-core`'s `catalog::video_tags` unit tests.
+fn write_minimal_mp4(path: &std::path::Path, title: &str, width: u32, height: u32) {
+    ffmpeg_next::init().expect("ffmpeg init");
+
+    let mut octx = ffmpeg_next::format::output(path).expect("create output context");
+    octx.set_metadata({
+        let mut dict = ffmpeg_next::Dictionary::new();
+        dict.set("title", title);
+        dict
+    });
+
+    let codec =
+        ffmpeg_next::encoder::find(ffmpeg_next::codec::Id::MPEG4).expect("mpeg4 encoder available");
+    let mut ost = octx.add_stream(codec).expect("add video stream");
+    let mut encoder = ffmpeg_next::codec::context::Context::new_with_codec(codec)
+        .encoder()
+        .video()
+        .expect("video encoder context");
+    encoder.set_width(width);
+    encoder.set_height(height);
+    encoder.set_format(ffmpeg_next::format::Pixel::YUV420P);
+    encoder.set_time_base(ffmpeg_next::Rational(1, 25));
+    let mut encoder = encoder.open().expect("open encoder");
+    ost.set_parameters(&encoder);
+
+    octx.write_header().expect("write header");
+
+    let mut frame =
+        ffmpeg_next::frame::Video::new(ffmpeg_next::format::Pixel::YUV420P, width, height);
+    for plane in 0..frame.planes() {
+        frame.data_mut(plane).fill(16);
+    }
+
+    for i in 0..10 {
+        frame.set_pts(Some(i));
+        encoder.send_frame(&frame).expect("send frame");
+        let mut packet = ffmpeg_next::Packet::empty();
+        while encoder.receive_packet(&mut packet).is_ok() {
+            packet.set_stream(0);
+            packet.write_interleaved(&mut octx).expect("write packet");
+        }
+    }
+    encoder.send_eof().expect("send eof");
+    let mut packet = ffmpeg_next::Packet::empty();
+    while encoder.receive_packet(&mut packet).is_ok() {
+        packet.set_stream(0);
+        packet.write_interleaved(&mut octx).expect("write packet");
+    }
+    octx.write_trailer().expect("write trailer");
+}
+
+/// Poll until `video_files.title`/`video_files.resolution`/
+/// `video_files.duration_seconds` are all non-NULL for the named file —
+/// proves BOTH extraction writes landed (metadata write and duration
+/// write are separate transactions), not just file-row existence or a
+/// single write.
+async fn wait_for_http_video_extraction(pool: &sqlx::sqlite::SqlitePool, name: &str) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let row: Option<(Option<String>, Option<String>, Option<f64>)> = sqlx::query_as(
+            "SELECT video_files.title, video_files.resolution, video_files.duration_seconds \
+             FROM video_files \
+             JOIN files ON files.id = video_files.file_id \
+             WHERE files.name = ?",
+        )
+        .bind(name)
+        .fetch_optional(pool)
+        .await
+        .unwrap();
+        if let Some((Some(_), Some(_), Some(_))) = row {
+            return;
+        }
+        if std::time::Instant::now() > deadline {
+            panic!("http never wrote extracted video metadata");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+}
+
+/// Issue #44 video slice parity — index a tagged MP4 through both
+/// transports and assert the extracted title/resolution/durationSeconds
+/// (written by the indexer itself, not by a manual PATCH) are
+/// byte-for-byte identical.
+#[tokio::test]
+async fn given_tagged_mp4_file_when_indexed_via_http_and_ffi_then_extracted_metadata_matches() {
+    let _g = SERIAL.lock().unwrap();
+
+    // ---- HTTP leg ----
+    let http_lib = tempdir().unwrap();
+    let http_video = http_lib.path().join("movie.mp4");
+    write_minimal_mp4(&http_video, "Parity Title", 320, 240);
+
+    let http_dir = tempdir().unwrap();
+    let http_db = db_path(&http_dir, "http.sqlite");
+    let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    seed_session(&http_pool, TEST_TOKEN).await;
+    let http_services =
+        std::sync::Arc::new(build_services(&local_settings(), http_pool.clone()).await);
+
+    let index_req = Request::builder()
+        .method("POST")
+        .uri("/v1/index")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({ "root": http_lib.path().to_str().unwrap() }).to_string(),
+        ))
+        .unwrap();
+    let _ = app(Settings::default(), http_services.clone())
+        .oneshot(index_req)
+        .await
+        .expect("http index");
+    wait_for_http_video_extraction(&http_pool, "movie.mp4").await;
+
+    let (http_uuid,): (String,) = sqlx::query_as("SELECT uuid FROM files WHERE name = ?")
+        .bind("movie.mp4")
+        .fetch_one(&http_pool)
+        .await
+        .unwrap();
+
+    let get_req = Request::builder()
+        .method("GET")
+        .uri(format!("/v1/files/{http_uuid}"))
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
+        .body(Body::empty())
+        .unwrap();
+    let get_resp = app(Settings::default(), http_services)
+        .oneshot(get_req)
+        .await
+        .expect("http get");
+    assert_eq!(get_resp.status(), axum::http::StatusCode::OK);
+    let http_body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(get_resp.into_body(), usize::MAX).await.unwrap()).unwrap();
+
+    // ---- FFI leg ----
+    let ffi_dir = tempdir().unwrap();
+    let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
+    let ffi_lib = tempdir().unwrap();
+    let ffi_video = ffi_lib.path().join("movie.mp4");
+    write_minimal_mp4(&ffi_video, "Parity Title", 320, 240);
+    let ffi_lib_path = ffi_lib.path().to_str().unwrap().to_string();
+    let ffi_db_for_poll = ffi_db.clone();
+
+    let ffi_body: String = tokio::task::spawn_blocking(move || -> String {
+        let cdb = CString::new(ffi_db).unwrap();
+        assert_eq!(
+            alexandria_index_init(cdb.as_ptr()),
+            alexandria_ffi::INDEX_OK
+        );
+
+        let root = CString::new(ffi_lib_path).unwrap();
+        let token = CString::new(TEST_TOKEN).unwrap();
+        let started = alexandria_index_start(root.as_ptr(), token.as_ptr());
+        assert_eq!(started.status, alexandria_ffi::INDEX_OK);
+
+        // Poll the FFI leg's own sqlite file directly for all three
+        // extraction writes (title, resolution, duration_seconds) — not
+        // just file-row existence, and not just the first of the writes
+        // the indexer commits across its separate transactions.
+        type FfiVideoExtractionRow = (String, Option<String>, Option<String>, Option<f64>);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let ffi_uuid: String = rt.block_on(async {
+            let pool = sqlx::sqlite::SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect(&format!("sqlite://{ffi_db_for_poll}?mode=rw"))
+                .await
+                .unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                let row: Option<FfiVideoExtractionRow> = sqlx::query_as(
+                    "SELECT files.uuid, video_files.title, video_files.resolution, \
+                     video_files.duration_seconds \
+                     FROM video_files \
+                     JOIN files ON files.id = video_files.file_id \
+                     WHERE files.name = ?",
+                )
+                .bind("movie.mp4")
+                .fetch_optional(&pool)
+                .await
+                .unwrap();
+                if let Some((uuid, Some(_), Some(_), Some(_))) = row {
+                    return uuid;
+                }
+                if std::time::Instant::now() > deadline {
+                    panic!("ffi never wrote extracted video metadata");
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        });
+
+        let uuid_c = CString::new(ffi_uuid).unwrap();
+        let result = alexandria_file_get_by_uuid(uuid_c.as_ptr(), token.as_ptr());
+        assert_eq!(result.status, alexandria_ffi::FILE_OK);
+        assert!(!result.json.is_null());
+        let json = unsafe { CStr::from_ptr(result.json) }
+            .to_str()
+            .unwrap()
+            .to_string();
+        unsafe {
+            alexandria_free_string(result.json);
+        }
+        json
+    })
+    .await
+    .unwrap();
+
+    let ffi_body: serde_json::Value = serde_json::from_str(&ffi_body).unwrap();
+
+    // ---- compare ----
+    assert_eq!(http_body["durationSeconds"], ffi_body["durationSeconds"]);
+    assert_eq!(http_body["metadata"], ffi_body["metadata"]);
+    assert_eq!(http_body["metadata"]["title"], "Parity Title");
+    assert_eq!(http_body["metadata"]["resolution"], "320x240");
+    let http_duration = http_body["durationSeconds"]
+        .as_f64()
+        .expect("duration is a number");
+    assert!(
+        http_duration > 0.0,
+        "expected a positive duration, got {http_duration}"
+    );
+}
