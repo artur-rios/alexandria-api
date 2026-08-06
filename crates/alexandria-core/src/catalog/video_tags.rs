@@ -109,6 +109,7 @@ mod tests {
         octx.set_metadata({
             let mut dict = ffmpeg_next::Dictionary::new();
             dict.set("title", title);
+            dict.set("date", "2024-01-01T00:00:00Z");
             dict
         });
 
@@ -155,7 +156,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn given_tagged_mp4_when_read_then_title_resolution_and_duration_extracted() {
+    async fn given_tagged_mp4_when_read_then_title_year_resolution_and_duration_extracted() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("tagged.mp4");
         write_minimal_mp4(&path, "Test Title", 320, 240);
@@ -167,6 +168,7 @@ mod tests {
             .expect("tags extracted");
 
         assert_eq!(tags.title.as_deref(), Some("Test Title"));
+        assert_eq!(tags.year, Some(2024));
         assert_eq!(tags.resolution.as_deref(), Some("320x240"));
         assert!(
             tags.duration_seconds.is_some(),
