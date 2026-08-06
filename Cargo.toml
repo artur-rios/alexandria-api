@@ -23,6 +23,7 @@ axum = "0.8"
 cbindgen = "0.29"
 chrono = { version = "0.4", features = ["serde"] }
 epub = "2"
+ffmpeg-next = "9"
 jsonwebtoken = "9"
 kamadak-exif = "0.5"
 lofty = "0.22"
