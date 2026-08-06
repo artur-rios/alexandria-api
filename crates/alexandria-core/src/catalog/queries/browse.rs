@@ -111,11 +111,21 @@ where
             (None, None)
         };
 
+        // Issue #44 document slice: page_count lives outside
+        // `SubtypeMetadata` (see `find_document_page_count`'s doc comment),
+        // so it's fetched separately and only for document files.
+        let page_count = if file.file_type == FileType::Document {
+            self.repo.find_document_page_count(uuid).await?
+        } else {
+            None
+        };
+
         Ok(FileView {
             file,
             metadata,
             width,
             height,
+            page_count,
         })
     }
 }

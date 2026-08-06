@@ -272,6 +272,11 @@ pub struct FileView {
     /// how it displays.
     pub width: Option<i64>,
     pub height: Option<i64>,
+    /// Extracted page count (issue #44 document slice). `None` for every
+    /// non-document file, for a document whose page count hasn't been
+    /// extracted yet, and always for EPUB (reflowable text has no fixed
+    /// page count).
+    pub page_count: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
