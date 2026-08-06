@@ -22,6 +22,7 @@ use alexandria_core::bookmarks::model::{Bookmark, BookmarkState, NewBookmark};
 use alexandria_core::bookmarks::repos::BookmarkRepository;
 use alexandria_core::catalog::audio_tags::{AudioMetadataReader, AudioTags};
 use alexandria_core::catalog::clock::FixedClock;
+use alexandria_core::catalog::document_tags::{DocumentMetadataReader, DocumentTags};
 use alexandria_core::catalog::fs::{FileEntry, Filesystem};
 use alexandria_core::catalog::image_tags::{ImageMetadataReader, ImageTags};
 use alexandria_core::catalog::model::{
@@ -1574,6 +1575,42 @@ impl FakeImageMetadataReader {
 
 impl ImageMetadataReader for FakeImageMetadataReader {
     async fn read(&self, path: &str) -> Option<ImageTags> {
+        *self.call_count.lock().unwrap() += 1;
+        self.tags.lock().unwrap().get(path).cloned()
+    }
+}
+
+/// In-memory document reader (issue #44 document slice). `read()` answers
+/// `None` for any path with no seeded tags, mirroring "unsupported
+/// extension / no metadata / couldn't parse" — the same outcome
+/// `PdfEpubMetadataReader` produces for those cases. Also counts calls, so
+/// a test can assert the reader was never consulted at all (e.g. for a
+/// non-document file).
+#[derive(Debug, Default, Clone)]
+pub struct FakeDocumentMetadataReader {
+    tags: Arc<Mutex<HashMap<String, DocumentTags>>>,
+    call_count: Arc<Mutex<usize>>,
+}
+
+impl FakeDocumentMetadataReader {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Seed the tags `read()` returns for `path`.
+    pub fn seed(&self, path: &str, tags: DocumentTags) -> &Self {
+        self.tags.lock().unwrap().insert(path.to_string(), tags);
+        self
+    }
+
+    /// How many times `read()` has been called.
+    pub fn call_count(&self) -> usize {
+        *self.call_count.lock().unwrap()
+    }
+}
+
+impl DocumentMetadataReader for FakeDocumentMetadataReader {
+    async fn read(&self, path: &str) -> Option<DocumentTags> {
         *self.call_count.lock().unwrap() += 1;
         self.tags.lock().unwrap().get(path).cloned()
     }
