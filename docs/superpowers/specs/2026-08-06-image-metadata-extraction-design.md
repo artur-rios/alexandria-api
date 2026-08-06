@@ -93,7 +93,42 @@ Concrete implementation `ExifImageMetadataReader` wraps `kamadak-exif`'s
 async fn set_image_dimensions(&self, uuid: Uuid, width: i64, height: i64) -> Result<(), DomainError>;
 ```
 
-Sqlite implementation: `UPDATE images SET width = ?, height = ? WHERE file_id = (SELECT id FROM files WHERE uuid = ?)`.
+Sqlite implementation mirrors `update_metadata`'s existing shape (resolve `id`/`type` from `uuid` in a transaction, verify `FileType::Image`, `UPDATE`, check `rows_affected`).
+
+### New repository read method and `FileView` field addition
+
+Discovered while planning: `width`/`height` currently have **no read path at
+all** — no query selects them, and `FileView` (UC-03's single-file response,
+`{ file, metadata }`) has nowhere to carry them, since `SubtypeMetadata::Image`
+deliberately excludes them. Writing them via extraction with no way to read
+them back would make this data invisible to every caller. Fix, chosen to
+keep the blast radius minimal (a sibling read method rather than changing
+`find_metadata_by_uuid`'s existing return type, which many call sites
+depend on):
+
+```rust
+/// Read an image file's pixel dimensions, if both are set (issue #44 image
+/// pilot). `None` when the file doesn't exist, isn't an image, or either
+/// column is still NULL (extraction never ran, or found no dimensions).
+async fn find_image_dimensions(&self, uuid: Uuid) -> Result<Option<(i64, i64)>, DomainError>;
+```
+
+`FileView` (`catalog/model.rs`) gains two fields:
+
+```rust
+pub struct FileView {
+    pub file: File,
+    pub metadata: Option<SubtypeMetadata>,
+    pub width: Option<i64>,
+    pub height: Option<i64>,
+}
+```
+
+`width`/`height` are `None` for every non-image file and for an image file
+whose dimensions haven't been extracted yet. `BrowseFilesHandler::get_by_uuid`
+(`catalog/queries/browse.rs`) calls `find_image_dimensions` alongside its
+existing `find_metadata_by_uuid` call, only when `file.file_type ==
+FileType::Image`, and threads the result into `FileView`.
 
 ### `IndexHandler` wiring
 
