@@ -52,6 +52,8 @@ dependencies = [
  "axum",
  "cbindgen",
  "chrono",
+ "image",
+ "little_exif",
  "lofty",
  "serde_json",
  "sqlx",
