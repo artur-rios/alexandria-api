@@ -23,6 +23,7 @@ use alexandria_core::bookmarks::repos::BookmarkRepository;
 use alexandria_core::catalog::audio_tags::{AudioMetadataReader, AudioTags};
 use alexandria_core::catalog::clock::FixedClock;
 use alexandria_core::catalog::fs::{FileEntry, Filesystem};
+use alexandria_core::catalog::image_tags::{ImageMetadataReader, ImageTags};
 use alexandria_core::catalog::model::{
     File, FileState, FileType, NewFile, StateFilter, SubtypeMetadata,
 };
@@ -95,6 +96,9 @@ pub struct FakeCatalogRepository {
     failing_purge_uuids: Arc<Mutex<std::collections::HashSet<Uuid>>>,
     /// File uuid -> collection uuid, as written by `set_collection` (UC-13).
     collection_links: Arc<Mutex<HashMap<Uuid, Uuid>>>,
+    /// File uuid -> (width, height), as written by `set_image_dimensions`
+    /// (issue #44 image slice).
+    dimensions: Arc<Mutex<HashMap<Uuid, (i64, i64)>>>,
 }
 
 impl FakeCatalogRepository {
@@ -184,6 +188,12 @@ impl FakeCatalogRepository {
     /// (UC-13). `None` when never linked.
     pub fn collection_for_file(&self, uuid: Uuid) -> Option<Uuid> {
         self.collection_links.lock().unwrap().get(&uuid).copied()
+    }
+
+    /// Dimensions last written for `uuid` via `set_image_dimensions`. `None`
+    /// means no call has landed for that file yet.
+    pub fn dimensions_for(&self, uuid: Uuid) -> Option<(i64, i64)> {
+        self.dimensions.lock().unwrap().get(&uuid).copied()
     }
 }
 
@@ -307,6 +317,41 @@ impl CatalogRepository for FakeCatalogRepository {
         uuid: Uuid,
     ) -> Result<Option<SubtypeMetadata>, DomainError> {
         Ok(self.metadata.lock().unwrap().get(&uuid).cloned())
+    }
+
+    async fn set_image_dimensions(
+        &self,
+        uuid: Uuid,
+        width: i64,
+        height: i64,
+    ) -> Result<(), DomainError> {
+        let files = self.files.lock().unwrap();
+        let file = files
+            .values()
+            .find(|f| f.uuid == uuid)
+            .ok_or(DomainError::NotFound)?;
+        if file.file_type != alexandria_core::catalog::model::FileType::Image {
+            return Err(DomainError::InvalidInput("file is not an image".into()));
+        }
+        drop(files);
+        self.dimensions
+            .lock()
+            .unwrap()
+            .insert(uuid, (width, height));
+        Ok(())
+    }
+
+    async fn find_image_dimensions(&self, uuid: Uuid) -> Result<Option<(i64, i64)>, DomainError> {
+        let files = self.files.lock().unwrap();
+        let file = match files.values().find(|f| f.uuid == uuid) {
+            Some(f) => f,
+            None => return Ok(None),
+        };
+        if file.file_type != alexandria_core::catalog::model::FileType::Image {
+            return Ok(None);
+        }
+        drop(files);
+        Ok(self.dimensions.lock().unwrap().get(&uuid).copied())
     }
 
     async fn rename_file(
@@ -1494,6 +1539,41 @@ impl FakeAudioMetadataReader {
 
 impl AudioMetadataReader for FakeAudioMetadataReader {
     async fn read(&self, path: &str) -> Option<AudioTags> {
+        *self.call_count.lock().unwrap() += 1;
+        self.tags.lock().unwrap().get(path).cloned()
+    }
+}
+
+/// In-memory image-EXIF reader (issue #44 image slice). `read()` answers
+/// `None` for any path with no seeded tags, mirroring "no EXIF found /
+/// couldn't parse" — the same outcome `ExifImageMetadataReader` produces
+/// for those cases. Also counts calls, so a test can assert the reader was
+/// never consulted at all (e.g. for a non-image file).
+#[derive(Debug, Default, Clone)]
+pub struct FakeImageMetadataReader {
+    tags: Arc<Mutex<HashMap<String, ImageTags>>>,
+    call_count: Arc<Mutex<usize>>,
+}
+
+impl FakeImageMetadataReader {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Seed the tags `read()` returns for `path`.
+    pub fn seed(&self, path: &str, tags: ImageTags) -> &Self {
+        self.tags.lock().unwrap().insert(path.to_string(), tags);
+        self
+    }
+
+    /// How many times `read()` has been called.
+    pub fn call_count(&self) -> usize {
+        *self.call_count.lock().unwrap()
+    }
+}
+
+impl ImageMetadataReader for FakeImageMetadataReader {
+    async fn read(&self, path: &str) -> Option<ImageTags> {
         *self.call_count.lock().unwrap() += 1;
         self.tags.lock().unwrap().get(path).cloned()
     }

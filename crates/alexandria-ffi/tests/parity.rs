@@ -8913,3 +8913,195 @@ async fn given_tagged_audio_file_when_indexed_via_http_and_ffi_then_extracted_me
     assert_eq!(http_body["metadata"]["year"], 2015);
     assert_eq!(http_body["metadata"]["track"], 2);
 }
+
+/// Encode a tiny real JPEG (4x3 pixels) using the `image` crate — a real,
+/// valid JPEG file, not hand-crafted bytes. Mirrors the identical helper in
+/// `alexandria-core`'s `catalog::image_tags` unit tests.
+fn write_minimal_jpeg(path: &std::path::Path) {
+    let img = image::RgbImage::from_pixel(4, 3, image::Rgb([128, 64, 32]));
+    img.save(path).expect("encode jpeg");
+}
+
+/// Write EXIF tags (pixel dimensions + a description) into an existing JPEG
+/// using `little_exif`.
+fn write_test_exif(path: &std::path::Path, width: u32, height: u32, description: &str) {
+    use little_exif::exif_tag::ExifTag;
+    use little_exif::metadata::Metadata;
+
+    let mut metadata = Metadata::new();
+    metadata.set_tag(ExifTag::ImageDescription(description.to_string()));
+    // little_exif names these `ExifImageWidth`/`ExifImageHeight`, but they
+    // write tag IDs 0xa002/0xa003 — the same IDs `kamadak-exif` reads back
+    // as `Tag::PixelXDimension`/`Tag::PixelYDimension` (see
+    // alexandria-core's `catalog::image_tags` unit tests for the same
+    // discovery).
+    metadata.set_tag(ExifTag::ExifImageWidth(vec![width]));
+    metadata.set_tag(ExifTag::ExifImageHeight(vec![height]));
+    metadata.write_to_file(path).expect("write exif");
+}
+
+/// Poll until `images.width`/`images.height`/`images.title` are all
+/// non-NULL for the named file — proves both extraction writes landed
+/// (`IndexHandler`'s image branch commits dimensions and title as two
+/// separate sequential transactions), not just the first of the two, and
+/// not just that the file row exists (the audio slice's final review found
+/// and fixed exactly this race for its own parity test; this test extends
+/// that fix to cover every write it asserts on).
+async fn wait_for_http_image_extraction(pool: &sqlx::sqlite::SqlitePool, name: &str) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let row: Option<(Option<i64>, Option<i64>, Option<String>)> = sqlx::query_as(
+            "SELECT images.width, images.height, images.title FROM images \
+             JOIN files ON files.id = images.file_id \
+             WHERE files.name = ?",
+        )
+        .bind(name)
+        .fetch_optional(pool)
+        .await
+        .unwrap();
+        if let Some((Some(_), Some(_), Some(_))) = row {
+            return;
+        }
+        if std::time::Instant::now() > deadline {
+            panic!("http never wrote extracted image dimensions and title");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+}
+
+/// Issue #44 image slice parity — index a tagged JPEG through both
+/// transports and assert the extracted dimensions + title (written by the
+/// indexer itself, not by a manual PATCH) are byte-for-byte identical.
+#[tokio::test]
+async fn given_tagged_image_file_when_indexed_via_http_and_ffi_then_extracted_metadata_matches() {
+    let _g = SERIAL.lock().unwrap();
+
+    // ---- HTTP leg ----
+    let http_lib = tempdir().unwrap();
+    let http_photo = http_lib.path().join("photo.jpg");
+    write_minimal_jpeg(&http_photo);
+    write_test_exif(&http_photo, 800, 600, "Parity Description");
+
+    let http_dir = tempdir().unwrap();
+    let http_db = db_path(&http_dir, "http.sqlite");
+    let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    seed_session(&http_pool, TEST_TOKEN).await;
+    let http_services =
+        std::sync::Arc::new(build_services(&local_settings(), http_pool.clone()).await);
+
+    let index_req = Request::builder()
+        .method("POST")
+        .uri("/v1/index")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({ "root": http_lib.path().to_str().unwrap() }).to_string(),
+        ))
+        .unwrap();
+    let _ = app(Settings::default(), http_services.clone())
+        .oneshot(index_req)
+        .await
+        .expect("http index");
+    wait_for_http_image_extraction(&http_pool, "photo.jpg").await;
+
+    let (http_uuid,): (String,) = sqlx::query_as("SELECT uuid FROM files WHERE name = ?")
+        .bind("photo.jpg")
+        .fetch_one(&http_pool)
+        .await
+        .unwrap();
+
+    let get_req = Request::builder()
+        .method("GET")
+        .uri(format!("/v1/files/{http_uuid}"))
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
+        .body(Body::empty())
+        .unwrap();
+    let get_resp = app(Settings::default(), http_services)
+        .oneshot(get_req)
+        .await
+        .expect("http get");
+    assert_eq!(get_resp.status(), axum::http::StatusCode::OK);
+    let http_body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(get_resp.into_body(), usize::MAX).await.unwrap()).unwrap();
+
+    // ---- FFI leg ----
+    let ffi_dir = tempdir().unwrap();
+    let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
+    let ffi_lib = tempdir().unwrap();
+    let ffi_photo = ffi_lib.path().join("photo.jpg");
+    write_minimal_jpeg(&ffi_photo);
+    write_test_exif(&ffi_photo, 800, 600, "Parity Description");
+    let ffi_lib_path = ffi_lib.path().to_str().unwrap().to_string();
+    let ffi_db_for_poll = ffi_db.clone();
+
+    let ffi_body: String = tokio::task::spawn_blocking(move || -> String {
+        let cdb = CString::new(ffi_db).unwrap();
+        assert_eq!(
+            alexandria_index_init(cdb.as_ptr()),
+            alexandria_ffi::INDEX_OK
+        );
+
+        let root = CString::new(ffi_lib_path).unwrap();
+        let token = CString::new(TEST_TOKEN).unwrap();
+        let started = alexandria_index_start(root.as_ptr(), token.as_ptr());
+        assert_eq!(started.status, alexandria_ffi::INDEX_OK);
+
+        // Poll the FFI leg's own sqlite file directly for both extraction
+        // writes (dimensions and title), same as the HTTP leg — not just
+        // file-row existence, and not just the first of the two sequential
+        // writes the indexer commits.
+        type FfiImageExtractionRow = (String, Option<i64>, Option<i64>, Option<String>);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let ffi_uuid: String = rt.block_on(async {
+            let pool = sqlx::sqlite::SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect(&format!("sqlite://{ffi_db_for_poll}?mode=rw"))
+                .await
+                .unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                let row: Option<FfiImageExtractionRow> = sqlx::query_as(
+                    "SELECT files.uuid, images.width, images.height, images.title FROM images \
+                     JOIN files ON files.id = images.file_id \
+                     WHERE files.name = ?",
+                )
+                .bind("photo.jpg")
+                .fetch_optional(&pool)
+                .await
+                .unwrap();
+                if let Some((uuid, Some(_), Some(_), Some(_))) = row {
+                    return uuid;
+                }
+                if std::time::Instant::now() > deadline {
+                    panic!("ffi never wrote extracted image dimensions and title");
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        });
+
+        let uuid_c = CString::new(ffi_uuid).unwrap();
+        let result = alexandria_file_get_by_uuid(uuid_c.as_ptr(), token.as_ptr());
+        assert_eq!(result.status, alexandria_ffi::FILE_OK);
+        assert!(!result.json.is_null());
+        let json = unsafe { CStr::from_ptr(result.json) }
+            .to_str()
+            .unwrap()
+            .to_string();
+        unsafe {
+            alexandria_free_string(result.json);
+        }
+        json
+    })
+    .await
+    .unwrap();
+
+    let ffi_body: serde_json::Value = serde_json::from_str(&ffi_body).unwrap();
+
+    // ---- compare ----
+    assert_eq!(http_body["width"], ffi_body["width"]);
+    assert_eq!(http_body["height"], ffi_body["height"]);
+    assert_eq!(http_body["metadata"], ffi_body["metadata"]);
+    assert_eq!(http_body["width"], 800);
+    assert_eq!(http_body["height"], 600);
+    assert_eq!(http_body["metadata"]["title"], "Parity Description");
+}

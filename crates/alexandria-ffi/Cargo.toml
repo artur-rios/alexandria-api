@@ -26,6 +26,8 @@ alexandria-core = { path = "../alexandria-core" }
 alexandria-http = { path = "../alexandria-http" }
 axum = { workspace = true }
 chrono.workspace = true
+image.workspace = true
+little_exif.workspace = true
 lofty.workspace = true
 serde_json.workspace = true
 sqlx.workspace = true

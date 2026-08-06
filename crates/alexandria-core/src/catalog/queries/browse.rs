@@ -99,6 +99,23 @@ where
 
         let metadata = self.repo.find_metadata_by_uuid(uuid).await?;
 
-        Ok(FileView { file, metadata })
+        // Issue #44 image slice: width/height live outside `SubtypeMetadata`
+        // (see `find_image_dimensions`'s doc comment), so they're fetched
+        // separately and only for image files.
+        let (width, height) = if file.file_type == FileType::Image {
+            match self.repo.find_image_dimensions(uuid).await? {
+                Some((w, h)) => (Some(w), Some(h)),
+                None => (None, None),
+            }
+        } else {
+            (None, None)
+        };
+
+        Ok(FileView {
+            file,
+            metadata,
+            width,
+            height,
+        })
     }
 }
