@@ -3,6 +3,7 @@ use serde::Serialize;
 use uuid::Uuid;
 
 use crate::auth::AuthService;
+use crate::catalog::audio_tags::AudioMetadataReader;
 use crate::catalog::classify::classify_by_extension;
 use crate::catalog::clock::Clock;
 use crate::catalog::fs::{FileEntry, Filesystem};
@@ -46,26 +47,29 @@ pub struct IndexOutcome {
 /// against trait fakes (no real DB, filesystem, or auth service in unit
 /// tests), then wired with the concrete Sqlite/StdFilesystem/Bearer/services
 /// at runtime.
-pub struct IndexHandler<A, R, F, C> {
+pub struct IndexHandler<A, R, F, C, M> {
     auth: A,
     repo: R,
     fs: F,
     clock: C,
+    audio_tags: M,
 }
 
-impl<A, R, F, C> IndexHandler<A, R, F, C>
+impl<A, R, F, C, M> IndexHandler<A, R, F, C, M>
 where
     A: AuthService,
     R: CatalogRepository,
     F: Filesystem,
     C: Clock,
+    M: AudioMetadataReader,
 {
-    pub fn new(auth: A, repo: R, fs: F, clock: C) -> Self {
+    pub fn new(auth: A, repo: R, fs: F, clock: C, audio_tags: M) -> Self {
         Self {
             auth,
             repo,
             fs,
             clock,
+            audio_tags,
         }
     }
 
@@ -146,16 +150,38 @@ where
             return Ok(false);
         }
         let content_hash = self.fs.content_hash(&entry.path).await?;
-        self.repo
+        let file = self
+            .repo
             .insert_file(NewFile {
                 uuid: Uuid::new_v4(),
-                path: entry.path,
+                path: entry.path.clone(),
                 name: entry.name,
                 file_type,
                 content_hash,
                 indexed_at: now,
             })
             .await?;
+
+        // Best-effort audio tag prefill (issue #44 pilot). Extraction only
+        // ever runs here, at first index — refresh never touches metadata.
+        // A parse failure or a write failure here must not fail indexing
+        // (it is not counted in `IndexOutcome::failed`).
+        if file_type == FileType::Audio {
+            if let Some(metadata) = self
+                .audio_tags
+                .read(&entry.path)
+                .await
+                .and_then(|tags| tags.into_subtype_metadata())
+            {
+                if let Err(err) = self.repo.update_metadata(file.uuid, &metadata).await {
+                    tracing::warn!(
+                        path = %entry.path,
+                        error = %err,
+                        "indexed but failed to write extracted audio tags"
+                    );
+                }
+            }
+        }
         Ok(true)
     }
 }

@@ -1,29 +1,38 @@
 use uuid::Uuid;
 
 use alexandria_core::auth::AuthService;
+use alexandria_core::catalog::audio_tags::{AudioMetadataReader, AudioTags};
 use alexandria_core::catalog::classify::classify_by_extension;
 use alexandria_core::catalog::clock::Clock;
 use alexandria_core::catalog::commands::index::{IndexHandler, IndexRequest};
 use alexandria_core::catalog::fs::Filesystem;
-use alexandria_core::catalog::model::FileType;
+use alexandria_core::catalog::model::{FileType, SubtypeMetadata};
 use alexandria_core::catalog::repos::CatalogRepository;
 use alexandria_core::errors::DomainError;
 
 use crate::common::{
-    existing_file, fixed_clock, now, FakeAuth, FakeCatalogRepository, FakeFilesystem,
+    existing_file, fixed_clock, now, FakeAudioMetadataReader, FakeAuth, FakeCatalogRepository,
+    FakeFilesystem,
 };
 
 const ROOT: &str = "/library";
 const TOKEN: &str = "bearer-token";
 
-fn handler<A, R, F, C>(auth: A, repo: R, fs: F, clock: C) -> IndexHandler<A, R, F, C>
+fn handler<A, R, F, C, M>(
+    auth: A,
+    repo: R,
+    fs: F,
+    clock: C,
+    audio_tags: M,
+) -> IndexHandler<A, R, F, C, M>
 where
     A: AuthService,
     R: CatalogRepository,
     F: Filesystem,
     C: Clock,
+    M: AudioMetadataReader,
 {
-    IndexHandler::new(auth, repo, fs, clock)
+    IndexHandler::new(auth, repo, fs, clock, audio_tags)
 }
 
 #[test]
@@ -45,6 +54,7 @@ async fn given_valid_root_and_authenticated_when_start_then_returns_run_id() {
         FakeCatalogRepository::new(),
         fs,
         fixed_clock(now()),
+        FakeAudioMetadataReader::new(),
     );
 
     let started = handler
@@ -68,6 +78,7 @@ async fn given_missing_root_when_start_then_invalid_input() {
         FakeCatalogRepository::new(),
         fs,
         fixed_clock(now()),
+        FakeAudioMetadataReader::new(),
     );
 
     let result = handler
@@ -90,6 +101,7 @@ async fn given_unauthenticated_when_start_then_unauthorized() {
         FakeCatalogRepository::new(),
         fs,
         fixed_clock(now()),
+        FakeAudioMetadataReader::new(),
     );
 
     let result = handler
@@ -116,7 +128,13 @@ async fn given_already_cataloged_path_when_execute_then_skipped_no_duplicate() {
     // own move of the original clone.
     let repo = FakeCatalogRepository::with_existing(existing_file(existing_path, FileType::Audio));
     let repo_handle = repo.clone();
-    let handler = handler(FakeAuth::Allowing, repo, fs, fixed_clock(now()));
+    let handler = handler(
+        FakeAuth::Allowing,
+        repo,
+        fs,
+        fixed_clock(now()),
+        FakeAudioMetadataReader::new(),
+    );
 
     let outcome = handler
         .execute(ROOT, Uuid::new_v4())
@@ -146,7 +164,13 @@ async fn given_supported_files_when_execute_then_indexed_with_hash_and_indexedat
         .build();
     let repo = FakeCatalogRepository::new();
     let repo_handle = repo.clone();
-    let handler = handler(FakeAuth::Allowing, repo, fs, fixed_clock(now()));
+    let handler = handler(
+        FakeAuth::Allowing,
+        repo,
+        fs,
+        fixed_clock(now()),
+        FakeAudioMetadataReader::new(),
+    );
 
     let outcome = handler
         .execute(ROOT, Uuid::new_v4())
@@ -174,7 +198,13 @@ async fn given_unsupported_extension_when_execute_then_skipped() {
         .with_file(ROOT, "/library/archive.zip", "archive.zip", "h-2")
         .build();
     let repo = FakeCatalogRepository::new();
-    let handler = handler(FakeAuth::Allowing, repo, fs, fixed_clock(now()));
+    let handler = handler(
+        FakeAuth::Allowing,
+        repo,
+        fs,
+        fixed_clock(now()),
+        FakeAudioMetadataReader::new(),
+    );
 
     let outcome = handler
         .execute(ROOT, Uuid::new_v4())
@@ -197,7 +227,13 @@ async fn given_unreadable_file_when_execute_then_run_continues_and_counts_failur
         .build();
     let repo = FakeCatalogRepository::new();
     let repo_handle = repo.clone();
-    let handler = handler(FakeAuth::Allowing, repo, fs, fixed_clock(now()));
+    let handler = handler(
+        FakeAuth::Allowing,
+        repo,
+        fs,
+        fixed_clock(now()),
+        FakeAudioMetadataReader::new(),
+    );
 
     let outcome = handler
         .execute(ROOT, Uuid::new_v4())
@@ -227,7 +263,13 @@ async fn given_failing_repository_write_when_execute_then_run_continues_and_coun
         .build();
     let repo = FakeCatalogRepository::new().failing_for("/library/a.mp3");
     let repo_handle = repo.clone();
-    let handler = handler(FakeAuth::Allowing, repo, fs, fixed_clock(now()));
+    let handler = handler(
+        FakeAuth::Allowing,
+        repo,
+        fs,
+        fixed_clock(now()),
+        FakeAudioMetadataReader::new(),
+    );
 
     let outcome = handler
         .execute(ROOT, Uuid::new_v4())
@@ -260,4 +302,108 @@ async fn given_bearer_auth_when_empty_token_then_unauthorized() {
 fn given_fixed_clock_when_now_then_returns_seeded_time() {
     let clock = fixed_clock(now());
     assert_eq!(clock.now(), now());
+}
+
+#[tokio::test]
+async fn given_tagged_audio_file_when_execute_then_subtype_metadata_written() {
+    let fs = FakeFilesystem::builder()
+        .with_file(ROOT, "/library/a.mp3", "a.mp3", "h-a")
+        .build();
+    let repo = FakeCatalogRepository::new();
+    let repo_handle = repo.clone();
+    let audio_tags = FakeAudioMetadataReader::new();
+    audio_tags.seed(
+        "/library/a.mp3",
+        AudioTags {
+            title: Some("Song".to_string()),
+            artist: Some("Band".to_string()),
+            album: Some("LP".to_string()),
+            year: Some(2001),
+            genre: Some("Rock".to_string()),
+            track: Some(4),
+        },
+    );
+    let handler = handler(FakeAuth::Allowing, repo, fs, fixed_clock(now()), audio_tags);
+
+    let outcome = handler
+        .execute(ROOT, Uuid::new_v4())
+        .await
+        .expect("execute");
+
+    assert_eq!(outcome.indexed, 1);
+    let a = repo_handle.file_for("/library/a.mp3").expect("indexed");
+    let metadata = repo_handle
+        .metadata_for(a.uuid)
+        .expect("metadata written from extracted tags");
+    assert_eq!(
+        metadata,
+        SubtypeMetadata::Audio {
+            title: Some("Song".to_string()),
+            artist: Some("Band".to_string()),
+            album: Some("LP".to_string()),
+            year: Some(2001),
+            genre: Some("Rock".to_string()),
+            track: Some(4),
+        }
+    );
+}
+
+#[tokio::test]
+async fn given_untagged_audio_file_when_execute_then_subtype_metadata_stays_empty() {
+    let fs = FakeFilesystem::builder()
+        .with_file(ROOT, "/library/a.mp3", "a.mp3", "h-a")
+        .build();
+    let repo = FakeCatalogRepository::new();
+    let repo_handle = repo.clone();
+    // No tags seeded — FakeAudioMetadataReader::read returns None for any
+    // unseeded path.
+    let handler = handler(
+        FakeAuth::Allowing,
+        repo,
+        fs,
+        fixed_clock(now()),
+        FakeAudioMetadataReader::new(),
+    );
+
+    let outcome = handler
+        .execute(ROOT, Uuid::new_v4())
+        .await
+        .expect("execute");
+
+    assert_eq!(outcome.indexed, 1);
+    let a = repo_handle.file_for("/library/a.mp3").expect("indexed");
+    assert!(
+        repo_handle.metadata_for(a.uuid).is_none(),
+        "no tags found means no update_metadata call"
+    );
+}
+
+#[tokio::test]
+async fn given_non_audio_file_when_execute_then_reader_never_consulted() {
+    let fs = FakeFilesystem::builder()
+        .with_file(ROOT, "/library/notes.md", "notes.md", "h-a")
+        .build();
+    let repo = FakeCatalogRepository::new();
+    let repo_handle = repo.clone();
+    let audio_tags = FakeAudioMetadataReader::new();
+    let audio_tags_handle = audio_tags.clone();
+    let handler = handler(FakeAuth::Allowing, repo, fs, fixed_clock(now()), audio_tags);
+
+    let outcome = handler
+        .execute(ROOT, Uuid::new_v4())
+        .await
+        .expect("execute");
+
+    assert_eq!(outcome.indexed, 1);
+    let notes = repo_handle.file_for("/library/notes.md").expect("indexed");
+    assert_eq!(notes.file_type, FileType::Text);
+    assert_eq!(
+        audio_tags_handle.call_count(),
+        0,
+        "the reader must not be consulted at all for a non-audio file"
+    );
+    assert!(
+        repo_handle.metadata_for(notes.uuid).is_none(),
+        "Text has no SubtypeMetadata variant; extraction must not run for it"
+    );
 }

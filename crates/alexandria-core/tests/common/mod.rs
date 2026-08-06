@@ -20,6 +20,7 @@ use alexandria_core::auth::local::{LocalCredential, LocalCredentialRepository, S
 use alexandria_core::auth::{AuthService, Principal};
 use alexandria_core::bookmarks::model::{Bookmark, BookmarkState, NewBookmark};
 use alexandria_core::bookmarks::repos::BookmarkRepository;
+use alexandria_core::catalog::audio_tags::{AudioMetadataReader, AudioTags};
 use alexandria_core::catalog::clock::FixedClock;
 use alexandria_core::catalog::fs::{FileEntry, Filesystem};
 use alexandria_core::catalog::model::{
@@ -1458,5 +1459,42 @@ impl SessionRepository for FakeSessionRepository {
             .unwrap()
             .get(&id)
             .is_some_and(|expires_at| now < *expires_at))
+    }
+}
+
+/// In-memory audio-tag reader (issue #44 pilot). `read()` answers `None`
+/// for any path with no seeded tags, mirroring "no tags found / couldn't
+/// parse" — the same outcome `LoftyAudioMetadataReader` produces for those
+/// cases. Also counts calls, so a test can assert the reader was never
+/// consulted at all (e.g. for a non-audio file) — `metadata_for` staying
+/// `None` alone can't distinguish "never called" from "called, but its
+/// result was rejected/discarded downstream."
+#[derive(Debug, Default, Clone)]
+pub struct FakeAudioMetadataReader {
+    tags: Arc<Mutex<HashMap<String, AudioTags>>>,
+    call_count: Arc<Mutex<usize>>,
+}
+
+impl FakeAudioMetadataReader {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Seed the tags `read()` returns for `path`.
+    pub fn seed(&self, path: &str, tags: AudioTags) -> &Self {
+        self.tags.lock().unwrap().insert(path.to_string(), tags);
+        self
+    }
+
+    /// How many times `read()` has been called.
+    pub fn call_count(&self) -> usize {
+        *self.call_count.lock().unwrap()
+    }
+}
+
+impl AudioMetadataReader for FakeAudioMetadataReader {
+    async fn read(&self, path: &str) -> Option<AudioTags> {
+        *self.call_count.lock().unwrap() += 1;
+        self.tags.lock().unwrap().get(path).cloned()
     }
 }

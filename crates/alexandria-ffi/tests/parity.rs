@@ -417,6 +417,36 @@ fn wait_for_http_files(
     })
 }
 
+/// Indexing is two steps: `insert_file` commits the `files` row in its own
+/// transaction first, and only then does `index_entry` call the audio-tag
+/// reader and persist the extracted metadata via a separate `update_metadata`
+/// call. Waiting only on the `files` row (as `wait_for_http_files` does) can
+/// therefore race ahead of extraction — poll the `audio_files` row itself so
+/// callers only proceed once the title has actually landed.
+async fn wait_for_http_audio_title(pool: &sqlx::sqlite::SqlitePool, expected_title: &str) {
+    let dl = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let row: Option<(Option<String>,)> = sqlx::query_as(
+            "SELECT audio_files.title FROM audio_files \
+             JOIN files ON files.id = audio_files.file_id \
+             WHERE files.name = ?",
+        )
+        .bind("song.wav")
+        .fetch_optional(pool)
+        .await
+        .unwrap();
+        if let Some((Some(title),)) = &row {
+            if title == expected_title {
+                return;
+            }
+        }
+        if std::time::Instant::now() > dl {
+            panic!("http never wrote extracted audio title");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+}
+
 async fn wait_for_http_missing(pool: &sqlx::sqlite::SqlitePool, expected: i64) {
     let dl = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
@@ -8662,4 +8692,224 @@ async fn given_same_local_credentials_when_set_and_logged_in_via_http_and_ffi_th
             "sessionId is a uuid: {session_id}"
         );
     }
+}
+
+/// Write a minimal valid single-channel 8-bit PCM WAV file (see
+/// `alexandria-core`'s `catalog::audio_tags` unit tests for the same
+/// helper) — just enough of a real RIFF/WAVE container for `lofty` to
+/// recognize the format and accept a written tag.
+fn write_minimal_wav(path: &std::path::Path) {
+    let sample_data: [u8; 8] = [0x80; 8];
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"RIFF");
+    bytes.extend_from_slice(&(36u32 + sample_data.len() as u32).to_le_bytes());
+    bytes.extend_from_slice(b"WAVE");
+    bytes.extend_from_slice(b"fmt ");
+    bytes.extend_from_slice(&16u32.to_le_bytes());
+    bytes.extend_from_slice(&1u16.to_le_bytes());
+    bytes.extend_from_slice(&1u16.to_le_bytes());
+    bytes.extend_from_slice(&8000u32.to_le_bytes());
+    bytes.extend_from_slice(&8000u32.to_le_bytes());
+    bytes.extend_from_slice(&1u16.to_le_bytes());
+    bytes.extend_from_slice(&8u16.to_le_bytes());
+    bytes.extend_from_slice(b"data");
+    bytes.extend_from_slice(&(sample_data.len() as u32).to_le_bytes());
+    bytes.extend_from_slice(&sample_data);
+    std::fs::write(path, bytes).expect("write wav");
+}
+
+fn write_test_tags(path: &std::path::Path) {
+    use lofty::config::WriteOptions;
+    use lofty::tag::{Accessor, Tag, TagExt, TagType};
+
+    let mut tag = Tag::new(TagType::Id3v2);
+    tag.set_title("Parity Title".to_string());
+    tag.set_artist("Parity Artist".to_string());
+    tag.set_album("Parity Album".to_string());
+    tag.set_genre("Parity Genre".to_string());
+    tag.set_year(2015);
+    tag.set_track(2);
+    tag.save_to_path(path, WriteOptions::default())
+        .expect("save tag");
+}
+
+/// Issue #44 pilot parity — index a tagged audio file through both
+/// transports and assert the extracted subtype metadata (written by the
+/// indexer itself, not by a manual PATCH) is byte-for-byte identical.
+#[tokio::test]
+async fn given_tagged_audio_file_when_indexed_via_http_and_ffi_then_extracted_metadata_matches() {
+    let _g = SERIAL.lock().unwrap();
+
+    // ---- HTTP leg ----
+    let http_lib = tempdir().unwrap();
+    let http_track = http_lib.path().join("song.wav");
+    write_minimal_wav(&http_track);
+    write_test_tags(&http_track);
+
+    let http_dir = tempdir().unwrap();
+    let http_db = db_path(&http_dir, "http.sqlite");
+    let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    seed_session(&http_pool, TEST_TOKEN).await;
+    let http_services =
+        std::sync::Arc::new(build_services(&local_settings(), http_pool.clone()).await);
+
+    let index_req = Request::builder()
+        .method("POST")
+        .uri("/v1/index")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({ "root": http_lib.path().to_str().unwrap() }).to_string(),
+        ))
+        .unwrap();
+    let _ = app(Settings::default(), http_services.clone())
+        .oneshot(index_req)
+        .await
+        .expect("http index");
+    wait_for_http_files(&http_pool, 1).await;
+    // Wait on the extracted metadata itself, not just the file row —
+    // `insert_file` commits the `files` row before `index_entry` reads the
+    // audio tags and writes `audio_files` in a separate transaction.
+    wait_for_http_audio_title(&http_pool, "Parity Title").await;
+
+    let (http_uuid,): (String,) = sqlx::query_as("SELECT uuid FROM files WHERE name = ?")
+        .bind("song.wav")
+        .fetch_one(&http_pool)
+        .await
+        .unwrap();
+
+    let get_req = Request::builder()
+        .method("GET")
+        .uri(format!("/v1/files/{http_uuid}"))
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
+        .body(Body::empty())
+        .unwrap();
+    let get_resp = app(Settings::default(), http_services)
+        .oneshot(get_req)
+        .await
+        .expect("http get");
+    assert_eq!(get_resp.status(), axum::http::StatusCode::OK);
+    let http_body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(get_resp.into_body(), usize::MAX).await.unwrap()).unwrap();
+
+    // ---- FFI leg ----
+    let ffi_dir = tempdir().unwrap();
+    let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
+    let ffi_lib = tempdir().unwrap();
+    let ffi_track = ffi_lib.path().join("song.wav");
+    write_minimal_wav(&ffi_track);
+    write_test_tags(&ffi_track);
+    let ffi_lib_path = ffi_lib.path().to_str().unwrap().to_string();
+
+    let ffi_db_for_uuid_lookup = ffi_db.clone();
+    let ffi_body: String = tokio::task::spawn_blocking(move || -> String {
+        let cdb = CString::new(ffi_db).unwrap();
+        assert_eq!(
+            alexandria_index_init(cdb.as_ptr()),
+            alexandria_ffi::INDEX_OK
+        );
+
+        let root = CString::new(ffi_lib_path).unwrap();
+        let token = CString::new(TEST_TOKEN).unwrap();
+        let started = alexandria_index_start(root.as_ptr(), token.as_ptr());
+        assert_eq!(started.status, alexandria_ffi::INDEX_OK);
+
+        let dl = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if alexandria_index_count_files() >= 1 {
+                break;
+            }
+            if std::time::Instant::now() > dl {
+                panic!("ffi never persisted 1 file");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+
+        // `alexandria_index_files_json` deliberately doesn't expose `uuid`
+        // (only path/name/type/hash/missingAt), so look the uuid up
+        // directly the same way the HTTP leg does — via a fresh connection
+        // on its own current-thread runtime, mirroring the established
+        // pattern used elsewhere in this file for querying the FFI db from
+        // inside a `spawn_blocking` closure.
+        //
+        // The `files` row above is committed by `insert_file` before
+        // `index_entry` extracts audio tags and writes `audio_files` in a
+        // separate transaction, so also poll the `audio_files` row itself —
+        // otherwise this leg can race ahead of extraction just like the
+        // HTTP leg can.
+        let ffi_uuid = std::thread::spawn(move || -> String {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                let url = format!("sqlite://{ffi_db_for_uuid_lookup}");
+                let pool = sqlx::sqlite::SqlitePoolOptions::new()
+                    .max_connections(1)
+                    .connect(&format!("{url}?mode=rw"))
+                    .await
+                    .unwrap();
+
+                let dl = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                loop {
+                    let row: Option<(Option<String>,)> = sqlx::query_as(
+                        "SELECT audio_files.title FROM audio_files \
+                         JOIN files ON files.id = audio_files.file_id \
+                         WHERE files.name = ?",
+                    )
+                    .bind("song.wav")
+                    .fetch_optional(&pool)
+                    .await
+                    .unwrap();
+                    if let Some((Some(title),)) = &row {
+                        if title == "Parity Title" {
+                            break;
+                        }
+                    }
+                    if std::time::Instant::now() > dl {
+                        panic!("ffi never wrote extracted audio title");
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                }
+
+                let (uuid,): (String,) = sqlx::query_as("SELECT uuid FROM files WHERE name = ?")
+                    .bind("song.wav")
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+                uuid
+            })
+        })
+        .join()
+        .unwrap();
+
+        let uuid_c = CString::new(ffi_uuid).unwrap();
+        let result = alexandria_file_get_by_uuid(uuid_c.as_ptr(), token.as_ptr());
+        assert_eq!(result.status, alexandria_ffi::FILE_OK);
+        assert!(!result.json.is_null());
+        let json = unsafe { CStr::from_ptr(result.json) }
+            .to_str()
+            .unwrap()
+            .to_string();
+        unsafe {
+            alexandria_free_string(result.json);
+        }
+        json
+    })
+    .await
+    .unwrap();
+
+    let ffi_body: serde_json::Value = serde_json::from_str(&ffi_body).unwrap();
+
+    // ---- compare ----
+    assert_eq!(
+        http_body["metadata"], ffi_body["metadata"],
+        "extracted audio metadata must match across surfaces"
+    );
+    assert_eq!(http_body["metadata"]["title"], "Parity Title");
+    assert_eq!(http_body["metadata"]["artist"], "Parity Artist");
+    assert_eq!(http_body["metadata"]["album"], "Parity Album");
+    assert_eq!(http_body["metadata"]["genre"], "Parity Genre");
+    assert_eq!(http_body["metadata"]["year"], 2015);
+    assert_eq!(http_body["metadata"]["track"], 2);
 }

@@ -427,10 +427,14 @@ block:
 /// In-memory audio-tag reader (issue #44 pilot). `read()` answers `None`
 /// for any path with no seeded tags, mirroring "no tags found / couldn't
 /// parse" — the same outcome `LoftyAudioMetadataReader` produces for those
-/// cases.
+/// cases. Also counts calls, so a test can assert the reader was never
+/// consulted at all (e.g. for a non-audio file) — `metadata_for` staying
+/// `None` alone can't distinguish "never called" from "called, but its
+/// result was rejected/discarded downstream."
 #[derive(Debug, Default, Clone)]
 pub struct FakeAudioMetadataReader {
     tags: Arc<Mutex<HashMap<String, AudioTags>>>,
+    call_count: Arc<Mutex<usize>>,
 }
 
 impl FakeAudioMetadataReader {
@@ -443,10 +447,16 @@ impl FakeAudioMetadataReader {
         self.tags.lock().unwrap().insert(path.to_string(), tags);
         self
     }
+
+    /// How many times `read()` has been called.
+    pub fn call_count(&self) -> usize {
+        *self.call_count.lock().unwrap()
+    }
 }
 
 impl AudioMetadataReader for FakeAudioMetadataReader {
     async fn read(&self, path: &str) -> Option<AudioTags> {
+        *self.call_count.lock().unwrap() += 1;
         self.tags.lock().unwrap().get(path).cloned()
     }
 }
@@ -734,13 +744,9 @@ async fn given_non_audio_file_when_execute_then_reader_never_consulted() {
         .with_file(ROOT, "/library/notes.md", "notes.md", "h-a")
         .build();
     let repo = FakeCatalogRepository::new();
-    let audio_tags = FakeAudioMetadataReader::new();
-    // Seed a path that does not exist in this library — if the handler
-    // mistakenly consulted the reader for a text file, this would only
-    // matter if it also queried the wrong path, so the strongest check is
-    // the outcome below: no metadata for the text file's uuid, and the
-    // fake never needed a seed to prove Text files are skipped entirely.
     let repo_handle = repo.clone();
+    let audio_tags = FakeAudioMetadataReader::new();
+    let audio_tags_handle = audio_tags.clone();
     let handler = handler(FakeAuth::Allowing, repo, fs, fixed_clock(now()), audio_tags);
 
     let outcome = handler
@@ -753,6 +759,11 @@ async fn given_non_audio_file_when_execute_then_reader_never_consulted() {
         .file_for("/library/notes.md")
         .expect("indexed");
     assert_eq!(notes.file_type, FileType::Text);
+    assert_eq!(
+        audio_tags_handle.call_count(),
+        0,
+        "the reader must not be consulted at all for a non-audio file"
+    );
     assert!(
         repo_handle.metadata_for(notes.uuid).is_none(),
         "Text has no SubtypeMetadata variant; extraction must not run for it"
