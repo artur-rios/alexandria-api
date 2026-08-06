@@ -23,6 +23,7 @@ use alexandria_core::bookmarks::repos::BookmarkRepository;
 use alexandria_core::catalog::audio_tags::{AudioMetadataReader, AudioTags};
 use alexandria_core::catalog::clock::FixedClock;
 use alexandria_core::catalog::fs::{FileEntry, Filesystem};
+use alexandria_core::catalog::image_tags::{ImageMetadataReader, ImageTags};
 use alexandria_core::catalog::model::{
     File, FileState, FileType, NewFile, StateFilter, SubtypeMetadata,
 };
@@ -1494,6 +1495,41 @@ impl FakeAudioMetadataReader {
 
 impl AudioMetadataReader for FakeAudioMetadataReader {
     async fn read(&self, path: &str) -> Option<AudioTags> {
+        *self.call_count.lock().unwrap() += 1;
+        self.tags.lock().unwrap().get(path).cloned()
+    }
+}
+
+/// In-memory image-EXIF reader (issue #44 image slice). `read()` answers
+/// `None` for any path with no seeded tags, mirroring "no EXIF found /
+/// couldn't parse" — the same outcome `ExifImageMetadataReader` produces
+/// for those cases. Also counts calls, so a test can assert the reader was
+/// never consulted at all (e.g. for a non-image file).
+#[derive(Debug, Default, Clone)]
+pub struct FakeImageMetadataReader {
+    tags: Arc<Mutex<HashMap<String, ImageTags>>>,
+    call_count: Arc<Mutex<usize>>,
+}
+
+impl FakeImageMetadataReader {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Seed the tags `read()` returns for `path`.
+    pub fn seed(&self, path: &str, tags: ImageTags) -> &Self {
+        self.tags.lock().unwrap().insert(path.to_string(), tags);
+        self
+    }
+
+    /// How many times `read()` has been called.
+    pub fn call_count(&self) -> usize {
+        *self.call_count.lock().unwrap()
+    }
+}
+
+impl ImageMetadataReader for FakeImageMetadataReader {
+    async fn read(&self, path: &str) -> Option<ImageTags> {
         *self.call_count.lock().unwrap() += 1;
         self.tags.lock().unwrap().get(path).cloned()
     }
