@@ -50,9 +50,50 @@ pub trait AudioMetadataReader: Send + Sync {
     async fn read(&self, path: &str) -> Option<AudioTags>;
 }
 
+/// Real audio-tag reader backed by `lofty`, covering ID3v1/v2 (MP3, WAV),
+/// Vorbis comments (FLAC, OGG/OGA, Opus), and MP4 atoms (M4A, AAC-in-MP4) —
+/// every extension `classify_by_extension` maps to `FileType::Audio`.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct LoftyAudioMetadataReader;
+
+impl AudioMetadataReader for LoftyAudioMetadataReader {
+    async fn read(&self, path: &str) -> Option<AudioTags> {
+        use lofty::file::TaggedFileExt;
+        use lofty::probe::Probe;
+        use lofty::tag::Accessor;
+
+        let tagged_file = match Probe::open(path).and_then(|probe| probe.read()) {
+            Ok(f) => f,
+            Err(err) => {
+                tracing::debug!(path, error = %err, "could not parse audio tags");
+                return None;
+            }
+        };
+
+        let tag = tagged_file
+            .primary_tag()
+            .or_else(|| tagged_file.first_tag())?;
+
+        let tags = AudioTags {
+            title: tag.title().map(|s| s.to_string()),
+            artist: tag.artist().map(|s| s.to_string()),
+            album: tag.album().map(|s| s.to_string()),
+            year: tag.year().map(i64::from),
+            genre: tag.genre().map(|s| s.to_string()),
+            track: tag.track().map(i64::from),
+        };
+
+        tags.clone()
+            .into_subtype_metadata()
+            .is_some()
+            .then_some(tags)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     #[test]
     fn given_all_fields_none_when_into_subtype_metadata_then_none() {
@@ -84,5 +125,89 @@ mod tests {
                 track: Some(3),
             }
         );
+    }
+
+    /// Write a minimal valid single-channel 8-bit PCM WAV file — just
+    /// enough of a real RIFF/WAVE container for `lofty` to recognize the
+    /// format and accept a written tag. No real audio content is needed;
+    /// the eight sample bytes are arbitrary.
+    fn write_minimal_wav(path: &std::path::Path) {
+        let sample_data: [u8; 8] = [0x80; 8];
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"RIFF");
+        bytes.extend_from_slice(&(36u32 + sample_data.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(b"WAVE");
+        bytes.extend_from_slice(b"fmt ");
+        bytes.extend_from_slice(&16u32.to_le_bytes()); // fmt chunk size
+        bytes.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        bytes.extend_from_slice(&1u16.to_le_bytes()); // mono
+        bytes.extend_from_slice(&8000u32.to_le_bytes()); // sample rate
+        bytes.extend_from_slice(&8000u32.to_le_bytes()); // byte rate
+        bytes.extend_from_slice(&1u16.to_le_bytes()); // block align
+        bytes.extend_from_slice(&8u16.to_le_bytes()); // bits per sample
+        bytes.extend_from_slice(b"data");
+        bytes.extend_from_slice(&(sample_data.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&sample_data);
+
+        let mut file = std::fs::File::create(path).expect("create wav");
+        file.write_all(&bytes).expect("write wav");
+    }
+
+    /// Write an ID3v2 tag with all six fields onto an existing WAV file.
+    fn write_test_tags(path: &std::path::Path) {
+        use lofty::config::WriteOptions;
+        use lofty::tag::{Accessor, Tag, TagExt, TagType};
+
+        let mut tag = Tag::new(TagType::Id3v2);
+        tag.set_title("Test Title".to_string());
+        tag.set_artist("Test Artist".to_string());
+        tag.set_album("Test Album".to_string());
+        tag.set_genre("Test Genre".to_string());
+        tag.set_year(2020);
+        tag.set_track(7);
+        tag.save_to_path(path, WriteOptions::default())
+            .expect("save tag");
+    }
+
+    #[tokio::test]
+    async fn given_tagged_wav_when_read_then_all_fields_extracted() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("tagged.wav");
+        write_minimal_wav(&path);
+        write_test_tags(&path);
+
+        let reader = LoftyAudioMetadataReader;
+        let tags = reader
+            .read(path.to_str().unwrap())
+            .await
+            .expect("tags extracted");
+
+        assert_eq!(tags.title.as_deref(), Some("Test Title"));
+        assert_eq!(tags.artist.as_deref(), Some("Test Artist"));
+        assert_eq!(tags.album.as_deref(), Some("Test Album"));
+        assert_eq!(tags.genre.as_deref(), Some("Test Genre"));
+        assert_eq!(tags.year, Some(2020));
+        assert_eq!(tags.track, Some(7));
+    }
+
+    #[tokio::test]
+    async fn given_untagged_wav_when_read_then_none() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("untagged.wav");
+        write_minimal_wav(&path);
+
+        let reader = LoftyAudioMetadataReader;
+        let tags = reader.read(path.to_str().unwrap()).await;
+
+        assert!(tags.is_none(), "no tag written, no tag read");
+    }
+
+    #[tokio::test]
+    async fn given_missing_file_when_read_then_none_not_panic() {
+        let reader = LoftyAudioMetadataReader;
+
+        let tags = reader.read("/no/such/file.wav").await;
+
+        assert!(tags.is_none());
     }
 }
