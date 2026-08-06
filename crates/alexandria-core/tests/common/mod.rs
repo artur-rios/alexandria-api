@@ -29,6 +29,7 @@ use alexandria_core::catalog::model::{
     File, FileState, FileType, NewFile, StateFilter, SubtypeMetadata,
 };
 use alexandria_core::catalog::repos::CatalogRepository;
+use alexandria_core::catalog::video_tags::{VideoMetadataReader, VideoTags};
 use alexandria_core::collections::model::{Collection, NewCollection};
 use alexandria_core::collections::repos::CollectionRepository;
 use alexandria_core::config::AuthMode;
@@ -1663,6 +1664,42 @@ impl FakeDocumentMetadataReader {
 
 impl DocumentMetadataReader for FakeDocumentMetadataReader {
     async fn read(&self, path: &str) -> Option<DocumentTags> {
+        *self.call_count.lock().unwrap() += 1;
+        self.tags.lock().unwrap().get(path).cloned()
+    }
+}
+
+/// In-memory video reader (issue #44 video slice). `read()` answers
+/// `None` for any path with no seeded tags, mirroring "couldn't open
+/// container / no video stream / no metadata" — the same outcome
+/// `FfmpegVideoMetadataReader` produces for those cases. Also counts
+/// calls, so a test can assert the reader was never consulted at all
+/// (e.g. for a non-video file).
+#[derive(Debug, Default, Clone)]
+pub struct FakeVideoMetadataReader {
+    tags: Arc<Mutex<HashMap<String, VideoTags>>>,
+    call_count: Arc<Mutex<usize>>,
+}
+
+impl FakeVideoMetadataReader {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Seed the tags `read()` returns for `path`.
+    pub fn seed(&self, path: &str, tags: VideoTags) -> &Self {
+        self.tags.lock().unwrap().insert(path.to_string(), tags);
+        self
+    }
+
+    /// How many times `read()` has been called.
+    pub fn call_count(&self) -> usize {
+        *self.call_count.lock().unwrap()
+    }
+}
+
+impl VideoMetadataReader for FakeVideoMetadataReader {
+    async fn read(&self, path: &str) -> Option<VideoTags> {
         *self.call_count.lock().unwrap() += 1;
         self.tags.lock().unwrap().get(path).cloned()
     }
