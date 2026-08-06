@@ -23,6 +23,7 @@ axum = "0.8"
 cbindgen = "0.29"
 chrono = { version = "0.4", features = ["serde"] }
 jsonwebtoken = "9"
+kamadak-exif = "0.5"
 lofty = "0.22"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
@@ -40,6 +41,8 @@ uuid = { version = "1", features = ["v4", "serde"] }
 walkdir = "2"
 
 # dev-only
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
+little_exif = "0.6"
 tempfile = "3"
 
 [profile.release]
