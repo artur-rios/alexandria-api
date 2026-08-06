@@ -22,9 +22,11 @@ argon2 = { version = "0.5", features = ["std"] }
 axum = "0.8"
 cbindgen = "0.29"
 chrono = { version = "0.4", features = ["serde"] }
+epub = "2"
 jsonwebtoken = "9"
 kamadak-exif = "0.5"
 lofty = "0.22"
+lopdf = "0.34"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -44,6 +46,7 @@ walkdir = "2"
 image = { version = "0.25", default-features = false, features = ["jpeg"] }
 little_exif = "0.6"
 tempfile = "3"
+zip = "2"
 
 [profile.release]
 lto = true

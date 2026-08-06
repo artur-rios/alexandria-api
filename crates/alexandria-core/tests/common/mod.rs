@@ -22,6 +22,7 @@ use alexandria_core::bookmarks::model::{Bookmark, BookmarkState, NewBookmark};
 use alexandria_core::bookmarks::repos::BookmarkRepository;
 use alexandria_core::catalog::audio_tags::{AudioMetadataReader, AudioTags};
 use alexandria_core::catalog::clock::FixedClock;
+use alexandria_core::catalog::document_tags::{DocumentMetadataReader, DocumentTags};
 use alexandria_core::catalog::fs::{FileEntry, Filesystem};
 use alexandria_core::catalog::image_tags::{ImageMetadataReader, ImageTags};
 use alexandria_core::catalog::model::{
@@ -99,6 +100,9 @@ pub struct FakeCatalogRepository {
     /// File uuid -> (width, height), as written by `set_image_dimensions`
     /// (issue #44 image slice).
     dimensions: Arc<Mutex<HashMap<Uuid, (i64, i64)>>>,
+    /// Page count last written for `uuid` via `set_document_page_count`
+    /// (issue #44 document slice).
+    document_page_counts: Arc<Mutex<HashMap<Uuid, i64>>>,
 }
 
 impl FakeCatalogRepository {
@@ -194,6 +198,16 @@ impl FakeCatalogRepository {
     /// means no call has landed for that file yet.
     pub fn dimensions_for(&self, uuid: Uuid) -> Option<(i64, i64)> {
         self.dimensions.lock().unwrap().get(&uuid).copied()
+    }
+
+    /// Page count last written for `uuid` via `set_document_page_count`.
+    /// `None` means no call has landed for that file yet.
+    pub fn document_page_count_for(&self, uuid: Uuid) -> Option<i64> {
+        self.document_page_counts
+            .lock()
+            .unwrap()
+            .get(&uuid)
+            .copied()
     }
 }
 
@@ -352,6 +366,45 @@ impl CatalogRepository for FakeCatalogRepository {
         }
         drop(files);
         Ok(self.dimensions.lock().unwrap().get(&uuid).copied())
+    }
+
+    async fn set_document_page_count(
+        &self,
+        uuid: Uuid,
+        page_count: i64,
+    ) -> Result<(), DomainError> {
+        let files = self.files.lock().unwrap();
+        let file = files
+            .values()
+            .find(|f| f.uuid == uuid)
+            .ok_or(DomainError::NotFound)?;
+        if file.file_type != alexandria_core::catalog::model::FileType::Document {
+            return Err(DomainError::InvalidInput("file is not a document".into()));
+        }
+        drop(files);
+        self.document_page_counts
+            .lock()
+            .unwrap()
+            .insert(uuid, page_count);
+        Ok(())
+    }
+
+    async fn find_document_page_count(&self, uuid: Uuid) -> Result<Option<i64>, DomainError> {
+        let files = self.files.lock().unwrap();
+        let file = match files.values().find(|f| f.uuid == uuid) {
+            Some(f) => f,
+            None => return Ok(None),
+        };
+        if file.file_type != alexandria_core::catalog::model::FileType::Document {
+            return Ok(None);
+        }
+        drop(files);
+        Ok(self
+            .document_page_counts
+            .lock()
+            .unwrap()
+            .get(&uuid)
+            .copied())
     }
 
     async fn rename_file(
@@ -1574,6 +1627,42 @@ impl FakeImageMetadataReader {
 
 impl ImageMetadataReader for FakeImageMetadataReader {
     async fn read(&self, path: &str) -> Option<ImageTags> {
+        *self.call_count.lock().unwrap() += 1;
+        self.tags.lock().unwrap().get(path).cloned()
+    }
+}
+
+/// In-memory document reader (issue #44 document slice). `read()` answers
+/// `None` for any path with no seeded tags, mirroring "unsupported
+/// extension / no metadata / couldn't parse" — the same outcome
+/// `PdfEpubMetadataReader` produces for those cases. Also counts calls, so
+/// a test can assert the reader was never consulted at all (e.g. for a
+/// non-document file).
+#[derive(Debug, Default, Clone)]
+pub struct FakeDocumentMetadataReader {
+    tags: Arc<Mutex<HashMap<String, DocumentTags>>>,
+    call_count: Arc<Mutex<usize>>,
+}
+
+impl FakeDocumentMetadataReader {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Seed the tags `read()` returns for `path`.
+    pub fn seed(&self, path: &str, tags: DocumentTags) -> &Self {
+        self.tags.lock().unwrap().insert(path.to_string(), tags);
+        self
+    }
+
+    /// How many times `read()` has been called.
+    pub fn call_count(&self) -> usize {
+        *self.call_count.lock().unwrap()
+    }
+}
+
+impl DocumentMetadataReader for FakeDocumentMetadataReader {
+    async fn read(&self, path: &str) -> Option<DocumentTags> {
         *self.call_count.lock().unwrap() += 1;
         self.tags.lock().unwrap().get(path).cloned()
     }

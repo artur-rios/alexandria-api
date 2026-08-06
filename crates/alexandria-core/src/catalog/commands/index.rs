@@ -6,6 +6,7 @@ use crate::auth::AuthService;
 use crate::catalog::audio_tags::AudioMetadataReader;
 use crate::catalog::classify::classify_by_extension;
 use crate::catalog::clock::Clock;
+use crate::catalog::document_tags::DocumentMetadataReader;
 use crate::catalog::fs::{FileEntry, Filesystem};
 use crate::catalog::image_tags::ImageMetadataReader;
 use crate::catalog::model::{FileType, NewFile};
@@ -48,16 +49,17 @@ pub struct IndexOutcome {
 /// against trait fakes (no real DB, filesystem, or auth service in unit
 /// tests), then wired with the concrete Sqlite/StdFilesystem/Bearer/services
 /// at runtime.
-pub struct IndexHandler<A, R, F, C, M, N> {
+pub struct IndexHandler<A, R, F, C, M, N, O> {
     auth: A,
     repo: R,
     fs: F,
     clock: C,
     audio_tags: M,
     image_tags: N,
+    document_tags: O,
 }
 
-impl<A, R, F, C, M, N> IndexHandler<A, R, F, C, M, N>
+impl<A, R, F, C, M, N, O> IndexHandler<A, R, F, C, M, N, O>
 where
     A: AuthService,
     R: CatalogRepository,
@@ -65,8 +67,17 @@ where
     C: Clock,
     M: AudioMetadataReader,
     N: ImageMetadataReader,
+    O: DocumentMetadataReader,
 {
-    pub fn new(auth: A, repo: R, fs: F, clock: C, audio_tags: M, image_tags: N) -> Self {
+    pub fn new(
+        auth: A,
+        repo: R,
+        fs: F,
+        clock: C,
+        audio_tags: M,
+        image_tags: N,
+        document_tags: O,
+    ) -> Self {
         Self {
             auth,
             repo,
@@ -74,6 +85,7 @@ where
             clock,
             audio_tags,
             image_tags,
+            document_tags,
         }
     }
 
@@ -222,6 +234,49 @@ where
                             path = %entry.path,
                             error = %err,
                             "indexed but failed to write extracted image title"
+                        );
+                    }
+                }
+            }
+        }
+
+        // Best-effort document metadata prefill (issue #44 document
+        // slice). Two independent writes: page count (outside
+        // SubtypeMetadata, via set_document_page_count — PDF only, EPUB
+        // never sets it) and title/author/year/format_kind (via the
+        // shared update_metadata). Neither write's failure blocks the
+        // other or fails indexing.
+        if file_type == FileType::Document {
+            if let Some(tags) = self.document_tags.read(&entry.path).await {
+                if let Some(page_count) = tags.page_count {
+                    if let Err(err) = self
+                        .repo
+                        .set_document_page_count(file.uuid, page_count)
+                        .await
+                    {
+                        tracing::warn!(
+                            path = %entry.path,
+                            error = %err,
+                            "indexed but failed to write extracted document page count"
+                        );
+                    }
+                }
+                if tags.title.is_some()
+                    || tags.author.is_some()
+                    || tags.year.is_some()
+                    || tags.format_kind.is_some()
+                {
+                    let metadata = crate::catalog::model::SubtypeMetadata::Document {
+                        title: tags.title,
+                        author: tags.author,
+                        year: tags.year,
+                        format_kind: tags.format_kind,
+                    };
+                    if let Err(err) = self.repo.update_metadata(file.uuid, &metadata).await {
+                        tracing::warn!(
+                            path = %entry.path,
+                            error = %err,
+                            "indexed but failed to write extracted document metadata"
                         );
                     }
                 }

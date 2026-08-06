@@ -29,6 +29,7 @@ chrono.workspace = true
 image.workspace = true
 little_exif.workspace = true
 lofty.workspace = true
+lopdf.workspace = true
 serde_json.workspace = true
 sqlx.workspace = true
 tempfile.workspace = true

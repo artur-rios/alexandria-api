@@ -86,6 +86,21 @@ pub trait CatalogRepository: Send + Sync {
     /// dimensions).
     async fn find_image_dimensions(&self, uuid: Uuid) -> Result<Option<(i64, i64)>, DomainError>;
 
+    /// Write a document file's page count (issue #44 document slice).
+    /// Unlike `update_metadata`, this touches `documents.page_count`
+    /// directly — `SubtypeMetadata::Document` deliberately excludes it
+    /// because it is not owner-editable (UC-04). Returns `NotFound` when
+    /// no file row carries the UUID, `InvalidInput` when the file is not a
+    /// document.
+    async fn set_document_page_count(&self, uuid: Uuid, page_count: i64)
+        -> Result<(), DomainError>;
+
+    /// Read a document file's page count, if set (issue #44 document
+    /// slice). `None` when the file doesn't exist, isn't a document, or
+    /// the column is still `NULL` (extraction never ran, or the file was
+    /// EPUB — EPUB never sets this).
+    async fn find_document_page_count(&self, uuid: Uuid) -> Result<Option<i64>, DomainError>;
+
     /// Rename a file within its current directory (UC-05 / FR-FC-19). Updates
     /// the cataloged `name` and `path` for the file identified by `uuid` to
     /// `new_name` and `new_path`. The caller is responsible for the on-disk
@@ -704,6 +719,65 @@ impl CatalogRepository for SqliteCatalogRepository {
             (Some(w), Some(h)) => Some((w, h)),
             _ => None,
         }))
+    }
+
+    async fn set_document_page_count(
+        &self,
+        uuid: Uuid,
+        page_count: i64,
+    ) -> Result<(), DomainError> {
+        let mut tx = self.pool.begin().await?;
+
+        let (id, type_str): (i64, String) =
+            sqlx::query_as("SELECT id, type FROM files WHERE uuid = ?")
+                .bind(uuid.to_string())
+                .fetch_optional(&mut *tx)
+                .await?
+                .ok_or(DomainError::NotFound)?;
+
+        let actual_type = parse_type_str(&type_str)?;
+        if actual_type != FileType::Document {
+            return Err(DomainError::InvalidInput("file is not a document".into()));
+        }
+
+        let affected = sqlx::query("UPDATE documents SET page_count = ? WHERE file_id = ?")
+            .bind(page_count)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+
+        if affected == 0 {
+            return Err(DomainError::internal(format!(
+                "subtype row missing for file {uuid} (document)"
+            )));
+        }
+
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn find_document_page_count(&self, uuid: Uuid) -> Result<Option<i64>, DomainError> {
+        let row: Option<(i64, String)> =
+            sqlx::query_as("SELECT id, type FROM files WHERE uuid = ?")
+                .bind(uuid.to_string())
+                .fetch_optional(&self.pool)
+                .await?;
+        let (id, type_str) = match row {
+            Some(r) => r,
+            None => return Ok(None),
+        };
+        if parse_type_str(&type_str)? != FileType::Document {
+            return Ok(None);
+        }
+
+        let row: Option<(Option<i64>,)> =
+            sqlx::query_as("SELECT page_count FROM documents WHERE file_id = ?")
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await?;
+
+        Ok(row.and_then(|(pc,)| pc))
     }
 
     async fn rename_file(

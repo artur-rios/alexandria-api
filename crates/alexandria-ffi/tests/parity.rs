@@ -9105,3 +9105,218 @@ async fn given_tagged_image_file_when_indexed_via_http_and_ffi_then_extracted_me
     assert_eq!(http_body["height"], 600);
     assert_eq!(http_body["metadata"]["title"], "Parity Description");
 }
+
+/// Build a minimal valid PDF with `lopdf` — mirrors the identical helper
+/// in `alexandria-core`'s `catalog::document_tags` unit tests.
+fn write_minimal_pdf(path: &std::path::Path, title: &str, author: &str) {
+    use lopdf::{dictionary, Document, Object};
+
+    let mut doc = Document::with_version("1.5");
+    let pages_id = doc.new_object_id();
+
+    let font_id = doc.add_object(dictionary! {
+        "Type" => "Font",
+        "Subtype" => "Type1",
+        "BaseFont" => "Helvetica",
+    });
+    let resources_id = doc.add_object(dictionary! {
+        "Font" => dictionary! { "F1" => font_id },
+    });
+    let content = lopdf::content::Content { operations: vec![] };
+    let content_id = doc.add_object(lopdf::Stream::new(
+        dictionary! {},
+        content.encode().expect("encode content"),
+    ));
+    let page_id = doc.add_object(dictionary! {
+        "Type" => "Page",
+        "Parent" => pages_id,
+        "Contents" => content_id,
+        "Resources" => resources_id,
+        "MediaBox" => vec![0.into(), 0.into(), 200.into(), 200.into()],
+    });
+    doc.objects.insert(
+        pages_id,
+        Object::Dictionary(dictionary! {
+            "Type" => "Pages",
+            "Kids" => vec![page_id.into()],
+            "Count" => 1,
+        }),
+    );
+    let catalog_id = doc.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => pages_id,
+    });
+    doc.trailer.set("Root", catalog_id);
+
+    let info_id = doc.add_object(dictionary! {
+        "Title" => Object::string_literal(title),
+        "Author" => Object::string_literal(author),
+    });
+    doc.trailer.set("Info", info_id);
+
+    doc.save(path).expect("save pdf");
+}
+
+/// Poll until `documents.title`/`documents.author`/`documents.page_count`
+/// are all non-NULL for the named file — proves BOTH extraction writes
+/// landed (metadata write and page-count write are separate
+/// transactions), not just file-row existence or a single write.
+async fn wait_for_http_document_extraction(pool: &sqlx::sqlite::SqlitePool, name: &str) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let row: Option<(Option<String>, Option<String>, Option<i64>)> = sqlx::query_as(
+            "SELECT documents.title, documents.author, documents.page_count FROM documents \
+             JOIN files ON files.id = documents.file_id \
+             WHERE files.name = ?",
+        )
+        .bind(name)
+        .fetch_optional(pool)
+        .await
+        .unwrap();
+        if let Some((Some(_), Some(_), Some(_))) = row {
+            return;
+        }
+        if std::time::Instant::now() > deadline {
+            panic!("http never wrote extracted document metadata");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+}
+
+/// Issue #44 document slice parity — index a tagged PDF through both
+/// transports and assert the extracted title/author/formatKind/page_count
+/// (written by the indexer itself, not by a manual PATCH) are
+/// byte-for-byte identical. PDF is used (not EPUB) because it's the format
+/// that exercises both independent writes (page_count + metadata) at once.
+#[tokio::test]
+async fn given_tagged_pdf_file_when_indexed_via_http_and_ffi_then_extracted_metadata_matches() {
+    let _g = SERIAL.lock().unwrap();
+
+    // ---- HTTP leg ----
+    let http_lib = tempdir().unwrap();
+    let http_doc = http_lib.path().join("book.pdf");
+    write_minimal_pdf(&http_doc, "Parity Title", "Parity Author");
+
+    let http_dir = tempdir().unwrap();
+    let http_db = db_path(&http_dir, "http.sqlite");
+    let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    seed_session(&http_pool, TEST_TOKEN).await;
+    let http_services =
+        std::sync::Arc::new(build_services(&local_settings(), http_pool.clone()).await);
+
+    let index_req = Request::builder()
+        .method("POST")
+        .uri("/v1/index")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({ "root": http_lib.path().to_str().unwrap() }).to_string(),
+        ))
+        .unwrap();
+    let _ = app(Settings::default(), http_services.clone())
+        .oneshot(index_req)
+        .await
+        .expect("http index");
+    wait_for_http_document_extraction(&http_pool, "book.pdf").await;
+
+    let (http_uuid,): (String,) = sqlx::query_as("SELECT uuid FROM files WHERE name = ?")
+        .bind("book.pdf")
+        .fetch_one(&http_pool)
+        .await
+        .unwrap();
+
+    let get_req = Request::builder()
+        .method("GET")
+        .uri(format!("/v1/files/{http_uuid}"))
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
+        .body(Body::empty())
+        .unwrap();
+    let get_resp = app(Settings::default(), http_services)
+        .oneshot(get_req)
+        .await
+        .expect("http get");
+    assert_eq!(get_resp.status(), axum::http::StatusCode::OK);
+    let http_body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(get_resp.into_body(), usize::MAX).await.unwrap()).unwrap();
+
+    // ---- FFI leg ----
+    let ffi_dir = tempdir().unwrap();
+    let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
+    let ffi_lib = tempdir().unwrap();
+    let ffi_doc = ffi_lib.path().join("book.pdf");
+    write_minimal_pdf(&ffi_doc, "Parity Title", "Parity Author");
+    let ffi_lib_path = ffi_lib.path().to_str().unwrap().to_string();
+    let ffi_db_for_poll = ffi_db.clone();
+
+    let ffi_body: String = tokio::task::spawn_blocking(move || -> String {
+        let cdb = CString::new(ffi_db).unwrap();
+        assert_eq!(
+            alexandria_index_init(cdb.as_ptr()),
+            alexandria_ffi::INDEX_OK
+        );
+
+        let root = CString::new(ffi_lib_path).unwrap();
+        let token = CString::new(TEST_TOKEN).unwrap();
+        let started = alexandria_index_start(root.as_ptr(), token.as_ptr());
+        assert_eq!(started.status, alexandria_ffi::INDEX_OK);
+
+        // Poll the FFI leg's own sqlite file directly for all three
+        // extraction writes (title, author, page_count) — not just
+        // file-row existence, and not just the first of the writes the
+        // indexer commits across its separate transactions.
+        type FfiDocumentExtractionRow = (String, Option<String>, Option<String>, Option<i64>);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let ffi_uuid: String = rt.block_on(async {
+            let pool = sqlx::sqlite::SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect(&format!("sqlite://{ffi_db_for_poll}?mode=rw"))
+                .await
+                .unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                let row: Option<FfiDocumentExtractionRow> = sqlx::query_as(
+                    "SELECT files.uuid, documents.title, documents.author, documents.page_count \
+                     FROM documents \
+                     JOIN files ON files.id = documents.file_id \
+                     WHERE files.name = ?",
+                )
+                .bind("book.pdf")
+                .fetch_optional(&pool)
+                .await
+                .unwrap();
+                if let Some((uuid, Some(_), Some(_), Some(_))) = row {
+                    return uuid;
+                }
+                if std::time::Instant::now() > deadline {
+                    panic!("ffi never wrote extracted document metadata");
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        });
+
+        let uuid_c = CString::new(ffi_uuid).unwrap();
+        let result = alexandria_file_get_by_uuid(uuid_c.as_ptr(), token.as_ptr());
+        assert_eq!(result.status, alexandria_ffi::FILE_OK);
+        assert!(!result.json.is_null());
+        let json = unsafe { CStr::from_ptr(result.json) }
+            .to_str()
+            .unwrap()
+            .to_string();
+        unsafe {
+            alexandria_free_string(result.json);
+        }
+        json
+    })
+    .await
+    .unwrap();
+
+    let ffi_body: serde_json::Value = serde_json::from_str(&ffi_body).unwrap();
+
+    // ---- compare ----
+    assert_eq!(http_body["pageCount"], ffi_body["pageCount"]);
+    assert_eq!(http_body["metadata"], ffi_body["metadata"]);
+    assert_eq!(http_body["pageCount"], 1);
+    assert_eq!(http_body["metadata"]["title"], "Parity Title");
+    assert_eq!(http_body["metadata"]["author"], "Parity Author");
+    assert_eq!(http_body["metadata"]["formatKind"], "book");
+}
