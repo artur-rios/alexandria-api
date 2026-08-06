@@ -100,6 +100,9 @@ pub struct FakeCatalogRepository {
     /// File uuid -> (width, height), as written by `set_image_dimensions`
     /// (issue #44 image slice).
     dimensions: Arc<Mutex<HashMap<Uuid, (i64, i64)>>>,
+    /// Page count last written for `uuid` via `set_document_page_count`
+    /// (issue #44 document slice).
+    document_page_counts: Arc<Mutex<HashMap<Uuid, i64>>>,
 }
 
 impl FakeCatalogRepository {
@@ -195,6 +198,16 @@ impl FakeCatalogRepository {
     /// means no call has landed for that file yet.
     pub fn dimensions_for(&self, uuid: Uuid) -> Option<(i64, i64)> {
         self.dimensions.lock().unwrap().get(&uuid).copied()
+    }
+
+    /// Page count last written for `uuid` via `set_document_page_count`.
+    /// `None` means no call has landed for that file yet.
+    pub fn document_page_count_for(&self, uuid: Uuid) -> Option<i64> {
+        self.document_page_counts
+            .lock()
+            .unwrap()
+            .get(&uuid)
+            .copied()
     }
 }
 
@@ -353,6 +366,45 @@ impl CatalogRepository for FakeCatalogRepository {
         }
         drop(files);
         Ok(self.dimensions.lock().unwrap().get(&uuid).copied())
+    }
+
+    async fn set_document_page_count(
+        &self,
+        uuid: Uuid,
+        page_count: i64,
+    ) -> Result<(), DomainError> {
+        let files = self.files.lock().unwrap();
+        let file = files
+            .values()
+            .find(|f| f.uuid == uuid)
+            .ok_or(DomainError::NotFound)?;
+        if file.file_type != alexandria_core::catalog::model::FileType::Document {
+            return Err(DomainError::InvalidInput("file is not a document".into()));
+        }
+        drop(files);
+        self.document_page_counts
+            .lock()
+            .unwrap()
+            .insert(uuid, page_count);
+        Ok(())
+    }
+
+    async fn find_document_page_count(&self, uuid: Uuid) -> Result<Option<i64>, DomainError> {
+        let files = self.files.lock().unwrap();
+        let file = match files.values().find(|f| f.uuid == uuid) {
+            Some(f) => f,
+            None => return Ok(None),
+        };
+        if file.file_type != alexandria_core::catalog::model::FileType::Document {
+            return Ok(None);
+        }
+        drop(files);
+        Ok(self
+            .document_page_counts
+            .lock()
+            .unwrap()
+            .get(&uuid)
+            .copied())
     }
 
     async fn rename_file(
