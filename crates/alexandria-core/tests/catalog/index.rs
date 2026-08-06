@@ -10,17 +10,19 @@ use alexandria_core::catalog::fs::Filesystem;
 use alexandria_core::catalog::image_tags::{ImageMetadataReader, ImageTags};
 use alexandria_core::catalog::model::{FileType, FormatKind, SubtypeMetadata};
 use alexandria_core::catalog::repos::CatalogRepository;
+use alexandria_core::catalog::video_tags::{VideoDuration, VideoMetadataReader, VideoTags};
 use alexandria_core::errors::DomainError;
 
 use crate::common::{
     existing_file, fixed_clock, now, FakeAudioMetadataReader, FakeAuth, FakeCatalogRepository,
-    FakeDocumentMetadataReader, FakeFilesystem, FakeImageMetadataReader,
+    FakeDocumentMetadataReader, FakeFilesystem, FakeImageMetadataReader, FakeVideoMetadataReader,
 };
 
 const ROOT: &str = "/library";
 const TOKEN: &str = "bearer-token";
 
-fn handler<A, R, F, C, M, N, O>(
+#[allow(clippy::too_many_arguments)]
+fn handler<A, R, F, C, M, N, O, P>(
     auth: A,
     repo: R,
     fs: F,
@@ -28,7 +30,8 @@ fn handler<A, R, F, C, M, N, O>(
     audio_tags: M,
     image_tags: N,
     document_tags: O,
-) -> IndexHandler<A, R, F, C, M, N, O>
+    video_tags: P,
+) -> IndexHandler<A, R, F, C, M, N, O, P>
 where
     A: AuthService,
     R: CatalogRepository,
@@ -37,8 +40,18 @@ where
     M: AudioMetadataReader,
     N: ImageMetadataReader,
     O: DocumentMetadataReader,
+    P: VideoMetadataReader,
 {
-    IndexHandler::new(auth, repo, fs, clock, audio_tags, image_tags, document_tags)
+    IndexHandler::new(
+        auth,
+        repo,
+        fs,
+        clock,
+        audio_tags,
+        image_tags,
+        document_tags,
+        video_tags,
+    )
 }
 
 #[test]
@@ -63,6 +76,7 @@ async fn given_valid_root_and_authenticated_when_start_then_returns_run_id() {
         FakeAudioMetadataReader::new(),
         FakeImageMetadataReader::new(),
         FakeDocumentMetadataReader::new(),
+        FakeVideoMetadataReader::new(),
     );
 
     let started = handler
@@ -89,6 +103,7 @@ async fn given_missing_root_when_start_then_invalid_input() {
         FakeAudioMetadataReader::new(),
         FakeImageMetadataReader::new(),
         FakeDocumentMetadataReader::new(),
+        FakeVideoMetadataReader::new(),
     );
 
     let result = handler
@@ -114,6 +129,7 @@ async fn given_unauthenticated_when_start_then_unauthorized() {
         FakeAudioMetadataReader::new(),
         FakeImageMetadataReader::new(),
         FakeDocumentMetadataReader::new(),
+        FakeVideoMetadataReader::new(),
     );
 
     let result = handler
@@ -148,6 +164,7 @@ async fn given_already_cataloged_path_when_execute_then_skipped_no_duplicate() {
         FakeAudioMetadataReader::new(),
         FakeImageMetadataReader::new(),
         FakeDocumentMetadataReader::new(),
+        FakeVideoMetadataReader::new(),
     );
 
     let outcome = handler
@@ -186,6 +203,7 @@ async fn given_supported_files_when_execute_then_indexed_with_hash_and_indexedat
         FakeAudioMetadataReader::new(),
         FakeImageMetadataReader::new(),
         FakeDocumentMetadataReader::new(),
+        FakeVideoMetadataReader::new(),
     );
 
     let outcome = handler
@@ -222,6 +240,7 @@ async fn given_unsupported_extension_when_execute_then_skipped() {
         FakeAudioMetadataReader::new(),
         FakeImageMetadataReader::new(),
         FakeDocumentMetadataReader::new(),
+        FakeVideoMetadataReader::new(),
     );
 
     let outcome = handler
@@ -253,6 +272,7 @@ async fn given_unreadable_file_when_execute_then_run_continues_and_counts_failur
         FakeAudioMetadataReader::new(),
         FakeImageMetadataReader::new(),
         FakeDocumentMetadataReader::new(),
+        FakeVideoMetadataReader::new(),
     );
 
     let outcome = handler
@@ -291,6 +311,7 @@ async fn given_failing_repository_write_when_execute_then_run_continues_and_coun
         FakeAudioMetadataReader::new(),
         FakeImageMetadataReader::new(),
         FakeDocumentMetadataReader::new(),
+        FakeVideoMetadataReader::new(),
     );
 
     let outcome = handler
@@ -353,6 +374,7 @@ async fn given_tagged_audio_file_when_execute_then_subtype_metadata_written() {
         audio_tags,
         FakeImageMetadataReader::new(),
         FakeDocumentMetadataReader::new(),
+        FakeVideoMetadataReader::new(),
     );
 
     let outcome = handler
@@ -395,6 +417,7 @@ async fn given_untagged_audio_file_when_execute_then_subtype_metadata_stays_empt
         FakeAudioMetadataReader::new(),
         FakeImageMetadataReader::new(),
         FakeDocumentMetadataReader::new(),
+        FakeVideoMetadataReader::new(),
     );
 
     let outcome = handler
@@ -427,6 +450,7 @@ async fn given_non_audio_file_when_execute_then_reader_never_consulted() {
         audio_tags,
         FakeImageMetadataReader::new(),
         FakeDocumentMetadataReader::new(),
+        FakeVideoMetadataReader::new(),
     );
 
     let outcome = handler
@@ -472,6 +496,7 @@ async fn given_tagged_image_file_when_execute_then_dimensions_and_title_written(
         FakeAudioMetadataReader::new(),
         image_tags,
         FakeDocumentMetadataReader::new(),
+        FakeVideoMetadataReader::new(),
     );
 
     let outcome = handler
@@ -518,6 +543,7 @@ async fn given_image_with_dimensions_but_no_title_when_execute_then_only_dimensi
         FakeAudioMetadataReader::new(),
         image_tags,
         FakeDocumentMetadataReader::new(),
+        FakeVideoMetadataReader::new(),
     );
 
     let outcome = handler
@@ -558,6 +584,7 @@ async fn given_image_with_title_but_no_dimensions_when_execute_then_only_title_w
         FakeAudioMetadataReader::new(),
         image_tags,
         FakeDocumentMetadataReader::new(),
+        FakeVideoMetadataReader::new(),
     );
 
     let outcome = handler
@@ -608,6 +635,7 @@ async fn given_image_with_partial_dimensions_when_execute_then_dimensions_write_
         FakeAudioMetadataReader::new(),
         image_tags,
         FakeDocumentMetadataReader::new(),
+        FakeVideoMetadataReader::new(),
     );
 
     let outcome = handler
@@ -643,6 +671,7 @@ async fn given_untagged_image_file_when_execute_then_neither_write_happens() {
         FakeAudioMetadataReader::new(),
         FakeImageMetadataReader::new(),
         FakeDocumentMetadataReader::new(),
+        FakeVideoMetadataReader::new(),
     );
 
     let outcome = handler
@@ -673,6 +702,7 @@ async fn given_non_image_file_when_execute_then_image_reader_never_consulted() {
         audio_tags,
         image_tags,
         FakeDocumentMetadataReader::new(),
+        FakeVideoMetadataReader::new(),
     );
 
     let outcome = handler
@@ -714,6 +744,7 @@ async fn given_tagged_pdf_when_execute_then_page_count_and_metadata_written() {
         FakeAudioMetadataReader::new(),
         FakeImageMetadataReader::new(),
         document_tags,
+        FakeVideoMetadataReader::new(),
     );
 
     let outcome = handler
@@ -764,6 +795,7 @@ async fn given_tagged_epub_when_execute_then_metadata_written_no_page_count() {
         FakeAudioMetadataReader::new(),
         FakeImageMetadataReader::new(),
         document_tags,
+        FakeVideoMetadataReader::new(),
     );
 
     let outcome = handler
@@ -823,6 +855,7 @@ async fn given_document_with_page_count_but_no_other_fields_when_execute_then_bo
         FakeAudioMetadataReader::new(),
         FakeImageMetadataReader::new(),
         document_tags,
+        FakeVideoMetadataReader::new(),
     );
 
     let outcome = handler
@@ -862,6 +895,7 @@ async fn given_untagged_document_file_when_execute_then_neither_write_happens() 
         FakeAudioMetadataReader::new(),
         FakeImageMetadataReader::new(),
         FakeDocumentMetadataReader::new(),
+        FakeVideoMetadataReader::new(),
     );
 
     let outcome = handler
@@ -893,6 +927,7 @@ async fn given_non_document_file_when_execute_then_document_reader_never_consult
         audio_tags,
         image_tags,
         document_tags,
+        FakeVideoMetadataReader::new(),
     );
 
     let outcome = handler
@@ -905,5 +940,215 @@ async fn given_non_document_file_when_execute_then_document_reader_never_consult
         document_tags_handle.call_count(),
         0,
         "the document reader must not be consulted at all for a non-document file"
+    );
+}
+
+#[tokio::test]
+async fn given_tagged_video_when_execute_then_duration_and_metadata_written() {
+    let fs = FakeFilesystem::builder()
+        .with_file(ROOT, "/library/a.mp4", "a.mp4", "h-a")
+        .build();
+    let repo = FakeCatalogRepository::new();
+    let repo_handle = repo.clone();
+    let video_tags = FakeVideoMetadataReader::new();
+    video_tags.seed(
+        "/library/a.mp4",
+        VideoTags {
+            title: Some("A Movie".to_string()),
+            year: Some(2020),
+            resolution: Some("1920x1080".to_string()),
+            duration_seconds: Some(VideoDuration(125.5)),
+        },
+    );
+    let handler = handler(
+        FakeAuth::Allowing,
+        repo,
+        fs,
+        fixed_clock(now()),
+        FakeAudioMetadataReader::new(),
+        FakeImageMetadataReader::new(),
+        FakeDocumentMetadataReader::new(),
+        video_tags,
+    );
+
+    let outcome = handler
+        .execute(ROOT, Uuid::new_v4())
+        .await
+        .expect("execute");
+
+    assert_eq!(outcome.indexed, 1);
+    let a = repo_handle.file_for("/library/a.mp4").expect("indexed");
+    assert_eq!(repo_handle.video_duration_for(a.uuid), Some(125.5));
+    let metadata = repo_handle
+        .metadata_for(a.uuid)
+        .expect("metadata written from extracted tags");
+    assert_eq!(
+        metadata,
+        SubtypeMetadata::Video {
+            title: Some("A Movie".to_string()),
+            year: Some(2020),
+            resolution: Some("1920x1080".to_string()),
+            media_kind: None,
+        }
+    );
+}
+
+#[tokio::test]
+async fn given_video_with_duration_but_no_other_fields_when_execute_then_only_duration_written() {
+    let fs = FakeFilesystem::builder()
+        .with_file(ROOT, "/library/a.mp4", "a.mp4", "h-a")
+        .build();
+    let repo = FakeCatalogRepository::new();
+    let repo_handle = repo.clone();
+    let video_tags = FakeVideoMetadataReader::new();
+    video_tags.seed(
+        "/library/a.mp4",
+        VideoTags {
+            title: None,
+            year: None,
+            resolution: None,
+            duration_seconds: Some(VideoDuration(60.0)),
+        },
+    );
+    let handler = handler(
+        FakeAuth::Allowing,
+        repo,
+        fs,
+        fixed_clock(now()),
+        FakeAudioMetadataReader::new(),
+        FakeImageMetadataReader::new(),
+        FakeDocumentMetadataReader::new(),
+        video_tags,
+    );
+
+    let outcome = handler
+        .execute(ROOT, Uuid::new_v4())
+        .await
+        .expect("execute");
+
+    assert_eq!(outcome.indexed, 1);
+    let a = repo_handle.file_for("/library/a.mp4").expect("indexed");
+    assert_eq!(repo_handle.video_duration_for(a.uuid), Some(60.0));
+    assert!(
+        repo_handle.metadata_for(a.uuid).is_none(),
+        "no title/year/resolution extracted means update_metadata is never called"
+    );
+}
+
+#[tokio::test]
+async fn given_video_with_resolution_but_no_duration_when_execute_then_only_metadata_written() {
+    let fs = FakeFilesystem::builder()
+        .with_file(ROOT, "/library/a.mp4", "a.mp4", "h-a")
+        .build();
+    let repo = FakeCatalogRepository::new();
+    let repo_handle = repo.clone();
+    let video_tags = FakeVideoMetadataReader::new();
+    video_tags.seed(
+        "/library/a.mp4",
+        VideoTags {
+            title: None,
+            year: None,
+            resolution: Some("1280x720".to_string()),
+            duration_seconds: None,
+        },
+    );
+    let handler = handler(
+        FakeAuth::Allowing,
+        repo,
+        fs,
+        fixed_clock(now()),
+        FakeAudioMetadataReader::new(),
+        FakeImageMetadataReader::new(),
+        FakeDocumentMetadataReader::new(),
+        video_tags,
+    );
+
+    let outcome = handler
+        .execute(ROOT, Uuid::new_v4())
+        .await
+        .expect("execute");
+
+    assert_eq!(outcome.indexed, 1);
+    let a = repo_handle.file_for("/library/a.mp4").expect("indexed");
+    assert_eq!(
+        repo_handle.video_duration_for(a.uuid),
+        None,
+        "no duration extracted means set_video_duration is never called"
+    );
+    let metadata = repo_handle
+        .metadata_for(a.uuid)
+        .expect("resolution written from extracted tags");
+    assert_eq!(
+        metadata,
+        SubtypeMetadata::Video {
+            title: None,
+            year: None,
+            resolution: Some("1280x720".to_string()),
+            media_kind: None,
+        }
+    );
+}
+
+#[tokio::test]
+async fn given_untagged_video_file_when_execute_then_neither_write_happens() {
+    let fs = FakeFilesystem::builder()
+        .with_file(ROOT, "/library/a.mp4", "a.mp4", "h-a")
+        .build();
+    let repo = FakeCatalogRepository::new();
+    let repo_handle = repo.clone();
+    let handler = handler(
+        FakeAuth::Allowing,
+        repo,
+        fs,
+        fixed_clock(now()),
+        FakeAudioMetadataReader::new(),
+        FakeImageMetadataReader::new(),
+        FakeDocumentMetadataReader::new(),
+        FakeVideoMetadataReader::new(),
+    );
+
+    let outcome = handler
+        .execute(ROOT, Uuid::new_v4())
+        .await
+        .expect("execute");
+
+    assert_eq!(outcome.indexed, 1);
+    let a = repo_handle.file_for("/library/a.mp4").expect("indexed");
+    assert_eq!(repo_handle.video_duration_for(a.uuid), None);
+    assert!(repo_handle.metadata_for(a.uuid).is_none());
+}
+
+#[tokio::test]
+async fn given_non_video_file_when_execute_then_video_reader_never_consulted() {
+    let fs = FakeFilesystem::builder()
+        .with_file(ROOT, "/library/notes.md", "notes.md", "h-a")
+        .build();
+    let repo = FakeCatalogRepository::new();
+    let audio_tags = FakeAudioMetadataReader::new();
+    let image_tags = FakeImageMetadataReader::new();
+    let document_tags = FakeDocumentMetadataReader::new();
+    let video_tags = FakeVideoMetadataReader::new();
+    let video_tags_handle = video_tags.clone();
+    let handler = handler(
+        FakeAuth::Allowing,
+        repo,
+        fs,
+        fixed_clock(now()),
+        audio_tags,
+        image_tags,
+        document_tags,
+        video_tags,
+    );
+
+    let outcome = handler
+        .execute(ROOT, Uuid::new_v4())
+        .await
+        .expect("execute");
+
+    assert_eq!(outcome.indexed, 1);
+    assert_eq!(
+        video_tags_handle.call_count(),
+        0,
+        "the video reader must not be consulted at all for a non-video file"
     );
 }
