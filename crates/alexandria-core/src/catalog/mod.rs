@@ -1,3 +1,4 @@
+pub mod audio_tags;
 pub mod classify;
 pub mod clock;
 pub mod commands;
