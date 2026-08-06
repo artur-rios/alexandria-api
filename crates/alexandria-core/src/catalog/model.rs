@@ -260,6 +260,7 @@ impl StateFilter {
 /// Serialized as `{"file": …, "metadata": …}` over both the HTTP and FFI
 /// surfaces so the two stay at parity (FR-FC-24 / NFR-09).
 #[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct FileView {
     pub file: File,
     /// `None` when the subtype has no editable metadata (Text/Html), or when

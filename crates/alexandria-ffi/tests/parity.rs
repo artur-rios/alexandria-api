@@ -9313,9 +9313,9 @@ async fn given_tagged_pdf_file_when_indexed_via_http_and_ffi_then_extracted_meta
     let ffi_body: serde_json::Value = serde_json::from_str(&ffi_body).unwrap();
 
     // ---- compare ----
-    assert_eq!(http_body["page_count"], ffi_body["page_count"]);
+    assert_eq!(http_body["pageCount"], ffi_body["pageCount"]);
     assert_eq!(http_body["metadata"], ffi_body["metadata"]);
-    assert_eq!(http_body["page_count"], 1);
+    assert_eq!(http_body["pageCount"], 1);
     assert_eq!(http_body["metadata"]["title"], "Parity Title");
     assert_eq!(http_body["metadata"]["author"], "Parity Author");
     assert_eq!(http_body["metadata"]["formatKind"], "book");
