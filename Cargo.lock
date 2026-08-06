@@ -49,6 +49,7 @@ dependencies = [
  "axum",
  "cbindgen",
  "chrono",
+ "lofty",
  "serde_json",
  "sqlx",
  "tempfile",
