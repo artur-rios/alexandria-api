@@ -15,6 +15,7 @@ use crate::bookmarks::commands::purge::PurgeBookmarkHandler;
 use crate::bookmarks::commands::update::UpdateBookmarkHandler;
 use crate::bookmarks::queries::browse::BrowseBookmarksHandler;
 use crate::bookmarks::repos::SqliteBookmarkRepository;
+use crate::catalog::audio_tags::LoftyAudioMetadataReader;
 use crate::catalog::clock::SystemClock;
 use crate::catalog::commands::edit_content::EditTextFileContentHandler;
 use crate::catalog::commands::edit_metadata::EditMetadataHandler;
@@ -57,8 +58,13 @@ use crate::watchlists::repos::SqliteWatchlistRepository;
 /// auth stub, the Sqlite catalog repository, the on-disk filesystem, and the
 /// system clock. Both the HTTP and FFI surfaces depend on the same `Services`
 /// instance so the two transports stay at parity (NFR-09).
-pub type DefaultIndexHandler =
-    IndexHandler<RuntimeAuthService, SqliteCatalogRepository, StdFilesystem, SystemClock>;
+pub type DefaultIndexHandler = IndexHandler<
+    RuntimeAuthService,
+    SqliteCatalogRepository,
+    StdFilesystem,
+    SystemClock,
+    LoftyAudioMetadataReader,
+>;
 
 pub type DefaultRefreshHandler =
     RefreshHandler<RuntimeAuthService, SqliteCatalogRepository, StdFilesystem, SystemClock>;
@@ -256,7 +262,14 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
             HttpJwksProvider::new(settings.auth.jwks_url.clone()),
         )),
     };
-    let index_handler = Arc::new(IndexHandler::new(auth.clone(), repo.clone(), fs, clock));
+    let audio_tags = LoftyAudioMetadataReader;
+    let index_handler = Arc::new(IndexHandler::new(
+        auth.clone(),
+        repo.clone(),
+        fs,
+        clock,
+        audio_tags,
+    ));
     let refresh_handler = Arc::new(RefreshHandler::new(auth.clone(), repo.clone(), fs, clock));
     let edit_metadata_handler = Arc::new(EditMetadataHandler::new(auth.clone(), repo.clone()));
     let rename_file_handler = Arc::new(RenameFileHandler::new(auth.clone(), repo.clone(), fs));
