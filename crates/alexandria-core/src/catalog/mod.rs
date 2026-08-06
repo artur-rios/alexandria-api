@@ -2,6 +2,7 @@ pub mod audio_tags;
 pub mod classify;
 pub mod clock;
 pub mod commands;
+pub mod document_tags;
 pub mod fs;
 pub mod image_tags;
 pub mod model;
