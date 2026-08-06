@@ -27,6 +27,7 @@ use crate::catalog::commands::rename::RenameFileHandler;
 use crate::catalog::commands::restore::RestoreFileHandler;
 use crate::catalog::commands::soft_delete::SoftDeleteFileHandler;
 use crate::catalog::fs::StdFilesystem;
+use crate::catalog::image_tags::ExifImageMetadataReader;
 use crate::catalog::queries::browse::BrowseFilesHandler;
 use crate::catalog::queries::read_content::ReadTextFileContentHandler;
 use crate::catalog::repos::SqliteCatalogRepository;
@@ -64,6 +65,7 @@ pub type DefaultIndexHandler = IndexHandler<
     StdFilesystem,
     SystemClock,
     LoftyAudioMetadataReader,
+    ExifImageMetadataReader,
 >;
 
 pub type DefaultRefreshHandler =
@@ -263,12 +265,14 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         )),
     };
     let audio_tags = LoftyAudioMetadataReader;
+    let image_tags = ExifImageMetadataReader;
     let index_handler = Arc::new(IndexHandler::new(
         auth.clone(),
         repo.clone(),
         fs,
         clock,
         audio_tags,
+        image_tags,
     ));
     let refresh_handler = Arc::new(RefreshHandler::new(auth.clone(), repo.clone(), fs, clock));
     let edit_metadata_handler = Arc::new(EditMetadataHandler::new(auth.clone(), repo.clone()));
