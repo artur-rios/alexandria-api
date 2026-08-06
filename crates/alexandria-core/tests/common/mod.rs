@@ -96,6 +96,9 @@ pub struct FakeCatalogRepository {
     failing_purge_uuids: Arc<Mutex<std::collections::HashSet<Uuid>>>,
     /// File uuid -> collection uuid, as written by `set_collection` (UC-13).
     collection_links: Arc<Mutex<HashMap<Uuid, Uuid>>>,
+    /// File uuid -> (width, height), as written by `set_image_dimensions`
+    /// (issue #44 image slice).
+    dimensions: Arc<Mutex<HashMap<Uuid, (i64, i64)>>>,
 }
 
 impl FakeCatalogRepository {
@@ -185,6 +188,12 @@ impl FakeCatalogRepository {
     /// (UC-13). `None` when never linked.
     pub fn collection_for_file(&self, uuid: Uuid) -> Option<Uuid> {
         self.collection_links.lock().unwrap().get(&uuid).copied()
+    }
+
+    /// Dimensions last written for `uuid` via `set_image_dimensions`. `None`
+    /// means no call has landed for that file yet.
+    pub fn dimensions_for(&self, uuid: Uuid) -> Option<(i64, i64)> {
+        self.dimensions.lock().unwrap().get(&uuid).copied()
     }
 }
 
@@ -308,6 +317,32 @@ impl CatalogRepository for FakeCatalogRepository {
         uuid: Uuid,
     ) -> Result<Option<SubtypeMetadata>, DomainError> {
         Ok(self.metadata.lock().unwrap().get(&uuid).cloned())
+    }
+
+    async fn set_image_dimensions(
+        &self,
+        uuid: Uuid,
+        width: i64,
+        height: i64,
+    ) -> Result<(), DomainError> {
+        let files = self.files.lock().unwrap();
+        let file = files
+            .values()
+            .find(|f| f.uuid == uuid)
+            .ok_or(DomainError::NotFound)?;
+        if file.file_type != alexandria_core::catalog::model::FileType::Image {
+            return Err(DomainError::InvalidInput("file is not an image".into()));
+        }
+        drop(files);
+        self.dimensions
+            .lock()
+            .unwrap()
+            .insert(uuid, (width, height));
+        Ok(())
+    }
+
+    async fn find_image_dimensions(&self, uuid: Uuid) -> Result<Option<(i64, i64)>, DomainError> {
+        Ok(self.dimensions.lock().unwrap().get(&uuid).copied())
     }
 
     async fn rename_file(

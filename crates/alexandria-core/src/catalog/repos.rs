@@ -67,6 +67,25 @@ pub trait CatalogRepository: Send + Sync {
         uuid: Uuid,
     ) -> Result<Option<SubtypeMetadata>, DomainError>;
 
+    /// Write an image file's pixel dimensions (issue #44 image slice).
+    /// Unlike `update_metadata`, this touches `images.width`/`images.height`
+    /// directly — columns `SubtypeMetadata::Image` deliberately excludes
+    /// because they are not owner-editable (UC-04). Returns `NotFound` when
+    /// no file row carries the UUID, `InvalidInput` when the file is not an
+    /// image.
+    async fn set_image_dimensions(
+        &self,
+        uuid: Uuid,
+        width: i64,
+        height: i64,
+    ) -> Result<(), DomainError>;
+
+    /// Read an image file's pixel dimensions, if both are set (issue #44
+    /// image slice). `None` when the file doesn't exist, isn't an image, or
+    /// either column is still `NULL` (extraction never ran, or found no
+    /// dimensions).
+    async fn find_image_dimensions(&self, uuid: Uuid) -> Result<Option<(i64, i64)>, DomainError>;
+
     /// Rename a file within its current directory (UC-05 / FR-FC-19). Updates
     /// the cataloged `name` and `path` for the file identified by `uuid` to
     /// `new_name` and `new_path`. The caller is responsible for the on-disk
@@ -621,6 +640,70 @@ impl CatalogRepository for SqliteCatalogRepository {
             FileType::Text | FileType::Html => None,
         };
         Ok(metadata)
+    }
+
+    async fn set_image_dimensions(
+        &self,
+        uuid: Uuid,
+        width: i64,
+        height: i64,
+    ) -> Result<(), DomainError> {
+        let mut tx = self.pool.begin().await?;
+
+        let (id, type_str): (i64, String) =
+            sqlx::query_as("SELECT id, type FROM files WHERE uuid = ?")
+                .bind(uuid.to_string())
+                .fetch_optional(&mut *tx)
+                .await?
+                .ok_or(DomainError::NotFound)?;
+
+        let actual_type = parse_type_str(&type_str)?;
+        if actual_type != FileType::Image {
+            return Err(DomainError::InvalidInput("file is not an image".into()));
+        }
+
+        let affected = sqlx::query("UPDATE images SET width = ?, height = ? WHERE file_id = ?")
+            .bind(width)
+            .bind(height)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+
+        if affected == 0 {
+            return Err(DomainError::internal(format!(
+                "subtype row missing for file {uuid} (image)"
+            )));
+        }
+
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn find_image_dimensions(&self, uuid: Uuid) -> Result<Option<(i64, i64)>, DomainError> {
+        let row: Option<(i64, String)> =
+            sqlx::query_as("SELECT id, type FROM files WHERE uuid = ?")
+                .bind(uuid.to_string())
+                .fetch_optional(&self.pool)
+                .await?;
+        let (id, type_str) = match row {
+            Some(r) => r,
+            None => return Ok(None),
+        };
+        if parse_type_str(&type_str)? != FileType::Image {
+            return Ok(None);
+        }
+
+        let dims: Option<(Option<i64>, Option<i64>)> =
+            sqlx::query_as("SELECT width, height FROM images WHERE file_id = ?")
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await?;
+
+        Ok(dims.and_then(|(w, h)| match (w, h) {
+            (Some(w), Some(h)) => Some((w, h)),
+            _ => None,
+        }))
     }
 
     async fn rename_file(
