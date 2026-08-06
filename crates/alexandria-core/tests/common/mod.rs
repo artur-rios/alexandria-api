@@ -104,6 +104,9 @@ pub struct FakeCatalogRepository {
     /// Page count last written for `uuid` via `set_document_page_count`
     /// (issue #44 document slice).
     document_page_counts: Arc<Mutex<HashMap<Uuid, i64>>>,
+    /// Duration (seconds) last written for `uuid` via `set_video_duration`
+    /// (issue #44 video slice).
+    video_durations: Arc<Mutex<HashMap<Uuid, f64>>>,
 }
 
 impl FakeCatalogRepository {
@@ -209,6 +212,12 @@ impl FakeCatalogRepository {
             .unwrap()
             .get(&uuid)
             .copied()
+    }
+
+    /// Duration (seconds) last written for `uuid` via `set_video_duration`.
+    /// `None` means no call has landed for that file yet.
+    pub fn video_duration_for(&self, uuid: Uuid) -> Option<f64> {
+        self.video_durations.lock().unwrap().get(&uuid).copied()
     }
 }
 
@@ -406,6 +415,40 @@ impl CatalogRepository for FakeCatalogRepository {
             .unwrap()
             .get(&uuid)
             .copied())
+    }
+
+    async fn set_video_duration(
+        &self,
+        uuid: Uuid,
+        duration_seconds: f64,
+    ) -> Result<(), DomainError> {
+        let files = self.files.lock().unwrap();
+        let file = files
+            .values()
+            .find(|f| f.uuid == uuid)
+            .ok_or(DomainError::NotFound)?;
+        if file.file_type != alexandria_core::catalog::model::FileType::Video {
+            return Err(DomainError::InvalidInput("file is not a video".into()));
+        }
+        drop(files);
+        self.video_durations
+            .lock()
+            .unwrap()
+            .insert(uuid, duration_seconds);
+        Ok(())
+    }
+
+    async fn find_video_duration(&self, uuid: Uuid) -> Result<Option<f64>, DomainError> {
+        let files = self.files.lock().unwrap();
+        let file = match files.values().find(|f| f.uuid == uuid) {
+            Some(f) => f,
+            None => return Ok(None),
+        };
+        if file.file_type != alexandria_core::catalog::model::FileType::Video {
+            return Ok(None);
+        }
+        drop(files);
+        Ok(self.video_durations.lock().unwrap().get(&uuid).copied())
     }
 
     async fn rename_file(
