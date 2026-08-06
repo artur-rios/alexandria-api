@@ -269,6 +269,49 @@ async fn given_text_file_when_get_by_uuid_then_metadata_is_none() {
     assert!(view.metadata.is_none(), "Text has no SubtypeMetadata");
 }
 
+#[tokio::test]
+async fn given_image_with_extracted_dimensions_when_get_by_uuid_then_width_and_height_present() {
+    let repo = FakeCatalogRepository::new();
+    let file = existing_file_with_hash("/lib/photo.jpg", "photo", FileType::Image, "h");
+    let uuid = file.uuid;
+    repo.seed(file);
+    repo.set_image_dimensions(uuid, 800, 600).await.unwrap();
+
+    let h = handler(FakeAuth::Allowing, repo);
+    let view = h.get_by_uuid(uuid, TOKEN).await.expect("get");
+
+    assert_eq!(view.width, Some(800));
+    assert_eq!(view.height, Some(600));
+}
+
+#[tokio::test]
+async fn given_image_with_no_extracted_dimensions_when_get_by_uuid_then_width_and_height_none() {
+    let repo = FakeCatalogRepository::new();
+    let file = existing_file_with_hash("/lib/photo.jpg", "photo", FileType::Image, "h");
+    let uuid = file.uuid;
+    repo.seed(file);
+
+    let h = handler(FakeAuth::Allowing, repo);
+    let view = h.get_by_uuid(uuid, TOKEN).await.expect("get");
+
+    assert_eq!(view.width, None);
+    assert_eq!(view.height, None);
+}
+
+#[tokio::test]
+async fn given_non_image_file_when_get_by_uuid_then_width_and_height_none() {
+    let repo = FakeCatalogRepository::new();
+    let file = existing_file_with_hash("/lib/song.mp3", "song", FileType::Audio, "h");
+    let uuid = file.uuid;
+    repo.seed(file);
+
+    let h = handler(FakeAuth::Allowing, repo);
+    let view = h.get_by_uuid(uuid, TOKEN).await.expect("get");
+
+    assert_eq!(view.width, None);
+    assert_eq!(view.height, None);
+}
+
 // AF-01: requested UUID does not exist
 
 #[tokio::test]

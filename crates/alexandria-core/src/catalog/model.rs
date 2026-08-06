@@ -265,6 +265,11 @@ pub struct FileView {
     /// `None` when the subtype has no editable metadata (Text/Html), or when
     /// no metadata has been written to the subtype row yet.
     pub metadata: Option<SubtypeMetadata>,
+    /// Extracted pixel dimensions (issue #44 image slice). `None` for every
+    /// non-image file, and for an image file whose dimensions haven't been
+    /// extracted yet.
+    pub width: Option<i64>,
+    pub height: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
