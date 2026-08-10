@@ -59,8 +59,10 @@ pub trait AudioMetadataReader: Send + Sync {
 #[derive(Debug, Default, Clone, Copy)]
 pub struct LoftyAudioMetadataReader;
 
-impl AudioMetadataReader for LoftyAudioMetadataReader {
-    async fn read(&self, path: &str) -> Option<AudioTags> {
+impl LoftyAudioMetadataReader {
+    /// The synchronous probe. `read` runs it on the blocking pool — see
+    /// [`crate::catalog::read_blocking`].
+    fn parse(path: &str) -> Option<AudioTags> {
         use lofty::file::TaggedFileExt;
         use lofty::probe::Probe;
         use lofty::tag::Accessor;
@@ -102,6 +104,12 @@ impl AudioMetadataReader for LoftyAudioMetadataReader {
             .into_subtype_metadata()
             .is_some()
             .then_some(tags)
+    }
+}
+
+impl AudioMetadataReader for LoftyAudioMetadataReader {
+    async fn read(&self, path: &str) -> Option<AudioTags> {
+        crate::catalog::read_blocking(path, Self::parse).await
     }
 }
 

@@ -33,8 +33,10 @@ pub trait ImageMetadataReader: Send + Sync {
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ExifImageMetadataReader;
 
-impl ImageMetadataReader for ExifImageMetadataReader {
-    async fn read(&self, path: &str) -> Option<ImageTags> {
+impl ExifImageMetadataReader {
+    /// The synchronous EXIF parse. `read` runs it on the blocking pool — see
+    /// [`crate::catalog::read_blocking`].
+    fn parse(path: &str) -> Option<ImageTags> {
         let file = std::fs::File::open(path).ok()?;
         let mut bufreader = std::io::BufReader::new(&file);
         let exif = match exif::Reader::new().read_from_container(&mut bufreader) {
@@ -75,6 +77,12 @@ impl ImageMetadataReader for ExifImageMetadataReader {
             height,
             title,
         })
+    }
+}
+
+impl ImageMetadataReader for ExifImageMetadataReader {
+    async fn read(&self, path: &str) -> Option<ImageTags> {
+        crate::catalog::read_blocking(path, Self::parse).await
     }
 }
 

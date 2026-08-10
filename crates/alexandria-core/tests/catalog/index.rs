@@ -23,6 +23,12 @@ use crate::common::{
 const ROOT: &str = "/library";
 const TOKEN: &str = "bearer-token";
 
+/// The concurrency these unit tests build handlers with. Deliberately > 1:
+/// the outcome tallies must not depend on how many entries are in flight, so
+/// exercising the concurrent path is what keeps that true. Tests that assert
+/// on a *single* entry are unaffected either way.
+const TEST_CONCURRENCY: u32 = 4;
+
 #[allow(clippy::too_many_arguments)]
 fn handler<A, R, F, C, M, N, O, P, Q>(
     auth: A,
@@ -56,6 +62,7 @@ where
         document_tags,
         video_tags,
         comic_tags,
+        TEST_CONCURRENCY,
     )
 }
 
@@ -233,6 +240,90 @@ async fn given_supported_files_when_execute_then_indexed_with_hash_and_indexedat
     assert_eq!(b.indexed_at, now());
     assert_eq!(a.file_type, FileType::Audio);
     assert_eq!(b.file_type, FileType::Text);
+}
+
+// ---------------- Bounded concurrency (FR-FC-08) ----------------
+
+/// The walk processes several files at a time, so the order entries finish in
+/// is unspecified — but the tallies are not. Running the same library at every
+/// concurrency from sequential to wider-than-the-library must produce
+/// identical counts and identical catalog contents.
+#[tokio::test]
+async fn given_any_concurrency_when_execute_then_same_counts_and_same_catalog() {
+    // 1 (sequential), 3 (narrower than the library), 4 (exactly), and 16
+    // (wider than the library — the buffer never fills).
+    for concurrency in [1u32, 3, 4, 16] {
+        let fs = FakeFilesystem::builder()
+            .with_file(ROOT, "/library/a.mp3", "a.mp3", "h-a")
+            .with_file(ROOT, "/library/b.md", "b.md", "h-b")
+            .with_unreadable_file(ROOT, "/library/c.mp3", "c.mp3")
+            .with_file(ROOT, "/library/d.zip", "d.zip", "h-d")
+            .build();
+        let repo = FakeCatalogRepository::new();
+        let repo_handle = repo.clone();
+        let handler = IndexHandler::new(
+            FakeAuth::Allowing,
+            repo,
+            fs,
+            fixed_clock(now()),
+            FakeAudioMetadataReader::new(),
+            FakeImageMetadataReader::new(),
+            FakeDocumentMetadataReader::new(),
+            FakeVideoMetadataReader::new(),
+            FakeComicMetadataReader::new(),
+            concurrency,
+        );
+
+        let outcome = handler
+            .execute(ROOT, Uuid::new_v4())
+            .await
+            .expect("execute");
+
+        assert_eq!(outcome.scanned, 4, "concurrency {concurrency}");
+        assert_eq!(outcome.indexed, 2, "concurrency {concurrency}");
+        assert_eq!(
+            outcome.skipped, 1,
+            "the .zip is unsupported (concurrency {concurrency})"
+        );
+        assert_eq!(
+            outcome.failed, 1,
+            "the unreadable mp3 (concurrency {concurrency})"
+        );
+        assert!(repo_handle.has_path("/library/a.mp3"));
+        assert!(repo_handle.has_path("/library/b.md"));
+        assert!(!repo_handle.has_path("/library/c.mp3"));
+        assert!(!repo_handle.has_path("/library/d.zip"));
+    }
+}
+
+/// Zero is clamped to sequential. A stream buffered zero deep yields nothing
+/// and the run would hang forever, so this asserts the run *completes* — the
+/// counts are incidental; the point is that it returns at all.
+#[tokio::test]
+async fn given_zero_concurrency_when_execute_then_runs_sequentially_rather_than_hanging() {
+    let fs = FakeFilesystem::builder()
+        .with_file(ROOT, "/library/a.mp3", "a.mp3", "h-a")
+        .with_file(ROOT, "/library/b.mp3", "b.mp3", "h-b")
+        .build();
+    let handler = IndexHandler::new(
+        FakeAuth::Allowing,
+        FakeCatalogRepository::new(),
+        fs,
+        fixed_clock(now()),
+        FakeAudioMetadataReader::new(),
+        FakeImageMetadataReader::new(),
+        FakeDocumentMetadataReader::new(),
+        FakeVideoMetadataReader::new(),
+        FakeComicMetadataReader::new(),
+        0,
+    );
+
+    let outcome = handler
+        .execute(ROOT, Uuid::new_v4())
+        .await
+        .expect("execute");
+
+    assert_eq!(outcome.indexed, 2);
 }
 
 #[tokio::test]

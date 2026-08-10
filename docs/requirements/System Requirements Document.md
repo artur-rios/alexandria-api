@@ -83,7 +83,7 @@ graph LR
 | FR-FC-05 | The system shall index PDF and e-book files as Documents. `formatKind` (book/ebook) is owner-supplied via FR-FC-16; indexing does not infer it. |
 | FR-FC-06 | The system shall index comic-book files (CBR/CBZ) as ComicBooks. Series and issue metadata are owner-supplied via FR-FC-17. A `.pdf` indexes as a Document (FR-FC-05): file extension alone cannot distinguish a comic PDF from a book PDF. |
 | FR-FC-07 | The system shall index image files. |
-| FR-FC-08 | The system shall run indexing asynchronously and shall not block read/query operations while indexing is in progress. |
+| FR-FC-08 | The system shall run indexing asynchronously and shall not block read/query operations while indexing is in progress. Filesystem work (directory walks, hashing, metadata parsing) shall run off the async runtime's worker threads, and the index and re-index walks shall process a bounded number of files concurrently (`indexing.concurrency`, default 4) rather than one at a time. |
 | FR-FC-09 | The system shall compute a SHA-256 content hash for each indexed file and store it on the File record. |
 | FR-FC-10 | The system shall, on re-index, detect a content-hash change for an existing path and refresh that File's stored hash and `indexedAt`. |
 | FR-FC-11 | The system shall, on re-index, detect a path that no longer exists on disk and set the File's `missingAt` marker without deleting the record or changing its `state`. |
@@ -100,6 +100,7 @@ graph LR
 | FR-FC-22 | The system shall hard-purge a File record permanently only after its soft-delete retention window has elapsed. |
 | FR-FC-23 | The system shall, on an explicit purge-on-disk operation, remove the File record and delete the underlying file on disk. |
 | FR-FC-24 | The system shall expose every catalog operation via both the HTTP/REST-JSON surface and the FFI surface with identical results. |
+| FR-FC-25 | The system shall, at first index only, prefill a file's subtype metadata from the metadata embedded in the file itself (audio tags, image EXIF, document and comic metadata, video container metadata). Extraction is best-effort: a failure leaves the fields empty and never fails the file's indexing, and re-index (FR-FC-10) never re-runs it, so an owner's edit (FR-FC-14..18) is never overwritten. |
 
 ### 3.2 Collections (CO)
 
@@ -165,11 +166,12 @@ graph LR
 | FR-AU-01 | The system shall read the active authentication mode from startup configuration; exactly one mode (external JWT or local login) shall be active at runtime. |
 | FR-AU-02 | In external mode, the system shall validate each caller's JWT against the external authentication service. |
 | FR-AU-03 | The system shall accept only the active auth mode and shall reject credentials presented via the inactive mode. |
-| FR-AU-04 | In local mode, the system shall verify the caller's email and salted/hashed password against the encrypted credential row in SQLite. |
+| FR-AU-04 | In local mode, the system shall verify the caller's email and password against the salted Argon2 password hash stored in the SQLite credential row. |
 | FR-AU-05 | The system shall provide a local setup operation to set or change local-login credentials (email and password). |
 | FR-AU-06 | The system shall never store plaintext passwords and shall never log credentials. |
 | FR-AU-07 | The system shall authorize the single owner for every catalog operation and shall reject unauthenticated calls. |
 | FR-AU-08 | The system shall expose authentication operations via both the HTTP and FFI surfaces consistently. |
+| FR-AU-09 | In local mode, a successful login shall create a Session with a configurable expiry (default 24 hours); the caller shall present that session's id on every subsequent request, and the system shall reject an unknown or expired session id as unauthenticated. |
 
 ---
 
@@ -306,6 +308,22 @@ Single-row table (the owner).
 | passwordHash | text | required | Argon2 salted hash; never plaintext. |
 | updatedAt | timestamp | required | Last credential change. |
 
+The password is stored only as a salted Argon2 hash, which is one-way — the row
+cannot be reversed back to the plaintext password (FR-AU-06, NFR-05). The row
+itself is not separately encrypted at rest.
+
+### 4.10 Session Fields
+
+Created by a successful local login (UC-34 / FR-AU-09); local mode has no
+bearer token, so the session id is the credential every subsequent request
+presents. External mode creates no sessions — each request carries its own JWT.
+
+| Field | Type | Constraints | Description |
+| --- | --- | --- | --- |
+| id | UUID | PK | The session id returned to the caller at login. |
+| createdAt | timestamp | required | When the login succeeded. |
+| expiresAt | timestamp | required | `createdAt` + the configured `auth.session_ttl_hours` (default 24). A request presenting a session at or past this instant is unauthenticated. |
+
 ---
 
 ## 5. API Endpoints Overview
@@ -389,11 +407,17 @@ endpoint requires authentication from the active mode (see §7).
 
 | Method | Path | Description | Requirement |
 | --- | --- | --- | --- |
-| POST | /v1/auth/local/login | Verify email + password (local mode). | FR-AU-04 |
+| POST | /v1/auth/local/login | Verify email + password and open a session (local mode). | FR-AU-04, FR-AU-09 |
 | POST | /v1/auth/local/credentials | Set or change local credentials (local mode). | FR-AU-05, FR-AU-06 |
 
 External JWT validation (FR-AU-02) is enforced by HTTP middleware on every
-request, not by an endpoint.
+request, not by an endpoint. The same middleware validates the local-mode
+session id (FR-AU-09); both are presented as `Authorization: Bearer <value>`.
+
+Both auth endpoints sit outside the blanket authentication gate, for the
+reasons §7 gives: login is how a caller obtains credentials, and first-time
+credential setup has none yet (UC-35 enforces its own conditional
+authorization once credentials exist).
 
 ---
 

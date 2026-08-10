@@ -275,6 +275,9 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
     let document_tags = PdfEpubMetadataReader;
     let video_tags = FfmpegVideoMetadataReader;
     let comic_tags = CbzComicMetadataReader;
+    // UC-01 and UC-02 are the same hash-every-file workload, so both walks
+    // take the same `indexing.concurrency` bound.
+    let indexing_concurrency = settings.indexing.concurrency;
     let index_handler = Arc::new(IndexHandler::new(
         auth.clone(),
         repo.clone(),
@@ -285,8 +288,15 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         document_tags,
         video_tags,
         comic_tags,
+        indexing_concurrency,
     ));
-    let refresh_handler = Arc::new(RefreshHandler::new(auth.clone(), repo.clone(), fs, clock));
+    let refresh_handler = Arc::new(RefreshHandler::new(
+        auth.clone(),
+        repo.clone(),
+        fs,
+        clock,
+        indexing_concurrency,
+    ));
     let edit_metadata_handler = Arc::new(EditMetadataHandler::new(auth.clone(), repo.clone()));
     let rename_file_handler = Arc::new(RenameFileHandler::new(auth.clone(), repo.clone(), fs));
     let soft_delete_file_handler = Arc::new(SoftDeleteFileHandler::new(

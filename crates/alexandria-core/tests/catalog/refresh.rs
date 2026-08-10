@@ -15,6 +15,10 @@ use crate::common::{
 
 const TOKEN: &str = "bearer-token";
 
+/// Deliberately > 1 so these tests exercise the concurrent walk — the outcome
+/// tallies must not depend on how many paths are in flight.
+const TEST_CONCURRENCY: u32 = 4;
+
 fn refresh_handler<A, R, F, C>(auth: A, repo: R, fs: F, clock: C) -> RefreshHandler<A, R, F, C>
 where
     A: AuthService,
@@ -22,7 +26,7 @@ where
     F: Filesystem,
     C: Clock,
 {
-    RefreshHandler::new(auth, repo, fs, clock)
+    RefreshHandler::new(auth, repo, fs, clock, TEST_CONCURRENCY)
 }
 
 #[tokio::test]
@@ -285,6 +289,89 @@ async fn given_failing_repository_write_when_execute_then_refresh_continues_and_
         repo_handle.file_for("/lib/b.mp3").unwrap().content_hash,
         "b-new"
     );
+}
+
+// ---------------- Bounded concurrency (FR-FC-08) ----------------
+
+/// Paths are refreshed several at a time, so the visit order is unspecified —
+/// the tallies must not be. Every concurrency from sequential to
+/// wider-than-the-catalog produces the same counts over the same catalog, and
+/// each of the four outcomes is represented so none of them can be
+/// mis-attributed by the concurrent fold.
+#[tokio::test]
+async fn given_any_concurrency_when_execute_then_same_outcome_tallies() {
+    for concurrency in [1u32, 2, 4, 16] {
+        let repo = FakeCatalogRepository::new();
+        // changed on disk -> refreshed
+        repo.seed(existing_file_with_hash(
+            "/lib/a.mp3",
+            "a.mp3",
+            FileType::Audio,
+            "a-old",
+        ));
+        // same hash -> unchanged
+        repo.seed(existing_file_with_hash(
+            "/lib/b.mp3",
+            "b.mp3",
+            FileType::Audio,
+            "b-same",
+        ));
+        // absent on disk -> marked missing
+        repo.seed(existing_file_with_hash(
+            "/lib/c.mp3",
+            "c.mp3",
+            FileType::Audio,
+            "c-old",
+        ));
+        // present but the write fails -> failed
+        repo.seed(existing_file_with_hash(
+            "/lib/d.mp3",
+            "d.mp3",
+            FileType::Audio,
+            "d-old",
+        ));
+        let repo = repo.failing_for("/lib/d.mp3");
+
+        let fs = FakeFilesystem::builder()
+            .with_file("/lib", "/lib/a.mp3", "a.mp3", "a-new")
+            .with_file("/lib", "/lib/b.mp3", "b.mp3", "b-same")
+            .with_file("/lib", "/lib/d.mp3", "d.mp3", "d-new")
+            .build();
+        let handler = RefreshHandler::new(
+            FakeAuth::Allowing,
+            repo,
+            fs,
+            fixed_clock(now()),
+            concurrency,
+        );
+
+        let outcome = handler.execute(Uuid::new_v4()).await.expect("execute");
+
+        assert_eq!(outcome.refreshed, 1, "concurrency {concurrency}");
+        assert_eq!(outcome.unchanged, 1, "concurrency {concurrency}");
+        assert_eq!(outcome.marked_missing, 1, "concurrency {concurrency}");
+        assert_eq!(outcome.failed, 1, "concurrency {concurrency}");
+    }
+}
+
+/// Zero is clamped to sequential rather than buffering zero deep and hanging.
+#[tokio::test]
+async fn given_zero_concurrency_when_execute_then_runs_sequentially_rather_than_hanging() {
+    let repo = FakeCatalogRepository::new();
+    repo.seed(existing_file_with_hash(
+        "/lib/a.mp3",
+        "a.mp3",
+        FileType::Audio,
+        "a-old",
+    ));
+    let fs = FakeFilesystem::builder()
+        .with_file("/lib", "/lib/a.mp3", "a.mp3", "a-new")
+        .build();
+    let handler = RefreshHandler::new(FakeAuth::Allowing, repo, fs, fixed_clock(now()), 0);
+
+    let outcome = handler.execute(Uuid::new_v4()).await.expect("execute");
+
+    assert_eq!(outcome.refreshed, 1);
 }
 
 #[tokio::test]

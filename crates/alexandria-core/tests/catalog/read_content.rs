@@ -2,7 +2,8 @@
 //! Specification §6). Each test exercises exactly the handler against
 //! trait fakes — no real DB, filesystem, or auth service. Coverage follows
 //! §6.3: happy path, wrong file type (AF-01), disk read failure (AF-02),
-//! not-found (AF-03), and the unauthorized branch (AF-04).
+//! not-found (AF-03), the unauthorized branch (AF-04), and the
+//! soft-deleted-record guard the use case's `active` precondition calls for.
 
 use uuid::Uuid;
 
@@ -10,7 +11,7 @@ use alexandria_core::catalog::model::FileType;
 use alexandria_core::catalog::queries::read_content::ReadTextFileContentHandler;
 use alexandria_core::errors::DomainError;
 
-use crate::common::{existing_file, FakeAuth, FakeCatalogRepository, FakeFilesystem};
+use crate::common::{deleted_file, existing_file, FakeAuth, FakeCatalogRepository, FakeFilesystem};
 
 const TOKEN: &str = "bearer-token";
 
@@ -86,6 +87,28 @@ async fn given_unknown_uuid_when_read_then_not_found() {
     let result = h.read(Uuid::new_v4(), TOKEN).await;
 
     assert!(matches!(result, Err(DomainError::NotFound)));
+}
+
+// ---------------- Soft-deleted record guard ----------------
+
+/// UC-32's precondition names an `active` TextFile. A soft-deleted record is
+/// rejected with `InvalidState` (restore first via UC-07) — the same guard
+/// UC-33 and UC-04 apply, so the three cannot disagree about what a deleted
+/// record permits.
+#[tokio::test]
+async fn given_deleted_file_when_read_then_invalid_state() {
+    let repo = FakeCatalogRepository::new();
+    let file = deleted_file("/lib/notes.txt", "notes.txt", FileType::Text);
+    let uuid = file.uuid;
+    repo.seed(file);
+    let fs = FakeFilesystem::builder()
+        .with_text_content("/lib/notes.txt", "hello world")
+        .build();
+    let h = handler(FakeAuth::Allowing, repo, fs);
+
+    let result = h.read(uuid, TOKEN).await;
+
+    assert!(matches!(result, Err(DomainError::InvalidState)));
 }
 
 // ---------------- AF-04: unauthorized ----------------

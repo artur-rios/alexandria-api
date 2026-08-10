@@ -37,6 +37,7 @@ dependencies = [
  "chrono",
  "epub",
  "ffmpeg-next",
+ "futures-util",
  "image",
  "jsonwebtoken",
  "kamadak-exif",

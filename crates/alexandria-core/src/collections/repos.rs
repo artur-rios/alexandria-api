@@ -105,13 +105,23 @@ impl CollectionRepository for SqliteCollectionRepository {
     async fn delete_collection(&self, uuid: Uuid) -> Result<(), DomainError> {
         let mut tx = self.pool.begin().await?;
 
-        // Unlink every file the collection holds before removing it — a
-        // deleted collection must not leave `files.collection_id` pointing at
-        // a row that no longer exists (UC-12 / FR-CO-04). Bookmarks get the
-        // same treatment once UC-15 introduces a `bookmarks` table; there is
-        // nothing to unlink there yet.
+        // Unlink every item the collection holds before removing it — a
+        // deleted collection must not leave a `collection_id` pointing at a
+        // row that no longer exists (UC-12 / FR-CO-04). A collection's `kind`
+        // fixes which table actually holds members, but both are cleared
+        // unconditionally: the statement for the other table matches nothing,
+        // and running both keeps the unlink correct even for a row whose
+        // `kind` was written before the invariant was enforced.
         sqlx::query(
             "UPDATE files SET collection_id = NULL \
+             WHERE collection_id = (SELECT id FROM collections WHERE uuid = ?)",
+        )
+        .bind(uuid.to_string())
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            "UPDATE bookmarks SET collection_id = NULL \
              WHERE collection_id = (SELECT id FROM collections WHERE uuid = ?)",
         )
         .bind(uuid.to_string())

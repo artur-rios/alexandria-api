@@ -133,6 +133,12 @@ impl Default for DatabaseSettings {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct IndexingSettings {
+    /// How many files UC-01's index walk and UC-02's re-index walk process at
+    /// a time. The per-file cost is dominated by hashing the bytes, which runs
+    /// on Tokio's blocking pool, so this is a real parallelism knob — but the
+    /// database half of each file's work still serializes behind SQLite's
+    /// single writer and the pool's 8 connections, so values far above that
+    /// buy nothing. Zero is clamped to 1 (sequential) by the handlers.
     #[serde(default = "default_indexing_concurrency")]
     pub concurrency: u32,
 }
@@ -247,6 +253,11 @@ impl Settings {
         if let Ok(jwks_url) = env::var("ALEXANDRIA_AUTH_JWKS_URL") {
             self.auth.jwks_url = jwks_url;
         }
+        if let Ok(hours) = env::var("ALEXANDRIA_AUTH_SESSION_TTL_HOURS") {
+            if let Ok(parsed) = hours.parse::<u32>() {
+                self.auth.session_ttl_hours = parsed;
+            }
+        }
         if let Ok(addr) = env::var("ALEXANDRIA_HTTP_BIND_ADDR") {
             self.http.bind_addr = addr;
         }
@@ -257,6 +268,11 @@ impl Settings {
         }
         if let Ok(path) = env::var("ALEXANDRIA_DATABASE_PATH") {
             self.database.path = path;
+        }
+        if let Ok(concurrency) = env::var("ALEXANDRIA_INDEXING_CONCURRENCY") {
+            if let Ok(parsed) = concurrency.parse::<u32>() {
+                self.indexing.concurrency = parsed;
+            }
         }
         if let Ok(days) = env::var("ALEXANDRIA_DELETION_RETENTION_DAYS") {
             if let Ok(parsed) = days.parse::<u32>() {

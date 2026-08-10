@@ -54,12 +54,48 @@ choices instead of restating them, so that:
 | **tracing** / **tracing-subscriber** | latest stable at implementation time | all crates | structured, span-aware logging |
 | **anyhow** | latest stable at implementation time | all crates | error propagation across crate boundaries |
 | **thiserror** | latest stable at implementation time | alexandria-core | typed domain error enums per command/query |
-| **validator** | latest stable at implementation time | alexandria-core | declarative input validation (entities, commands) |
 | **argon2** | latest stable at implementation time | alexandria-core (auth) | salted password hashing for local-login mode |
+| **reqwest** | latest stable at implementation time | alexandria-core (auth) | fetches the external auth service's JWKS in external mode |
 | **jsonwebtoken** | latest stable at implementation time | alexandria-core (auth) | JWT decode/verification for external-auth mode |
 | **toml** | latest stable at implementation time | all crates | `config.toml` parsing with env-var overrides |
 | **cbindgen** | latest stable at implementation time | alexandria-ffi (build) | generates the C header consumed by Flutter FFI |
 | **ring** or **sha2** | latest stable at implementation time | alexandria-core | content hashing for indexed files (SHA-256) |
+| **walkdir** | latest stable at implementation time | alexandria-core | recursive tree walk performed by the indexer (UC-01) |
+| **futures-util** | latest stable at implementation time | alexandria-core | `buffer_unordered`, the bounded-concurrency combinator the index and re-index walks are built on (FR-FC-08) |
+
+Blocking filesystem work — the tree walk, hashing, and every metadata parse in
+§3.1 — is dispatched to Tokio's blocking pool via `spawn_blocking` rather than
+run on a runtime worker. That is both what keeps reads answerable during a scan
+(FR-FC-08) and what makes `indexing.concurrency` buy real parallelism instead of
+interleaved waiting.
+
+Input validation is **hand-written** per command handler (a `validate_*`
+function beside the handler it guards, unit-tested against its own table of
+rejected inputs) rather than derived from a validation crate. The rules are
+cross-transport invariants — no leading/trailing whitespace, no NUL that would
+truncate at the FFI boundary, byte-length caps — that both the HTTP and FFI
+surfaces have to apply identically (NFR-09), and keeping them as plain
+functions is what lets both call the same code.
+
+There is no OpenAPI specification. The REST contract is defined by §5 of the
+[System Requirements Document](System%20Requirements%20Document.md) and the
+route-level documentation in `alexandria-http`; generating a machine-readable
+spec is a possible future addition, not a current dependency.
+
+### 3.1 Metadata extraction (FR-FC-25)
+
+Prefilling a file's subtype metadata at first index needs one reader per family
+of formats. Each is best-effort: a parse failure leaves the fields empty and
+never fails the file's indexing.
+
+| Package | Used for | Notes |
+| --- | --- | --- |
+| **lofty** | audio tags (title, artist, album, year, genre, track) | pure Rust, no system dependency |
+| **kamadak-exif** | image EXIF (title, pixel dimensions) | raw EXIF dimensions; `Orientation` is not applied |
+| **lopdf** | PDF metadata and page count | pure Rust |
+| **epub** / **quick-xml** | EPUB metadata | EPUB is reflowable, so it never yields a page count |
+| **zip** | comic archive metadata and page count (CBZ) | reads `ComicInfo.xml` when present |
+| **ffmpeg-next** | video duration, resolution, container metadata | **the one system dependency in the graph** — needs the ffmpeg C dev libraries, `pkg-config`, and `clang` present at build time. See the README's Building section for the per-platform install. |
 
 ---
 
@@ -67,7 +103,7 @@ choices instead of restating them, so that:
 
 | Concern | Choice |
 | --- | --- |
-| Catalog database | **SQLite** — embedded, file-based, ships with the desktop bundle; stores catalog metadata, collections, bookmarks, watchlists, reading lists, deletion state, and local-login credentials (encrypted). |
+| Catalog database | **SQLite** — embedded, file-based, ships with the desktop bundle; stores catalog metadata, collections, bookmarks, watchlists, reading lists, deletion state, and local-login credentials (password stored as a salted Argon2 hash, never plaintext). |
 | Connection configuration | path from `config.toml` / env override; a single connection pool sized for a single-user workload. |
 | Migrations | **sqlx migrate**; migrations live in `alexandria-core/migrations` and run at startup. |
 | Same engine in tests | yes — every environment including tests uses an on-disk or in-memory SQLite database; see the [Testing Specification Document](Testing%20Specification%20Document.md). |
@@ -97,11 +133,11 @@ unit tests substitute in-memory fakes (see the
 
 | Concern | Technology | Version | How it is used |
 | --- | --- | --- | --- |
-| Input validation | **validator** | latest stable at implementation time | declarative constraints on command structs and entity fields |
+| Input validation | hand-written `validate_*` functions in alexandria-core | — | one function per validated value, called by the handler and shared by both transports (see §3) |
 | Logging | **tracing** / **tracing-subscriber** | latest stable at implementation time | structured span-aware logs; see the [Operations & Infrastructure Document](Operations%20%26%20Infrastructure%20Document.md) §4 |
 | Authentication / authorization | pluggable auth module (external JWT via **jsonwebtoken**, local login via **argon2**) | latest stable at implementation time | selected at startup from config; exactly one mode active |
 | Error / result model | typed domain errors via **thiserror**; **anyhow** at crate boundaries; `Result<T, E>` everywhere | latest stable at implementation time | commands/queries return `Result<T, DomainError>`; the HTTP layer maps `DomainError` to status codes |
-| API documentation | **utoipa** (OpenAPI) | latest stable at implementation time | generates the OpenAPI spec for the REST contract; the FFI surface mirrors the same operations |
+| API documentation | System Requirements Document §5 + rustdoc on each route | — | the endpoint table is the contract; the FFI surface mirrors the same operations. No generated OpenAPI spec (see §3). |
 | Configuration | **toml** + env overrides | latest stable at implementation time | `config.toml` read at startup; the `ALEXANDRIA_*` env namespace overrides keys |
 | Content hashing | **sha2** (SHA-256) | latest stable at implementation time | per-file content hash stored at index time, refreshed on re-index |
 

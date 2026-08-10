@@ -13,6 +13,7 @@ argon2.workspace = true
 chrono.workspace = true
 epub.workspace = true
 ffmpeg-next.workspace = true
+futures-util.workspace = true
 jsonwebtoken.workspace = true
 kamadak-exif.workspace = true
 lofty.workspace = true

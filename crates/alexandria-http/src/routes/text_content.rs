@@ -1,4 +1,4 @@
-use axum::extract::rejection::JsonRejection;
+use axum::extract::rejection::{JsonRejection, PathRejection};
 use axum::extract::{Path, State};
 use axum::http::HeaderMap;
 use axum::http::StatusCode;
@@ -15,16 +15,22 @@ use crate::AppState;
 
 /// `GET /v1/files/{uuid}/content` — read a TextFile's content from disk
 /// (UC-32 / FR-TX-01). Returns `200` with the `FileContent`, or `400` (the
-/// file is not a TextFile, AF-01), `404` (uuid, AF-03), `500` (the on-disk
-/// file cannot be read, AF-02), or `401` (unauthenticated, AF-04). Both the
+/// file is not a TextFile, AF-01), `404` (uuid, AF-03), `409` (the file is
+/// soft-deleted — restore via UC-07 first), `500` (the on-disk file cannot
+/// be read, AF-02), or `401` (unauthenticated, AF-04). Both the
 /// HTTP and FFI surfaces call the same core handler so the two stay at
 /// parity (FR-FC-24 / NFR-09).
+///
+/// The path is taken as `Result` so a rejection becomes this surface's
+/// `400` + `{"error": …}` envelope rather than axum's bare-text rejection.
 pub async fn get_content(
     State(state): State<AppState>,
-    Path(uuid): Path<Uuid>,
+    uuid: Result<Path<Uuid>, PathRejection>,
     headers: HeaderMap,
 ) -> Result<(StatusCode, Json<FileContent>), ApiError> {
     let token = bearer_token(&headers);
+
+    let Path(uuid) = uuid.map_err(|_| invalid_input("path segment is not a valid UUID"))?;
 
     let content = state
         .services
@@ -60,12 +66,13 @@ pub struct EditContentRequest {
 /// `422`/`400`.
 pub async fn edit_content(
     State(state): State<AppState>,
-    Path(uuid): Path<Uuid>,
+    uuid: Result<Path<Uuid>, PathRejection>,
     headers: HeaderMap,
     body: Result<Json<EditContentRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<File>), ApiError> {
     let token = bearer_token(&headers);
 
+    let Path(uuid) = uuid.map_err(|_| invalid_input("path segment is not a valid UUID"))?;
     let Json(request) =
         body.map_err(|err| invalid_input(format!("invalid edit content body: {err}")))?;
 

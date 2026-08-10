@@ -1,3 +1,4 @@
+use axum::extract::rejection::PathRejection;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
@@ -7,6 +8,7 @@ use uuid::Uuid;
 use alexandria_core::catalog::model::{File, FileType, FileView, StateFilter};
 use alexandria_core::catalog::queries::browse::FileFilter;
 
+use crate::middleware::auth::invalid_input;
 use crate::middleware::error::ApiError;
 use crate::routes::bearer_token;
 use crate::AppState;
@@ -85,14 +87,19 @@ pub async fn list_files(
 
 /// `GET /v1/files/{uuid}` — get a single file's metadata by its public UUID
 /// (UC-03 / FR-FC-13). Returns `200` with a `FileView` (the file plus its
-/// stored subtype metadata when the subtype has one), or `404` (AF-01) or
-/// `401` (AF-02).
+/// stored subtype metadata when the subtype has one), or `400` (bad uuid),
+/// `404` (AF-01) or `401` (AF-02).
+///
+/// The path is taken as `Result` so a rejection becomes this surface's
+/// `400` + `{"error": …}` envelope rather than axum's bare-text rejection.
 pub async fn get_file(
     State(state): State<AppState>,
-    Path(uuid): Path<Uuid>,
+    uuid: Result<Path<Uuid>, PathRejection>,
     headers: HeaderMap,
 ) -> Result<(StatusCode, Json<FileView>), ApiError> {
     let token = bearer_token(&headers);
+
+    let Path(uuid) = uuid.map_err(|_| invalid_input("path segment is not a valid UUID"))?;
 
     let view = state
         .services

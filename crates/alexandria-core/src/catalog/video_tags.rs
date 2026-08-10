@@ -38,8 +38,12 @@ pub trait VideoMetadataReader: Send + Sync {
 #[derive(Debug, Default, Clone, Copy)]
 pub struct FfmpegVideoMetadataReader;
 
-impl VideoMetadataReader for FfmpegVideoMetadataReader {
-    async fn read(&self, path: &str) -> Option<VideoTags> {
+impl FfmpegVideoMetadataReader {
+    /// The synchronous container probe. `read` runs it on the blocking pool —
+    /// see [`crate::catalog::read_blocking`]. This is the slowest of the five
+    /// readers: ffmpeg may read a long way into a file to find the best video
+    /// stream, so it is the one that most needs to stay off the runtime.
+    fn parse(path: &str) -> Option<VideoTags> {
         if ffmpeg_next::init().is_err() {
             return None;
         }
@@ -91,6 +95,12 @@ impl VideoMetadataReader for FfmpegVideoMetadataReader {
             resolution,
             duration_seconds,
         })
+    }
+}
+
+impl VideoMetadataReader for FfmpegVideoMetadataReader {
+    async fn read(&self, path: &str) -> Option<VideoTags> {
+        crate::catalog::read_blocking(path, Self::parse).await
     }
 }
 

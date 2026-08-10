@@ -43,9 +43,9 @@ Two configurable modes, selected at startup; only one is active at runtime:
 1. **External JWT** — JWTs issued by an external authentication microservice;
    Alexandria validates them through a pluggable auth service module. The actual
    provider integration is wired later.
-2. **Local login** — encrypted credentials (email and a salted/hashed password)
-   stored in an encrypted SQLite row on the local machine, verified by
-   Alexandria. No plaintext credentials are ever stored.
+2. **Local login** — credentials (email and a salted/hashed password) stored in
+   a SQLite row on the local machine, verified by Alexandria. No plaintext
+   credentials are ever stored — only the one-way password hash.
 
 Both modes authorize the single owner; only the configured mode is accepted.
 

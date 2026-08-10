@@ -116,14 +116,22 @@ fn parse_comic_info(xml: &str) -> (Option<String>, Option<String>, Option<i64>) 
     (title, series, issue_number)
 }
 
-impl ComicMetadataReader for CbzComicMetadataReader {
-    async fn read(&self, path: &str) -> Option<ComicTags> {
+impl CbzComicMetadataReader {
+    /// The synchronous archive read. `read` runs it on the blocking pool —
+    /// see [`crate::catalog::read_blocking`].
+    fn parse(path: &str) -> Option<ComicTags> {
         let lower = path.to_ascii_lowercase();
         if lower.ends_with(".cbz") {
             Self::read_cbz(path)
         } else {
             None
         }
+    }
+}
+
+impl ComicMetadataReader for CbzComicMetadataReader {
+    async fn read(&self, path: &str) -> Option<ComicTags> {
+        crate::catalog::read_blocking(path, Self::parse).await
     }
 }
 

@@ -1089,6 +1089,23 @@ impl CatalogRepository for SqliteCatalogRepository {
             .execute(&mut *tx)
             .await?;
 
+        // The progress rows that tracked this file go with it. Nothing pins
+        // `PRAGMA foreign_keys = ON` (see `delete_subtype_sql`), so without
+        // these two statements a purged video/document/comic leaves
+        // `watch_progress` / `reading_progress` rows pointing at a `files.id`
+        // that no longer exists — invisible to UC-21/UC-27 (both inner-join
+        // `files`) but permanently orphaned. Like the subtype delete, a
+        // zero-row DELETE is the normal case, not an error.
+        sqlx::query("DELETE FROM watch_progress WHERE video_file_id = ?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+
+        sqlx::query("DELETE FROM reading_progress WHERE item_file_id = ?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+
         let affected = sqlx::query("DELETE FROM files WHERE id = ?")
             .bind(id)
             .execute(&mut *tx)

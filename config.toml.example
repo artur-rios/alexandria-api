@@ -1,7 +1,10 @@
 # Alexandria example configuration.
-# Copy this file to config.toml and adjust as needed. Any key can be overridden
-# by an environment variable named ALEXANDRIA_<SECTION>_<KEY> (e.g.
-# ALEXANDRIA_HTTP_PORT, ALEXANDRIA_AUTH_MODE). Unknown keys are ignored.
+# Copy this file to config.toml and adjust as needed. Most keys can also be set
+# through an environment variable named ALEXANDRIA_<SECTION>_<KEY> (e.g.
+# ALEXANDRIA_HTTP_PORT, ALEXANDRIA_AUTH_MODE); `auth.local_db` is the one key
+# with no override. Unknown keys are ignored. This file lists every key the
+# server reads — see the Operations & Infrastructure Document §4 for the
+# authoritative table.
 
 [auth]
 # The single active authentication mode. One of: "external", "local".
@@ -16,6 +19,11 @@ jwks_url = ""
 # before callers can authenticate. Ignored when mode = "external".
 local_db = false
 
+# Local mode only: how long the session created by a successful local login
+# (UC-34) stays valid. Callers present that session id on subsequent requests.
+# Ignored when mode = "external".
+session_ttl_hours = 24
+
 [http]
 # Bind address. Loopback by default so the API is reachable only from the local
 # machine unless explicitly reconfigured (see IR-03).
@@ -26,8 +34,18 @@ port = 8080
 # SQLite file path. Bundled beside the desktop app's data directory by default.
 path = "alexandria.sqlite"
 
+[filesystem]
+# The library root the health check probes for reachability (IR-03). Distinct
+# from the root passed per-request to the indexing operations (UC-01/UC-02).
+# Empty means the probe reports the filesystem unreachable.
+root = ""
+
 [indexing]
-# Maximum number of concurrent async indexing workers.
+# How many files the index (UC-01) and re-index (UC-02) walks process at a
+# time. Hashing runs on a blocking thread pool, so this is real parallelism —
+# but the database half of each file's work still serializes behind SQLite's
+# single writer and the pool's 8 connections, so raising this far above that
+# only lengthens the queue. 0 is treated as 1 (sequential).
 concurrency = 4
 
 [deletion]

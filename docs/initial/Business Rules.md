@@ -45,7 +45,7 @@ The owner is a single implicit principal; entities carry no per-user foreign key
 | **BR-05** | Watchlists apply only to VideoFiles (movies and series). Non-video files cannot be watchlisted. | Watchlists track media consumption, which is meaningful only for video. |
 | **BR-06** | For a series, watch progress is tracked per episode; for a movie, as a single item. | Reflects how movies and series are consumed. |
 | **BR-07** | The domain logic lives in a Rust core library and is exposed over HTTP/REST-JSON and via a Flutter FFI surface. Both transports produce identical results for the same operation. | The owner chooses HTTP or FFI per client without behavioral drift. |
-| **BR-08** | Authorization is pluggable and configured at startup; exactly one auth mode is active at runtime. The **external mode** validates JWTs issued by an external authentication service (issuance is never self-performed; provider integration is wired later). The **local-login mode** validates encrypted credentials (email + salted/hashed password) stored in an encrypted SQLite row on the local machine. No plaintext credentials are ever stored. | Defer identity to a dedicated external service when available; offer a self-contained local alternative for single-user desktop use. |
+| **BR-08** | Authorization is pluggable and configured at startup; exactly one auth mode is active at runtime. The **external mode** validates JWTs issued by an external authentication service (issuance is never self-performed; provider integration is wired later). The **local-login mode** validates credentials (email + salted/hashed password) stored in a SQLite row on the local machine. No plaintext credentials are ever stored — only the one-way password hash. | Defer identity to a dedicated external service when available; offer a self-contained local alternative for single-user desktop use. |
 | **BR-09** | Indexing runs asynchronously and must not block read/query operations. | The owner indexes thousands of files while still browsing and editing. |
 | **BR-10** | Record deletion is two-phase. Soft delete hides a record and keeps it restorable; a hard purge removes it permanently only after a configurable retention period has elapsed. | Protect the owner from accidental data loss. |
 | **BR-11** | A hard purge removes a catalog record without touching the on-disk file. Removing the on-disk file is a separate, explicit *purge-on-disk* operation that removes both the record and the physical file. | Disk deletions must be intentional and never a side effect of catalog cleanup. |
@@ -55,7 +55,7 @@ The owner is a single implicit principal; entities carry no per-user foreign key
 | **BR-15** | Reading lists apply only to book Documents and ComicBooks. Watchlists apply only to VideoFiles. Reading lists and watchlists never overlap their target file kinds. | Each kind of consumption tracking is meaningful only for its matching media. |
 | **BR-16** | For a comic book series, reading progress is tracked per issue; for a single book, as a single item. | Reflects how books and comics are consumed (parallel to BR-06). |
 | **BR-17** | Exactly one auth mode (external JWT or local login) is active at a time, selected by startup configuration. A caller authenticated by the inactive mode is rejected. | Avoid ambiguity in the trust boundary; keep the model simple per deployment. |
-| **BR-18** | Local-login credentials (email and a salted/hashed password) live in a single encrypted SQLite row and are set or changed via a local setup command. The plaintext password is never stored and never logged. | Protect the single user's credentials on a local-only desktop deployment. |
+| **BR-18** | Local-login credentials (email and a salted/hashed password) live in a single SQLite row and are set or changed via a local setup command. The plaintext password is never stored and never logged. | Protect the single user's credentials on a local-only desktop deployment. |
 | **BR-19** | Deleting a ReadingList removes its ReadingProgress entries only. Its target Documents and ComicBooks are preserved. | Removing a tracking list should not remove the catalogued items. |
 
 ## Validation Constraints
@@ -127,8 +127,9 @@ reading list; transitions `Pending → Reading → Read`; for a comic series,
 tracked per issue; deleted when the item is removed from the reading list or the
 reading list is deleted.
 
-**Local-login credentials** — set or changed via a local setup command; stored
-encrypted in SQLite; not soft/hard-deleted through the catalog lifecycle (their
+**Local-login credentials** — set or changed via a local setup command; the
+password stored in SQLite only as a salted one-way hash; not soft/hard-deleted
+through the catalog lifecycle (their
 management is part of the auth module, not the catalog).
 
 ## Prohibitions

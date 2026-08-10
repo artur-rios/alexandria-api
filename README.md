@@ -201,10 +201,44 @@ from sqlx 0.9, the highest MSRV in the dependency graph.
 
 `alexandria-core` links against `ffmpeg-next` for video metadata extraction, so
 the ffmpeg C dev libraries, `pkg-config`, and `clang` (for bindgen) must be
-installed locally before the workspace will build — the first system
-dependency this project has needed. On Debian/Ubuntu:
-`sudo apt-get install libavformat-dev libavcodec-dev libavutil-dev libavfilter-dev libavdevice-dev libswscale-dev libswresample-dev pkg-config clang`.
-On macOS: `brew install ffmpeg pkg-config llvm`.
+installed locally before the workspace will build — the only system dependency
+this project has. Without it `cargo build` and `cargo test` fail for the whole
+workspace, not just the video code, so install it first.
+
+**Debian/Ubuntu**
+
+```bash
+sudo apt-get install libavformat-dev libavcodec-dev libavutil-dev libavfilter-dev libavdevice-dev libswscale-dev libswresample-dev pkg-config clang
+```
+
+**macOS**
+
+```bash
+brew install ffmpeg pkg-config llvm
+```
+
+**Windows** — install through vcpkg, which `ffmpeg-sys-next` discovers without
+`pkg-config`. Requires the MSVC toolchain and LLVM/clang (`winget install
+LLVM.LLVM`) for bindgen:
+
+```bash
+vcpkg install ffmpeg:x64-windows
+```
+
+Then point the build at it by setting `VCPKG_ROOT` to the vcpkg checkout.
+Alternatively, download a prebuilt *shared* ffmpeg build (the `-shared` variant,
+which ships the `include/` and `lib/` directories the `-essentials` builds omit)
+and set `FFMPEG_DIR` to its root:
+
+```bash
+setx FFMPEG_DIR "C:\ffmpeg"
+```
+
+Verify the toolchain resolves before building the workspace:
+
+```bash
+cargo build -p alexandria-core
+```
 
 ```bash
 # Build the whole workspace (core + http + ffi)
@@ -223,8 +257,9 @@ The workspace enforces `#![deny(unsafe_code)]` in every crate.
 
 Configuration is read from `config.toml` at startup, with any key overridable
 through an `ALEXANDRIA_*` environment variable. See [`config.toml.example`](config.toml.example)
-for the full list (auth mode, HTTP bind address, SQLite path, indexing
-concurrency, soft-delete retention, log level).
+for the full list (auth mode and session TTL, HTTP bind address, SQLite path,
+health-probe filesystem root, indexing concurrency, soft-delete retention, log
+level).
 
 ```bash
 # 1. Create a local config from the example
@@ -254,7 +289,10 @@ In external auth mode, set `ALEXANDRIA_AUTH_MODE=external` and
 `ALEXANDRIA_AUTH_JWKS_URL` to the external auth service's JWKS endpoint. In
 local login mode (`ALEXANDRIA_AUTH_MODE=local`), set the owner's credentials
 once via the local credential setup operation (UC-35) before callers can
-authenticate.
+authenticate. Local mode has no bearer token of its own: `POST
+/v1/auth/local/login` returns a `sessionId`, and that id is what subsequent
+requests present as `Authorization: Bearer <sessionId>` until it expires
+(`auth.session_ttl_hours`, default 24).
 
 ### Health check
 

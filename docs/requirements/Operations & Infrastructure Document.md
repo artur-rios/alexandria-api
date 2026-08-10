@@ -115,24 +115,30 @@ alexandria-api/
 ## 3. Configuration
 
 Configuration is read from `config.toml` at startup, with `ALEXANDRIA_*`
-environment variables overriding any key. Unknown keys are ignored; invalid
-values for required keys fail startup.
+environment variables overriding a key. Unknown keys are ignored; invalid
+values for required keys fail startup. The table below is the complete set of
+keys — a key not listed here does not exist, and only the keys showing an
+`ALEXANDRIA_*` name have an environment override.
 
 | Concern | Mechanism | Notes |
 | --- | --- | --- |
 | `auth.mode` | config / `ALEXANDRIA_AUTH_MODE` | one of `external`, `local`; selects the single active auth mode (FR-AU-01). |
 | `auth.jwks_url` | config / `ALEXANDRIA_AUTH_JWKS_URL` | external mode only; where JWT keys are fetched. |
 | `auth.local_db` | config | local mode only; flag indicating local credentials are in SQLite. |
+| `auth.session_ttl_hours` | config / `ALEXANDRIA_AUTH_SESSION_TTL_HOURS` | local mode only; how long a login session stays valid; default `24` (FR-AU-09). |
 | `http.bind_addr` | config / `ALEXANDRIA_HTTP_BIND_ADDR` | default `127.0.0.1`; loopback by default (IR-03). |
 | `http.port` | config / `ALEXANDRIA_HTTP_PORT` | default `8080`. |
 | `database.path` | config / `ALEXANDRIA_DATABASE_PATH` | SQLite file path; bundled beside the desktop app's data dir. |
-| `indexing.concurrency` | config | max concurrent indexing workers (async). |
+| `filesystem.root` | config / `ALEXANDRIA_FILESYSTEM_ROOT` | the library root the health check probes for reachability (IR-03 / UC-37). Distinct from the per-request root UC-01/UC-02 take. |
+| `indexing.concurrency` | config / `ALEXANDRIA_INDEXING_CONCURRENCY` | how many files the UC-01 index and UC-02 re-index walks process at a time; default `4`, `0` is treated as `1`. Hashing runs on the blocking pool, so this is real parallelism; the DB half still serializes behind SQLite's single writer and the 8-connection pool. |
 | `deletion.retention_days` | config / `ALEXANDRIA_DELETION_RETENTION_DAYS` | soft-delete retention window; default `30` (NFR-10). |
 | `logging.level` | config / `ALEXANDRIA_LOG_LEVEL` | `error` / `warn` / `info` / `debug` / `trace`; default `info`. |
 
-**Secrets:** local-login credentials live only in the encrypted SQLite row
-(never in config or env). JWT signing keys are never stored by Alexandria — only
-the JWKS endpoint URL is configured.
+**Secrets:** local-login credentials live only in the SQLite credential row
+(never in config or env), and the password is held there only as a one-way
+salted Argon2 hash — the row cannot be reversed back to the plaintext. JWT
+signing keys are never stored by Alexandria — only the JWKS endpoint URL is
+configured.
 
 ---
 

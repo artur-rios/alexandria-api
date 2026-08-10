@@ -1,4 +1,5 @@
 use chrono::{DateTime, Utc};
+use futures_util::stream::{self, StreamExt};
 use serde::Serialize;
 use uuid::Uuid;
 
@@ -43,6 +44,11 @@ pub struct RefreshOutcome {
 ///   * marks `missing_at` (leaving `state` untouched — soft-delete is UC-06)
 ///     when the on-disk file is gone (FR-FC-11 / AF-01).
 ///
+/// Like `IndexHandler`, `execute` processes up to `concurrency` cataloged
+/// paths at a time (`indexing.concurrency`, the same setting — a re-index is
+/// the same hash-every-file workload as an index, so splitting the two knobs
+/// would only invite them to disagree).
+///
 /// Generic over collaborators so the decision logic is unit-tested against
 /// trait fakes with no real DB / filesystem / auth service (Testing Spec §6.2).
 pub struct RefreshHandler<A, R, F, C> {
@@ -50,6 +56,7 @@ pub struct RefreshHandler<A, R, F, C> {
     repo: R,
     fs: F,
     clock: C,
+    concurrency: usize,
 }
 
 impl<A, R, F, C> RefreshHandler<A, R, F, C>
@@ -59,12 +66,15 @@ where
     F: Filesystem,
     C: Clock,
 {
-    pub fn new(auth: A, repo: R, fs: F, clock: C) -> Self {
+    /// `concurrency` is how many cataloged paths `execute` refreshes at a
+    /// time; zero is clamped to 1, as in `IndexHandler::new`.
+    pub fn new(auth: A, repo: R, fs: F, clock: C, concurrency: u32) -> Self {
         Self {
             auth,
             repo,
             fs,
             clock,
+            concurrency: concurrency.max(1) as usize,
         }
     }
 
@@ -79,6 +89,11 @@ where
 
     /// Walk every cataloged path and refresh / mark missing.
     ///
+    /// Up to `concurrency` paths are in flight at once, so the order they are
+    /// visited in is unspecified. Each path's outcome depends only on that
+    /// path's own row and its own bytes, so the tallies do not depend on the
+    /// order — every row contributes exactly one outcome.
+    ///
     /// A failure that concerns one specific file — its bytes cannot be read, or
     /// a repository write for it fails — is counted in `failed`, logged at
     /// `warn`, and the walk continues. One locked file must not abandon the
@@ -87,27 +102,41 @@ where
         let now = self.clock.now();
         let files = self.repo.list_all().await?;
 
-        let mut refreshed = 0usize;
-        let mut marked_missing = 0usize;
-        let mut unchanged = 0usize;
-        let mut failed = 0usize;
-
-        for file in files {
-            match self.refresh_one(&file, now).await {
-                Ok(PathOutcome::Refreshed) => refreshed += 1,
-                Ok(PathOutcome::MarkedMissing) => marked_missing += 1,
-                Ok(PathOutcome::Unchanged) => unchanged += 1,
-                Err(err) => {
-                    failed += 1;
-                    tracing::warn!(
-                        %run_id,
-                        path = %file.path,
-                        error = %err,
-                        "skipping cataloged path that could not be refreshed"
-                    );
+        let (refreshed, marked_missing, unchanged, failed) = stream::iter(files)
+            .map(|file| async move {
+                match self.refresh_one(&file, now).await {
+                    Ok(outcome) => outcome,
+                    Err(err) => {
+                        tracing::warn!(
+                            %run_id,
+                            path = %file.path,
+                            error = %err,
+                            "skipping cataloged path that could not be refreshed"
+                        );
+                        PathOutcome::Failed
+                    }
                 }
-            }
-        }
+            })
+            .buffer_unordered(self.concurrency)
+            .fold(
+                (0usize, 0usize, 0usize, 0usize),
+                |counts, outcome| async move {
+                    let (refreshed, marked_missing, unchanged, failed) = counts;
+                    match outcome {
+                        PathOutcome::Refreshed => {
+                            (refreshed + 1, marked_missing, unchanged, failed)
+                        }
+                        PathOutcome::MarkedMissing => {
+                            (refreshed, marked_missing + 1, unchanged, failed)
+                        }
+                        PathOutcome::Unchanged => {
+                            (refreshed, marked_missing, unchanged + 1, failed)
+                        }
+                        PathOutcome::Failed => (refreshed, marked_missing, unchanged, failed + 1),
+                    }
+                },
+            )
+            .await;
 
         let outcome = RefreshOutcome {
             run_id,
@@ -153,8 +182,12 @@ where
 }
 
 /// What a single cataloged path resolved to during a refresh pass.
+/// `Failed` is produced by `execute` after it logs the path's error, so the
+/// concurrent walk can tally outcomes without sharing a counter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PathOutcome {
     Refreshed,
     MarkedMissing,
     Unchanged,
+    Failed,
 }

@@ -24,6 +24,10 @@ cbindgen = "0.29"
 chrono = { version = "0.4", features = ["serde"] }
 epub = "2"
 ffmpeg-next = "9"
+# Bounded-concurrency stream combinators (`buffer_unordered`) for the indexer.
+# Already in the dependency graph via sqlx and reqwest, so this adds no new
+# transitive weight — only a direct, declared use of it.
+futures-util = { version = "0.3", default-features = false, features = ["std", "async-await"] }
 jsonwebtoken = "9"
 kamadak-exif = "0.5"
 lofty = "0.22"

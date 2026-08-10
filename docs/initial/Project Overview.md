@@ -64,8 +64,8 @@ already on disk, without re-encoding, duplicating, or relocating the files.
   touches the on-disk file unless the user runs a separate, explicit purge.
 - No self-issued authentication for the external mode. When external auth is
   configured, JWTs are issued by an external authentication service; Alexandria
-  validates them. As an alternative, a local-login mode validates encrypted
-  credentials stored on the local machine. Only one mode is active at runtime.
+  validates them. As an alternative, a local-login mode validates credentials
+  against a salted password hash stored on the local machine. Only one mode is active at runtime.
 
 ## How Success Is Measured
 

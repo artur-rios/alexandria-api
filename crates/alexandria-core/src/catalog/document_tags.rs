@@ -108,8 +108,10 @@ impl PdfEpubMetadataReader {
     }
 }
 
-impl DocumentMetadataReader for PdfEpubMetadataReader {
-    async fn read(&self, path: &str) -> Option<DocumentTags> {
+impl PdfEpubMetadataReader {
+    /// The synchronous parse. `read` runs it on the blocking pool — see
+    /// [`crate::catalog::read_blocking`].
+    fn parse(path: &str) -> Option<DocumentTags> {
         let lower = path.to_ascii_lowercase();
         if lower.ends_with(".pdf") {
             Self::read_pdf(path)
@@ -118,6 +120,12 @@ impl DocumentMetadataReader for PdfEpubMetadataReader {
         } else {
             None
         }
+    }
+}
+
+impl DocumentMetadataReader for PdfEpubMetadataReader {
+    async fn read(&self, path: &str) -> Option<DocumentTags> {
+        crate::catalog::read_blocking(path, Self::parse).await
     }
 }
 

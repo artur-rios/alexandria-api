@@ -1,3 +1,4 @@
+use axum::extract::rejection::JsonRejection;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
@@ -5,6 +6,7 @@ use serde::Deserialize;
 
 use alexandria_core::catalog::commands::index::{IndexRequest, IndexStarted};
 
+use crate::middleware::auth::invalid_input;
 use crate::middleware::error::ApiError;
 use crate::routes::bearer_token;
 use crate::AppState;
@@ -14,12 +16,20 @@ pub struct IndexBody {
     pub root: String,
 }
 
+/// `POST /v1/index` — start an asynchronous indexing scan of a root path
+/// (UC-01 / FR-FC-01..09). Returns `202` with the run id; the scan runs on a
+/// spawned task (FR-FC-08).
+///
+/// The body is taken as `Result` so a rejection becomes this surface's `400`
+/// + `{"error": …}` envelope rather than axum's bare-text `422`, matching
+/// what the FFI surface reports for the same payload (FR-FC-24 / NFR-09).
 pub async fn index(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(body): Json<IndexBody>,
+    body: Result<Json<IndexBody>, JsonRejection>,
 ) -> Result<(StatusCode, Json<IndexStarted>), ApiError> {
     let token = bearer_token(&headers);
+    let Json(body) = body.map_err(|err| invalid_input(format!("invalid index body: {err}")))?;
     let request = IndexRequest {
         root: body.root.clone(),
     };

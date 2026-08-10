@@ -2,7 +2,7 @@ use uuid::Uuid;
 
 use crate::auth::AuthService;
 use crate::catalog::fs::Filesystem;
-use crate::catalog::model::{FileContent, FileType};
+use crate::catalog::model::{FileContent, FileState, FileType};
 use crate::catalog::repos::CatalogRepository;
 use crate::errors::DomainError;
 
@@ -41,6 +41,13 @@ where
             .find_by_uuid(uuid)
             .await?
             .ok_or(DomainError::NotFound)?;
+
+        // Precondition: the target file must be `active` — restore via UC-07
+        // before reading a soft-deleted record, matching how UC-33 (edit
+        // content) and UC-04 (edit metadata) guard the same precondition.
+        if file.state == FileState::Deleted {
+            return Err(DomainError::InvalidState);
+        }
 
         // AF-01: the target file must be a TextFile.
         if file.file_type != FileType::Text {

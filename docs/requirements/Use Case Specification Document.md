@@ -96,15 +96,16 @@ graph LR
 | **Actors** | Owner, Local Filesystem |
 | **Description** | Scan a root directory and create type-aware catalog records for every supported file type. |
 | **Preconditions** | The caller is authenticated as the owner; the root path is supplied. |
-| **Postconditions** | A File record (with an empty subtype record) exists for each supported file found, each with a content hash; indexing runs without blocking reads. |
-| **Requirements** | FR-FC-01, FR-FC-02, FR-FC-03, FR-FC-04, FR-FC-05, FR-FC-06, FR-FC-07, FR-FC-08, FR-FC-09, FR-FC-24 |
+| **Postconditions** | A File record exists for each supported file found, each with a content hash and a subtype record prefilled with whatever metadata could be extracted from the file itself; indexing runs without blocking reads. |
+| **Requirements** | FR-FC-01, FR-FC-02, FR-FC-03, FR-FC-04, FR-FC-05, FR-FC-06, FR-FC-07, FR-FC-08, FR-FC-09, FR-FC-24, FR-FC-25 |
 
 **Main Flow**
 
 1. The owner requests indexing with a root path.
 2. The system starts an asynchronous scan and returns immediately.
-3. The system walks the tree, classifies each supported file **by extension**, and creates a File record (with an empty row in the matching subtype table) carrying path, name, type, and the computed SHA-256 content hash. Type-specific metadata is not read from file contents — the owner supplies it via UC-04.
-4. The system records the `indexedAt` timestamp and logs the run's outcome (scanned, indexed, skipped, failed).
+3. The system walks the tree, classifies each supported file **by extension**, and creates a File record (with a row in the matching subtype table) carrying path, name, type, and the computed SHA-256 content hash. Files are processed **several at a time**, up to the configured `indexing.concurrency`; the order is therefore unspecified, but every scanned entry contributes exactly one outcome to the run's counts.
+4. For the subtypes that carry embedded metadata — audio, image, document, video, and comic — the system reads the file's own metadata and prefills the subtype row with it (FR-FC-25). Extraction is **best-effort**: an unreadable or metadata-less file simply leaves the fields empty, and the owner can set or correct any of them afterwards via UC-04. Extraction runs **only here, at first index** — UC-02 never re-reads it, so an owner's UC-04 edit is never overwritten by a later run.
+5. The system records the `indexedAt` timestamp and logs the run's outcome (scanned, indexed, skipped, failed).
 
 The `runId` returned in step 2 is opaque: completion is reported to the log only, and there is no query to retrieve a run's outcome.
 
@@ -116,6 +117,7 @@ The `runId` returned in step 2 is opaque: completion is reported to the log only
 | AF-02 | The caller is not authenticated | The system denies with an unauthorized error. |
 | AF-03 | A file path is already cataloged | The system skips creation (no duplicate path); a refresh is handled by UC-02. |
 | AF-04 | A single file cannot be read or persisted | The system counts it as failed, logs a warning naming the path, and continues the run; the remaining files are still indexed. |
+| AF-05 | A file's embedded metadata cannot be parsed, or writing the extracted values fails | The system logs a warning naming the path and leaves the subtype fields empty. The file is still indexed successfully — this is **not** counted as a failure (step 4 is best-effort). |
 
 ---
 
@@ -134,8 +136,8 @@ The `runId` returned in step 2 is opaque: completion is reported to the log only
 **Main Flow**
 
 1. The owner requests a re-index.
-2. The system re-reads each cataloged path's bytes asynchronously.
-3. For each path whose content hash changed, the system refreshes the hash and updates `indexedAt`. (There is no stored metadata to refresh — see UC-01 main flow step 3.)
+2. The system re-reads each cataloged path's bytes asynchronously, several paths at a time (the same `indexing.concurrency` bound UC-01 uses — a re-index is the same hash-every-file workload). The order paths are visited in is unspecified; each path's outcome depends only on its own row and its own bytes.
+3. For each path whose content hash changed, the system refreshes the hash and updates `indexedAt`. Subtype metadata is **not** refreshed: extraction happens once, at first index (UC-01 step 4), so a re-index can never overwrite what the owner set via UC-04.
 4. For each path that no longer exists on disk, the system sets the File's `missingAt` marker without deleting the record. `state` is untouched: `missingAt` is orthogonal to the soft-delete lifecycle owned by UC-06/UC-07, so a file may be `active` and missing at the same time. A file that returns to disk has its marker cleared.
 
 **Alternative Flows**
@@ -1022,17 +1024,22 @@ The `runId` returned in step 2 is opaque: completion is reported to the log only
 | **ID** | UC-34 |
 | **Name** | Local login |
 | **Actors** | Owner |
-| **Description** | Verify email and password against the encrypted local credential row (local auth mode). |
+| **Description** | Verify email and password against the stored local credential row and open a session (local auth mode). |
 | **Preconditions** | The active auth mode is local login; local credentials have been set. |
-| **Postconditions** | On success the caller is authenticated as the owner; on failure the caller is not. |
-| **Requirements** | FR-AU-01, FR-AU-04, FR-AU-07, FR-AU-08 |
+| **Postconditions** | On success a Session exists and its id is returned to the caller, who presents it on every subsequent request to be authenticated as the owner; on failure no session is created and the caller is not authenticated. |
+| **Requirements** | FR-AU-01, FR-AU-04, FR-AU-07, FR-AU-08, FR-AU-09 |
 
 **Main Flow**
 
 1. The caller submits email and password.
 2. The system confirms the active auth mode is local login.
-3. The system verifies the salted/hashed password against the encrypted SQLite row.
-4. The system authenticates the caller as the owner.
+3. The system verifies the submitted password against the stored salted Argon2 hash.
+4. The system creates a Session with an expiry `sessionTtlHours` in the future (configurable, default 24) and returns its id.
+5. The caller presents that session id in place of a bearer token on subsequent requests; the system authenticates it as the owner until the session expires.
+
+Local mode has no bearer token of its own — the session id **is** the credential
+for every operation after login. Sessions are the local-mode counterpart of
+UC-36's externally issued JWT.
 
 **Alternative Flows**
 
@@ -1041,6 +1048,7 @@ The `runId` returned in step 2 is opaque: completion is reported to the log only
 | AF-01 | The active auth mode is external JWT (local login inactive) | The system rejects the local credentials with an unauthorized error. |
 | AF-02 | The email or password is wrong | The system denies with an unauthorized error; no plaintext is logged. |
 | AF-03 | Local credentials have not been set | The system responds with a configuration error (run UC-35 first). |
+| AF-04 | A later request presents a session id that is unknown or has expired | The system denies that request with an unauthorized error; the caller logs in again to obtain a new session. |
 
 ---
 
@@ -1053,14 +1061,14 @@ The `runId` returned in step 2 is opaque: completion is reported to the log only
 | **Actors** | Owner |
 | **Description** | Set or change the local-login email and password. |
 | **Preconditions** | The active auth mode is local login; the caller is authenticated as the owner (or no credentials exist yet). |
-| **Postconditions** | The encrypted credential row holds the new salted password hash and email. |
+| **Postconditions** | The credential row holds the new email and the new salted password hash. |
 | **Requirements** | FR-AU-05, FR-AU-06, FR-AU-08 |
 
 **Main Flow**
 
 1. The owner submits a new email and password.
 2. The system validates the email format and a non-empty password.
-3. The system salts and hashes the password (Argon2) and writes/updates the encrypted credential row.
+3. The system salts and hashes the password (Argon2) and writes/updates the credential row. Only the hash is stored — the plaintext is never persisted, so the row is not reversible back to the password.
 4. The system returns confirmation; the plaintext password is never stored or logged.
 
 **Alternative Flows**
@@ -1106,7 +1114,7 @@ The `runId` returned in step 2 is opaque: completion is reported to the log only
 
 | Use Case | Requirements |
 | --- | --- |
-| UC-01: Index library files | FR-FC-01, FR-FC-02, FR-FC-03, FR-FC-04, FR-FC-05, FR-FC-06, FR-FC-07, FR-FC-08, FR-FC-09, FR-FC-24 |
+| UC-01: Index library files | FR-FC-01, FR-FC-02, FR-FC-03, FR-FC-04, FR-FC-05, FR-FC-06, FR-FC-07, FR-FC-08, FR-FC-09, FR-FC-24, FR-FC-25 |
 | UC-02: Re-index and refresh the catalog | FR-FC-08, FR-FC-10, FR-FC-11, FR-FC-24 |
 | UC-03: Browse and view file metadata | FR-FC-12, FR-FC-13, FR-FC-24 |
 | UC-04: Edit file metadata | FR-FC-14, FR-FC-15, FR-FC-16, FR-FC-17, FR-FC-18, FR-FC-24 |
@@ -1139,13 +1147,13 @@ The `runId` returned in step 2 is opaque: completion is reported to the log only
 | UC-31: Delete a reading list | FR-RL-07, FR-FC-24 |
 | UC-32: Read text file content | FR-TX-01, FR-FC-24 |
 | UC-33: Edit text file content | FR-TX-02, FR-TX-03, FR-FC-24 |
-| UC-34: Local login | FR-AU-01, FR-AU-04, FR-AU-07, FR-AU-08 |
+| UC-34: Local login | FR-AU-01, FR-AU-04, FR-AU-07, FR-AU-08, FR-AU-09 |
 | UC-35: Set or change local login credentials | FR-AU-05, FR-AU-06, FR-AU-08 |
 | UC-36: Authenticate via external JWT | FR-AU-01, FR-AU-02, FR-AU-03, FR-AU-07, FR-AU-08 |
 
 Every functional requirement in [System Requirements Document](System%20Requirements%20Document.md)
-§3 appears in at least one row above: FR-FC-01..24, FR-CO-01..07, FR-BM-01..06,
-FR-WL-01..08, FR-RL-01..08, FR-TX-01..03, FR-AU-01..08.
+§3 appears in at least one row above: FR-FC-01..25, FR-CO-01..07, FR-BM-01..06,
+FR-WL-01..08, FR-RL-01..08, FR-TX-01..03, FR-AU-01..09.
 
 ---
 

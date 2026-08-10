@@ -1,4 +1,5 @@
 use chrono::{DateTime, Utc};
+use futures_util::stream::{self, StreamExt};
 use serde::Serialize;
 use uuid::Uuid;
 
@@ -47,6 +48,18 @@ pub struct IndexOutcome {
 /// separated so the HTTP/FFI layer can spawn `execute` in the background
 /// (FR-FC-08) while `start` returns `202` right away.
 ///
+/// `execute` processes up to `concurrency` files at a time (configurable via
+/// `indexing.concurrency`, default 4). The per-file work is dominated by
+/// hashing the bytes, which `StdFilesystem` runs on Tokio's blocking pool, so
+/// the concurrency buys real parallelism rather than interleaved waiting —
+/// that is what NFR-02's throughput target rests on. It is bounded rather
+/// than unlimited because an unbounded fan-out over a large library would
+/// queue one blocking task per file and starve every other user of the
+/// blocking pool. Note that the *database* half of each file's work still
+/// serializes: SQLite admits one writer at a time, and the pool caps
+/// connections at 8, so raising `concurrency` past that only lengthens the
+/// queue in front of the writer.
+///
 /// Generic over its collaborators so the same decision logic is unit-tested
 /// against trait fakes (no real DB, filesystem, or auth service in unit
 /// tests), then wired with the concrete Sqlite/StdFilesystem/Bearer/services
@@ -61,6 +74,16 @@ pub struct IndexHandler<A, R, F, C, M, N, O, P, Q> {
     document_tags: O,
     video_tags: P,
     comic_tags: Q,
+    concurrency: usize,
+}
+
+/// What one scanned entry resolved to. Returned by the per-entry future so
+/// the concurrent walk can tally outcomes without sharing a counter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EntryOutcome {
+    Indexed,
+    Skipped,
+    Failed,
 }
 
 impl<A, R, F, C, M, N, O, P, Q> IndexHandler<A, R, F, C, M, N, O, P, Q>
@@ -75,6 +98,10 @@ where
     P: VideoMetadataReader,
     Q: ComicMetadataReader,
 {
+    /// `concurrency` is how many files `execute` processes at a time
+    /// (`indexing.concurrency`). Zero is meaningless — a stream buffered zero
+    /// deep makes no progress — so it is clamped to 1, which is the
+    /// sequential behaviour a caller asking for "no concurrency" means.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         auth: A,
@@ -86,6 +113,7 @@ where
         document_tags: O,
         video_tags: P,
         comic_tags: Q,
+        concurrency: u32,
     ) -> Self {
         Self {
             auth,
@@ -97,6 +125,7 @@ where
             document_tags,
             video_tags,
             comic_tags,
+            concurrency: concurrency.max(1) as usize,
         }
     }
 
@@ -118,6 +147,14 @@ where
     /// Walk, classify, hash, and persist. Skips unsupported extensions and
     /// paths already cataloged (AF-03). Completion is logged at `info`.
     ///
+    /// Up to `concurrency` entries are in flight at once. The order files are
+    /// processed in is therefore unspecified — the outcome counts are not,
+    /// since each entry contributes exactly one outcome regardless of when it
+    /// finishes. Two entries naming the same path would race the
+    /// already-cataloged check (AF-03), but `list_files` cannot produce a path
+    /// twice, and the `files.path` unique constraint turns any such duplicate
+    /// into that entry's own `failed` rather than a corrupt second record.
+    ///
     /// A failure that concerns one specific file — its bytes cannot be read, or
     /// a repository write for it fails — is counted in `failed`, logged at
     /// `warn`, and the walk continues. One locked file must not abandon the
@@ -126,33 +163,37 @@ where
         let now = self.clock.now();
         let entries = self.fs.list_files(root).await?;
         let scanned = entries.len();
-        let mut indexed = 0usize;
-        let mut skipped = 0usize;
-        let mut failed = 0usize;
 
-        for entry in entries {
-            let file_type = match classify_by_extension(&entry.name) {
-                Some(t) => t,
-                None => {
-                    skipped += 1;
-                    continue;
+        let (indexed, skipped, failed) = stream::iter(entries)
+            .map(|entry| async move {
+                let Some(file_type) = classify_by_extension(&entry.name) else {
+                    return EntryOutcome::Skipped;
+                };
+                let path = entry.path.clone();
+                match self.index_entry(entry, file_type, now).await {
+                    Ok(true) => EntryOutcome::Indexed,
+                    Ok(false) => EntryOutcome::Skipped,
+                    Err(err) => {
+                        tracing::warn!(
+                            %run_id,
+                            path = %path,
+                            error = %err,
+                            "skipping file that could not be indexed"
+                        );
+                        EntryOutcome::Failed
+                    }
                 }
-            };
-            let path = entry.path.clone();
-            match self.index_entry(entry, file_type, now).await {
-                Ok(true) => indexed += 1,
-                Ok(false) => skipped += 1,
-                Err(err) => {
-                    failed += 1;
-                    tracing::warn!(
-                        %run_id,
-                        path = %path,
-                        error = %err,
-                        "skipping file that could not be indexed"
-                    );
+            })
+            .buffer_unordered(self.concurrency)
+            .fold((0usize, 0usize, 0usize), |counts, outcome| async move {
+                let (indexed, skipped, failed) = counts;
+                match outcome {
+                    EntryOutcome::Indexed => (indexed + 1, skipped, failed),
+                    EntryOutcome::Skipped => (indexed, skipped + 1, failed),
+                    EntryOutcome::Failed => (indexed, skipped, failed + 1),
                 }
-            }
-        }
+            })
+            .await;
 
         tracing::info!(%run_id, scanned, indexed, skipped, failed, "indexing complete");
         Ok(IndexOutcome {
