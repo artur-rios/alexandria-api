@@ -201,6 +201,32 @@ impl Default for LoggingSettings {
     }
 }
 
+/// Media playback settings (F-10).
+#[derive(Debug, Clone, Deserialize)]
+pub struct PlaybackSettings {
+    /// Directory holding generated thumbnails (UC-40), created on first
+    /// use. Relative by default, matching `database.path`.
+    ///
+    /// Cache entries are keyed by content hash, so a re-index that changes
+    /// a file's bytes invalidates its thumbnail for free. There is no
+    /// eviction policy: inventing one before anyone has a full cache would
+    /// be guessing.
+    #[serde(default = "default_thumbnail_cache_dir")]
+    pub thumbnail_cache_dir: String,
+}
+
+fn default_thumbnail_cache_dir() -> String {
+    "thumbnails".to_string()
+}
+
+impl Default for PlaybackSettings {
+    fn default() -> Self {
+        Self {
+            thumbnail_cache_dir: default_thumbnail_cache_dir(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct Settings {
     #[serde(default)]
@@ -217,6 +243,8 @@ pub struct Settings {
     pub logging: LoggingSettings,
     #[serde(default)]
     pub filesystem: FilesystemSettings,
+    #[serde(default)]
+    pub playback: PlaybackSettings,
 }
 
 impl Settings {
@@ -287,6 +315,9 @@ impl Settings {
         if let Ok(root) = env::var("ALEXANDRIA_FILESYSTEM_ROOT") {
             self.filesystem.root = root;
         }
+        if let Ok(dir) = env::var("ALEXANDRIA_PLAYBACK_THUMBNAIL_CACHE_DIR") {
+            self.playback.thumbnail_cache_dir = dir;
+        }
     }
 }
 
@@ -329,5 +360,33 @@ mod tests {
         assert!(addr.ip().is_loopback());
         assert_eq!(addr.port(), 8080);
         assert_eq!(settings.logging.level.as_str(), "info");
+    }
+
+    #[test]
+    fn given_config_without_playback_section_when_loaded_then_default_cache_dir() {
+        // Arrange — every other section omitted too; playback must not become
+        // a required section for existing deployments.
+        let toml = "";
+
+        // Act
+        let settings: Settings = toml::from_str(toml).expect("parses");
+
+        // Assert
+        assert_eq!(settings.playback.thumbnail_cache_dir, "thumbnails");
+    }
+
+    #[test]
+    fn given_config_with_playback_section_when_loaded_then_cache_dir_read() {
+        // Arrange
+        let toml = "[playback]\nthumbnail_cache_dir = \"/var/cache/alexandria\"\n";
+
+        // Act
+        let settings: Settings = toml::from_str(toml).expect("parses");
+
+        // Assert
+        assert_eq!(
+            settings.playback.thumbnail_cache_dir,
+            "/var/cache/alexandria"
+        );
     }
 }
