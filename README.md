@@ -248,9 +248,9 @@ Prerequisites for every option below:
   ```bash
   winget install LLVM.LLVM
   ```
-  Setting `LIBCLANG_PATH` is what actually makes bindgen find it — installing
-  LLVM alone is often not enough, because its `bin` directory is not added to
-  `PATH` by default:
+  A default LLVM install is normally enough — bindgen locates `libclang.dll`
+  without help (verified against LLVM 22 installed this way). Only if it
+  reports that it cannot find libclang do you need to point at it explicitly:
   ```bash
   setx LIBCLANG_PATH "C:\Program Files\LLVM\bin"
   ```
@@ -286,8 +286,10 @@ packages are GPL builds (see [Licensing](#a-note-on-ffmpeg-licensing) below).
    setx FFMPEG_DIR "C:\path\to\ffmpeg-n7.1-...-shared"
    ```
 5. Add that root's `bin` directory to `PATH` (via Settings, per the warning
-   above). This is needed at **run** time, not build time: a shared build links
-   against DLLs, and `cargo test` will fail to start without them.
+   above). **Do not skip this.** It is needed at **run** time rather than build
+   time, so the symptom is confusing: `cargo build` succeeds, then every test
+   binary dies instantly with `exit code: 0xc0000135, STATUS_DLL_NOT_FOUND`,
+   because a shared build resolves its DLLs when the process starts.
 6. Open a new terminal and jump to [Verifying](#verifying-the-toolchain).
 
 #### Option B — vcpkg (slower; LGPL by default)
