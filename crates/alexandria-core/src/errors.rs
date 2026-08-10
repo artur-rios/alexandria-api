@@ -1,5 +1,28 @@
 use thiserror::Error;
 
+/// The `BEGIN` every explicit transaction in this workspace uses.
+///
+/// `BEGIN IMMEDIATE`, not the plain deferred `BEGIN` sqlx's `Pool::begin`
+/// issues. Every transaction here writes, and most of them read first (resolve
+/// a uuid to an internal id, then update that row). A deferred transaction
+/// that reads before it writes has to upgrade its lock, and SQLite answers a
+/// contended upgrade with `SQLITE_BUSY` **immediately** — the busy handler is
+/// deliberately not invoked, because two transactions each waiting to upgrade
+/// would deadlock. So the 5-second `busy_timeout` does not protect these; only
+/// taking the write lock at `BEGIN` does.
+///
+/// This matters because UC-01/UC-02 now walk several files at a time
+/// (`indexing.concurrency`), which puts the extraction writes
+/// (`update_metadata`, `set_*`) in contention with each other. Those writes are
+/// best-effort and only logged, so a `SQLITE_BUSY` there would silently lose
+/// extracted metadata rather than fail loudly.
+///
+/// Applied to *every* explicit transaction rather than only the read-then-write
+/// ones: all of them write, so none of them is harmed by taking the lock a few
+/// statements early, and a single rule leaves no judgement call for the next
+/// transaction someone adds.
+pub const WRITE_TX: &str = "BEGIN IMMEDIATE";
+
 #[derive(Debug, Error)]
 pub enum DomainError {
     #[error("entity not found")]

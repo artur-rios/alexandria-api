@@ -3,7 +3,7 @@ use sqlx::Row;
 use uuid::Uuid;
 
 use crate::collections::model::{Collection, CollectionKind, NewCollection};
-use crate::errors::DomainError;
+use crate::errors::{DomainError, WRITE_TX};
 
 /// Collections repository port. The create handler depends on this trait so
 /// its decision logic (validation, uuid minting) is unit-tested against an
@@ -103,7 +103,7 @@ impl CollectionRepository for SqliteCollectionRepository {
     }
 
     async fn delete_collection(&self, uuid: Uuid) -> Result<(), DomainError> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with(WRITE_TX).await?;
 
         // Unlink every item the collection holds before removing it — a
         // deleted collection must not leave a `collection_id` pointing at a

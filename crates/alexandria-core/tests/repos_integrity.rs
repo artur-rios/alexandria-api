@@ -1,12 +1,14 @@
 //! Referential-integrity regressions at the repository layer, exercised
 //! against a real migrated SQLite database.
 //!
-//! Nothing in this workspace sets `PRAGMA foreign_keys = ON`, so no delete
-//! cascades on its own — every row that references a deleted row has to be
-//! cleared by the repository that performs the delete. These tests pin the
-//! two places where that had been missed: UC-12's unlink of a bookmark
-//! collection's members, and UC-08/UC-09's removal of the progress rows that
-//! tracked a purged file.
+//! Foreign keys *are* enforced — sqlx sets `PRAGMA foreign_keys = ON` on every
+//! connection — but only the subtype tables declare one. `watch_progress`,
+//! `reading_progress`, and the two `collection_id` columns have no foreign key
+//! at all (SQLite cannot add one via `ALTER TABLE`), so nothing cascades to
+//! them and the repository performing a delete has to clear them by hand.
+//! These tests pin the two places where it had not: UC-12's unlink of a
+//! bookmark collection's members, and UC-08/UC-09's removal of the progress
+//! rows that tracked a purged file.
 
 use alexandria_core::bookmarks::model::NewBookmark;
 use alexandria_core::bookmarks::repos::{BookmarkRepository, SqliteBookmarkRepository};

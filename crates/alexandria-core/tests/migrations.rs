@@ -51,3 +51,45 @@ async fn given_fresh_in_memory_db_when_migrate_then_collections_table_exists() {
 
     pool.close().await;
 }
+
+/// The connection settings `migrate_database` establishes are load-bearing,
+/// and both were previously assumed wrong in comments across this crate.
+///
+/// `journal_mode = wal` is what lets reads proceed while an indexing run
+/// writes (FR-FC-08); sqlx does not set it, so it is our choice and a
+/// regression here would silently reintroduce whole-database write locks.
+///
+/// `foreign_keys = 1` is set by sqlx, not by us — which means the subtype
+/// tables' `ON DELETE CASCADE` is live. Several `migrations/` comments claim
+/// foreign keys are off; they are frozen by sqlx's migration checksums and
+/// cannot be corrected in place, so this test is where the real behaviour is
+/// recorded.
+#[tokio::test]
+async fn given_migrated_database_when_connected_then_wal_and_foreign_keys_enabled() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("pragmas.sqlite");
+    let pool = alexandria_core::migrate::migrate_database(path.to_str().expect("utf-8 path"))
+        .await
+        .expect("migrate");
+
+    let (journal_mode,): (String,) = sqlx::query_as("PRAGMA journal_mode")
+        .fetch_one(&pool)
+        .await
+        .expect("journal_mode");
+    assert_eq!(
+        journal_mode.to_ascii_lowercase(),
+        "wal",
+        "reads must not block behind an indexing write (FR-FC-08)"
+    );
+
+    let (foreign_keys,): (i64,) = sqlx::query_as("PRAGMA foreign_keys")
+        .fetch_one(&pool)
+        .await
+        .expect("foreign_keys");
+    assert_eq!(
+        foreign_keys, 1,
+        "sqlx enables foreign keys; the subtype ON DELETE CASCADE is live"
+    );
+
+    pool.close().await;
+}

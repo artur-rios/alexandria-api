@@ -500,7 +500,7 @@ Cascade notes:
 
 | Feature | Requirements |
 | --- | --- |
-| F-01 File indexing | FR-FC-01 through FR-FC-09 |
+| F-01 File indexing | FR-FC-01 through FR-FC-11, FR-FC-25 |
 | F-02 Catalog browsing and metadata editing | FR-FC-12 through FR-FC-18 |
 | F-03 Renaming and lifecycle management | FR-FC-19 through FR-FC-23 |
 | F-04 Text file content editing | FR-TX-01 through FR-TX-03 |
@@ -508,7 +508,7 @@ Cascade notes:
 | F-06 Bookmark management | FR-BM-01 through FR-BM-06 |
 | F-07 Watchlists | FR-WL-01 through FR-WL-08 |
 | F-08 Reading lists | FR-RL-01 through FR-RL-08 |
-| F-09 Pluggable authentication | FR-AU-01 through FR-AU-08 |
+| F-09 Pluggable authentication | FR-AU-01 through FR-AU-09 |
 | F-10 Dual-transport parity | FR-FC-24, FR-AU-08, NFR-09 |
 
 ### 9.2 Business Rule → Requirements

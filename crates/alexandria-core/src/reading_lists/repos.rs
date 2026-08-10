@@ -2,7 +2,7 @@ use sqlx::sqlite::SqlitePool;
 use sqlx::Row;
 use uuid::Uuid;
 
-use crate::errors::DomainError;
+use crate::errors::{DomainError, WRITE_TX};
 use crate::reading_lists::model::{
     NewReadingList, ReadingList, ReadingProgress, ReadingState, ReadingTargetKind,
 };
@@ -320,7 +320,7 @@ impl ReadingListRepository for SqliteReadingListRepository {
     }
 
     async fn delete_reading_list(&self, uuid: Uuid) -> Result<(), DomainError> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with(WRITE_TX).await?;
 
         // Delete every ReadingProgress entry the reading list holds before
         // removing it — a deleted reading list must not leave orphaned

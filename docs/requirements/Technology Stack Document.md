@@ -104,7 +104,8 @@ never fails the file's indexing.
 | Concern | Choice |
 | --- | --- |
 | Catalog database | **SQLite** — embedded, file-based, ships with the desktop bundle; stores catalog metadata, collections, bookmarks, watchlists, reading lists, deletion state, and local-login credentials (password stored as a salted Argon2 hash, never plaintext). |
-| Connection configuration | path from `config.toml` / env override; a single connection pool sized for a single-user workload. |
+| Connection configuration | path from `config.toml` / env override; a single connection pool sized for a single-user workload. **WAL journal mode**, so reads proceed against a snapshot while an indexing run writes (FR-FC-08); sqlx leaves the journal mode alone by default, so this is set explicitly at pool construction. Every explicit transaction begins `IMMEDIATE`: they all write, and a deferred transaction that reads first gets an un-retryable `SQLITE_BUSY` when it tries to upgrade under contention. |
+| Foreign keys | enforced — sqlx sets `PRAGMA foreign_keys = ON` per connection. The subtype tables cascade from `files`; `watch_progress`, `reading_progress`, and the two `collection_id` columns declare no foreign key (SQLite cannot add one via `ALTER TABLE`), so their cleanup is explicit in the repositories. |
 | Migrations | **sqlx migrate**; migrations live in `alexandria-core/migrations` and run at startup. |
 | Same engine in tests | yes — every environment including tests uses an on-disk or in-memory SQLite database; see the [Testing Specification Document](Testing%20Specification%20Document.md). |
 

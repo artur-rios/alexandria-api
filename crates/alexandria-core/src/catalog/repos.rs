@@ -5,7 +5,7 @@ use uuid::Uuid;
 use crate::catalog::model::{
     File, FileState, FileType, FormatKind, MediaKind, NewFile, StateFilter, SubtypeMetadata,
 };
-use crate::errors::DomainError;
+use crate::errors::{DomainError, WRITE_TX};
 
 /// Catalog repository port. The indexer depends on this trait so its decision
 /// logic (skip duplicates, insert) is unit-tested against an in-memory fake
@@ -214,9 +214,24 @@ impl SqliteCatalogRepository {
         }
     }
 
-    /// The subtype row is deleted explicitly (not via `ON DELETE CASCADE`) —
-    /// the FK constraints exist in the schema but nothing pins
-    /// `PRAGMA foreign_keys = ON`, so cascade cannot be relied on (UC-08).
+    /// The subtype row is deleted explicitly, ahead of the `files` row (UC-08).
+    ///
+    /// This is belt-and-braces, not a necessity: the subtype tables declare
+    /// `FOREIGN KEY (file_id) REFERENCES files (id) ON DELETE CASCADE`, and the
+    /// cascade **is** live, because sqlx sets `PRAGMA foreign_keys = ON` on
+    /// every connection it opens (verified: the pragma reads back as `1`).
+    /// Several comments in the `migrations/` folder claim the opposite. They
+    /// are wrong and cannot be corrected in place — sqlx checksums migration
+    /// files and would reject any already-migrated database with a
+    /// `VersionMismatch` — so treat this comment as the accurate one.
+    ///
+    /// The explicit delete stays because it makes the purge self-contained
+    /// rather than dependent on a pragma default that sqlx could change. What
+    /// it must *not* be read as is evidence that referential cleanup is
+    /// automatic in general: `watch_progress`, `reading_progress`, and the two
+    /// `collection_id` columns declare no foreign key at all (SQLite cannot add
+    /// one via `ALTER TABLE`), so nothing cascades to them and `purge` /
+    /// `delete_collection` clear them by hand.
     fn delete_subtype_sql(file_type: FileType) -> &'static str {
         match file_type {
             FileType::Audio => "DELETE FROM audio_files WHERE file_id = ?",
@@ -303,7 +318,7 @@ impl CatalogRepository for SqliteCatalogRepository {
     }
 
     async fn insert_file(&self, new_file: NewFile) -> Result<File, DomainError> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with(WRITE_TX).await?;
 
         sqlx::query(
             "INSERT INTO files \
@@ -385,7 +400,7 @@ impl CatalogRepository for SqliteCatalogRepository {
         uuid: Uuid,
         metadata: &SubtypeMetadata,
     ) -> Result<(), DomainError> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with(WRITE_TX).await?;
 
         // Resolve the file's internal id and its type in one transaction so a
         // race with a concurrent delete can't produce a subtype write against a
@@ -693,7 +708,7 @@ impl CatalogRepository for SqliteCatalogRepository {
         width: i64,
         height: i64,
     ) -> Result<(), DomainError> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with(WRITE_TX).await?;
 
         let (id, type_str): (i64, String) =
             sqlx::query_as("SELECT id, type FROM files WHERE uuid = ?")
@@ -756,7 +771,7 @@ impl CatalogRepository for SqliteCatalogRepository {
         uuid: Uuid,
         page_count: i64,
     ) -> Result<(), DomainError> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with(WRITE_TX).await?;
 
         let (id, type_str): (i64, String) =
             sqlx::query_as("SELECT id, type FROM files WHERE uuid = ?")
@@ -815,7 +830,7 @@ impl CatalogRepository for SqliteCatalogRepository {
         uuid: Uuid,
         duration_seconds: f64,
     ) -> Result<(), DomainError> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with(WRITE_TX).await?;
 
         let (id, type_str): (i64, String) =
             sqlx::query_as("SELECT id, type FROM files WHERE uuid = ?")
@@ -870,7 +885,7 @@ impl CatalogRepository for SqliteCatalogRepository {
     }
 
     async fn set_comic_page_count(&self, uuid: Uuid, page_count: i64) -> Result<(), DomainError> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with(WRITE_TX).await?;
 
         let (id, type_str): (i64, String) =
             sqlx::query_as("SELECT id, type FROM files WHERE uuid = ?")
@@ -930,7 +945,7 @@ impl CatalogRepository for SqliteCatalogRepository {
         new_name: &str,
         new_path: &str,
     ) -> Result<File, DomainError> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with(WRITE_TX).await?;
 
         // Resolve the file's internal id so a missing uuid is NotFound, not
         // a zero-row UPDATE that the caller could mistake for success.
@@ -987,7 +1002,7 @@ impl CatalogRepository for SqliteCatalogRepository {
         uuid: Uuid,
         deleted_at: DateTime<Utc>,
     ) -> Result<File, DomainError> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with(WRITE_TX).await?;
 
         // Resolve the file's internal id so a missing uuid is NotFound, not
         // a zero-row UPDATE that the caller could mistake for success.
@@ -1024,7 +1039,7 @@ impl CatalogRepository for SqliteCatalogRepository {
     }
 
     async fn restore(&self, uuid: Uuid) -> Result<File, DomainError> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with(WRITE_TX).await?;
 
         // Resolve the file's internal id so a missing uuid is NotFound, not
         // a zero-row UPDATE that the caller could mistake for success. This
@@ -1062,7 +1077,7 @@ impl CatalogRepository for SqliteCatalogRepository {
     }
 
     async fn purge(&self, uuid: Uuid) -> Result<(), DomainError> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with(WRITE_TX).await?;
 
         // Resolve the file's internal id and type so a missing uuid is
         // NotFound, not a zero-row DELETE the caller could mistake for
@@ -1089,13 +1104,15 @@ impl CatalogRepository for SqliteCatalogRepository {
             .execute(&mut *tx)
             .await?;
 
-        // The progress rows that tracked this file go with it. Nothing pins
-        // `PRAGMA foreign_keys = ON` (see `delete_subtype_sql`), so without
-        // these two statements a purged video/document/comic leaves
-        // `watch_progress` / `reading_progress` rows pointing at a `files.id`
-        // that no longer exists — invisible to UC-21/UC-27 (both inner-join
-        // `files`) but permanently orphaned. Like the subtype delete, a
-        // zero-row DELETE is the normal case, not an error.
+        // The progress rows that tracked this file go with it. Unlike the
+        // subtype tables, `watch_progress` and `reading_progress` declare no
+        // foreign key (SQLite cannot add one via `ALTER TABLE`), so the
+        // cascade that covers the subtype row does not reach them — see
+        // `delete_subtype_sql`. Without these two statements a purged
+        // video/document/comic leaves rows pointing at a `files.id` that no
+        // longer exists: invisible to UC-21/UC-27, which inner-join `files`,
+        // but permanently orphaned. A zero-row DELETE is the normal case here,
+        // not an error.
         sqlx::query("DELETE FROM watch_progress WHERE video_file_id = ?")
             .bind(id)
             .execute(&mut *tx)

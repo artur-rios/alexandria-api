@@ -2,7 +2,7 @@ use sqlx::sqlite::SqlitePool;
 use sqlx::Row;
 use uuid::Uuid;
 
-use crate::errors::DomainError;
+use crate::errors::{DomainError, WRITE_TX};
 use crate::watchlists::model::{NewWatchlist, WatchProgress, WatchState, Watchlist};
 
 /// Watchlists repository port. The create handler depends on this trait so
@@ -316,7 +316,7 @@ impl WatchlistRepository for SqliteWatchlistRepository {
     }
 
     async fn delete_watchlist(&self, uuid: Uuid) -> Result<(), DomainError> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with(WRITE_TX).await?;
 
         // Delete every WatchProgress entry the watchlist holds before
         // removing it — a deleted watchlist must not leave orphaned
