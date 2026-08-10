@@ -55,15 +55,14 @@ impl CbzComicMetadataReader {
             }
         }
 
-        let (title, series, issue_number) = match comic_info_index {
-            Some(i) => {
+        let (title, series, issue_number) = comic_info_index
+            .and_then(|i| {
                 let mut entry = archive.by_index(i).ok()?;
                 let mut xml = String::new();
                 std::io::Read::read_to_string(&mut entry, &mut xml).ok()?;
-                parse_comic_info(&xml)
-            }
-            None => (None, None, None),
-        };
+                Some(parse_comic_info(&xml))
+            })
+            .unwrap_or((None, None, None));
 
         Some(ComicTags {
             title,
@@ -229,6 +228,51 @@ mod tests {
         assert_eq!(
             tags.issue_number, None,
             "a non-integer <Number> must not error, just leave issue_number None"
+        );
+    }
+
+    #[tokio::test]
+    async fn given_cbz_with_unreadable_comicinfo_when_read_then_page_count_survives() {
+        use std::io::Write;
+        use zip::write::SimpleFileOptions;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("bad-comicinfo.cbz");
+
+        let file = std::fs::File::create(&path).expect("create cbz file");
+        let mut zip = zip::ZipWriter::new(file);
+        let options = SimpleFileOptions::default();
+
+        // ComicInfo.xml entry present but containing invalid UTF-8 bytes,
+        // so `read_to_string` fails on it even though the archive itself
+        // opens fine.
+        zip.start_file("ComicInfo.xml", options)
+            .expect("start ComicInfo.xml");
+        zip.write_all(&[0xFF, 0xFE, 0x00, 0x41, 0x00, 0x42])
+            .expect("write invalid utf-8 ComicInfo.xml");
+
+        for i in 0..4 {
+            zip.start_file(format!("page-{i:03}.jpg"), options)
+                .expect("start page");
+            zip.write_all(b"not-a-real-jpeg-just-bytes")
+                .expect("write page");
+        }
+
+        zip.finish().expect("finish cbz zip");
+
+        let reader = CbzComicMetadataReader;
+        let tags = reader
+            .read(path.to_str().unwrap())
+            .await
+            .expect("archive opens fine, so page_count must still be returned");
+
+        assert_eq!(tags.title, None);
+        assert_eq!(tags.series, None);
+        assert_eq!(tags.issue_number, None);
+        assert_eq!(
+            tags.page_count,
+            Some(4),
+            "page_count must survive even when ComicInfo.xml fails to read"
         );
     }
 
