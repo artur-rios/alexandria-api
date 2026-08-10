@@ -22,6 +22,7 @@ use alexandria_core::bookmarks::model::{Bookmark, BookmarkState, NewBookmark};
 use alexandria_core::bookmarks::repos::BookmarkRepository;
 use alexandria_core::catalog::audio_tags::{AudioMetadataReader, AudioTags};
 use alexandria_core::catalog::clock::FixedClock;
+use alexandria_core::catalog::comic_tags::{ComicMetadataReader, ComicTags};
 use alexandria_core::catalog::document_tags::{DocumentMetadataReader, DocumentTags};
 use alexandria_core::catalog::fs::{FileEntry, Filesystem};
 use alexandria_core::catalog::image_tags::{ImageMetadataReader, ImageTags};
@@ -1743,6 +1744,42 @@ impl FakeVideoMetadataReader {
 
 impl VideoMetadataReader for FakeVideoMetadataReader {
     async fn read(&self, path: &str) -> Option<VideoTags> {
+        *self.call_count.lock().unwrap() += 1;
+        self.tags.lock().unwrap().get(path).cloned()
+    }
+}
+
+/// In-memory comic reader (issue #44 comic slice). `read()` answers
+/// `None` for any path with no seeded tags, mirroring "couldn't open
+/// archive / unsupported extension" — the same outcome
+/// `CbzComicMetadataReader` produces for those cases. Also counts calls,
+/// so a test can assert the reader was never consulted at all (e.g. for
+/// a non-comic file).
+#[derive(Debug, Default, Clone)]
+pub struct FakeComicMetadataReader {
+    tags: Arc<Mutex<HashMap<String, ComicTags>>>,
+    call_count: Arc<Mutex<usize>>,
+}
+
+impl FakeComicMetadataReader {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Seed the tags `read()` returns for `path`.
+    pub fn seed(&self, path: &str, tags: ComicTags) -> &Self {
+        self.tags.lock().unwrap().insert(path.to_string(), tags);
+        self
+    }
+
+    /// How many times `read()` has been called.
+    pub fn call_count(&self) -> usize {
+        *self.call_count.lock().unwrap()
+    }
+}
+
+impl ComicMetadataReader for FakeComicMetadataReader {
+    async fn read(&self, path: &str) -> Option<ComicTags> {
         *self.call_count.lock().unwrap() += 1;
         self.tags.lock().unwrap().get(path).cloned()
     }
