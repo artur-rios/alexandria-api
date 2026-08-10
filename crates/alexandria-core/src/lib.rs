@@ -7,6 +7,7 @@ pub mod collections;
 pub mod config;
 pub mod errors;
 pub mod migrate;
+pub mod playback;
 pub mod reading_lists;
 pub mod services;
 pub mod watchlists;
