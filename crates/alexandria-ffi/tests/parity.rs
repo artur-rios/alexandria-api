@@ -21,10 +21,11 @@ use alexandria_ffi::{
     alexandria_bookmark_purge, alexandria_bookmark_restore, alexandria_bookmark_soft_delete,
     alexandria_bookmark_update, alexandria_bookmarks_list, alexandria_collection_add_items,
     alexandria_collection_create, alexandria_collection_delete, alexandria_collection_list_items,
-    alexandria_collection_remove_item, alexandria_collection_rename, alexandria_file_edit_content,
-    alexandria_file_edit_metadata, alexandria_file_get_by_uuid, alexandria_file_purge,
-    alexandria_file_purge_on_disk, alexandria_file_read_content, alexandria_file_rename,
-    alexandria_file_restore, alexandria_file_soft_delete, alexandria_files_list,
+    alexandria_collection_remove_item, alexandria_collection_rename, alexandria_comic_page,
+    alexandria_file_edit_content, alexandria_file_edit_metadata, alexandria_file_get_by_uuid,
+    alexandria_file_playback_source, alexandria_file_purge, alexandria_file_purge_on_disk,
+    alexandria_file_read_content, alexandria_file_rename, alexandria_file_restore,
+    alexandria_file_soft_delete, alexandria_file_thumbnail, alexandria_files_list,
     alexandria_free_string, alexandria_index_count_files, alexandria_index_count_missing,
     alexandria_index_files_json, alexandria_index_init, alexandria_index_refresh_start,
     alexandria_index_start, alexandria_reading_list_add_item, alexandria_reading_list_create,
@@ -9755,4 +9756,483 @@ async fn given_tagged_cbz_file_when_indexed_via_http_and_ffi_then_extracted_meta
     assert_eq!(http_body["metadata"]["title"], "Parity Title");
     assert_eq!(http_body["metadata"]["series"], "Parity Series");
     assert_eq!(http_body["metadata"]["issueNumber"], 3);
+}
+
+// ---------------------------------------------------------------------------
+// F-10 media playback parity (UC-38, UC-39, UC-40 — FR-MP-06).
+//
+// The two legs keep their own library directory and their own database, as
+// every parity test above does, so an absolute path is *not* comparable
+// between them: UC-38's descriptor names the FFI leg's copy of the fixture.
+// Parity is therefore asserted on the decisions and on the bytes — the
+// descriptor's mime/size against HTTP's headers, and the bytes at the
+// descriptor's path against the bytes HTTP streamed.
+// ---------------------------------------------------------------------------
+
+/// A tiny, real, valid JPEG — deterministic per `seed`, so a test can
+/// recompute the exact bytes an archive entry was written with. Local copy of
+/// `alexandria-http`'s test helper of the same name: an integration test
+/// cannot import another crate's test module.
+fn jpeg_bytes_for(seed: &str) -> Vec<u8> {
+    let sum: u32 = seed.bytes().map(u32::from).sum();
+    let pixel = image::Rgb([(sum % 256) as u8, ((sum / 3) % 256) as u8, 128]);
+    let img = image::RgbImage::from_pixel(4, 4, pixel);
+    let mut out = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new(&mut out)
+        .encode_image(&image::DynamicImage::ImageRgb8(img))
+        .expect("encode jpeg");
+    out
+}
+
+/// Write a real CBZ (ZIP) at `dir/name` holding one real JPEG per entry, in
+/// exactly the order given — callers pass entries out of page order on
+/// purpose, so "page 1" proves the reader sorts rather than trusting archive
+/// order. Returns the path as a string, ready for `seed_file_at_path`.
+fn write_cbz(dir: &TempDir, name: &str, entries: &[&str]) -> String {
+    use std::io::Write;
+    use zip::write::SimpleFileOptions;
+
+    let path = dir.path().join(name);
+    let file = std::fs::File::create(&path).expect("create cbz");
+    let mut zip = zip::ZipWriter::new(file);
+    for entry in entries {
+        zip.start_file(*entry, SimpleFileOptions::default())
+            .expect("start entry");
+        zip.write_all(&jpeg_bytes_for(entry)).expect("write entry");
+    }
+    zip.finish().expect("finish cbz");
+    path.to_str().unwrap().to_string()
+}
+
+/// Write a real PNG of `width` x `height` at `dir/name`.
+fn write_image(dir: &TempDir, name: &str, width: u32, height: u32) -> String {
+    let path = dir.path().join(name);
+    let img = image::RgbImage::from_pixel(width, height, image::Rgb([200, 60, 30]));
+    image::DynamicImage::ImageRgb8(img)
+        .save(&path)
+        .expect("write png");
+    path.to_str().unwrap().to_string()
+}
+
+/// Local settings with UC-40's thumbnail cache pointed inside `cache_dir`.
+/// The default is the *relative* path `"thumbnails"`, which would otherwise be
+/// created in the test process's working directory — the repository itself.
+fn playback_settings(cache_dir: &TempDir) -> Settings {
+    let mut settings = local_settings();
+    settings.playback.thumbnail_cache_dir = cache_dir.path().to_str().unwrap().to_string();
+    settings
+}
+
+/// A response header as an owned string, panicking when it is absent. The
+/// playback surfaces carry their parity contract in headers (`content-type`,
+/// `content-length`), so a missing one is a failure, not a `None` to tolerate.
+fn header_string(response: &axum::response::Response, name: &str) -> String {
+    response
+        .headers()
+        .get(name)
+        .unwrap_or_else(|| panic!("response has no {name} header"))
+        .to_str()
+        .expect("header is valid ascii")
+        .to_string()
+}
+
+/// Point the FFI leg's thumbnail cache at `cache_dir`. `alexandria_index_init`
+/// takes no `Settings` — it calls `load_settings()` — so the only way to
+/// override the default relative `"thumbnails"` is the environment, exactly as
+/// `setup_ffi_db` does for the auth mode. Must run before the init.
+fn set_ffi_thumbnail_cache(cache_dir: &TempDir) {
+    std::env::set_var(
+        "ALEXANDRIA_PLAYBACK_THUMBNAIL_CACHE_DIR",
+        cache_dir.path().to_str().unwrap(),
+    );
+}
+
+/// UC-38 parity - stream the same fixture over HTTP and resolve it over FFI,
+/// then assert the descriptor describes exactly what HTTP served (Testing
+/// Specification section 7.3, FR-MP-01, FR-MP-06).
+#[tokio::test]
+async fn given_same_file_when_streamed_then_descriptor_agrees_with_http() {
+    // Arrange — one identical fixture per leg, each in its own library.
+    let _g = SERIAL.lock().unwrap();
+    let contents = b"fake mp4 bytes, but real enough for a byte stream";
+
+    let http_lib = tempdir().unwrap();
+    let http_file = http_lib.path().join("sample.mp4");
+    std::fs::write(&http_file, contents).unwrap();
+    let http_file = http_file.to_str().unwrap().to_string();
+
+    let ffi_lib = tempdir().unwrap();
+    let ffi_file = ffi_lib.path().join("sample.mp4");
+    std::fs::write(&ffi_file, contents).unwrap();
+    let ffi_file = ffi_file.to_str().unwrap().to_string();
+
+    let http_dir = tempdir().unwrap();
+    let http_pool = migrate_database(&db_path(&http_dir, "http.sqlite"))
+        .await
+        .expect("http migrate");
+    seed_session(&http_pool, TEST_TOKEN).await;
+    let settings = local_settings();
+    let http_services = std::sync::Arc::new(build_services(&settings, http_pool.clone()).await);
+    let http_uuid = seed_file_at_path(&http_pool, "video", &http_file).await;
+
+    let ffi_dir = tempdir().unwrap();
+    let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
+    let ffi_pool = migrate_database(&ffi_db).await.expect("ffi migrate");
+    let ffi_uuid = seed_file_at_path(&ffi_pool, "video", &ffi_file).await;
+    ffi_pool.close().await;
+
+    // Act — HTTP streams the bytes; FFI returns the descriptor.
+    let req = Request::builder()
+        .method("GET")
+        .uri(format!("/v1/files/{http_uuid}/stream"))
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = app(settings.clone(), http_services)
+        .oneshot(req)
+        .await
+        .expect("http stream");
+    assert_eq!(resp.status(), axum::http::StatusCode::OK);
+    let http_content_type = header_string(&resp, "content-type");
+    let http_content_length: u64 = header_string(&resp, "content-length").parse().unwrap();
+    let http_body = to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap()
+        .to_vec();
+
+    let descriptor: serde_json::Value =
+        tokio::task::spawn_blocking(move || -> serde_json::Value {
+            let cdb = CString::new(ffi_db).unwrap();
+            assert_eq!(
+                alexandria_index_init(cdb.as_ptr()),
+                alexandria_ffi::INDEX_OK
+            );
+
+            let token = CString::new(TEST_TOKEN).unwrap();
+            let uuid_c = CString::new(ffi_uuid).unwrap();
+            let r = alexandria_file_playback_source(uuid_c.as_ptr(), token.as_ptr());
+            assert_eq!(r.status, alexandria_ffi::PLAYBACK_OK, "ffi playback source");
+            assert!(!r.json.is_null());
+            let s = unsafe { CStr::from_ptr(r.json) }
+                .to_string_lossy()
+                .into_owned();
+            unsafe {
+                alexandria_free_string(r.json);
+            }
+            serde_json::from_str(&s).unwrap()
+        })
+        .await
+        .unwrap();
+
+    // Assert — FR-MP-06: parity is on the descriptor, and the path it names
+    // must hold exactly the bytes HTTP served. The path itself is deliberately
+    // not compared: each leg indexed its own copy of the fixture.
+    assert_eq!(descriptor["mimeType"], http_content_type);
+    assert_eq!(descriptor["mimeType"], "video/mp4");
+    assert_eq!(
+        descriptor["sizeBytes"].as_u64().expect("sizeBytes"),
+        http_content_length
+    );
+    let on_disk = std::fs::read(descriptor["path"].as_str().expect("path")).unwrap();
+    assert_eq!(
+        on_disk, http_body,
+        "descriptor path holds the streamed bytes"
+    );
+}
+
+/// UC-39 parity - read page 1 of the same CBZ over both transports and assert
+/// the bytes are identical, HTTP raw against FFI base64 (Testing
+/// Specification section 7.3, FR-MP-04, FR-MP-06).
+#[tokio::test]
+async fn given_same_comic_when_page_read_then_bytes_identical_across_surfaces() {
+    // Arrange — entries deliberately stored out of page order.
+    let _g = SERIAL.lock().unwrap();
+    let entries = ["page002.jpg", "page001.jpg"];
+
+    let http_lib = tempdir().unwrap();
+    let http_file = write_cbz(&http_lib, "issue.cbz", &entries);
+    let ffi_lib = tempdir().unwrap();
+    let ffi_file = write_cbz(&ffi_lib, "issue.cbz", &entries);
+
+    let http_dir = tempdir().unwrap();
+    let http_pool = migrate_database(&db_path(&http_dir, "http.sqlite"))
+        .await
+        .expect("http migrate");
+    seed_session(&http_pool, TEST_TOKEN).await;
+    let settings = local_settings();
+    let http_services = std::sync::Arc::new(build_services(&settings, http_pool.clone()).await);
+    let http_uuid = seed_file_at_path(&http_pool, "comic", &http_file).await;
+
+    let ffi_dir = tempdir().unwrap();
+    let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
+    let ffi_pool = migrate_database(&ffi_db).await.expect("ffi migrate");
+    let ffi_uuid = seed_file_at_path(&ffi_pool, "comic", &ffi_file).await;
+    ffi_pool.close().await;
+
+    // Act
+    let req = Request::builder()
+        .method("GET")
+        .uri(format!("/v1/files/{http_uuid}/pages/1"))
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = app(settings.clone(), http_services)
+        .oneshot(req)
+        .await
+        .expect("http comic page");
+    assert_eq!(resp.status(), axum::http::StatusCode::OK);
+    let http_content_type = header_string(&resp, "content-type");
+    let http_body = to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap()
+        .to_vec();
+
+    let ffi_page: serde_json::Value = tokio::task::spawn_blocking(move || -> serde_json::Value {
+        let cdb = CString::new(ffi_db).unwrap();
+        assert_eq!(
+            alexandria_index_init(cdb.as_ptr()),
+            alexandria_ffi::INDEX_OK
+        );
+
+        let token = CString::new(TEST_TOKEN).unwrap();
+        let uuid_c = CString::new(ffi_uuid).unwrap();
+        let r = alexandria_comic_page(uuid_c.as_ptr(), 1, token.as_ptr());
+        assert_eq!(r.status, alexandria_ffi::PLAYBACK_OK, "ffi comic page");
+        assert!(!r.json.is_null());
+        let s = unsafe { CStr::from_ptr(r.json) }
+            .to_string_lossy()
+            .into_owned();
+        unsafe {
+            alexandria_free_string(r.json);
+        }
+        serde_json::from_str(&s).unwrap()
+    })
+    .await
+    .unwrap();
+
+    // Assert — byte-exact across the two surfaces (FR-MP-03: nothing is
+    // re-encoded), and page 1 is the sorted first entry, not the stored one.
+    use base64::Engine;
+    let ffi_bytes = base64::engine::general_purpose::STANDARD
+        .decode(ffi_page["bytesBase64"].as_str().expect("bytesBase64"))
+        .expect("decode base64");
+    assert_eq!(ffi_bytes, http_body, "comic page bytes identical");
+    assert_eq!(ffi_bytes, jpeg_bytes_for("page001.jpg"), "page 1 is sorted");
+    assert_eq!(ffi_page["mimeType"], http_content_type);
+    assert_eq!(ffi_page["mimeType"], "image/jpeg");
+    assert_eq!(ffi_page["page"], 1);
+    assert_eq!(ffi_page["pageCount"], 2);
+}
+
+/// UC-40 parity - thumbnail the same image over both transports and assert
+/// the JPEG bytes are identical, HTTP raw against FFI base64 (Testing
+/// Specification section 7.3, FR-MP-05, FR-MP-06).
+#[tokio::test]
+async fn given_same_image_when_thumbnailed_then_bytes_identical_across_surfaces() {
+    // Arrange — each leg gets its own cache directory: the default is the
+    // relative path "thumbnails", which would land in the repository.
+    let _g = SERIAL.lock().unwrap();
+
+    let http_lib = tempdir().unwrap();
+    let http_file = write_image(&http_lib, "photo.png", 640, 480);
+    let ffi_lib = tempdir().unwrap();
+    let ffi_file = write_image(&ffi_lib, "photo.png", 640, 480);
+
+    let http_cache = tempdir().unwrap();
+    let http_dir = tempdir().unwrap();
+    let http_pool = migrate_database(&db_path(&http_dir, "http.sqlite"))
+        .await
+        .expect("http migrate");
+    seed_session(&http_pool, TEST_TOKEN).await;
+    let settings = playback_settings(&http_cache);
+    let http_services = std::sync::Arc::new(build_services(&settings, http_pool.clone()).await);
+    let http_uuid = seed_file_at_path(&http_pool, "image", &http_file).await;
+
+    let ffi_cache = tempdir().unwrap();
+    set_ffi_thumbnail_cache(&ffi_cache);
+    let ffi_dir = tempdir().unwrap();
+    let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
+    let ffi_pool = migrate_database(&ffi_db).await.expect("ffi migrate");
+    let ffi_uuid = seed_file_at_path(&ffi_pool, "image", &ffi_file).await;
+    ffi_pool.close().await;
+
+    // Act
+    let req = Request::builder()
+        .method("GET")
+        .uri(format!("/v1/files/{http_uuid}/thumbnail"))
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = app(settings.clone(), http_services)
+        .oneshot(req)
+        .await
+        .expect("http thumbnail");
+    assert_eq!(resp.status(), axum::http::StatusCode::OK);
+    let http_content_type = header_string(&resp, "content-type");
+    let http_body = to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap()
+        .to_vec();
+
+    let ffi_thumb: serde_json::Value = tokio::task::spawn_blocking(move || -> serde_json::Value {
+        let cdb = CString::new(ffi_db).unwrap();
+        assert_eq!(
+            alexandria_index_init(cdb.as_ptr()),
+            alexandria_ffi::INDEX_OK
+        );
+
+        let token = CString::new(TEST_TOKEN).unwrap();
+        let uuid_c = CString::new(ffi_uuid).unwrap();
+        let r = alexandria_file_thumbnail(uuid_c.as_ptr(), token.as_ptr());
+        assert_eq!(r.status, alexandria_ffi::PLAYBACK_OK, "ffi thumbnail");
+        assert!(!r.json.is_null());
+        let s = unsafe { CStr::from_ptr(r.json) }
+            .to_string_lossy()
+            .into_owned();
+        unsafe {
+            alexandria_free_string(r.json);
+        }
+        serde_json::from_str(&s).unwrap()
+    })
+    .await
+    .unwrap();
+
+    // Assert — the downscale-and-encode is deterministic, so the same source
+    // image thumbnailed on either surface is byte-for-byte the same JPEG.
+    use base64::Engine;
+    let ffi_bytes = base64::engine::general_purpose::STANDARD
+        .decode(ffi_thumb["bytesBase64"].as_str().expect("bytesBase64"))
+        .expect("decode base64");
+    assert_eq!(ffi_bytes, http_body, "thumbnail bytes identical");
+    assert_eq!(ffi_thumb["mimeType"], http_content_type);
+    assert_eq!(ffi_thumb["mimeType"], "image/jpeg");
+
+    // Each leg cached its one entry inside its own directory, and nowhere
+    // else — the default relative path would have written into the repository.
+    assert_eq!(std::fs::read_dir(http_cache.path()).unwrap().count(), 1);
+    assert_eq!(std::fs::read_dir(ffi_cache.path()).unwrap().count(), 1);
+}
+
+/// Playback error parity - every row of F-10's error table decides the same
+/// way on both surfaces (Testing Specification section 7.3, FR-MP-06,
+/// NFR-09).
+#[tokio::test]
+async fn given_error_conditions_when_played_then_both_surfaces_agree() {
+    // Arrange — per leg, one known text file (playable, but neither a comic
+    // nor thumbnailable) and one soft-deleted file.
+    let _g = SERIAL.lock().unwrap();
+
+    let http_lib = tempdir().unwrap();
+    let http_known = http_lib.path().join("sample.txt");
+    std::fs::write(&http_known, b"data").unwrap();
+    let http_known = http_known.to_str().unwrap().to_string();
+    let http_gone = http_lib.path().join("gone.txt");
+    std::fs::write(&http_gone, b"data").unwrap();
+    let http_gone = http_gone.to_str().unwrap().to_string();
+
+    let ffi_lib = tempdir().unwrap();
+    let ffi_known = ffi_lib.path().join("sample.txt");
+    std::fs::write(&ffi_known, b"data").unwrap();
+    let ffi_known = ffi_known.to_str().unwrap().to_string();
+    let ffi_gone = ffi_lib.path().join("gone.txt");
+    std::fs::write(&ffi_gone, b"data").unwrap();
+    let ffi_gone = ffi_gone.to_str().unwrap().to_string();
+
+    let unknown = uuid::Uuid::new_v4().to_string();
+
+    let http_cache = tempdir().unwrap();
+    let http_dir = tempdir().unwrap();
+    let http_pool = migrate_database(&db_path(&http_dir, "http.sqlite"))
+        .await
+        .expect("http migrate");
+    seed_session(&http_pool, TEST_TOKEN).await;
+    let settings = playback_settings(&http_cache);
+    let http_services = std::sync::Arc::new(build_services(&settings, http_pool.clone()).await);
+    let http_known_uuid = seed_file_at_path(&http_pool, "text", &http_known).await;
+    let http_deleted_uuid = seed_file_at_path(&http_pool, "text", &http_gone).await;
+    sqlx::query("UPDATE files SET state = 'deleted', deleted_at = ? WHERE uuid = ?")
+        .bind(chrono::Utc::now().to_rfc3339())
+        .bind(&http_deleted_uuid)
+        .execute(&http_pool)
+        .await
+        .unwrap();
+
+    let ffi_cache = tempdir().unwrap();
+    set_ffi_thumbnail_cache(&ffi_cache);
+    let ffi_dir = tempdir().unwrap();
+    let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
+    let ffi_pool = migrate_database(&ffi_db).await.expect("ffi migrate");
+    let ffi_known_uuid = seed_file_at_path(&ffi_pool, "text", &ffi_known).await;
+    let ffi_deleted_uuid = seed_file_at_path(&ffi_pool, "text", &ffi_gone).await;
+    sqlx::query("UPDATE files SET state = 'deleted', deleted_at = ? WHERE uuid = ?")
+        .bind(chrono::Utc::now().to_rfc3339())
+        .bind(&ffi_deleted_uuid)
+        .execute(&ffi_pool)
+        .await
+        .unwrap();
+    ffi_pool.close().await;
+
+    // Act — the same four requests on each surface, in the same order.
+    let mut http_statuses = Vec::new();
+    for uri in [
+        format!("/v1/files/{unknown}/stream"),
+        format!("/v1/files/{http_deleted_uuid}/stream"),
+        format!("/v1/files/{http_known_uuid}/pages/1"),
+        format!("/v1/files/{http_known_uuid}/thumbnail"),
+    ] {
+        let req = Request::builder()
+            .method("GET")
+            .uri(&uri)
+            .header("authorization", &format!("Bearer {TEST_TOKEN}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app(settings.clone(), http_services.clone())
+            .oneshot(req)
+            .await
+            .expect("http playback");
+        http_statuses.push(resp.status().as_u16());
+    }
+
+    let unknown_for_ffi = unknown.clone();
+    let ffi_statuses = tokio::task::spawn_blocking(move || -> Vec<i32> {
+        let cdb = CString::new(ffi_db).unwrap();
+        assert_eq!(
+            alexandria_index_init(cdb.as_ptr()),
+            alexandria_ffi::INDEX_OK
+        );
+
+        let token = CString::new(TEST_TOKEN).unwrap();
+        let unknown_c = CString::new(unknown_for_ffi).unwrap();
+        let deleted_c = CString::new(ffi_deleted_uuid).unwrap();
+        let known_c = CString::new(ffi_known_uuid).unwrap();
+
+        let mut out = Vec::new();
+        for uuid_c in [&unknown_c, &deleted_c] {
+            let r = alexandria_file_playback_source(uuid_c.as_ptr(), token.as_ptr());
+            assert!(r.json.is_null());
+            out.push(r.status);
+        }
+        let r = alexandria_comic_page(known_c.as_ptr(), 1, token.as_ptr());
+        assert!(r.json.is_null());
+        out.push(r.status);
+        let r = alexandria_file_thumbnail(known_c.as_ptr(), token.as_ptr());
+        assert!(r.json.is_null());
+        out.push(r.status);
+        out
+    })
+    .await
+    .unwrap();
+
+    // Assert — unknown uuid, soft-deleted, page on a non-comic, and thumbnail
+    // on a type that has none, decided identically on both surfaces.
+    assert_eq!(http_statuses, vec![404, 409, 400, 400]);
+    assert_eq!(
+        ffi_statuses,
+        vec![
+            alexandria_ffi::PLAYBACK_ERR_NOT_FOUND,
+            alexandria_ffi::PLAYBACK_ERR_INVALID_STATE,
+            alexandria_ffi::PLAYBACK_ERR_INVALID_INPUT,
+            alexandria_ffi::PLAYBACK_ERR_INVALID_INPUT,
+        ]
+    );
 }
