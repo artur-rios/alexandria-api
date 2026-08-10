@@ -53,7 +53,11 @@ about playback either way, and that silence is worth closing.
    file-ness: unbounded original bytes travel as a path (UC-38), bounded
    derived artifacts travel as base64 inside the JSON payload (UC-39, UC-40).
    Both stay within the existing FFI shape, and HTTP/FFI parity for UC-39 and
-   UC-40 is byte-exact.
+   UC-40 is byte-exact. The three new functions carry the same
+   `#[allow(unsafe_code)]` on `#[no_mangle]` that every existing FFI
+   function already carries — that targeted allow is the crate's
+   established pattern, and no raw pointer buffers or manual lifetimes are
+   introduced beyond it.
 
 4. **Comic pages are served without decoding.** A CBZ entry is already a JPEG
    or PNG. UC-39 returns the entry's raw bytes with a MIME type derived from
@@ -108,7 +112,7 @@ Document, §3.8:
 
 | UC | Name | HTTP | FFI |
 | --- | --- | --- | --- |
-| UC-38 | Stream file content | `GET /v1/files/{uuid}/content` | `alexandria_file_playback_source` |
+| UC-38 | Stream file content | `GET /v1/files/{uuid}/stream` | `alexandria_file_playback_source` |
 | UC-39 | Read a comic book page | `GET /v1/files/{uuid}/pages/{n}` | `alexandria_comic_page` |
 | UC-40 | Get a file thumbnail | `GET /v1/files/{uuid}/thumbnail` | `alexandria_file_thumbnail` |
 
@@ -136,6 +140,11 @@ existing catalog repository, reject a non-`active` file, reject one whose
 `missingAt` is set — so that lives once in `mod.rs` rather than in three
 copies.
 
+UC-38's route is `/stream`, not `/content`: `GET /v1/files/{uuid}/content`
+is already UC-32's text-content route and `PUT` on the same path is UC-33's
+editor. `/stream` also describes the operation more honestly — the response
+is a seekable byte stream, not a JSON content document.
+
 HTTP gains one `routes/playback.rs` holding all three handlers. FFI gains
 three functions and a `PLAYBACK_*` status set, following the established
 per-area convention (`INDEX_*`, `FILE_*`, `COLLECTION_*`), with
@@ -154,10 +163,18 @@ per-area convention (`INDEX_*`, `FILE_*`, `COLLECTION_*`), with
 ## Data flow
 
 **UC-38 (HTTP).** Authenticate via existing middleware → resolve UUID →
-assert `active` and not `missingAt` → derive MIME from the extension → hand
+assert `active` → reject a set `missingAt` as `Disk` → `stat` the path,
+mapping a failed `stat` to `Disk` → derive MIME from the extension → hand
 the path to `ServeFile`, which opens it, honours `Range`, and streams. The
 guard completes before any byte is written, so every failure is a clean JSON
 error response and nothing can fail halfway through a `200`.
+
+The `stat` is load-bearing twice over: it supplies `sizeBytes` for the FFI
+descriptor, and it is what turns a file that vanished without a re-index
+into a `Disk` error. Without it `ServeFile` would answer its own `404`,
+which would tell the client the catalog record does not exist when it
+plainly does. Checking `missingAt` first is a cheap short-circuit for the
+case re-index already knows about.
 
 **UC-38 (FFI).** The same guard, then `{"path", "mimeType", "sizeBytes"}`.
 No bytes cross the boundary.
@@ -217,7 +234,7 @@ No new `DomainError` variants; the existing ones and
 | --- | --- | --- | --- |
 | UUID unknown | `NotFound` | 404 | `PLAYBACK_ERR_NOT_FOUND` |
 | File is `deleted` | `InvalidState` | 409 | `PLAYBACK_ERR_INVALID_STATE` |
-| `missingAt` is set, or the read fails | `Disk` | 500 | `PLAYBACK_ERR_DISK` |
+| `missingAt` is set, or `stat`/read fails | `Disk` | 500 | `PLAYBACK_ERR_DISK` |
 | Wrong type for the operation | `InvalidInput` | 400 | `PLAYBACK_ERR_INVALID_INPUT` |
 | CBR comic page requested | `InvalidInput` | 400 | `PLAYBACK_ERR_INVALID_INPUT` |
 | Page index out of range | `InvalidInput` | 400 | `PLAYBACK_ERR_INVALID_INPUT` |
