@@ -23,14 +23,19 @@ pub fn mime_for_path(path: &str) -> &'static str {
         "opus" => "audio/opus",
         "m4a" => "audio/mp4",
         "aac" => "audio/aac",
+        "wma" => "audio/x-ms-wma",
         // video
         "mp4" | "m4v" => "video/mp4",
         "mkv" => "video/x-matroska",
         "webm" => "video/webm",
         "avi" => "video/x-msvideo",
         "mov" => "video/quicktime",
+        "mpg" | "mpeg" => "video/mpeg",
+        "wmv" => "video/x-ms-wmv",
+        "flv" => "video/x-flv",
         // html / text
         "html" | "htm" => "text/html",
+        "mhtml" => "multipart/related",
         "md" | "markdown" => "text/markdown",
         "txt" => "text/plain",
         // documents
@@ -48,6 +53,7 @@ pub fn mime_for_path(path: &str) -> &'static str {
         "webp" => "image/webp",
         "bmp" => "image/bmp",
         "tif" | "tiff" => "image/tiff",
+        "svg" => "image/svg+xml",
         _ => "application/octet-stream",
     }
 }
@@ -62,9 +68,15 @@ mod tests {
         let cases = [
             ("/lib/song.mp3", "audio/mpeg"),
             ("/lib/song.flac", "audio/flac"),
+            ("/lib/song.wma", "audio/x-ms-wma"),
             ("/lib/movie.mp4", "video/mp4"),
             ("/lib/movie.mkv", "video/x-matroska"),
+            ("/lib/movie.mpg", "video/mpeg"),
+            ("/lib/movie.mpeg", "video/mpeg"),
+            ("/lib/movie.wmv", "video/x-ms-wmv"),
+            ("/lib/movie.flv", "video/x-flv"),
             ("/lib/page.html", "text/html"),
+            ("/lib/page.mhtml", "multipart/related"),
             ("/lib/notes.md", "text/markdown"),
             ("/lib/notes.txt", "text/plain"),
             ("/lib/book.pdf", "application/pdf"),
@@ -72,6 +84,7 @@ mod tests {
             ("/lib/issue.cbz", "application/vnd.comicbook+zip"),
             ("/lib/photo.jpg", "image/jpeg"),
             ("/lib/photo.png", "image/png"),
+            ("/lib/logo.svg", "image/svg+xml"),
         ];
 
         // Act / Assert
