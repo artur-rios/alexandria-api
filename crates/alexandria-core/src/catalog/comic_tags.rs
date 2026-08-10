@@ -35,6 +35,24 @@ pub struct CbzComicMetadataReader;
 
 const IMAGE_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "gif", "webp", "bmp"];
 
+/// Does this archive entry count as a comic page?
+///
+/// The single source of truth for that question, shared by
+/// `read_cbz`'s page count (FR-FC-25) and UC-39's page index (FR-MP-04).
+/// If these two ever disagreed, "page 7" and `comicPageCount` would be
+/// describing different things.
+pub fn is_page_entry(entry_name: &str) -> bool {
+    if entry_name.eq_ignore_ascii_case("ComicInfo.xml") {
+        return false;
+    }
+    let ext = entry_name
+        .rsplit('.')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    IMAGE_EXTENSIONS.contains(&ext.as_str())
+}
+
 impl CbzComicMetadataReader {
     fn read_cbz(path: &str) -> Option<ComicTags> {
         let file = std::fs::File::open(path).ok()?;
@@ -49,8 +67,7 @@ impl CbzComicMetadataReader {
                 comic_info_index = Some(i);
                 continue;
             }
-            let ext = name.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
-            if IMAGE_EXTENSIONS.contains(&ext.as_str()) {
+            if is_page_entry(&name) {
                 page_count += 1;
             }
         }
@@ -303,5 +320,18 @@ mod tests {
         let tags = reader.read(path.to_str().unwrap()).await;
 
         assert!(tags.is_none(), ".cbr is not attempted at all");
+    }
+
+    #[test]
+    fn given_archive_entry_names_when_tested_then_only_images_are_pages() {
+        // Arrange / Act / Assert — the metadata file is not a page, nor is a
+        // non-image sidecar; every image extension the catalog recognizes is.
+        assert!(!is_page_entry("ComicInfo.xml"));
+        assert!(!is_page_entry("comicinfo.xml"));
+        assert!(!is_page_entry("notes.txt"));
+        assert!(is_page_entry("page001.jpg"));
+        assert!(is_page_entry("page002.JPEG"));
+        assert!(is_page_entry("sub/dir/page003.png"));
+        assert!(is_page_entry("page004.webp"));
     }
 }
