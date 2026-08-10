@@ -5,8 +5,10 @@
 -- rather than resetting progress that UC-23 may have already advanced.
 --
 -- No FOREIGN KEY, for the same reason the collections/bookmarks migrations
--- have none: SQLite cannot add one via ALTER TABLE, and nothing in this
--- workspace sets `PRAGMA foreign_keys = ON`.
+-- have none: SQLite cannot add one via ALTER TABLE. Foreign keys are enforced
+-- in this workspace (sqlx sets `PRAGMA foreign_keys = ON` per connection), so
+-- the absence here is exactly why purging a file must delete this table's rows
+-- explicitly — nothing cascades to them.
 CREATE TABLE IF NOT EXISTS watch_progress (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     watchlist_id    INTEGER NOT NULL,

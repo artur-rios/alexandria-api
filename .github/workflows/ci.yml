@@ -49,3 +49,43 @@ jobs:
 
       - name: Test
         run: cargo test --workspace
+
+  # NFR-02 (indexing throughput) and NFR-01's read latency under load are
+  # measurements, not assertions, so they are deliberately not part of the gate
+  # above: a shared runner's throughput says more about the runner than about
+  # the commit. This job exists so the harness cannot rot unnoticed and so the
+  # figures are recorded run over run — read them in the log.
+  #
+  # It runs without ALEXANDRIA_NFR_STRICT, so the assertions are the loose
+  # floors (see the Testing Specification Document §9): low enough that runner
+  # noise cannot trip them, tight enough to catch a re-serialized walk or
+  # blocking I/O back on the async runtime. The requirement's actual 500
+  # files/sec target is verified on a developer machine, which is what NFR-02
+  # scopes it to.
+  performance:
+    name: performance (non-gating)
+    runs-on: ubuntu-latest
+    # Only on main: on a pull request this would double CI time to report a
+    # number nobody reviews.
+    if: github.event_name == 'push'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install ffmpeg dev libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libavformat-dev libavcodec-dev libavutil-dev \
+            libavfilter-dev libavdevice-dev libswscale-dev \
+            libswresample-dev pkg-config clang
+
+      - name: Install the toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and build output
+        uses: Swatinem/rust-cache@v2
+
+      - name: Measure indexing throughput and read latency
+        run: |
+          cargo test -p alexandria-core --test throughput \
+            -- --ignored --nocapture --test-threads=1

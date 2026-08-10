@@ -219,11 +219,7 @@ impl SqliteCatalogRepository {
     /// This is belt-and-braces, not a necessity: the subtype tables declare
     /// `FOREIGN KEY (file_id) REFERENCES files (id) ON DELETE CASCADE`, and the
     /// cascade **is** live, because sqlx sets `PRAGMA foreign_keys = ON` on
-    /// every connection it opens (verified: the pragma reads back as `1`).
-    /// Several comments in the `migrations/` folder claim the opposite. They
-    /// are wrong and cannot be corrected in place — sqlx checksums migration
-    /// files and would reject any already-migrated database with a
-    /// `VersionMismatch` — so treat this comment as the accurate one.
+    /// every connection it opens (pinned by a test in `tests/migrations.rs`).
     ///
     /// The explicit delete stays because it makes the purge self-contained
     /// rather than dependent on a pragma default that sqlx could change. What

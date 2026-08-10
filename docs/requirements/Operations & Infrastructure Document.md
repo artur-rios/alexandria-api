@@ -110,6 +110,25 @@ alexandria-api/
 | IR-05 | Database migrations shall run at startup before the server begins serving requests. |
 | IR-06 | The solution shall generate a C header for the FFI surface (via cbindgen) as part of the build, for the Flutter front-end to consume. |
 
+### 2.5 Migrations are append-only
+
+sqlx records a checksum of every applied migration's **file content** and
+refuses to run against a database whose stored checksum no longer matches,
+failing with `VersionMismatch`. Editing a migration that has already run —
+including changing only a comment — therefore breaks every existing database,
+not just schema-relevant edits.
+
+The rule: once a migration has been applied anywhere it must be treated as
+frozen; corrections go in a new migration. A database that has drifted (because
+a migration was edited before this rule was written down) is repaired by
+re-syncing the stored checksum, or, in development, by deleting the database
+file and letting it rebuild:
+
+```sql
+-- inspect what the database believes it applied
+SELECT version, description, checksum FROM _sqlx_migrations ORDER BY version;
+```
+
 ---
 
 ## 3. Configuration

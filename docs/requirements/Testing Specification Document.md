@@ -196,7 +196,47 @@ Apply this every time a use case is implemented:
 5. Run the suite; fix failures; re-run until green.
 6. Commit the implementation and its tests together on the feature branch.
 
-## 9. Running the suites
+## 9. Performance requirements (NFR-01, NFR-02)
+
+Functional requirements are verified by assertions; performance requirements
+are **measurements**, and the two do not belong in the same gate. A throughput
+floor is a statement about a machine, so asserting 500 files/sec inside
+`cargo test --workspace` would make the suite report on the runner rather than
+on the code.
+
+`alexandria-core/tests/throughput.rs` measures both halves of NFR-02 — the
+indexing rate, and that reads keep being served while a run is in flight
+(NFR-01's p95 during load). Its tests are `#[ignore]`d and run on request:
+
+```bash
+cargo test -p alexandria-core --test throughput -- --ignored --nocapture
+```
+
+`--nocapture` is required: the measured figures are printed, and the figures
+are the deliverable. Two assertion modes:
+
+| Mode | Asserts | For |
+| --- | --- | --- |
+| default | loose floors (≥ 50 files/sec, p95 < 2 s) | catching a real regression — a re-serialized walk, or blocking I/O back on the async runtime — without flaking on a shared runner |
+| `ALEXANDRIA_NFR_STRICT=1` | the requirement itself (≥ 500 files/sec, p95 < 200 ms) | verifying NFR-02 on "a personal machine", which is what the requirement scopes it to |
+
+Fixture size is tunable via `ALEXANDRIA_BENCH_FILES`,
+`ALEXANDRIA_BENCH_FILE_BYTES`, and `ALEXANDRIA_BENCH_CONCURRENCY`.
+
+**What the number covers.** The fixture is plain text files, so it measures the
+walk → classify → hash → persist pipeline (FR-FC-01..09). It excludes
+per-format metadata extraction (FR-FC-25), whose cost belongs to lofty / lopdf
+/ ffmpeg and the file rather than to this crate — a fixture of synthetic MP4s
+would report ffmpeg's probe speed under the banner of Alexandria's indexing
+rate. A real media library indexes more slowly, dominated by extraction. If
+that figure is ever needed, it warrants its own fixture and its own number
+rather than being folded into this one.
+
+CI runs these on pushes to `main` as a separate, non-gating job, so the numbers
+are recorded over time and the harness cannot rot, without a noisy runner
+turning a red build into something to ignore.
+
+## 10. Running the suites
 
 ```bash
 cargo test
@@ -209,6 +249,7 @@ cargo test
 | Integration tests | `cargo test --test '*'` |
 | Parity tests | `cargo test --package alexandria-ffi --test parity` |
 | Auth tests | `cargo test --package alexandria-core --test auth` |
+| Performance (§9) | `cargo test -p alexandria-core --test throughput -- --ignored --nocapture` |
 | With coverage | `cargo tarpaulin` (optional) |
 
 Categories are separated by crate and test file; parity tests live in their own

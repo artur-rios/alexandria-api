@@ -5,8 +5,10 @@
 --
 -- No FOREIGN KEY on `collection_id`, for the same reason `files.collection_id`
 -- has none (see the collections migration's note): SQLite cannot add one via
--- ALTER TABLE, and nothing in this workspace sets
--- `PRAGMA foreign_keys = ON` regardless.
+-- ALTER TABLE. Foreign keys are enforced in this workspace (sqlx sets
+-- `PRAGMA foreign_keys = ON` per connection), so the absence here is what
+-- makes UC-12's unlink of a bookmark collection's members a manual step
+-- rather than a cascade.
 CREATE TABLE IF NOT EXISTS bookmarks (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     uuid          TEXT    NOT NULL UNIQUE,

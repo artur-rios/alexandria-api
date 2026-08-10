@@ -8,8 +8,10 @@
 -- already advanced.
 --
 -- No FOREIGN KEY, for the same reason `watch_progress` has none: SQLite
--- cannot add one via ALTER TABLE, and nothing in this workspace sets
--- `PRAGMA foreign_keys = ON`.
+-- cannot add one via ALTER TABLE. Foreign keys are enforced in this workspace
+-- (sqlx sets `PRAGMA foreign_keys = ON` per connection), so the absence here is
+-- exactly why purging a file must delete this table's rows explicitly —
+-- nothing cascades to them.
 CREATE TABLE IF NOT EXISTS reading_progress (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     reading_list_id INTEGER NOT NULL,

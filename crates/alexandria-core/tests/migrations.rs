@@ -60,10 +60,11 @@ async fn given_fresh_in_memory_db_when_migrate_then_collections_table_exists() {
 /// regression here would silently reintroduce whole-database write locks.
 ///
 /// `foreign_keys = 1` is set by sqlx, not by us — which means the subtype
-/// tables' `ON DELETE CASCADE` is live. Several `migrations/` comments claim
-/// foreign keys are off; they are frozen by sqlx's migration checksums and
-/// cannot be corrected in place, so this test is where the real behaviour is
-/// recorded.
+/// tables' `ON DELETE CASCADE` is live, while the tables that declare no
+/// foreign key (`watch_progress`, `reading_progress`, both `collection_id`
+/// columns) get no cleanup for free. The whole codebase assumed the opposite
+/// until this was measured, so the behaviour is pinned here rather than
+/// described in prose.
 #[tokio::test]
 async fn given_migrated_database_when_connected_then_wal_and_foreign_keys_enabled() {
     let dir = tempfile::tempdir().expect("tempdir");
