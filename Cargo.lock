@@ -43,6 +43,7 @@ dependencies = [
  "little_exif",
  "lofty",
  "lopdf",
+ "quick-xml",
  "reqwest",
  "serde",
  "serde_json",
