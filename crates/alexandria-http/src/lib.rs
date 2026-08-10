@@ -45,6 +45,7 @@ pub fn app(settings: Settings, services: Arc<Services>) -> Router {
             "/v1/files/{uuid}/content",
             put(routes::text_content::edit_content),
         )
+        .route("/v1/files/{uuid}/stream", get(routes::playback::stream))
         .route("/v1/files/{uuid}", get(routes::browse::get_file))
         .route("/v1/files/{uuid}", delete(routes::delete_file::delete_file))
         .route("/v1/files/{uuid}/restore", post(routes::restore::restore))
