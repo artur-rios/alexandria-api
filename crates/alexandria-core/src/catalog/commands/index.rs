@@ -11,6 +11,7 @@ use crate::catalog::fs::{FileEntry, Filesystem};
 use crate::catalog::image_tags::ImageMetadataReader;
 use crate::catalog::model::{FileType, NewFile};
 use crate::catalog::repos::CatalogRepository;
+use crate::catalog::video_tags::VideoMetadataReader;
 use crate::errors::DomainError;
 
 #[derive(Debug, Clone)]
@@ -49,7 +50,7 @@ pub struct IndexOutcome {
 /// against trait fakes (no real DB, filesystem, or auth service in unit
 /// tests), then wired with the concrete Sqlite/StdFilesystem/Bearer/services
 /// at runtime.
-pub struct IndexHandler<A, R, F, C, M, N, O> {
+pub struct IndexHandler<A, R, F, C, M, N, O, P> {
     auth: A,
     repo: R,
     fs: F,
@@ -57,9 +58,10 @@ pub struct IndexHandler<A, R, F, C, M, N, O> {
     audio_tags: M,
     image_tags: N,
     document_tags: O,
+    video_tags: P,
 }
 
-impl<A, R, F, C, M, N, O> IndexHandler<A, R, F, C, M, N, O>
+impl<A, R, F, C, M, N, O, P> IndexHandler<A, R, F, C, M, N, O, P>
 where
     A: AuthService,
     R: CatalogRepository,
@@ -68,7 +70,9 @@ where
     M: AudioMetadataReader,
     N: ImageMetadataReader,
     O: DocumentMetadataReader,
+    P: VideoMetadataReader,
 {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         auth: A,
         repo: R,
@@ -77,6 +81,7 @@ where
         audio_tags: M,
         image_tags: N,
         document_tags: O,
+        video_tags: P,
     ) -> Self {
         Self {
             auth,
@@ -86,6 +91,7 @@ where
             audio_tags,
             image_tags,
             document_tags,
+            video_tags,
         }
     }
 
@@ -277,6 +283,47 @@ where
                             path = %entry.path,
                             error = %err,
                             "indexed but failed to write extracted document metadata"
+                        );
+                    }
+                }
+            }
+        }
+
+        // Best-effort video metadata prefill (issue #44 video slice). Two
+        // independent writes: duration (outside SubtypeMetadata, via
+        // set_video_duration) and title/year/resolution (via the shared
+        // update_metadata, media_kind always None — it is not inferable
+        // from the file). Neither write's failure blocks the other or
+        // fails indexing.
+        if file_type == FileType::Video {
+            if let Some(tags) = self.video_tags.read(&entry.path).await {
+                if let Some(crate::catalog::video_tags::VideoDuration(duration_seconds)) =
+                    tags.duration_seconds
+                {
+                    if let Err(err) = self
+                        .repo
+                        .set_video_duration(file.uuid, duration_seconds)
+                        .await
+                    {
+                        tracing::warn!(
+                            path = %entry.path,
+                            error = %err,
+                            "indexed but failed to write extracted video duration"
+                        );
+                    }
+                }
+                if tags.title.is_some() || tags.year.is_some() || tags.resolution.is_some() {
+                    let metadata = crate::catalog::model::SubtypeMetadata::Video {
+                        title: tags.title,
+                        year: tags.year,
+                        resolution: tags.resolution,
+                        media_kind: None,
+                    };
+                    if let Err(err) = self.repo.update_metadata(file.uuid, &metadata).await {
+                        tracing::warn!(
+                            path = %entry.path,
+                            error = %err,
+                            "indexed but failed to write extracted video metadata"
                         );
                     }
                 }

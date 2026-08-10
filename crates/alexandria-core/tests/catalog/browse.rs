@@ -352,6 +352,46 @@ async fn given_non_document_file_when_get_by_uuid_then_page_count_none() {
     assert_eq!(view.page_count, None);
 }
 
+#[tokio::test]
+async fn given_video_with_extracted_duration_when_get_by_uuid_then_duration_present() {
+    let repo = FakeCatalogRepository::new();
+    let file = existing_file_with_hash("/lib/movie.mp4", "movie", FileType::Video, "h");
+    let uuid = file.uuid;
+    repo.seed(file);
+    repo.set_video_duration(uuid, 125.5).await.unwrap();
+
+    let h = handler(FakeAuth::Allowing, repo);
+    let view = h.get_by_uuid(uuid, TOKEN).await.expect("get");
+
+    assert_eq!(view.duration_seconds, Some(125.5));
+}
+
+#[tokio::test]
+async fn given_video_with_no_extracted_duration_when_get_by_uuid_then_duration_none() {
+    let repo = FakeCatalogRepository::new();
+    let file = existing_file_with_hash("/lib/movie.mp4", "movie", FileType::Video, "h");
+    let uuid = file.uuid;
+    repo.seed(file);
+
+    let h = handler(FakeAuth::Allowing, repo);
+    let view = h.get_by_uuid(uuid, TOKEN).await.expect("get");
+
+    assert_eq!(view.duration_seconds, None);
+}
+
+#[tokio::test]
+async fn given_non_video_file_when_get_by_uuid_then_duration_none() {
+    let repo = FakeCatalogRepository::new();
+    let file = existing_file_with_hash("/lib/song.mp3", "song", FileType::Audio, "h");
+    let uuid = file.uuid;
+    repo.seed(file);
+
+    let h = handler(FakeAuth::Allowing, repo);
+    let view = h.get_by_uuid(uuid, TOKEN).await.expect("get");
+
+    assert_eq!(view.duration_seconds, None);
+}
+
 // AF-01: requested UUID does not exist
 
 #[tokio::test]

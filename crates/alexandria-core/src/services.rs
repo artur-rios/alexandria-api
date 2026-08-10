@@ -32,6 +32,7 @@ use crate::catalog::image_tags::ExifImageMetadataReader;
 use crate::catalog::queries::browse::BrowseFilesHandler;
 use crate::catalog::queries::read_content::ReadTextFileContentHandler;
 use crate::catalog::repos::SqliteCatalogRepository;
+use crate::catalog::video_tags::FfmpegVideoMetadataReader;
 use crate::collections::commands::add_items::AddItemsToCollectionHandler;
 use crate::collections::commands::create::CreateCollectionHandler;
 use crate::collections::commands::delete::DeleteCollectionHandler;
@@ -68,6 +69,7 @@ pub type DefaultIndexHandler = IndexHandler<
     LoftyAudioMetadataReader,
     ExifImageMetadataReader,
     PdfEpubMetadataReader,
+    FfmpegVideoMetadataReader,
 >;
 
 pub type DefaultRefreshHandler =
@@ -269,6 +271,7 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
     let audio_tags = LoftyAudioMetadataReader;
     let image_tags = ExifImageMetadataReader;
     let document_tags = PdfEpubMetadataReader;
+    let video_tags = FfmpegVideoMetadataReader;
     let index_handler = Arc::new(IndexHandler::new(
         auth.clone(),
         repo.clone(),
@@ -277,6 +280,7 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         audio_tags,
         image_tags,
         document_tags,
+        video_tags,
     ));
     let refresh_handler = Arc::new(RefreshHandler::new(auth.clone(), repo.clone(), fs, clock));
     let edit_metadata_handler = Arc::new(EditMetadataHandler::new(auth.clone(), repo.clone()));

@@ -18,6 +18,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # ffmpeg-next's underlying ffmpeg-sys-next crate needs the ffmpeg C
+      # dev libraries at build time (issue #44 video slice) — the first
+      # system dependency this workspace has needed.
+      - name: Install ffmpeg dev libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libavformat-dev libavcodec-dev libavutil-dev \
+            libavfilter-dev libavdevice-dev libswscale-dev \
+            libswresample-dev pkg-config clang
+
       - name: Install the toolchain
         uses: dtolnay/rust-toolchain@stable
         with:

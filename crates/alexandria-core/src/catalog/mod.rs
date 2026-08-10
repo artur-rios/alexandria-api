@@ -8,3 +8,4 @@ pub mod image_tags;
 pub mod model;
 pub mod queries;
 pub mod repos;
+pub mod video_tags;

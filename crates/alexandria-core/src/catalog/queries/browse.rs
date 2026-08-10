@@ -120,12 +120,22 @@ where
             None
         };
 
+        // Issue #44 video slice: duration_seconds lives outside
+        // `SubtypeMetadata` (see `find_video_duration`'s doc comment), so
+        // it's fetched separately and only for video files.
+        let duration_seconds = if file.file_type == FileType::Video {
+            self.repo.find_video_duration(uuid).await?
+        } else {
+            None
+        };
+
         Ok(FileView {
             file,
             metadata,
             width,
             height,
             page_count,
+            duration_seconds,
         })
     }
 }

@@ -29,6 +29,7 @@ use alexandria_core::catalog::model::{
     File, FileState, FileType, NewFile, StateFilter, SubtypeMetadata,
 };
 use alexandria_core::catalog::repos::CatalogRepository;
+use alexandria_core::catalog::video_tags::{VideoMetadataReader, VideoTags};
 use alexandria_core::collections::model::{Collection, NewCollection};
 use alexandria_core::collections::repos::CollectionRepository;
 use alexandria_core::config::AuthMode;
@@ -103,6 +104,9 @@ pub struct FakeCatalogRepository {
     /// Page count last written for `uuid` via `set_document_page_count`
     /// (issue #44 document slice).
     document_page_counts: Arc<Mutex<HashMap<Uuid, i64>>>,
+    /// Duration (seconds) last written for `uuid` via `set_video_duration`
+    /// (issue #44 video slice).
+    video_durations: Arc<Mutex<HashMap<Uuid, f64>>>,
 }
 
 impl FakeCatalogRepository {
@@ -208,6 +212,12 @@ impl FakeCatalogRepository {
             .unwrap()
             .get(&uuid)
             .copied()
+    }
+
+    /// Duration (seconds) last written for `uuid` via `set_video_duration`.
+    /// `None` means no call has landed for that file yet.
+    pub fn video_duration_for(&self, uuid: Uuid) -> Option<f64> {
+        self.video_durations.lock().unwrap().get(&uuid).copied()
     }
 }
 
@@ -405,6 +415,40 @@ impl CatalogRepository for FakeCatalogRepository {
             .unwrap()
             .get(&uuid)
             .copied())
+    }
+
+    async fn set_video_duration(
+        &self,
+        uuid: Uuid,
+        duration_seconds: f64,
+    ) -> Result<(), DomainError> {
+        let files = self.files.lock().unwrap();
+        let file = files
+            .values()
+            .find(|f| f.uuid == uuid)
+            .ok_or(DomainError::NotFound)?;
+        if file.file_type != alexandria_core::catalog::model::FileType::Video {
+            return Err(DomainError::InvalidInput("file is not a video".into()));
+        }
+        drop(files);
+        self.video_durations
+            .lock()
+            .unwrap()
+            .insert(uuid, duration_seconds);
+        Ok(())
+    }
+
+    async fn find_video_duration(&self, uuid: Uuid) -> Result<Option<f64>, DomainError> {
+        let files = self.files.lock().unwrap();
+        let file = match files.values().find(|f| f.uuid == uuid) {
+            Some(f) => f,
+            None => return Ok(None),
+        };
+        if file.file_type != alexandria_core::catalog::model::FileType::Video {
+            return Ok(None);
+        }
+        drop(files);
+        Ok(self.video_durations.lock().unwrap().get(&uuid).copied())
     }
 
     async fn rename_file(
@@ -1663,6 +1707,42 @@ impl FakeDocumentMetadataReader {
 
 impl DocumentMetadataReader for FakeDocumentMetadataReader {
     async fn read(&self, path: &str) -> Option<DocumentTags> {
+        *self.call_count.lock().unwrap() += 1;
+        self.tags.lock().unwrap().get(path).cloned()
+    }
+}
+
+/// In-memory video reader (issue #44 video slice). `read()` answers
+/// `None` for any path with no seeded tags, mirroring "couldn't open
+/// container / no video stream / no metadata" — the same outcome
+/// `FfmpegVideoMetadataReader` produces for those cases. Also counts
+/// calls, so a test can assert the reader was never consulted at all
+/// (e.g. for a non-video file).
+#[derive(Debug, Default, Clone)]
+pub struct FakeVideoMetadataReader {
+    tags: Arc<Mutex<HashMap<String, VideoTags>>>,
+    call_count: Arc<Mutex<usize>>,
+}
+
+impl FakeVideoMetadataReader {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Seed the tags `read()` returns for `path`.
+    pub fn seed(&self, path: &str, tags: VideoTags) -> &Self {
+        self.tags.lock().unwrap().insert(path.to_string(), tags);
+        self
+    }
+
+    /// How many times `read()` has been called.
+    pub fn call_count(&self) -> usize {
+        *self.call_count.lock().unwrap()
+    }
+}
+
+impl VideoMetadataReader for FakeVideoMetadataReader {
+    async fn read(&self, path: &str) -> Option<VideoTags> {
         *self.call_count.lock().unwrap() += 1;
         self.tags.lock().unwrap().get(path).cloned()
     }
