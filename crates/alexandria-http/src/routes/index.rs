@@ -20,9 +20,10 @@ pub struct IndexBody {
 /// (UC-01 / FR-FC-01..09). Returns `202` with the run id; the scan runs on a
 /// spawned task (FR-FC-08).
 ///
-/// The body is taken as `Result` so a rejection becomes this surface's `400`
-/// + `{"error": …}` envelope rather than axum's bare-text `422`, matching
-/// what the FFI surface reports for the same payload (FR-FC-24 / NFR-09).
+/// The body is taken as `Result` so a rejection becomes this surface's
+/// `400` + `{"error": …}` envelope rather than axum's bare-text `422`,
+/// matching what the FFI surface reports for the same payload
+/// (FR-FC-24 / NFR-09).
 pub async fn index(
     State(state): State<AppState>,
     headers: HeaderMap,
