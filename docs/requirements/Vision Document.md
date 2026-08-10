@@ -26,6 +26,9 @@ libraries; perform complex media editing (audio/video re-encoding, image
 manipulation); store or duplicate file bytes; automatically remove files from
 disk; or issue its own JWTs in external-auth mode.
 
+Serving a file's bytes for playback is **in scope**: Alexandria streams them
+unmodified, which is not the media editing excluded above.
+
 ### 1.3 Definitions and Acronyms
 
 | Term | Definition |
