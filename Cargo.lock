@@ -67,6 +67,7 @@ dependencies = [
  "alexandria-core",
  "alexandria-http",
  "axum",
+ "base64",
  "cbindgen",
  "chrono",
  "ffmpeg-next",

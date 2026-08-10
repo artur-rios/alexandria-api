@@ -20,6 +20,7 @@ alexandria-core = { path = "crates/alexandria-core" }
 anyhow = "1"
 argon2 = { version = "0.5", features = ["std"] }
 axum = "0.8"
+base64 = "0.22"
 cbindgen = "0.29"
 chrono = { version = "0.4", features = ["serde"] }
 epub = "2"
