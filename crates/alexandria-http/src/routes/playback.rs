@@ -71,3 +71,63 @@ pub async fn stream(
 
     Ok(response)
 }
+
+/// `GET /v1/files/{uuid}/pages/{page}` — one page of a CBZ ComicBook
+/// (UC-39 / FR-MP-04), 1-based. Returns `200` with the archive entry's own
+/// bytes, undecoded. Errors are `400` (not a comic, not a CBZ, page out of
+/// range, malformed path), `401`, `404`, `409`, `500`.
+pub async fn comic_page(
+    State(state): State<AppState>,
+    path: Result<Path<(Uuid, u32)>, PathRejection>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    let token = bearer_token(&headers);
+
+    let Path((uuid, page)) =
+        path.map_err(|_| invalid_input("path segments must be a UUID and a page number"))?;
+
+    let page = state
+        .services
+        .comic_page_handler
+        .read_page(uuid, page, &token)
+        .await
+        .map_err(ApiError)?;
+
+    let content_type = HeaderValue::from_str(&page.mime_type)
+        .unwrap_or(HeaderValue::from_static("application/octet-stream"));
+
+    Ok((
+        [(axum::http::header::CONTENT_TYPE, content_type)],
+        page.bytes,
+    )
+        .into_response())
+}
+
+/// `GET /v1/files/{uuid}/thumbnail` — a downscaled JPEG for a video, image,
+/// or comic (UC-40 / FR-MP-05). Errors are `400` (a type with no
+/// thumbnail), `401`, `404`, `409`, `500`.
+pub async fn thumbnail(
+    State(state): State<AppState>,
+    uuid: Result<Path<Uuid>, PathRejection>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    let token = bearer_token(&headers);
+
+    let Path(uuid) = uuid.map_err(|_| invalid_input("path segment is not a valid UUID"))?;
+
+    let thumb = state
+        .services
+        .thumbnail_handler
+        .thumbnail(uuid, &token)
+        .await
+        .map_err(ApiError)?;
+
+    Ok((
+        [(
+            axum::http::header::CONTENT_TYPE,
+            HeaderValue::from_static("image/jpeg"),
+        )],
+        thumb.bytes,
+    )
+        .into_response())
+}

@@ -31,6 +31,19 @@ pub struct TestApp {
 pub const TEST_TOKEN: &str = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
 
 pub async fn test_app() -> TestApp {
+    let mut settings = Settings::default();
+    settings.auth.mode = AuthMode::Local;
+    test_app_with_settings(settings).await
+}
+
+/// Like [`test_app`], but lets the caller override `Settings` before
+/// `build_services` runs — e.g. to point `playback.thumbnail_cache_dir` at a
+/// path inside a test's own `TempDir` instead of the default relative
+/// `"thumbnails"`, which would otherwise write into the test process's
+/// working directory (the repository itself). `settings.auth.mode` is forced
+/// to `Local` regardless of what the caller passed in, matching `test_app`,
+/// so `TEST_TOKEN` always authenticates.
+pub async fn test_app_with_settings(mut settings: Settings) -> TestApp {
     let dir = tempfile::tempdir().expect("tempdir");
     let db_path = dir.path().join("alexandria.sqlite");
     let pool = migrate_database(db_path.to_str().expect("path"))
@@ -38,7 +51,6 @@ pub async fn test_app() -> TestApp {
         .expect("migrate");
     seed_session(&pool, TEST_TOKEN).await;
 
-    let mut settings = Settings::default();
     settings.auth.mode = AuthMode::Local;
 
     let services = std::sync::Arc::new(services::build_services(&settings, pool.clone()).await);
@@ -121,4 +133,67 @@ pub fn write_file(dir: &tempfile::TempDir, name: &str, contents: &[u8]) -> std::
     let path = dir.path().join(name);
     std::fs::write(&path, contents).expect("write");
     path
+}
+
+/// A tiny, real, valid JPEG — deterministic per `seed` so a test can
+/// recompute the exact bytes an archive entry was written with just by
+/// calling this again with the same seed, without `write_cbz` having to hand
+/// back a bytes map. The color is derived from `seed`'s bytes, so different
+/// entries encode to different (but still real, decodable) JPEGs.
+pub fn jpeg_bytes_for(seed: &str) -> Vec<u8> {
+    let sum: u32 = seed.bytes().map(u32::from).sum();
+    let pixel = image::Rgb([(sum % 256) as u8, ((sum / 3) % 256) as u8, 128]);
+    let img = image::RgbImage::from_pixel(4, 4, pixel);
+    let mut out = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new(&mut out)
+        .encode_image(&image::DynamicImage::ImageRgb8(img))
+        .expect("encode jpeg");
+    out
+}
+
+/// Write a real CBZ (ZIP) archive at `dir/name` containing one real JPEG per
+/// entry in `entries`, in exactly the order given — callers deliberately
+/// pass entries out of page order to prove a reader sorts rather than
+/// trusting archive order. Each entry's bytes are `jpeg_bytes_for(entry)`.
+pub fn write_cbz(dir: &tempfile::TempDir, name: &str, entries: &[&str]) -> std::path::PathBuf {
+    use std::io::Write;
+    use zip::write::SimpleFileOptions;
+
+    let path = dir.path().join(name);
+    let file = std::fs::File::create(&path).expect("create cbz file");
+    let mut zip = zip::ZipWriter::new(file);
+    let options = SimpleFileOptions::default();
+
+    for entry in entries {
+        zip.start_file(*entry, options).expect("start entry");
+        zip.write_all(&jpeg_bytes_for(entry)).expect("write entry");
+    }
+
+    zip.finish().expect("finish cbz zip");
+    path
+}
+
+/// Write a real PNG of `width` x `height` at `dir/name`.
+pub fn write_image(
+    dir: &tempfile::TempDir,
+    name: &str,
+    width: u32,
+    height: u32,
+) -> std::path::PathBuf {
+    let path = dir.path().join(name);
+    let img = image::RgbImage::from_pixel(width, height, image::Rgb([200, 60, 30]));
+    image::DynamicImage::ImageRgb8(img)
+        .save(&path)
+        .expect("write png");
+    path
+}
+
+/// Count entries in a directory, treating a missing directory as zero — the
+/// thumbnail cache directory does not exist until the first thumbnail is
+/// written.
+pub fn count_dir_entries(dir: &std::path::Path) -> usize {
+    match std::fs::read_dir(dir) {
+        Ok(entries) => entries.count(),
+        Err(_) => 0,
+    }
 }

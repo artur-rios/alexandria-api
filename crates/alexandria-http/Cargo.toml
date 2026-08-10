@@ -23,8 +23,10 @@ uuid.workspace = true
 
 [dev-dependencies]
 chrono.workspace = true
+image.workspace = true
 serde_json.workspace = true
 sqlx.workspace = true
 tempfile.workspace = true
 tower.workspace = true
 uuid.workspace = true
+zip.workspace = true
