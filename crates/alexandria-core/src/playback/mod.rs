@@ -4,6 +4,7 @@
 //! This module resolves a catalog record to on-disk bytes and, for two
 //! types, to a bounded derived artifact — a comic page or a thumbnail.
 
+pub mod comic_page;
 pub mod mime;
 pub mod source;
 

@@ -47,12 +47,12 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 walkdir = "2"
+zip = "2"
 
 # dev-only
 image = { version = "0.25", default-features = false, features = ["jpeg"] }
 little_exif = "0.6"
 tempfile = "3"
-zip = "2"
 
 [profile.release]
 lto = true
