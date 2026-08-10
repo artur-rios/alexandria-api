@@ -17,6 +17,7 @@ use crate::bookmarks::queries::browse::BrowseBookmarksHandler;
 use crate::bookmarks::repos::SqliteBookmarkRepository;
 use crate::catalog::audio_tags::LoftyAudioMetadataReader;
 use crate::catalog::clock::SystemClock;
+use crate::catalog::comic_tags::CbzComicMetadataReader;
 use crate::catalog::commands::edit_content::EditTextFileContentHandler;
 use crate::catalog::commands::edit_metadata::EditMetadataHandler;
 use crate::catalog::commands::index::IndexHandler;
@@ -70,6 +71,7 @@ pub type DefaultIndexHandler = IndexHandler<
     ExifImageMetadataReader,
     PdfEpubMetadataReader,
     FfmpegVideoMetadataReader,
+    CbzComicMetadataReader,
 >;
 
 pub type DefaultRefreshHandler =
@@ -272,6 +274,7 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
     let image_tags = ExifImageMetadataReader;
     let document_tags = PdfEpubMetadataReader;
     let video_tags = FfmpegVideoMetadataReader;
+    let comic_tags = CbzComicMetadataReader;
     let index_handler = Arc::new(IndexHandler::new(
         auth.clone(),
         repo.clone(),
@@ -281,6 +284,7 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         image_tags,
         document_tags,
         video_tags,
+        comic_tags,
     ));
     let refresh_handler = Arc::new(RefreshHandler::new(auth.clone(), repo.clone(), fs, clock));
     let edit_metadata_handler = Arc::new(EditMetadataHandler::new(auth.clone(), repo.clone()));

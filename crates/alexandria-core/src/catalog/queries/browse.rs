@@ -129,6 +129,15 @@ where
             None
         };
 
+        // Issue #44 comic slice: comic_page_count lives outside
+        // `SubtypeMetadata` (see `find_comic_page_count`'s doc comment),
+        // so it's fetched separately and only for comic files.
+        let comic_page_count = if file.file_type == FileType::Comic {
+            self.repo.find_comic_page_count(uuid).await?
+        } else {
+            None
+        };
+
         Ok(FileView {
             file,
             metadata,
@@ -136,6 +145,7 @@ where
             height,
             page_count,
             duration_seconds,
+            comic_page_count,
         })
     }
 }

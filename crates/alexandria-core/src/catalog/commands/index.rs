@@ -6,6 +6,7 @@ use crate::auth::AuthService;
 use crate::catalog::audio_tags::AudioMetadataReader;
 use crate::catalog::classify::classify_by_extension;
 use crate::catalog::clock::Clock;
+use crate::catalog::comic_tags::ComicMetadataReader;
 use crate::catalog::document_tags::DocumentMetadataReader;
 use crate::catalog::fs::{FileEntry, Filesystem};
 use crate::catalog::image_tags::ImageMetadataReader;
@@ -50,7 +51,7 @@ pub struct IndexOutcome {
 /// against trait fakes (no real DB, filesystem, or auth service in unit
 /// tests), then wired with the concrete Sqlite/StdFilesystem/Bearer/services
 /// at runtime.
-pub struct IndexHandler<A, R, F, C, M, N, O, P> {
+pub struct IndexHandler<A, R, F, C, M, N, O, P, Q> {
     auth: A,
     repo: R,
     fs: F,
@@ -59,9 +60,10 @@ pub struct IndexHandler<A, R, F, C, M, N, O, P> {
     image_tags: N,
     document_tags: O,
     video_tags: P,
+    comic_tags: Q,
 }
 
-impl<A, R, F, C, M, N, O, P> IndexHandler<A, R, F, C, M, N, O, P>
+impl<A, R, F, C, M, N, O, P, Q> IndexHandler<A, R, F, C, M, N, O, P, Q>
 where
     A: AuthService,
     R: CatalogRepository,
@@ -71,6 +73,7 @@ where
     N: ImageMetadataReader,
     O: DocumentMetadataReader,
     P: VideoMetadataReader,
+    Q: ComicMetadataReader,
 {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -82,6 +85,7 @@ where
         image_tags: N,
         document_tags: O,
         video_tags: P,
+        comic_tags: Q,
     ) -> Self {
         Self {
             auth,
@@ -92,6 +96,7 @@ where
             image_tags,
             document_tags,
             video_tags,
+            comic_tags,
         }
     }
 
@@ -324,6 +329,39 @@ where
                             path = %entry.path,
                             error = %err,
                             "indexed but failed to write extracted video metadata"
+                        );
+                    }
+                }
+            }
+        }
+
+        // Best-effort comic metadata prefill (issue #44 comic slice). Two
+        // independent writes: page count (outside SubtypeMetadata, via
+        // set_comic_page_count — always present once the archive opens)
+        // and title/series/issue_number (via the shared update_metadata).
+        // Neither write's failure blocks the other or fails indexing.
+        if file_type == FileType::Comic {
+            if let Some(tags) = self.comic_tags.read(&entry.path).await {
+                if let Some(page_count) = tags.page_count {
+                    if let Err(err) = self.repo.set_comic_page_count(file.uuid, page_count).await {
+                        tracing::warn!(
+                            path = %entry.path,
+                            error = %err,
+                            "indexed but failed to write extracted comic page count"
+                        );
+                    }
+                }
+                if tags.title.is_some() || tags.series.is_some() || tags.issue_number.is_some() {
+                    let metadata = crate::catalog::model::SubtypeMetadata::Comic {
+                        title: tags.title,
+                        series: tags.series,
+                        issue_number: tags.issue_number,
+                    };
+                    if let Err(err) = self.repo.update_metadata(file.uuid, &metadata).await {
+                        tracing::warn!(
+                            path = %entry.path,
+                            error = %err,
+                            "indexed but failed to write extracted comic metadata"
                         );
                     }
                 }

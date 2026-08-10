@@ -228,11 +228,11 @@ type-specific metadata. Representative subtype fields:
 | Subtype | Extra Fields |
 | --- | --- |
 | AudioFile | title, artist, album, year, genre, track |
-| VideoFile | title, year, resolution, mediaKind (movie/series), episodeCount (series) |
+| VideoFile | title, year, resolution, mediaKind (movie/series), episodeCount (series), durationSeconds |
 | HtmlPage | title, sourceUrl, savedAt |
 | TextFile | (content is read/written on disk, not stored) |
 | Document | title, author, year, formatKind (book/ebook), pageCount |
-| ComicBook | title, series, issueNumber, pageCount |
+| ComicBook | title, series, issueNumber, comicPageCount |
 | Image | title, caption, width, height |
 
 ### 4.3 Collection Fields

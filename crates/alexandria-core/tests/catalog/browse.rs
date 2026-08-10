@@ -392,6 +392,46 @@ async fn given_non_video_file_when_get_by_uuid_then_duration_none() {
     assert_eq!(view.duration_seconds, None);
 }
 
+#[tokio::test]
+async fn given_comic_with_extracted_page_count_when_get_by_uuid_then_page_count_present() {
+    let repo = FakeCatalogRepository::new();
+    let file = existing_file_with_hash("/lib/issue1.cbz", "issue1", FileType::Comic, "h");
+    let uuid = file.uuid;
+    repo.seed(file);
+    repo.set_comic_page_count(uuid, 24).await.unwrap();
+
+    let h = handler(FakeAuth::Allowing, repo);
+    let view = h.get_by_uuid(uuid, TOKEN).await.expect("get");
+
+    assert_eq!(view.comic_page_count, Some(24));
+}
+
+#[tokio::test]
+async fn given_comic_with_no_extracted_page_count_when_get_by_uuid_then_page_count_none() {
+    let repo = FakeCatalogRepository::new();
+    let file = existing_file_with_hash("/lib/issue1.cbz", "issue1", FileType::Comic, "h");
+    let uuid = file.uuid;
+    repo.seed(file);
+
+    let h = handler(FakeAuth::Allowing, repo);
+    let view = h.get_by_uuid(uuid, TOKEN).await.expect("get");
+
+    assert_eq!(view.comic_page_count, None);
+}
+
+#[tokio::test]
+async fn given_non_comic_file_when_get_by_uuid_then_comic_page_count_none() {
+    let repo = FakeCatalogRepository::new();
+    let file = existing_file_with_hash("/lib/song.mp3", "song", FileType::Audio, "h");
+    let uuid = file.uuid;
+    repo.seed(file);
+
+    let h = handler(FakeAuth::Allowing, repo);
+    let view = h.get_by_uuid(uuid, TOKEN).await.expect("get");
+
+    assert_eq!(view.comic_page_count, None);
+}
+
 // AF-01: requested UUID does not exist
 
 #[tokio::test]

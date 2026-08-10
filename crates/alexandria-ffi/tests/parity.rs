@@ -9543,3 +9543,216 @@ async fn given_tagged_mp4_file_when_indexed_via_http_and_ffi_then_extracted_meta
         "expected a positive duration, got {http_duration}"
     );
 }
+
+/// Build a minimal valid CBZ with the `zip` crate — mirrors the identical
+/// helper in `alexandria-core`'s `catalog::comic_tags` unit tests.
+fn write_minimal_cbz(
+    path: &std::path::Path,
+    title: &str,
+    series: &str,
+    number: &str,
+    page_count: usize,
+) {
+    use std::io::Write;
+    use zip::write::SimpleFileOptions;
+
+    let file = std::fs::File::create(path).expect("create cbz file");
+    let mut zip = zip::ZipWriter::new(file);
+    let options = SimpleFileOptions::default();
+
+    zip.start_file("ComicInfo.xml", options)
+        .expect("start ComicInfo.xml");
+    let xml = format!(
+        r#"<?xml version="1.0"?>
+<ComicInfo xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+  <Title>{title}</Title>
+  <Series>{series}</Series>
+  <Number>{number}</Number>
+</ComicInfo>"#
+    );
+    zip.write_all(xml.as_bytes()).expect("write ComicInfo.xml");
+
+    for i in 0..page_count {
+        zip.start_file(format!("page-{i:03}.jpg"), options)
+            .expect("start page");
+        zip.write_all(b"not-a-real-jpeg-just-bytes")
+            .expect("write page");
+    }
+
+    zip.finish().expect("finish cbz zip");
+}
+
+/// Poll until `comic_books.title`/`comic_books.series`/
+/// `comic_books.issue_number`/`comic_books.page_count` are all non-NULL
+/// for the named file — proves BOTH extraction writes landed (metadata
+/// write and page-count write are separate transactions), not just
+/// file-row existence or a single write.
+type HttpComicExtractionRow = (Option<String>, Option<String>, Option<i64>, Option<i64>);
+
+async fn wait_for_http_comic_extraction(pool: &sqlx::sqlite::SqlitePool, name: &str) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let row: Option<HttpComicExtractionRow> = sqlx::query_as(
+            "SELECT comic_books.title, comic_books.series, comic_books.issue_number, \
+             comic_books.page_count \
+             FROM comic_books \
+             JOIN files ON files.id = comic_books.file_id \
+             WHERE files.name = ?",
+        )
+        .bind(name)
+        .fetch_optional(pool)
+        .await
+        .unwrap();
+        if let Some((Some(_), Some(_), Some(_), Some(_))) = row {
+            return;
+        }
+        if std::time::Instant::now() > deadline {
+            panic!("http never wrote extracted comic metadata");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+}
+
+/// Issue #44 comic slice parity — index a tagged CBZ through both
+/// transports and assert the extracted title/series/issueNumber/
+/// comicPageCount (written by the indexer itself, not by a manual PATCH)
+/// are byte-for-byte identical.
+#[tokio::test]
+async fn given_tagged_cbz_file_when_indexed_via_http_and_ffi_then_extracted_metadata_matches() {
+    let _g = SERIAL.lock().unwrap();
+
+    // ---- HTTP leg ----
+    let http_lib = tempdir().unwrap();
+    let http_comic = http_lib.path().join("issue1.cbz");
+    write_minimal_cbz(&http_comic, "Parity Title", "Parity Series", "3", 24);
+
+    let http_dir = tempdir().unwrap();
+    let http_db = db_path(&http_dir, "http.sqlite");
+    let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    seed_session(&http_pool, TEST_TOKEN).await;
+    let http_services =
+        std::sync::Arc::new(build_services(&local_settings(), http_pool.clone()).await);
+
+    let index_req = Request::builder()
+        .method("POST")
+        .uri("/v1/index")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({ "root": http_lib.path().to_str().unwrap() }).to_string(),
+        ))
+        .unwrap();
+    let _ = app(Settings::default(), http_services.clone())
+        .oneshot(index_req)
+        .await
+        .expect("http index");
+    wait_for_http_comic_extraction(&http_pool, "issue1.cbz").await;
+
+    let (http_uuid,): (String,) = sqlx::query_as("SELECT uuid FROM files WHERE name = ?")
+        .bind("issue1.cbz")
+        .fetch_one(&http_pool)
+        .await
+        .unwrap();
+
+    let get_req = Request::builder()
+        .method("GET")
+        .uri(format!("/v1/files/{http_uuid}"))
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
+        .body(Body::empty())
+        .unwrap();
+    let get_resp = app(Settings::default(), http_services)
+        .oneshot(get_req)
+        .await
+        .expect("http get");
+    assert_eq!(get_resp.status(), axum::http::StatusCode::OK);
+    let http_body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(get_resp.into_body(), usize::MAX).await.unwrap()).unwrap();
+
+    // ---- FFI leg ----
+    let ffi_dir = tempdir().unwrap();
+    let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
+    let ffi_lib = tempdir().unwrap();
+    let ffi_comic = ffi_lib.path().join("issue1.cbz");
+    write_minimal_cbz(&ffi_comic, "Parity Title", "Parity Series", "3", 24);
+    let ffi_lib_path = ffi_lib.path().to_str().unwrap().to_string();
+    let ffi_db_for_poll = ffi_db.clone();
+
+    let ffi_body: String = tokio::task::spawn_blocking(move || -> String {
+        let cdb = CString::new(ffi_db).unwrap();
+        assert_eq!(
+            alexandria_index_init(cdb.as_ptr()),
+            alexandria_ffi::INDEX_OK
+        );
+
+        let root = CString::new(ffi_lib_path).unwrap();
+        let token = CString::new(TEST_TOKEN).unwrap();
+        let started = alexandria_index_start(root.as_ptr(), token.as_ptr());
+        assert_eq!(started.status, alexandria_ffi::INDEX_OK);
+
+        // Poll the FFI leg's own sqlite file directly for all four
+        // extraction writes (title, series, issue_number, page_count) —
+        // not just file-row existence, and not just the first of the
+        // writes the indexer commits across its separate transactions.
+        type FfiComicExtractionRow = (
+            String,
+            Option<String>,
+            Option<String>,
+            Option<i64>,
+            Option<i64>,
+        );
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let ffi_uuid: String = rt.block_on(async {
+            let pool = sqlx::sqlite::SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect(&format!("sqlite://{ffi_db_for_poll}?mode=rw"))
+                .await
+                .unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                let row: Option<FfiComicExtractionRow> = sqlx::query_as(
+                    "SELECT files.uuid, comic_books.title, comic_books.series, \
+                     comic_books.issue_number, comic_books.page_count \
+                     FROM comic_books \
+                     JOIN files ON files.id = comic_books.file_id \
+                     WHERE files.name = ?",
+                )
+                .bind("issue1.cbz")
+                .fetch_optional(&pool)
+                .await
+                .unwrap();
+                if let Some((uuid, Some(_), Some(_), Some(_), Some(_))) = row {
+                    return uuid;
+                }
+                if std::time::Instant::now() > deadline {
+                    panic!("ffi never wrote extracted comic metadata");
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        });
+
+        let uuid_c = CString::new(ffi_uuid).unwrap();
+        let result = alexandria_file_get_by_uuid(uuid_c.as_ptr(), token.as_ptr());
+        assert_eq!(result.status, alexandria_ffi::FILE_OK);
+        assert!(!result.json.is_null());
+        let json = unsafe { CStr::from_ptr(result.json) }
+            .to_str()
+            .unwrap()
+            .to_string();
+        unsafe {
+            alexandria_free_string(result.json);
+        }
+        json
+    })
+    .await
+    .unwrap();
+
+    let ffi_body: serde_json::Value = serde_json::from_str(&ffi_body).unwrap();
+
+    // ---- compare ----
+    assert_eq!(http_body["comicPageCount"], ffi_body["comicPageCount"]);
+    assert_eq!(http_body["metadata"], ffi_body["metadata"]);
+    assert_eq!(http_body["comicPageCount"], 24);
+    assert_eq!(http_body["metadata"]["title"], "Parity Title");
+    assert_eq!(http_body["metadata"]["series"], "Parity Series");
+    assert_eq!(http_body["metadata"]["issueNumber"], 3);
+}

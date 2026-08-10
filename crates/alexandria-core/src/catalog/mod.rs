@@ -1,6 +1,7 @@
 pub mod audio_tags;
 pub mod classify;
 pub mod clock;
+pub mod comic_tags;
 pub mod commands;
 pub mod document_tags;
 pub mod fs;

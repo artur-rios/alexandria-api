@@ -282,6 +282,14 @@ pub struct FileView {
     /// every non-video file, and for a video file whose duration hasn't
     /// been extracted yet.
     pub duration_seconds: Option<f64>,
+    /// Extracted page count (issue #44 comic slice). `None` for every
+    /// non-comic file, and for a comic file whose archive couldn't be
+    /// opened or hasn't been extracted yet. Named `comic_page_count`
+    /// rather than `page_count` because `FileView` already has a
+    /// `page_count` field for the document slice's extracted page count —
+    /// the two are never both `Some` for the same file, but sharing one
+    /// name across two distinct subtypes' fields would be ambiguous.
+    pub comic_page_count: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize)]

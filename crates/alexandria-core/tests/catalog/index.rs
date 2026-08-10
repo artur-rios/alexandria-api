@@ -4,6 +4,7 @@ use alexandria_core::auth::AuthService;
 use alexandria_core::catalog::audio_tags::{AudioMetadataReader, AudioTags};
 use alexandria_core::catalog::classify::classify_by_extension;
 use alexandria_core::catalog::clock::Clock;
+use alexandria_core::catalog::comic_tags::{ComicMetadataReader, ComicTags};
 use alexandria_core::catalog::commands::index::{IndexHandler, IndexRequest};
 use alexandria_core::catalog::document_tags::{DocumentMetadataReader, DocumentTags};
 use alexandria_core::catalog::fs::Filesystem;
@@ -15,14 +16,15 @@ use alexandria_core::errors::DomainError;
 
 use crate::common::{
     existing_file, fixed_clock, now, FakeAudioMetadataReader, FakeAuth, FakeCatalogRepository,
-    FakeDocumentMetadataReader, FakeFilesystem, FakeImageMetadataReader, FakeVideoMetadataReader,
+    FakeComicMetadataReader, FakeDocumentMetadataReader, FakeFilesystem, FakeImageMetadataReader,
+    FakeVideoMetadataReader,
 };
 
 const ROOT: &str = "/library";
 const TOKEN: &str = "bearer-token";
 
 #[allow(clippy::too_many_arguments)]
-fn handler<A, R, F, C, M, N, O, P>(
+fn handler<A, R, F, C, M, N, O, P, Q>(
     auth: A,
     repo: R,
     fs: F,
@@ -31,7 +33,8 @@ fn handler<A, R, F, C, M, N, O, P>(
     image_tags: N,
     document_tags: O,
     video_tags: P,
-) -> IndexHandler<A, R, F, C, M, N, O, P>
+    comic_tags: Q,
+) -> IndexHandler<A, R, F, C, M, N, O, P, Q>
 where
     A: AuthService,
     R: CatalogRepository,
@@ -41,6 +44,7 @@ where
     N: ImageMetadataReader,
     O: DocumentMetadataReader,
     P: VideoMetadataReader,
+    Q: ComicMetadataReader,
 {
     IndexHandler::new(
         auth,
@@ -51,6 +55,7 @@ where
         image_tags,
         document_tags,
         video_tags,
+        comic_tags,
     )
 }
 
@@ -77,6 +82,7 @@ async fn given_valid_root_and_authenticated_when_start_then_returns_run_id() {
         FakeImageMetadataReader::new(),
         FakeDocumentMetadataReader::new(),
         FakeVideoMetadataReader::new(),
+        FakeComicMetadataReader::new(),
     );
 
     let started = handler
@@ -104,6 +110,7 @@ async fn given_missing_root_when_start_then_invalid_input() {
         FakeImageMetadataReader::new(),
         FakeDocumentMetadataReader::new(),
         FakeVideoMetadataReader::new(),
+        FakeComicMetadataReader::new(),
     );
 
     let result = handler
@@ -130,6 +137,7 @@ async fn given_unauthenticated_when_start_then_unauthorized() {
         FakeImageMetadataReader::new(),
         FakeDocumentMetadataReader::new(),
         FakeVideoMetadataReader::new(),
+        FakeComicMetadataReader::new(),
     );
 
     let result = handler
@@ -165,6 +173,7 @@ async fn given_already_cataloged_path_when_execute_then_skipped_no_duplicate() {
         FakeImageMetadataReader::new(),
         FakeDocumentMetadataReader::new(),
         FakeVideoMetadataReader::new(),
+        FakeComicMetadataReader::new(),
     );
 
     let outcome = handler
@@ -204,6 +213,7 @@ async fn given_supported_files_when_execute_then_indexed_with_hash_and_indexedat
         FakeImageMetadataReader::new(),
         FakeDocumentMetadataReader::new(),
         FakeVideoMetadataReader::new(),
+        FakeComicMetadataReader::new(),
     );
 
     let outcome = handler
@@ -241,6 +251,7 @@ async fn given_unsupported_extension_when_execute_then_skipped() {
         FakeImageMetadataReader::new(),
         FakeDocumentMetadataReader::new(),
         FakeVideoMetadataReader::new(),
+        FakeComicMetadataReader::new(),
     );
 
     let outcome = handler
@@ -273,6 +284,7 @@ async fn given_unreadable_file_when_execute_then_run_continues_and_counts_failur
         FakeImageMetadataReader::new(),
         FakeDocumentMetadataReader::new(),
         FakeVideoMetadataReader::new(),
+        FakeComicMetadataReader::new(),
     );
 
     let outcome = handler
@@ -312,6 +324,7 @@ async fn given_failing_repository_write_when_execute_then_run_continues_and_coun
         FakeImageMetadataReader::new(),
         FakeDocumentMetadataReader::new(),
         FakeVideoMetadataReader::new(),
+        FakeComicMetadataReader::new(),
     );
 
     let outcome = handler
@@ -375,6 +388,7 @@ async fn given_tagged_audio_file_when_execute_then_subtype_metadata_written() {
         FakeImageMetadataReader::new(),
         FakeDocumentMetadataReader::new(),
         FakeVideoMetadataReader::new(),
+        FakeComicMetadataReader::new(),
     );
 
     let outcome = handler
@@ -418,6 +432,7 @@ async fn given_untagged_audio_file_when_execute_then_subtype_metadata_stays_empt
         FakeImageMetadataReader::new(),
         FakeDocumentMetadataReader::new(),
         FakeVideoMetadataReader::new(),
+        FakeComicMetadataReader::new(),
     );
 
     let outcome = handler
@@ -451,6 +466,7 @@ async fn given_non_audio_file_when_execute_then_reader_never_consulted() {
         FakeImageMetadataReader::new(),
         FakeDocumentMetadataReader::new(),
         FakeVideoMetadataReader::new(),
+        FakeComicMetadataReader::new(),
     );
 
     let outcome = handler
@@ -497,6 +513,7 @@ async fn given_tagged_image_file_when_execute_then_dimensions_and_title_written(
         image_tags,
         FakeDocumentMetadataReader::new(),
         FakeVideoMetadataReader::new(),
+        FakeComicMetadataReader::new(),
     );
 
     let outcome = handler
@@ -544,6 +561,7 @@ async fn given_image_with_dimensions_but_no_title_when_execute_then_only_dimensi
         image_tags,
         FakeDocumentMetadataReader::new(),
         FakeVideoMetadataReader::new(),
+        FakeComicMetadataReader::new(),
     );
 
     let outcome = handler
@@ -585,6 +603,7 @@ async fn given_image_with_title_but_no_dimensions_when_execute_then_only_title_w
         image_tags,
         FakeDocumentMetadataReader::new(),
         FakeVideoMetadataReader::new(),
+        FakeComicMetadataReader::new(),
     );
 
     let outcome = handler
@@ -636,6 +655,7 @@ async fn given_image_with_partial_dimensions_when_execute_then_dimensions_write_
         image_tags,
         FakeDocumentMetadataReader::new(),
         FakeVideoMetadataReader::new(),
+        FakeComicMetadataReader::new(),
     );
 
     let outcome = handler
@@ -672,6 +692,7 @@ async fn given_untagged_image_file_when_execute_then_neither_write_happens() {
         FakeImageMetadataReader::new(),
         FakeDocumentMetadataReader::new(),
         FakeVideoMetadataReader::new(),
+        FakeComicMetadataReader::new(),
     );
 
     let outcome = handler
@@ -703,6 +724,7 @@ async fn given_non_image_file_when_execute_then_image_reader_never_consulted() {
         image_tags,
         FakeDocumentMetadataReader::new(),
         FakeVideoMetadataReader::new(),
+        FakeComicMetadataReader::new(),
     );
 
     let outcome = handler
@@ -745,6 +767,7 @@ async fn given_tagged_pdf_when_execute_then_page_count_and_metadata_written() {
         FakeImageMetadataReader::new(),
         document_tags,
         FakeVideoMetadataReader::new(),
+        FakeComicMetadataReader::new(),
     );
 
     let outcome = handler
@@ -796,6 +819,7 @@ async fn given_tagged_epub_when_execute_then_metadata_written_no_page_count() {
         FakeImageMetadataReader::new(),
         document_tags,
         FakeVideoMetadataReader::new(),
+        FakeComicMetadataReader::new(),
     );
 
     let outcome = handler
@@ -856,6 +880,7 @@ async fn given_document_with_page_count_but_no_other_fields_when_execute_then_bo
         FakeImageMetadataReader::new(),
         document_tags,
         FakeVideoMetadataReader::new(),
+        FakeComicMetadataReader::new(),
     );
 
     let outcome = handler
@@ -896,6 +921,7 @@ async fn given_untagged_document_file_when_execute_then_neither_write_happens() 
         FakeImageMetadataReader::new(),
         FakeDocumentMetadataReader::new(),
         FakeVideoMetadataReader::new(),
+        FakeComicMetadataReader::new(),
     );
 
     let outcome = handler
@@ -928,6 +954,7 @@ async fn given_non_document_file_when_execute_then_document_reader_never_consult
         image_tags,
         document_tags,
         FakeVideoMetadataReader::new(),
+        FakeComicMetadataReader::new(),
     );
 
     let outcome = handler
@@ -969,6 +996,7 @@ async fn given_tagged_video_when_execute_then_duration_and_metadata_written() {
         FakeImageMetadataReader::new(),
         FakeDocumentMetadataReader::new(),
         video_tags,
+        FakeComicMetadataReader::new(),
     );
 
     let outcome = handler
@@ -1019,6 +1047,7 @@ async fn given_video_with_duration_but_no_other_fields_when_execute_then_only_du
         FakeImageMetadataReader::new(),
         FakeDocumentMetadataReader::new(),
         video_tags,
+        FakeComicMetadataReader::new(),
     );
 
     let outcome = handler
@@ -1061,6 +1090,7 @@ async fn given_video_with_resolution_but_no_duration_when_execute_then_only_meta
         FakeImageMetadataReader::new(),
         FakeDocumentMetadataReader::new(),
         video_tags,
+        FakeComicMetadataReader::new(),
     );
 
     let outcome = handler
@@ -1105,6 +1135,7 @@ async fn given_untagged_video_file_when_execute_then_neither_write_happens() {
         FakeImageMetadataReader::new(),
         FakeDocumentMetadataReader::new(),
         FakeVideoMetadataReader::new(),
+        FakeComicMetadataReader::new(),
     );
 
     let outcome = handler
@@ -1138,6 +1169,7 @@ async fn given_non_video_file_when_execute_then_video_reader_never_consulted() {
         image_tags,
         document_tags,
         video_tags,
+        FakeComicMetadataReader::new(),
     );
 
     let outcome = handler
@@ -1150,5 +1182,220 @@ async fn given_non_video_file_when_execute_then_video_reader_never_consulted() {
         video_tags_handle.call_count(),
         0,
         "the video reader must not be consulted at all for a non-video file"
+    );
+}
+
+#[tokio::test]
+async fn given_tagged_comic_when_execute_then_page_count_and_metadata_written() {
+    let fs = FakeFilesystem::builder()
+        .with_file(ROOT, "/library/a.cbz", "a.cbz", "h-a")
+        .build();
+    let repo = FakeCatalogRepository::new();
+    let repo_handle = repo.clone();
+    let comic_tags = FakeComicMetadataReader::new();
+    comic_tags.seed(
+        "/library/a.cbz",
+        ComicTags {
+            title: Some("A Comic".to_string()),
+            series: Some("A Series".to_string()),
+            issue_number: Some(3),
+            page_count: Some(24),
+        },
+    );
+    let handler = handler(
+        FakeAuth::Allowing,
+        repo,
+        fs,
+        fixed_clock(now()),
+        FakeAudioMetadataReader::new(),
+        FakeImageMetadataReader::new(),
+        FakeDocumentMetadataReader::new(),
+        FakeVideoMetadataReader::new(),
+        comic_tags,
+    );
+
+    let outcome = handler
+        .execute(ROOT, Uuid::new_v4())
+        .await
+        .expect("execute");
+
+    assert_eq!(outcome.indexed, 1);
+    let a = repo_handle.file_for("/library/a.cbz").expect("indexed");
+    assert_eq!(repo_handle.comic_page_count_for(a.uuid), Some(24));
+    let metadata = repo_handle
+        .metadata_for(a.uuid)
+        .expect("metadata written from extracted tags");
+    assert_eq!(
+        metadata,
+        SubtypeMetadata::Comic {
+            title: Some("A Comic".to_string()),
+            series: Some("A Series".to_string()),
+            issue_number: Some(3),
+        }
+    );
+}
+
+#[tokio::test]
+async fn given_comic_with_page_count_but_no_other_fields_when_execute_then_only_page_count_written()
+{
+    let fs = FakeFilesystem::builder()
+        .with_file(ROOT, "/library/a.cbz", "a.cbz", "h-a")
+        .build();
+    let repo = FakeCatalogRepository::new();
+    let repo_handle = repo.clone();
+    let comic_tags = FakeComicMetadataReader::new();
+    comic_tags.seed(
+        "/library/a.cbz",
+        ComicTags {
+            title: None,
+            series: None,
+            issue_number: None,
+            page_count: Some(10),
+        },
+    );
+    let handler = handler(
+        FakeAuth::Allowing,
+        repo,
+        fs,
+        fixed_clock(now()),
+        FakeAudioMetadataReader::new(),
+        FakeImageMetadataReader::new(),
+        FakeDocumentMetadataReader::new(),
+        FakeVideoMetadataReader::new(),
+        comic_tags,
+    );
+
+    let outcome = handler
+        .execute(ROOT, Uuid::new_v4())
+        .await
+        .expect("execute");
+
+    assert_eq!(outcome.indexed, 1);
+    let a = repo_handle.file_for("/library/a.cbz").expect("indexed");
+    assert_eq!(repo_handle.comic_page_count_for(a.uuid), Some(10));
+    assert!(
+        repo_handle.metadata_for(a.uuid).is_none(),
+        "no title/series/issue_number extracted means update_metadata is never called"
+    );
+}
+
+#[tokio::test]
+async fn given_comic_with_issue_number_but_no_page_count_when_execute_then_only_metadata_written() {
+    let fs = FakeFilesystem::builder()
+        .with_file(ROOT, "/library/a.cbz", "a.cbz", "h-a")
+        .build();
+    let repo = FakeCatalogRepository::new();
+    let repo_handle = repo.clone();
+    let comic_tags = FakeComicMetadataReader::new();
+    comic_tags.seed(
+        "/library/a.cbz",
+        ComicTags {
+            title: None,
+            series: None,
+            issue_number: Some(7),
+            page_count: None,
+        },
+    );
+    let handler = handler(
+        FakeAuth::Allowing,
+        repo,
+        fs,
+        fixed_clock(now()),
+        FakeAudioMetadataReader::new(),
+        FakeImageMetadataReader::new(),
+        FakeDocumentMetadataReader::new(),
+        FakeVideoMetadataReader::new(),
+        comic_tags,
+    );
+
+    let outcome = handler
+        .execute(ROOT, Uuid::new_v4())
+        .await
+        .expect("execute");
+
+    assert_eq!(outcome.indexed, 1);
+    let a = repo_handle.file_for("/library/a.cbz").expect("indexed");
+    assert_eq!(
+        repo_handle.comic_page_count_for(a.uuid),
+        None,
+        "no page_count extracted means set_comic_page_count is never called"
+    );
+    let metadata = repo_handle
+        .metadata_for(a.uuid)
+        .expect("issue_number alone triggers the metadata write");
+    assert_eq!(
+        metadata,
+        SubtypeMetadata::Comic {
+            title: None,
+            series: None,
+            issue_number: Some(7),
+        }
+    );
+}
+
+#[tokio::test]
+async fn given_unopenable_comic_file_when_execute_then_neither_write_happens() {
+    let fs = FakeFilesystem::builder()
+        .with_file(ROOT, "/library/a.cbz", "a.cbz", "h-a")
+        .build();
+    let repo = FakeCatalogRepository::new();
+    let repo_handle = repo.clone();
+    let handler = handler(
+        FakeAuth::Allowing,
+        repo,
+        fs,
+        fixed_clock(now()),
+        FakeAudioMetadataReader::new(),
+        FakeImageMetadataReader::new(),
+        FakeDocumentMetadataReader::new(),
+        FakeVideoMetadataReader::new(),
+        FakeComicMetadataReader::new(),
+    );
+
+    let outcome = handler
+        .execute(ROOT, Uuid::new_v4())
+        .await
+        .expect("execute");
+
+    assert_eq!(outcome.indexed, 1);
+    let a = repo_handle.file_for("/library/a.cbz").expect("indexed");
+    assert_eq!(repo_handle.comic_page_count_for(a.uuid), None);
+    assert!(repo_handle.metadata_for(a.uuid).is_none());
+}
+
+#[tokio::test]
+async fn given_non_comic_file_when_execute_then_comic_reader_never_consulted() {
+    let fs = FakeFilesystem::builder()
+        .with_file(ROOT, "/library/notes.md", "notes.md", "h-a")
+        .build();
+    let repo = FakeCatalogRepository::new();
+    let audio_tags = FakeAudioMetadataReader::new();
+    let image_tags = FakeImageMetadataReader::new();
+    let document_tags = FakeDocumentMetadataReader::new();
+    let video_tags = FakeVideoMetadataReader::new();
+    let comic_tags = FakeComicMetadataReader::new();
+    let comic_tags_handle = comic_tags.clone();
+    let handler = handler(
+        FakeAuth::Allowing,
+        repo,
+        fs,
+        fixed_clock(now()),
+        audio_tags,
+        image_tags,
+        document_tags,
+        video_tags,
+        comic_tags,
+    );
+
+    let outcome = handler
+        .execute(ROOT, Uuid::new_v4())
+        .await
+        .expect("execute");
+
+    assert_eq!(outcome.indexed, 1);
+    assert_eq!(
+        comic_tags_handle.call_count(),
+        0,
+        "the comic reader must not be consulted at all for a non-comic file"
     );
 }
