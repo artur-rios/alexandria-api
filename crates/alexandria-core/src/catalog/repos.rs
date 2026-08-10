@@ -101,6 +101,23 @@ pub trait CatalogRepository: Send + Sync {
     /// EPUB — EPUB never sets this).
     async fn find_document_page_count(&self, uuid: Uuid) -> Result<Option<i64>, DomainError>;
 
+    /// Write a video file's duration in seconds (issue #44 video slice).
+    /// Unlike `update_metadata`, this touches `video_files.duration_seconds`
+    /// directly — `SubtypeMetadata::Video` deliberately excludes it because
+    /// it is not owner-editable (UC-04). Returns `NotFound` when no file row
+    /// carries the UUID, `InvalidInput` when the file is not a video.
+    async fn set_video_duration(
+        &self,
+        uuid: Uuid,
+        duration_seconds: f64,
+    ) -> Result<(), DomainError>;
+
+    /// Read a video file's duration in seconds, if set (issue #44 video
+    /// slice). `None` when the file doesn't exist, isn't a video, or the
+    /// column is still `NULL` (extraction never ran, or found no readable
+    /// duration).
+    async fn find_video_duration(&self, uuid: Uuid) -> Result<Option<f64>, DomainError>;
+
     /// Rename a file within its current directory (UC-05 / FR-FC-19). Updates
     /// the cataloged `name` and `path` for the file identified by `uuid` to
     /// `new_name` and `new_path`. The caller is responsible for the on-disk
@@ -778,6 +795,65 @@ impl CatalogRepository for SqliteCatalogRepository {
                 .await?;
 
         Ok(row.and_then(|(pc,)| pc))
+    }
+
+    async fn set_video_duration(
+        &self,
+        uuid: Uuid,
+        duration_seconds: f64,
+    ) -> Result<(), DomainError> {
+        let mut tx = self.pool.begin().await?;
+
+        let (id, type_str): (i64, String) =
+            sqlx::query_as("SELECT id, type FROM files WHERE uuid = ?")
+                .bind(uuid.to_string())
+                .fetch_optional(&mut *tx)
+                .await?
+                .ok_or(DomainError::NotFound)?;
+
+        let actual_type = parse_type_str(&type_str)?;
+        if actual_type != FileType::Video {
+            return Err(DomainError::InvalidInput("file is not a video".into()));
+        }
+
+        let affected = sqlx::query("UPDATE video_files SET duration_seconds = ? WHERE file_id = ?")
+            .bind(duration_seconds)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+
+        if affected == 0 {
+            return Err(DomainError::internal(format!(
+                "subtype row missing for file {uuid} (video)"
+            )));
+        }
+
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn find_video_duration(&self, uuid: Uuid) -> Result<Option<f64>, DomainError> {
+        let row: Option<(i64, String)> =
+            sqlx::query_as("SELECT id, type FROM files WHERE uuid = ?")
+                .bind(uuid.to_string())
+                .fetch_optional(&self.pool)
+                .await?;
+        let (id, type_str) = match row {
+            Some(r) => r,
+            None => return Ok(None),
+        };
+        if parse_type_str(&type_str)? != FileType::Video {
+            return Ok(None);
+        }
+
+        let row: Option<(Option<f64>,)> =
+            sqlx::query_as("SELECT duration_seconds FROM video_files WHERE file_id = ?")
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await?;
+
+        Ok(row.and_then(|(d,)| d))
     }
 
     async fn rename_file(

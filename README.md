@@ -199,6 +199,13 @@ alexandria-api/
 Requirements: Rust **1.94** or newer (edition 2021) and `cargo`. The floor comes
 from sqlx 0.9, the highest MSRV in the dependency graph.
 
+`alexandria-core` links against `ffmpeg-next` for video metadata extraction, so
+the ffmpeg C dev libraries, `pkg-config`, and `clang` (for bindgen) must be
+installed locally before the workspace will build — the first system
+dependency this project has needed. On Debian/Ubuntu:
+`sudo apt-get install libavformat-dev libavcodec-dev libavutil-dev libavfilter-dev libavdevice-dev libswscale-dev libswresample-dev pkg-config clang`.
+On macOS: `brew install ffmpeg pkg-config llvm`.
+
 ```bash
 # Build the whole workspace (core + http + ffi)
 cargo build --workspace --release

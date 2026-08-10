@@ -278,6 +278,10 @@ pub struct FileView {
     /// extracted yet, and always for EPUB (reflowable text has no fixed
     /// page count).
     pub page_count: Option<i64>,
+    /// Extracted duration in seconds (issue #44 video slice). `None` for
+    /// every non-video file, and for a video file whose duration hasn't
+    /// been extracted yet.
+    pub duration_seconds: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
