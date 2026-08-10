@@ -116,6 +116,51 @@ async fn given_indexed_file_when_streamed_then_bytes_match_disk_exactly() {
 }
 
 #[tokio::test]
+async fn given_cbz_when_streamed_then_catalog_mime_wins_over_servefile_guess() {
+    // Arrange — `.cbz` is a case where our catalog MIME table and
+    // `ServeFile`'s own `mime_guess`-based fallback genuinely disagree:
+    // the catalog table (`alexandria-core/src/playback/mime.rs`) maps it to
+    // `application/vnd.comicbook+zip`, while `mime_guess` has no `.cbz`
+    // entry and falls back to `application/octet-stream`. The bytes below
+    // are not a real zip — UC-38 streams bytes without parsing them, and
+    // `.cbz` classifies as Comic purely by extension, so arbitrary bytes
+    // index and stream fine.
+    let lib = tempdir().unwrap();
+    common::write_file(&lib, "issue.cbz", b"not really a zip");
+
+    let test = test_app().await;
+    let router = app(Settings::default(), test.services.clone());
+
+    router
+        .clone()
+        .oneshot(index_request(lib.path().to_str().unwrap()))
+        .await
+        .expect("index");
+    wait_for_files(&test.pool, 1).await;
+    let rows = file_rows_with_uuid(&test.pool).await;
+    let uuid = rows[0].0.clone();
+
+    // Act
+    let response = router
+        .oneshot(stream_request(&uuid))
+        .await
+        .expect("one-shot");
+
+    // Assert — the catalog table's MIME wins, not `ServeFile`'s guess
+    // (which would be `application/octet-stream` for this extension).
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "application/vnd.comicbook+zip"
+    );
+}
+
+#[tokio::test]
 async fn given_range_request_when_streamed_then_partial_content_returned() {
     // Arrange — this is the behavior a video player's seek depends on.
     let lib = tempdir().unwrap();
