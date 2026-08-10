@@ -28,6 +28,10 @@ ffmpeg-next = "9"
 # Already in the dependency graph via sqlx and reqwest, so this adds no new
 # transitive weight — only a direct, declared use of it.
 futures-util = { version = "0.3", default-features = false, features = ["std", "async-await"] }
+# UC-40 thumbnails decode and re-encode stills, so this is no longer dev-only.
+# `webp` joins `jpeg`/`png` because those three are what the still formats the
+# catalog indexes actually are.
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 jsonwebtoken = "9"
 kamadak-exif = "0.5"
 lofty = "0.22"
@@ -50,7 +54,6 @@ walkdir = "2"
 zip = "2"
 
 # dev-only
-image = { version = "0.25", default-features = false, features = ["jpeg"] }
 little_exif = "0.6"
 tempfile = "3"
 

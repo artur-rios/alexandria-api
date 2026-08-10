@@ -7,6 +7,7 @@
 pub mod comic_page;
 pub mod mime;
 pub mod source;
+pub mod thumbnail;
 
 use serde::Serialize;
 use uuid::Uuid;

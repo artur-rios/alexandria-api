@@ -14,6 +14,7 @@ chrono.workspace = true
 epub.workspace = true
 ffmpeg-next.workspace = true
 futures-util.workspace = true
+image.workspace = true
 jsonwebtoken.workspace = true
 kamadak-exif.workspace = true
 lofty.workspace = true
@@ -33,7 +34,6 @@ walkdir.workspace = true
 zip.workspace = true
 
 [dev-dependencies]
-image.workspace = true
 little_exif.workspace = true
 tempfile.workspace = true
 tokio.workspace = true
