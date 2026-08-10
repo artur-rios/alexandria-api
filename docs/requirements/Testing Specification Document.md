@@ -223,14 +223,25 @@ are the deliverable. Two assertion modes:
 Fixture size is tunable via `ALEXANDRIA_BENCH_FILES`,
 `ALEXANDRIA_BENCH_FILE_BYTES`, and `ALEXANDRIA_BENCH_CONCURRENCY`.
 
-**What the number covers.** The fixture is plain text files, so it measures the
-walk → classify → hash → persist pipeline (FR-FC-01..09). It excludes
-per-format metadata extraction (FR-FC-25), whose cost belongs to lofty / lopdf
-/ ffmpeg and the file rather than to this crate — a fixture of synthetic MP4s
-would report ffmpeg's probe speed under the banner of Alexandria's indexing
-rate. A real media library indexes more slowly, dominated by extraction. If
-that figure is ever needed, it warrants its own fixture and its own number
-rather than being folded into this one.
+**What the NFR-02 number covers.** Its fixture is plain text files, so it
+measures the walk → classify → hash → persist pipeline (FR-FC-01..09) and
+nothing else. Extraction is excluded there deliberately: folding ffmpeg's probe
+speed into a figure labelled "Alexandria's indexing rate" would make the number
+say less, not more.
+
+**Extraction cost (FR-FC-25)** is measured separately, by the third test in the
+same file. It generates a real fixture per metadata-carrying subtype — an
+ID3-tagged WAV, an EXIF JPEG, a PDF, a CBZ, an MP4 encoded by ffmpeg itself —
+runs each through the same indexer, and prints files/sec, ms/file, and each
+format's rate as a percentage of the text baseline.
+
+Those rows are **floors, not forecasts.** Each fixture is the smallest valid
+file of its format, so a row isolates the fixed per-file cost — open the
+container, find the metadata, parse it — with almost no payload to scale over.
+Real media is orders of magnitude larger, and two costs grow with size:
+hashing reads every byte, and ffmpeg may seek a long way to find its best video
+stream. Read a row as "extraction costs at least this much per file, before
+file size enters into it".
 
 CI runs these on pushes to `main` as a separate, non-gating job, so the numbers
 are recorded over time and the harness cannot rot, without a noisy runner

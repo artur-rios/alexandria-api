@@ -24,19 +24,24 @@
 //! requirement scopes to "a personal machine", i.e. yours, not a runner — set
 //! `ALEXANDRIA_NFR_STRICT=1`.
 //!
-//! # What is and is not measured
+//! # What each test measures
 //!
-//! The library fixture is plain text files. That measures the pipeline
-//! FR-FC-01..09 describes: walk, classify, hash, persist. It deliberately
-//! excludes per-format metadata extraction (FR-FC-25), whose cost is a
-//! property of lofty/lopdf/ffmpeg and the file, not of this crate — a fixture
-//! of synthetic MP4s would report ffmpeg's probe speed under the banner of
-//! Alexandria's indexing rate. Read the number as "catalog pipeline
-//! throughput"; a library of real media will index more slowly, dominated by
-//! extraction.
+//! The NFR-02 tests use a plain-text fixture, which measures the pipeline
+//! FR-FC-01..09 describes — walk, classify, hash, persist — and nothing else.
+//! Extraction is excluded there on purpose: folding ffmpeg's probe speed into
+//! a figure labelled "Alexandria's indexing rate" would make the number say
+//! less, not more.
+//!
+//! That cost is instead measured on its own terms by
+//! `given_each_media_format_when_indexed_then_extraction_cost_is_measured`,
+//! which runs every metadata-carrying subtype (FR-FC-25) through the same
+//! indexer against the same text baseline, so the rows are comparable and the
+//! only variable is the file the reader is handed. See that test's own note on
+//! why its rows are floors rather than forecasts.
 //!
 //! Knobs (all optional): `ALEXANDRIA_BENCH_FILES` (default 2000),
 //! `ALEXANDRIA_BENCH_FILE_BYTES` (default 4096),
+//! `ALEXANDRIA_BENCH_MEDIA_FILES` (default 150, quartered for video),
 //! `ALEXANDRIA_BENCH_CONCURRENCY` (default 4).
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -90,12 +95,261 @@ fn generate_library(root: &std::path::Path, count: usize, bytes: usize) {
     // Vary the content per file so every hash differs; a library of identical
     // files could let a filesystem or page cache flatter the read path.
     for i in 0..count {
-        let dir = root.join(format!("d{:03}", i / 100));
-        std::fs::create_dir_all(&dir).expect("create fixture dir");
+        let dir = fixture_dir(root, i);
         let mut content = format!("file {i}\n").into_bytes();
         content.resize(bytes, b'x');
         std::fs::write(dir.join(format!("f{i:06}.txt")), &content).expect("write fixture file");
     }
+}
+
+fn fixture_dir(root: &std::path::Path, i: usize) -> std::path::PathBuf {
+    let dir = root.join(format!("d{:03}", i / 100));
+    std::fs::create_dir_all(&dir).expect("create fixture dir");
+    dir
+}
+
+/// The subtypes that carry embedded metadata (FR-FC-25), plus `Text` as the
+/// no-extraction baseline to measure them against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Format {
+    Text,
+    Audio,
+    Image,
+    Document,
+    Comic,
+    Video,
+}
+
+impl Format {
+    /// `Text` first so it prints as the baseline row.
+    const ALL: [Format; 6] = [
+        Format::Text,
+        Format::Audio,
+        Format::Image,
+        Format::Document,
+        Format::Comic,
+        Format::Video,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Format::Text => "text (baseline)",
+            Format::Audio => "audio (wav/id3)",
+            Format::Image => "image (jpeg/exif)",
+            Format::Document => "document (pdf)",
+            Format::Comic => "comic (cbz)",
+            Format::Video => "video (mp4)",
+        }
+    }
+
+    fn extension(self) -> &'static str {
+        match self {
+            Format::Text => "txt",
+            Format::Audio => "wav",
+            Format::Image => "jpg",
+            Format::Document => "pdf",
+            Format::Comic => "cbz",
+            Format::Video => "mp4",
+        }
+    }
+
+    /// Video is the outlier on both sides: each fixture has to be encoded, and
+    /// each probe reads a container. A smaller sample keeps the harness's own
+    /// wall-clock sane without changing what a per-second rate means.
+    fn count(self, base: usize) -> usize {
+        match self {
+            Format::Video => (base / 4).max(1),
+            _ => base,
+        }
+    }
+
+    fn write(self, path: &std::path::Path, i: usize) {
+        match self {
+            Format::Text => {
+                std::fs::write(path, format!("file {i}\n")).expect("write txt");
+            }
+            Format::Audio => {
+                write_minimal_wav(path);
+                write_audio_tags(path, i);
+            }
+            Format::Image => {
+                write_minimal_jpeg(path);
+                write_image_exif(path, i);
+            }
+            Format::Document => write_minimal_pdf(path, i),
+            Format::Comic => write_minimal_cbz(path, i),
+            Format::Video => write_minimal_mp4(path, i),
+        }
+    }
+}
+
+/// A minimal valid WAV (8 bytes of PCM) — enough of a container for lofty to
+/// probe and for an ID3v2 tag to be written onto.
+fn write_minimal_wav(path: &std::path::Path) {
+    let sample_data: [u8; 8] = [0x80; 8];
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"RIFF");
+    bytes.extend_from_slice(&(36u32 + sample_data.len() as u32).to_le_bytes());
+    bytes.extend_from_slice(b"WAVE");
+    bytes.extend_from_slice(b"fmt ");
+    bytes.extend_from_slice(&16u32.to_le_bytes());
+    bytes.extend_from_slice(&1u16.to_le_bytes()); // PCM
+    bytes.extend_from_slice(&1u16.to_le_bytes()); // mono
+    bytes.extend_from_slice(&8000u32.to_le_bytes());
+    bytes.extend_from_slice(&8000u32.to_le_bytes());
+    bytes.extend_from_slice(&1u16.to_le_bytes());
+    bytes.extend_from_slice(&8u16.to_le_bytes());
+    bytes.extend_from_slice(b"data");
+    bytes.extend_from_slice(&(sample_data.len() as u32).to_le_bytes());
+    bytes.extend_from_slice(&sample_data);
+    std::fs::write(path, &bytes).expect("write wav");
+}
+
+fn write_audio_tags(path: &std::path::Path, i: usize) {
+    use lofty::config::WriteOptions;
+    use lofty::tag::{Accessor, Tag, TagExt, TagType};
+
+    let mut tag = Tag::new(TagType::Id3v2);
+    tag.set_title(format!("Title {i}"));
+    tag.set_artist(format!("Artist {i}"));
+    tag.set_album(format!("Album {i}"));
+    tag.set_genre("Bench".to_string());
+    tag.set_year(2020);
+    tag.set_track(u32::try_from(i % 100).unwrap_or(0));
+    tag.save_to_path(path, WriteOptions::default())
+        .expect("save id3 tag");
+}
+
+fn write_minimal_jpeg(path: &std::path::Path) {
+    image::RgbImage::from_pixel(4, 3, image::Rgb([128, 64, 32]))
+        .save(path)
+        .expect("encode jpeg");
+}
+
+fn write_image_exif(path: &std::path::Path, i: usize) {
+    use little_exif::exif_tag::ExifTag;
+    use little_exif::metadata::Metadata;
+
+    let mut metadata = Metadata::new();
+    metadata.set_tag(ExifTag::ImageDescription(format!("Image {i}")));
+    metadata.set_tag(ExifTag::ExifImageWidth(vec![4]));
+    metadata.set_tag(ExifTag::ExifImageHeight(vec![3]));
+    metadata.write_to_file(path).expect("write exif");
+}
+
+fn write_minimal_pdf(path: &std::path::Path, i: usize) {
+    use lopdf::{dictionary, Document, Object};
+
+    let mut doc = Document::with_version("1.5");
+    let pages_id = doc.new_object_id();
+    let content = lopdf::content::Content { operations: vec![] };
+    let content_id = doc.add_object(lopdf::Stream::new(
+        dictionary! {},
+        content.encode().expect("encode content"),
+    ));
+    let page_id = doc.add_object(dictionary! {
+        "Type" => "Page",
+        "Parent" => pages_id,
+        "Contents" => content_id,
+        "MediaBox" => vec![0.into(), 0.into(), 200.into(), 200.into()],
+    });
+    doc.objects.insert(
+        pages_id,
+        Object::Dictionary(dictionary! {
+            "Type" => "Pages",
+            "Kids" => vec![page_id.into()],
+            "Count" => 1,
+        }),
+    );
+    let catalog_id = doc.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => pages_id,
+    });
+    doc.trailer.set("Root", catalog_id);
+    let info_id = doc.add_object(dictionary! {
+        "Title" => Object::string_literal(format!("Doc {i}")),
+        "Author" => Object::string_literal("Bench Author"),
+    });
+    doc.trailer.set("Info", info_id);
+    doc.save(path).expect("save pdf");
+}
+
+fn write_minimal_cbz(path: &std::path::Path, i: usize) {
+    use std::io::Write;
+    use zip::write::SimpleFileOptions;
+
+    let file = std::fs::File::create(path).expect("create cbz");
+    let mut zip = zip::ZipWriter::new(file);
+    let options = SimpleFileOptions::default();
+
+    zip.start_file("ComicInfo.xml", options)
+        .expect("start ComicInfo.xml");
+    let xml = format!(
+        r#"<?xml version="1.0"?>
+<ComicInfo><Title>Issue {i}</Title><Series>Bench</Series><Number>{i}</Number></ComicInfo>"#
+    );
+    zip.write_all(xml.as_bytes()).expect("write ComicInfo.xml");
+
+    // 12 pages: a comic's page count is the archive's entry count, so the
+    // number of entries is what the reader actually walks.
+    for page in 0..12 {
+        zip.start_file(format!("page-{page:03}.jpg"), options)
+            .expect("start page");
+        zip.write_all(b"not-a-real-jpeg-just-bytes")
+            .expect("write page");
+    }
+    zip.finish().expect("finish cbz");
+}
+
+fn write_minimal_mp4(path: &std::path::Path, i: usize) {
+    ffmpeg_next::init().expect("ffmpeg init");
+    let (width, height) = (64u32, 48u32);
+
+    let mut octx = ffmpeg_next::format::output(path).expect("create output context");
+    octx.set_metadata({
+        let mut dict = ffmpeg_next::Dictionary::new();
+        dict.set("title", &format!("Video {i}"));
+        dict.set("date", "2024-01-01T00:00:00Z");
+        dict
+    });
+
+    let codec =
+        ffmpeg_next::encoder::find(ffmpeg_next::codec::Id::MPEG4).expect("mpeg4 encoder available");
+    let mut ost = octx.add_stream(codec).expect("add video stream");
+    let mut encoder = ffmpeg_next::codec::context::Context::new_with_codec(codec)
+        .encoder()
+        .video()
+        .expect("video encoder context");
+    encoder.set_width(width);
+    encoder.set_height(height);
+    encoder.set_format(ffmpeg_next::format::Pixel::YUV420P);
+    encoder.set_time_base(ffmpeg_next::Rational(1, 25));
+    let mut encoder = encoder.open().expect("open encoder");
+    ost.set_parameters(&encoder);
+
+    octx.write_header().expect("write header");
+
+    let mut frame =
+        ffmpeg_next::frame::Video::new(ffmpeg_next::format::Pixel::YUV420P, width, height);
+    for plane in 0..frame.planes() {
+        frame.data_mut(plane).fill(16);
+    }
+    for pts in 0..10 {
+        frame.set_pts(Some(pts));
+        encoder.send_frame(&frame).expect("send frame");
+        let mut packet = ffmpeg_next::Packet::empty();
+        while encoder.receive_packet(&mut packet).is_ok() {
+            packet.set_stream(0);
+            packet.write_interleaved(&mut octx).expect("write packet");
+        }
+    }
+    encoder.send_eof().expect("send eof");
+    let mut packet = ffmpeg_next::Packet::empty();
+    while encoder.receive_packet(&mut packet).is_ok() {
+        packet.set_stream(0);
+        packet.write_interleaved(&mut octx).expect("write packet");
+    }
+    octx.write_trailer().expect("write trailer");
 }
 
 async fn build(
@@ -255,6 +509,103 @@ async fn given_an_index_run_in_flight_when_reads_are_issued_then_they_are_not_bl
             "reads stalled to {:.1} ms p95 during indexing — blocking I/O is \
              likely back on the async runtime",
             p95.as_secs_f64() * 1000.0
+        );
+    }
+}
+
+/// FR-FC-25 — what metadata extraction costs, per format.
+///
+/// The throughput test above deliberately excludes extraction, which leaves
+/// the obvious question unanswered: a real library is mostly media, so how far
+/// below the text-file rate does it actually land? This measures each subtype
+/// that carries embedded metadata against the same text baseline, through the
+/// same indexer, so the rows are directly comparable — the only variable is
+/// the file the reader is handed.
+///
+/// # These are floors, not forecasts
+///
+/// The fixtures are the *smallest valid file* of each format: an 8-sample WAV,
+/// a 4×3 JPEG, a one-page PDF, a 12-entry CBZ, ten frames of 64×48 video. So
+/// each row isolates the **fixed per-file cost** — open the container, find
+/// the metadata, parse it — with almost no payload to scale over. Real media
+/// is orders of magnitude larger, and two costs grow with it: hashing reads
+/// every byte, and ffmpeg may seek a long way to find its best video stream.
+///
+/// Read a row as "extraction costs at least this much per file, before file
+/// size enters into it". A library of 4 GB films will not index at the video
+/// row's rate.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "measures machine throughput; run explicitly with --ignored --nocapture"]
+async fn given_each_media_format_when_indexed_then_extraction_cost_is_measured() {
+    let base = env_usize("ALEXANDRIA_BENCH_MEDIA_FILES", 150);
+    let concurrency = env_usize("ALEXANDRIA_BENCH_CONCURRENCY", 4) as u32;
+
+    let mut rows: Vec<(Format, usize, f64, f64)> = Vec::new();
+
+    for format in Format::ALL {
+        let count = format.count(base);
+        let lib = tempfile::tempdir().expect("tempdir");
+        let dbdir = tempfile::tempdir().expect("tempdir");
+
+        for i in 0..count {
+            let dir = fixture_dir(lib.path(), i);
+            format.write(&dir.join(format!("f{i:06}.{}", format.extension())), i);
+        }
+
+        let (handler, _repo) = build(&dbdir.path().join("bench.sqlite"), concurrency).await;
+
+        let started = Instant::now();
+        let outcome = handler
+            .execute(lib.path().to_str().expect("utf-8 lib path"), Uuid::new_v4())
+            .await
+            .expect("index run");
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            outcome.indexed,
+            count,
+            "every {} fixture is cataloged",
+            format.label()
+        );
+        assert_eq!(outcome.failed, 0, "no {} file failed", format.label());
+
+        let per_second = count as f64 / elapsed.as_secs_f64();
+        rows.push((
+            format,
+            count,
+            per_second,
+            elapsed.as_secs_f64() * 1000.0 / count as f64,
+        ));
+    }
+
+    let baseline = rows
+        .iter()
+        .find(|(f, ..)| *f == Format::Text)
+        .map(|(_, _, rate, _)| *rate)
+        .expect("text baseline row");
+
+    println!("\nFR-FC-25 per-format extraction cost (concurrency {concurrency})");
+    println!(
+        "  {:<20}{:>7}{:>14}{:>11}{:>12}",
+        "format", "files", "files/sec", "ms/file", "vs text"
+    );
+    for (format, count, per_second, ms) in &rows {
+        println!(
+            "  {:<20}{count:>7}{per_second:>14.0}{ms:>11.2}{:>11.0}%",
+            format.label(),
+            per_second / baseline * 100.0
+        );
+    }
+    println!(
+        "\n  Minimal-size fixtures: these isolate fixed per-file extraction\n\
+         \x20 cost. Real media is larger and will index more slowly.\n"
+    );
+
+    for (format, _, per_second, _) in &rows {
+        assert!(
+            *per_second >= 5.0,
+            "{} extraction collapsed to {per_second:.1} files/sec",
+            format.label()
         );
     }
 }
