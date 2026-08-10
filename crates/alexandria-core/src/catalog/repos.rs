@@ -118,6 +118,19 @@ pub trait CatalogRepository: Send + Sync {
     /// duration).
     async fn find_video_duration(&self, uuid: Uuid) -> Result<Option<f64>, DomainError>;
 
+    /// Write a comic file's page count (issue #44 comic slice). Unlike
+    /// `update_metadata`, this touches `comic_books.page_count` directly —
+    /// `SubtypeMetadata::Comic` deliberately excludes it because it is not
+    /// owner-editable (UC-04). Returns `NotFound` when no file row carries
+    /// the UUID, `InvalidInput` when the file is not a comic.
+    async fn set_comic_page_count(&self, uuid: Uuid, page_count: i64) -> Result<(), DomainError>;
+
+    /// Read a comic file's page count, if set (issue #44 comic slice).
+    /// `None` when the file doesn't exist, isn't a comic, or the column is
+    /// still `NULL` (extraction never ran, or the archive couldn't be
+    /// opened).
+    async fn find_comic_page_count(&self, uuid: Uuid) -> Result<Option<i64>, DomainError>;
+
     /// Rename a file within its current directory (UC-05 / FR-FC-19). Updates
     /// the cataloged `name` and `path` for the file identified by `uuid` to
     /// `new_name` and `new_path`. The caller is responsible for the on-disk
@@ -854,6 +867,61 @@ impl CatalogRepository for SqliteCatalogRepository {
                 .await?;
 
         Ok(row.and_then(|(d,)| d))
+    }
+
+    async fn set_comic_page_count(&self, uuid: Uuid, page_count: i64) -> Result<(), DomainError> {
+        let mut tx = self.pool.begin().await?;
+
+        let (id, type_str): (i64, String) =
+            sqlx::query_as("SELECT id, type FROM files WHERE uuid = ?")
+                .bind(uuid.to_string())
+                .fetch_optional(&mut *tx)
+                .await?
+                .ok_or(DomainError::NotFound)?;
+
+        let actual_type = parse_type_str(&type_str)?;
+        if actual_type != FileType::Comic {
+            return Err(DomainError::InvalidInput("file is not a comic".into()));
+        }
+
+        let affected = sqlx::query("UPDATE comic_books SET page_count = ? WHERE file_id = ?")
+            .bind(page_count)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+
+        if affected == 0 {
+            return Err(DomainError::internal(format!(
+                "subtype row missing for file {uuid} (comic)"
+            )));
+        }
+
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn find_comic_page_count(&self, uuid: Uuid) -> Result<Option<i64>, DomainError> {
+        let row: Option<(i64, String)> =
+            sqlx::query_as("SELECT id, type FROM files WHERE uuid = ?")
+                .bind(uuid.to_string())
+                .fetch_optional(&self.pool)
+                .await?;
+        let (id, type_str) = match row {
+            Some(r) => r,
+            None => return Ok(None),
+        };
+        if parse_type_str(&type_str)? != FileType::Comic {
+            return Ok(None);
+        }
+
+        let row: Option<(Option<i64>,)> =
+            sqlx::query_as("SELECT page_count FROM comic_books WHERE file_id = ?")
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await?;
+
+        Ok(row.and_then(|(pc,)| pc))
     }
 
     async fn rename_file(

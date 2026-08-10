@@ -108,6 +108,9 @@ pub struct FakeCatalogRepository {
     /// Duration (seconds) last written for `uuid` via `set_video_duration`
     /// (issue #44 video slice).
     video_durations: Arc<Mutex<HashMap<Uuid, f64>>>,
+    /// Page count last written for `uuid` via `set_comic_page_count`
+    /// (issue #44 comic slice).
+    comic_page_counts: Arc<Mutex<HashMap<Uuid, i64>>>,
 }
 
 impl FakeCatalogRepository {
@@ -219,6 +222,12 @@ impl FakeCatalogRepository {
     /// `None` means no call has landed for that file yet.
     pub fn video_duration_for(&self, uuid: Uuid) -> Option<f64> {
         self.video_durations.lock().unwrap().get(&uuid).copied()
+    }
+
+    /// Page count last written for `uuid` via `set_comic_page_count`.
+    /// `None` means no call has landed for that file yet.
+    pub fn comic_page_count_for(&self, uuid: Uuid) -> Option<i64> {
+        self.comic_page_counts.lock().unwrap().get(&uuid).copied()
     }
 }
 
@@ -450,6 +459,36 @@ impl CatalogRepository for FakeCatalogRepository {
         }
         drop(files);
         Ok(self.video_durations.lock().unwrap().get(&uuid).copied())
+    }
+
+    async fn set_comic_page_count(&self, uuid: Uuid, page_count: i64) -> Result<(), DomainError> {
+        let files = self.files.lock().unwrap();
+        let file = files
+            .values()
+            .find(|f| f.uuid == uuid)
+            .ok_or(DomainError::NotFound)?;
+        if file.file_type != alexandria_core::catalog::model::FileType::Comic {
+            return Err(DomainError::InvalidInput("file is not a comic".into()));
+        }
+        drop(files);
+        self.comic_page_counts
+            .lock()
+            .unwrap()
+            .insert(uuid, page_count);
+        Ok(())
+    }
+
+    async fn find_comic_page_count(&self, uuid: Uuid) -> Result<Option<i64>, DomainError> {
+        let files = self.files.lock().unwrap();
+        let file = match files.values().find(|f| f.uuid == uuid) {
+            Some(f) => f,
+            None => return Ok(None),
+        };
+        if file.file_type != alexandria_core::catalog::model::FileType::Comic {
+            return Ok(None);
+        }
+        drop(files);
+        Ok(self.comic_page_counts.lock().unwrap().get(&uuid).copied())
     }
 
     async fn rename_file(
