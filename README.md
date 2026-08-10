@@ -200,45 +200,179 @@ Requirements: Rust **1.94** or newer (edition 2021) and `cargo`. The floor comes
 from sqlx 0.9, the highest MSRV in the dependency graph.
 
 `alexandria-core` links against `ffmpeg-next` for video metadata extraction, so
-the ffmpeg C dev libraries, `pkg-config`, and `clang` (for bindgen) must be
-installed locally before the workspace will build — the only system dependency
-this project has. Without it `cargo build` and `cargo test` fail for the whole
-workspace, not just the video code, so install it first.
+the ffmpeg C development libraries and `clang` (for bindgen) must be installed
+locally before the workspace will build — the only system dependency this
+project has. Without them `cargo build` and `cargo test` fail for the whole
+workspace, not just the video code, so install them first.
 
-**Debian/Ubuntu**
+Any ffmpeg from **3.0 to 9.0** works — `ffmpeg-sys-next 9` gates its bindings
+by version and covers that whole range — so on a platform with a system package
+you can install whatever it offers. CI builds against Ubuntu's 6.1.
+
+### Debian/Ubuntu
 
 ```bash
 sudo apt-get install libavformat-dev libavcodec-dev libavutil-dev libavfilter-dev libavdevice-dev libswscale-dev libswresample-dev pkg-config clang
 ```
 
-**macOS**
+### macOS
 
 ```bash
 brew install ffmpeg pkg-config llvm
 ```
 
-**Windows** — install through vcpkg, which `ffmpeg-sys-next` discovers without
-`pkg-config`. Requires the MSVC toolchain and LLVM/clang (`winget install
-LLVM.LLVM`) for bindgen:
+Homebrew's `ffmpeg` formula tracks the current major, which is inside the
+supported range.
 
-```bash
-vcpkg install ffmpeg:x64-windows
-```
+### Windows
 
-Then point the build at it by setting `VCPKG_ROOT` to the vcpkg checkout.
-Alternatively, download a prebuilt *shared* ffmpeg build (the `-shared` variant,
-which ships the `include/` and `lib/` directories the `-essentials` builds omit)
-and set `FFMPEG_DIR` to its root:
+Windows has no system package that ffmpeg's build tooling finds automatically,
+so this takes a few deliberate steps. One constraint causes nearly every failed
+attempt, so read it before picking an option.
+
+**The build needs ffmpeg's headers and import libraries, not `ffmpeg.exe`.**
+Most Windows ffmpeg downloads — including everything labelled "essentials", and
+the packages you get by searching for "ffmpeg windows" — ship only a `bin/`
+directory with the executables. Those are useless here. You need a build that
+also ships `include/` and `lib/`, which in BtbN's naming means a **`.Shared.`**
+variant, and in the ffmpeg world generally is called a *dev* or *shared* build.
+
+Version is not a constraint: `ffmpeg-sys-next 9` supports ffmpeg 3.0 through
+9.0, so any current build will do.
+
+Prerequisites for every option below:
+
+- **MSVC build tools** — the Visual Studio "Desktop development with C++"
+  workload, matching Rust's `x86_64-pc-windows-msvc` target.
+- **LLVM/clang**, which `bindgen` needs to parse ffmpeg's headers:
+  ```bash
+  winget install LLVM.LLVM
+  ```
+  Setting `LIBCLANG_PATH` is what actually makes bindgen find it — installing
+  LLVM alone is often not enough, because its `bin` directory is not added to
+  `PATH` by default:
+  ```bash
+  setx LIBCLANG_PATH "C:\Program Files\LLVM\bin"
+  ```
+
+`setx` writes a persistent user variable but does **not** affect the shell you
+type it in. Open a new terminal before building. Never use `setx PATH` — it
+truncates `PATH` at 1024 characters and can destroy it; edit `PATH` through
+Settings → *Edit environment variables for your account* instead.
+
+#### Option A — winget, prebuilt (fastest; ~1 minute)
+
+Best if you just want the workspace building. The trade-off is licensing: BtbN's
+packages are GPL builds (see [Licensing](#a-note-on-ffmpeg-licensing) below).
+
+1. Install a **shared** build. Pinning a release branch rather than `master`
+   keeps the toolchain reproducible; any of the release branches work:
+   ```bash
+   winget install BtbN.FFmpeg.GPL.Shared.7.1
+   ```
+   `winget search ffmpeg` lists the alternatives. Avoid `Gyan.FFmpeg` unless you
+   confirm the package ships `include/` and `lib/` — its widely-mirrored builds
+   are executables only.
+2. Find where winget put it — the directory name contains a hash, so it must be
+   looked up rather than guessed. In PowerShell:
+   ```powershell
+   Get-ChildItem "$env:LOCALAPPDATA\Microsoft\WinGet\Packages" -Recurse -Depth 3 -Directory -Filter include | Where-Object { $_.FullName -like "*ffmpeg*" }
+   ```
+3. Confirm the parent of that `include` directory also contains `lib` and `bin`.
+   That parent is your ffmpeg root. If there is no `include`, you installed a
+   non-`Shared` variant — go back to step 1.
+4. Point the build at it, substituting the path from step 3:
+   ```bash
+   setx FFMPEG_DIR "C:\path\to\ffmpeg-n7.1-...-shared"
+   ```
+5. Add that root's `bin` directory to `PATH` (via Settings, per the warning
+   above). This is needed at **run** time, not build time: a shared build links
+   against DLLs, and `cargo test` will fail to start without them.
+6. Open a new terminal and jump to [Verifying](#verifying-the-toolchain).
+
+#### Option B — vcpkg (slower; LGPL by default)
+
+Preferred if you care about the licensing of what you link, since vcpkg's
+default ffmpeg port is LGPL — it omits the GPL-only codecs. It builds from
+source, so budget 30–60 minutes on first install.
+
+1. Clone and bootstrap vcpkg:
+   ```bash
+   git clone https://github.com/microsoft/vcpkg C:\vcpkg
+   C:\vcpkg\bootstrap-vcpkg.bat
+   ```
+2. Install ffmpeg, pinning a supported major version:
+   ```bash
+   C:\vcpkg\vcpkg.exe install "ffmpeg[core,avcodec,avformat,avfilter,avdevice,swscale,swresample]:x64-windows"
+   ```
+3. Tell the build where the tree is — `ffmpeg-sys-next` looks for `VCPKG_ROOT`
+   as its second discovery method, after `FFMPEG_DIR`:
+   ```bash
+   setx VCPKG_ROOT "C:\vcpkg"
+   ```
+4. The `x64-windows` triplet is a dynamic (DLL) build, and the `vcpkg` crate
+   ignores dynamic libraries unless told otherwise:
+   ```bash
+   setx VCPKGRS_DYNAMIC "1"
+   ```
+   To avoid this and the runtime DLL question entirely, use
+   `:x64-windows-static-md` in step 2 and skip this step.
+5. Open a new terminal and jump to [Verifying](#verifying-the-toolchain).
+
+#### Option C — a downloaded build, placed by hand
+
+Equivalent to Option A without winget; use it when you want a specific build.
+Download a **shared** ffmpeg 6.1 or 7.1 archive, extract it somewhere stable
+such as `C:\ffmpeg`, confirm that directory contains `include/`, `lib/`, and
+`bin/`, then:
 
 ```bash
 setx FFMPEG_DIR "C:\ffmpeg"
 ```
 
-Verify the toolchain resolves before building the workspace:
+Add `C:\ffmpeg\bin` to `PATH` for the runtime DLLs, open a new terminal, and
+verify.
+
+#### Verifying the toolchain
+
+Build the one crate that links ffmpeg, before the whole workspace — its failure
+messages are the legible ones:
 
 ```bash
 cargo build -p alexandria-core
 ```
+
+Then confirm the libraries also resolve at run time, which a build alone does
+not prove:
+
+```bash
+cargo test -p alexandria-core --test hashing
+```
+
+#### When it still fails
+
+`ffmpeg-sys-next` reports which discovery methods it tried, in order:
+`FFMPEG_DIR`, then vcpkg, then `pkg-config`. Read that list in the error — it
+tells you which step above did not take effect.
+
+| Symptom | Cause and fix |
+| --- | --- |
+| `1. FFMPEG_DIR environment variable (not set)` | `setx` does not affect the current shell. Open a new terminal. |
+| `2. vcpkg package manager (ffmpeg package not found)` | `VCPKG_ROOT` unset or the port is not installed for the `x64-windows` triplet. |
+| `The pkg-config command could not be found` | Expected on Windows and harmless — it is only the third fallback. If you see it, the real failure is that methods 1 and 2 both missed. |
+| `Unable to find libclang` | `LIBCLANG_PATH` is unset or wrong. It must point at the directory containing `libclang.dll`, normally `C:\Program Files\LLVM\bin`. |
+| Compile or link errors inside `ffmpeg-sys-next` | Usually a partial install — headers present but import libraries missing, or a mix of two ffmpeg versions on `PATH`/`FFMPEG_DIR`. Confirm one root holds `include/`, `lib/`, and `bin/` together. |
+| Builds fine, but tests fail to start or exit with `0xc0000135` | The shared build's DLLs are not on `PATH`. Add the ffmpeg `bin` directory. |
+
+#### A note on ffmpeg licensing
+
+Alexandria is proprietary (see [LICENSE](LICENSE)). ffmpeg is LGPL by default,
+but builds configured with `--enable-gpl` — which includes every BtbN `GPL`
+package above, and most convenience builds — are GPL. Linking a GPL library
+into a proprietary binary you distribute is a licensing problem; using one on
+your own machine to develop is not. If Alexandria is ever shipped with ffmpeg
+bundled, that build needs to be an LGPL one (vcpkg's default port, Option B, is
+LGPL). Flagging the distinction, not giving legal advice.
 
 ```bash
 # Build the whole workspace (core + http + ffi)
