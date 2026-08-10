@@ -5,6 +5,7 @@
 //! types, to a bounded derived artifact — a comic page or a thumbnail.
 
 pub mod mime;
+pub mod source;
 
 use serde::Serialize;
 use uuid::Uuid;
