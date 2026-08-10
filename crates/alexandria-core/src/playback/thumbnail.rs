@@ -1,5 +1,7 @@
 //! UC-40 — Get a file thumbnail (FR-MP-05).
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use serde::Serialize;
 use uuid::Uuid;
 
@@ -145,10 +147,21 @@ pub struct ImageThumbnailRenderer;
 
 impl ImageThumbnailRenderer {
     /// Downscale an already-decoded image to fit `max_dim` and encode JPEG.
+    ///
+    /// Downscale only. `DynamicImage::thumbnail` would happily *enlarge* a
+    /// source smaller than the box — its ratio is not clamped to 1.0 — which
+    /// would return a blocky upsample that is both worse-looking and larger
+    /// than the original. FR-MP-05 asks for a downscaled thumbnail, so an
+    /// image already inside the box is encoded at its own size.
     fn encode(img: image::DynamicImage, max_dim: u32) -> Result<Vec<u8>, DomainError> {
         use image::codecs::jpeg::JpegEncoder;
+        let fits = img.width() <= max_dim && img.height() <= max_dim;
         // `thumbnail` preserves aspect ratio, fitting inside the box.
-        let scaled = img.thumbnail(max_dim, max_dim);
+        let scaled = if fits {
+            img
+        } else {
+            img.thumbnail(max_dim, max_dim)
+        };
         let mut out = Vec::new();
         JpegEncoder::new(&mut out)
             .encode_image(&scaled)
@@ -308,6 +321,16 @@ impl DiskThumbnailCache {
     fn path_for(&self, key: &str) -> std::path::PathBuf {
         std::path::Path::new(&self.root).join(format!("{key}.jpg"))
     }
+
+    /// A scratch path in the *same* directory as the target, so the rename
+    /// that follows stays on one volume and is therefore atomic. Unique per
+    /// call: two writers must never share a temp file, or one would truncate
+    /// the other's bytes and the rename would publish the damage.
+    fn temp_path_for(&self, key: &str) -> std::path::PathBuf {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::path::Path::new(&self.root).join(format!("{key}.{}.{n}.tmp", std::process::id()))
+    }
 }
 
 impl ThumbnailCache for DiskThumbnailCache {
@@ -315,13 +338,40 @@ impl ThumbnailCache for DiskThumbnailCache {
         tokio::fs::read(self.path_for(key)).await.ok()
     }
 
+    /// Write-then-rename, never write in place.
+    ///
+    /// `tokio::fs::write` is `File::create` followed by `write_all` — two
+    /// syscalls, with a window in between where the file is zero bytes. A
+    /// concurrent `get` on the same key would read that window and succeed:
+    /// `read_to_end` returns `Ok` for a short read, so the caller would be
+    /// handed an empty or truncated body labelled `image/jpeg`, with nothing
+    /// to catch it. Writing to a unique temp file and renaming closes the
+    /// window: `rename(2)` is atomic on POSIX, and Rust's `fs::rename` uses
+    /// `MoveFileEx` with `MOVEFILE_REPLACE_EXISTING` on Windows, so readers
+    /// only ever observe a whole file — the old one or the new one.
+    ///
+    /// Two concurrent renders of the same key both write and both rename;
+    /// last one wins and the bytes are identical, so that costs a wasted CPU
+    /// cycle and nothing else. It is only the *partial* file that was ever a
+    /// correctness problem.
     async fn put(&self, key: &str, bytes: &[u8]) -> Result<(), DomainError> {
         tokio::fs::create_dir_all(&self.root)
             .await
             .map_err(|e| DomainError::disk(format!("cannot create {}: {e}", self.root)))?;
-        tokio::fs::write(self.path_for(key), bytes)
-            .await
-            .map_err(|e| DomainError::disk(format!("cannot write thumbnail: {e}")))
+
+        let temp = self.temp_path_for(key);
+        if let Err(e) = tokio::fs::write(&temp, bytes).await {
+            // Leave no scratch file behind on a failed write.
+            let _ = tokio::fs::remove_file(&temp).await;
+            return Err(DomainError::disk(format!("cannot write thumbnail: {e}")));
+        }
+
+        if let Err(e) = tokio::fs::rename(&temp, self.path_for(key)).await {
+            let _ = tokio::fs::remove_file(&temp).await;
+            return Err(DomainError::disk(format!("cannot publish thumbnail: {e}")));
+        }
+
+        Ok(())
     }
 }
 
@@ -715,5 +765,34 @@ mod tests {
 
         // Assert
         assert!(matches!(result, Err(DomainError::InvalidInput(_))));
+    }
+
+    #[tokio::test]
+    async fn given_image_smaller_than_max_dim_when_encoded_then_dimensions_unchanged() {
+        // Arrange — a 64x64 source, well inside the 320 box. `thumbnail`
+        // alone would enlarge it to 320x320: its ratio is not clamped to
+        // 1.0. FR-MP-05 asks for a *downscaled* thumbnail, so a source that
+        // already fits must come back untouched. In-memory PNG only — no
+        // real file, no ffmpeg, the same shape `catalog::image_tags`' tests
+        // already use.
+        let source = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+            64,
+            64,
+            image::Rgb([10, 200, 30]),
+        ));
+        let mut png = std::io::Cursor::new(Vec::new());
+        source
+            .write_to(&mut png, image::ImageFormat::Png)
+            .expect("encode source png");
+
+        // Act
+        let bytes = ImageThumbnailRenderer
+            .from_image_bytes(png.get_ref(), THUMBNAIL_MAX_DIM)
+            .await
+            .expect("thumbnail");
+
+        // Assert
+        let out = image::load_from_memory(&bytes).expect("valid jpeg");
+        assert_eq!((out.width(), out.height()), (64, 64));
     }
 }
