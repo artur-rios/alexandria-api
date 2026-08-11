@@ -203,7 +203,9 @@ counting, so `comicPageCount` remains consistent whichever order is applied.
 cache by `contentHash` + max dimension → on a miss, produce the source image
 (video: an ffmpeg keyframe; image: decode the file; comic: decode page 1 via
 the UC-39 path) → downscale preserving aspect ratio to fit `maxDim` (default
-320) → encode JPEG → write the cache entry → return the bytes.
+320) → encode JPEG → write the cache entry → return the bytes. Downscale
+only, never upscale: a source already within `maxDim` in both dimensions is
+encoded at its original size rather than enlarged to fill the box.
 
 **MIME resolution.** One table in `mime.rs`, keyed by extension, covering the
 formats `classify.rs` already recognizes for each of the seven file types. An

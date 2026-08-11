@@ -33,7 +33,8 @@ its open/closed state, so the tables stay in sync with the board automatically.
 | [F-07 Watchlists](https://github.com/artur-rios/alexandria-api/milestone/8) | UC-20 … UC-25 | 6 / 6 |
 | [F-08 Reading lists](https://github.com/artur-rios/alexandria-api/milestone/9) | UC-26 … UC-31 | 6 / 6 |
 | [F-09 Pluggable authentication](https://github.com/artur-rios/alexandria-api/milestone/10) | UC-34 … UC-36 | 3 / 3 |
-| **Total** | | **38 / 38** |
+| [F-10 Media playback](https://github.com/artur-rios/alexandria-api/milestone/11) | UC-38 … UC-40 | 3 / 3 |
+| **Total** | | **41 / 41** |
 
 ### F-00 — Foundation & operations
 
@@ -143,6 +144,16 @@ Exactly one active auth mode: external JWT **or** local encrypted login.
 | [#35](https://github.com/artur-rios/alexandria-api/issues/35) | UC-34 | &#9745; | Local login | FR-AU-01, FR-AU-04, FR-AU-07, FR-AU-08 |
 | [#36](https://github.com/artur-rios/alexandria-api/issues/36) | UC-35 | &#9745; | Set or change local login credentials | FR-AU-05, FR-AU-06, FR-AU-08 |
 | [#37](https://github.com/artur-rios/alexandria-api/issues/37) | UC-36 | &#9745; | Authenticate via external JWT | FR-AU-01, FR-AU-02, FR-AU-03, FR-AU-07, FR-AU-08 |
+
+### F-10 — Media playback
+
+Serve file bytes to the front-end, plus comic pages and thumbnails.
+
+| Issue | Use case | Status | Title | Requirements |
+| --- | --- | :---: | --- | --- |
+| [#90](https://github.com/artur-rios/alexandria-api/issues/90) | UC-38 | &#9745; | Stream file content | FR-MP-01, FR-MP-02, FR-MP-03, FR-MP-06 |
+| [#91](https://github.com/artur-rios/alexandria-api/issues/91) | UC-39 | &#9745; | Read a comic book page | FR-MP-03, FR-MP-04, FR-MP-06 |
+| [#92](https://github.com/artur-rios/alexandria-api/issues/92) | UC-40 | &#9745; | Get a file thumbnail | FR-MP-05, FR-MP-06 |
 
 To update the tables: when an issue closes, flip its marker from **&#9744;** to
 **&#9745;** and bump the milestone's progress count. The issue number references
@@ -436,6 +447,28 @@ requests present as `Authorization: Bearer <sessionId>` until it expires
 curl http://127.0.0.1:8080/health
 # {"status":"ok","database":"reachable","filesystem":"reachable","authMode":"external"}
 ```
+
+### Media playback
+
+```bash
+# Stream a file, seeking to a byte offset the way a player does
+curl -H "Authorization: Bearer $TOKEN" \
+     -H "Range: bytes=1048576-2097151" \
+     http://127.0.0.1:8080/v1/files/$UUID/stream --output chunk.bin
+
+# Page 3 of a CBZ comic
+curl -H "Authorization: Bearer $TOKEN" \
+     http://127.0.0.1:8080/v1/files/$UUID/pages/3 --output page3.jpg
+
+# A 320px thumbnail
+curl -H "Authorization: Bearer $TOKEN" \
+     http://127.0.0.1:8080/v1/files/$UUID/thumbnail --output thumb.jpg
+```
+
+The Flutter front-end must send the `Authorization` header on media
+requests; `video_player` and `just_audio` both support per-request headers.
+Over FFI there is no stream: `alexandria_file_playback_source` returns the
+file's path and the client opens it directly.
 
 ## Testing
 
