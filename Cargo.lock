@@ -93,6 +93,7 @@ dependencies = [
  "anyhow",
  "axum",
  "chrono",
+ "ffmpeg-next",
  "image",
  "serde",
  "serde_json",

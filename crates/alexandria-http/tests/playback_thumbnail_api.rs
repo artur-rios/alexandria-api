@@ -199,6 +199,35 @@ async fn given_tiff_image_when_thumbnailed_then_jpeg_within_max_dimension() {
 }
 
 #[tokio::test]
+async fn given_video_file_when_thumbnailed_then_keyframe_jpeg_within_max_dimension() {
+    // Arrange — a real, ffmpeg-encoded 640x360 MP4. This is the only test
+    // in the workspace that drives `decode_video_keyframe`: ffmpeg init,
+    // best-stream selection, the packet loop, the EOF flush and the
+    // stride-aware row copy all run for real here. The design assumed CI
+    // can decode video on a read request path; this is what checks it.
+    let lib = tempdir().unwrap();
+    common::write_mp4(&lib, "clip.mp4", 640, 360);
+    let cache_dir = tempdir().unwrap();
+    let (_test, router, uuid) = index_one(&lib, cache_dir.path()).await;
+
+    // Act
+    let response = router
+        .oneshot(thumbnail_request(&uuid))
+        .await
+        .expect("one-shot");
+
+    // Assert — 16:9 scaled into the 320 box is 320x180.
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get("content-type").unwrap(),
+        "image/jpeg"
+    );
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let decoded = image::load_from_memory(&body).expect("valid jpeg");
+    assert_eq!((decoded.width(), decoded.height()), (320, 180));
+}
+
+#[tokio::test]
 async fn given_svg_image_when_thumbnailed_then_bad_request() {
     // Arrange — SVG classifies as `FileType::Image` but is vector, and
     // `image` is a raster crate. Rasterizing would need a new dependency, so

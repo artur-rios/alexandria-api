@@ -188,6 +188,67 @@ pub fn write_image(
     path
 }
 
+/// Write a real, ffmpeg-encoded MP4 of `width` x `height` at `dir/name`.
+///
+/// Mirrors the `write_minimal_mp4` helper `alexandria-core`'s `video_tags`
+/// unit tests and the FFI parity suite already use — MPEG-4 video, ten
+/// identical flat frames, no audio. UC-40's video path decodes a real
+/// keyframe through ffmpeg, so nothing short of a genuinely encoded file
+/// exercises it.
+pub fn write_mp4(
+    dir: &tempfile::TempDir,
+    name: &str,
+    width: u32,
+    height: u32,
+) -> std::path::PathBuf {
+    let path = dir.path().join(name);
+
+    ffmpeg_next::init().expect("ffmpeg init");
+
+    let mut octx = ffmpeg_next::format::output(&path).expect("create output context");
+
+    let codec =
+        ffmpeg_next::encoder::find(ffmpeg_next::codec::Id::MPEG4).expect("mpeg4 encoder available");
+    let mut ost = octx.add_stream(codec).expect("add video stream");
+    let mut encoder = ffmpeg_next::codec::context::Context::new_with_codec(codec)
+        .encoder()
+        .video()
+        .expect("video encoder context");
+    encoder.set_width(width);
+    encoder.set_height(height);
+    encoder.set_format(ffmpeg_next::format::Pixel::YUV420P);
+    encoder.set_time_base(ffmpeg_next::Rational(1, 25));
+    let mut encoder = encoder.open().expect("open encoder");
+    ost.set_parameters(&encoder);
+
+    octx.write_header().expect("write header");
+
+    let mut frame =
+        ffmpeg_next::frame::Video::new(ffmpeg_next::format::Pixel::YUV420P, width, height);
+    for plane in 0..frame.planes() {
+        frame.data_mut(plane).fill(16);
+    }
+
+    for i in 0..10 {
+        frame.set_pts(Some(i));
+        encoder.send_frame(&frame).expect("send frame");
+        let mut packet = ffmpeg_next::Packet::empty();
+        while encoder.receive_packet(&mut packet).is_ok() {
+            packet.set_stream(0);
+            packet.write_interleaved(&mut octx).expect("write packet");
+        }
+    }
+    encoder.send_eof().expect("send eof");
+    let mut packet = ffmpeg_next::Packet::empty();
+    while encoder.receive_packet(&mut packet).is_ok() {
+        packet.set_stream(0);
+        packet.write_interleaved(&mut octx).expect("write packet");
+    }
+    octx.write_trailer().expect("write trailer");
+
+    path
+}
+
 /// Count entries in a directory, treating a missing directory as zero — the
 /// thumbnail cache directory does not exist until the first thumbnail is
 /// written.

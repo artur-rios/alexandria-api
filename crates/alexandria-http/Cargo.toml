@@ -23,6 +23,12 @@ uuid.workspace = true
 
 [dev-dependencies]
 chrono.workspace = true
+# UC-40's video thumbnail is decoded by ffmpeg, so testing it end to end
+# needs a genuine encoded video. The same `write_minimal_mp4` helper
+# `alexandria-core`'s video tests and the FFI parity suite already use is
+# reproduced in `tests/common`; ffmpeg is already this workspace's only
+# system dependency, so this adds nothing new to the build environment.
+ffmpeg-next.workspace = true
 image.workspace = true
 serde_json.workspace = true
 sqlx.workspace = true
