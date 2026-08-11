@@ -25,15 +25,35 @@ pub struct ComicPage {
     pub bytes: Vec<u8>,
 }
 
-/// Comic archive port. Unit tests substitute a fake; the real
-/// implementation reads a ZIP.
+/// One page as the archive resolved it: the entry's bytes, the entry's name
+/// (the only thing the MIME table needs), and how many pages the archive
+/// holds. Everything a caller can learn from a single open, returned from a
+/// single open.
+#[derive(Debug, Clone)]
+pub struct ArchivePage {
+    pub entry: String,
+    pub bytes: Vec<u8>,
+    pub page_count: u32,
+}
+
+/// Comic archive port. Unit tests substitute a fake; the real implementation
+/// reads a ZIP.
+///
+/// One method, not the `page_names` + `read_entry` pair it replaced. That
+/// pair made a single page request open and parse the archive twice — a
+/// reader paging through a 200-page comic paid 400 central-directory parses —
+/// and the two calls could observe different archive states. It was also
+/// wrong for a CBZ holding two entries with the same name, which ZIP permits:
+/// `page_names` counted both while `by_name` returned the first for either
+/// index, so page 2 silently served page 1's bytes.
+///
+/// No policy moves into the port: implementations resolve the page number by
+/// calling [`select_page`], the same pure function the fakes call, so the
+/// ordering and bounds rules stay in one directly unit-testable place.
 #[allow(async_fn_in_trait)]
 pub trait ComicArchive: Send + Sync {
-    /// Names of the archive entries that count as pages, in whatever order
-    /// the archive stores them. The handler sorts.
-    async fn page_names(&self, path: &str) -> Result<Vec<String>, DomainError>;
-    /// The raw bytes of one entry.
-    async fn read_entry(&self, path: &str, entry: &str) -> Result<Vec<u8>, DomainError>;
+    /// Page `page` (1-based) of the archive at `path`, from one open.
+    async fn read_page(&self, path: &str, page: u32) -> Result<ArchivePage, DomainError>;
 }
 
 /// Real `ComicArchive`, reading CBZ (ZIP) on the blocking pool.
@@ -41,14 +61,23 @@ pub trait ComicArchive: Send + Sync {
 pub struct ZipComicArchive;
 
 impl ComicArchive for ZipComicArchive {
-    async fn page_names(&self, path: &str) -> Result<Vec<String>, DomainError> {
+    /// One `File::open`, one central-directory parse, one `spawn_blocking`.
+    ///
+    /// Entries are selected by *index*, never by name: names are not unique
+    /// in a ZIP, and `by_name` would collapse duplicates onto the first of
+    /// them. [`select_page`] returns the position it chose within the list it
+    /// was given, and that list is built alongside the archive indices it
+    /// came from, so the entry finally read is the exact one counted.
+    async fn read_page(&self, path: &str, page: u32) -> Result<ArchivePage, DomainError> {
         let owned = path.to_string();
         let handle = tokio::task::spawn_blocking(move || {
             let file = std::fs::File::open(&owned)
                 .map_err(|e| DomainError::disk(format!("cannot open {owned}: {e}")))?;
             let mut archive = zip::ZipArchive::new(file)
                 .map_err(|e| DomainError::disk(format!("cannot read {owned}: {e}")))?;
+
             let mut names = Vec::new();
+            let mut indices = Vec::new();
             for i in 0..archive.len() {
                 let entry = archive
                     .by_index(i)
@@ -56,28 +85,22 @@ impl ComicArchive for ZipComicArchive {
                 let name = entry.name().to_string();
                 if is_page_entry(&name) {
                     names.push(name);
+                    indices.push(i);
                 }
             }
-            Ok(names)
-        });
-        match handle.await {
-            Ok(result) => result,
-            Err(err) => Err(DomainError::internal(format!("archive task failed: {err}"))),
-        }
-    }
 
-    async fn read_entry(&self, path: &str, entry: &str) -> Result<Vec<u8>, DomainError> {
-        let owned = path.to_string();
-        let wanted = entry.to_string();
-        let handle = tokio::task::spawn_blocking(move || {
-            let file = std::fs::File::open(&owned)
-                .map_err(|e| DomainError::disk(format!("cannot open {owned}: {e}")))?;
-            let mut archive = zip::ZipArchive::new(file)
-                .map_err(|e| DomainError::disk(format!("cannot read {owned}: {e}")))?;
+            let (position, page_count) = select_page(&names, page)?;
+            let entry_name = names[position].clone();
             let zip_entry = archive
-                .by_name(&wanted)
-                .map_err(|e| DomainError::disk(format!("cannot read entry {wanted}: {e}")))?;
-            read_entry_capped(zip_entry, MAX_PLAYBACK_READ_BYTES)
+                .by_index(indices[position])
+                .map_err(|e| DomainError::disk(format!("cannot read entry {entry_name}: {e}")))?;
+            let bytes = read_entry_capped(zip_entry, MAX_PLAYBACK_READ_BYTES)?;
+
+            Ok(ArchivePage {
+                entry: entry_name,
+                bytes,
+                page_count,
+            })
         });
         match handle.await {
             Ok(result) => result,
@@ -120,55 +143,68 @@ pub(crate) fn read_entry_capped<R: std::io::Read>(
     Ok(bytes)
 }
 
-/// Which archive entry is page `page` (1-based) of the comic at `path`, and
-/// how many pages the comic has.
+/// Reject anything that is not a CBZ, before any archive is touched.
 ///
-/// The single implementation of "what is page N of a comic", shared by
-/// UC-39's page route and UC-40's comic thumbnail — the design puts the
-/// thumbnail on the UC-39 path precisely so the two can never disagree. When
-/// this lived in both handlers, they had already drifted: only UC-39 guarded
-/// CBR, so a `.cbr` thumbnail reached `ZipComicArchive`, failed to open, and
-/// became a 500 where the error table promises a 400.
+/// CBR is RAR: proprietary, with no viable pure-Rust reader. The same
+/// graceful-degradation line `comic_tags.rs` already draws — except here the
+/// caller asked for something specific, so it is told the format is
+/// unsupported rather than silently getting nothing.
 ///
-/// Three rules, in order:
-///
-/// 1. CBR is RAR: proprietary, no viable pure-Rust reader. The same
-///    graceful-degradation line `comic_tags.rs` already draws — except here
-///    the caller asked for something specific, so it is told the format is
-///    unsupported rather than silently getting nothing.
-/// 2. Archive-storage order is not page order — nothing obliges a writer to
-///    store entries in sequence. Sort case-insensitively by name, which is
-///    what comic readers conventionally do and what the zero-padded
-///    filenames CBZ archives use are designed for.
-/// 3. Pages are 1-based, so 0 and `count + 1` are both out of range. A comic
-///    with no page entries at all has every page out of range, including
-///    page 1.
-///
-/// Every rejection is `InvalidInput`: each describes the request or the
-/// file's format, never a fault in reading it.
-pub async fn select_page<C: ComicArchive>(
-    archive: &C,
-    uuid: Uuid,
-    path: &str,
-    page: u32,
-) -> Result<(String, u32), DomainError> {
+/// Shared by UC-39's page route and UC-40's comic thumbnail, and called by
+/// both *handlers* rather than by the archive port: a `.cbr` must never reach
+/// `ZipComicArchive`, where a failure to open would surface as a `Disk` error
+/// and a 500 where the error table promises a 400. The two had already
+/// drifted apart once on exactly this point.
+pub fn ensure_cbz(uuid: Uuid, path: &str) -> Result<(), DomainError> {
     if !path.to_ascii_lowercase().ends_with(".cbz") {
         return Err(DomainError::InvalidInput(format!(
             "comic {uuid} is not a CBZ archive; page extraction supports CBZ only"
         )));
     }
+    Ok(())
+}
 
-    let mut names = archive.page_names(path).await?;
-    names.sort_by_key(|name| name.to_ascii_lowercase());
-
+/// Which of `names` is page `page` (1-based), and how many pages there are.
+///
+/// The single implementation of "what is page N of a comic": every
+/// `ComicArchive` — the real ZIP reader and every test fake — resolves the
+/// page number through this one function, so the ordering rule cannot drift
+/// between them and stays directly unit-testable without a filesystem. UC-39's
+/// page route and UC-40's comic thumbnail therefore always agree on what page
+/// 1 is, which is the whole reason the thumbnail sits on the UC-39 path.
+///
+/// Two rules:
+///
+/// 1. Archive-storage order is not page order — nothing obliges a writer to
+///    store entries in sequence. Sort case-insensitively by name, which is
+///    what comic readers conventionally do and what the zero-padded filenames
+///    CBZ archives use are designed for. The sort is *stable*, so entries
+///    sharing a name (legal in ZIP) keep their archive order and stay
+///    distinct pages.
+/// 2. Pages are 1-based, so 0 and `count + 1` are both out of range. A comic
+///    with no page entries at all has every page out of range, including
+///    page 1.
+///
+/// Returns an index into `names` rather than the name itself: a name does not
+/// identify an entry in an archive that permits duplicates, and the caller
+/// holds the archive index that matches each position.
+///
+/// The out-of-range message names neither the comic nor its path. It is
+/// `InvalidInput` — it describes the request, not a fault in reading the file
+/// — and `InvalidInput` messages are rendered into the client's error
+/// envelope, where a library path has no business appearing.
+pub fn select_page(names: &[String], page: u32) -> Result<(usize, u32), DomainError> {
     let page_count = names.len() as u32;
     if page == 0 || page > page_count {
         return Err(DomainError::InvalidInput(format!(
-            "page {page} is out of range; comic {uuid} has {page_count} pages"
+            "page {page} is out of range; the comic has {page_count} pages"
         )));
     }
 
-    Ok((names.swap_remove((page - 1) as usize), page_count))
+    let mut order: Vec<usize> = (0..names.len()).collect();
+    order.sort_by_key(|&i| names[i].to_ascii_lowercase());
+
+    Ok((order[(page - 1) as usize], page_count))
 }
 
 /// UC-39 — return page `page` (1-based) of a CBZ ComicBook.
@@ -206,15 +242,20 @@ where
             )));
         }
 
-        let (entry, page_count) = select_page(&self.archive, uuid, &file.path, page).await?;
-        let bytes = self.archive.read_entry(&file.path, &entry).await?;
+        // Before the archive is opened, so a `.cbr` is a 400 and never a ZIP
+        // reader failure.
+        ensure_cbz(uuid, &file.path)?;
+
+        // One call, one open: ordering, bounds and bytes all come from the
+        // same view of the archive.
+        let page_data = self.archive.read_page(&file.path, page).await?;
 
         Ok(ComicPage {
             uuid: file.uuid,
             page,
-            page_count,
-            mime_type: mime_for_path(&entry).to_string(),
-            bytes,
+            page_count: page_data.page_count,
+            mime_type: mime_for_path(&page_data.entry).to_string(),
+            bytes: page_data.bytes,
         })
     }
 }
@@ -226,21 +267,26 @@ mod tests {
     use crate::playback::test_support::{a_file, FakeAuth, FakeRepo};
 
     /// Archive fake: entries deliberately supplied out of order, to prove
-    /// the handler sorts rather than trusting archive order.
+    /// the ordering rule is applied rather than archive order trusted. It
+    /// resolves the page number through the real `select_page`, exactly as
+    /// `ZipComicArchive` does, and echoes the chosen entry's name as its
+    /// bytes so a test can see which entry was picked.
     #[derive(Clone)]
     struct FakeArchive;
 
     impl ComicArchive for FakeArchive {
-        async fn page_names(&self, _path: &str) -> Result<Vec<String>, DomainError> {
-            Ok(vec![
+        async fn read_page(&self, _path: &str, page: u32) -> Result<ArchivePage, DomainError> {
+            let names = vec![
                 "page003.jpg".to_string(),
                 "page001.jpg".to_string(),
                 "page002.png".to_string(),
-            ])
-        }
-
-        async fn read_entry(&self, _path: &str, entry: &str) -> Result<Vec<u8>, DomainError> {
-            Ok(entry.as_bytes().to_vec())
+            ];
+            let (position, page_count) = select_page(&names, page)?;
+            Ok(ArchivePage {
+                bytes: names[position].as_bytes().to_vec(),
+                entry: names[position].clone(),
+                page_count,
+            })
         }
     }
 
@@ -353,6 +399,34 @@ mod tests {
 
         // Assert
         assert_eq!(bytes.expect("read"), b"tiny page".to_vec());
+    }
+
+    #[test]
+    fn given_duplicate_entry_names_when_selected_then_each_page_is_a_distinct_entry() {
+        // Arrange — ZIP permits two entries with the same name. The port used
+        // to count both while `by_name` returned the first for either index,
+        // so page 2 silently served page 1's bytes. Selection now returns a
+        // *position*, which the archive maps to its own entry index, and the
+        // sort is stable, so duplicates stay two distinct pages in archive
+        // order. (No real CBZ fixture here: the `zip` crate's writer rejects
+        // duplicate filenames outright with `InvalidArchive("Duplicate
+        // filename")`, so such an archive cannot be built with it.)
+        let names = vec![
+            "page001.jpg".to_string(),
+            "page001.jpg".to_string(),
+            "page000.jpg".to_string(),
+        ];
+
+        // Act
+        let first = select_page(&names, 1).expect("page 1");
+        let second = select_page(&names, 2).expect("page 2");
+        let third = select_page(&names, 3).expect("page 3");
+
+        // Assert — three pages, three different entries, and the two
+        // duplicates keep their archive order behind the entry that sorts
+        // first.
+        assert_eq!((first.1, second.1, third.1), (3, 3, 3));
+        assert_eq!((first.0, second.0, third.0), (2, 0, 1));
     }
 
     #[tokio::test]

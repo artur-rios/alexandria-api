@@ -124,19 +124,19 @@ where
                     .await?
             }
             FileType::Comic => {
-                // Page 1 via UC-39's own selection, not a second copy of it:
-                // the CBZ guard, the case-insensitive sort and the range
-                // check are all `select_page`'s. A comic's thumbnail is
+                // Page 1 via UC-39's own path, not a second copy of it: the
+                // CBZ guard is `ensure_cbz`, and the case-insensitive sort
+                // and range check live in `select_page`, which every
+                // `ComicArchive` resolves through. A comic's thumbnail is
                 // therefore the same image `GET /pages/1` returns, by
-                // construction, and a `.cbr` is rejected here with the same
-                // `InvalidInput` the page route gives instead of failing
-                // inside the ZIP reader as a `Disk` error.
-                let (first, _) =
-                    crate::playback::comic_page::select_page(&self.archive, uuid, &file.path, 1)
-                        .await?;
-                let raw = self.archive.read_entry(&file.path, &first).await?;
+                // construction, and a `.cbr` is rejected here — before the
+                // archive is opened — with the same `InvalidInput` the page
+                // route gives instead of failing inside the ZIP reader as a
+                // `Disk` error.
+                crate::playback::comic_page::ensure_cbz(uuid, &file.path)?;
+                let first = self.archive.read_page(&file.path, 1).await?;
                 self.renderer
-                    .from_image_bytes(&raw, THUMBNAIL_MAX_DIM)
+                    .from_image_bytes(&first.bytes, THUMBNAIL_MAX_DIM)
                     .await?
             }
             _ => {
@@ -411,18 +411,26 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     /// Archive fake: pages deliberately supplied out of order, so the
-    /// "page 1" assertion proves the handler sorts rather than taking
-    /// whatever the archive happened to store first.
+    /// "page 1" assertion proves the ordering rule ran rather than the
+    /// archive's own storage order being taken. Like the real
+    /// `ZipComicArchive`, it resolves the page number through `select_page`,
+    /// and it echoes the chosen entry's name as its bytes.
     #[derive(Clone)]
     struct FakeArchive;
 
     impl ComicArchive for FakeArchive {
-        async fn page_names(&self, _path: &str) -> Result<Vec<String>, DomainError> {
-            Ok(vec!["p2.jpg".to_string(), "p1.jpg".to_string()])
-        }
-
-        async fn read_entry(&self, _path: &str, entry: &str) -> Result<Vec<u8>, DomainError> {
-            Ok(entry.as_bytes().to_vec())
+        async fn read_page(
+            &self,
+            _path: &str,
+            page: u32,
+        ) -> Result<crate::playback::comic_page::ArchivePage, DomainError> {
+            let names = vec!["p2.jpg".to_string(), "p1.jpg".to_string()];
+            let (position, page_count) = crate::playback::comic_page::select_page(&names, page)?;
+            Ok(crate::playback::comic_page::ArchivePage {
+                bytes: names[position].as_bytes().to_vec(),
+                entry: names[position].clone(),
+                page_count,
+            })
         }
     }
 
