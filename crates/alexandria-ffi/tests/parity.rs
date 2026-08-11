@@ -56,6 +56,17 @@ use tower::ServiceExt;
 // failures.
 static SERIAL: Mutex<()> = Mutex::new(());
 
+/// How long a poll waits for an asynchronous index / re-index run to land in
+/// the database before it gives up and panics.
+///
+/// Generous on purpose. UC-01 and UC-02 return immediately and finish in the
+/// background (FR-FC-08), so every assertion about their results has to poll.
+/// The runs themselves take milliseconds; what the bound has to absorb is the
+/// machine, and under `cargo test --workspace` these binaries share a host
+/// with dozens of others and a live compile. A tighter bound does not catch a
+/// slow indexer — it just reports the runner's load as a product failure.
+const ASYNC_RUN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// The editable columns of an `audio_files` row, in the order every
 /// assertion here selects them: title, artist, album, year, genre, track.
 type AudioMetadataRow = (
@@ -165,7 +176,7 @@ async fn given_same_lib_when_indexed_via_http_and_ffi_then_files_rows_identical(
 
     // wait for HTTP persistence
     let expected: i64 = 3;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + ASYNC_RUN_DEADLINE;
     loop {
         let (c,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM files")
             .fetch_one(&http_pool)
@@ -203,7 +214,7 @@ async fn given_same_lib_when_indexed_via_http_and_ffi_then_files_rows_identical(
         assert_eq!(result.status, alexandria_ffi::INDEX_OK, "ffi start failed");
         assert!(!run_id_string(&result).is_empty());
 
-        let dl = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let dl = std::time::Instant::now() + ASYNC_RUN_DEADLINE;
         loop {
             let c = alexandria_index_count_files();
             if c >= 3 {
@@ -410,7 +421,7 @@ fn wait_for_http_files(
     expected: i64,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
     Box::pin(async move {
-        let dl = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let dl = std::time::Instant::now() + ASYNC_RUN_DEADLINE;
         loop {
             let (c,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM files")
                 .fetch_one(pool)
@@ -434,7 +445,7 @@ fn wait_for_http_files(
 /// therefore race ahead of extraction — poll the `audio_files` row itself so
 /// callers only proceed once the title has actually landed.
 async fn wait_for_http_audio_title(pool: &sqlx::sqlite::SqlitePool, expected_title: &str) {
-    let dl = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let dl = std::time::Instant::now() + ASYNC_RUN_DEADLINE;
     loop {
         let row: Option<(Option<String>,)> = sqlx::query_as(
             "SELECT audio_files.title FROM audio_files \
@@ -458,7 +469,7 @@ async fn wait_for_http_audio_title(pool: &sqlx::sqlite::SqlitePool, expected_tit
 }
 
 async fn wait_for_http_missing(pool: &sqlx::sqlite::SqlitePool, expected: i64) {
-    let dl = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let dl = std::time::Instant::now() + ASYNC_RUN_DEADLINE;
     loop {
         let (c,): (i64,) =
             sqlx::query_as("SELECT COUNT(*) FROM files WHERE missing_at IS NOT NULL")
@@ -476,7 +487,7 @@ async fn wait_for_http_missing(pool: &sqlx::sqlite::SqlitePool, expected: i64) {
 }
 
 fn wait_for_ffi_files(expected: i64) {
-    let dl = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let dl = std::time::Instant::now() + ASYNC_RUN_DEADLINE;
     loop {
         if alexandria_index_count_files() >= expected {
             return;
@@ -489,7 +500,7 @@ fn wait_for_ffi_files(expected: i64) {
 }
 
 fn wait_for_ffi_missing(expected: i64) {
-    let dl = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let dl = std::time::Instant::now() + ASYNC_RUN_DEADLINE;
     loop {
         if alexandria_index_count_missing() >= expected {
             return;
@@ -8824,7 +8835,7 @@ async fn given_tagged_audio_file_when_indexed_via_http_and_ffi_then_extracted_me
         let started = alexandria_index_start(root.as_ptr(), token.as_ptr());
         assert_eq!(started.status, alexandria_ffi::INDEX_OK);
 
-        let dl = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let dl = std::time::Instant::now() + ASYNC_RUN_DEADLINE;
         loop {
             if alexandria_index_count_files() >= 1 {
                 break;
@@ -8860,7 +8871,7 @@ async fn given_tagged_audio_file_when_indexed_via_http_and_ffi_then_extracted_me
                     .await
                     .unwrap();
 
-                let dl = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                let dl = std::time::Instant::now() + ASYNC_RUN_DEADLINE;
                 loop {
                     let row: Option<(Option<String>,)> = sqlx::query_as(
                         "SELECT audio_files.title FROM audio_files \
@@ -8958,7 +8969,7 @@ fn write_test_exif(path: &std::path::Path, width: u32, height: u32, description:
 /// and fixed exactly this race for its own parity test; this test extends
 /// that fix to cover every write it asserts on).
 async fn wait_for_http_image_extraction(pool: &sqlx::sqlite::SqlitePool, name: &str) {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + ASYNC_RUN_DEADLINE;
     loop {
         let row: Option<(Option<i64>, Option<i64>, Option<String>)> = sqlx::query_as(
             "SELECT images.width, images.height, images.title FROM images \
@@ -9068,7 +9079,7 @@ async fn given_tagged_image_file_when_indexed_via_http_and_ffi_then_extracted_me
                 .connect(&format!("sqlite://{ffi_db_for_poll}?mode=rw"))
                 .await
                 .unwrap();
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let deadline = std::time::Instant::now() + ASYNC_RUN_DEADLINE;
             loop {
                 let row: Option<FfiImageExtractionRow> = sqlx::query_as(
                     "SELECT files.uuid, images.width, images.height, images.title FROM images \
@@ -9172,7 +9183,7 @@ fn write_minimal_pdf(path: &std::path::Path, title: &str, author: &str) {
 /// landed (metadata write and page-count write are separate
 /// transactions), not just file-row existence or a single write.
 async fn wait_for_http_document_extraction(pool: &sqlx::sqlite::SqlitePool, name: &str) {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + ASYNC_RUN_DEADLINE;
     loop {
         let row: Option<(Option<String>, Option<String>, Option<i64>)> = sqlx::query_as(
             "SELECT documents.title, documents.author, documents.page_count FROM documents \
@@ -9282,7 +9293,7 @@ async fn given_tagged_pdf_file_when_indexed_via_http_and_ffi_then_extracted_meta
                 .connect(&format!("sqlite://{ffi_db_for_poll}?mode=rw"))
                 .await
                 .unwrap();
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let deadline = std::time::Instant::now() + ASYNC_RUN_DEADLINE;
             loop {
                 let row: Option<FfiDocumentExtractionRow> = sqlx::query_as(
                     "SELECT files.uuid, documents.title, documents.author, documents.page_count \
@@ -9389,7 +9400,7 @@ fn write_minimal_mp4(path: &std::path::Path, title: &str, width: u32, height: u3
 /// write are separate transactions), not just file-row existence or a
 /// single write.
 async fn wait_for_http_video_extraction(pool: &sqlx::sqlite::SqlitePool, name: &str) {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + ASYNC_RUN_DEADLINE;
     loop {
         let row: Option<(Option<String>, Option<String>, Option<f64>)> = sqlx::query_as(
             "SELECT video_files.title, video_files.resolution, video_files.duration_seconds \
@@ -9499,7 +9510,7 @@ async fn given_tagged_mp4_file_when_indexed_via_http_and_ffi_then_extracted_meta
                 .connect(&format!("sqlite://{ffi_db_for_poll}?mode=rw"))
                 .await
                 .unwrap();
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let deadline = std::time::Instant::now() + ASYNC_RUN_DEADLINE;
             loop {
                 let row: Option<FfiVideoExtractionRow> = sqlx::query_as(
                     "SELECT files.uuid, video_files.title, video_files.resolution, \
@@ -9600,7 +9611,7 @@ fn write_minimal_cbz(
 type HttpComicExtractionRow = (Option<String>, Option<String>, Option<i64>, Option<i64>);
 
 async fn wait_for_http_comic_extraction(pool: &sqlx::sqlite::SqlitePool, name: &str) {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + ASYNC_RUN_DEADLINE;
     loop {
         let row: Option<HttpComicExtractionRow> = sqlx::query_as(
             "SELECT comic_books.title, comic_books.series, comic_books.issue_number, \
@@ -9717,7 +9728,7 @@ async fn given_tagged_cbz_file_when_indexed_via_http_and_ffi_then_extracted_meta
                 .connect(&format!("sqlite://{ffi_db_for_poll}?mode=rw"))
                 .await
                 .unwrap();
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let deadline = std::time::Instant::now() + ASYNC_RUN_DEADLINE;
             loop {
                 let row: Option<FfiComicExtractionRow> = sqlx::query_as(
                     "SELECT files.uuid, comic_books.title, comic_books.series, \

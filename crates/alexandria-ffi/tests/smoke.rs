@@ -10,8 +10,25 @@ use tempfile::{tempdir, TempDir};
 static SERIAL: Mutex<()> = Mutex::new(());
 
 fn serial() -> std::sync::MutexGuard<'static, ()> {
-    SERIAL.lock().unwrap()
+    // Recover from poisoning rather than propagating it, matching
+    // `parity.rs`. The guard protects a process-global services slot, not an
+    // invariant this lock can corrupt: every test re-initializes it through
+    // `init_temp_db`. Unwrapping instead let the *first* panicking test poison
+    // the mutex and turn every later test in this file into an opaque
+    // `PoisonError`, burying the one real failure under 42 fake ones.
+    SERIAL.lock().unwrap_or_else(|e| e.into_inner())
 }
+
+/// How long a poll waits for an asynchronous index / re-index run to land in
+/// the database before it gives up and panics.
+///
+/// Generous on purpose. UC-01 and UC-02 return immediately and finish in the
+/// background (FR-FC-08), so every assertion about their results has to poll.
+/// The runs themselves take milliseconds; what the bound has to absorb is the
+/// machine, and under `cargo test --workspace` these binaries share a host
+/// with dozens of others and a live compile. A tighter bound does not catch a
+/// slow indexer — it just reports the runner's load as a product failure.
+const ASYNC_RUN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// The editable columns of an `audio_files` row, in the order every
 /// assertion here selects them: title, artist, album, year, genre, track.
@@ -104,7 +121,7 @@ fn run_id_string(r: &IndexStartResult) -> String {
 }
 
 fn wait_for_files(expected: i64) -> i64 {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + ASYNC_RUN_DEADLINE;
     loop {
         let count = alexandria_index_count_files();
         if count >= expected {
@@ -264,7 +281,7 @@ fn files_json_value() -> serde_json::Value {
 
 /// Wait until `missing_at IS NOT NULL` count reaches `expected` missing files.
 fn wait_for_missing(expected: i64) -> i64 {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + ASYNC_RUN_DEADLINE;
     loop {
         let count = alexandria_index_count_missing();
         if count >= expected {
