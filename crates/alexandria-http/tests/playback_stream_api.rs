@@ -111,6 +111,16 @@ async fn given_indexed_file_when_streamed_then_bytes_match_disk_exactly() {
             .unwrap(),
         "text/plain"
     );
+    // Library bytes are served verbatim, including HTML and SVG. `nosniff`
+    // holds the browser to the catalog's MIME answer instead of letting it
+    // re-sniff the body and execute it in the API's origin.
+    assert_eq!(
+        response
+            .headers()
+            .get("x-content-type-options")
+            .expect("nosniff header present"),
+        "nosniff"
+    );
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     assert_eq!(body.to_vec(), contents);
 }

@@ -13,6 +13,21 @@ use crate::middleware::error::ApiError;
 use crate::routes::bearer_token;
 use crate::AppState;
 
+/// Every playback response carries `X-Content-Type-Options: nosniff`.
+///
+/// These three routes are this API's only byte-serving surface, and what
+/// they serve includes `text/html`, `multipart/related` and `image/svg+xml`
+/// straight from the library. A library HTML or SVG file containing a script,
+/// opened in a webview at its stream URL, would otherwise execute in the
+/// API's origin. Impact is limited — auth is a Bearer header, so there is no
+/// cookie for such a script to steal — but the header is one line and the
+/// surface is new. `nosniff` also holds browsers to the catalog MIME table's
+/// answer rather than letting them re-sniff the bytes.
+const NOSNIFF: (axum::http::HeaderName, HeaderValue) = (
+    axum::http::header::X_CONTENT_TYPE_OPTIONS,
+    HeaderValue::from_static("nosniff"),
+);
+
 /// `GET /v1/files/{uuid}/stream` — stream a File's bytes from disk
 /// (UC-38 / FR-MP-01, FR-MP-02). Returns `200` with the whole file, or
 /// `206` for a `Range` request, or `416` for an unsatisfiable range. Errors
@@ -69,6 +84,8 @@ pub async fn stream(
         .headers_mut()
         .insert("accept-ranges", HeaderValue::from_static("bytes"));
 
+    response.headers_mut().insert(NOSNIFF.0, NOSNIFF.1);
+
     Ok(response)
 }
 
@@ -97,7 +114,7 @@ pub async fn comic_page(
         .unwrap_or(HeaderValue::from_static("application/octet-stream"));
 
     Ok((
-        [(axum::http::header::CONTENT_TYPE, content_type)],
+        [(axum::http::header::CONTENT_TYPE, content_type), NOSNIFF],
         page.bytes,
     )
         .into_response())
@@ -123,10 +140,13 @@ pub async fn thumbnail(
         .map_err(ApiError)?;
 
     Ok((
-        [(
-            axum::http::header::CONTENT_TYPE,
-            HeaderValue::from_static("image/jpeg"),
-        )],
+        [
+            (
+                axum::http::header::CONTENT_TYPE,
+                HeaderValue::from_static("image/jpeg"),
+            ),
+            NOSNIFF,
+        ],
         thumb.bytes,
     )
         .into_response())
