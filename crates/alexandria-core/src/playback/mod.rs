@@ -19,6 +19,63 @@ use crate::catalog::model::{File, FileState};
 use crate::catalog::repos::CatalogRepository;
 use crate::errors::DomainError;
 
+/// Ceiling on any single blob playback pulls into memory before it can decode
+/// it — a source image for a thumbnail, or one decompressed entry of a comic
+/// archive.
+///
+/// Both of those reads sit on a *request* path, not on owner-initiated
+/// indexing, and both are sized by data an attacker who can put a file in the
+/// library controls: a 3 GB TIFF allocates 3 GB before `image` ever applies
+/// its own decode guard, and a 900 KB CBZ whose entry inflates to 40 GB is
+/// the classic zip bomb — a single request allocates until the process dies.
+///
+/// 256 MiB sits an order of magnitude above anything a real library holds and
+/// well below anything that threatens the process. A 100-megapixel 8-bit RGB
+/// photo is roughly 25 MB compressed and a comic page is a JPEG of a few MB;
+/// on the other side `image` already refuses to allocate more than 512 MB of
+/// *decoded* pixels, so a source past this cap could almost never have
+/// produced a thumbnail anyway. Deliberately a constant and not a config key:
+/// it is a safety limit rather than a preference, and a deployment able to
+/// raise it would be equally able to disable it.
+pub const MAX_PLAYBACK_READ_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Read at most `cap` bytes from `path`, refusing anything larger.
+///
+/// `tokio::fs::read` allocates the whole file first, which is exactly the
+/// behavior being bounded here. Reading `cap + 1` bytes costs one byte over
+/// the limit and never truncates — a silently short JPEG decodes into a
+/// garbage thumbnail, which is worse than an error.
+///
+/// Over-cap is `InvalidInput`, not `Disk`: nothing failed to read. The file is
+/// simply not something this route can work with, the same classification the
+/// SVG and CBR rejections already use, and the same `400` the error table
+/// promises for an unsupported source. The message names no path: an
+/// `InvalidInput` message is rendered into the client's error envelope.
+///
+/// `cap` is a parameter rather than a read of [`MAX_PLAYBACK_READ_BYTES`], so
+/// a test can drive the over-cap branch against a fixture of a few bytes.
+pub(crate) async fn read_capped(path: &str, cap: u64) -> Result<Vec<u8>, DomainError> {
+    use tokio::io::AsyncReadExt;
+
+    let file = tokio::fs::File::open(path)
+        .await
+        .map_err(|e| DomainError::disk(format!("cannot read {path}: {e}")))?;
+
+    let mut bytes = Vec::new();
+    file.take(cap + 1)
+        .read_to_end(&mut bytes)
+        .await
+        .map_err(|e| DomainError::disk(format!("cannot read {path}: {e}")))?;
+
+    if bytes.len() as u64 > cap {
+        return Err(DomainError::InvalidInput(format!(
+            "file is larger than the {cap}-byte playback read limit"
+        )));
+    }
+
+    Ok(bytes)
+}
+
 /// UC-38's FFI payload (FR-MP-06): everything a local player needs to open
 /// the file itself. The FFI surface cannot carry a byte stream, so it hands
 /// back the resolved path instead and Flutter opens it directly — zero-copy,
@@ -172,6 +229,39 @@ mod tests {
 
         // Assert
         assert!(matches!(result, Err(DomainError::Disk(_))));
+    }
+
+    #[tokio::test]
+    async fn given_source_larger_than_cap_when_read_then_invalid_input() {
+        // Arrange — 64 bytes on disk against a 16-byte cap. `cap` is a
+        // parameter precisely so this fixture stays tiny; the request path
+        // passes `MAX_PLAYBACK_READ_BYTES`. Reaching this branch at all
+        // proves the read stopped short of allocating the whole file.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("huge.tiff");
+        std::fs::write(&path, vec![7u8; 64]).expect("write fixture");
+
+        // Act
+        let result = read_capped(path.to_str().expect("path"), 16).await;
+
+        // Assert — an error, not a truncated 16-byte buffer that would
+        // decode into a garbage thumbnail.
+        assert!(matches!(result, Err(DomainError::InvalidInput(_))));
+    }
+
+    #[tokio::test]
+    async fn given_source_exactly_at_cap_when_read_then_all_bytes_returned() {
+        // Arrange — a file the same size as the cap is legal, and the extra
+        // byte the reader is allowed must not turn it into a rejection.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("exact.png");
+        std::fs::write(&path, vec![7u8; 16]).expect("write fixture");
+
+        // Act
+        let bytes = read_capped(path.to_str().expect("path"), 16).await;
+
+        // Assert
+        assert_eq!(bytes.expect("read"), vec![7u8; 16]);
     }
 
     #[tokio::test]

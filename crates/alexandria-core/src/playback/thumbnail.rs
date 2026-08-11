@@ -10,7 +10,7 @@ use crate::catalog::model::FileType;
 use crate::catalog::repos::CatalogRepository;
 use crate::errors::DomainError;
 use crate::playback::comic_page::ComicArchive;
-use crate::playback::resolve_playable;
+use crate::playback::{resolve_playable, MAX_PLAYBACK_READ_BYTES};
 
 /// The one thumbnail size. Not a config key and not a query parameter —
 /// there is one size until something needs a second. The cache key includes
@@ -115,9 +115,10 @@ where
                         "file {uuid} is an SVG; SVG thumbnails are not supported"
                     )));
                 }
-                let raw = tokio::fs::read(&file.path)
-                    .await
-                    .map_err(|e| DomainError::disk(format!("cannot read {}: {e}", file.path)))?;
+                // Bounded: `tokio::fs::read` would allocate the whole source
+                // first, so a 3 GB TIFF costs 3 GB before `image`'s own
+                // decode guard ever runs (`MAX_PLAYBACK_READ_BYTES`).
+                let raw = crate::playback::read_capped(&file.path, MAX_PLAYBACK_READ_BYTES).await?;
                 self.renderer
                     .from_image_bytes(&raw, THUMBNAIL_MAX_DIM)
                     .await?

@@ -9,7 +9,7 @@ use crate::catalog::model::FileType;
 use crate::catalog::repos::CatalogRepository;
 use crate::errors::DomainError;
 use crate::playback::mime::mime_for_path;
-use crate::playback::resolve_playable;
+use crate::playback::{resolve_playable, MAX_PLAYBACK_READ_BYTES};
 
 /// One page of a comic archive. `bytes` are the archive entry's own bytes,
 /// undecoded and unmodified (FR-MP-03) — a CBZ page is already a JPEG or
@@ -74,19 +74,50 @@ impl ComicArchive for ZipComicArchive {
                 .map_err(|e| DomainError::disk(format!("cannot open {owned}: {e}")))?;
             let mut archive = zip::ZipArchive::new(file)
                 .map_err(|e| DomainError::disk(format!("cannot read {owned}: {e}")))?;
-            let mut zip_entry = archive
+            let zip_entry = archive
                 .by_name(&wanted)
                 .map_err(|e| DomainError::disk(format!("cannot read entry {wanted}: {e}")))?;
-            let mut bytes = Vec::new();
-            std::io::Read::read_to_end(&mut zip_entry, &mut bytes)
-                .map_err(|e| DomainError::disk(format!("cannot read entry {wanted}: {e}")))?;
-            Ok(bytes)
+            read_entry_capped(zip_entry, MAX_PLAYBACK_READ_BYTES)
         });
         match handle.await {
             Ok(result) => result,
             Err(err) => Err(DomainError::internal(format!("archive task failed: {err}"))),
         }
     }
+}
+
+/// Read one archive entry, refusing anything that decompresses past `cap`.
+///
+/// A ZIP entry's decompressed size is whatever the archive claims it is, and
+/// the bytes keep coming whatever the header said: `read_to_end` on a 900 KB
+/// CBZ whose entry inflates to 40 GB allocates until the process dies. `take`
+/// bounds the reader itself, so the allocation can never exceed the cap
+/// regardless of what the entry declares.
+///
+/// `cap + 1` bytes are read so a file *at* the cap is still served and a file
+/// past it is detected rather than truncated — a short JPEG decodes into a
+/// garbage page, which is worse than an error. Over-cap is `InvalidInput`,
+/// consistent with every other "this file is not something we can work with"
+/// rejection on this path, and the message names no entry because
+/// `InvalidInput` messages reach the client.
+///
+/// `cap` is a parameter, not a read of [`MAX_PLAYBACK_READ_BYTES`], so a test
+/// can drive the over-cap branch against a fixture of a few hundred bytes.
+pub(crate) fn read_entry_capped<R: std::io::Read>(
+    reader: R,
+    cap: u64,
+) -> Result<Vec<u8>, DomainError> {
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(&mut reader.take(cap + 1), &mut bytes)
+        .map_err(|e| DomainError::disk(format!("cannot read comic entry: {e}")))?;
+
+    if bytes.len() as u64 > cap {
+        return Err(DomainError::InvalidInput(format!(
+            "comic page is larger than the {cap}-byte playback read limit"
+        )));
+    }
+
+    Ok(bytes)
 }
 
 /// Which archive entry is page `page` (1-based) of the comic at `path`, and
@@ -276,6 +307,52 @@ mod tests {
         // Assert
         assert!(matches!(zero, Err(DomainError::InvalidInput(_))));
         assert!(matches!(past_end, Err(DomainError::InvalidInput(_))));
+    }
+
+    /// A real one-entry ZIP in memory, so the cap test reads through the
+    /// `zip` crate's own decompressing reader rather than a stand-in.
+    fn zip_with_entry(name: &str, bytes: &[u8]) -> Vec<u8> {
+        use std::io::Write;
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        writer
+            .start_file(name, zip::write::SimpleFileOptions::default())
+            .expect("start entry");
+        writer.write_all(bytes).expect("write entry");
+        writer.finish().expect("finish zip").into_inner()
+    }
+
+    #[test]
+    fn given_entry_larger_than_cap_when_read_then_invalid_input() {
+        // Arrange — a zip bomb in miniature: 4096 highly compressible bytes
+        // stored in a far smaller archive, read against a 64-byte cap. `cap`
+        // is a parameter so the fixture stays small; the request path passes
+        // `MAX_PLAYBACK_READ_BYTES`.
+        let archive_bytes = zip_with_entry("page001.jpg", &vec![0u8; 4096]);
+        assert!(archive_bytes.len() < 4096, "entry must inflate on read");
+        let mut archive =
+            zip::ZipArchive::new(std::io::Cursor::new(archive_bytes)).expect("open zip");
+        let entry = archive.by_index(0).expect("entry");
+
+        // Act
+        let result = read_entry_capped(entry, 64);
+
+        // Assert — an error, not 64 truncated bytes labelled `image/jpeg`.
+        assert!(matches!(result, Err(DomainError::InvalidInput(_))));
+    }
+
+    #[test]
+    fn given_entry_within_cap_when_read_then_bytes_returned() {
+        // Arrange — the cap must not reject a legitimate page.
+        let archive_bytes = zip_with_entry("page001.jpg", b"tiny page");
+        let mut archive =
+            zip::ZipArchive::new(std::io::Cursor::new(archive_bytes)).expect("open zip");
+        let entry = archive.by_index(0).expect("entry");
+
+        // Act
+        let bytes = read_entry_capped(entry, 64);
+
+        // Assert
+        assert_eq!(bytes.expect("read"), b"tiny page".to_vec());
     }
 
     #[tokio::test]
