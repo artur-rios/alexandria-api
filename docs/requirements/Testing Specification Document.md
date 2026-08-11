@@ -209,11 +209,13 @@ indexing rate, and that reads keep being served while a run is in flight
 (NFR-01's p95 during load). Its tests are `#[ignore]`d and run on request:
 
 ```bash
-cargo test -p alexandria-core --test throughput -- --ignored --nocapture
+cargo test --release -p alexandria-core --test throughput -- --ignored --nocapture
 ```
 
 `--nocapture` is required: the measured figures are printed, and the figures
-are the deliverable. Two assertion modes:
+are the deliverable. `--release` matters just as much — NFR-02 scopes its
+target to a shipped build, and an unoptimized one measures the debug profile
+rather than the product. Two assertion modes:
 
 | Mode | Asserts | For |
 | --- | --- | --- |
@@ -243,10 +245,26 @@ hashing reads every byte, and ffmpeg may seek a long way to find its best video
 stream. Read a row as "extraction costs at least this much per file, before
 file size enters into it".
 
+The test discards one warm-up round before the row it reports as the baseline.
+Every row builds its own database and fixture tree, but the first row also
+absorbs what a process pays exactly once — the first migration on a cold page
+cache, the first touch of the sqlite and ffmpeg code paths, and on Windows the
+anti-malware scan of a newly written binary. Those landed on `text`, the row
+every other row is divided by, and the `vs text` column consequently reported
+audio and document as *faster* than extracting nothing at all. That is
+impossible: extraction is strictly extra work on the same pipeline. If that
+column ever shows a figure above 100% again, suspect the harness before the
+extractor.
+
 CI runs these on pushes to `main` as a separate job carrying
 `continue-on-error: true`, so the numbers are recorded over time and the
 harness cannot rot, without a noisy runner turning a red build into something
-to ignore.
+to ignore. That job deliberately runs the **debug** profile and without
+`ALEXANDRIA_NFR_STRICT` — it is checking that the harness still compiles and
+still finds every fixture, not measuring the requirement, and paying for an
+LTO release build on every push to `main` would buy a number the loose floors
+do not read anyway. The `--release` invocation above is for the on-request run
+that produces a figure worth recording.
 
 That flag is load-bearing, not decorative. The loose floors resist runner
 noise, but the harness also asserts **exact counts** — every fixture file
@@ -259,6 +277,45 @@ a measurement.
 
 Read a red mark here as a prompt to compare the figures against the previous
 run, not as a broken build.
+
+### 9.1 Recorded measurements
+
+Requirements that are measured rather than asserted are only verified when
+someone writes the measurement down. This is that record — not a target to
+regress against, since the next machine will read differently.
+
+| | |
+| --- | --- |
+| Date | 2026-08-11 |
+| Commit | `2929529` |
+| Machine | Intel Core i9-13900K (24 cores / 32 threads), 32 GB RAM, NVMe SSD |
+| OS | Windows 11 Pro 10.0.26200 |
+| Toolchain | rustc 1.97.1, `--release` (`lto = true`, `codegen-units = 1`) |
+| Command | `ALEXANDRIA_NFR_STRICT=1 cargo test --release -p alexandria-core --test throughput -- --ignored --nocapture` |
+
+**NFR-02 — indexing throughput.** 2000 files of 4096 B, concurrency 4,
+elapsed 2.33 s: **859 files/sec** against a target of ≥ 500.
+
+**NFR-01 — read latency during indexing.** 259 reads issued while the run was
+in flight: **p95 12.0 ms**, worst 29.4 ms, against a target of < 200 ms.
+
+**FR-FC-25 — per-format extraction cost**, concurrency 4:
+
+| format | files | files/sec | ms/file | vs text |
+| --- | ---: | ---: | ---: | ---: |
+| text (baseline) | 150 | 722 | 1.38 | 100% |
+| audio (wav/id3) | 150 | 339 | 2.95 | 47% |
+| image (jpeg/exif) | 150 | 315 | 3.18 | 44% |
+| document (pdf) | 150 | 267 | 3.74 | 37% |
+| comic (cbz) | 150 | 336 | 2.98 | 46% |
+| video (mp4) | 37 | 323 | 3.10 | 45% |
+
+Extraction roughly halves the per-file rate across every format — about
+1.6–2.4 ms of fixed cost on top of a 1.4 ms baseline — with no format standing
+out as pathological. Both NFR targets are met with 1.7× headroom on throughput
+and 16× on latency, on hardware well above what the requirement means by "a
+personal machine"; a modest laptop should be expected to sit closer to the
+floor.
 
 ## 10. Running the suites
 

@@ -413,6 +413,46 @@ async fn build(
     (handler, repo)
 }
 
+/// Index `count` fixtures of one format against a fresh database and return
+/// `(files_per_second, ms_per_file)`.
+///
+/// Each call gets its own library tree and its own database, so one format's
+/// rows never share a page cache or a `files` table with another's. Extracted
+/// as a function because the extraction-cost test calls it once more than it
+/// reports — see the warm-up round at that test's top.
+async fn measure(format: Format, count: usize, concurrency: u32) -> (f64, f64) {
+    let lib = tempfile::tempdir().expect("tempdir");
+    let dbdir = tempfile::tempdir().expect("tempdir");
+
+    for i in 0..count {
+        let dir = fixture_dir(lib.path(), i);
+        format.write(&dir.join(format!("f{i:06}.{}", format.extension())), i);
+    }
+
+    let (handler, _repo) = build(&dbdir.path().join("bench.sqlite"), concurrency).await;
+
+    let started = Instant::now();
+    let outcome = handler
+        .execute(lib.path().to_str().expect("utf-8 lib path"), Uuid::new_v4())
+        .await
+        .expect("index run");
+    let elapsed = started.elapsed();
+
+    assert_eq!(
+        outcome.indexed,
+        count,
+        "every {} fixture is cataloged ({})",
+        format.label(),
+        outcome_counters(&outcome)
+    );
+    assert_eq!(outcome.failed, 0, "no {} file failed", format.label());
+
+    (
+        count as f64 / elapsed.as_secs_f64(),
+        elapsed.as_secs_f64() * 1000.0 / count as f64,
+    )
+}
+
 /// NFR-02, first half — the indexing rate.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "measures machine throughput; run explicitly with --ignored --nocapture"]
@@ -598,42 +638,26 @@ async fn given_each_media_format_when_indexed_then_extraction_cost_is_measured()
     let base = env_usize("ALEXANDRIA_BENCH_MEDIA_FILES", 150);
     let concurrency = env_usize("ALEXANDRIA_BENCH_CONCURRENCY", 4) as u32;
 
+    // Warm-up round, discarded. Every row below pays for its own fresh
+    // database and fixture tree, but the *first* row also pays the costs that
+    // are paid once per process: the first `migrate_database` on a cold page
+    // cache, the first touch of the sqlite and ffmpeg code paths, and on
+    // Windows the anti-malware scan of a freshly written binary. Those landed
+    // on `Text`, which is the baseline every other row is divided by, so the
+    // `vs text` column reported audio and document as *faster* than doing no
+    // extraction at all — an impossible result, since extraction is strictly
+    // extra work on the same walk/hash/persist pipeline. Burning one round
+    // first puts the baseline on the same footing as the rows it is compared
+    // against. It is `Text` specifically so the warm path is the baseline's
+    // own.
+    measure(Format::Text, Format::Text.count(base), concurrency).await;
+
     let mut rows: Vec<(Format, usize, f64, f64)> = Vec::new();
 
     for format in Format::ALL {
         let count = format.count(base);
-        let lib = tempfile::tempdir().expect("tempdir");
-        let dbdir = tempfile::tempdir().expect("tempdir");
-
-        for i in 0..count {
-            let dir = fixture_dir(lib.path(), i);
-            format.write(&dir.join(format!("f{i:06}.{}", format.extension())), i);
-        }
-
-        let (handler, _repo) = build(&dbdir.path().join("bench.sqlite"), concurrency).await;
-
-        let started = Instant::now();
-        let outcome = handler
-            .execute(lib.path().to_str().expect("utf-8 lib path"), Uuid::new_v4())
-            .await
-            .expect("index run");
-        let elapsed = started.elapsed();
-
-        assert_eq!(
-            outcome.indexed,
-            count,
-            "every {} fixture is cataloged",
-            format.label()
-        );
-        assert_eq!(outcome.failed, 0, "no {} file failed", format.label());
-
-        let per_second = count as f64 / elapsed.as_secs_f64();
-        rows.push((
-            format,
-            count,
-            per_second,
-            elapsed.as_secs_f64() * 1000.0 / count as f64,
-        ));
+        let (per_second, ms_per_file) = measure(format, count, concurrency).await;
+        rows.push((format, count, per_second, ms_per_file));
     }
 
     let baseline = rows
