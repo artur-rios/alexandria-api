@@ -45,6 +45,23 @@ pub fn is_page_entry(entry_name: &str) -> bool {
     if entry_name.eq_ignore_ascii_case("ComicInfo.xml") {
         return false;
     }
+
+    // macOS's Archive Utility writes one AppleDouble sidecar per file — a
+    // few KB of resource fork and Finder metadata, stored under
+    // `__MACOSX/` with the original name prefixed `._`. They carry the
+    // page's extension, so without this a CBZ zipped on a Mac counts and
+    // serves twice its real page count, and `._page001.jpg` sorts *before*
+    // `page001.jpg` (`_` is 0x5F, `p` is 0x70) — so page 1 and the
+    // thumbnail both become an undecodable blob labelled `image/jpeg`.
+    let mut components = entry_name.split(['/', '\\']);
+    if components.any(|part| part.eq_ignore_ascii_case("__MACOSX")) {
+        return false;
+    }
+    let basename = entry_name.rsplit(['/', '\\']).next().unwrap_or(entry_name);
+    if basename.starts_with("._") {
+        return false;
+    }
+
     let ext = entry_name
         .rsplit('.')
         .next()
@@ -333,5 +350,21 @@ mod tests {
         assert!(is_page_entry("page002.JPEG"));
         assert!(is_page_entry("sub/dir/page003.png"));
         assert!(is_page_entry("page004.webp"));
+    }
+
+    #[test]
+    fn given_appledouble_sidecars_when_tested_then_not_pages() {
+        // Arrange / Act / Assert — a CBZ zipped on macOS carries one
+        // AppleDouble sidecar per page, under `__MACOSX/` and named `._` +
+        // the original. Both forms must be excluded, or a 20-page comic
+        // reports 40 pages and `pages/1` serves a metadata blob (`._` sorts
+        // before the real name) labelled `image/jpeg`.
+        assert!(!is_page_entry("__MACOSX/._page001.jpg"));
+        assert!(!is_page_entry("__MACOSX/sub/._page002.png"));
+        assert!(!is_page_entry("._page003.jpg"));
+        assert!(!is_page_entry("sub/dir/._page004.png"));
+        // The real pages beside them are still pages.
+        assert!(is_page_entry("page001.jpg"));
+        assert!(is_page_entry("sub/page002.png"));
     }
 }
