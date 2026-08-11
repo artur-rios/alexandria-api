@@ -15,6 +15,7 @@ use crate::catalog::model::{FileType, NewFile};
 use crate::catalog::repos::CatalogRepository;
 use crate::catalog::video_tags::VideoMetadataReader;
 use crate::errors::DomainError;
+use crate::retry::{retry_on_busy, BUSY_ATTEMPTS};
 
 #[derive(Debug, Clone)]
 pub struct IndexRequest {
@@ -293,6 +294,11 @@ where
     /// Index one already-classified entry. `Ok(true)` means a record was
     /// created, `Ok(false)` that the path was already cataloged (AF-03), and
     /// `Err` that this one file failed — the caller counts it and moves on.
+    ///
+    /// The `insert_file` write is wrapped in [`retry_on_busy`]: with several
+    /// files in flight and a client reading throughout, a loaded machine can
+    /// push a writer past SQLite's `busy_timeout` into `SQLITE_BUSY`, which
+    /// used to lose that file from the catalog silently but for a `warn`.
     async fn index_entry(
         &self,
         entry: FileEntry,
@@ -303,17 +309,25 @@ where
             return Ok(false);
         }
         let content_hash = self.fs.content_hash(&entry.path).await?;
-        let file = self
-            .repo
-            .insert_file(NewFile {
-                uuid: Uuid::new_v4(),
-                path: entry.path.clone(),
-                name: entry.name,
-                file_type,
-                content_hash,
-                indexed_at: now,
-            })
-            .await?;
+        let new_file = NewFile {
+            uuid: Uuid::new_v4(),
+            path: entry.path.clone(),
+            name: entry.name,
+            file_type,
+            content_hash,
+            indexed_at: now,
+        };
+        // Only this one write is retried, and only on a transient busy. The
+        // directory walk and the hash above are not: they have already
+        // succeeded, and re-reading the bytes to answer database contention
+        // would multiply the expensive half of the work. A file that is still
+        // busy after the bound falls through exactly as before — counted in
+        // `failed`, logged, run continues.
+        let file = retry_on_busy(BUSY_ATTEMPTS, || {
+            let new_file = new_file.clone();
+            async { self.repo.insert_file(new_file).await }
+        })
+        .await?;
 
         // Best-effort audio tag prefill (issue #44 pilot). Extraction only
         // ever runs here, at first index — refresh never touches metadata.
