@@ -145,7 +145,20 @@ where
             }
         };
 
-        self.cache.put(&key, &bytes).await?;
+        // A cache write that fails must not fail a request whose thumbnail
+        // is already rendered and correct. `get` deliberately treats
+        // failure as a miss — "a cache that cannot answer is a miss, never
+        // an error" — and `put` is the same bargain from the other side: a
+        // full disk or a read-only cache directory costs the next caller a
+        // re-render, not this caller a 500.
+        if let Err(e) = self.cache.put(&key, &bytes).await {
+            tracing::warn!(
+                uuid = %file.uuid,
+                key = %key,
+                error = %e,
+                "could not cache thumbnail; returning it uncached"
+            );
+        }
 
         Ok(Thumbnail {
             uuid: file.uuid,
@@ -726,6 +739,44 @@ mod tests {
 
         // Assert
         assert_eq!(*calls.lock().unwrap(), vec!["image:p1.jpg".to_string()]);
+    }
+
+    /// Cache fake whose `put` always fails — a full disk, or a cache
+    /// directory that is not writable. `get` is always a miss.
+    struct FailingPutCache;
+
+    impl ThumbnailCache for FailingPutCache {
+        async fn get(&self, _key: &str) -> Option<Vec<u8>> {
+            None
+        }
+
+        async fn put(&self, _key: &str, _bytes: &[u8]) -> Result<(), DomainError> {
+            Err(DomainError::disk("no space left on device"))
+        }
+    }
+
+    #[tokio::test]
+    async fn given_cache_write_failure_when_thumbnailed_then_thumbnail_still_returned() {
+        // Arrange — by the time `put` runs, the JPEG is rendered and
+        // correct. A cache that cannot be written costs the next caller a
+        // re-render; it must not cost this caller the response.
+        let repo = FakeRepo::with_file(a_file("/lib/movie.mp4", FileType::Video));
+        let handler = ThumbnailHandler::new(
+            FakeAuth,
+            repo,
+            FakeArchive,
+            FakeRenderer {
+                calls: Arc::new(Mutex::new(Vec::new())),
+            },
+            FailingPutCache,
+        );
+
+        // Act
+        let thumb = handler.thumbnail(Uuid::nil(), "t").await.expect("thumb");
+
+        // Assert
+        assert_eq!(thumb.bytes, b"JPEG".to_vec());
+        assert_eq!(thumb.mime_type, "image/jpeg");
     }
 
     #[tokio::test]
