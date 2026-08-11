@@ -77,6 +77,16 @@ async fn given_cbz_when_first_page_requested_then_image_bytes_returned() {
         response.headers().get("content-type").unwrap(),
         "image/jpeg"
     );
+    // A comic entry is library-supplied and served undecoded, so its bytes
+    // are as sniffable as any other; `nosniff` holds the browser to the MIME
+    // the entry name resolved to.
+    assert_eq!(
+        response
+            .headers()
+            .get("x-content-type-options")
+            .expect("nosniff header present"),
+        "nosniff"
+    );
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     assert_eq!(body.to_vec(), common::jpeg_bytes_for("page001.jpg"));
 }

@@ -82,6 +82,15 @@ async fn given_image_file_when_thumbnailed_then_jpeg_within_max_dimension() {
         response.headers().get("content-type").unwrap(),
         "image/jpeg"
     );
+    // The third byte-serving route, and the third place `nosniff` has to
+    // hold: all of them are reachable from a webview at a plain URL.
+    assert_eq!(
+        response
+            .headers()
+            .get("x-content-type-options")
+            .expect("nosniff header present"),
+        "nosniff"
+    );
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     let decoded = image::load_from_memory(&body).expect("valid jpeg");
     assert_eq!(decoded.width(), 320);
