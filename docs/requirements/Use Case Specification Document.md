@@ -106,9 +106,9 @@ graph LR
 | **Name** | Index library files |
 | **Actors** | Owner, Local Filesystem |
 | **Description** | Scan a root directory and create type-aware catalog records for every supported file type. |
-| **Preconditions** | The caller is authenticated as the owner; the root path is supplied. |
+| **Preconditions** | The caller is authenticated as the owner; the root path is supplied, and it sits inside the configured `filesystem.root` when one is configured (FR-FC-26). |
 | **Postconditions** | A File record exists for each supported file found, each with a content hash and a subtype record prefilled with whatever metadata could be extracted from the file itself; indexing runs without blocking reads. |
-| **Requirements** | FR-FC-01, FR-FC-02, FR-FC-03, FR-FC-04, FR-FC-05, FR-FC-06, FR-FC-07, FR-FC-08, FR-FC-09, FR-FC-24, FR-FC-25 |
+| **Requirements** | FR-FC-01, FR-FC-02, FR-FC-03, FR-FC-04, FR-FC-05, FR-FC-06, FR-FC-07, FR-FC-08, FR-FC-09, FR-FC-24, FR-FC-25, FR-FC-26 |
 
 **Main Flow**
 
@@ -129,6 +129,8 @@ The `runId` returned in step 2 is opaque: completion is reported to the log only
 | AF-03 | A file path is already cataloged | The system skips creation (no duplicate path); a refresh is handled by UC-02. |
 | AF-04 | A single file cannot be read or persisted | The system counts it as failed, logs a warning naming the path, and continues the run; the remaining files are still indexed. |
 | AF-05 | A file's embedded metadata cannot be parsed, or writing the extracted values fails | The system logs a warning naming the path and leaves the subtype fields empty. The file is still indexed successfully — this is **not** counted as a failure (step 4 is best-effort). |
+| AF-06 | `filesystem.root` is configured and the requested root is neither it nor a descendant of it (FR-FC-26) | The system rejects the request with an invalid-input error saying the root is outside the configured library root. Both paths are canonicalized before the comparison, so `..` segments, trailing separators, symbolic links, and a sibling whose name merely shares a prefix with the library root are all judged on where they actually resolve to. The message does not disclose the configured root's location. Where `filesystem.root` is unset the check does not run at all and any readable root is accepted. |
+| AF-07 | `filesystem.root` is configured but cannot be resolved on disk | The system rejects the request with the same invalid-input error and logs an error naming the key. A bound that silently vanished when its configuration went bad would be worse than none, because the operator would still believe it were there. |
 
 ---
 
@@ -1222,7 +1224,7 @@ UC-36's externally issued JWT.
 
 | Use Case | Requirements |
 | --- | --- |
-| UC-01: Index library files | FR-FC-01, FR-FC-02, FR-FC-03, FR-FC-04, FR-FC-05, FR-FC-06, FR-FC-07, FR-FC-08, FR-FC-09, FR-FC-24, FR-FC-25 |
+| UC-01: Index library files | FR-FC-01, FR-FC-02, FR-FC-03, FR-FC-04, FR-FC-05, FR-FC-06, FR-FC-07, FR-FC-08, FR-FC-09, FR-FC-24, FR-FC-25, FR-FC-26 |
 | UC-02: Re-index and refresh the catalog | FR-FC-08, FR-FC-10, FR-FC-11, FR-FC-24 |
 | UC-03: Browse and view file metadata | FR-FC-12, FR-FC-13, FR-FC-24 |
 | UC-04: Edit file metadata | FR-FC-14, FR-FC-15, FR-FC-16, FR-FC-17, FR-FC-18, FR-FC-24 |

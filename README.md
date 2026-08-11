@@ -405,8 +405,8 @@ The workspace enforces `#![deny(unsafe_code)]` in every crate.
 Configuration is read from `config.toml` at startup, with any key overridable
 through an `ALEXANDRIA_*` environment variable. See [`config.toml.example`](config.toml.example)
 for the full list (auth mode and session TTL, HTTP bind address, SQLite path,
-health-probe filesystem root, indexing concurrency, soft-delete retention, log
-level).
+filesystem root — which both feeds the health probe and bounds what indexing
+may reach — indexing concurrency, soft-delete retention, log level).
 
 ```bash
 # 1. Create a local config from the example

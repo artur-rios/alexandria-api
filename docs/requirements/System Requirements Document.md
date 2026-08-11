@@ -103,6 +103,7 @@ graph LR
 | FR-FC-23 | The system shall, on an explicit purge-on-disk operation, remove the File record and delete the underlying file on disk. |
 | FR-FC-24 | The system shall expose every catalog operation via both the HTTP/REST-JSON surface and the FFI surface with identical results. FR-MP-06 defines the single exception: byte transfer, where the FFI surface returns a playback descriptor instead of a stream. |
 | FR-FC-25 | The system shall, at first index only, prefill a file's subtype metadata from the metadata embedded in the file itself (audio tags, image EXIF, document and comic metadata, video container metadata). Extraction is best-effort: a failure leaves the fields empty and never fails the file's indexing, and re-index (FR-FC-10) never re-runs it, so an owner's edit (FR-FC-14..18) is never overwritten. |
+| FR-FC-26 | The system shall reject an index request (FR-FC-01) whose root path is not the configured `filesystem.root` or a descendant of it, comparing the two paths after resolving each to its canonical form so that traversal segments, trailing separators, and symbolic links cannot escape the bound. When `filesystem.root` is unset, indexing is unconstrained and any readable root is accepted — the constraint is opt-in by configuration. Re-index (FR-FC-10, FR-FC-11) takes no root and is unaffected. |
 
 ### 3.2 Collections (CO)
 
@@ -513,7 +514,7 @@ Cascade notes:
 
 | Feature | Requirements |
 | --- | --- |
-| F-01 File indexing | FR-FC-01 through FR-FC-11, FR-FC-25 |
+| F-01 File indexing | FR-FC-01 through FR-FC-11, FR-FC-25, FR-FC-26 |
 | F-02 Catalog browsing and metadata editing | FR-FC-12 through FR-FC-18 |
 | F-03 Renaming and lifecycle management | FR-FC-19 through FR-FC-23 |
 | F-04 Text file content editing | FR-TX-01 through FR-TX-03 |

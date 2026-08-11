@@ -35,9 +35,17 @@ port = 8080
 path = "alexandria.sqlite"
 
 [filesystem]
-# The library root the health check probes for reachability (IR-03). Distinct
-# from the root passed per-request to the indexing operations (UC-01/UC-02).
-# Empty means the probe reports the filesystem unreachable.
+# The library root, used for two things. The health check probes it for
+# reachability (IR-03), and it bounds indexing: the index operation (UC-01)
+# rejects a requested root that is not this path or a descendant of it
+# (FR-FC-26). Both paths are canonicalized before the comparison, so `..`
+# segments and symlinks cannot slip past it.
+#
+# Empty — the default — turns both off: the probe reports the filesystem
+# unreachable, and indexing is unconstrained, meaning UC-01 will catalog any
+# absolute path a caller supplies and the stream operation (UC-38) can then
+# read those bytes back. Startup logs a warning while this is unset. The
+# re-index operation (UC-02) takes no root and is unaffected either way.
 root = ""
 
 [indexing]
