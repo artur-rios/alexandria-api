@@ -5,7 +5,7 @@ use alexandria_core::catalog::audio_tags::{AudioMetadataReader, AudioTags};
 use alexandria_core::catalog::classify::classify_by_extension;
 use alexandria_core::catalog::clock::Clock;
 use alexandria_core::catalog::comic_tags::{ComicMetadataReader, ComicTags};
-use alexandria_core::catalog::commands::index::{IndexHandler, IndexRequest};
+use alexandria_core::catalog::commands::index::{IndexHandler, IndexRequest, IndexStarted};
 use alexandria_core::catalog::document_tags::{DocumentMetadataReader, DocumentTags};
 use alexandria_core::catalog::fs::Filesystem;
 use alexandria_core::catalog::image_tags::{ImageMetadataReader, ImageTags};
@@ -52,6 +52,48 @@ where
     P: VideoMetadataReader,
     Q: ComicMetadataReader,
 {
+    // Empty library root: unconstrained indexing, which is what every test
+    // predating FR-FC-26 assumes.
+    handler_with_library_root(
+        auth,
+        repo,
+        fs,
+        clock,
+        audio_tags,
+        image_tags,
+        document_tags,
+        video_tags,
+        comic_tags,
+        String::new(),
+    )
+}
+
+/// Same as [`handler`], but with an explicit `filesystem.root` bound
+/// (FR-FC-26).
+#[allow(clippy::too_many_arguments)]
+fn handler_with_library_root<A, R, F, C, M, N, O, P, Q>(
+    auth: A,
+    repo: R,
+    fs: F,
+    clock: C,
+    audio_tags: M,
+    image_tags: N,
+    document_tags: O,
+    video_tags: P,
+    comic_tags: Q,
+    library_root: String,
+) -> IndexHandler<A, R, F, C, M, N, O, P, Q>
+where
+    A: AuthService,
+    R: CatalogRepository,
+    F: Filesystem,
+    C: Clock,
+    M: AudioMetadataReader,
+    N: ImageMetadataReader,
+    O: DocumentMetadataReader,
+    P: VideoMetadataReader,
+    Q: ComicMetadataReader,
+{
     IndexHandler::new(
         auth,
         repo,
@@ -63,6 +105,7 @@ where
         video_tags,
         comic_tags,
         TEST_CONCURRENCY,
+        library_root,
     )
 }
 
@@ -272,6 +315,7 @@ async fn given_any_concurrency_when_execute_then_same_counts_and_same_catalog() 
             FakeVideoMetadataReader::new(),
             FakeComicMetadataReader::new(),
             concurrency,
+            String::new(),
         );
 
         let outcome = handler
@@ -316,6 +360,7 @@ async fn given_zero_concurrency_when_execute_then_runs_sequentially_rather_than_
         FakeVideoMetadataReader::new(),
         FakeComicMetadataReader::new(),
         0,
+        String::new(),
     );
 
     let outcome = handler
@@ -1489,4 +1534,161 @@ async fn given_non_comic_file_when_execute_then_comic_reader_never_consulted() {
         0,
         "the comic reader must not be consulted at all for a non-comic file"
     );
+}
+
+// -------- FR-FC-26: the index root must sit inside `filesystem.root` --------
+//
+// These tests need paths `std::fs::canonicalize` can actually resolve, so they
+// use real temp directories rather than the `/library` literal the rest of this
+// file uses. The `FakeFilesystem` still stands in for the walk; only the
+// containment check touches the real disk.
+
+/// Start an index bounded by `library_root`. `requested` is registered as an
+/// existing root on the fake filesystem so the pre-existing "root path does
+/// not exist" guard (AF-01) passes and the containment check (AF-06) is what
+/// decides the outcome.
+async fn start_bounded(
+    library_root: &std::path::Path,
+    requested: &str,
+) -> Result<IndexStarted, DomainError> {
+    let handler = handler_with_library_root(
+        FakeAuth::Allowing,
+        FakeCatalogRepository::new(),
+        FakeFilesystem::builder().with_root(requested).build(),
+        fixed_clock(now()),
+        FakeAudioMetadataReader::new(),
+        FakeImageMetadataReader::new(),
+        FakeDocumentMetadataReader::new(),
+        FakeVideoMetadataReader::new(),
+        FakeComicMetadataReader::new(),
+        library_root
+            .to_str()
+            .expect("utf-8 library root")
+            .to_string(),
+    );
+    handler
+        .start(
+            IndexRequest {
+                root: requested.to_string(),
+            },
+            TOKEN,
+        )
+        .await
+}
+
+#[tokio::test]
+async fn given_root_inside_configured_library_root_when_start_then_returns_run_id() {
+    // Arrange
+    let library = tempfile::tempdir().expect("tempdir");
+    let inside = library.path().join("music");
+    std::fs::create_dir(&inside).expect("create inside");
+    let requested = inside.to_str().expect("utf-8").to_string();
+
+    // Act
+    let result = start_bounded(library.path(), &requested).await;
+
+    // Assert
+    assert_ne!(result.expect("start").run_id, Uuid::nil());
+}
+
+#[tokio::test]
+async fn given_configured_library_root_itself_when_start_then_returns_run_id() {
+    // Arrange
+    let library = tempfile::tempdir().expect("tempdir");
+    let requested = library.path().to_str().expect("utf-8").to_string();
+
+    // Act
+    let result = start_bounded(library.path(), &requested).await;
+
+    // Assert
+    assert_ne!(result.expect("start").run_id, Uuid::nil());
+}
+
+#[tokio::test]
+async fn given_root_outside_configured_library_root_when_start_then_invalid_input() {
+    // Arrange
+    let parent = tempfile::tempdir().expect("tempdir");
+    let library = parent.path().join("library");
+    let outside = parent.path().join("secrets");
+    std::fs::create_dir(&library).expect("create library");
+    std::fs::create_dir(&outside).expect("create outside");
+    let requested = outside.to_str().expect("utf-8").to_string();
+
+    // Act
+    let result = start_bounded(&library, &requested).await;
+
+    // Assert
+    assert!(matches!(result, Err(DomainError::InvalidInput(_))));
+}
+
+/// The traversal case: the requested root is spelled as a path *inside* the
+/// library that climbs back out with `..`. A string comparison would accept it
+/// — the text does start with the library root's text. Canonicalizing first
+/// resolves the `..` away and the escape becomes visible.
+#[tokio::test]
+async fn given_traversal_escaping_library_root_when_start_then_invalid_input() {
+    // Arrange
+    let parent = tempfile::tempdir().expect("tempdir");
+    let library = parent.path().join("library");
+    let outside = parent.path().join("secrets");
+    std::fs::create_dir(&library).expect("create library");
+    std::fs::create_dir(&outside).expect("create outside");
+    let requested = library
+        .join("..")
+        .join("secrets")
+        .to_str()
+        .expect("utf-8")
+        .to_string();
+
+    // Act
+    let result = start_bounded(&library, &requested).await;
+
+    // Assert
+    assert!(matches!(result, Err(DomainError::InvalidInput(_))));
+}
+
+/// The prefix case: `<tmp>/lib-evil` is a sibling of `<tmp>/lib`, not a
+/// descendant, yet its string starts with the library root's string. Only a
+/// component-wise comparison rejects it.
+#[tokio::test]
+async fn given_sibling_root_sharing_a_name_prefix_when_start_then_invalid_input() {
+    // Arrange
+    let parent = tempfile::tempdir().expect("tempdir");
+    let library = parent.path().join("lib");
+    let sibling = parent.path().join("lib-evil");
+    std::fs::create_dir(&library).expect("create library");
+    std::fs::create_dir(&sibling).expect("create sibling");
+    let requested = sibling.to_str().expect("utf-8").to_string();
+
+    // Act
+    let result = start_bounded(&library, &requested).await;
+
+    // Assert
+    assert!(matches!(result, Err(DomainError::InvalidInput(_))));
+}
+
+/// The backward-compatibility guarantee: an unset `filesystem.root` leaves
+/// indexing exactly as unconstrained as it was before FR-FC-26 existed.
+#[tokio::test]
+async fn given_empty_configured_library_root_when_start_then_any_root_accepted() {
+    // Arrange
+    let anywhere = tempfile::tempdir().expect("tempdir");
+    let requested = anywhere.path().to_str().expect("utf-8").to_string();
+    let handler = handler(
+        FakeAuth::Allowing,
+        FakeCatalogRepository::new(),
+        FakeFilesystem::builder().with_root(&requested).build(),
+        fixed_clock(now()),
+        FakeAudioMetadataReader::new(),
+        FakeImageMetadataReader::new(),
+        FakeDocumentMetadataReader::new(),
+        FakeVideoMetadataReader::new(),
+        FakeComicMetadataReader::new(),
+    );
+
+    // Act
+    let started = handler.start(IndexRequest { root: requested }, TOKEN).await;
+
+    // Assert
+    assert_ne!(started.expect("start").run_id, Uuid::nil());
 }

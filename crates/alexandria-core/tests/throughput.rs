@@ -371,6 +371,7 @@ async fn build(
         FfmpegVideoMetadataReader,
         CbzComicMetadataReader,
         concurrency,
+        String::new(),
     );
     (handler, repo)
 }

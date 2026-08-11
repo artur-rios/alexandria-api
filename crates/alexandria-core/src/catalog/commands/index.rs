@@ -42,11 +42,13 @@ pub struct IndexOutcome {
 
 /// Index library files (UC-01).
 ///
-/// `start` authenticates the caller, validates the root path, and returns a
-/// fresh run id immediately. The heavy `execute` walk hashes and persists each
-/// supported file, skipping already-cataloged paths. `start` and `execute` are
-/// separated so the HTTP/FFI layer can spawn `execute` in the background
-/// (FR-FC-08) while `start` returns `202` right away.
+/// `start` authenticates the caller, validates the root path — it must exist,
+/// and it must sit inside the configured `filesystem.root` when one is set
+/// (FR-FC-26) — and returns a fresh run id immediately. The heavy `execute`
+/// walk hashes and persists each supported file, skipping already-cataloged
+/// paths. `start` and `execute` are separated so the HTTP/FFI layer can spawn
+/// `execute` in the background (FR-FC-08) while `start` returns `202` right
+/// away.
 ///
 /// `execute` processes up to `concurrency` files at a time (configurable via
 /// `indexing.concurrency`, default 4). The per-file work is dominated by
@@ -75,7 +77,16 @@ pub struct IndexHandler<A, R, F, C, M, N, O, P, Q> {
     video_tags: P,
     comic_tags: Q,
     concurrency: usize,
+    /// The configured library root (`filesystem.root`) every requested index
+    /// root must sit inside (FR-FC-26). `None` when the key is unset, which
+    /// leaves indexing unconstrained — the historical behaviour.
+    library_root: Option<String>,
 }
+
+/// The client-facing rejection message for FR-FC-26. Deliberately free of the
+/// configured root's absolute path: the caller does not need to be told where
+/// the library lives in order to learn that its request was out of bounds.
+const OUTSIDE_LIBRARY_ROOT: &str = "root path is outside the configured library root";
 
 /// What one scanned entry resolved to. Returned by the per-entry future so
 /// the concurrent walk can tally outcomes without sharing a counter.
@@ -102,6 +113,12 @@ where
     /// (`indexing.concurrency`). Zero is meaningless — a stream buffered zero
     /// deep makes no progress — so it is clamped to 1, which is the
     /// sequential behaviour a caller asking for "no concurrency" means.
+    ///
+    /// `library_root` is the configured `filesystem.root` (FR-FC-26). An
+    /// empty string means the key is unset, and indexing stays unconstrained
+    /// exactly as it was before the constraint existed — the constraint is
+    /// opt-in by configuration, so no existing deployment changes behaviour
+    /// on upgrade.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         auth: A,
@@ -114,7 +131,16 @@ where
         video_tags: P,
         comic_tags: Q,
         concurrency: u32,
+        library_root: String,
     ) -> Self {
+        let library_root = {
+            let trimmed = library_root.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        };
         Self {
             auth,
             repo,
@@ -126,6 +152,51 @@ where
             video_tags,
             comic_tags,
             concurrency: concurrency.max(1) as usize,
+            library_root,
+        }
+    }
+
+    /// FR-FC-26: the requested root must be the configured library root or a
+    /// descendant of it. Returns `Ok(())` unconditionally when no library
+    /// root is configured.
+    ///
+    /// Both sides are canonicalized before comparison. That is what makes the
+    /// check hold against `<root>/../../etc` (the traversal is resolved away),
+    /// against `<root>` vs `<root>/` vs `<root>/.` (all resolve to the same
+    /// path), and against a symlinked root (both sides resolve to the link
+    /// target). The comparison itself is `Path::starts_with`, which matches
+    /// whole path components — a string prefix test would let `/library-evil`
+    /// slip past a `/library` bound.
+    fn check_root_within_library(&self, requested: &str) -> Result<(), DomainError> {
+        let Some(library_root) = self.library_root.as_deref() else {
+            return Ok(());
+        };
+        // A configured root that cannot be resolved is a misconfiguration, not
+        // a caller error. Fail the request rather than silently degrading to
+        // unconstrained indexing: a security bound that disappears when its
+        // configuration is wrong is worse than no bound at all, because the
+        // operator believes it is there. The process still starts and every
+        // other operation still works — only indexing is refused, and the log
+        // names the key to fix.
+        let canonical_library_root = match std::fs::canonicalize(library_root) {
+            Ok(path) => path,
+            Err(err) => {
+                tracing::error!(
+                    error = %err,
+                    "configured filesystem.root cannot be resolved; refusing to index until it is fixed"
+                );
+                return Err(DomainError::InvalidInput(OUTSIDE_LIBRARY_ROOT.into()));
+            }
+        };
+        // The requested root's existence was already checked above, so a
+        // canonicalization failure here means the path cannot be resolved to
+        // something comparable. Fail closed.
+        let canonical_requested = std::fs::canonicalize(requested)
+            .map_err(|_| DomainError::InvalidInput(OUTSIDE_LIBRARY_ROOT.into()))?;
+        if canonical_requested.starts_with(&canonical_library_root) {
+            Ok(())
+        } else {
+            Err(DomainError::InvalidInput(OUTSIDE_LIBRARY_ROOT.into()))
         }
     }
 
@@ -139,6 +210,7 @@ where
         if !self.fs.path_exists(&request.root).await {
             return Err(DomainError::InvalidInput("root path does not exist".into()));
         }
+        self.check_root_within_library(&request.root)?;
         Ok(IndexStarted {
             run_id: Uuid::new_v4(),
         })

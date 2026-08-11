@@ -299,6 +299,18 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
     // UC-01 and UC-02 are the same hash-every-file workload, so both walks
     // take the same `indexing.concurrency` bound.
     let indexing_concurrency = settings.indexing.concurrency;
+    // FR-FC-26: `filesystem.root` bounds which trees UC-01 will index. It is
+    // logged here, once per process, because this is the single startup path
+    // both transports go through — the HTTP binary and `alexandria_index_init`
+    // — so the two surfaces cannot disagree about whether the bound is on.
+    // UC-02 takes no root (it re-walks paths already in the catalog), so it
+    // needs no equivalent.
+    if settings.filesystem.root.trim().is_empty() {
+        tracing::warn!(
+            "filesystem.root is unset: indexing is unconstrained and will catalog any \
+             absolute path a caller supplies; set filesystem.root to bound it"
+        );
+    }
     let index_handler = Arc::new(IndexHandler::new(
         auth.clone(),
         repo.clone(),
@@ -310,6 +322,7 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         video_tags,
         comic_tags,
         indexing_concurrency,
+        settings.filesystem.root.clone(),
     ));
     let refresh_handler = Arc::new(RefreshHandler::new(
         auth.clone(),
