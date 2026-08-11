@@ -68,13 +68,54 @@ pub async fn stream(
 
     let service = ServeFile::new(&source.path);
 
-    let mut response = service
+    let response = service
         .oneshot(request)
         .await
         .map_err(|e| ApiError(DomainError::disk(e.to_string())))?
         .into_response();
 
-    let content_type = HeaderValue::from_str(&source.mime_type)
+    finish_stream(response, uuid, &source.mime_type)
+}
+
+/// Turn what `ServeFile` produced into what this API promises.
+///
+/// The core handler stats the file first, so a file that was already gone is
+/// a `Disk` error and a clean JSON envelope. That leaves a residual window:
+/// the file can still vanish between the stat and `ServeFile`'s own open.
+/// `ServeFile` answers that with its own bare `404` — no body, and nothing in
+/// this API's `{"error": …}` shape — and stamping `content-type:
+/// video/mp4` onto it would hand the client a response that is neither a
+/// valid error nor valid video. It is converted into the same `Disk` error
+/// the stat guard would have produced, so it flows through the existing
+/// `ApiError` mapping and comes back as a proper JSON `500`. (`ServeFile`
+/// also answers `404` for `PermissionDenied`, which belongs in the same
+/// bucket: the bytes are on disk but unreadable.)
+///
+/// Playback headers are stamped only on the two statuses that actually carry
+/// the file's bytes, `200` and `206`. A `416` or a `304` is `ServeFile`'s own
+/// answer about the *request*, carries no body from the file, and has no
+/// business claiming the file's content type.
+fn finish_stream(
+    mut response: Response,
+    uuid: Uuid,
+    mime_type: &str,
+) -> Result<Response, ApiError> {
+    use axum::http::StatusCode;
+
+    if response.status() == StatusCode::NOT_FOUND {
+        return Err(ApiError(DomainError::disk(format!(
+            "file {uuid} could not be opened after it was stat'd"
+        ))));
+    }
+
+    if !matches!(
+        response.status(),
+        StatusCode::OK | StatusCode::PARTIAL_CONTENT
+    ) {
+        return Ok(response);
+    }
+
+    let content_type = HeaderValue::from_str(mime_type)
         .map_err(|e| ApiError(DomainError::internal(format!("invalid mime type: {e}"))))?;
     response.headers_mut().insert("content-type", content_type);
 
@@ -150,4 +191,72 @@ pub async fn thumbnail(
         thumb.bytes,
     )
         .into_response())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::StatusCode;
+
+    /// A response shaped like one `ServeFile` would have returned.
+    fn serve_file_response(status: StatusCode) -> Response {
+        Response::builder()
+            .status(status)
+            .header("content-type", "application/octet-stream")
+            .body(Body::empty())
+            .expect("build response")
+    }
+
+    #[test]
+    fn given_file_vanished_after_stat_when_finished_then_disk_error() {
+        // Arrange — the file was there when the core handler stat'd it and
+        // gone by the time `ServeFile` opened it, so `ServeFile` produced its
+        // own empty 404. The real race cannot be driven deterministically
+        // from a test, but the decision it lands on is exactly this one.
+        let response = serve_file_response(StatusCode::NOT_FOUND);
+
+        // Act
+        let result = finish_stream(response, Uuid::nil(), "video/mp4");
+
+        // Assert — the same `Disk` error the stat guard raises, which the
+        // `ApiError` mapping renders as a JSON 500. Not a bare 404 stamped
+        // `video/mp4`.
+        assert!(matches!(result, Err(ApiError(DomainError::Disk(_)))));
+    }
+
+    #[test]
+    fn given_partial_content_when_finished_then_playback_headers_stamped() {
+        // Arrange — a 206 does carry the file's bytes.
+        let response = serve_file_response(StatusCode::PARTIAL_CONTENT);
+
+        // Act
+        let response = finish_stream(response, Uuid::nil(), "video/mp4").expect("206 passes");
+
+        // Assert
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(response.headers().get("content-type").unwrap(), "video/mp4");
+        assert_eq!(response.headers().get("accept-ranges").unwrap(), "bytes");
+        assert_eq!(
+            response.headers().get("x-content-type-options").unwrap(),
+            "nosniff"
+        );
+    }
+
+    #[test]
+    fn given_range_not_satisfiable_when_finished_then_passed_through_unstamped() {
+        // Arrange — a 416 is `ServeFile`'s answer about the *request*; it
+        // carries no bytes from the file and must not claim its MIME type.
+        let response = serve_file_response(StatusCode::RANGE_NOT_SATISFIABLE);
+
+        // Act
+        let response = finish_stream(response, Uuid::nil(), "video/mp4").expect("416 passes");
+
+        // Assert
+        assert_eq!(response.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(
+            response.headers().get("content-type").unwrap(),
+            "application/octet-stream"
+        );
+    }
 }
