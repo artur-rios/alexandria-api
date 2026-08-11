@@ -45,6 +45,15 @@ use tower::ServiceExt;
 // One global FFI services slot per process: serialize every parity test that
 // touches it (there is only one here, but the guard keeps the suite safe if
 // more are added).
+//
+// Every acquisition below is `unwrap_or_else(|e| e.into_inner())`, never
+// `unwrap()`. This mutex orders tests; it guards no invariant that a panic
+// could leave half-established, so poisoning carries no information. With
+// `unwrap()`, one panicking test made every test after it fail with
+// `PoisonError` — observed once during development, turning a single flake
+// into 39 red tests in the suite that gates HTTP/FFI parity. Taking the
+// poisoned guard keeps the failure count equal to the number of real
+// failures.
 static SERIAL: Mutex<()> = Mutex::new(());
 
 /// The editable columns of an `audio_files` row, in the order every
@@ -122,7 +131,7 @@ fn run_id_string(r: &IndexStartResult) -> String {
 
 #[tokio::test]
 async fn given_same_lib_when_indexed_via_http_and_ffi_then_files_rows_identical() {
-    let _g = SERIAL.lock().unwrap();
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
     // Shared library under test.
     let lib = tempdir().unwrap();
@@ -248,7 +257,7 @@ async fn given_same_lib_when_indexed_via_http_and_ffi_then_files_rows_identical(
 /// marker, with matching rows.
 #[tokio::test]
 async fn given_same_lib_when_refreshed_via_http_and_ffi_then_rows_and_missing_markers_identical() {
-    let _g = SERIAL.lock().unwrap();
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
     fn seed_lib() -> TempDir {
         let lib = tempdir().unwrap();
@@ -499,7 +508,7 @@ fn wait_for_ffi_missing(expected: i64) {
 #[tokio::test]
 async fn given_same_audio_file_when_metadata_edited_via_http_and_ffi_then_responses_and_rows_identical(
 ) {
-    let _g = SERIAL.lock().unwrap();
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
     let patch_json = r#"{"type":"audio","title":"Parity Title","artist":"Artist","album":"Album","year":2001,"genre":"Rock","track":3}"#;
     let patch_value: serde_json::Value = serde_json::from_str(patch_json).unwrap();
@@ -715,7 +724,7 @@ async fn given_same_audio_file_when_metadata_edited_via_http_and_ffi_then_respon
 /// (Testing Specification §7.3, FR-FC-24).
 #[tokio::test]
 async fn given_same_lib_when_files_listed_via_http_and_ffi_then_arrays_identical() {
-    let _g = SERIAL.lock().unwrap();
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
     // ---- HTTP leg ----
     let http_lib = tempdir().unwrap();
@@ -939,7 +948,7 @@ async fn given_same_lib_when_files_listed_via_http_and_ffi_then_arrays_identical
 /// FR-FC-24).
 #[tokio::test]
 async fn given_same_file_when_fetched_via_http_and_ffi_then_file_view_bodies_identical() {
-    let _g = SERIAL.lock().unwrap();
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
     // ---- HTTP leg ----
     let http_lib = tempdir().unwrap();
@@ -1107,7 +1116,7 @@ async fn given_same_file_when_fetched_via_http_and_ffi_then_file_view_bodies_ide
 /// surfaces (HTTP 404, FFI `FILE_ERR_NOT_FOUND`).
 #[tokio::test]
 async fn given_missing_uuid_when_fetched_via_http_and_ffi_then_both_not_found() {
-    let _g = SERIAL.lock().unwrap();
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
     let missing = uuid::Uuid::new_v4();
 
@@ -1158,7 +1167,7 @@ async fn given_missing_uuid_when_fetched_via_http_and_ffi_then_both_not_found() 
 /// returned the whole catalog — the exact divergence FR-FC-24 / NFR-09 forbid.
 #[tokio::test]
 async fn given_unknown_filter_values_when_listed_via_http_and_ffi_then_both_reject() {
-    let _g = SERIAL.lock().unwrap();
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
     // ---- HTTP leg: index a file so a silently-dropped filter would show up
     // as a non-empty 200 rather than an error. ----
@@ -1277,7 +1286,7 @@ async fn given_unknown_filter_values_when_listed_via_http_and_ffi_then_both_reje
 /// surfaces (HTTP 401, FFI `FILE_ERR_UNAUTHORIZED`).
 #[tokio::test]
 async fn given_no_token_when_files_listed_via_http_and_ffi_then_both_unauthorized() {
-    let _g = SERIAL.lock().unwrap();
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
     // ---- HTTP leg ----
     let http_dir = tempdir().unwrap();
@@ -1325,7 +1334,7 @@ async fn given_no_token_when_files_listed_via_http_and_ffi_then_both_unauthorize
 #[tokio::test]
 async fn given_no_token_and_malformed_payload_when_edited_via_http_and_ffi_then_both_unauthorized()
 {
-    let _g = SERIAL.lock().unwrap();
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
     // ---- HTTP leg ----
     let http_dir = tempdir().unwrap();
@@ -1421,7 +1430,7 @@ async fn given_no_token_and_malformed_payload_when_edited_via_http_and_ffi_then_
 /// FR-FC-24).
 #[tokio::test]
 async fn given_same_file_when_renamed_via_http_and_ffi_then_file_bodies_and_disk_state_identical() {
-    let _g = SERIAL.lock().unwrap();
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
     let new_name = "renamed.mp3";
 
@@ -1593,7 +1602,7 @@ async fn given_same_file_when_renamed_via_http_and_ffi_then_file_bodies_and_disk
 /// (FR-AU-07 / SRD §7, FR-FC-24 / NFR-09).
 #[tokio::test]
 async fn given_no_token_when_renamed_via_http_and_ffi_then_both_unauthorized() {
-    let _g = SERIAL.lock().unwrap();
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
     // ---- HTTP leg ----
     let http_dir = tempdir().unwrap();
@@ -1672,7 +1681,7 @@ async fn given_no_token_when_renamed_via_http_and_ffi_then_both_unauthorized() {
 /// purge-on-disk is UC-09).
 #[tokio::test]
 async fn given_same_file_when_soft_deleted_via_http_and_ffi_then_file_bodies_identical() {
-    let _g = SERIAL.lock().unwrap();
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
     // ---- HTTP leg ----
     let http_lib = tempdir().unwrap();
@@ -1855,7 +1864,7 @@ async fn given_same_file_when_soft_deleted_via_http_and_ffi_then_file_bodies_ide
 /// (FR-AU-07 / SRD §7, FR-FC-24 / NFR-09).
 #[tokio::test]
 async fn given_no_token_when_soft_deleted_via_http_and_ffi_then_both_unauthorized() {
-    let _g = SERIAL.lock().unwrap();
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
     // ---- HTTP leg ----
     let http_dir = tempdir().unwrap();
@@ -1932,7 +1941,7 @@ async fn given_no_token_when_soft_deleted_via_http_and_ffi_then_both_unauthorize
 /// file is preserved on both legs (UC-07 leaves it; purge-on-disk is UC-09).
 #[tokio::test]
 async fn given_soft_deleted_file_when_restored_via_http_and_ffi_then_file_bodies_identical() {
-    let _g = SERIAL.lock().unwrap();
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
     // A `deleted_at` comfortably within the 30-day default retention window,
     // so both legs are restorable. Exact-boundary coverage is in the core
@@ -2130,7 +2139,7 @@ async fn given_soft_deleted_file_when_restored_via_http_and_ffi_then_file_bodies
 /// (FR-AU-07 / SRD §7, FR-FC-24 / NFR-09).
 #[tokio::test]
 async fn given_no_token_when_restored_via_http_and_ffi_then_both_unauthorized() {
-    let _g = SERIAL.lock().unwrap();
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
     // ---- HTTP leg ----
     let http_dir = tempdir().unwrap();
@@ -2206,7 +2215,7 @@ async fn given_no_token_when_restored_via_http_and_ffi_then_both_unauthorized() 
 /// leg owns its own database.
 #[tokio::test]
 async fn given_purgeable_file_when_purged_via_http_and_ffi_then_file_bodies_identical() {
-    let _g = SERIAL.lock().unwrap();
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
     // Well past the default 30-day retention window on both legs.
     let deleted_at = "2024-01-01T00:00:00Z";
@@ -2440,7 +2449,7 @@ async fn given_purgeable_file_when_purged_via_http_and_ffi_then_file_bodies_iden
 /// (FR-AU-07 / SRD §7, FR-FC-24 / NFR-09).
 #[tokio::test]
 async fn given_no_token_when_purged_via_http_and_ffi_then_both_unauthorized() {
-    let _g = SERIAL.lock().unwrap();
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
     // ---- HTTP leg ----
     let http_dir = tempdir().unwrap();
@@ -2517,7 +2526,7 @@ async fn given_no_token_when_purged_via_http_and_ffi_then_both_unauthorized() {
 /// retention gate, so an `active` (never soft-deleted) record is purgeable.
 #[tokio::test]
 async fn given_active_file_when_purged_on_disk_via_http_and_ffi_then_file_bodies_identical() {
-    let _g = SERIAL.lock().unwrap();
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
     // ---- HTTP leg ----
     let http_lib = tempdir().unwrap();
@@ -2753,7 +2762,7 @@ async fn given_active_file_when_purged_on_disk_via_http_and_ffi_then_file_bodies
 /// FR-FC-24 / NFR-09).
 #[tokio::test]
 async fn given_no_token_when_purged_on_disk_via_http_and_ffi_then_both_unauthorized() {
-    let _g = SERIAL.lock().unwrap();
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
     // ---- HTTP leg ----
     let http_dir = tempdir().unwrap();
@@ -2829,7 +2838,7 @@ async fn given_no_token_when_purged_on_disk_via_http_and_ffi_then_both_unauthori
 /// remove the catalog rows (Testing Specification §7.3, FR-FC-23, FR-FC-24).
 #[tokio::test]
 async fn given_missing_disk_file_when_purged_on_disk_via_http_and_ffi_then_both_report_absence() {
-    let _g = SERIAL.lock().unwrap();
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
     // ---- HTTP leg ----
     let http_lib = tempdir().unwrap();
@@ -3049,7 +3058,7 @@ async fn given_missing_disk_file_when_purged_on_disk_via_http_and_ffi_then_both_
 /// the catalogs are empty on both legs, so every uuid is unknown.
 #[tokio::test]
 async fn given_unknown_uuid_when_purged_via_http_and_ffi_then_both_not_found() {
-    let _g = SERIAL.lock().unwrap();
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
     let uuid = uuid::Uuid::new_v4().to_string();
 
@@ -3131,7 +3140,7 @@ async fn given_unknown_uuid_when_purged_via_http_and_ffi_then_both_not_found() {
 /// (FR-FC-22, NFR-07, FR-FC-24 / NFR-09).
 #[tokio::test]
 async fn given_active_file_when_purged_via_http_and_ffi_then_both_invalid_state() {
-    let _g = SERIAL.lock().unwrap();
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
     // ---- HTTP leg ----
     let http_lib = tempdir().unwrap();
@@ -3290,7 +3299,7 @@ async fn given_active_file_when_purged_via_http_and_ffi_then_both_invalid_state(
 /// (Testing Specification §7.3, FR-CO-01, FR-CO-02, FR-FC-24).
 #[tokio::test]
 async fn given_same_collection_when_created_via_http_and_ffi_then_bodies_and_rows_identical() {
-    let _g = SERIAL.lock().unwrap();
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
     // ---- HTTP leg ----
     let http_dir = tempdir().unwrap();
@@ -3401,7 +3410,7 @@ async fn given_same_collection_when_created_via_http_and_ffi_then_bodies_and_row
 /// persists a row (AF-01, FR-FC-24 / NFR-09).
 #[tokio::test]
 async fn given_unrecognised_kind_when_created_via_http_and_ffi_then_both_reject() {
-    let _g = SERIAL.lock().unwrap();
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
     // ---- HTTP leg ----
     let http_dir = tempdir().unwrap();
@@ -3473,7 +3482,7 @@ async fn given_unrecognised_kind_when_created_via_http_and_ffi_then_both_reject(
 /// (FR-AU-07 / SRD §7, FR-FC-24 / NFR-09).
 #[tokio::test]
 async fn given_no_token_when_collection_created_via_http_and_ffi_then_both_unauthorized() {
-    let _g = SERIAL.lock().unwrap();
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
     // ---- HTTP leg ----
     let http_dir = tempdir().unwrap();
@@ -3540,7 +3549,7 @@ async fn given_no_token_when_collection_created_via_http_and_ffi_then_both_unaut
 /// (Testing Specification §7.3, FR-CO-03, FR-FC-24).
 #[tokio::test]
 async fn given_same_collection_when_renamed_via_http_and_ffi_then_bodies_and_rows_identical() {
-    let _g = SERIAL.lock().unwrap();
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
     // ---- HTTP leg ----
     let http_dir = tempdir().unwrap();
@@ -3666,7 +3675,7 @@ async fn given_same_collection_when_renamed_via_http_and_ffi_then_bodies_and_row
 /// (HTTP 404, FFI `COLLECTION_ERR_NOT_FOUND`) (AF-02, FR-FC-24 / NFR-09).
 #[tokio::test]
 async fn given_unknown_uuid_when_renamed_via_http_and_ffi_then_both_not_found() {
-    let _g = SERIAL.lock().unwrap();
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
     // ---- HTTP leg ----
     let http_dir = tempdir().unwrap();
@@ -3721,7 +3730,7 @@ async fn given_unknown_uuid_when_renamed_via_http_and_ffi_then_both_not_found() 
 /// (Testing Specification §7.3, FR-CO-04, FR-FC-24).
 #[tokio::test]
 async fn given_same_collection_when_deleted_via_http_and_ffi_then_bodies_and_rows_identical() {
-    let _g = SERIAL.lock().unwrap();
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
     // ---- HTTP leg ----
     let http_dir = tempdir().unwrap();
@@ -3839,7 +3848,7 @@ async fn given_same_collection_when_deleted_via_http_and_ffi_then_bodies_and_row
 /// (HTTP 404, FFI `COLLECTION_ERR_NOT_FOUND`) (AF-01, FR-FC-24 / NFR-09).
 #[tokio::test]
 async fn given_unknown_uuid_when_deleted_via_http_and_ffi_then_both_not_found() {
-    let _g = SERIAL.lock().unwrap();
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
     // ---- HTTP leg ----
     let http_dir = tempdir().unwrap();
@@ -3893,7 +3902,7 @@ async fn given_unknown_uuid_when_deleted_via_http_and_ffi_then_both_not_found() 
 /// FR-FC-24).
 #[tokio::test]
 async fn given_same_bookmark_when_created_via_http_and_ffi_then_bodies_and_rows_identical() {
-    let _g = SERIAL.lock().unwrap();
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
     // ---- HTTP leg ----
     let http_dir = tempdir().unwrap();
@@ -4002,7 +4011,7 @@ async fn given_same_bookmark_when_created_via_http_and_ffi_then_bodies_and_rows_
 /// FR-FC-24 / NFR-09).
 #[tokio::test]
 async fn given_unknown_collection_when_bookmark_created_via_http_and_ffi_then_both_not_found() {
-    let _g = SERIAL.lock().unwrap();
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let unknown = uuid::Uuid::new_v4();
 
     // ---- HTTP leg ----
@@ -4079,7 +4088,7 @@ async fn given_unknown_collection_when_bookmark_created_via_http_and_ffi_then_bo
 #[tokio::test]
 async fn given_same_file_when_added_to_collection_via_http_and_ffi_then_bodies_and_links_identical()
 {
-    let _g = SERIAL.lock().unwrap();
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
     // ---- HTTP leg ----
     let http_dir = tempdir().unwrap();
@@ -4227,7 +4236,7 @@ async fn given_same_file_when_added_to_collection_via_http_and_ffi_then_bodies_a
 /// FR-FC-24 / NFR-09).
 #[tokio::test]
 async fn given_unknown_item_when_added_via_http_and_ffi_then_both_not_found() {
-    let _g = SERIAL.lock().unwrap();
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let unknown = uuid::Uuid::new_v4();
 
     // ---- HTTP leg ----
@@ -4316,7 +4325,7 @@ async fn given_unknown_item_when_added_via_http_and_ffi_then_both_not_found() {
 /// is unlinked (Testing Specification §7.3, FR-CO-06, FR-FC-24).
 #[tokio::test]
 async fn given_same_linked_file_when_removed_via_http_and_ffi_then_bodies_and_links_identical() {
-    let _g = SERIAL.lock().unwrap();
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
     // ---- HTTP leg ----
     let http_dir = tempdir().unwrap();
@@ -4493,7 +4502,7 @@ async fn given_same_linked_file_when_removed_via_http_and_ffi_then_bodies_and_li
 /// (AF-01, FR-FC-24 / NFR-09).
 #[tokio::test]
 async fn given_unlinked_item_when_removed_via_http_and_ffi_then_both_not_found() {
-    let _g = SERIAL.lock().unwrap();
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
     // ---- HTTP leg ----
     let http_dir = tempdir().unwrap();
@@ -4589,7 +4598,7 @@ async fn given_unlinked_item_when_removed_via_http_and_ffi_then_both_not_found()
 /// §7.3, FR-CO-07, FR-FC-24).
 #[tokio::test]
 async fn given_same_collection_when_items_listed_via_http_and_ffi_then_bodies_identical() {
-    let _g = SERIAL.lock().unwrap();
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
     // ---- HTTP leg ----
     let http_dir = tempdir().unwrap();
@@ -4750,7 +4759,7 @@ async fn given_same_collection_when_items_listed_via_http_and_ffi_then_bodies_id
 /// Specification §7.3, FR-BM-02, FR-FC-24).
 #[tokio::test]
 async fn given_same_bookmark_when_updated_via_http_and_ffi_then_bodies_and_rows_identical() {
-    let _g = SERIAL.lock().unwrap();
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
     // ---- HTTP leg ----
     let http_dir = tempdir().unwrap();
@@ -4884,7 +4893,7 @@ async fn given_same_bookmark_when_updated_via_http_and_ffi_then_bodies_and_rows_
 /// (HTTP 404, FFI `BOOKMARK_ERR_NOT_FOUND`) (AF-02, FR-FC-24 / NFR-09).
 #[tokio::test]
 async fn given_unknown_uuid_when_bookmark_updated_via_http_and_ffi_then_both_not_found() {
-    let _g = SERIAL.lock().unwrap();
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
     // ---- HTTP leg ----
     let http_dir = tempdir().unwrap();
@@ -4943,7 +4952,7 @@ async fn given_unknown_uuid_when_bookmark_updated_via_http_and_ffi_then_both_not
 /// FR-FC-24).
 #[tokio::test]
 async fn given_same_bookmarks_when_listed_via_http_and_ffi_then_bodies_identical() {
-    let _g = SERIAL.lock().unwrap();
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
     // ---- HTTP leg ----
     let http_dir = tempdir().unwrap();
@@ -5029,7 +5038,7 @@ async fn given_same_bookmarks_when_listed_via_http_and_ffi_then_bodies_identical
 /// FR-FC-24 / NFR-09).
 #[tokio::test]
 async fn given_unknown_collection_when_bookmarks_listed_via_http_and_ffi_then_both_not_found() {
-    let _g = SERIAL.lock().unwrap();
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let unknown = uuid::Uuid::new_v4();
 
     // ---- HTTP leg ----
@@ -5083,7 +5092,7 @@ async fn given_unknown_collection_when_bookmarks_listed_via_http_and_ffi_then_bo
 #[tokio::test]
 async fn given_same_bookmark_when_deleted_and_restored_via_http_and_ffi_then_bodies_and_rows_identical(
 ) {
-    let _g = SERIAL.lock().unwrap();
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
     // ---- HTTP leg ----
     let http_dir = tempdir().unwrap();
@@ -5230,7 +5239,7 @@ async fn given_same_bookmark_when_deleted_and_restored_via_http_and_ffi_then_bod
 /// FR-FC-24 / NFR-09).
 #[tokio::test]
 async fn given_unknown_uuid_when_bookmark_soft_deleted_via_http_and_ffi_then_both_not_found() {
-    let _g = SERIAL.lock().unwrap();
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
     // ---- HTTP leg ----
     let http_dir = tempdir().unwrap();
@@ -5283,7 +5292,7 @@ async fn given_unknown_uuid_when_bookmark_soft_deleted_via_http_and_ffi_then_bot
 /// (Testing Specification section 7.3, FR-BM-04, FR-FC-24).
 #[tokio::test]
 async fn given_purgeable_bookmark_when_purged_via_http_and_ffi_then_bodies_and_rows_identical() {
-    let _g = SERIAL.lock().unwrap();
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
     let deleted_at = "2024-01-01T00:00:00Z";
 
@@ -5431,7 +5440,7 @@ async fn given_purgeable_bookmark_when_purged_via_http_and_ffi_then_bodies_and_r
 /// (HTTP 404, FFI BOOKMARK_ERR_NOT_FOUND) (AF-02, FR-FC-24 / NFR-09).
 #[tokio::test]
 async fn given_unknown_uuid_when_bookmark_purged_via_http_and_ffi_then_both_not_found() {
-    let _g = SERIAL.lock().unwrap();
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
     // ---- HTTP leg ----
     let http_dir = tempdir().unwrap();
@@ -5485,7 +5494,7 @@ async fn given_unknown_uuid_when_bookmark_purged_via_http_and_ffi_then_both_not_
 /// FR-WL-01, FR-FC-24).
 #[tokio::test]
 async fn given_same_watchlist_when_created_via_http_and_ffi_then_bodies_and_rows_identical() {
-    let _g = SERIAL.lock().unwrap();
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
     // ---- HTTP leg ----
     let http_dir = tempdir().unwrap();
@@ -5570,7 +5579,7 @@ async fn given_same_watchlist_when_created_via_http_and_ffi_then_bodies_and_rows
 /// (FR-AU-07 / SRD section 7, FR-FC-24 / NFR-09).
 #[tokio::test]
 async fn given_no_token_when_watchlist_created_via_http_and_ffi_then_both_unauthorized() {
-    let _g = SERIAL.lock().unwrap();
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
     // ---- HTTP leg ----
     let http_dir = tempdir().unwrap();
@@ -5643,7 +5652,7 @@ async fn seed_file(pool: &sqlx::sqlite::SqlitePool, file_type: &str) -> String {
 /// (Testing Specification section 7.3, FR-WL-02, FR-WL-03, FR-FC-24).
 #[tokio::test]
 async fn given_same_video_when_added_via_http_and_ffi_then_bodies_and_rows_identical() {
-    let _g = SERIAL.lock().unwrap();
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
     // ---- HTTP leg ----
     let http_dir = tempdir().unwrap();
@@ -5776,7 +5785,7 @@ async fn given_same_video_when_added_via_http_and_ffi_then_bodies_and_rows_ident
 /// (FR-FC-24 / NFR-09).
 #[tokio::test]
 async fn given_unknown_watchlist_when_video_added_via_http_and_ffi_then_both_not_found() {
-    let _g = SERIAL.lock().unwrap();
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
     // ---- HTTP leg ----
     let http_dir = tempdir().unwrap();
@@ -5844,7 +5853,7 @@ async fn given_unknown_watchlist_when_video_added_via_http_and_ffi_then_both_not
 /// (Testing Specification section 7.3, FR-WL-08, FR-FC-24).
 #[tokio::test]
 async fn given_same_watchlist_when_browsed_via_http_and_ffi_then_bodies_identical() {
-    let _g = SERIAL.lock().unwrap();
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
     // ---- HTTP leg ----
     let http_dir = tempdir().unwrap();
@@ -5983,7 +5992,7 @@ async fn given_same_watchlist_when_browsed_via_http_and_ffi_then_bodies_identica
 /// (FR-FC-24 / NFR-09).
 #[tokio::test]
 async fn given_unknown_watchlist_when_browsed_via_http_and_ffi_then_both_not_found() {
-    let _g = SERIAL.lock().unwrap();
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
     // ---- HTTP leg ----
     let http_dir = tempdir().unwrap();
@@ -6038,7 +6047,7 @@ async fn given_unknown_watchlist_when_browsed_via_http_and_ffi_then_both_not_fou
 /// Specification section 7.3, FR-WL-04, FR-WL-05, FR-FC-24).
 #[tokio::test]
 async fn given_same_transition_when_updated_via_http_and_ffi_then_bodies_and_rows_identical() {
-    let _g = SERIAL.lock().unwrap();
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
     // ---- HTTP leg ----
     let http_dir = tempdir().unwrap();
@@ -6208,7 +6217,7 @@ async fn given_same_transition_when_updated_via_http_and_ffi_then_bodies_and_row
 /// 409, FFI WATCHLIST_ERR_INVALID_STATE) (FR-FC-24 / NFR-09).
 #[tokio::test]
 async fn given_invalid_transition_when_updated_via_http_and_ffi_then_both_conflict() {
-    let _g = SERIAL.lock().unwrap();
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
     // ---- HTTP leg ----
     let http_dir = tempdir().unwrap();
@@ -6341,7 +6350,7 @@ async fn given_invalid_transition_when_updated_via_http_and_ffi_then_both_confli
 /// FR-FC-24).
 #[tokio::test]
 async fn given_same_video_when_removed_via_http_and_ffi_then_bodies_and_rows_identical() {
-    let _g = SERIAL.lock().unwrap();
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
     // ---- HTTP leg ----
     let http_dir = tempdir().unwrap();
@@ -6518,7 +6527,7 @@ async fn given_same_video_when_removed_via_http_and_ffi_then_bodies_and_rows_ide
 /// (FR-FC-24 / NFR-09).
 #[tokio::test]
 async fn given_video_not_on_watchlist_when_removed_via_http_and_ffi_then_both_not_found() {
-    let _g = SERIAL.lock().unwrap();
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
     // ---- HTTP leg ----
     let http_dir = tempdir().unwrap();
@@ -6616,7 +6625,7 @@ async fn given_video_not_on_watchlist_when_removed_via_http_and_ffi_then_both_no
 /// FR-WL-07, FR-FC-24).
 #[tokio::test]
 async fn given_same_watchlist_when_deleted_via_http_and_ffi_then_bodies_and_rows_identical() {
-    let _g = SERIAL.lock().unwrap();
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
     // ---- HTTP leg ----
     let http_dir = tempdir().unwrap();
@@ -6793,7 +6802,7 @@ async fn given_same_watchlist_when_deleted_via_http_and_ffi_then_bodies_and_rows
 /// NFR-09).
 #[tokio::test]
 async fn given_unknown_watchlist_when_deleted_via_http_and_ffi_then_both_not_found() {
-    let _g = SERIAL.lock().unwrap();
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
     // ---- HTTP leg ----
     let http_dir = tempdir().unwrap();
@@ -6849,7 +6858,7 @@ async fn given_unknown_watchlist_when_deleted_via_http_and_ffi_then_both_not_fou
 /// 7.3, FR-RL-01, FR-FC-24).
 #[tokio::test]
 async fn given_same_reading_list_when_created_via_http_and_ffi_then_bodies_and_rows_identical() {
-    let _g = SERIAL.lock().unwrap();
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
     // ---- HTTP leg ----
     let http_dir = tempdir().unwrap();
@@ -6934,7 +6943,7 @@ async fn given_same_reading_list_when_created_via_http_and_ffi_then_bodies_and_r
 /// (FR-AU-07 / SRD section 7, FR-FC-24 / NFR-09).
 #[tokio::test]
 async fn given_no_token_when_reading_list_created_via_http_and_ffi_then_both_unauthorized() {
-    let _g = SERIAL.lock().unwrap();
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
     // ---- HTTP leg ----
     let http_dir = tempdir().unwrap();
@@ -6987,7 +6996,7 @@ async fn given_no_token_when_reading_list_created_via_http_and_ffi_then_both_una
 /// (Testing Specification section 7.3, FR-RL-02, FR-RL-03, FR-FC-24).
 #[tokio::test]
 async fn given_same_item_when_added_via_http_and_ffi_then_bodies_and_rows_identical() {
-    let _g = SERIAL.lock().unwrap();
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
     // ---- HTTP leg ----
     let http_dir = tempdir().unwrap();
@@ -7139,7 +7148,7 @@ async fn given_same_item_when_added_via_http_and_ffi_then_bodies_and_rows_identi
 /// (FR-FC-24 / NFR-09).
 #[tokio::test]
 async fn given_unknown_reading_list_when_item_added_via_http_and_ffi_then_both_not_found() {
-    let _g = SERIAL.lock().unwrap();
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
     // ---- HTTP leg ----
     let http_dir = tempdir().unwrap();
@@ -7207,7 +7216,7 @@ async fn given_unknown_reading_list_when_item_added_via_http_and_ffi_then_both_n
 /// uuids (Testing Specification section 7.3, FR-RL-08, FR-FC-24).
 #[tokio::test]
 async fn given_same_reading_list_when_browsed_via_http_and_ffi_then_bodies_identical() {
-    let _g = SERIAL.lock().unwrap();
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
     // ---- HTTP leg ----
     let http_dir = tempdir().unwrap();
@@ -7361,7 +7370,7 @@ async fn given_same_reading_list_when_browsed_via_http_and_ffi_then_bodies_ident
 /// (FR-FC-24 / NFR-09).
 #[tokio::test]
 async fn given_unknown_reading_list_when_browsed_via_http_and_ffi_then_both_not_found() {
-    let _g = SERIAL.lock().unwrap();
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
     // ---- HTTP leg ----
     let http_dir = tempdir().unwrap();
@@ -7417,7 +7426,7 @@ async fn given_unknown_reading_list_when_browsed_via_http_and_ffi_then_both_not_
 #[tokio::test]
 async fn given_same_reading_transition_when_updated_via_http_and_ffi_then_bodies_and_rows_identical(
 ) {
-    let _g = SERIAL.lock().unwrap();
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
     // ---- HTTP leg ----
     let http_dir = tempdir().unwrap();
@@ -7595,7 +7604,7 @@ async fn given_same_reading_transition_when_updated_via_http_and_ffi_then_bodies
 /// 409, FFI READING_LIST_ERR_INVALID_STATE) (FR-FC-24 / NFR-09).
 #[tokio::test]
 async fn given_invalid_reading_transition_when_updated_via_http_and_ffi_then_both_conflict() {
-    let _g = SERIAL.lock().unwrap();
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
     // ---- HTTP leg ----
     let http_dir = tempdir().unwrap();
@@ -7736,7 +7745,7 @@ async fn given_invalid_reading_transition_when_updated_via_http_and_ffi_then_bot
 /// FR-FC-24).
 #[tokio::test]
 async fn given_same_item_when_removed_via_http_and_ffi_then_bodies_and_rows_identical() {
-    let _g = SERIAL.lock().unwrap();
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
     // ---- HTTP leg ----
     let http_dir = tempdir().unwrap();
@@ -7921,7 +7930,7 @@ async fn given_same_item_when_removed_via_http_and_ffi_then_bodies_and_rows_iden
 /// (FR-FC-24 / NFR-09).
 #[tokio::test]
 async fn given_item_not_on_reading_list_when_removed_via_http_and_ffi_then_both_not_found() {
-    let _g = SERIAL.lock().unwrap();
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
     // ---- HTTP leg ----
     let http_dir = tempdir().unwrap();
@@ -8023,7 +8032,7 @@ async fn given_item_not_on_reading_list_when_removed_via_http_and_ffi_then_both_
 /// Specification section 7.3, FR-RL-07, FR-FC-24).
 #[tokio::test]
 async fn given_same_reading_list_when_deleted_via_http_and_ffi_then_bodies_and_rows_identical() {
-    let _g = SERIAL.lock().unwrap();
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
     // ---- HTTP leg ----
     let http_dir = tempdir().unwrap();
@@ -8214,7 +8223,7 @@ async fn given_same_reading_list_when_deleted_via_http_and_ffi_then_bodies_and_r
 /// (FR-FC-24 / NFR-09).
 #[tokio::test]
 async fn given_unknown_reading_list_when_deleted_via_http_and_ffi_then_both_not_found() {
-    let _g = SERIAL.lock().unwrap();
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
     // ---- HTTP leg ----
     let http_dir = tempdir().unwrap();
@@ -8290,7 +8299,7 @@ async fn seed_file_at_path(pool: &sqlx::sqlite::SqlitePool, file_type: &str, pat
 /// uuids (Testing Specification section 7.3, FR-TX-01, FR-FC-24).
 #[tokio::test]
 async fn given_same_text_file_when_read_via_http_and_ffi_then_bodies_identical() {
-    let _g = SERIAL.lock().unwrap();
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
     let lib = tempdir().unwrap();
     let file_path = lib.path().join("notes.txt");
@@ -8366,7 +8375,7 @@ async fn given_same_text_file_when_read_via_http_and_ffi_then_bodies_identical()
 /// (FR-FC-24 / NFR-09).
 #[tokio::test]
 async fn given_non_text_file_when_read_via_http_and_ffi_then_both_invalid_input() {
-    let _g = SERIAL.lock().unwrap();
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
     let lib = tempdir().unwrap();
     let file_path = lib.path().join("song.mp3");
@@ -8432,7 +8441,7 @@ async fn given_non_text_file_when_read_via_http_and_ffi_then_both_invalid_input(
 /// FR-FC-24).
 #[tokio::test]
 async fn given_same_content_when_edited_via_http_and_ffi_then_bodies_and_disk_identical() {
-    let _g = SERIAL.lock().unwrap();
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
     let http_lib = tempdir().unwrap();
     let http_file_path = http_lib.path().join("notes.txt");
@@ -8525,7 +8534,7 @@ async fn given_same_content_when_edited_via_http_and_ffi_then_bodies_and_disk_id
 /// (FR-FC-24 / NFR-09).
 #[tokio::test]
 async fn given_non_text_file_when_edited_via_http_and_ffi_then_both_invalid_input() {
-    let _g = SERIAL.lock().unwrap();
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
     let lib = tempdir().unwrap();
     let file_path = lib.path().join("song.mp3");
@@ -8592,7 +8601,7 @@ async fn given_non_text_file_when_edited_via_http_and_ffi_then_both_invalid_inpu
 /// parity asserts each is present and well-formed rather than equal.
 #[tokio::test]
 async fn given_same_local_credentials_when_set_and_logged_in_via_http_and_ffi_then_bodies_match() {
-    let _g = SERIAL.lock().unwrap();
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
     // ---- HTTP leg ----
     let http_dir = tempdir().unwrap();
@@ -8739,7 +8748,7 @@ fn write_test_tags(path: &std::path::Path) {
 /// indexer itself, not by a manual PATCH) is byte-for-byte identical.
 #[tokio::test]
 async fn given_tagged_audio_file_when_indexed_via_http_and_ffi_then_extracted_metadata_matches() {
-    let _g = SERIAL.lock().unwrap();
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
     // ---- HTTP leg ----
     let http_lib = tempdir().unwrap();
@@ -8975,7 +8984,7 @@ async fn wait_for_http_image_extraction(pool: &sqlx::sqlite::SqlitePool, name: &
 /// indexer itself, not by a manual PATCH) are byte-for-byte identical.
 #[tokio::test]
 async fn given_tagged_image_file_when_indexed_via_http_and_ffi_then_extracted_metadata_matches() {
-    let _g = SERIAL.lock().unwrap();
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
     // ---- HTTP leg ----
     let http_lib = tempdir().unwrap();
@@ -9191,7 +9200,7 @@ async fn wait_for_http_document_extraction(pool: &sqlx::sqlite::SqlitePool, name
 /// that exercises both independent writes (page_count + metadata) at once.
 #[tokio::test]
 async fn given_tagged_pdf_file_when_indexed_via_http_and_ffi_then_extracted_metadata_matches() {
-    let _g = SERIAL.lock().unwrap();
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
     // ---- HTTP leg ----
     let http_lib = tempdir().unwrap();
@@ -9408,7 +9417,7 @@ async fn wait_for_http_video_extraction(pool: &sqlx::sqlite::SqlitePool, name: &
 /// byte-for-byte identical.
 #[tokio::test]
 async fn given_tagged_mp4_file_when_indexed_via_http_and_ffi_then_extracted_metadata_matches() {
-    let _g = SERIAL.lock().unwrap();
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
     // ---- HTTP leg ----
     let http_lib = tempdir().unwrap();
@@ -9620,7 +9629,7 @@ async fn wait_for_http_comic_extraction(pool: &sqlx::sqlite::SqlitePool, name: &
 /// are byte-for-byte identical.
 #[tokio::test]
 async fn given_tagged_cbz_file_when_indexed_via_http_and_ffi_then_extracted_metadata_matches() {
-    let _g = SERIAL.lock().unwrap();
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
     // ---- HTTP leg ----
     let http_lib = tempdir().unwrap();
@@ -9853,7 +9862,7 @@ fn set_ffi_thumbnail_cache(cache_dir: &TempDir) {
 #[tokio::test]
 async fn given_same_file_when_streamed_then_descriptor_agrees_with_http() {
     // Arrange — one identical fixture per leg, each in its own library.
-    let _g = SERIAL.lock().unwrap();
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let contents = b"fake mp4 bytes, but real enough for a byte stream";
 
     let http_lib = tempdir().unwrap();
@@ -9946,7 +9955,7 @@ async fn given_same_file_when_streamed_then_descriptor_agrees_with_http() {
 #[tokio::test]
 async fn given_same_comic_when_page_read_then_bytes_identical_across_surfaces() {
     // Arrange — entries deliberately stored out of page order.
-    let _g = SERIAL.lock().unwrap();
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let entries = ["page002.jpg", "page001.jpg"];
 
     let http_lib = tempdir().unwrap();
@@ -10031,7 +10040,7 @@ async fn given_same_comic_when_page_read_then_bytes_identical_across_surfaces() 
 async fn given_same_image_when_thumbnailed_then_bytes_identical_across_surfaces() {
     // Arrange — each leg gets its own cache directory: the default is the
     // relative path "thumbnails", which would land in the repository.
-    let _g = SERIAL.lock().unwrap();
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
     let http_lib = tempdir().unwrap();
     let http_file = write_image(&http_lib, "photo.png", 640, 480);
@@ -10120,7 +10129,7 @@ async fn given_same_image_when_thumbnailed_then_bytes_identical_across_surfaces(
 async fn given_error_conditions_when_played_then_both_surfaces_agree() {
     // Arrange — per leg, one known text file (playable, but neither a comic
     // nor thumbnailable) and one soft-deleted file.
-    let _g = SERIAL.lock().unwrap();
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
     let http_lib = tempdir().unwrap();
     let http_known = http_lib.path().join("sample.txt");
