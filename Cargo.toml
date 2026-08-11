@@ -20,6 +20,7 @@ alexandria-core = { path = "crates/alexandria-core" }
 anyhow = "1"
 argon2 = { version = "0.5", features = ["std"] }
 axum = "0.8"
+base64 = "0.22"
 cbindgen = "0.29"
 chrono = { version = "0.4", features = ["serde"] }
 epub = "2"
@@ -28,6 +29,15 @@ ffmpeg-next = "9"
 # Already in the dependency graph via sqlx and reqwest, so this adds no new
 # transitive weight — only a direct, declared use of it.
 futures-util = { version = "0.3", default-features = false, features = ["std", "async-await"] }
+# UC-40 thumbnails decode and re-encode stills, so this is no longer dev-only.
+# The feature list mirrors `catalog::classify`'s `FileType::Image` extension
+# table exactly, so every still the indexer admits has a decoder: jpg/jpeg,
+# png, webp, gif, bmp, and tif/tiff. All six are pure-Rust decoders shipped by
+# the `image` crate itself — no new system dependency. The one extension
+# `classify` maps to `Image` that is deliberately *not* here is `.svg`: it is
+# vector, `image` is a raster crate, and rasterizing it would mean a new
+# dependency. `ThumbnailHandler` rejects SVG explicitly instead.
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif", "bmp", "tiff"] }
 jsonwebtoken = "9"
 kamadak-exif = "0.5"
 lofty = "0.22"
@@ -42,17 +52,16 @@ thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 toml = "1"
 tower = "0.5"
-tower-http = { version = "0.7", features = ["trace"] }
+tower-http = { version = "0.7", features = ["trace", "fs"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 walkdir = "2"
+zip = "2"
 
 # dev-only
-image = { version = "0.25", default-features = false, features = ["jpeg"] }
 little_exif = "0.6"
 tempfile = "3"
-zip = "2"
 
 [profile.release]
 lto = true

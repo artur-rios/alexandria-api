@@ -35,6 +35,41 @@ pub struct CbzComicMetadataReader;
 
 const IMAGE_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "gif", "webp", "bmp"];
 
+/// Does this archive entry count as a comic page?
+///
+/// The single source of truth for that question, shared by
+/// `read_cbz`'s page count (FR-FC-25) and UC-39's page index (FR-MP-04).
+/// If these two ever disagreed, "page 7" and `comicPageCount` would be
+/// describing different things.
+pub fn is_page_entry(entry_name: &str) -> bool {
+    if entry_name.eq_ignore_ascii_case("ComicInfo.xml") {
+        return false;
+    }
+
+    // macOS's Archive Utility writes one AppleDouble sidecar per file — a
+    // few KB of resource fork and Finder metadata, stored under
+    // `__MACOSX/` with the original name prefixed `._`. They carry the
+    // page's extension, so without this a CBZ zipped on a Mac counts and
+    // serves twice its real page count, and `._page001.jpg` sorts *before*
+    // `page001.jpg` (`_` is 0x5F, `p` is 0x70) — so page 1 and the
+    // thumbnail both become an undecodable blob labelled `image/jpeg`.
+    let mut components = entry_name.split(['/', '\\']);
+    if components.any(|part| part.eq_ignore_ascii_case("__MACOSX")) {
+        return false;
+    }
+    let basename = entry_name.rsplit(['/', '\\']).next().unwrap_or(entry_name);
+    if basename.starts_with("._") {
+        return false;
+    }
+
+    let ext = entry_name
+        .rsplit('.')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    IMAGE_EXTENSIONS.contains(&ext.as_str())
+}
+
 impl CbzComicMetadataReader {
     fn read_cbz(path: &str) -> Option<ComicTags> {
         let file = std::fs::File::open(path).ok()?;
@@ -49,8 +84,7 @@ impl CbzComicMetadataReader {
                 comic_info_index = Some(i);
                 continue;
             }
-            let ext = name.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
-            if IMAGE_EXTENSIONS.contains(&ext.as_str()) {
+            if is_page_entry(&name) {
                 page_count += 1;
             }
         }
@@ -303,5 +337,34 @@ mod tests {
         let tags = reader.read(path.to_str().unwrap()).await;
 
         assert!(tags.is_none(), ".cbr is not attempted at all");
+    }
+
+    #[test]
+    fn given_archive_entry_names_when_tested_then_only_images_are_pages() {
+        // Arrange / Act / Assert — the metadata file is not a page, nor is a
+        // non-image sidecar; every image extension the catalog recognizes is.
+        assert!(!is_page_entry("ComicInfo.xml"));
+        assert!(!is_page_entry("comicinfo.xml"));
+        assert!(!is_page_entry("notes.txt"));
+        assert!(is_page_entry("page001.jpg"));
+        assert!(is_page_entry("page002.JPEG"));
+        assert!(is_page_entry("sub/dir/page003.png"));
+        assert!(is_page_entry("page004.webp"));
+    }
+
+    #[test]
+    fn given_appledouble_sidecars_when_tested_then_not_pages() {
+        // Arrange / Act / Assert — a CBZ zipped on macOS carries one
+        // AppleDouble sidecar per page, under `__MACOSX/` and named `._` +
+        // the original. Both forms must be excluded, or a 20-page comic
+        // reports 40 pages and `pages/1` serves a metadata blob (`._` sorts
+        // before the real name) labelled `image/jpeg`.
+        assert!(!is_page_entry("__MACOSX/._page001.jpg"));
+        assert!(!is_page_entry("__MACOSX/sub/._page002.png"));
+        assert!(!is_page_entry("._page003.jpg"));
+        assert!(!is_page_entry("sub/dir/._page004.png"));
+        // The real pages beside them are still pages.
+        assert!(is_page_entry("page001.jpg"));
+        assert!(is_page_entry("sub/page002.png"));
     }
 }

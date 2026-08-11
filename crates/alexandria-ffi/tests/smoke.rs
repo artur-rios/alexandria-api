@@ -174,6 +174,59 @@ fn given_missing_root_when_ffi_index_start_then_returns_invalid_input() {
     assert_eq!(result.status, STATUS_INVALID_INPUT);
 }
 
+/// FR-FC-26 parity: the constraint lives in the core handler, so the FFI
+/// surface rejects an out-of-root index exactly as HTTP's 400 does (NFR-09).
+/// The bound is configured the only way the FFI reads configuration — the
+/// `ALEXANDRIA_*` environment — which is process-wide, so it is removed again
+/// before any assertion can unwind out of this test.
+#[test]
+fn given_root_outside_configured_library_root_when_ffi_index_start_then_invalid_input() {
+    // Arrange
+    let _g = serial();
+    let parent = tempdir().unwrap();
+    let library = parent.path().join("library");
+    let outside = parent.path().join("secrets");
+    std::fs::create_dir(&library).unwrap();
+    std::fs::create_dir(&outside).unwrap();
+    std::env::set_var("ALEXANDRIA_FILESYSTEM_ROOT", library.to_str().unwrap());
+    let _db = init_temp_db();
+
+    // Act
+    let root = c(outside.to_str().unwrap());
+    let token = c(TEST_TOKEN);
+    let result = alexandria_index_start(root.as_ptr(), token.as_ptr());
+    std::env::remove_var("ALEXANDRIA_FILESYSTEM_ROOT");
+
+    // Assert
+    assert_eq!(result.status, STATUS_INVALID_INPUT);
+}
+
+/// The other half of the parity pair: with the same bound configured, a root
+/// *inside* it is accepted — so the test above is proving the constraint, not
+/// some unrelated FFI failure.
+#[test]
+fn given_root_inside_configured_library_root_when_ffi_index_start_then_ok() {
+    // Arrange
+    let _g = serial();
+    let library = tempdir().unwrap();
+    let inside = library.path().join("music");
+    std::fs::create_dir(&inside).unwrap();
+    std::env::set_var(
+        "ALEXANDRIA_FILESYSTEM_ROOT",
+        library.path().to_str().unwrap(),
+    );
+    let _db = init_temp_db();
+
+    // Act
+    let root = c(inside.to_str().unwrap());
+    let token = c(TEST_TOKEN);
+    let result = alexandria_index_start(root.as_ptr(), token.as_ptr());
+    std::env::remove_var("ALEXANDRIA_FILESYSTEM_ROOT");
+
+    // Assert
+    assert_eq!(result.status, STATUS_OK);
+}
+
 #[test]
 fn given_empty_token_when_ffi_index_start_then_returns_unauthorized() {
     let _g = serial();

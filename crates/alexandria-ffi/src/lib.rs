@@ -51,6 +51,19 @@ pub const COLLECTION_ERR_NOT_FOUND: c_int = 4;
 pub const COLLECTION_ERR_INVALID_STATE: c_int = 5;
 pub const COLLECTION_ERR_OTHER: c_int = 9;
 
+/// FFI status codes returned by playback operations (UC-38…UC-40).
+/// Deliberately separate from `INDEX_*`, `FILE_*`, and `COLLECTION_*` — per
+/// the convention above — so F-10 can grow its own set without colliding;
+/// `PLAYBACK_OK == FILE_OK == 0` by convention.
+pub const PLAYBACK_OK: c_int = 0;
+pub const PLAYBACK_ERR_INVALID_INPUT: c_int = 1;
+pub const PLAYBACK_ERR_UNAUTHORIZED: c_int = 2;
+pub const PLAYBACK_ERR_NOT_INITIALIZED: c_int = 3;
+pub const PLAYBACK_ERR_NOT_FOUND: c_int = 4;
+pub const PLAYBACK_ERR_INVALID_STATE: c_int = 5;
+pub const PLAYBACK_ERR_DISK: c_int = 6;
+pub const PLAYBACK_ERR_OTHER: c_int = 9;
+
 fn runtime() -> &'static Runtime {
     RUNTIME.get_or_init(|| {
         Builder::new_multi_thread()
@@ -414,6 +427,43 @@ impl FileJsonResult {
     }
 }
 
+/// JSON result for the playback functions. `json` is NULL on error and
+/// `status` carries the mapped code. The caller must free `json` with
+/// `alexandria_free_string`.
+#[repr(C)]
+pub struct PlaybackJsonResult {
+    pub status: c_int,
+    pub json: *mut c_char,
+}
+
+impl PlaybackJsonResult {
+    fn err(status: c_int) -> Self {
+        Self {
+            status,
+            json: std::ptr::null_mut(),
+        }
+    }
+
+    fn ok(json: String) -> Self {
+        let cstring = CString::new(json).unwrap_or_default();
+        Self {
+            status: PLAYBACK_OK,
+            json: cstring.into_raw(),
+        }
+    }
+}
+
+fn map_playback_err(err: DomainError) -> PlaybackJsonResult {
+    match err {
+        DomainError::NotFound => PlaybackJsonResult::err(PLAYBACK_ERR_NOT_FOUND),
+        DomainError::Unauthorized => PlaybackJsonResult::err(PLAYBACK_ERR_UNAUTHORIZED),
+        DomainError::InvalidInput(_) => PlaybackJsonResult::err(PLAYBACK_ERR_INVALID_INPUT),
+        DomainError::InvalidState => PlaybackJsonResult::err(PLAYBACK_ERR_INVALID_STATE),
+        DomainError::Disk(_) => PlaybackJsonResult::err(PLAYBACK_ERR_DISK),
+        _ => PlaybackJsonResult::err(PLAYBACK_ERR_OTHER),
+    }
+}
+
 /// JSON filter body accepted by `alexandria_files_list` (UC-03 / FR-FC-12).
 /// Both fields optional; an empty/null body, omitted fields, or empty-string
 /// values use the defaults (`file_type = None`, `state = "active"` — excludes
@@ -624,6 +674,149 @@ pub extern "C" fn alexandria_file_read_content(
             FileJsonResult::ok(json)
         }
         Err(err) => map_file_err(err),
+    }
+}
+
+/// Resolve a File to everything a local player needs to open it
+/// (UC-38 / FR-MP-01, FR-MP-06).
+///
+/// The FFI surface cannot carry a byte stream, so where HTTP streams
+/// `GET /v1/files/{uuid}/stream`, this returns
+/// `{"uuid":…,"path":…,"mimeType":…,"sizeBytes":…}` and the caller — Flutter
+/// desktop, on the same machine as the file — opens that path directly.
+/// Zero bytes cross this boundary. Parity with HTTP is defined on this
+/// descriptor and on the authorization, state, and error decisions rather
+/// than on byte transfer (FR-MP-06).
+#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
+#[no_mangle]
+pub extern "C" fn alexandria_file_playback_source(
+    uuid: *const c_char,
+    token: *const c_char,
+) -> PlaybackJsonResult {
+    let services = match services_slot().lock().unwrap().clone() {
+        Some(s) => s,
+        None => return PlaybackJsonResult::err(PLAYBACK_ERR_NOT_INITIALIZED),
+    };
+
+    // Deny before touching the payload — an unauthenticated caller must not
+    // learn whether its uuid would have parsed.
+    let token = cstr_lossy(token).unwrap_or_default();
+    if !authenticated(&services, &token) {
+        return PlaybackJsonResult::err(PLAYBACK_ERR_UNAUTHORIZED);
+    }
+
+    let uuid = match cstr_lossy(uuid).and_then(|s| uuid::Uuid::parse_str(&s).ok()) {
+        Some(u) => u,
+        None => return PlaybackJsonResult::err(PLAYBACK_ERR_INVALID_INPUT),
+    };
+
+    let result =
+        runtime().block_on(async { services.playback_source_handler.resolve(uuid, &token).await });
+
+    match result {
+        Ok(source) => {
+            let json = serde_json::to_string(&source).unwrap_or_default();
+            PlaybackJsonResult::ok(json)
+        }
+        Err(err) => map_playback_err(err),
+    }
+}
+
+/// One page of a CBZ ComicBook (UC-39 / FR-MP-04).
+///
+/// Returns `{"uuid":…,"page":N,"pageCount":N,"mimeType":…,"bytesBase64":…}`.
+/// Unlike UC-38, the bytes *do* cross the boundary: a comic page has no path
+/// of its own — it lives inside an archive — and it is bounded, so
+/// base64 inside the existing JSON payload keeps the FFI shape intact while
+/// staying byte-exact with HTTP.
+#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
+#[no_mangle]
+pub extern "C" fn alexandria_comic_page(
+    uuid: *const c_char,
+    page: u32,
+    token: *const c_char,
+) -> PlaybackJsonResult {
+    let services = match services_slot().lock().unwrap().clone() {
+        Some(s) => s,
+        None => return PlaybackJsonResult::err(PLAYBACK_ERR_NOT_INITIALIZED),
+    };
+
+    let token = cstr_lossy(token).unwrap_or_default();
+    if !authenticated(&services, &token) {
+        return PlaybackJsonResult::err(PLAYBACK_ERR_UNAUTHORIZED);
+    }
+
+    let uuid = match cstr_lossy(uuid).and_then(|s| uuid::Uuid::parse_str(&s).ok()) {
+        Some(u) => u,
+        None => return PlaybackJsonResult::err(PLAYBACK_ERR_INVALID_INPUT),
+    };
+
+    let result = runtime().block_on(async {
+        services
+            .comic_page_handler
+            .read_page(uuid, page, &token)
+            .await
+    });
+
+    match result {
+        Ok(comic_page) => {
+            use base64::Engine;
+            let encoded = base64::engine::general_purpose::STANDARD.encode(&comic_page.bytes);
+            let json = serde_json::json!({
+                "uuid": comic_page.uuid,
+                "page": comic_page.page,
+                "pageCount": comic_page.page_count,
+                "mimeType": comic_page.mime_type,
+                "bytesBase64": encoded,
+            })
+            .to_string();
+            PlaybackJsonResult::ok(json)
+        }
+        Err(err) => map_playback_err(err),
+    }
+}
+
+/// A downscaled thumbnail for a video, image, or comic
+/// (UC-40 / FR-MP-05). Returns
+/// `{"uuid":…,"mimeType":"image/jpeg","bytesBase64":…}`. Bounded derived
+/// bytes, so the same base64 rule as `alexandria_comic_page` applies.
+#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
+#[no_mangle]
+pub extern "C" fn alexandria_file_thumbnail(
+    uuid: *const c_char,
+    token: *const c_char,
+) -> PlaybackJsonResult {
+    let services = match services_slot().lock().unwrap().clone() {
+        Some(s) => s,
+        None => return PlaybackJsonResult::err(PLAYBACK_ERR_NOT_INITIALIZED),
+    };
+
+    let token = cstr_lossy(token).unwrap_or_default();
+    if !authenticated(&services, &token) {
+        return PlaybackJsonResult::err(PLAYBACK_ERR_UNAUTHORIZED);
+    }
+
+    let uuid = match cstr_lossy(uuid).and_then(|s| uuid::Uuid::parse_str(&s).ok()) {
+        Some(u) => u,
+        None => return PlaybackJsonResult::err(PLAYBACK_ERR_INVALID_INPUT),
+    };
+
+    let result =
+        runtime().block_on(async { services.thumbnail_handler.thumbnail(uuid, &token).await });
+
+    match result {
+        Ok(thumb) => {
+            use base64::Engine;
+            let encoded = base64::engine::general_purpose::STANDARD.encode(&thumb.bytes);
+            let json = serde_json::json!({
+                "uuid": thumb.uuid,
+                "mimeType": thumb.mime_type,
+                "bytesBase64": encoded,
+            })
+            .to_string();
+            PlaybackJsonResult::ok(json)
+        }
+        Err(err) => map_playback_err(err),
     }
 }
 

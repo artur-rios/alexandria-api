@@ -43,6 +43,10 @@ use crate::collections::queries::list_items::ListCollectionItemsHandler;
 use crate::collections::repos::SqliteCollectionRepository;
 use crate::config::AuthMode;
 use crate::config::Settings;
+use crate::playback::comic_page::{ComicPageHandler, ZipComicArchive};
+use crate::playback::source::PlaybackSourceHandler;
+use crate::playback::thumbnail::{DiskThumbnailCache, ImageThumbnailRenderer, ThumbnailHandler};
+use crate::playback::StdFileStat;
 use crate::reading_lists::commands::add_item::AddItemToReadingListHandler;
 use crate::reading_lists::commands::create::CreateReadingListHandler;
 use crate::reading_lists::commands::delete::DeleteReadingListHandler;
@@ -106,6 +110,20 @@ pub type DefaultEditTextFileContentHandler = EditTextFileContentHandler<
     SqliteCatalogRepository,
     StdFilesystem,
     SystemClock,
+>;
+
+pub type DefaultPlaybackSourceHandler =
+    PlaybackSourceHandler<RuntimeAuthService, SqliteCatalogRepository, StdFileStat>;
+
+pub type DefaultComicPageHandler =
+    ComicPageHandler<RuntimeAuthService, SqliteCatalogRepository, ZipComicArchive>;
+
+pub type DefaultThumbnailHandler = ThumbnailHandler<
+    RuntimeAuthService,
+    SqliteCatalogRepository,
+    ZipComicArchive,
+    ImageThumbnailRenderer,
+    DiskThumbnailCache,
 >;
 
 pub type DefaultCreateCollectionHandler =
@@ -217,6 +235,9 @@ pub struct Services {
     pub browse_files_handler: Arc<DefaultBrowseFilesHandler>,
     pub read_text_file_content_handler: Arc<DefaultReadTextFileContentHandler>,
     pub edit_text_file_content_handler: Arc<DefaultEditTextFileContentHandler>,
+    pub playback_source_handler: Arc<DefaultPlaybackSourceHandler>,
+    pub comic_page_handler: Arc<DefaultComicPageHandler>,
+    pub thumbnail_handler: Arc<DefaultThumbnailHandler>,
     pub create_collection_handler: Arc<DefaultCreateCollectionHandler>,
     pub rename_collection_handler: Arc<DefaultRenameCollectionHandler>,
     pub delete_collection_handler: Arc<DefaultDeleteCollectionHandler>,
@@ -278,6 +299,28 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
     // UC-01 and UC-02 are the same hash-every-file workload, so both walks
     // take the same `indexing.concurrency` bound.
     let indexing_concurrency = settings.indexing.concurrency;
+    // FR-FC-26: `filesystem.root` bounds which trees UC-01 will index. It is
+    // logged here, once per process, because this is the single startup path
+    // both transports go through — the HTTP binary and `alexandria_index_init`
+    // — so the two surfaces cannot disagree about whether the bound is on.
+    // UC-02 takes no root (it re-walks paths already in the catalog), so it
+    // needs no equivalent.
+    if settings.filesystem.root.trim().is_empty() {
+        tracing::warn!(
+            "filesystem.root is unset: indexing is unconstrained and will catalog any \
+             absolute path a caller supplies; set filesystem.root to bound it"
+        );
+    } else if let Err(err) = std::fs::canonicalize(settings.filesystem.root.trim()) {
+        // Not fatal: the server still starts and every other operation still
+        // works, exactly as `check_root_within_library` does at request time
+        // (FR-FC-26/AF-07). Logged here too so a broken bound is visible at
+        // startup rather than only on the first index attempt.
+        tracing::error!(
+            root = %settings.filesystem.root,
+            error = %err,
+            "configured filesystem.root cannot be resolved; indexing will be refused until it is fixed"
+        );
+    }
     let index_handler = Arc::new(IndexHandler::new(
         auth.clone(),
         repo.clone(),
@@ -289,6 +332,7 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         video_tags,
         comic_tags,
         indexing_concurrency,
+        settings.filesystem.root.clone(),
     ));
     let refresh_handler = Arc::new(RefreshHandler::new(
         auth.clone(),
@@ -329,6 +373,23 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         repo.clone(),
         fs,
         clock,
+    ));
+    let playback_source_handler = Arc::new(PlaybackSourceHandler::new(
+        auth.clone(),
+        repo.clone(),
+        StdFileStat,
+    ));
+    let comic_page_handler = Arc::new(ComicPageHandler::new(
+        auth.clone(),
+        repo.clone(),
+        ZipComicArchive,
+    ));
+    let thumbnail_handler = Arc::new(ThumbnailHandler::new(
+        auth.clone(),
+        repo.clone(),
+        ZipComicArchive,
+        ImageThumbnailRenderer,
+        DiskThumbnailCache::new(settings.playback.thumbnail_cache_dir.clone()),
     ));
     let create_collection_handler = Arc::new(CreateCollectionHandler::new(
         auth.clone(),
@@ -461,6 +522,9 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         browse_files_handler,
         read_text_file_content_handler,
         edit_text_file_content_handler,
+        playback_source_handler,
+        comic_page_handler,
+        thumbnail_handler,
         create_collection_handler,
         rename_collection_handler,
         delete_collection_handler,

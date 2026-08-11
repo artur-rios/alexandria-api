@@ -61,6 +61,12 @@ graph LR
         UC36[UC-36 External JWT]
     end
 
+    subgraph "Playback"
+        UC38[UC-38 Stream content]
+        UC39[UC-39 Comic page]
+        UC40[UC-40 Thumbnail]
+    end
+
     O --> UC01
     O --> UC03
     O --> UC04
@@ -79,6 +85,11 @@ graph LR
     O --> UC34
     O --> UC36
     UC36 --> AUTH
+    O --> UC38
+    O --> UC39
+    O --> UC40
+    UC38 --> FS
+    UC39 --> FS
 ```
 
 ---
@@ -95,9 +106,9 @@ graph LR
 | **Name** | Index library files |
 | **Actors** | Owner, Local Filesystem |
 | **Description** | Scan a root directory and create type-aware catalog records for every supported file type. |
-| **Preconditions** | The caller is authenticated as the owner; the root path is supplied. |
+| **Preconditions** | The caller is authenticated as the owner; the root path is supplied, and it sits inside the configured `filesystem.root` when one is configured (FR-FC-26). |
 | **Postconditions** | A File record exists for each supported file found, each with a content hash and a subtype record prefilled with whatever metadata could be extracted from the file itself; indexing runs without blocking reads. |
-| **Requirements** | FR-FC-01, FR-FC-02, FR-FC-03, FR-FC-04, FR-FC-05, FR-FC-06, FR-FC-07, FR-FC-08, FR-FC-09, FR-FC-24, FR-FC-25 |
+| **Requirements** | FR-FC-01, FR-FC-02, FR-FC-03, FR-FC-04, FR-FC-05, FR-FC-06, FR-FC-07, FR-FC-08, FR-FC-09, FR-FC-24, FR-FC-25, FR-FC-26 |
 
 **Main Flow**
 
@@ -118,6 +129,8 @@ The `runId` returned in step 2 is opaque: completion is reported to the log only
 | AF-03 | A file path is already cataloged | The system skips creation (no duplicate path); a refresh is handled by UC-02. |
 | AF-04 | A single file cannot be read or persisted | The system counts it as failed, logs a warning naming the path, and continues the run; the remaining files are still indexed. |
 | AF-05 | A file's embedded metadata cannot be parsed, or writing the extracted values fails | The system logs a warning naming the path and leaves the subtype fields empty. The file is still indexed successfully — this is **not** counted as a failure (step 4 is best-effort). |
+| AF-06 | `filesystem.root` is configured and the requested root is neither it nor a descendant of it (FR-FC-26) | The system rejects the request with an invalid-input error saying the root is outside the configured library root. Both paths are canonicalized before the comparison, so `..` segments, trailing separators, symbolic links, and a sibling whose name merely shares a prefix with the library root are all judged on where they actually resolve to. The message does not disclose the configured root's location. Where `filesystem.root` is unset the check does not run at all and any readable root is accepted. |
+| AF-07 | `filesystem.root` is configured but cannot be resolved on disk | The system rejects the request with a distinct invalid-input error saying the server's configured library root could not be resolved (not the AF-06 "outside the library root" message, which would misleadingly blame the caller) and logs an error naming the key and the unresolvable value. A bound that silently vanished when its configuration went bad would be worse than none, because the operator would still believe it were there. |
 
 ---
 
@@ -1110,11 +1123,108 @@ UC-36's externally issued JWT.
 
 ---
 
+### UC-38: Stream file content
+
+| Field | Value |
+| --- | --- |
+| **ID** | UC-38 |
+| **Name** | Stream file content |
+| **Actors** | Owner, Local Filesystem |
+| **Description** | Serve the bytes of an active File from its recorded path for playback. Over HTTP the bytes are streamed with `Range` support; over FFI the system returns a playback descriptor instead, since the FFI surface cannot carry a byte stream. |
+| **Preconditions** | The caller is authenticated; the target file is `active` and present on disk. |
+| **Postconditions** | Over HTTP, the caller receives the file's bytes (in full or as the requested range). Over FFI, the caller receives the file's resolved path, MIME type, and byte size. |
+| **Requirements** | FR-MP-01, FR-MP-02, FR-MP-03, FR-MP-06 |
+
+**Main Flow**
+
+1. The owner requests the bytes of a File UUID, optionally with an HTTP `Range` header.
+2. The system verifies the file is `active` and confirms it is present on disk.
+3. The system derives the MIME type from the file's extension.
+4. Over HTTP, the system streams the bytes from the recorded path unmodified, honouring the `Range` header — a full response, or a partial response for a mid-file range. Over FFI, the system returns a playback descriptor (resolved path, MIME type, byte size) and the local client opens the path directly (FR-MP-06).
+
+**Alternative Flows**
+
+| ID | Condition | Outcome |
+| --- | --- | --- |
+| AF-01 | The file UUID does not exist | The system responds with a not-found error. |
+| AF-02 | The file is soft-deleted | The system rejects with an invalid-state error (restore via UC-07 first). |
+| AF-03 | The file is marked missing on disk, or its path cannot be stat'd | The system responds with a disk-error. |
+| AF-04 | The requested `Range` is unsatisfiable | The system responds with a range-not-satisfiable error. |
+| AF-05 | The caller is not authenticated | The system denies with an unauthorized error. |
+
+---
+
+### UC-39: Read a comic book page
+
+| Field | Value |
+| --- | --- |
+| **ID** | UC-39 |
+| **Name** | Read a comic book page |
+| **Actors** | Owner, Local Filesystem |
+| **Description** | Return a single page of a CBZ ComicBook as an image, addressed by 1-based page index. |
+| **Preconditions** | The caller is authenticated; the target file is `active`, present on disk, a ComicBook, and stored as a CBZ archive. |
+| **Postconditions** | The caller receives the requested page's raw bytes, its MIME type, and the comic's total page count. |
+| **Requirements** | FR-MP-03, FR-MP-04, FR-MP-06 |
+
+**Main Flow**
+
+1. The owner requests page *n* of a ComicBook UUID.
+2. The system verifies the file is a ComicBook and that its archive is a CBZ.
+3. The system reads the archive's page entries and sorts them case-insensitively by name, since archive-storage order does not guarantee page order.
+4. The system bounds-checks *n* (1-based) against the sorted page count.
+5. The system returns the entry's raw bytes, undecoded, and a MIME type derived from the entry's extension (FR-MP-03).
+
+**Alternative Flows**
+
+| ID | Condition | Outcome |
+| --- | --- | --- |
+| AF-01 | The file is not a ComicBook | The system rejects with an invalid-input error. |
+| AF-02 | The comic is not a CBZ archive (e.g. CBR) | The system rejects with an invalid-input error; only CBZ page extraction is supported. |
+| AF-03 | The requested page is out of range (0, or greater than the page count) | The system rejects with an invalid-input error. |
+| AF-04 | The file UUID does not exist | The system responds with a not-found error. |
+| AF-05 | The file is soft-deleted | The system rejects with an invalid-state error (restore via UC-07 first). |
+| AF-06 | The file is marked missing on disk, or the archive cannot be opened or read | The system responds with a disk-error. |
+| AF-07 | The caller is not authenticated | The system denies with an unauthorized error. |
+
+---
+
+### UC-40: Get a file thumbnail
+
+| Field | Value |
+| --- | --- |
+| **ID** | UC-40 |
+| **Name** | Get a file thumbnail |
+| **Actors** | Owner, Local Filesystem |
+| **Description** | Return a downscaled JPEG thumbnail for a video, image, or comic File, cached on disk keyed by content hash. |
+| **Preconditions** | The caller is authenticated; the target file is `active`, present on disk, and of type video, image, or comic. |
+| **Postconditions** | The caller receives the thumbnail's bytes; on a cache miss, the generated thumbnail is written to the disk cache under a key derived from the file's content hash. |
+| **Requirements** | FR-MP-05, FR-MP-06 |
+
+**Main Flow**
+
+1. The owner requests a thumbnail for a File UUID.
+2. The system verifies the file's type is video, image, or comic.
+3. The system looks up the thumbnail cache by a key derived from the file's content hash; on a hit, it returns the cached bytes without rendering anything.
+4. On a cache miss, the system produces a source image — a video keyframe, the decoded image, or the comic's first page — and downscales it to fit within 320 pixels on its longest side, preserving aspect ratio and never enlarging a source that is already smaller, then encodes it as JPEG.
+5. The system writes the encoded bytes to the cache and returns them.
+
+**Alternative Flows**
+
+| ID | Condition | Outcome |
+| --- | --- | --- |
+| AF-01 | The file's type has no thumbnail (audio, text, HTML page, or document) | The system rejects with an invalid-input error. |
+| AF-02 | The file UUID does not exist | The system responds with a not-found error. |
+| AF-03 | The file is soft-deleted | The system rejects with an invalid-state error (restore via UC-07 first). |
+| AF-04 | The file is marked missing on disk, or its bytes cannot be read or decoded | The system responds with a disk-error. |
+| AF-05 | The caller is not authenticated | The system denies with an unauthorized error. |
+
+---
+
 ## 3. Use Case — Requirements Traceability
 
 | Use Case | Requirements |
 | --- | --- |
-| UC-01: Index library files | FR-FC-01, FR-FC-02, FR-FC-03, FR-FC-04, FR-FC-05, FR-FC-06, FR-FC-07, FR-FC-08, FR-FC-09, FR-FC-24, FR-FC-25 |
+| UC-01: Index library files | FR-FC-01, FR-FC-02, FR-FC-03, FR-FC-04, FR-FC-05, FR-FC-06, FR-FC-07, FR-FC-08, FR-FC-09, FR-FC-24, FR-FC-25, FR-FC-26 |
 | UC-02: Re-index and refresh the catalog | FR-FC-08, FR-FC-10, FR-FC-11, FR-FC-24 |
 | UC-03: Browse and view file metadata | FR-FC-12, FR-FC-13, FR-FC-24 |
 | UC-04: Edit file metadata | FR-FC-14, FR-FC-15, FR-FC-16, FR-FC-17, FR-FC-18, FR-FC-24 |
@@ -1150,10 +1260,16 @@ UC-36's externally issued JWT.
 | UC-34: Local login | FR-AU-01, FR-AU-04, FR-AU-07, FR-AU-08, FR-AU-09 |
 | UC-35: Set or change local login credentials | FR-AU-05, FR-AU-06, FR-AU-08 |
 | UC-36: Authenticate via external JWT | FR-AU-01, FR-AU-02, FR-AU-03, FR-AU-07, FR-AU-08 |
+| UC-38: Stream file content | FR-MP-01, FR-MP-02, FR-MP-03, FR-MP-06 |
+| UC-39: Read a comic book page | FR-MP-03, FR-MP-04, FR-MP-06 |
+| UC-40: Get a file thumbnail | FR-MP-05, FR-MP-06 |
 
 Every functional requirement in [System Requirements Document](System%20Requirements%20Document.md)
 §3 appears in at least one row above: FR-FC-01..25, FR-CO-01..07, FR-BM-01..06,
-FR-WL-01..08, FR-RL-01..08, FR-TX-01..03, FR-AU-01..09.
+FR-WL-01..08, FR-RL-01..08, FR-TX-01..03, FR-AU-01..09, FR-MP-01..06.
+UC-37 (Health check) is specified in the
+[Operations & Infrastructure Document](Operations%20%26%20Infrastructure%20Document.md)
+§5.3, not here, since it is an operational concern rather than a catalog use case.
 
 ---
 

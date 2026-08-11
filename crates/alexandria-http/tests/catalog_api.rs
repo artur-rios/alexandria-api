@@ -125,6 +125,32 @@ async fn given_missing_root_when_index_posted_then_returns_400() {
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
 
+/// FR-FC-26 over HTTP. The core handler owns the decision — this asserts the
+/// transport maps its `InvalidInput` to 400, so the constraint is observable
+/// on the surface that made `GET /v1/files/{uuid}/stream` reachable.
+#[tokio::test]
+async fn given_root_outside_configured_library_root_when_index_posted_then_returns_400() {
+    // Arrange
+    let parent = tempdir().unwrap();
+    let library = parent.path().join("library");
+    let outside = parent.path().join("secrets");
+    std::fs::create_dir(&library).unwrap();
+    std::fs::create_dir(&outside).unwrap();
+    let mut settings = Settings::default();
+    settings.filesystem.root = library.to_str().unwrap().to_string();
+    let test = common::test_app_with_settings(settings).await;
+    let router = app(Settings::default(), test.services);
+
+    // Act
+    let response = router
+        .oneshot(index_request(outside.to_str().unwrap()))
+        .await
+        .expect("one-shot");
+
+    // Assert
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
 #[tokio::test]
 async fn given_no_bearer_when_index_posted_then_returns_401() {
     let lib = tempdir().unwrap();

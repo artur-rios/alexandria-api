@@ -15,9 +15,10 @@ rather than restating them.
 
 ### 1.2 Scope
 
-The requirements cover seven capability areas: file catalog and indexing (FC),
+The requirements cover eight capability areas: file catalog and indexing (FC),
 collections (CO), bookmarks (BM), watchlists (WL), reading lists (RL), text file
-content editing (TX), and authentication and authorization (AU). Non-functional
+content editing (TX), authentication and authorization (AU), and media playback
+(MP). Non-functional
 requirements apply across all areas. Operational platform concerns (logging,
 health, configuration, deployment) are specified in the
 [Operations & Infrastructure Document](Operations%20%26%20Infrastructure%20Document.md).
@@ -34,6 +35,7 @@ health, configuration, deployment) are specified in the
 | **formatKind** | Document discriminator: `book` or `ebook`. |
 | **Watch/Read state** | Progress state: `Pending`, `Watching`/`Reading`, `Watched`/`Read`. |
 | **Active auth mode** | The single authentication mode (external JWT or local login) selected at startup; the other mode is inactive and its credentials are rejected. |
+| **Playback descriptor** | The FFI answer to UC-38: the resolved absolute path, MIME type, and byte size of a File, from which a local client opens the file itself. The FFI surface cannot carry a byte stream. |
 
 ---
 
@@ -99,8 +101,9 @@ graph LR
 | FR-FC-21 | The system shall restore a soft-deleted File to `active`. |
 | FR-FC-22 | The system shall hard-purge a File record permanently only after its soft-delete retention window has elapsed. |
 | FR-FC-23 | The system shall, on an explicit purge-on-disk operation, remove the File record and delete the underlying file on disk. |
-| FR-FC-24 | The system shall expose every catalog operation via both the HTTP/REST-JSON surface and the FFI surface with identical results. |
+| FR-FC-24 | The system shall expose every catalog operation via both the HTTP/REST-JSON surface and the FFI surface with identical results. FR-MP-06 defines the single exception: byte transfer, where the FFI surface returns a playback descriptor instead of a stream. |
 | FR-FC-25 | The system shall, at first index only, prefill a file's subtype metadata from the metadata embedded in the file itself (audio tags, image EXIF, document and comic metadata, video container metadata). Extraction is best-effort: a failure leaves the fields empty and never fails the file's indexing, and re-index (FR-FC-10) never re-runs it, so an owner's edit (FR-FC-14..18) is never overwritten. |
+| FR-FC-26 | The system shall reject an index request (FR-FC-01) whose root path is not the configured `filesystem.root` or a descendant of it, comparing the two paths after resolving each to its canonical form so that traversal segments, trailing separators, and symbolic links cannot escape the bound. When `filesystem.root` is unset, indexing is unconstrained and any readable root is accepted — the constraint is opt-in by configuration. Re-index (FR-FC-10, FR-FC-11) takes no root and is unaffected. |
 
 ### 3.2 Collections (CO)
 
@@ -172,6 +175,17 @@ graph LR
 | FR-AU-07 | The system shall authorize the single owner for every catalog operation and shall reject unauthenticated calls. |
 | FR-AU-08 | The system shall expose authentication operations via both the HTTP and FFI surfaces consistently. |
 | FR-AU-09 | In local mode, a successful login shall create a Session with a configurable expiry (default 24 hours); the caller shall present that session's id on every subsequent request, and the system shall reject an unknown or expired session id as unauthenticated. |
+
+### 3.8 Media Playback (MP)
+
+| ID | Requirement |
+| --- | --- |
+| FR-MP-01 | The system shall stream the bytes of an `active` File from its recorded path, with a MIME type derived from the file's extension. |
+| FR-MP-02 | The system shall support HTTP byte-range requests over that stream, so a client can seek without transferring the whole file. |
+| FR-MP-03 | The system shall never re-encode, transcode, or otherwise modify the bytes it serves. |
+| FR-MP-04 | The system shall return a single page of a CBZ ComicBook as an image, addressed by 1-based page index. |
+| FR-MP-05 | The system shall return a downscaled thumbnail image for a video, image, or comic File. |
+| FR-MP-06 | The system shall expose playback operations via both the HTTP and FFI surfaces. Because the FFI surface cannot carry a byte stream, FR-MP-01 over FFI returns a **playback descriptor** — resolved absolute path, MIME type, and byte size — and parity for it is defined on that descriptor and on the authorization, state, and error decisions rather than on byte transfer. FR-MP-04 and FR-MP-05 return their bytes over both surfaces and are byte-exact across them. |
 
 ---
 
@@ -500,7 +514,7 @@ Cascade notes:
 
 | Feature | Requirements |
 | --- | --- |
-| F-01 File indexing | FR-FC-01 through FR-FC-11, FR-FC-25 |
+| F-01 File indexing | FR-FC-01 through FR-FC-11, FR-FC-25, FR-FC-26 |
 | F-02 Catalog browsing and metadata editing | FR-FC-12 through FR-FC-18 |
 | F-03 Renaming and lifecycle management | FR-FC-19 through FR-FC-23 |
 | F-04 Text file content editing | FR-TX-01 through FR-TX-03 |
