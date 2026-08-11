@@ -243,9 +243,22 @@ hashing reads every byte, and ffmpeg may seek a long way to find its best video
 stream. Read a row as "extraction costs at least this much per file, before
 file size enters into it".
 
-CI runs these on pushes to `main` as a separate, non-gating job, so the numbers
-are recorded over time and the harness cannot rot, without a noisy runner
-turning a red build into something to ignore.
+CI runs these on pushes to `main` as a separate job carrying
+`continue-on-error: true`, so the numbers are recorded over time and the
+harness cannot rot, without a noisy runner turning a red build into something
+to ignore.
+
+That flag is load-bearing, not decorative. The loose floors resist runner
+noise, but the harness also asserts **exact counts** — every fixture file
+cataloged — and those are not noise-proof. A runner roughly 3.5× slower than
+usual once pushed the concurrent writers past SQLite's `busy_timeout` and cost
+the run two files out of two thousand, reddening `main` on a commit that was
+fine. The indexer now retries a busy write, which removes that particular
+cause; the flag is what stops the next unforeseen one from failing a build over
+a measurement.
+
+Read a red mark here as a prompt to compare the figures against the previous
+run, not as a broken build.
 
 ## 10. Running the suites
 

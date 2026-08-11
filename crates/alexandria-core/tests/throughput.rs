@@ -87,6 +87,43 @@ fn strict() -> bool {
     std::env::var("ALEXANDRIA_NFR_STRICT").is_ok_and(|v| v != "0" && !v.is_empty())
 }
 
+/// Route the indexer's per-file `warn` to stdout.
+///
+/// The indexer logs every file it could not index with that file's path and
+/// the underlying error, but a test binary installs no `tracing` subscriber,
+/// so those events went nowhere. A CI failure could therefore report that two
+/// of two thousand files were missing without saying which, or why. With this
+/// installed and `--nocapture` (which is how these are run), the warnings land
+/// in the same log as the assertion that fires.
+///
+/// `try_init` rather than `init`: the subscriber is global and these tests
+/// share a binary, so the second caller must find it already there rather than
+/// panic. `RUST_LOG` still overrides the default if a run wants more detail.
+fn install_tracing() {
+    use tracing_subscriber::EnvFilter;
+
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn")),
+        )
+        .with_test_writer()
+        .try_init();
+}
+
+/// Render an index run's three outcome counters for an assertion message.
+///
+/// A bare `assert_eq!(outcome.indexed, files)` says a file is unaccounted for
+/// but not which bucket it fell into — skipped (classified out) and failed
+/// (read or write error) have completely different causes, and the failure
+/// message is all a CI log has to go on.
+fn outcome_counters(outcome: &alexandria_core::catalog::commands::index::IndexOutcome) -> String {
+    format!(
+        "scanned {}, indexed {}, skipped {}, failed {} \
+         (a `failed` count is explained by the per-file warnings above)",
+        outcome.scanned, outcome.indexed, outcome.skipped, outcome.failed
+    )
+}
+
 /// Write `count` text files of `bytes` each, spread over subdirectories so the
 /// walk has a tree to descend rather than one flat directory — a flat
 /// directory of 10k entries has different filesystem characteristics than a
@@ -380,6 +417,7 @@ async fn build(
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "measures machine throughput; run explicitly with --ignored --nocapture"]
 async fn given_a_generated_library_when_indexed_then_throughput_is_measured() {
+    install_tracing();
     let files = env_usize("ALEXANDRIA_BENCH_FILES", 2000);
     let bytes = env_usize("ALEXANDRIA_BENCH_FILE_BYTES", 4096);
     let concurrency = env_usize("ALEXANDRIA_BENCH_CONCURRENCY", 4) as u32;
@@ -398,8 +436,18 @@ async fn given_a_generated_library_when_indexed_then_throughput_is_measured() {
         .expect("index run");
     let elapsed = started.elapsed();
 
-    assert_eq!(outcome.indexed, files, "every fixture file is cataloged");
-    assert_eq!(outcome.failed, 0, "no file failed to index");
+    assert_eq!(
+        outcome.indexed,
+        files,
+        "every fixture file is cataloged: {}",
+        outcome_counters(&outcome)
+    );
+    assert_eq!(
+        outcome.failed,
+        0,
+        "no file failed to index: {}",
+        outcome_counters(&outcome)
+    );
 
     let per_second = files as f64 / elapsed.as_secs_f64();
     println!(
@@ -439,6 +487,7 @@ async fn given_a_generated_library_when_indexed_then_throughput_is_measured() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "measures machine latency; run explicitly with --ignored --nocapture"]
 async fn given_an_index_run_in_flight_when_reads_are_issued_then_they_are_not_blocked() {
+    install_tracing();
     let files = env_usize("ALEXANDRIA_BENCH_FILES", 2000);
     let bytes = env_usize("ALEXANDRIA_BENCH_FILE_BYTES", 4096);
     let concurrency = env_usize("ALEXANDRIA_BENCH_CONCURRENCY", 4) as u32;
@@ -475,7 +524,15 @@ async fn given_an_index_run_in_flight_when_reads_are_issued_then_they_are_not_bl
     }
 
     let outcome = index_task.await.expect("index task").expect("index run");
-    assert_eq!(outcome.indexed, files);
+    // Strict on purpose. Contention with the reader is the whole point of this
+    // test, so a file lost to it is a real defect, not tolerable noise — the
+    // message just has to say which bucket it landed in.
+    assert_eq!(
+        outcome.indexed,
+        files,
+        "every fixture file is cataloged despite concurrent reads: {}",
+        outcome_counters(&outcome)
+    );
 
     assert!(
         latencies.len() >= 10,

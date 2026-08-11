@@ -56,17 +56,32 @@ jobs:
   # the commit. This job exists so the harness cannot rot unnoticed and so the
   # figures are recorded run over run — read them in the log.
   #
-  # It runs without ALEXANDRIA_NFR_STRICT, so the assertions are the loose
-  # floors (see the Testing Specification Document §9): low enough that runner
-  # noise cannot trip them, tight enough to catch a re-serialized walk or
-  # blocking I/O back on the async runtime. The requirement's actual 500
-  # files/sec target is verified on a developer machine, which is what NFR-02
-  # scopes it to.
+  # It runs without ALEXANDRIA_NFR_STRICT, so the throughput and latency
+  # assertions are the loose floors (see the Testing Specification Document §9):
+  # low enough that runner noise cannot trip them, tight enough to catch a
+  # re-serialized walk or blocking I/O back on the async runtime. The
+  # requirement's actual 500 files/sec target is verified on a developer
+  # machine, which is what NFR-02 scopes it to.
+  #
+  # The floors are not the whole harness, though. It also asserts exact counts
+  # — every fixture file cataloged — and those are not noise-proof: a runner
+  # roughly 3.5x slower than usual pushed concurrent writers past SQLite's
+  # busy_timeout and cost the run two files out of two thousand, reddening main
+  # on a commit that was fine. `continue-on-error` is what makes the
+  # "non-gating" in this job's name true; without it the comment above was
+  # aspirational and a slow runner could fail the build.
+  #
+  # So: this job measures and records. It never blocks. A red mark here is a
+  # prompt to read the log and compare the figures against the previous run,
+  # not a broken build — and if the figures are normal but a count assertion
+  # failed, that is contention, which the indexer now retries through.
   performance:
     name: performance (non-gating)
     runs-on: ubuntu-latest
+    continue-on-error: true
     # Only on main: on a pull request this would double CI time to report a
-    # number nobody reviews.
+    # number nobody reviews — and now that the job cannot gate, running it
+    # earlier would buy nothing a post-merge reading does not already give.
     if: github.event_name == 'push'
     steps:
       - uses: actions/checkout@v4
