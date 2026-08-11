@@ -310,6 +310,16 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
             "filesystem.root is unset: indexing is unconstrained and will catalog any \
              absolute path a caller supplies; set filesystem.root to bound it"
         );
+    } else if let Err(err) = std::fs::canonicalize(settings.filesystem.root.trim()) {
+        // Not fatal: the server still starts and every other operation still
+        // works, exactly as `check_root_within_library` does at request time
+        // (FR-FC-26/AF-07). Logged here too so a broken bound is visible at
+        // startup rather than only on the first index attempt.
+        tracing::error!(
+            root = %settings.filesystem.root,
+            error = %err,
+            "configured filesystem.root cannot be resolved; indexing will be refused until it is fixed"
+        );
     }
     let index_handler = Arc::new(IndexHandler::new(
         auth.clone(),

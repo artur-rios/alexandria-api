@@ -83,10 +83,22 @@ pub struct IndexHandler<A, R, F, C, M, N, O, P, Q> {
     library_root: Option<String>,
 }
 
-/// The client-facing rejection message for FR-FC-26. Deliberately free of the
-/// configured root's absolute path: the caller does not need to be told where
-/// the library lives in order to learn that its request was out of bounds.
+/// The client-facing rejection message for FR-FC-26 when the *requested*
+/// root is genuinely outside the configured library root. Deliberately free
+/// of the configured root's absolute path: the caller does not need to be
+/// told where the library lives in order to learn that its request was out
+/// of bounds.
 const OUTSIDE_LIBRARY_ROOT: &str = "root path is outside the configured library root";
+
+/// The client-facing rejection message for FR-FC-26 when the *server's*
+/// `filesystem.root` configuration itself cannot be resolved. Deliberately
+/// distinct from [`OUTSIDE_LIBRARY_ROOT`]: that message implies the caller's
+/// request was wrong, which is misleading here — the caller's root may be
+/// perfectly fine, and it is the server's configuration that needs fixing.
+/// Still free of the configured root's absolute path — naming the failure
+/// mode is not the same as naming the path.
+const LIBRARY_ROOT_UNRESOLVABLE: &str =
+    "the server's configured library root could not be resolved; contact the operator";
 
 /// What one scanned entry resolved to. Returned by the per-entry future so
 /// the concurrent walk can tally outcomes without sharing a counter.
@@ -182,10 +194,11 @@ where
             Ok(path) => path,
             Err(err) => {
                 tracing::error!(
+                    root = %library_root,
                     error = %err,
                     "configured filesystem.root cannot be resolved; refusing to index until it is fixed"
                 );
-                return Err(DomainError::InvalidInput(OUTSIDE_LIBRARY_ROOT.into()));
+                return Err(DomainError::InvalidInput(LIBRARY_ROOT_UNRESOLVABLE.into()));
             }
         };
         // The requested root's existence was already checked above, so a
