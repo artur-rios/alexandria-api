@@ -405,28 +405,9 @@ impl ThumbnailCache for DiskThumbnailCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::Principal;
-    use crate::catalog::model::{File, FileState, FileType, NewFile, StateFilter, SubtypeMetadata};
-    use crate::config::AuthMode;
-    use chrono::{DateTime, Utc};
+    use crate::catalog::model::FileState;
+    use crate::playback::test_support::{a_file, FakeAuth, FakeRepo};
     use std::sync::{Arc, Mutex};
-
-    /// Auth fake: accepts any token. Mirrors `playback::comic_page`'s
-    /// `FakeAuth` — the real `AuthService` returns a `Principal`, not `()`.
-    #[derive(Clone)]
-    struct FakeAuth;
-
-    impl AuthService for FakeAuth {
-        async fn authenticate(&self, _token: &str) -> Result<Principal, DomainError> {
-            Ok(Principal {
-                user_id: "owner".to_string(),
-            })
-        }
-
-        fn mode(&self) -> AuthMode {
-            AuthMode::External
-        }
-    }
 
     /// Archive fake: pages deliberately supplied out of order, so the
     /// "page 1" assertion proves the handler sorts rather than taking
@@ -498,199 +479,20 @@ mod tests {
         }
     }
 
-    /// Catalog repo fake returning one canned file. Exactly one
-    /// `CatalogRepository` method is exercised (`find_by_uuid`); every other
-    /// is `unimplemented!()` so an accidental extra call fails loudly.
-    #[derive(Clone)]
-    struct FakeRepo {
-        file: Option<File>,
-    }
-
-    impl FakeRepo {
-        fn with_file(file: File) -> Self {
-            Self { file: Some(file) }
-        }
-    }
-
-    impl CatalogRepository for FakeRepo {
-        async fn find_by_path(&self, _path: &str) -> Result<Option<File>, DomainError> {
-            unimplemented!()
-        }
-
-        async fn find_by_uuid(&self, _uuid: Uuid) -> Result<Option<File>, DomainError> {
-            Ok(self.file.clone())
-        }
-
-        async fn insert_file(&self, _new_file: NewFile) -> Result<File, DomainError> {
-            unimplemented!()
-        }
-
-        async fn list_all(&self) -> Result<Vec<File>, DomainError> {
-            unimplemented!()
-        }
-
-        async fn refresh_hash(
-            &self,
-            _path: &str,
-            _content_hash: &str,
-            _indexed_at: DateTime<Utc>,
-        ) -> Result<(), DomainError> {
-            unimplemented!()
-        }
-
-        async fn mark_missing(
-            &self,
-            _path: &str,
-            _missing_at: DateTime<Utc>,
-        ) -> Result<(), DomainError> {
-            unimplemented!()
-        }
-
-        async fn update_metadata(
-            &self,
-            _uuid: Uuid,
-            _metadata: &SubtypeMetadata,
-        ) -> Result<(), DomainError> {
-            unimplemented!()
-        }
-
-        async fn list_filtered(
-            &self,
-            _file_type: Option<FileType>,
-            _state: StateFilter,
-            _collection_uuid: Option<Uuid>,
-        ) -> Result<Vec<File>, DomainError> {
-            unimplemented!()
-        }
-
-        async fn find_metadata_by_uuid(
-            &self,
-            _uuid: Uuid,
-        ) -> Result<Option<SubtypeMetadata>, DomainError> {
-            unimplemented!()
-        }
-
-        async fn set_image_dimensions(
-            &self,
-            _uuid: Uuid,
-            _width: i64,
-            _height: i64,
-        ) -> Result<(), DomainError> {
-            unimplemented!()
-        }
-
-        async fn find_image_dimensions(
-            &self,
-            _uuid: Uuid,
-        ) -> Result<Option<(i64, i64)>, DomainError> {
-            unimplemented!()
-        }
-
-        async fn set_document_page_count(
-            &self,
-            _uuid: Uuid,
-            _page_count: i64,
-        ) -> Result<(), DomainError> {
-            unimplemented!()
-        }
-
-        async fn find_document_page_count(&self, _uuid: Uuid) -> Result<Option<i64>, DomainError> {
-            unimplemented!()
-        }
-
-        async fn set_video_duration(
-            &self,
-            _uuid: Uuid,
-            _duration_seconds: f64,
-        ) -> Result<(), DomainError> {
-            unimplemented!()
-        }
-
-        async fn find_video_duration(&self, _uuid: Uuid) -> Result<Option<f64>, DomainError> {
-            unimplemented!()
-        }
-
-        async fn set_comic_page_count(
-            &self,
-            _uuid: Uuid,
-            _page_count: i64,
-        ) -> Result<(), DomainError> {
-            unimplemented!()
-        }
-
-        async fn find_comic_page_count(&self, _uuid: Uuid) -> Result<Option<i64>, DomainError> {
-            unimplemented!()
-        }
-
-        async fn rename_file(
-            &self,
-            _uuid: Uuid,
-            _new_name: &str,
-            _new_path: &str,
-        ) -> Result<File, DomainError> {
-            unimplemented!()
-        }
-
-        async fn soft_delete(
-            &self,
-            _uuid: Uuid,
-            _deleted_at: DateTime<Utc>,
-        ) -> Result<File, DomainError> {
-            unimplemented!()
-        }
-
-        async fn restore(&self, _uuid: Uuid) -> Result<File, DomainError> {
-            unimplemented!()
-        }
-
-        async fn purge(&self, _uuid: Uuid) -> Result<(), DomainError> {
-            unimplemented!()
-        }
-
-        async fn set_collection(
-            &self,
-            _uuid: Uuid,
-            _collection_uuid: Uuid,
-        ) -> Result<(), DomainError> {
-            unimplemented!()
-        }
-
-        async fn clear_collection(
-            &self,
-            _uuid: Uuid,
-            _collection_uuid: Uuid,
-        ) -> Result<(), DomainError> {
-            unimplemented!()
-        }
-    }
-
-    /// `content_hash` is `"abc"` on purpose: the cache-key assertions below
-    /// are written against it.
-    fn a_file(path: &str, file_type: FileType) -> File {
-        File {
-            uuid: Uuid::nil(),
-            path: path.to_string(),
-            name: path
-                .rsplit_once('/')
-                .map_or(path, |(_, name)| name)
-                .to_string(),
-            file_type,
-            content_hash: "abc".to_string(),
-            state: FileState::Active,
-            deleted_at: None,
-            indexed_at: Utc::now(),
-            missing_at: None,
-        }
-    }
-
     #[tokio::test]
     async fn given_video_when_thumbnailed_then_video_renderer_used_and_cached() {
-        // Arrange
-        let repo = FakeRepo::with_file(a_file("/lib/movie.mp4", FileType::Video));
+        // Arrange — `content_hash` is `"abc"` in the shared `a_file` helper
+        // on purpose: the cache-key assertions below are written against it.
+        let repo = FakeRepo::with_file(a_file(
+            "/lib/movie.mp4",
+            FileType::Video,
+            FileState::Active,
+            None,
+        ));
         let calls = Arc::new(Mutex::new(Vec::new()));
         let entries = Arc::new(Mutex::new(Vec::new()));
         let handler = ThumbnailHandler::new(
-            FakeAuth,
+            FakeAuth { good: "t" },
             repo,
             FakeArchive,
             FakeRenderer {
@@ -720,10 +522,15 @@ mod tests {
     #[tokio::test]
     async fn given_comic_when_thumbnailed_then_first_page_rendered() {
         // Arrange — pages sort to p1, p2; the thumbnail is page 1.
-        let repo = FakeRepo::with_file(a_file("/lib/issue.cbz", FileType::Comic));
+        let repo = FakeRepo::with_file(a_file(
+            "/lib/issue.cbz",
+            FileType::Comic,
+            FileState::Active,
+            None,
+        ));
         let calls = Arc::new(Mutex::new(Vec::new()));
         let handler = ThumbnailHandler::new(
-            FakeAuth,
+            FakeAuth { good: "t" },
             repo,
             FakeArchive,
             FakeRenderer {
@@ -760,9 +567,14 @@ mod tests {
         // Arrange — by the time `put` runs, the JPEG is rendered and
         // correct. A cache that cannot be written costs the next caller a
         // re-render; it must not cost this caller the response.
-        let repo = FakeRepo::with_file(a_file("/lib/movie.mp4", FileType::Video));
+        let repo = FakeRepo::with_file(a_file(
+            "/lib/movie.mp4",
+            FileType::Video,
+            FileState::Active,
+            None,
+        ));
         let handler = ThumbnailHandler::new(
-            FakeAuth,
+            FakeAuth { good: "t" },
             repo,
             FakeArchive,
             FakeRenderer {
@@ -786,9 +598,14 @@ mod tests {
         // instead reached the ZIP reader and failed as `Disk`, which the
         // HTTP surface renders as 500. The error table promises 400 on both
         // routes.
-        let repo = FakeRepo::with_file(a_file("/lib/issue.cbr", FileType::Comic));
+        let repo = FakeRepo::with_file(a_file(
+            "/lib/issue.cbr",
+            FileType::Comic,
+            FileState::Active,
+            None,
+        ));
         let handler = ThumbnailHandler::new(
-            FakeAuth,
+            FakeAuth { good: "t" },
             repo,
             FakeArchive,
             FakeRenderer {
@@ -813,10 +630,10 @@ mod tests {
         // future change to page ordering would silently make "the
         // thumbnail" and "page 1" different images.
         use crate::playback::comic_page::ComicPageHandler;
-        let file = a_file("/lib/issue.cbz", FileType::Comic);
+        let file = a_file("/lib/issue.cbz", FileType::Comic, FileState::Active, None);
         let calls = Arc::new(Mutex::new(Vec::new()));
         let thumbnails = ThumbnailHandler::new(
-            FakeAuth,
+            FakeAuth { good: "t" },
             FakeRepo::with_file(file.clone()),
             FakeArchive,
             FakeRenderer {
@@ -826,7 +643,11 @@ mod tests {
                 entries: Arc::new(Mutex::new(Vec::new())),
             },
         );
-        let pages = ComicPageHandler::new(FakeAuth, FakeRepo::with_file(file), FakeArchive);
+        let pages = ComicPageHandler::new(
+            FakeAuth { good: "t" },
+            FakeRepo::with_file(file),
+            FakeArchive,
+        );
 
         // Act
         thumbnails.thumbnail(Uuid::nil(), "t").await.expect("thumb");
@@ -847,7 +668,12 @@ mod tests {
     #[tokio::test]
     async fn given_cached_thumbnail_when_requested_then_renderer_not_called() {
         // Arrange — the cache already holds an entry for this content hash.
-        let repo = FakeRepo::with_file(a_file("/lib/movie.mp4", FileType::Video));
+        let repo = FakeRepo::with_file(a_file(
+            "/lib/movie.mp4",
+            FileType::Video,
+            FileState::Active,
+            None,
+        ));
         let calls = Arc::new(Mutex::new(Vec::new()));
         let cache = FakeCache {
             entries: Arc::new(Mutex::new(vec![(
@@ -856,7 +682,7 @@ mod tests {
             )])),
         };
         let handler = ThumbnailHandler::new(
-            FakeAuth,
+            FakeAuth { good: "t" },
             repo,
             FakeArchive,
             FakeRenderer {
@@ -877,9 +703,14 @@ mod tests {
     async fn given_unsupported_type_when_thumbnailed_then_invalid_input() {
         // Arrange — FR-MP-05 covers video, image, and comic only. A PDF
         // would need a rasterizer, which is out of scope.
-        let repo = FakeRepo::with_file(a_file("/lib/book.pdf", FileType::Document));
+        let repo = FakeRepo::with_file(a_file(
+            "/lib/book.pdf",
+            FileType::Document,
+            FileState::Active,
+            None,
+        ));
         let handler = ThumbnailHandler::new(
-            FakeAuth,
+            FakeAuth { good: "t" },
             repo,
             FakeArchive,
             FakeRenderer {
@@ -902,10 +733,15 @@ mod tests {
         // Arrange — SVG classifies as `FileType::Image`, but no raster
         // decoder can read it. It must be rejected before the renderer is
         // reached, so the caller sees "not supported" and not a decode error.
-        let repo = FakeRepo::with_file(a_file("/lib/logo.svg", FileType::Image));
+        let repo = FakeRepo::with_file(a_file(
+            "/lib/logo.svg",
+            FileType::Image,
+            FileState::Active,
+            None,
+        ));
         let calls = Arc::new(Mutex::new(Vec::new()));
         let handler = ThumbnailHandler::new(
-            FakeAuth,
+            FakeAuth { good: "t" },
             repo,
             FakeArchive,
             FakeRenderer {
