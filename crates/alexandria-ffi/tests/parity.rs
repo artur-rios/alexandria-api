@@ -9845,28 +9845,38 @@ fn header_string(response: &axum::response::Response, name: &str) -> String {
         .to_string()
 }
 
-/// Point the FFI leg's thumbnail cache at `cache_dir`. `alexandria_index_init`
-/// takes no `Settings` — it calls `load_settings()` — so the only way to
-/// override the default relative `"thumbnails"` is the environment, exactly as
-/// `setup_ffi_db` does for the auth mode. Must run before the init.
+/// Points the FFI leg's thumbnail cache at a `TempDir` for as long as this
+/// guard is alive, and clears the override on `Drop` — including when the
+/// holding test unwinds from a failed assertion, unlike a plain trailing
+/// call to a `clear_*` function, which a panic would skip. Skipping the
+/// clear left `ALEXANDRIA_PLAYBACK_THUMBNAIL_CACHE_DIR` naming a deleted
+/// temp directory once the `TempDir` dropped, silently inherited by the next
+/// test to call `alexandria_index_init` — turning one red test into several.
 ///
-/// The caller must pair this with [`clear_ffi_thumbnail_cache`] before its
-/// test returns, while it still holds `SERIAL` — otherwise the variable is
-/// left pointing at `cache_dir`, and once that `TempDir` is dropped it names
-/// a directory that no longer exists, which the next test to call
-/// `alexandria_index_init` would silently inherit.
-fn set_ffi_thumbnail_cache(cache_dir: &TempDir) {
-    std::env::set_var(
-        "ALEXANDRIA_PLAYBACK_THUMBNAIL_CACHE_DIR",
-        cache_dir.path().to_str().unwrap(),
-    );
+/// `alexandria_index_init` takes no `Settings` — it calls `load_settings()`
+/// — so the only way to override the default relative `"thumbnails"` is the
+/// environment, exactly as `setup_ffi_db` does for the auth mode.
+///
+/// Must be constructed and dropped while still holding `SERIAL`:
+/// `std::env::set_var`/`remove_var` are only sound in this multithreaded
+/// test process because every test in this file holds that mutex for its
+/// whole body.
+struct ThumbnailCacheGuard;
+
+impl ThumbnailCacheGuard {
+    fn new(cache_dir: &TempDir) -> Self {
+        std::env::set_var(
+            "ALEXANDRIA_PLAYBACK_THUMBNAIL_CACHE_DIR",
+            cache_dir.path().to_str().unwrap(),
+        );
+        Self
+    }
 }
 
-/// Undo [`set_ffi_thumbnail_cache`]. Must run before the `SERIAL` guard held
-/// by the calling test is dropped, so no later test can observe the stale
-/// override.
-fn clear_ffi_thumbnail_cache() {
-    std::env::remove_var("ALEXANDRIA_PLAYBACK_THUMBNAIL_CACHE_DIR");
+impl Drop for ThumbnailCacheGuard {
+    fn drop(&mut self) {
+        std::env::remove_var("ALEXANDRIA_PLAYBACK_THUMBNAIL_CACHE_DIR");
+    }
 }
 
 /// UC-38 parity - stream the same fixture over HTTP and resolve it over FFI,
@@ -10071,7 +10081,7 @@ async fn given_same_image_when_thumbnailed_then_bytes_identical_across_surfaces(
     let http_uuid = seed_file_at_path(&http_pool, "image", &http_file).await;
 
     let ffi_cache = tempdir().unwrap();
-    set_ffi_thumbnail_cache(&ffi_cache);
+    let _thumbnail_cache_guard = ThumbnailCacheGuard::new(&ffi_cache);
     let ffi_dir = tempdir().unwrap();
     let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
     let ffi_pool = migrate_database(&ffi_db).await.expect("ffi migrate");
@@ -10133,11 +10143,6 @@ async fn given_same_image_when_thumbnailed_then_bytes_identical_across_surfaces(
     // else — the default relative path would have written into the repository.
     assert_eq!(std::fs::read_dir(http_cache.path()).unwrap().count(), 1);
     assert_eq!(std::fs::read_dir(ffi_cache.path()).unwrap().count(), 1);
-
-    // Cleanup — still inside the `SERIAL` guard, before `ffi_cache` is
-    // dropped, so no later test can inherit an override pointing at a
-    // deleted directory.
-    clear_ffi_thumbnail_cache();
 }
 
 /// Playback error parity - every row of F-10's error table decides the same
@@ -10185,7 +10190,7 @@ async fn given_error_conditions_when_played_then_both_surfaces_agree() {
         .unwrap();
 
     let ffi_cache = tempdir().unwrap();
-    set_ffi_thumbnail_cache(&ffi_cache);
+    let _thumbnail_cache_guard = ThumbnailCacheGuard::new(&ffi_cache);
     let ffi_dir = tempdir().unwrap();
     let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
     let ffi_pool = migrate_database(&ffi_db).await.expect("ffi migrate");
@@ -10262,9 +10267,4 @@ async fn given_error_conditions_when_played_then_both_surfaces_agree() {
             alexandria_ffi::PLAYBACK_ERR_INVALID_INPUT,
         ]
     );
-
-    // Cleanup — still inside the `SERIAL` guard, before `ffi_cache` is
-    // dropped, so no later test can inherit an override pointing at a
-    // deleted directory.
-    clear_ffi_thumbnail_cache();
 }

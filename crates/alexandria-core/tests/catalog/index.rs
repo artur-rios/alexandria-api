@@ -1671,9 +1671,11 @@ async fn given_sibling_root_sharing_a_name_prefix_when_start_then_invalid_input(
 /// indexing exactly as unconstrained as it was before FR-FC-26 existed.
 #[tokio::test]
 async fn given_empty_configured_library_root_when_start_then_any_root_accepted() {
-    // Arrange
-    let anywhere = tempfile::tempdir().expect("tempdir");
-    let requested = anywhere.path().to_str().expect("utf-8").to_string();
+    // Arrange — a path that does not exist on the test host. If the
+    // empty-root early return were ever deleted, `check_root_within_library`
+    // would try to canonicalize this and fail, so this test would catch that
+    // removal instead of passing incidentally on a real tempdir.
+    let requested = "/library".to_string();
     let handler = handler(
         FakeAuth::Allowing,
         FakeCatalogRepository::new(),

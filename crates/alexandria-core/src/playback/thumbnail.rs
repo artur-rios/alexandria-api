@@ -662,7 +662,7 @@ mod tests {
         thumbnails.thumbnail(Uuid::nil(), "t").await.expect("thumb");
         let page_one = pages.read_page(Uuid::nil(), 1, "t").await.expect("page 1");
 
-        // Assert — `FakeArchive::read_entry` echoes the entry name, and
+        // Assert — `FakeArchive::read_page` echoes the entry name, and
         // `FakeRenderer` logs the bytes it was handed, so both sides name
         // the entry each route chose.
         assert_eq!(
