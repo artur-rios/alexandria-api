@@ -9849,11 +9849,24 @@ fn header_string(response: &axum::response::Response, name: &str) -> String {
 /// takes no `Settings` — it calls `load_settings()` — so the only way to
 /// override the default relative `"thumbnails"` is the environment, exactly as
 /// `setup_ffi_db` does for the auth mode. Must run before the init.
+///
+/// The caller must pair this with [`clear_ffi_thumbnail_cache`] before its
+/// test returns, while it still holds `SERIAL` — otherwise the variable is
+/// left pointing at `cache_dir`, and once that `TempDir` is dropped it names
+/// a directory that no longer exists, which the next test to call
+/// `alexandria_index_init` would silently inherit.
 fn set_ffi_thumbnail_cache(cache_dir: &TempDir) {
     std::env::set_var(
         "ALEXANDRIA_PLAYBACK_THUMBNAIL_CACHE_DIR",
         cache_dir.path().to_str().unwrap(),
     );
+}
+
+/// Undo [`set_ffi_thumbnail_cache`]. Must run before the `SERIAL` guard held
+/// by the calling test is dropped, so no later test can observe the stale
+/// override.
+fn clear_ffi_thumbnail_cache() {
+    std::env::remove_var("ALEXANDRIA_PLAYBACK_THUMBNAIL_CACHE_DIR");
 }
 
 /// UC-38 parity - stream the same fixture over HTTP and resolve it over FFI,
@@ -10120,6 +10133,11 @@ async fn given_same_image_when_thumbnailed_then_bytes_identical_across_surfaces(
     // else — the default relative path would have written into the repository.
     assert_eq!(std::fs::read_dir(http_cache.path()).unwrap().count(), 1);
     assert_eq!(std::fs::read_dir(ffi_cache.path()).unwrap().count(), 1);
+
+    // Cleanup — still inside the `SERIAL` guard, before `ffi_cache` is
+    // dropped, so no later test can inherit an override pointing at a
+    // deleted directory.
+    clear_ffi_thumbnail_cache();
 }
 
 /// Playback error parity - every row of F-10's error table decides the same
@@ -10244,4 +10262,9 @@ async fn given_error_conditions_when_played_then_both_surfaces_agree() {
             alexandria_ffi::PLAYBACK_ERR_INVALID_INPUT,
         ]
     );
+
+    // Cleanup — still inside the `SERIAL` guard, before `ffi_cache` is
+    // dropped, so no later test can inherit an override pointing at a
+    // deleted directory.
+    clear_ffi_thumbnail_cache();
 }
