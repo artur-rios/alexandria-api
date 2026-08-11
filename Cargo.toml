@@ -30,9 +30,14 @@ ffmpeg-next = "9"
 # transitive weight — only a direct, declared use of it.
 futures-util = { version = "0.3", default-features = false, features = ["std", "async-await"] }
 # UC-40 thumbnails decode and re-encode stills, so this is no longer dev-only.
-# `webp` joins `jpeg`/`png` because those three are what the still formats the
-# catalog indexes actually are.
-image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+# The feature list mirrors `catalog::classify`'s `FileType::Image` extension
+# table exactly, so every still the indexer admits has a decoder: jpg/jpeg,
+# png, webp, gif, bmp, and tif/tiff. All six are pure-Rust decoders shipped by
+# the `image` crate itself — no new system dependency. The one extension
+# `classify` maps to `Image` that is deliberately *not* here is `.svg`: it is
+# vector, `image` is a raster crate, and rasterizing it would mean a new
+# dependency. `ThumbnailHandler` rejects SVG explicitly instead.
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif", "bmp", "tiff"] }
 jsonwebtoken = "9"
 kamadak-exif = "0.5"
 lofty = "0.22"

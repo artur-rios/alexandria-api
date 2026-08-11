@@ -103,6 +103,18 @@ where
                     .await?
             }
             FileType::Image => {
+                // SVG is the one extension `classify_by_extension` maps to
+                // `FileType::Image` that has no raster decoder and never
+                // will: `image` decodes rasters, and rasterizing vector
+                // artwork would mean a new dependency. Reject it in the
+                // same shape as an unsupported *type*, so the caller gets
+                // "not supported" rather than a decoder error it cannot
+                // act on.
+                if file.path.to_ascii_lowercase().ends_with(".svg") {
+                    return Err(DomainError::InvalidInput(format!(
+                        "file {uuid} is an SVG; SVG thumbnails are not supported"
+                    )));
+                }
                 let raw = tokio::fs::read(&file.path)
                     .await
                     .map_err(|e| DomainError::disk(format!("cannot read {}: {e}", file.path)))?;
@@ -765,6 +777,33 @@ mod tests {
 
         // Assert
         assert!(matches!(result, Err(DomainError::InvalidInput(_))));
+    }
+
+    #[tokio::test]
+    async fn given_svg_image_when_thumbnailed_then_invalid_input_and_no_render() {
+        // Arrange — SVG classifies as `FileType::Image`, but no raster
+        // decoder can read it. It must be rejected before the renderer is
+        // reached, so the caller sees "not supported" and not a decode error.
+        let repo = FakeRepo::with_file(a_file("/lib/logo.svg", FileType::Image));
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let handler = ThumbnailHandler::new(
+            FakeAuth,
+            repo,
+            FakeArchive,
+            FakeRenderer {
+                calls: Arc::clone(&calls),
+            },
+            FakeCache {
+                entries: Arc::new(Mutex::new(Vec::new())),
+            },
+        );
+
+        // Act
+        let result = handler.thumbnail(Uuid::nil(), "t").await;
+
+        // Assert
+        assert!(matches!(result, Err(DomainError::InvalidInput(_))));
+        assert!(calls.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

@@ -130,6 +130,99 @@ async fn given_thumbnail_requested_twice_then_second_call_is_cached() {
     assert_eq!(cached_files_after_first, 1);
 }
 
+/// Index a single-file library and return the one file's UUID. Every format
+/// case below is the same three steps — write, index, wait — differing only
+/// in the file written, so they share this.
+async fn index_one(
+    lib: &tempfile::TempDir,
+    cache_dir: &std::path::Path,
+) -> (common::TestApp, axum::Router, String) {
+    let test = test_app_with_settings(settings_with_cache_dir(cache_dir)).await;
+    let router = app(Settings::default(), test.services.clone());
+
+    router
+        .clone()
+        .oneshot(index_request(lib.path().to_str().unwrap()))
+        .await
+        .expect("index");
+    wait_for_files(&test.pool, 1).await;
+    let rows = file_rows_with_uuid(&test.pool).await;
+    let uuid = rows[0].0.clone();
+
+    (test, router, uuid)
+}
+
+/// Every raster extension `classify_by_extension` maps to `FileType::Image`
+/// must actually thumbnail — the `image` crate's feature list and that
+/// extension table have to agree, or indexing a `.gif` produces a catalog
+/// entry whose thumbnail route answers 400 (FR-MP-05).
+///
+/// One test per format rather than a loop, so a missing decoder names the
+/// format it is missing.
+async fn assert_format_thumbnails(name: &str) {
+    // Arrange — a 1000x500 source; the thumbnail must fit 320 and keep 2:1.
+    let lib = tempdir().unwrap();
+    common::write_image(&lib, name, 1000, 500);
+    let cache_dir = tempdir().unwrap();
+    let (_test, router, uuid) = index_one(&lib, cache_dir.path()).await;
+
+    // Act
+    let response = router
+        .oneshot(thumbnail_request(&uuid))
+        .await
+        .expect("one-shot");
+
+    // Assert
+    assert_eq!(response.status(), StatusCode::OK, "{name} must thumbnail");
+    assert_eq!(
+        response.headers().get("content-type").unwrap(),
+        "image/jpeg"
+    );
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let decoded = image::load_from_memory(&body).expect("valid jpeg");
+    assert_eq!((decoded.width(), decoded.height()), (320, 160));
+}
+
+#[tokio::test]
+async fn given_gif_image_when_thumbnailed_then_jpeg_within_max_dimension() {
+    assert_format_thumbnails("holiday.gif").await;
+}
+
+#[tokio::test]
+async fn given_bmp_image_when_thumbnailed_then_jpeg_within_max_dimension() {
+    assert_format_thumbnails("scan.bmp").await;
+}
+
+#[tokio::test]
+async fn given_tiff_image_when_thumbnailed_then_jpeg_within_max_dimension() {
+    assert_format_thumbnails("scan.tiff").await;
+}
+
+#[tokio::test]
+async fn given_svg_image_when_thumbnailed_then_bad_request() {
+    // Arrange — SVG classifies as `FileType::Image` but is vector, and
+    // `image` is a raster crate. Rasterizing would need a new dependency, so
+    // the route rejects it explicitly rather than letting the caller see a
+    // decode failure.
+    let lib = tempdir().unwrap();
+    common::write_file(
+        &lib,
+        "logo.svg",
+        br#"<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"></svg>"#,
+    );
+    let cache_dir = tempdir().unwrap();
+    let (_test, router, uuid) = index_one(&lib, cache_dir.path()).await;
+
+    // Act
+    let response = router
+        .oneshot(thumbnail_request(&uuid))
+        .await
+        .expect("one-shot");
+
+    // Assert
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
 #[tokio::test]
 async fn given_document_when_thumbnailed_then_bad_request() {
     // Arrange — FR-MP-05 covers video, image, and comic only.
