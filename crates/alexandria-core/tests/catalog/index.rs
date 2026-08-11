@@ -1692,3 +1692,33 @@ async fn given_empty_configured_library_root_when_start_then_any_root_accepted()
     // Assert
     assert_ne!(started.expect("start").run_id, Uuid::nil());
 }
+
+/// The fail-closed guarantee: a *configured* `filesystem.root` that cannot be
+/// canonicalized (e.g. a config typo naming a path that does not exist) must
+/// reject the request rather than silently falling back to unconstrained
+/// indexing. Without this test, replacing the fallible branch with a silent
+/// `Ok(())` would leave every other test in this file passing.
+#[tokio::test]
+async fn given_unresolvable_configured_library_root_when_start_then_invalid_input() {
+    // Arrange
+    let requested_dir = tempfile::tempdir().expect("tempdir");
+    let requested = requested_dir.path().to_str().expect("utf-8").to_string();
+    let handler = handler_with_library_root(
+        FakeAuth::Allowing,
+        FakeCatalogRepository::new(),
+        FakeFilesystem::builder().with_root(&requested).build(),
+        fixed_clock(now()),
+        FakeAudioMetadataReader::new(),
+        FakeImageMetadataReader::new(),
+        FakeDocumentMetadataReader::new(),
+        FakeVideoMetadataReader::new(),
+        FakeComicMetadataReader::new(),
+        "/nonexistent-library-root".to_string(),
+    );
+
+    // Act
+    let result = handler.start(IndexRequest { root: requested }, TOKEN).await;
+
+    // Assert
+    assert!(matches!(result, Err(DomainError::InvalidInput(_))));
+}
