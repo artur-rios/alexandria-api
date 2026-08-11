@@ -7,15 +7,22 @@ use crate::reading_lists::repos::ReadingListRepository;
 
 /// Whether advancing a ReadingProgress from `from` to `to` is a valid
 /// transition (UC-29 / FR-RL-04). The ReadingProgress lifecycle (Use Case
-/// Specification Document §4.3) only defines two forward edges: `Pending` →
-/// `Reading` and `Reading` → `Read`. Anything else — going backward,
-/// skipping a state, or resubmitting the current state — is rejected
-/// (AF-01), so the state machine can only ever move forward one step.
-/// Mirrors `watchlists::commands::update_progress::is_valid_transition`.
+/// Specification Document §4.3) defines two forward edges: `Pending` →
+/// `Reading` and `Reading` → `Read`. Going backward or skipping a state is
+/// rejected (AF-01), so the state machine can only ever move forward one
+/// step.
+///
+/// `Reading` → `Reading` is the one self-edge, and it is what makes FR-RL-05
+/// work: a comic series advances issue by issue while its state stays
+/// `Reading`, and each of those is an update carrying a new `current_issue`.
+/// `Pending` → `Pending` and `Read` → `Read` stay rejected — neither carries
+/// progress. Mirrors
+/// `watchlists::commands::update_progress::is_valid_transition`.
 pub fn is_valid_transition(from: ReadingState, to: ReadingState) -> bool {
     matches!(
         (from, to),
         (ReadingState::Pending, ReadingState::Reading)
+            | (ReadingState::Reading, ReadingState::Reading)
             | (ReadingState::Reading, ReadingState::Read)
     )
 }

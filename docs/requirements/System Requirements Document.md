@@ -78,12 +78,12 @@ graph LR
 
 | ID | Requirement |
 | --- | --- |
-| FR-FC-01 | The system shall index audio files from a specified root path, creating a File record with path, name, type, and content hash, plus an AudioFile subtype record. Its metadata fields are owner-supplied via FR-FC-14; indexing does not read embedded tags. |
-| FR-FC-02 | The system shall index video files as VideoFiles. `mediaKind` (movie/series) is owner-supplied via FR-FC-15; indexing does not infer it. |
+| FR-FC-01 | The system shall index audio files from a specified root path, creating a File record with path, name, type, and content hash, plus an AudioFile subtype record. Its metadata fields are prefilled from the file's embedded tags at first index (FR-FC-25) and are editable by the owner via FR-FC-14. |
+| FR-FC-02 | The system shall index video files as VideoFiles. Title, year, resolution and duration are prefilled from the container at first index (FR-FC-25), but `mediaKind` (movie/series) is owner-supplied via FR-FC-15: nothing in a video file distinguishes a movie from an episode, so indexing does not infer it. |
 | FR-FC-03 | The system shall index saved HTML pages. |
 | FR-FC-04 | The system shall index Markdown and plain-text files as TextFiles. |
-| FR-FC-05 | The system shall index PDF and e-book files as Documents. `formatKind` (book/ebook) is owner-supplied via FR-FC-16; indexing does not infer it. |
-| FR-FC-06 | The system shall index comic-book files (CBR/CBZ) as ComicBooks. Series and issue metadata are owner-supplied via FR-FC-17. A `.pdf` indexes as a Document (FR-FC-05): file extension alone cannot distinguish a comic PDF from a book PDF. |
+| FR-FC-05 | The system shall index PDF and e-book files as Documents. Title, author and page count are prefilled from the file's own metadata at first index, and `formatKind` is set from the format itself — `book` for PDF, `ebook` for EPUB (FR-FC-25). Both remain editable by the owner via FR-FC-16. |
+| FR-FC-06 | The system shall index comic-book files (CBR/CBZ) as ComicBooks. Title, series and issue metadata are prefilled from the archive's `ComicInfo.xml` when it has one (FR-FC-25) and are editable by the owner via FR-FC-17. A `.pdf` indexes as a Document (FR-FC-05): file extension alone cannot distinguish a comic PDF from a book PDF. |
 | FR-FC-07 | The system shall index image files. |
 | FR-FC-08 | The system shall run indexing asynchronously and shall not block read/query operations while indexing is in progress. Filesystem work (directory walks, hashing, metadata parsing) shall run off the async runtime's worker threads, and the index and re-index walks shall process a bounded number of files concurrently (`indexing.concurrency`, default 4) rather than one at a time. |
 | FR-FC-09 | The system shall compute a SHA-256 content hash for each indexed file and store it on the File record. |
@@ -235,7 +235,7 @@ erDiagram
 | deletedAt | timestamp | nullable | Set when soft-deleted; drives the retention window. |
 | indexedAt | timestamp | required | Last index/re-index time. |
 | missingAt | timestamp | nullable | Set by re-index when the on-disk file is gone (FR-FC-11); cleared when it returns. Orthogonal to `state`: a file may be `active` and missing. |
-| collectionId | integer | nullable, FK → Collection | Containing collection, if any. Not exposed in API responses until Collections ship. |
+| collectionId | integer | nullable, FK → Collection | Containing collection, if any. Internal only: it is never exposed on the `File` payload, because it is an internal key and its public counterpart is reachable the other way round — `GET /v1/collections/{uuid}/items` (FR-CO-07) lists a collection's members, and `GET /v1/files?collectionUuid=…` (FR-FC-12) filters by it. |
 
 Type-specific subtype tables (AudioFile, VideoFile, HtmlPage, TextFile, Document,
 ComicBook, Image) share the File's `id` as a foreign key and carry only their
@@ -433,6 +433,19 @@ reasons §7 gives: login is how a caller obtains credentials, and first-time
 credential setup has none yet (UC-35 enforces its own conditional
 authorization once credentials exist).
 
+### 5.9 Media Playback
+
+| Method | Path | Description | Requirement |
+| --- | --- | --- | --- |
+| GET | /v1/files/{uuid}/stream | Stream an `active` File's bytes from disk, honouring `Range`. | FR-MP-01, FR-MP-02, FR-MP-03 |
+| GET | /v1/files/{uuid}/pages/{page} | Return one page of a CBZ ComicBook, 1-based. | FR-MP-04 |
+| GET | /v1/files/{uuid}/thumbnail | Return a downscaled JPEG thumbnail (video, image, comic). | FR-MP-05 |
+
+`/stream` is deliberately not `/content`: that path is UC-32's text-content
+read and UC-33's editor, which exchange a JSON document rather than a seekable
+byte stream. Over FFI the same three operations exist, except that FR-MP-01
+returns a playback descriptor instead of bytes (FR-MP-06).
+
 ---
 
 ## 6. Non-Functional Requirements
@@ -512,8 +525,12 @@ Cascade notes:
 
 ### 9.1 Feature → Requirements
 
+The feature identifiers are the milestones the
+[README](../../README.md#project-status) tracks, in the same order.
+
 | Feature | Requirements |
 | --- | --- |
+| F-00 Foundation and operations | IR-01 through IR-06 (Operations & Infrastructure Document §2) |
 | F-01 File indexing | FR-FC-01 through FR-FC-11, FR-FC-25, FR-FC-26 |
 | F-02 Catalog browsing and metadata editing | FR-FC-12 through FR-FC-18 |
 | F-03 Renaming and lifecycle management | FR-FC-19 through FR-FC-23 |
@@ -523,7 +540,11 @@ Cascade notes:
 | F-07 Watchlists | FR-WL-01 through FR-WL-08 |
 | F-08 Reading lists | FR-RL-01 through FR-RL-08 |
 | F-09 Pluggable authentication | FR-AU-01 through FR-AU-09 |
-| F-10 Dual-transport parity | FR-FC-24, FR-AU-08, NFR-09 |
+| F-10 Media playback | FR-MP-01 through FR-MP-06 |
+
+Dual-transport parity (FR-FC-24, FR-AU-08, FR-MP-06, NFR-09) is not a
+milestone of its own: it is a constraint every feature above satisfies as it
+ships, which is why each one lands on both surfaces at once.
 
 ### 9.2 Business Rule → Requirements
 

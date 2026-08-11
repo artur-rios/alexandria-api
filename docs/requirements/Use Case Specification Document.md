@@ -738,14 +738,17 @@ The `runId` returned in step 2 is opaque: completion is reported to the log only
 
 1. The owner submits a new state for a video on a watchlist.
 2. The system validates the transition (`Pending` → `Watching` → `Watched`).
-3. For a series, the system records the current episode.
+   Submitting `Watching` while already `Watching` is valid and is how a series
+   advances: the state does not move, the episode does.
+3. For a series, the system records the current episode. The episode fields
+   are a **full replace**, not a merge — omitting them clears them.
 4. The system updates the WatchProgress and returns it.
 
 **Alternative Flows**
 
 | ID | Condition | Outcome |
 | --- | --- | --- |
-| AF-01 | The requested transition is invalid (e.g. `Watched` → `Pending`) | The system rejects with an invalid-transition error. |
+| AF-01 | The requested transition is invalid — backward (`Watched` → `Pending`), skipping a state (`Pending` → `Watched`), or resubmitting a state that carries no progress (`Pending` → `Pending`, `Watched` → `Watched`) | The system rejects with an invalid-transition error. |
 | AF-02 | The WatchProgress does not exist (video not on the list) | The system responds with a not-found error. |
 | AF-03 | The caller is not authenticated | The system denies with an unauthorized error. |
 
@@ -902,14 +905,17 @@ The `runId` returned in step 2 is opaque: completion is reported to the log only
 
 1. The owner submits a new state for an item on a reading list.
 2. The system validates the transition (`Pending` → `Reading` → `Read`).
-3. For a comic series, the system records the current issue.
+   Submitting `Reading` while already `Reading` is valid and is how a comic
+   series advances: the state does not move, the issue does.
+3. For a comic series, the system records the current issue. The issue fields
+   are a **full replace**, not a merge — omitting them clears them.
 4. The system updates the ReadingProgress and returns it.
 
 **Alternative Flows**
 
 | ID | Condition | Outcome |
 | --- | --- | --- |
-| AF-01 | The requested transition is invalid | The system rejects with an invalid-transition error. |
+| AF-01 | The requested transition is invalid — backward (`Read` → `Pending`), skipping a state (`Pending` → `Read`), or resubmitting a state that carries no progress (`Pending` → `Pending`, `Read` → `Read`) | The system rejects with an invalid-transition error. |
 | AF-02 | The ReadingProgress does not exist | The system responds with a not-found error. |
 | AF-03 | The caller is not authenticated | The system denies with an unauthorized error. |
 
@@ -1293,6 +1299,7 @@ stateDiagram-v2
 stateDiagram-v2
     [*] --> Pending : video added to watchlist
     Pending --> Watching : update
+    Watching --> Watching : next episode (FR-WL-05)
     Watching --> Watched : update
     Watched --> [*] : video removed / watchlist deleted
     Pending --> [*] : video removed / watchlist deleted
@@ -1304,6 +1311,7 @@ stateDiagram-v2
 stateDiagram-v2
     [*] --> Pending : item added to reading list
     Pending --> Reading : update
+    Reading --> Reading : next issue (FR-RL-05)
     Reading --> Read : update
     Read --> [*] : item removed / reading list deleted
     Pending --> [*] : item removed / reading list deleted

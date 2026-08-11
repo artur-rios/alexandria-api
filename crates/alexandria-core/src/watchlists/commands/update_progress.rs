@@ -7,14 +7,25 @@ use crate::watchlists::repos::WatchlistRepository;
 
 /// Whether advancing a WatchProgress from `from` to `to` is a valid
 /// transition (UC-23 / FR-WL-04). The WatchProgress lifecycle (Use Case
-/// Specification Document §4.2) only defines two forward edges: `Pending` →
-/// `Watching` and `Watching` → `Watched`. Anything else — going backward,
-/// skipping a state, or resubmitting the current state — is rejected
-/// (AF-01), so the state machine can only ever move forward one step.
+/// Specification Document §4.2) defines two forward edges: `Pending` →
+/// `Watching` and `Watching` → `Watched`. Going backward or skipping a state
+/// is rejected (AF-01), so the state machine can only ever move forward one
+/// step.
+///
+/// `Watching` → `Watching` is the one self-edge, and it is what makes
+/// FR-WL-05 work. Per-episode tracking means an owner reports episode 3,
+/// then 4, then 5, all while still watching; every one of those is a state
+/// update carrying a new `current_episode`. Rejecting the self-edge would
+/// cap a series at exactly two episode writes for its whole life — the one
+/// entering `Watching` and the one leaving it — which is not tracking. The
+/// other two self-edges stay rejected because neither carries progress:
+/// `Pending` means nothing has been watched yet, and `Watched` is terminal.
 pub fn is_valid_transition(from: WatchState, to: WatchState) -> bool {
     matches!(
         (from, to),
-        (WatchState::Pending, WatchState::Watching) | (WatchState::Watching, WatchState::Watched)
+        (WatchState::Pending, WatchState::Watching)
+            | (WatchState::Watching, WatchState::Watching)
+            | (WatchState::Watching, WatchState::Watched)
     )
 }
 

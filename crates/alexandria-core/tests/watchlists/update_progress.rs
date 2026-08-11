@@ -63,6 +63,18 @@ fn given_forward_transitions_when_checked_then_valid() {
     ));
 }
 
+/// FR-WL-05: an owner watching a series reports episode after episode while
+/// the state stays `Watching`. That is a `Watching` → `Watching` update, so
+/// the self-edge has to be legal or per-episode tracking caps out at the two
+/// writes that enter and leave the state.
+#[test]
+fn given_still_watching_when_checked_then_valid() {
+    assert!(is_valid_transition(
+        WatchState::Watching,
+        WatchState::Watching
+    ));
+}
+
 #[test]
 fn given_backward_same_or_skipped_transitions_when_checked_then_invalid() {
     assert!(!is_valid_transition(
@@ -81,13 +93,12 @@ fn given_backward_same_or_skipped_transitions_when_checked_then_invalid() {
         WatchState::Pending,
         WatchState::Watched
     ));
+    // The two self-edges that carry no progress. `Watching` → `Watching` is
+    // deliberately absent — it is the per-episode edge FR-WL-05 needs, and
+    // `given_still_watching_when_checked_then_valid` covers it.
     assert!(!is_valid_transition(
         WatchState::Pending,
         WatchState::Pending
-    ));
-    assert!(!is_valid_transition(
-        WatchState::Watching,
-        WatchState::Watching
     ));
     assert!(!is_valid_transition(
         WatchState::Watched,
@@ -174,6 +185,50 @@ async fn given_series_episode_when_updated_then_episode_recorded() {
     assert_eq!(result.total_episodes, Some(12));
 }
 
+/// FR-WL-05 end to end: a 12-episode series is watched episode by episode.
+/// Every step after the first is a `Watching` → `Watching` update — the shape
+/// per-episode tracking actually takes — and each one must be accepted and
+/// must record its own episode.
+#[tokio::test]
+async fn given_series_watched_episode_by_episode_then_each_episode_recorded() {
+    let watchlist_repo = FakeWatchlistRepository::new();
+    let catalog_repo = FakeCatalogRepository::new();
+    let (watchlist_uuid, video_uuid) = seeded_pending(&watchlist_repo, catalog_repo).await;
+    let h = handler(FakeAuth::Allowing, watchlist_repo);
+
+    for episode in 1..=11 {
+        let result = h
+            .update(
+                watchlist_uuid,
+                video_uuid,
+                WatchState::Watching,
+                Some(episode),
+                Some(12),
+                TOKEN,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("episode {episode} rejected: {e}"));
+        assert_eq!(result.current_episode, Some(episode));
+        assert_eq!(result.state, WatchState::Watching);
+    }
+
+    // The last episode finishes the series, which is the forward edge.
+    let result = h
+        .update(
+            watchlist_uuid,
+            video_uuid,
+            WatchState::Watched,
+            Some(12),
+            Some(12),
+            TOKEN,
+        )
+        .await
+        .expect("finish the series");
+
+    assert_eq!(result.state, WatchState::Watched);
+    assert_eq!(result.current_episode, Some(12));
+}
+
 #[tokio::test]
 async fn given_episode_fields_omitted_when_updated_then_cleared_not_left_untouched() {
     let watchlist_repo = FakeWatchlistRepository::new();
@@ -231,7 +286,7 @@ async fn given_backward_transition_when_updated_then_invalid_state() {
 }
 
 #[tokio::test]
-async fn given_resubmitted_same_state_when_updated_then_invalid_state() {
+async fn given_resubmitted_pending_when_updated_then_invalid_state() {
     let watchlist_repo = FakeWatchlistRepository::new();
     let catalog_repo = FakeCatalogRepository::new();
     let (watchlist_uuid, video_uuid) = seeded_pending(&watchlist_repo, catalog_repo).await;

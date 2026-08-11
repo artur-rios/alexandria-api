@@ -85,15 +85,25 @@ fn given_backward_same_or_skipped_transitions_when_checked_then_invalid() {
         ReadingState::Pending,
         ReadingState::Read
     ));
+    // The two self-edges that carry no progress. `Reading` → `Reading` is
+    // deliberately absent — it is the per-issue edge FR-RL-05 needs, and
+    // `given_still_reading_when_checked_then_valid` covers it.
     assert!(!is_valid_transition(
         ReadingState::Pending,
         ReadingState::Pending
     ));
-    assert!(!is_valid_transition(
+    assert!(!is_valid_transition(ReadingState::Read, ReadingState::Read));
+}
+
+/// FR-RL-05: a comic series advances issue by issue while the state stays
+/// `Reading`, so the self-edge has to be legal or per-issue tracking caps out
+/// at the two writes that enter and leave the state.
+#[test]
+fn given_still_reading_when_checked_then_valid() {
+    assert!(is_valid_transition(
         ReadingState::Reading,
         ReadingState::Reading
     ));
-    assert!(!is_valid_transition(ReadingState::Read, ReadingState::Read));
 }
 
 // ---------------- Main flow ----------------
@@ -175,6 +185,50 @@ async fn given_comic_issue_when_updated_then_issue_recorded() {
     assert_eq!(result.total_issues, Some(12));
 }
 
+/// FR-RL-05 end to end: a 12-issue comic series is read issue by issue.
+/// Every step after the first is a `Reading` → `Reading` update — the shape
+/// per-issue tracking actually takes — and each one must be accepted and must
+/// record its own issue.
+#[tokio::test]
+async fn given_comic_series_read_issue_by_issue_then_each_issue_recorded() {
+    let reading_list_repo = FakeReadingListRepository::new();
+    let catalog_repo = FakeCatalogRepository::new();
+    let (reading_list_uuid, item_uuid) = seeded_pending(&reading_list_repo, catalog_repo).await;
+    let h = handler(FakeAuth::Allowing, reading_list_repo);
+
+    for issue in 1..=11 {
+        let result = h
+            .update(
+                reading_list_uuid,
+                item_uuid,
+                ReadingState::Reading,
+                Some(issue),
+                Some(12),
+                TOKEN,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("issue {issue} rejected: {e}"));
+        assert_eq!(result.current_issue, Some(issue));
+        assert_eq!(result.state, ReadingState::Reading);
+    }
+
+    // The last issue finishes the series, which is the forward edge.
+    let result = h
+        .update(
+            reading_list_uuid,
+            item_uuid,
+            ReadingState::Read,
+            Some(12),
+            Some(12),
+            TOKEN,
+        )
+        .await
+        .expect("finish the series");
+
+    assert_eq!(result.state, ReadingState::Read);
+    assert_eq!(result.current_issue, Some(12));
+}
+
 #[tokio::test]
 async fn given_issue_fields_omitted_when_updated_then_cleared_not_left_untouched() {
     let reading_list_repo = FakeReadingListRepository::new();
@@ -232,7 +286,7 @@ async fn given_backward_transition_when_updated_then_invalid_state() {
 }
 
 #[tokio::test]
-async fn given_resubmitted_same_state_when_updated_then_invalid_state() {
+async fn given_resubmitted_pending_when_updated_then_invalid_state() {
     let reading_list_repo = FakeReadingListRepository::new();
     let catalog_repo = FakeCatalogRepository::new();
     let (reading_list_uuid, item_uuid) = seeded_pending(&reading_list_repo, catalog_repo).await;

@@ -9,6 +9,7 @@ use crate::catalog::fs::Filesystem;
 use crate::catalog::model::File;
 use crate::catalog::repos::CatalogRepository;
 use crate::errors::DomainError;
+use crate::retry::{retry_on_busy, BUSY_ATTEMPTS};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct RefreshStarted {
@@ -158,6 +159,15 @@ where
 
     /// Refresh one cataloged path. `Err` means this one file failed — the
     /// caller counts it and moves on to the rest of the catalog.
+    ///
+    /// Both writes are wrapped in [`retry_on_busy`], for exactly the reason
+    /// UC-01's `insert_file` is: this walk runs `concurrency` writers against
+    /// SQLite's single writer while a client reads throughout, and a writer
+    /// that waits out its whole `busy_timeout` is answered `SQLITE_BUSY`. Left
+    /// unretried, that transient contention becomes a `failed` count — a
+    /// re-index silently leaving a stale hash or an unmarked missing file
+    /// behind, which is worse here than at first index, since nothing else
+    /// will revisit that row until the next run.
     async fn refresh_one(
         &self,
         file: &File,
@@ -166,13 +176,16 @@ where
         if self.fs.path_exists(&file.path).await {
             let new_hash = self.fs.content_hash(&file.path).await?;
             if new_hash != file.content_hash || file.missing_at.is_some() {
-                self.repo.refresh_hash(&file.path, &new_hash, now).await?;
+                retry_on_busy(BUSY_ATTEMPTS, || {
+                    self.repo.refresh_hash(&file.path, &new_hash, now)
+                })
+                .await?;
                 Ok(PathOutcome::Refreshed)
             } else {
                 Ok(PathOutcome::Unchanged)
             }
         } else if file.missing_at.is_none() {
-            self.repo.mark_missing(&file.path, now).await?;
+            retry_on_busy(BUSY_ATTEMPTS, || self.repo.mark_missing(&file.path, now)).await?;
             Ok(PathOutcome::MarkedMissing)
         } else {
             // Already marked missing and still gone — leave as-is.
