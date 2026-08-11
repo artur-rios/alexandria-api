@@ -123,15 +123,17 @@ where
                     .await?
             }
             FileType::Comic => {
-                let mut names = self.archive.page_names(&file.path).await?;
-                // Same case-insensitive sort `ComicPageHandler` uses, for
-                // the same reason: archive-storage order is not page order,
-                // and the thumbnail is page 1.
-                names.sort_by_key(|name| name.to_ascii_lowercase());
-                let first = names.first().ok_or_else(|| {
-                    DomainError::InvalidInput(format!("comic {uuid} has no pages"))
-                })?;
-                let raw = self.archive.read_entry(&file.path, first).await?;
+                // Page 1 via UC-39's own selection, not a second copy of it:
+                // the CBZ guard, the case-insensitive sort and the range
+                // check are all `select_page`'s. A comic's thumbnail is
+                // therefore the same image `GET /pages/1` returns, by
+                // construction, and a `.cbr` is rejected here with the same
+                // `InvalidInput` the page route gives instead of failing
+                // inside the ZIP reader as a `Disk` error.
+                let (first, _) =
+                    crate::playback::comic_page::select_page(&self.archive, uuid, &file.path, 1)
+                        .await?;
+                let raw = self.archive.read_entry(&file.path, &first).await?;
                 self.renderer
                     .from_image_bytes(&raw, THUMBNAIL_MAX_DIM)
                     .await?
@@ -724,6 +726,71 @@ mod tests {
 
         // Assert
         assert_eq!(*calls.lock().unwrap(), vec!["image:p1.jpg".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn given_cbr_comic_when_thumbnailed_then_invalid_input() {
+        // Arrange — CBR has no viable pure-Rust reader. The page route has
+        // always said so; before the selection was shared, the thumbnail
+        // instead reached the ZIP reader and failed as `Disk`, which the
+        // HTTP surface renders as 500. The error table promises 400 on both
+        // routes.
+        let repo = FakeRepo::with_file(a_file("/lib/issue.cbr", FileType::Comic));
+        let handler = ThumbnailHandler::new(
+            FakeAuth,
+            repo,
+            FakeArchive,
+            FakeRenderer {
+                calls: Arc::new(Mutex::new(Vec::new())),
+            },
+            FakeCache {
+                entries: Arc::new(Mutex::new(Vec::new())),
+            },
+        );
+
+        // Act
+        let result = handler.thumbnail(Uuid::nil(), "t").await;
+
+        // Assert
+        assert!(matches!(result, Err(DomainError::InvalidInput(_))));
+    }
+
+    #[tokio::test]
+    async fn given_comic_when_thumbnailed_then_same_entry_as_page_one() {
+        // Arrange — one archive, two handlers. The thumbnail must be
+        // derived from exactly the entry the `pages/1` route serves, or a
+        // future change to page ordering would silently make "the
+        // thumbnail" and "page 1" different images.
+        use crate::playback::comic_page::ComicPageHandler;
+        let file = a_file("/lib/issue.cbz", FileType::Comic);
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let thumbnails = ThumbnailHandler::new(
+            FakeAuth,
+            FakeRepo::with_file(file.clone()),
+            FakeArchive,
+            FakeRenderer {
+                calls: Arc::clone(&calls),
+            },
+            FakeCache {
+                entries: Arc::new(Mutex::new(Vec::new())),
+            },
+        );
+        let pages = ComicPageHandler::new(FakeAuth, FakeRepo::with_file(file), FakeArchive);
+
+        // Act
+        thumbnails.thumbnail(Uuid::nil(), "t").await.expect("thumb");
+        let page_one = pages.read_page(Uuid::nil(), 1, "t").await.expect("page 1");
+
+        // Assert — `FakeArchive::read_entry` echoes the entry name, and
+        // `FakeRenderer` logs the bytes it was handed, so both sides name
+        // the entry each route chose.
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![format!(
+                "image:{}",
+                String::from_utf8_lossy(&page_one.bytes)
+            )]
+        );
     }
 
     #[tokio::test]

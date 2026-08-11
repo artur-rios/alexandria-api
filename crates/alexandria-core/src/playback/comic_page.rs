@@ -89,6 +89,57 @@ impl ComicArchive for ZipComicArchive {
     }
 }
 
+/// Which archive entry is page `page` (1-based) of the comic at `path`, and
+/// how many pages the comic has.
+///
+/// The single implementation of "what is page N of a comic", shared by
+/// UC-39's page route and UC-40's comic thumbnail — the design puts the
+/// thumbnail on the UC-39 path precisely so the two can never disagree. When
+/// this lived in both handlers, they had already drifted: only UC-39 guarded
+/// CBR, so a `.cbr` thumbnail reached `ZipComicArchive`, failed to open, and
+/// became a 500 where the error table promises a 400.
+///
+/// Three rules, in order:
+///
+/// 1. CBR is RAR: proprietary, no viable pure-Rust reader. The same
+///    graceful-degradation line `comic_tags.rs` already draws — except here
+///    the caller asked for something specific, so it is told the format is
+///    unsupported rather than silently getting nothing.
+/// 2. Archive-storage order is not page order — nothing obliges a writer to
+///    store entries in sequence. Sort case-insensitively by name, which is
+///    what comic readers conventionally do and what the zero-padded
+///    filenames CBZ archives use are designed for.
+/// 3. Pages are 1-based, so 0 and `count + 1` are both out of range. A comic
+///    with no page entries at all has every page out of range, including
+///    page 1.
+///
+/// Every rejection is `InvalidInput`: each describes the request or the
+/// file's format, never a fault in reading it.
+pub async fn select_page<C: ComicArchive>(
+    archive: &C,
+    uuid: Uuid,
+    path: &str,
+    page: u32,
+) -> Result<(String, u32), DomainError> {
+    if !path.to_ascii_lowercase().ends_with(".cbz") {
+        return Err(DomainError::InvalidInput(format!(
+            "comic {uuid} is not a CBZ archive; page extraction supports CBZ only"
+        )));
+    }
+
+    let mut names = archive.page_names(path).await?;
+    names.sort_by_key(|name| name.to_ascii_lowercase());
+
+    let page_count = names.len() as u32;
+    if page == 0 || page > page_count {
+        return Err(DomainError::InvalidInput(format!(
+            "page {page} is out of range; comic {uuid} has {page_count} pages"
+        )));
+    }
+
+    Ok((names.swap_remove((page - 1) as usize), page_count))
+}
+
 /// UC-39 — return page `page` (1-based) of a CBZ ComicBook.
 pub struct ComicPageHandler<A, R, C> {
     auth: A,
@@ -124,39 +175,14 @@ where
             )));
         }
 
-        // CBR is RAR: proprietary, no viable pure-Rust reader. The same
-        // graceful-degradation line `comic_tags.rs` already draws — except
-        // here the caller asked for something specific, so it is told the
-        // format is unsupported rather than silently getting nothing.
-        if !file.path.to_ascii_lowercase().ends_with(".cbz") {
-            return Err(DomainError::InvalidInput(format!(
-                "comic {uuid} is not a CBZ archive; page extraction supports CBZ only"
-            )));
-        }
-
-        let mut names = self.archive.page_names(&file.path).await?;
-
-        // Archive-storage order is not page order — nothing obliges a writer
-        // to store entries in sequence. Sort case-insensitively by name,
-        // which is what comic readers conventionally do and what the
-        // zero-padded filenames CBZ archives use are designed for.
-        names.sort_by_key(|name| name.to_ascii_lowercase());
-
-        let page_count = names.len() as u32;
-        if page == 0 || page > page_count {
-            return Err(DomainError::InvalidInput(format!(
-                "page {page} is out of range; comic {uuid} has {page_count} pages"
-            )));
-        }
-
-        let entry = &names[(page - 1) as usize];
-        let bytes = self.archive.read_entry(&file.path, entry).await?;
+        let (entry, page_count) = select_page(&self.archive, uuid, &file.path, page).await?;
+        let bytes = self.archive.read_entry(&file.path, &entry).await?;
 
         Ok(ComicPage {
             uuid: file.uuid,
             page,
             page_count,
-            mime_type: mime_for_path(entry).to_string(),
+            mime_type: mime_for_path(&entry).to_string(),
             bytes,
         })
     }

@@ -253,6 +253,28 @@ async fn given_svg_image_when_thumbnailed_then_bad_request() {
 }
 
 #[tokio::test]
+async fn given_cbr_comic_when_thumbnailed_then_bad_request() {
+    // Arrange — `.cbr` is RAR, which nothing here reads. The page route has
+    // always answered 400; the thumbnail used to reach the ZIP reader and
+    // answer 500. Both now agree, as the error table requires. The bytes
+    // need not be a real RAR: `.cbr` classifies as Comic by extension and
+    // the format is rejected before anything is opened.
+    let lib = tempdir().unwrap();
+    common::write_file(&lib, "issue.cbr", b"Rar!\x1a\x07\x00 not really");
+    let cache_dir = tempdir().unwrap();
+    let (_test, router, uuid) = index_one(&lib, cache_dir.path()).await;
+
+    // Act
+    let response = router
+        .oneshot(thumbnail_request(&uuid))
+        .await
+        .expect("one-shot");
+
+    // Assert
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
 async fn given_document_when_thumbnailed_then_bad_request() {
     // Arrange — FR-MP-05 covers video, image, and comic only.
     let lib = tempdir().unwrap();
