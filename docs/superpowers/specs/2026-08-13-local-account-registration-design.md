@@ -121,8 +121,9 @@ called by both the register and the change handlers. The rules:
 | At least 12 characters | Length is the only strength lever that scales. |
 | At most 128 characters | Argon2 cost is paid per byte; an unbounded password is a cheap way to make the server work hard. |
 | Not entirely whitespace | `"            "` passes a naive length check. |
+| Not a single repeated character | `"aaaaaaaaaaaa"` passes any length floor. Checked on characters, not bytes. |
 | Not equal to the email, and does not contain the email's local part (case-insensitively) | The email is submitted in the same request and is the first thing an attacker guesses. |
-| Not in the embedded common-password list | A small (~25 entry) `const` list of the passwords that dominate every breach corpus, compared case-insensitively. Not a full corpus check — that needs a downloaded dataset, which the Technology Stack Document's dependency discipline rules out. |
+| Not in the embedded common-password list | A small (~25 entry) `const` list of common passwords, compared case-insensitively. Every entry is at least 12 characters — anything shorter is already unreachable through the length floor, so a shorter entry would be dead weight. Not a full corpus check: that needs a downloaded breach dataset, which the Technology Stack Document's dependency discipline rules out. |
 
 Each failure returns `InvalidInput` naming the unmet rule so a client can render
 it. The message never echoes the password.
