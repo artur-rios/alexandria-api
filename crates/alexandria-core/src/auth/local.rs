@@ -27,6 +27,18 @@ pub struct LocalLoginResult {
     pub session_id: Uuid,
 }
 
+/// Confirmation that the local account was created (UC-41 / FR-AU-10),
+/// carrying the session id registration opened so the caller is
+/// authenticated without a second round-trip through UC-34. Never carries
+/// the password or its hash (FR-AU-06).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalRegisterResult {
+    pub success: bool,
+    pub email: String,
+    pub session_id: Uuid,
+}
+
 /// The single owner's local-login credential row (SRD §4.9). Singleton —
 /// there is exactly one row, `id = 1`.
 #[derive(Debug, Clone)]

@@ -1644,6 +1644,27 @@ impl SessionRepository for FakeSessionRepository {
     }
 }
 
+/// A `SessionRepository` whose writes always fail (UC-41 AF-06). Lets a
+/// test drive the "credential row written, session creation failed" path
+/// without a real database.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct FailingSessionRepository;
+
+impl SessionRepository for FailingSessionRepository {
+    async fn create_session(
+        &self,
+        _id: Uuid,
+        _created_at: DateTime<Utc>,
+        _expires_at: DateTime<Utc>,
+    ) -> Result<(), DomainError> {
+        Err(DomainError::Disk("session store unavailable".into()))
+    }
+
+    async fn is_valid(&self, _id: Uuid, _now: DateTime<Utc>) -> Result<bool, DomainError> {
+        Err(DomainError::Disk("session store unavailable".into()))
+    }
+}
+
 /// In-memory audio-tag reader (issue #44 pilot). `read()` answers `None`
 /// for any path with no seeded tags, mirroring "no tags found / couldn't
 /// parse" — the same outcome `LoftyAudioMetadataReader` produces for those

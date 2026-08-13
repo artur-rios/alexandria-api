@@ -12,3 +12,6 @@ mod external;
 
 #[path = "auth/password.rs"]
 mod password;
+
+#[path = "auth/register.rs"]
+mod register;

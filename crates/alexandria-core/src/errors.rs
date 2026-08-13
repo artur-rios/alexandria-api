@@ -33,6 +33,14 @@ pub enum DomainError {
     InvalidInput(String),
     #[error("invalid state transition")]
     InvalidState,
+    /// A request that cannot be satisfied because it conflicts with state
+    /// that already exists (UC-41 AF-01, AF-02). Distinct from
+    /// `InvalidState`, which carries no message: registration has two
+    /// different 409 conditions — wrong auth mode and account-already-
+    /// exists — and a caller that cannot tell them apart cannot say
+    /// anything useful to the owner.
+    #[error("conflict: {0}")]
+    Conflict(String),
     /// A filesystem operation failed (UC-05 AF-02, UC-09 AF-02, UC-32 AF-02,
     /// UC-33 AF-02). The catalog and the on-disk store stay consistent: the
     /// caller is told the disk operation failed and nothing was committed.
@@ -59,6 +67,10 @@ pub enum DomainError {
 impl DomainError {
     pub fn config(message: impl Into<String>) -> Self {
         Self::Config(message.into())
+    }
+
+    pub fn conflict(message: impl Into<String>) -> Self {
+        Self::Conflict(message.into())
     }
 
     pub fn internal(message: impl Into<String>) -> Self {

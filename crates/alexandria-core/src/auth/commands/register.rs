@@ -1,0 +1,107 @@
+use crate::auth::commands::set_credentials::validate_email;
+use crate::auth::local::{
+    issue_session, LocalCredentialRepository, LocalRegisterResult, SessionRepository,
+};
+use crate::auth::password::{hash_password, validate_strength};
+use crate::catalog::clock::Clock;
+use crate::config::AuthMode;
+use crate::errors::DomainError;
+
+/// UC-41 — Register the local account (FR-AU-10, FR-AU-11). Creates the
+/// single owner's credential row when none exists and opens a session, so
+/// the caller is authenticated immediately.
+///
+/// Takes no `AuthService`: registration is unauthenticated by definition —
+/// it is what a caller does when there is nothing to authenticate with
+/// yet. It is safe to leave ungated precisely because it can succeed only
+/// once (AF-02); every subsequent call is a conflict.
+///
+/// Generic over the credential repository, session repository, and clock
+/// so the decision logic is unit-tested against trait fakes, then wired
+/// with the concrete Sqlite/System collaborators at runtime (services.rs).
+pub struct RegisterLocalAccountHandler<CR, SR, C> {
+    credentials: CR,
+    sessions: SR,
+    clock: C,
+    mode: AuthMode,
+    session_ttl_hours: u32,
+}
+
+impl<CR, SR, C> RegisterLocalAccountHandler<CR, SR, C>
+where
+    CR: LocalCredentialRepository,
+    SR: SessionRepository,
+    C: Clock,
+{
+    pub fn new(
+        credentials: CR,
+        sessions: SR,
+        clock: C,
+        mode: AuthMode,
+        session_ttl_hours: u32,
+    ) -> Self {
+        Self {
+            credentials,
+            sessions,
+            clock,
+            mode,
+            session_ttl_hours,
+        }
+    }
+
+    /// Create the local account and return a session for it.
+    ///
+    /// The checks run in the order below — mode, then existence, then the
+    /// three input rules. An unauthenticated caller therefore learns only
+    /// whether an account exists, which AF-02's error tells them anyway;
+    /// varying the submitted password never reveals anything about a
+    /// stored one.
+    pub async fn register(
+        &self,
+        email: String,
+        password: String,
+        password_confirmation: String,
+    ) -> Result<LocalRegisterResult, DomainError> {
+        // AF-01: the active auth mode must be local login.
+        if self.mode != AuthMode::Local {
+            return Err(DomainError::conflict(
+                "local login is not the active auth mode",
+            ));
+        }
+
+        // AF-02: registration creates the account; it never overwrites one.
+        if self.credentials.get().await?.is_some() {
+            return Err(DomainError::conflict("a local account already exists"));
+        }
+
+        // AF-03: the email must be well-formed.
+        let email = validate_email(&email)?;
+        // AF-04: the password must satisfy the strength policy.
+        validate_strength(&password, &email)?;
+        // AF-05: the owner's password is unrecoverable, so a typo here
+        // would lock them out of their own catalog.
+        if password != password_confirmation {
+            return Err(DomainError::InvalidInput(
+                "password confirmation does not match the password".into(),
+            ));
+        }
+
+        let password_hash = hash_password(&password)?;
+        self.credentials
+            .upsert(&email, &password_hash, self.clock.now())
+            .await?;
+
+        // AF-06: if this fails the account still exists — deliberately not
+        // rolled back. The two writes would need a shared transaction across
+        // two repository ports, which no other command here does, and the
+        // account left behind is exactly the one the caller asked for. They
+        // obtain a session through UC-34.
+        let session_id = issue_session(&self.sessions, &self.clock, self.session_ttl_hours).await?;
+
+        Ok(LocalRegisterResult {
+            success: true,
+            email,
+            session_id,
+        })
+    }
+}
