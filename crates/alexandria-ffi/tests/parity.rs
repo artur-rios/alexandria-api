@@ -307,6 +307,15 @@ async fn given_same_lib_when_refreshed_via_http_and_ffi_then_rows_and_missing_ma
 
     wait_for_http_files(&http_pool, 2).await;
 
+    // The hash `a.mp3` carries *before* the mutation, so the wait below can
+    // tell "the refresh has rewritten this row" from "the refresh has not
+    // reached it yet".
+    let (http_stale_hash,): (String,) =
+        sqlx::query_as("SELECT content_hash FROM files WHERE name = 'a.mp3'")
+            .fetch_one(&http_pool)
+            .await
+            .unwrap();
+
     mutate(&http_lib);
 
     let refresh_req = Request::builder()
@@ -322,6 +331,11 @@ async fn given_same_lib_when_refreshed_via_http_and_ffi_then_rows_and_missing_ma
     assert_eq!(refresh_resp.status(), axum::http::StatusCode::ACCEPTED);
 
     wait_for_http_missing(&http_pool, 1).await;
+    // Both halves of the refresh must land before the rows are read: the
+    // marker for the deleted `b.md` above, and the re-hash of the changed
+    // `a.mp3` here. They run concurrently, so the marker alone proves nothing
+    // about the hash.
+    wait_for_http_rehash(&http_pool, "a.mp3", &http_stale_hash).await;
 
     let http_rows: Vec<(String, String, String, String, Option<String>)> = sqlx::query_as(
         "SELECT path, name, type, content_hash, missing_at FROM files ORDER BY path",
@@ -350,6 +364,9 @@ async fn given_same_lib_when_refreshed_via_http_and_ffi_then_rows_and_missing_ma
                 assert_eq!(started.status, alexandria_ffi::INDEX_OK);
                 wait_for_ffi_files(2);
 
+                // Same purpose as the HTTP leg's `http_stale_hash`.
+                let ffi_stale_hash = ffi_hash_for("a.mp3").expect("a.mp3 indexed");
+
                 // identical mutation on disk
                 std::fs::write(ffi_lib.path().join("a.mp3"), b"audio-v2-CHANGED").unwrap();
                 std::fs::remove_file(ffi_lib.path().join("b.md")).unwrap();
@@ -357,6 +374,7 @@ async fn given_same_lib_when_refreshed_via_http_and_ffi_then_rows_and_missing_ma
                 let refresh = alexandria_index_refresh_start(token.as_ptr());
                 assert_eq!(refresh.status, alexandria_ffi::INDEX_OK);
                 wait_for_ffi_missing(1);
+                wait_for_ffi_rehash("a.mp3", &ffi_stale_hash);
 
                 let raw = alexandria_index_files_json();
                 assert!(!raw.is_null());
@@ -466,6 +484,73 @@ async fn wait_for_http_audio_title(pool: &sqlx::sqlite::SqlitePool, expected_tit
         }
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
+}
+
+/// Wait until `name`'s recorded hash is something other than `stale_hash` —
+/// that is, until the refresh pass has actually rewritten that row.
+///
+/// `wait_for_*_missing` pins only the *deletion* half of a refresh. The walk
+/// handles each cataloged path concurrently (`RefreshHandler::refresh_one`),
+/// so a removed file's missing marker can land while a changed file's
+/// re-hash is still in flight. A reader that stops at the missing marker can
+/// therefore still observe the pre-refresh hash.
+///
+/// That is exactly how this file's UC-02 parity test used to fail on a loaded
+/// runner: both legs waited only for the marker, one had re-hashed `a.mp3`
+/// and the other had not, and the cross-surface comparison reported two
+/// different hashes for the same content. Waiting on the condition the
+/// assertion actually depends on is the fix.
+async fn wait_for_http_rehash(pool: &sqlx::sqlite::SqlitePool, name: &str, stale_hash: &str) {
+    let dl = std::time::Instant::now() + ASYNC_RUN_DEADLINE;
+    loop {
+        let row: Option<(String,)> =
+            sqlx::query_as("SELECT content_hash FROM files WHERE name = ?")
+                .bind(name)
+                .fetch_optional(pool)
+                .await
+                .unwrap();
+        if row.is_some_and(|(hash,)| hash != stale_hash) {
+            return;
+        }
+        if std::time::Instant::now() > dl {
+            panic!("http never re-hashed {name}");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+}
+
+/// The FFI counterpart of [`wait_for_http_rehash`], reading the catalog
+/// through `alexandria_index_files_json` rather than the pool.
+fn wait_for_ffi_rehash(name: &str, stale_hash: &str) {
+    let dl = std::time::Instant::now() + ASYNC_RUN_DEADLINE;
+    loop {
+        if ffi_hash_for(name).is_some_and(|hash| hash != stale_hash) {
+            return;
+        }
+        if std::time::Instant::now() > dl {
+            panic!("ffi never re-hashed {name}");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+}
+
+/// The hash the FFI catalog currently records for the file called `name`,
+/// or `None` if no such row exists yet.
+fn ffi_hash_for(name: &str) -> Option<String> {
+    let raw = alexandria_index_files_json();
+    assert!(!raw.is_null());
+    let json = unsafe { CStr::from_ptr(raw) }.to_str().unwrap().to_string();
+    // SAFETY: pointer came from this library and is freed once.
+    unsafe {
+        alexandria_free_string(raw);
+    }
+    let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+    value
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["name"].as_str() == Some(name))
+        .map(|row| row["hash"].as_str().unwrap().to_string())
 }
 
 async fn wait_for_http_missing(pool: &sqlx::sqlite::SqlitePool, expected: i64) {
