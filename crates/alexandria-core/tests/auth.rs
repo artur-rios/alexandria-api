@@ -9,3 +9,6 @@ mod login;
 
 #[path = "auth/external.rs"]
 mod external;
+
+#[path = "auth/password.rs"]
+mod password;
