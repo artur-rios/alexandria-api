@@ -48,10 +48,6 @@ pub enum RunStatus {
 }
 
 impl RunStatus {
-    // Unused within this task (the SQLite adapter writes status literals
-    // directly in its queries), kept for symmetry with `RunKind::as_str` and
-    // for later tasks (HTTP/FFI surfaces) that need the raw string form.
-    #[allow(dead_code)]
     fn as_str(self) -> &'static str {
         match self {
             RunStatus::Running => "running",
@@ -136,6 +132,11 @@ pub trait CatalogRunRepository: Send + Sync {
 
     /// Close a run's record as `complete` with its tally. Per-file failures
     /// live inside `counts`; they do not make the run failed.
+    ///
+    /// Returns `DomainError::internal` if `counts`'s variant does not match
+    /// the run's own `RunKind` — writing the wrong variant would leave the
+    /// row's real count columns unset, silently masquerading as "no counts
+    /// yet" once read back.
     async fn finish(
         &self,
         id: Uuid,
@@ -179,6 +180,24 @@ fn parse_time(raw: &str, column: &str) -> Result<DateTime<Utc>, DomainError> {
         .map_err(|err| DomainError::internal(format!("corrupt catalog_runs.{column}: {err}")))
 }
 
+/// Reject a `finish()` call whose `RunCounts` variant does not match the
+/// run's own kind. Writing the wrong variant would silently leave the row's
+/// real count columns NULL — this turns that into a loud error instead.
+fn check_counts_match_kind(kind: RunKind, counts: &RunCounts) -> Result<(), DomainError> {
+    let matches = matches!(
+        (kind, counts),
+        (RunKind::Index, RunCounts::Index { .. }) | (RunKind::Refresh, RunCounts::Refresh { .. })
+    );
+    if matches {
+        Ok(())
+    } else {
+        Err(DomainError::internal(format!(
+            "counts kind mismatch: run is {:?} but counts are {:?}",
+            kind, counts
+        )))
+    }
+}
+
 impl CatalogRunRepository for SqliteCatalogRunRepository {
     async fn start(
         &self,
@@ -189,10 +208,11 @@ impl CatalogRunRepository for SqliteCatalogRunRepository {
     ) -> Result<(), DomainError> {
         sqlx::query(
             "INSERT INTO catalog_runs (id, kind, status, root, started_at) \
-             VALUES (?, ?, 'running', ?, ?)",
+             VALUES (?, ?, ?, ?, ?)",
         )
         .bind(id.to_string())
         .bind(kind.as_str())
+        .bind(RunStatus::Running.as_str())
         .bind(root)
         .bind(started_at.to_rfc3339())
         .execute(&self.pool)
@@ -206,6 +226,19 @@ impl CatalogRunRepository for SqliteCatalogRunRepository {
         counts: RunCounts,
         finished_at: DateTime<Utc>,
     ) -> Result<(), DomainError> {
+        // Guard against a caller passing the wrong kind's tally: writing it
+        // would leave the row's own kind's columns NULL, and `get` would then
+        // report a `Complete` run with no counts — a corrupted write that
+        // looks like "no counts yet" instead of failing loudly.
+        let row = sqlx::query("SELECT kind FROM catalog_runs WHERE id = ?")
+            .bind(id.to_string())
+            .fetch_optional(&self.pool)
+            .await?;
+        if let Some(row) = row {
+            let kind = RunKind::parse(&row.try_get::<String, _>("kind")?)?;
+            check_counts_match_kind(kind, &counts)?;
+        }
+
         let query = match counts {
             RunCounts::Index {
                 scanned,
@@ -213,9 +246,10 @@ impl CatalogRunRepository for SqliteCatalogRunRepository {
                 skipped,
                 failed,
             } => sqlx::query(
-                "UPDATE catalog_runs SET status = 'complete', finished_at = ?, \
+                "UPDATE catalog_runs SET status = ?, finished_at = ?, \
                  scanned = ?, indexed = ?, skipped = ?, failed = ? WHERE id = ?",
             )
+            .bind(RunStatus::Complete.as_str())
             .bind(finished_at.to_rfc3339())
             .bind(scanned as i64)
             .bind(indexed as i64)
@@ -228,9 +262,10 @@ impl CatalogRunRepository for SqliteCatalogRunRepository {
                 unchanged,
                 failed,
             } => sqlx::query(
-                "UPDATE catalog_runs SET status = 'complete', finished_at = ?, \
+                "UPDATE catalog_runs SET status = ?, finished_at = ?, \
                  refreshed = ?, marked_missing = ?, unchanged = ?, failed = ? WHERE id = ?",
             )
+            .bind(RunStatus::Complete.as_str())
             .bind(finished_at.to_rfc3339())
             .bind(refreshed as i64)
             .bind(marked_missing as i64)
@@ -248,14 +283,13 @@ impl CatalogRunRepository for SqliteCatalogRunRepository {
         error: &str,
         finished_at: DateTime<Utc>,
     ) -> Result<(), DomainError> {
-        sqlx::query(
-            "UPDATE catalog_runs SET status = 'failed', finished_at = ?, error = ? WHERE id = ?",
-        )
-        .bind(finished_at.to_rfc3339())
-        .bind(error)
-        .bind(id.to_string())
-        .execute(&self.pool)
-        .await?;
+        sqlx::query("UPDATE catalog_runs SET status = ?, finished_at = ?, error = ? WHERE id = ?")
+            .bind(RunStatus::Failed.as_str())
+            .bind(finished_at.to_rfc3339())
+            .bind(error)
+            .bind(id.to_string())
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
@@ -321,13 +355,13 @@ impl CatalogRunRepository for SqliteCatalogRunRepository {
     }
 
     async fn interrupt_running(&self, now: DateTime<Utc>) -> Result<u64, DomainError> {
-        let result = sqlx::query(
-            "UPDATE catalog_runs SET status = 'interrupted', finished_at = ? \
-             WHERE status = 'running'",
-        )
-        .bind(now.to_rfc3339())
-        .execute(&self.pool)
-        .await?;
+        let result =
+            sqlx::query("UPDATE catalog_runs SET status = ?, finished_at = ? WHERE status = ?")
+                .bind(RunStatus::Interrupted.as_str())
+                .bind(now.to_rfc3339())
+                .bind(RunStatus::Running.as_str())
+                .execute(&self.pool)
+                .await?;
         Ok(result.rows_affected())
     }
 }

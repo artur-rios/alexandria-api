@@ -1978,6 +1978,20 @@ impl CatalogRunRepository for FakeCatalogRunRepository {
     ) -> Result<(), DomainError> {
         let mut runs = self.runs.lock().unwrap();
         if let Some(run) = runs.get_mut(&id) {
+            // Mirrors the SQLite adapter's guard: the counts variant must
+            // match the run's own kind, or the write is rejected rather than
+            // silently leaving the wrong tally in place.
+            let matches = matches!(
+                (run.kind, &counts),
+                (RunKind::Index, RunCounts::Index { .. })
+                    | (RunKind::Refresh, RunCounts::Refresh { .. })
+            );
+            if !matches {
+                return Err(DomainError::internal(format!(
+                    "counts kind mismatch: run is {:?} but counts are {:?}",
+                    run.kind, counts
+                )));
+            }
             run.status = RunStatus::Complete;
             run.counts = Some(counts);
             run.finished_at = Some(finished_at);
