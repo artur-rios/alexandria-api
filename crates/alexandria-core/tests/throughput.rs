@@ -58,6 +58,7 @@ use alexandria_core::catalog::fs::StdFilesystem;
 use alexandria_core::catalog::image_tags::ExifImageMetadataReader;
 use alexandria_core::catalog::queries::browse::{BrowseFilesHandler, FileFilter};
 use alexandria_core::catalog::repos::SqliteCatalogRepository;
+use alexandria_core::catalog::runs::SqliteCatalogRunRepository;
 use alexandria_core::catalog::video_tags::FfmpegVideoMetadataReader;
 use alexandria_core::migrate::migrate_database;
 use uuid::Uuid;
@@ -74,6 +75,7 @@ type BenchIndexHandler = IndexHandler<
     PdfEpubMetadataReader,
     FfmpegVideoMetadataReader,
     CbzComicMetadataReader,
+    SqliteCatalogRunRepository,
 >;
 
 fn env_usize(key: &str, default: usize) -> usize {
@@ -396,7 +398,8 @@ async fn build(
     let pool = migrate_database(db.to_str().expect("utf-8 db path"))
         .await
         .expect("migrate");
-    let repo = SqliteCatalogRepository::new(pool);
+    let repo = SqliteCatalogRepository::new(pool.clone());
+    let run_repo = SqliteCatalogRunRepository::new(pool);
     let handler = IndexHandler::new(
         BearerAuthService,
         repo.clone(),
@@ -409,6 +412,7 @@ async fn build(
         CbzComicMetadataReader,
         concurrency,
         String::new(),
+        run_repo,
     );
     (handler, repo)
 }

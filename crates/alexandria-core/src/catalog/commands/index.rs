@@ -13,6 +13,7 @@ use crate::catalog::fs::{FileEntry, Filesystem};
 use crate::catalog::image_tags::ImageMetadataReader;
 use crate::catalog::model::{FileType, NewFile};
 use crate::catalog::repos::CatalogRepository;
+use crate::catalog::runs::{CatalogRunRepository, RunCounts, RunKind};
 use crate::catalog::video_tags::VideoMetadataReader;
 use crate::errors::DomainError;
 use crate::retry::{retry_on_busy, BUSY_ATTEMPTS};
@@ -67,7 +68,7 @@ pub struct IndexOutcome {
 /// against trait fakes (no real DB, filesystem, or auth service in unit
 /// tests), then wired with the concrete Sqlite/StdFilesystem/Bearer/services
 /// at runtime.
-pub struct IndexHandler<A, R, F, C, M, N, O, P, Q> {
+pub struct IndexHandler<A, R, F, C, M, N, O, P, Q, RR> {
     auth: A,
     repo: R,
     fs: F,
@@ -82,6 +83,7 @@ pub struct IndexHandler<A, R, F, C, M, N, O, P, Q> {
     /// root must sit inside (FR-FC-26). `None` when the key is unset, which
     /// leaves indexing unconstrained — the historical behaviour.
     library_root: Option<String>,
+    runs: RR,
 }
 
 /// The client-facing rejection message for FR-FC-26 when the *requested*
@@ -110,7 +112,7 @@ enum EntryOutcome {
     Failed,
 }
 
-impl<A, R, F, C, M, N, O, P, Q> IndexHandler<A, R, F, C, M, N, O, P, Q>
+impl<A, R, F, C, M, N, O, P, Q, RR> IndexHandler<A, R, F, C, M, N, O, P, Q, RR>
 where
     A: AuthService,
     R: CatalogRepository,
@@ -121,6 +123,7 @@ where
     O: DocumentMetadataReader,
     P: VideoMetadataReader,
     Q: ComicMetadataReader,
+    RR: CatalogRunRepository,
 {
     /// `concurrency` is how many files `execute` processes at a time
     /// (`indexing.concurrency`). Zero is meaningless — a stream buffered zero
@@ -145,6 +148,7 @@ where
         comic_tags: Q,
         concurrency: u32,
         library_root: String,
+        runs: RR,
     ) -> Self {
         let library_root = {
             let trimmed = library_root.trim();
@@ -166,6 +170,7 @@ where
             comic_tags,
             concurrency: concurrency.max(1) as usize,
             library_root,
+            runs,
         }
     }
 
@@ -215,6 +220,9 @@ where
     }
 
     /// Validate and start — returns a run id without doing any scanning.
+    ///
+    /// FR-FC-27: the run record opens only after the root is validated, so an
+    /// invalid root (AF-01 / AF-06) never leaves a stray record behind.
     pub async fn start(
         &self,
         request: IndexRequest,
@@ -225,9 +233,16 @@ where
             return Err(DomainError::InvalidInput("root path does not exist".into()));
         }
         self.check_root_within_library(&request.root)?;
-        Ok(IndexStarted {
-            run_id: Uuid::new_v4(),
-        })
+        let run_id = Uuid::new_v4();
+        self.runs
+            .start(
+                run_id,
+                RunKind::Index,
+                Some(&request.root),
+                self.clock.now(),
+            )
+            .await?;
+        Ok(IndexStarted { run_id })
     }
 
     /// Walk, classify, hash, and persist. Skips unsupported extensions and
@@ -247,7 +262,17 @@ where
     /// rest of the library. Only a failure to list the root at all aborts.
     pub async fn execute(&self, root: &str, run_id: Uuid) -> Result<IndexOutcome, DomainError> {
         let now = self.clock.now();
-        let entries = self.fs.list_files(root).await?;
+        let entries = match self.fs.list_files(root).await {
+            Ok(entries) => entries,
+            Err(err) => {
+                // FR-FC-27: the walk could not proceed at all — that, and
+                // only that, is a `failed` run.
+                self.runs
+                    .fail(run_id, &err.to_string(), self.clock.now())
+                    .await?;
+                return Err(err);
+            }
+        };
         let scanned = entries.len();
 
         let (indexed, skipped, failed) = stream::iter(entries)
@@ -282,6 +307,20 @@ where
             .await;
 
         tracing::info!(%run_id, scanned, indexed, skipped, failed, "indexing complete");
+        // FR-FC-27: the walk finished. Per-file failures are inside the
+        // tally and do not make the run failed.
+        self.runs
+            .finish(
+                run_id,
+                RunCounts::Index {
+                    scanned,
+                    indexed,
+                    skipped,
+                    failed,
+                },
+                self.clock.now(),
+            )
+            .await?;
         Ok(IndexOutcome {
             run_id,
             scanned,

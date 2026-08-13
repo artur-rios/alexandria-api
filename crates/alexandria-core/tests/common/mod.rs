@@ -2031,3 +2031,191 @@ impl CatalogRunRepository for FakeCatalogRunRepository {
         Ok(reconciled)
     }
 }
+
+/// A `CatalogRepository` whose `list_all` always fails (UC-42 / FR-FC-27).
+/// Drives `RefreshHandler::execute`'s "the walk could not proceed at all"
+/// path, which is the only case that records a run `failed`. Every other
+/// method is unreachable from that path, so it panics loudly if the walk
+/// ever changes to call one of them.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct FailingCatalogRepository;
+
+impl CatalogRepository for FailingCatalogRepository {
+    async fn find_by_path(&self, _path: &str) -> Result<Option<File>, DomainError> {
+        unimplemented!("not reached by the run-fails-to-list path")
+    }
+
+    async fn find_by_uuid(&self, _uuid: Uuid) -> Result<Option<File>, DomainError> {
+        unimplemented!("not reached by the run-fails-to-list path")
+    }
+
+    async fn insert_file(&self, _new_file: NewFile) -> Result<File, DomainError> {
+        unimplemented!("not reached by the run-fails-to-list path")
+    }
+
+    async fn list_all(&self) -> Result<Vec<File>, DomainError> {
+        Err(DomainError::Disk("catalog store unavailable".into()))
+    }
+
+    async fn refresh_hash(
+        &self,
+        _path: &str,
+        _content_hash: &str,
+        _indexed_at: DateTime<Utc>,
+    ) -> Result<(), DomainError> {
+        unimplemented!("not reached by the run-fails-to-list path")
+    }
+
+    async fn mark_missing(
+        &self,
+        _path: &str,
+        _missing_at: DateTime<Utc>,
+    ) -> Result<(), DomainError> {
+        unimplemented!("not reached by the run-fails-to-list path")
+    }
+
+    async fn update_metadata(
+        &self,
+        _uuid: Uuid,
+        _metadata: &SubtypeMetadata,
+    ) -> Result<(), DomainError> {
+        unimplemented!("not reached by the run-fails-to-list path")
+    }
+
+    async fn list_filtered(
+        &self,
+        _file_type: Option<FileType>,
+        _state: StateFilter,
+        _collection_uuid: Option<Uuid>,
+    ) -> Result<Vec<File>, DomainError> {
+        unimplemented!("not reached by the run-fails-to-list path")
+    }
+
+    async fn find_metadata_by_uuid(
+        &self,
+        _uuid: Uuid,
+    ) -> Result<Option<SubtypeMetadata>, DomainError> {
+        unimplemented!("not reached by the run-fails-to-list path")
+    }
+
+    async fn set_image_dimensions(
+        &self,
+        _uuid: Uuid,
+        _width: i64,
+        _height: i64,
+    ) -> Result<(), DomainError> {
+        unimplemented!("not reached by the run-fails-to-list path")
+    }
+
+    async fn find_image_dimensions(&self, _uuid: Uuid) -> Result<Option<(i64, i64)>, DomainError> {
+        unimplemented!("not reached by the run-fails-to-list path")
+    }
+
+    async fn set_document_page_count(
+        &self,
+        _uuid: Uuid,
+        _page_count: i64,
+    ) -> Result<(), DomainError> {
+        unimplemented!("not reached by the run-fails-to-list path")
+    }
+
+    async fn find_document_page_count(&self, _uuid: Uuid) -> Result<Option<i64>, DomainError> {
+        unimplemented!("not reached by the run-fails-to-list path")
+    }
+
+    async fn set_video_duration(
+        &self,
+        _uuid: Uuid,
+        _duration_seconds: f64,
+    ) -> Result<(), DomainError> {
+        unimplemented!("not reached by the run-fails-to-list path")
+    }
+
+    async fn find_video_duration(&self, _uuid: Uuid) -> Result<Option<f64>, DomainError> {
+        unimplemented!("not reached by the run-fails-to-list path")
+    }
+
+    async fn set_comic_page_count(&self, _uuid: Uuid, _page_count: i64) -> Result<(), DomainError> {
+        unimplemented!("not reached by the run-fails-to-list path")
+    }
+
+    async fn find_comic_page_count(&self, _uuid: Uuid) -> Result<Option<i64>, DomainError> {
+        unimplemented!("not reached by the run-fails-to-list path")
+    }
+
+    async fn rename_file(
+        &self,
+        _uuid: Uuid,
+        _new_name: &str,
+        _new_path: &str,
+    ) -> Result<File, DomainError> {
+        unimplemented!("not reached by the run-fails-to-list path")
+    }
+
+    async fn soft_delete(
+        &self,
+        _uuid: Uuid,
+        _deleted_at: DateTime<Utc>,
+    ) -> Result<File, DomainError> {
+        unimplemented!("not reached by the run-fails-to-list path")
+    }
+
+    async fn restore(&self, _uuid: Uuid) -> Result<File, DomainError> {
+        unimplemented!("not reached by the run-fails-to-list path")
+    }
+
+    async fn purge(&self, _uuid: Uuid) -> Result<(), DomainError> {
+        unimplemented!("not reached by the run-fails-to-list path")
+    }
+
+    async fn set_collection(&self, _uuid: Uuid, _collection_uuid: Uuid) -> Result<(), DomainError> {
+        unimplemented!("not reached by the run-fails-to-list path")
+    }
+
+    async fn clear_collection(
+        &self,
+        _uuid: Uuid,
+        _collection_uuid: Uuid,
+    ) -> Result<(), DomainError> {
+        unimplemented!("not reached by the run-fails-to-list path")
+    }
+}
+
+/// A `Filesystem` whose `list_files` always fails, `path_exists` always
+/// answers `true` (so `IndexHandler::start`'s root-exists guard passes and
+/// the failure surfaces from `execute`'s walk instead). Drives the "the walk
+/// could not proceed at all" path (UC-42 / FR-FC-27), the only case that
+/// records an index run `failed`. Every other method is unreachable from
+/// that path.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct FailingListFilesystem;
+
+impl Filesystem for FailingListFilesystem {
+    async fn path_exists(&self, _root: &str) -> bool {
+        true
+    }
+
+    async fn list_files(&self, _root: &str) -> Result<Vec<FileEntry>, DomainError> {
+        Err(DomainError::Disk("filesystem unavailable".into()))
+    }
+
+    async fn content_hash(&self, _path: &str) -> Result<String, DomainError> {
+        unimplemented!("not reached by the run-fails-to-list path")
+    }
+
+    async fn rename(&self, _from: &str, _to: &str) -> Result<(), DomainError> {
+        unimplemented!("not reached by the run-fails-to-list path")
+    }
+
+    async fn remove_file(&self, _path: &str) -> Result<bool, DomainError> {
+        unimplemented!("not reached by the run-fails-to-list path")
+    }
+
+    async fn read_file(&self, _path: &str) -> Result<String, DomainError> {
+        unimplemented!("not reached by the run-fails-to-list path")
+    }
+
+    async fn write_file(&self, _path: &str, _content: &str) -> Result<(), DomainError> {
+        unimplemented!("not reached by the run-fails-to-list path")
+    }
+}

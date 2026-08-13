@@ -34,6 +34,7 @@ use crate::catalog::image_tags::ExifImageMetadataReader;
 use crate::catalog::queries::browse::BrowseFilesHandler;
 use crate::catalog::queries::read_content::ReadTextFileContentHandler;
 use crate::catalog::repos::SqliteCatalogRepository;
+use crate::catalog::runs::SqliteCatalogRunRepository;
 use crate::catalog::video_tags::FfmpegVideoMetadataReader;
 use crate::collections::commands::add_items::AddItemsToCollectionHandler;
 use crate::collections::commands::create::CreateCollectionHandler;
@@ -77,10 +78,16 @@ pub type DefaultIndexHandler = IndexHandler<
     PdfEpubMetadataReader,
     FfmpegVideoMetadataReader,
     CbzComicMetadataReader,
+    SqliteCatalogRunRepository,
 >;
 
-pub type DefaultRefreshHandler =
-    RefreshHandler<RuntimeAuthService, SqliteCatalogRepository, StdFilesystem, SystemClock>;
+pub type DefaultRefreshHandler = RefreshHandler<
+    RuntimeAuthService,
+    SqliteCatalogRepository,
+    StdFilesystem,
+    SystemClock,
+    SqliteCatalogRunRepository,
+>;
 
 pub type DefaultEditMetadataHandler =
     EditMetadataHandler<RuntimeAuthService, SqliteCatalogRepository>;
@@ -285,6 +292,7 @@ pub struct Services {
 pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
     let retention_days = settings.deletion.retention_days;
     let repo = SqliteCatalogRepository::new(pool.clone());
+    let run_repo = SqliteCatalogRunRepository::new(pool.clone());
     let session_repo = SqliteSessionRepository::new(pool.clone());
     let credential_repo = SqliteLocalCredentialRepository::new(pool.clone());
     let fs = StdFilesystem;
@@ -341,6 +349,7 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         comic_tags,
         indexing_concurrency,
         settings.filesystem.root.clone(),
+        run_repo.clone(),
     ));
     let refresh_handler = Arc::new(RefreshHandler::new(
         auth.clone(),
@@ -348,6 +357,7 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         fs,
         clock,
         indexing_concurrency,
+        run_repo.clone(),
     ));
     let edit_metadata_handler = Arc::new(EditMetadataHandler::new(auth.clone(), repo.clone()));
     let rename_file_handler = Arc::new(RenameFileHandler::new(auth.clone(), repo.clone(), fs));
