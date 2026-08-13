@@ -30,6 +30,9 @@ use alexandria_core::catalog::model::{
     File, FileState, FileType, NewFile, StateFilter, SubtypeMetadata,
 };
 use alexandria_core::catalog::repos::CatalogRepository;
+use alexandria_core::catalog::runs::{
+    CatalogRun, CatalogRunRepository, RunCounts, RunKind, RunStatus,
+};
 use alexandria_core::catalog::video_tags::{VideoMetadataReader, VideoTags};
 use alexandria_core::collections::model::{Collection, NewCollection};
 use alexandria_core::collections::repos::CollectionRepository;
@@ -1918,5 +1921,99 @@ impl ComicMetadataReader for FakeComicMetadataReader {
     async fn read(&self, path: &str) -> Option<ComicTags> {
         *self.call_count.lock().unwrap() += 1;
         self.tags.lock().unwrap().get(path).cloned()
+    }
+}
+
+/// In-memory `CatalogRunRepository` (UC-42). Lets the index/refresh handler
+/// tests assert the run lifecycle without a database.
+#[derive(Debug, Default, Clone)]
+pub struct FakeCatalogRunRepository {
+    runs: Arc<Mutex<HashMap<Uuid, CatalogRun>>>,
+}
+
+impl FakeCatalogRunRepository {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The recorded run for `id`, for assertions.
+    pub fn get_recorded(&self, id: Uuid) -> Option<CatalogRun> {
+        self.runs.lock().unwrap().get(&id).cloned()
+    }
+
+    pub fn count(&self) -> usize {
+        self.runs.lock().unwrap().len()
+    }
+}
+
+impl CatalogRunRepository for FakeCatalogRunRepository {
+    async fn start(
+        &self,
+        id: Uuid,
+        kind: RunKind,
+        root: Option<&str>,
+        started_at: DateTime<Utc>,
+    ) -> Result<(), DomainError> {
+        self.runs.lock().unwrap().insert(
+            id,
+            CatalogRun {
+                id,
+                kind,
+                status: RunStatus::Running,
+                root: root.map(str::to_string),
+                started_at,
+                finished_at: None,
+                counts: None,
+                error: None,
+            },
+        );
+        Ok(())
+    }
+
+    async fn finish(
+        &self,
+        id: Uuid,
+        counts: RunCounts,
+        finished_at: DateTime<Utc>,
+    ) -> Result<(), DomainError> {
+        let mut runs = self.runs.lock().unwrap();
+        if let Some(run) = runs.get_mut(&id) {
+            run.status = RunStatus::Complete;
+            run.counts = Some(counts);
+            run.finished_at = Some(finished_at);
+        }
+        Ok(())
+    }
+
+    async fn fail(
+        &self,
+        id: Uuid,
+        error: &str,
+        finished_at: DateTime<Utc>,
+    ) -> Result<(), DomainError> {
+        let mut runs = self.runs.lock().unwrap();
+        if let Some(run) = runs.get_mut(&id) {
+            run.status = RunStatus::Failed;
+            run.error = Some(error.to_string());
+            run.finished_at = Some(finished_at);
+        }
+        Ok(())
+    }
+
+    async fn get(&self, id: Uuid) -> Result<Option<CatalogRun>, DomainError> {
+        Ok(self.runs.lock().unwrap().get(&id).cloned())
+    }
+
+    async fn interrupt_running(&self, now: DateTime<Utc>) -> Result<u64, DomainError> {
+        let mut runs = self.runs.lock().unwrap();
+        let mut reconciled = 0;
+        for run in runs.values_mut() {
+            if run.status == RunStatus::Running {
+                run.status = RunStatus::Interrupted;
+                run.finished_at = Some(now);
+                reconciled += 1;
+            }
+        }
+        Ok(reconciled)
     }
 }

@@ -9,6 +9,7 @@ pub mod image_tags;
 pub mod model;
 pub mod queries;
 pub mod repos;
+pub mod runs;
 pub mod video_tags;
 
 /// Run a blocking best-effort metadata read on Tokio's blocking pool.
