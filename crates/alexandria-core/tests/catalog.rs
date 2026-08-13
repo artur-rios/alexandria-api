@@ -36,3 +36,6 @@ mod runs;
 
 #[path = "catalog/soft_delete.rs"]
 mod soft_delete;
+
+#[path = "catalog/run_status.rs"]
+mod run_status;

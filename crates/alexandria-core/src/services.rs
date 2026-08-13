@@ -33,6 +33,7 @@ use crate::catalog::fs::StdFilesystem;
 use crate::catalog::image_tags::ExifImageMetadataReader;
 use crate::catalog::queries::browse::BrowseFilesHandler;
 use crate::catalog::queries::read_content::ReadTextFileContentHandler;
+use crate::catalog::queries::run_status::GetRunStatusHandler;
 use crate::catalog::repos::SqliteCatalogRepository;
 use crate::catalog::runs::{CatalogRunRepository, SqliteCatalogRunRepository};
 use crate::catalog::video_tags::FfmpegVideoMetadataReader;
@@ -112,6 +113,9 @@ pub type DefaultBrowseFilesHandler =
 
 pub type DefaultReadTextFileContentHandler =
     ReadTextFileContentHandler<RuntimeAuthService, SqliteCatalogRepository, StdFilesystem>;
+
+pub type DefaultGetRunStatusHandler =
+    GetRunStatusHandler<RuntimeAuthService, SqliteCatalogRunRepository>;
 
 pub type DefaultEditTextFileContentHandler = EditTextFileContentHandler<
     RuntimeAuthService,
@@ -248,6 +252,7 @@ pub struct Services {
     pub purge_file_on_disk_handler: Arc<DefaultPurgeFileOnDiskHandler>,
     pub browse_files_handler: Arc<DefaultBrowseFilesHandler>,
     pub read_text_file_content_handler: Arc<DefaultReadTextFileContentHandler>,
+    pub get_run_status_handler: Arc<DefaultGetRunStatusHandler>,
     pub edit_text_file_content_handler: Arc<DefaultEditTextFileContentHandler>,
     pub playback_source_handler: Arc<DefaultPlaybackSourceHandler>,
     pub comic_page_handler: Arc<DefaultComicPageHandler>,
@@ -401,6 +406,7 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         repo.clone(),
         fs,
     ));
+    let get_run_status_handler = Arc::new(GetRunStatusHandler::new(auth.clone(), run_repo.clone()));
     let edit_text_file_content_handler = Arc::new(EditTextFileContentHandler::new(
         auth.clone(),
         repo.clone(),
@@ -561,6 +567,7 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         purge_file_on_disk_handler,
         browse_files_handler,
         read_text_file_content_handler,
+        get_run_status_handler,
         edit_text_file_content_handler,
         playback_source_handler,
         comic_page_handler,
