@@ -26,12 +26,25 @@ fn register_request(body: Value) -> Request<Body> {
         .unwrap()
 }
 
+const ORIGINAL_EMAIL: &str = "owner@example.com";
+
 fn valid_body() -> Value {
     json!({
-        "email": "owner@example.com",
+        "email": ORIGINAL_EMAIL,
         "password": PASSWORD,
         "passwordConfirmation": PASSWORD,
     })
+}
+
+fn login_request(email: &str, password: &str) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri("/v1/auth/local/login")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({ "email": email, "password": password }).to_string(),
+        ))
+        .unwrap()
 }
 
 async fn body_json(response: axum::response::Response) -> Value {
@@ -109,6 +122,7 @@ async fn given_an_existing_account_when_register_posted_then_409() {
     assert_eq!(first.status(), StatusCode::CREATED);
 
     let response = router
+        .clone()
         .oneshot(register_request(json!({
             "email": "someone-else@example.com",
             "password": PASSWORD,
@@ -118,6 +132,24 @@ async fn given_an_existing_account_when_register_posted_then_409() {
         .expect("second one-shot");
 
     assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body = body_json(response).await;
+    assert_eq!(
+        body["error"], "a local account already exists",
+        "the response must carry the account-already-exists message: {body}"
+    );
+
+    // The spec's test plan calls for "409 on a second registration with
+    // the stored credentials unchanged" — prove it by logging in with the
+    // *original* email and password, not the rejected second submission.
+    let login_response = router
+        .oneshot(login_request(ORIGINAL_EMAIL, PASSWORD))
+        .await
+        .expect("login one-shot");
+    assert_eq!(
+        login_response.status(),
+        StatusCode::OK,
+        "the original credentials must still work after the rejected second registration"
+    );
 }
 
 // ---------------- AF-03 / AF-04 / AF-05: input rules ----------------
