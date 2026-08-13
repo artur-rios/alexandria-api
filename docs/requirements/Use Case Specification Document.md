@@ -1236,7 +1236,7 @@ UC-36's externally issued JWT.
 | **Actors** | Owner |
 | **Description** | Create the single owner's local-login account when none exists, and open a session for the caller. |
 | **Preconditions** | The active auth mode is local login; no local credentials exist. |
-| **Postconditions** | The credential row holds the submitted email and a salted Argon2 hash of the password, and a Session exists whose id is returned to the caller. On any failure neither is created. |
+| **Postconditions** | The credential row holds the submitted email and a salted Argon2 hash of the password, and a Session exists whose id is returned to the caller. On a failure before the credential row is written, neither is created; AF-06 is the one exception — the credential row survives a failed session creation. |
 | **Requirements** | FR-AU-05, FR-AU-06, FR-AU-08, FR-AU-09, FR-AU-10, FR-AU-11 |
 
 **Main Flow**
@@ -1322,7 +1322,7 @@ exactly the account the caller asked for, and UC-34 completes the job.
 
 Every functional requirement in [System Requirements Document](System%20Requirements%20Document.md)
 §3 appears in at least one row above: FR-FC-01..25, FR-CO-01..07, FR-BM-01..06,
-FR-WL-01..08, FR-RL-01..08, FR-TX-01..03, FR-AU-01..09, FR-MP-01..06.
+FR-WL-01..08, FR-RL-01..08, FR-TX-01..03, FR-AU-01..11, FR-MP-01..06.
 UC-37 (Health check) is specified in the
 [Operations & Infrastructure Document](Operations%20%26%20Infrastructure%20Document.md)
 §5.3, not here, since it is an operational concern rather than a catalog use case.

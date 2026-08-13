@@ -74,7 +74,7 @@ error.
 | **Actors** | Owner |
 | **Description** | Create the single owner's local-login account when none exists, and open a session for the caller. |
 | **Preconditions** | The active auth mode is local login; no local credentials exist. |
-| **Postconditions** | The credential row holds the submitted email and a salted Argon2 hash of the password, and a Session exists whose id is returned to the caller. On any failure neither is created. |
+| **Postconditions** | The credential row holds the submitted email and a salted Argon2 hash of the password, and a Session exists whose id is returned to the caller. On a failure before the credential row is written, neither is created; AF-06 is the one exception — the credential row survives a failed session creation. |
 | **Requirements** | FR-AU-05, FR-AU-06, FR-AU-08, FR-AU-09, FR-AU-10, FR-AU-11 |
 
 **Main Flow**
