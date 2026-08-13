@@ -17,7 +17,7 @@
 - **No migration.** The `local_login_credentials` and `sessions` tables are unchanged. Do not add a file under `crates/alexandria-core/migrations/`.
 - **Plaintext passwords are never stored and never logged** (FR-AU-06). This includes error messages: an error may name the rule a password broke, never the password.
 - **Dual-surface parity** (FR-AU-08): every operation added to HTTP must also be added to FFI, returning the same JSON body.
-- **`crates/alexandria-ffi/src/header.h` is generated** by `build.rs` via cbindgen. Never hand-edit it. It regenerates on `cargo build -p alexandria-ffi`; commit the regenerated file.
+- **`crates/alexandria-ffi/src/header.h` is generated and git-ignored.** `build.rs` regenerates it via cbindgen on `cargo build -p alexandria-ffi`, and `.gitignore` excludes it — it is not tracked. Never hand-edit it, and never `git add` it (the add would fail, or worse, start tracking a build artifact). Regenerate it to *verify* the exports are exposed correctly; that verification is the deliverable, not a commit.
 - **Test naming:** `given_<condition>_when_<action>_then_<outcome>`, as every existing test in this repo does.
 - **Full suite green before the PR:** `cargo test` from the workspace root (Development Workflow §6).
 - **Password policy values, verbatim:** minimum 12 characters, maximum 128 characters.
@@ -1283,7 +1283,7 @@ Dual-transport parity (FR-AU-08): the same operation, the same JSON, over the C 
 
 **Files:**
 - Modify: `crates/alexandria-ffi/src/lib.rs`
-- Modify (generated, do not hand-edit): `crates/alexandria-ffi/src/header.h`
+- Verify only (generated + git-ignored, never hand-edited, never committed): `crates/alexandria-ffi/src/header.h`
 - Modify: `crates/alexandria-ffi/tests/parity.rs`
 
 **Interfaces:**
@@ -1492,19 +1492,16 @@ pub extern "C" fn alexandria_auth_local_register(json_body: *const c_char) -> Au
 }
 ```
 
-- [ ] **Step 5: Regenerate the C header**
+- [ ] **Step 5: Regenerate the C header and verify it**
+
+The header is git-ignored, so this is a verification step, not a commit. It proves cbindgen actually exports the new symbol to C callers — a `#[no_mangle]` function that cbindgen skips is invisible to Flutter.
 
 ```bash
 cargo build -p alexandria-ffi
+grep -c "AUTH_ERR_CONFLICT\|alexandria_auth_local_register" crates/alexandria-ffi/src/header.h
 ```
 
-Then confirm the header picked up both additions — do not edit it by hand:
-
-```bash
-git diff --stat crates/alexandria-ffi/src/header.h
-```
-
-Expected: `header.h` shows `AUTH_ERR_CONFLICT` and `alexandria_auth_local_register`. If it is unchanged, run `cargo clean -p alexandria-ffi && cargo build -p alexandria-ffi`.
+Expected: a count of at least 2. If it is 0, run `cargo clean -p alexandria-ffi && cargo build -p alexandria-ffi` and check again. Do not edit the header by hand, and do not `git add` it.
 
 - [ ] **Step 6: Run the parity test to verify it passes**
 
@@ -1525,7 +1522,7 @@ Expected: green.
 - [ ] **Step 8: Commit**
 
 ```bash
-git add crates/alexandria-ffi/src/lib.rs crates/alexandria-ffi/src/header.h crates/alexandria-ffi/tests/parity.rs
+git add crates/alexandria-ffi/src/lib.rs crates/alexandria-ffi/tests/parity.rs
 git commit -m "feat: expose UC-41 registration over FFI"
 ```
 
@@ -1714,7 +1711,7 @@ In `crates/alexandria-ffi/src/lib.rs`, update the `alexandria_auth_local_set_cre
 /// account is `alexandria_auth_local_register` (UC-41).
 ```
 
-Then regenerate the header:
+Then regenerate the header so the C doc comment matches (verification only — it is git-ignored and never committed):
 
 ```bash
 cargo build -p alexandria-ffi
@@ -1731,7 +1728,7 @@ Expected: green. Any remaining failure is almost certainly a test still using a 
 - [ ] **Step 8: Commit**
 
 ```bash
-git add crates/alexandria-core/src/auth/commands/set_credentials.rs crates/alexandria-core/tests/auth/set_credentials.rs crates/alexandria-http/tests/auth_api.rs crates/alexandria-ffi/tests/parity.rs crates/alexandria-ffi/src/lib.rs crates/alexandria-ffi/src/header.h
+git add crates/alexandria-core/src/auth/commands/set_credentials.rs crates/alexandria-core/tests/auth/set_credentials.rs crates/alexandria-http/tests/auth_api.rs crates/alexandria-ffi/tests/parity.rs crates/alexandria-ffi/src/lib.rs
 git commit -m "refactor!: make UC-35 change-only, registration is UC-41"
 ```
 
@@ -1843,13 +1840,13 @@ cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings
 
 Expected: green, with no formatting diff. Do not proceed on a failure.
 
-- [ ] **Step 2: Confirm the generated header is committed**
+- [ ] **Step 2: Confirm no build artifact was accidentally staged**
 
 ```bash
-git status --porcelain crates/alexandria-ffi/src/header.h
+git ls-files crates/alexandria-ffi/src/header.h
 ```
 
-Expected: empty output. A dirty `header.h` here means a regeneration was never committed.
+Expected: empty output. The generated header is git-ignored; any output here means it was force-added and must be removed with `git rm --cached crates/alexandria-ffi/src/header.h`.
 
 - [ ] **Step 3: Push and open the PR**
 
