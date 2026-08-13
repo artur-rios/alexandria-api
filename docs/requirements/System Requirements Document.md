@@ -104,6 +104,9 @@ graph LR
 | FR-FC-24 | The system shall expose every catalog operation via both the HTTP/REST-JSON surface and the FFI surface with identical results. FR-MP-06 defines the single exception: byte transfer, where the FFI surface returns a playback descriptor instead of a stream. |
 | FR-FC-25 | The system shall, at first index only, prefill a file's subtype metadata from the metadata embedded in the file itself (audio tags, image EXIF, document and comic metadata, video container metadata). Extraction is best-effort: a failure leaves the fields empty and never fails the file's indexing, and re-index (FR-FC-10) never re-runs it, so an owner's edit (FR-FC-14..18) is never overwritten. |
 | FR-FC-26 | The system shall reject an index request (FR-FC-01) whose root path is not the configured `filesystem.root` or a descendant of it, comparing the two paths after resolving each to its canonical form so that traversal segments, trailing separators, and symbolic links cannot escape the bound. When `filesystem.root` is unset, indexing is unconstrained and any readable root is accepted — the constraint is opt-in by configuration. Re-index (FR-FC-10, FR-FC-11) takes no root and is unaffected. |
+| FR-FC-27 | The system shall record every index and re-index run: its id, kind, start time, terminal status, finish time, and the outcome counts for its kind. A run whose walk completes shall be recorded `complete` even when individual files failed — those are counted in the run's `failed` tally, and one file's failure shall not abandon the rest of the walk. A run that could not proceed at all shall be recorded `failed` with the underlying error. |
+| FR-FC-28 | The system shall expose a run's recorded status and outcome to an authenticated caller, given the run id returned when the run was started, over both the HTTP and FFI surfaces. |
+| FR-FC-29 | The system shall, at startup, mark every run still recorded as running as interrupted; runs execute in-process and are never resumed. |
 
 ### 3.2 Collections (CO)
 
@@ -341,6 +344,33 @@ presents. External mode creates no sessions — each request carries its own JWT
 | createdAt | timestamp | required | When the login succeeded. |
 | expiresAt | timestamp | required | `createdAt` + the configured `auth.session_ttl_hours` (default 24). A request presenting a session at or past this instant is unauthenticated. |
 
+### 4.11 CatalogRun Fields
+
+Records each index and re-index run (UC-01, UC-02), queried by run id (UC-42,
+FR-FC-27). A row is written `running` when the run starts and closed to a
+terminal `status` when it ends; rows are kept indefinitely.
+
+| Field | Type | Constraints | Description |
+| --- | --- | --- | --- |
+| id | UUID | PK | The run id returned when the run was started. |
+| kind | text | required | `index` or `refresh`. |
+| status | text | required | `running`, `complete`, `failed`, or `interrupted`. |
+| root | text | nullable | The indexed root, for an index run only; `NULL` for a refresh, which takes no root. |
+| startedAt | timestamp | required | When the run started. |
+| finishedAt | timestamp | nullable | When the run reached a terminal status; `NULL` while `running`. |
+| scanned | integer | nullable | Index only: files scanned. |
+| indexed | integer | nullable | Index only: files newly indexed. |
+| skipped | integer | nullable | Index only: files skipped. |
+| refreshed | integer | nullable | Refresh only: records refreshed. |
+| markedMissing | integer | nullable | Refresh only: records marked missing. |
+| unchanged | integer | nullable | Refresh only: records unchanged. |
+| failed | integer | nullable | Both kinds: files that failed individually without abandoning the run. |
+| error | text | nullable | The underlying error; set only when `status` is `failed`. |
+
+Every count field and `finishedAt` are `NULL` while the run is `running`. A run
+is `interrupted` at startup if it was still recorded `running`, since runs
+execute in-process and are never resumed (FR-FC-29).
+
 ---
 
 ## 5. API Endpoints Overview
@@ -355,6 +385,7 @@ endpoint requires authentication from the active mode (see §7).
 | --- | --- | --- | --- |
 | POST | /v1/index | Start an asynchronous indexing scan of a root path. | FR-FC-01..08 |
 | POST | /v1/index/refresh | Re-index existing records (refresh hashes/metadata). | FR-FC-10, FR-FC-11 |
+| GET | /v1/index/runs/{runId} | Report an index or re-index run's status and outcome. | FR-FC-27, FR-FC-28 |
 
 ### 5.2 Files
 
@@ -542,8 +573,8 @@ The feature identifiers are the milestones the
 | Feature | Requirements |
 | --- | --- |
 | F-00 Foundation and operations | IR-01 through IR-06 (Operations & Infrastructure Document §2) |
-| F-01 File indexing | FR-FC-01 through FR-FC-11, FR-FC-25, FR-FC-26 |
-| F-02 Catalog browsing and metadata editing | FR-FC-12 through FR-FC-18 |
+| F-01 File indexing | FR-FC-01 through FR-FC-11, FR-FC-25, FR-FC-26, FR-FC-27, FR-FC-29 |
+| F-02 Catalog browsing and metadata editing | FR-FC-12 through FR-FC-18, FR-FC-28 |
 | F-03 Renaming and lifecycle management | FR-FC-19 through FR-FC-23 |
 | F-04 Text file content editing | FR-TX-01 through FR-TX-03 |
 | F-05 Collections | FR-CO-01 through FR-CO-07 |

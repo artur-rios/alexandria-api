@@ -1275,6 +1275,44 @@ exactly the account the caller asked for, and UC-34 completes the job.
 
 ---
 
+### UC-42: Query an index or refresh run
+
+| Field | Value |
+| --- | --- |
+| **ID** | UC-42 |
+| **Name** | Query an index or refresh run |
+| **Actors** | Owner |
+| **Description** | Report the status and outcome of an index (UC-01) or re-index (UC-02) run, given the run id returned when it was started. |
+| **Preconditions** | The caller is authenticated; a run was started and its id retained. |
+| **Postconditions** | None — this is a query. The catalog is unchanged. |
+| **Requirements** | FR-FC-24, FR-FC-27, FR-FC-28, FR-FC-29 |
+
+**Main Flow**
+
+1. The caller submits a run id.
+2. The system confirms the caller is authenticated as the owner.
+3. The system reads the run record for that id.
+4. The system returns the run's kind, status, start time, finish time when it
+   has one, and the outcome counts for its kind.
+
+**Alternative Flows**
+
+| ID | Condition | Outcome |
+| --- | --- | --- |
+| AF-01 | No run exists with that id | The system responds with a not-found error. |
+| AF-02 | The caller is not authenticated | The system denies with an unauthorized error. |
+| AF-03 | The run is still executing | The system returns it with status `running`; the count fields are absent, since no tally exists until the walk finishes. |
+| AF-04 | The run could not proceed at all (the catalog was unreadable, or the root could not be walked) | The system returns it with status `failed` and the underlying error message. |
+| AF-05 | The run was executing when the process stopped | The system returns it with status `interrupted` — no task is executing it and it will not resume. |
+
+A run whose walk completed with per-file failures is `complete`, not `failed`:
+those are counted in its `failed` tally and the walk deliberately continues past
+them. `failed` is reserved for a run that could not proceed at all. The
+distinction already exists inside `execute()` — one unreadable file must not
+abandon the rest of the catalog — and this surfaces it.
+
+---
+
 ## 3. Use Case — Requirements Traceability
 
 | Use Case | Requirements |
@@ -1319,6 +1357,7 @@ exactly the account the caller asked for, and UC-34 completes the job.
 | UC-39: Read a comic book page | FR-MP-03, FR-MP-04, FR-MP-06 |
 | UC-40: Get a file thumbnail | FR-MP-05, FR-MP-06 |
 | UC-41: Register the local account | FR-AU-05, FR-AU-06, FR-AU-08, FR-AU-09, FR-AU-10, FR-AU-11 |
+| UC-42: Query an index or refresh run | FR-FC-24, FR-FC-27, FR-FC-28, FR-FC-29 |
 
 Every functional requirement in [System Requirements Document](System%20Requirements%20Document.md)
 §3 appears in at least one row above: FR-FC-01..25, FR-CO-01..07, FR-BM-01..06,
