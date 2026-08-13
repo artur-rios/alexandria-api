@@ -48,7 +48,9 @@ pub async fn index(
     tokio::spawn(async move {
         // Per-file failures are counted inside `execute`; an `Err` here means
         // the run could not start at all (e.g. the root became unlistable).
-        // Log it — nothing else observes this task's result.
+        // `execute` has already written the `failed` run record on its own
+        // error path (UC-42), so the failure is recorded, not lost. This log
+        // line is for the operator.
         if let Err(err) = handler.execute(&root, run_id).await {
             tracing::error!(%run_id, error = %err, "index run aborted");
         }

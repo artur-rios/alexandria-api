@@ -229,9 +229,11 @@ pub extern "C" fn alexandria_index_start(
             let run_id = s.run_id;
             let handler = services.index_handler.clone();
             rt.spawn(async move {
-                // Per-file failures are counted inside `execute`; an `Err` here
-                // means the run could not start at all. Log it — nothing else
-                // observes this task's result.
+                // Per-file failures are counted inside `execute`; an `Err`
+                // here means the run could not start at all. `execute` has
+                // already written the `failed` run record on its own error
+                // path (UC-42), so the failure is recorded, not lost. This
+                // log line is for the operator.
                 if let Err(err) = handler.execute(&root, run_id).await {
                     tracing::error!(%run_id, error = %err, "index run aborted");
                 }
@@ -268,9 +270,11 @@ pub extern "C" fn alexandria_index_refresh_start(token: *const c_char) -> IndexS
             let run_id = s.run_id;
             let handler = services.refresh_handler.clone();
             rt.spawn(async move {
-                // Per-file failures are counted inside `execute`; an `Err` here
-                // means the run could not start at all. Log it — nothing else
-                // observes this task's result.
+                // Per-file failures are counted inside `execute`; an `Err`
+                // here means the run could not start at all. `execute` has
+                // already written the `failed` run record on its own error
+                // path (UC-42), so the failure is recorded, not lost. This
+                // log line is for the operator.
                 if let Err(err) = handler.execute(run_id).await {
                     tracing::error!(%run_id, error = %err, "re-index run aborted");
                 }
