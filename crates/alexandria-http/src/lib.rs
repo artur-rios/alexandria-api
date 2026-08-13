@@ -31,6 +31,7 @@ pub fn app(settings: Settings, services: Arc<Services>) -> Router {
     let v1 = Router::new()
         .route("/v1/index", post(routes::index::index))
         .route("/v1/index/refresh", post(routes::refresh::refresh))
+        .route("/v1/index/runs/{run_id}", get(routes::runs::run_status))
         .route(
             "/v1/files/{uuid}/metadata",
             patch(routes::edit_metadata::edit_metadata),
