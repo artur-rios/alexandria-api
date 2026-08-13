@@ -81,8 +81,15 @@ async fn given_a_started_run_when_polled_to_completion_then_it_reports_complete_
     for field in ["refreshed", "markedMissing", "unchanged", "failed"] {
         assert!(run[field].is_number(), "missing {field}: {run}");
     }
-    assert!(run["scanned"].is_null(), "index counts must not appear");
-    assert!(run["root"].is_null(), "a refresh carries no root");
+    let obj = run.as_object().expect("response body is a JSON object");
+    assert!(
+        !obj.contains_key("scanned"),
+        "index-only counts must be omitted from a refresh run, not sent as null: {run}"
+    );
+    assert!(
+        !obj.contains_key("root"),
+        "a refresh carries no root, and the key must be omitted, not sent as null: {run}"
+    );
 }
 
 #[tokio::test]
