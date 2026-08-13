@@ -223,6 +223,9 @@ where
     ///
     /// FR-FC-27: the run record opens only after the root is validated, so an
     /// invalid root (AF-01 / AF-06) never leaves a stray record behind.
+    /// Unlike `finish`/`fail`, this write's failure is not swallowed after
+    /// retrying: if the record cannot be opened at all, the caller must not
+    /// receive a run id it can never query.
     pub async fn start(
         &self,
         request: IndexRequest,
@@ -234,14 +237,12 @@ where
         }
         self.check_root_within_library(&request.root)?;
         let run_id = Uuid::new_v4();
-        self.runs
-            .start(
-                run_id,
-                RunKind::Index,
-                Some(&request.root),
-                self.clock.now(),
-            )
-            .await?;
+        let started_at = self.clock.now();
+        retry_on_busy(BUSY_ATTEMPTS, || {
+            self.runs
+                .start(run_id, RunKind::Index, Some(&request.root), started_at)
+        })
+        .await?;
         Ok(IndexStarted { run_id })
     }
 
@@ -267,9 +268,19 @@ where
             Err(err) => {
                 // FR-FC-27: the walk could not proceed at all — that, and
                 // only that, is a `failed` run.
-                self.runs
-                    .fail(run_id, &err.to_string(), self.clock.now())
-                    .await?;
+                let fail_error = err.to_string();
+                let failed_at = self.clock.now();
+                if let Err(record_err) = retry_on_busy(BUSY_ATTEMPTS, || {
+                    self.runs.fail(run_id, &fail_error, failed_at)
+                })
+                .await
+                {
+                    // The walk's own error is the one that matters to the
+                    // caller — a bookkeeping failure on top of it must not
+                    // replace it. The record stays `running` until startup
+                    // reconciliation (FR-FC-29) closes it.
+                    tracing::warn!(%run_id, error = %record_err, "could not record run failure");
+                }
                 return Err(err);
             }
         };
@@ -309,18 +320,25 @@ where
         tracing::info!(%run_id, scanned, indexed, skipped, failed, "indexing complete");
         // FR-FC-27: the walk finished. Per-file failures are inside the
         // tally and do not make the run failed.
-        self.runs
-            .finish(
-                run_id,
-                RunCounts::Index {
-                    scanned,
-                    indexed,
-                    skipped,
-                    failed,
-                },
-                self.clock.now(),
-            )
-            .await?;
+        let finished_at = self.clock.now();
+        let counts = RunCounts::Index {
+            scanned,
+            indexed,
+            skipped,
+            failed,
+        };
+        if let Err(err) = retry_on_busy(BUSY_ATTEMPTS, || {
+            self.runs.finish(run_id, counts, finished_at)
+        })
+        .await
+        {
+            // FR-FC-27: the walk succeeded — only the bookkeeping write
+            // failed. Reporting the run as failed would be a lie about work
+            // that did happen, and the tally is already in the log line
+            // above. The record stays `running` until startup
+            // reconciliation (FR-FC-29) closes it.
+            tracing::warn!(%run_id, error = %err, "could not record run completion");
+        }
         Ok(IndexOutcome {
             run_id,
             scanned,

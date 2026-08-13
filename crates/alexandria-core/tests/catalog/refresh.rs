@@ -11,7 +11,8 @@ use alexandria_core::errors::DomainError;
 
 use crate::common::{
     existing_file_with_hash, existing_missing_file, fixed_clock, now, FailingCatalogRepository,
-    FakeAuth, FakeCatalogRepository, FakeCatalogRunRepository, FakeFilesystem,
+    FailingCatalogRunRepository, FakeAuth, FakeCatalogRepository, FakeCatalogRunRepository,
+    FakeFilesystem,
 };
 
 const TOKEN: &str = "bearer-token";
@@ -598,4 +599,40 @@ async fn given_a_catalog_that_cannot_be_listed_when_executed_then_the_run_is_rec
     );
     assert!(recorded.counts.is_none());
     let _ = err;
+}
+
+#[tokio::test]
+async fn given_run_completion_cannot_be_recorded_when_executed_then_the_outcome_is_still_returned()
+{
+    // FR-FC-27: the walk itself succeeds; only the bookkeeping write fails.
+    // The caller must still see the outcome it computed — a bookkeeping
+    // failure must not sink a completed walk. Same single-file fixture as
+    // `given_changed_hash_when_execute_then_hash_and_indexedat_refreshed`.
+    let repo = FakeCatalogRepository::new();
+    repo.seed(existing_file_with_hash(
+        "/lib/a.mp3",
+        "a.mp3",
+        FileType::Audio,
+        "old-hash",
+    ));
+    let fs = FakeFilesystem::builder()
+        .with_file("/lib", "/lib/a.mp3", "a.mp3", "new-hash")
+        .build();
+    let handler = refresh_handler(
+        FakeAuth::Allowing,
+        repo,
+        fs,
+        fixed_clock(now()),
+        FailingCatalogRunRepository,
+    );
+
+    let outcome = handler
+        .execute(Uuid::new_v4())
+        .await
+        .expect("a failed run-completion write must not fail the walk");
+
+    assert_eq!(outcome.refreshed, 1);
+    assert_eq!(outcome.marked_missing, 0);
+    assert_eq!(outcome.unchanged, 0);
+    assert_eq!(outcome.failed, 0);
 }

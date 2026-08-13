@@ -88,12 +88,17 @@ where
     ///
     /// FR-FC-27: a started run is always a recorded run — the record opens
     /// here, where the id is minted, so no caller can start one without it.
+    /// Unlike `finish`/`fail`, this write's failure is not swallowed after
+    /// retrying: if the record cannot be opened at all, the caller must not
+    /// receive a run id it can never query.
     pub async fn start(&self, token: &str) -> Result<RefreshStarted, DomainError> {
         self.auth.authenticate(token).await?;
         let run_id = Uuid::new_v4();
-        self.runs
-            .start(run_id, RunKind::Refresh, None, self.clock.now())
-            .await?;
+        let started_at = self.clock.now();
+        retry_on_busy(BUSY_ATTEMPTS, || {
+            self.runs.start(run_id, RunKind::Refresh, None, started_at)
+        })
+        .await?;
         Ok(RefreshStarted { run_id })
     }
 
@@ -115,9 +120,19 @@ where
             Err(err) => {
                 // FR-FC-27: the walk could not proceed at all — that, and
                 // only that, is a `failed` run.
-                self.runs
-                    .fail(run_id, &err.to_string(), self.clock.now())
-                    .await?;
+                let fail_error = err.to_string();
+                let failed_at = self.clock.now();
+                if let Err(record_err) = retry_on_busy(BUSY_ATTEMPTS, || {
+                    self.runs.fail(run_id, &fail_error, failed_at)
+                })
+                .await
+                {
+                    // The walk's own error is the one that matters to the
+                    // caller — a bookkeeping failure on top of it must not
+                    // replace it. The record stays `running` until startup
+                    // reconciliation (FR-FC-29) closes it.
+                    tracing::warn!(%run_id, error = %record_err, "could not record run failure");
+                }
                 return Err(err);
             }
         };
@@ -175,18 +190,25 @@ where
         );
         // FR-FC-27: the walk finished. Per-file failures are inside the
         // tally and do not make the run failed.
-        self.runs
-            .finish(
-                run_id,
-                RunCounts::Refresh {
-                    refreshed,
-                    marked_missing,
-                    unchanged,
-                    failed,
-                },
-                self.clock.now(),
-            )
-            .await?;
+        let finished_at = self.clock.now();
+        let counts = RunCounts::Refresh {
+            refreshed,
+            marked_missing,
+            unchanged,
+            failed,
+        };
+        if let Err(err) = retry_on_busy(BUSY_ATTEMPTS, || {
+            self.runs.finish(run_id, counts, finished_at)
+        })
+        .await
+        {
+            // FR-FC-27: the walk succeeded — only the bookkeeping write
+            // failed. Reporting the run as failed would be a lie about work
+            // that did happen, and the tally is already in the log line
+            // above. The record stays `running` until startup
+            // reconciliation (FR-FC-29) closes it.
+            tracing::warn!(%run_id, error = %err, "could not record run completion");
+        }
         Ok(outcome)
     }
 

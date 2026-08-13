@@ -2219,3 +2219,50 @@ impl Filesystem for FailingListFilesystem {
         unimplemented!("not reached by the run-fails-to-list path")
     }
 }
+
+/// A `CatalogRunRepository` whose `finish` always fails (UC-42 / FR-FC-27).
+/// Pins the "a bookkeeping failure must not sink a successful walk" behavior:
+/// `execute()` retries the write and, once retries are exhausted, still
+/// returns the outcome it computed rather than propagating the recording
+/// error. `start` and `fail` are not exercised by that test and are left
+/// `unimplemented!()`.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct FailingCatalogRunRepository;
+
+impl CatalogRunRepository for FailingCatalogRunRepository {
+    async fn start(
+        &self,
+        _id: Uuid,
+        _kind: RunKind,
+        _root: Option<&str>,
+        _started_at: DateTime<Utc>,
+    ) -> Result<(), DomainError> {
+        unimplemented!("not exercised by the finish-always-fails test")
+    }
+
+    async fn finish(
+        &self,
+        _id: Uuid,
+        _counts: RunCounts,
+        _finished_at: DateTime<Utc>,
+    ) -> Result<(), DomainError> {
+        Err(DomainError::Disk("run store unavailable".into()))
+    }
+
+    async fn fail(
+        &self,
+        _id: Uuid,
+        _error: &str,
+        _finished_at: DateTime<Utc>,
+    ) -> Result<(), DomainError> {
+        unimplemented!("not exercised by the finish-always-fails test")
+    }
+
+    async fn get(&self, _id: Uuid) -> Result<Option<CatalogRun>, DomainError> {
+        unimplemented!("not exercised by the finish-always-fails test")
+    }
+
+    async fn interrupt_running(&self, _now: DateTime<Utc>) -> Result<u64, DomainError> {
+        unimplemented!("not exercised by the finish-always-fails test")
+    }
+}
