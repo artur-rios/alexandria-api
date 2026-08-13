@@ -28,12 +28,12 @@ use alexandria_ffi::{
     alexandria_file_soft_delete, alexandria_file_thumbnail, alexandria_files_list,
     alexandria_free_string, alexandria_index_count_files, alexandria_index_count_missing,
     alexandria_index_files_json, alexandria_index_init, alexandria_index_refresh_start,
-    alexandria_index_start, alexandria_reading_list_add_item, alexandria_reading_list_create,
-    alexandria_reading_list_delete, alexandria_reading_list_remove_item,
-    alexandria_reading_list_update_progress, alexandria_reading_lists_list,
-    alexandria_watchlist_add_video, alexandria_watchlist_create, alexandria_watchlist_delete,
-    alexandria_watchlist_remove_video, alexandria_watchlist_update_progress,
-    alexandria_watchlists_list, IndexStartResult,
+    alexandria_index_run_status_json, alexandria_index_start, alexandria_reading_list_add_item,
+    alexandria_reading_list_create, alexandria_reading_list_delete,
+    alexandria_reading_list_remove_item, alexandria_reading_list_update_progress,
+    alexandria_reading_lists_list, alexandria_watchlist_add_video, alexandria_watchlist_create,
+    alexandria_watchlist_delete, alexandria_watchlist_remove_video,
+    alexandria_watchlist_update_progress, alexandria_watchlists_list, IndexStartResult,
 };
 use alexandria_http::app;
 use axum::body::{to_bytes, Body};
@@ -10497,5 +10497,127 @@ async fn given_uc41_register_when_called_on_both_surfaces_then_bodies_match() {
     for body in [&http_body, &ffi_body] {
         let session_id = body["sessionId"].as_str().expect("sessionId");
         uuid::Uuid::parse_str(session_id).expect("sessionId must be a uuid");
+    }
+}
+
+/// UC-42 parity — a run's recorded status must read identically over both
+/// transports. The run ids differ by construction (independent databases), so
+/// parity asserts every field except the id, which is asserted to be the id
+/// each surface was given.
+#[tokio::test]
+async fn given_a_completed_refresh_when_status_read_via_http_and_ffi_then_bodies_match() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+
+    // ---- HTTP leg ----
+    let http_dir = tempdir().unwrap();
+    let http_db = db_path(&http_dir, "http.sqlite");
+    let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    seed_session(&http_pool, TEST_TOKEN).await;
+    let http_services =
+        std::sync::Arc::new(build_services(&local_settings(), http_pool.clone()).await);
+    let router = app(Settings::default(), http_services);
+
+    let refresh_req = Request::builder()
+        .method("POST")
+        .uri("/v1/index/refresh")
+        .header("authorization", format!("Bearer {TEST_TOKEN}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = router
+        .clone()
+        .oneshot(refresh_req)
+        .await
+        .expect("http refresh");
+    assert_eq!(resp.status(), axum::http::StatusCode::ACCEPTED);
+    let http_run_id = serde_json::from_slice::<serde_json::Value>(
+        &to_bytes(resp.into_body(), usize::MAX).await.unwrap(),
+    )
+    .unwrap()["runId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let http_body = {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let req = Request::builder()
+                .method("GET")
+                .uri(format!("/v1/index/runs/{http_run_id}"))
+                .header("authorization", format!("Bearer {TEST_TOKEN}"))
+                .body(Body::empty())
+                .unwrap();
+            let resp = router.clone().oneshot(req).await.expect("http status");
+            assert_eq!(resp.status(), axum::http::StatusCode::OK);
+            let body: serde_json::Value =
+                serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await.unwrap())
+                    .unwrap();
+            if body["status"] != "running" {
+                break body;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "http run never finished"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    };
+
+    // ---- FFI leg ----
+    let ffi_dir = tempdir().unwrap();
+    let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
+    let (ffi_json, ffi_run_id): (String, String) =
+        tokio::task::spawn_blocking(move || -> (String, String) {
+            let cdb = CString::new(ffi_db).unwrap();
+            assert_eq!(
+                alexandria_index_init(cdb.as_ptr()),
+                alexandria_ffi::INDEX_OK
+            );
+
+            let token = CString::new(TEST_TOKEN).unwrap();
+            let started = alexandria_index_refresh_start(token.as_ptr());
+            assert_eq!(started.status, alexandria_ffi::INDEX_OK);
+            let run_id = run_id_string(&started);
+            assert!(!run_id.is_empty());
+
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                let id = CString::new(run_id.clone()).unwrap();
+                let token = CString::new(TEST_TOKEN).unwrap();
+                let result = alexandria_index_run_status_json(id.as_ptr(), token.as_ptr());
+                assert_eq!(result.status, alexandria_ffi::RUN_OK);
+                assert!(!result.json.is_null());
+                let json = unsafe { CStr::from_ptr(result.json) }
+                    .to_str()
+                    .unwrap()
+                    .to_string();
+                // SAFETY: pointer came from this library and is freed once.
+                unsafe {
+                    alexandria_free_string(result.json);
+                }
+                let body: serde_json::Value = serde_json::from_str(&json).unwrap();
+                if body["status"] != "running" {
+                    break (json, run_id);
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "ffi run never finished"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+        })
+        .await
+        .unwrap();
+
+    let ffi_body: serde_json::Value = serde_json::from_str(&ffi_json).unwrap();
+
+    // ---- compare ----
+    assert_eq!(http_body["runId"], http_run_id);
+    assert_eq!(ffi_body["runId"], ffi_run_id);
+    assert_eq!(http_body["kind"], ffi_body["kind"]);
+    assert_eq!(http_body["kind"], serde_json::json!("refresh"));
+    assert_eq!(http_body["status"], ffi_body["status"]);
+    assert_eq!(http_body["status"], serde_json::json!("complete"));
+    for field in ["refreshed", "markedMissing", "unchanged", "failed"] {
+        assert_eq!(http_body[field], ffi_body[field], "{field} differs");
     }
 }
