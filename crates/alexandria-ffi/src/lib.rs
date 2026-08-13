@@ -3079,6 +3079,10 @@ pub const AUTH_ERR_NOT_INITIALIZED: c_int = 3;
 pub const AUTH_ERR_INVALID_STATE: c_int = 5;
 pub const AUTH_ERR_CONFIG: c_int = 8;
 pub const AUTH_ERR_OTHER: c_int = 9;
+/// UC-41 AF-01/AF-02: the request conflicts with existing state — the
+/// active auth mode is not local, or an account already exists. The FFI
+/// counterpart of HTTP's `409`.
+pub const AUTH_ERR_CONFLICT: c_int = 10;
 
 /// Result of `alexandria_auth_local_login` / `alexandria_auth_local_set_credentials`
 /// (UC-34/UC-35). On success `status` is `AUTH_OK` and `json` is a
@@ -3117,6 +3121,7 @@ fn map_auth_err(err: DomainError) -> AuthJsonResult {
         DomainError::InvalidInput(_) => AuthJsonResult::err(AUTH_ERR_INVALID_INPUT),
         DomainError::InvalidState => AuthJsonResult::err(AUTH_ERR_INVALID_STATE),
         DomainError::Config(_) => AuthJsonResult::err(AUTH_ERR_CONFIG),
+        DomainError::Conflict(_) => AuthJsonResult::err(AUTH_ERR_CONFLICT),
         _ => AuthJsonResult::err(AUTH_ERR_OTHER),
     }
 }
@@ -3184,8 +3189,8 @@ pub extern "C" fn alexandria_auth_local_login(json_body: *const c_char) -> AuthJ
 
 /// Set or change local-login credentials (UC-35 / FR-AU-05, FR-AU-06).
 /// `json_body` is the JSON body HTTP would send (`email`, `password`).
-/// `token` is optional: required only once credentials already exist
-/// (AF-03) — pass an empty string on first-time setup.
+/// `token` is required: this changes existing credentials. Creating the
+/// account is `alexandria_auth_local_register` (UC-41).
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
 pub extern "C" fn alexandria_auth_local_set_credentials(
@@ -3218,6 +3223,69 @@ pub extern "C" fn alexandria_auth_local_set_credentials(
     match result {
         Ok(credentials) => {
             let json = serde_json::to_string(&credentials).unwrap_or_default();
+            AuthJsonResult::ok(json)
+        }
+        Err(err) => map_auth_err(err),
+    }
+}
+
+/// Request body for `alexandria_auth_local_register` — the same JSON the
+/// HTTP route takes: `{"email":"…","password":"…","passwordConfirmation":"…"}`.
+#[derive(Debug)]
+struct LocalRegisterBody {
+    email: String,
+    password: String,
+    password_confirmation: String,
+}
+
+impl LocalRegisterBody {
+    fn from_json_str(s: &str) -> Option<Self> {
+        let value: serde_json::Value = serde_json::from_str(s).ok()?;
+        let obj = value.as_object()?;
+        Some(Self {
+            email: obj.get("email")?.as_str()?.to_string(),
+            password: obj.get("password")?.as_str()?.to_string(),
+            password_confirmation: obj.get("passwordConfirmation")?.as_str()?.to_string(),
+        })
+    }
+}
+
+/// Register the local account (UC-41 / FR-AU-10, FR-AU-11): create the
+/// single owner's credentials and open a session. `json_body` is the JSON
+/// body HTTP would send (`email`, `password`, `passwordConfirmation`). On
+/// success `json` carries the `LocalRegisterResult`, whose `sessionId` the
+/// caller presents on subsequent requests.
+///
+/// Deliberately takes no `token`: there is nothing to authenticate with
+/// before an account exists. Succeeds only once — a second call returns
+/// `AUTH_ERR_CONFLICT` (AF-02).
+#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
+#[no_mangle]
+pub extern "C" fn alexandria_auth_local_register(json_body: *const c_char) -> AuthJsonResult {
+    let services = match services_slot().lock().unwrap().clone() {
+        Some(s) => s,
+        None => return AuthJsonResult::err(AUTH_ERR_NOT_INITIALIZED),
+    };
+
+    let body_str = match cstr_lossy(json_body) {
+        Some(s) => s,
+        None => return AuthJsonResult::err(AUTH_ERR_INVALID_INPUT),
+    };
+    let body = match LocalRegisterBody::from_json_str(&body_str) {
+        Some(b) => b,
+        None => return AuthJsonResult::err(AUTH_ERR_INVALID_INPUT),
+    };
+
+    let result = runtime().block_on(async {
+        services
+            .register_local_account_handler
+            .register(body.email, body.password, body.password_confirmation)
+            .await
+    });
+
+    match result {
+        Ok(registration) => {
+            let json = serde_json::to_string(&registration).unwrap_or_default();
             AuthJsonResult::ok(json)
         }
         Err(err) => map_auth_err(err),

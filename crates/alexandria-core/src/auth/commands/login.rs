@@ -1,6 +1,6 @@
-use uuid::Uuid;
-
-use crate::auth::local::{LocalCredentialRepository, LocalLoginResult, SessionRepository};
+use crate::auth::local::{
+    issue_session, LocalCredentialRepository, LocalLoginResult, SessionRepository,
+};
 use crate::auth::password::verify_password;
 use crate::catalog::clock::Clock;
 use crate::config::AuthMode;
@@ -58,7 +58,7 @@ where
             return Err(DomainError::Unauthorized);
         }
 
-        // AF-03: local credentials must have been set (run UC-35 first).
+        // AF-03: local credentials must have been set (run UC-41 first).
         let credential = self
             .credentials
             .get()
@@ -70,12 +70,7 @@ where
             return Err(DomainError::Unauthorized);
         }
 
-        let session_id = Uuid::new_v4();
-        let now = self.clock.now();
-        let expires_at = now + chrono::Duration::hours(i64::from(self.session_ttl_hours));
-        self.sessions
-            .create_session(session_id, now, expires_at)
-            .await?;
+        let session_id = issue_session(&self.sessions, &self.clock, self.session_ttl_hours).await?;
 
         Ok(LocalLoginResult {
             success: true,

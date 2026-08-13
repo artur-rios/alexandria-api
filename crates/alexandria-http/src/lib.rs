@@ -121,15 +121,16 @@ pub fn app(settings: Settings, services: Arc<Services>) -> Router {
             middleware::auth::require_auth,
         ));
 
-    // `/health`, the local login, and the local credentials endpoints are
+    // `/health`, the local register, login, and credentials endpoints are
     // deliberately outside the gate: `/health` reports reachability to a
-    // caller with no catalog credentials, login is how a caller obtains
-    // credentials in the first place (UC-34), and setting credentials must
-    // be reachable with no credentials yet on first-time setup (UC-35 —
-    // the handler enforces its own conditional authorization once
-    // credentials already exist, AF-03).
+    // caller with no catalog credentials, registration is how the account
+    // comes to exist at all (UC-41), and login is how a caller obtains
+    // credentials in the first place (UC-34). Registration is safe ungated
+    // because it succeeds only once (UC-41 AF-02); `/credentials` enforces
+    // authentication in its own handler (UC-35).
     Router::new()
         .route("/health", get(routes::health::health))
+        .route("/v1/auth/local/register", post(routes::auth::register))
         .route("/v1/auth/local/login", post(routes::auth::login))
         .route(
             "/v1/auth/local/credentials",

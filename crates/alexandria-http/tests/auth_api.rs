@@ -26,6 +26,24 @@ fn credentials_request(body: Value, token: Option<&str>) -> Request<Body> {
     builder.body(Body::from(body.to_string())).unwrap()
 }
 
+/// Create the account the way a client now does (UC-41), so the UC-35
+/// tests below have credentials to change.
+fn register_request(email: &str, password: &str) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri("/v1/auth/local/register")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({
+                "email": email,
+                "password": password,
+                "passwordConfirmation": password,
+            })
+            .to_string(),
+        ))
+        .unwrap()
+}
+
 fn login_request(body: Value) -> Request<Body> {
     Request::builder()
         .method("POST")
@@ -45,22 +63,20 @@ async fn body_json(response: axum::response::Response) -> Value {
 // ---------------- UC-35 main flow ----------------
 
 #[tokio::test]
-async fn given_no_credentials_yet_when_set_posted_unauthenticated_then_200_bootstrap_succeeds() {
+async fn given_no_credentials_yet_when_set_posted_unauthenticated_then_401() {
+    // UC-35 is change-only since UC-41; bootstrap is `/register`.
     let test = test_app().await;
     let router = app(Settings::default(), test.services);
 
     let response = router
         .oneshot(credentials_request(
-            json!({ "email": "owner@example.com", "password": "hunter2" }),
+            json!({ "email": "owner@example.com", "password": "correct horse battery" }),
             None,
         ))
         .await
         .expect("one-shot");
 
-    assert_eq!(response.status(), StatusCode::OK);
-    let body = body_json(response).await;
-    assert_eq!(body["success"], true);
-    assert_eq!(body["email"], "owner@example.com");
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]
@@ -70,17 +86,17 @@ async fn given_existing_credentials_and_valid_token_when_set_posted_then_200_and
 
     let first = router
         .clone()
-        .oneshot(credentials_request(
-            json!({ "email": "owner@example.com", "password": "hunter2" }),
-            None,
+        .oneshot(register_request(
+            "owner@example.com",
+            "correct horse battery",
         ))
         .await
-        .expect("bootstrap one-shot");
-    assert_eq!(first.status(), StatusCode::OK);
+        .expect("register one-shot");
+    assert_eq!(first.status(), StatusCode::CREATED);
 
     let response = router
         .oneshot(credentials_request(
-            json!({ "email": "new-owner@example.com", "password": "new-password" }),
+            json!({ "email": "new-owner@example.com", "password": "another good passphrase" }),
             Some(common::TEST_TOKEN),
         ))
         .await
@@ -91,7 +107,7 @@ async fn given_existing_credentials_and_valid_token_when_set_posted_then_200_and
     assert_eq!(body["email"], "new-owner@example.com");
 }
 
-// ---------------- UC-35 AF-03: conditional authorization ----------------
+// ---------------- UC-35 AF-03: unauthenticated caller ----------------
 
 #[tokio::test]
 async fn given_existing_credentials_and_no_token_when_set_posted_then_401_and_unchanged() {
@@ -100,17 +116,17 @@ async fn given_existing_credentials_and_no_token_when_set_posted_then_401_and_un
 
     let first = router
         .clone()
-        .oneshot(credentials_request(
-            json!({ "email": "owner@example.com", "password": "hunter2" }),
-            None,
+        .oneshot(register_request(
+            "owner@example.com",
+            "correct horse battery",
         ))
         .await
-        .expect("bootstrap one-shot");
-    assert_eq!(first.status(), StatusCode::OK);
+        .expect("register one-shot");
+    assert_eq!(first.status(), StatusCode::CREATED);
 
     let response = router
         .oneshot(credentials_request(
-            json!({ "email": "attacker@example.com", "password": "whatever" }),
+            json!({ "email": "attacker@example.com", "password": "another good passphrase" }),
             None,
         ))
         .await
@@ -124,12 +140,22 @@ async fn given_existing_credentials_and_no_token_when_set_posted_then_401_and_un
 #[tokio::test]
 async fn given_empty_password_when_set_posted_then_400() {
     let test = test_app().await;
-    let router = app(Settings::default(), test.services);
+    let router = app(Settings::default(), test.services.clone());
+
+    let first = router
+        .clone()
+        .oneshot(register_request(
+            "owner@example.com",
+            "correct horse battery",
+        ))
+        .await
+        .expect("register one-shot");
+    assert_eq!(first.status(), StatusCode::CREATED);
 
     let response = router
         .oneshot(credentials_request(
             json!({ "email": "owner@example.com", "password": "" }),
-            None,
+            Some(common::TEST_TOKEN),
         ))
         .await
         .expect("one-shot");
@@ -146,17 +172,17 @@ async fn given_correct_credentials_when_login_posted_then_200_with_session_id() 
 
     let setup = router
         .clone()
-        .oneshot(credentials_request(
-            json!({ "email": "owner@example.com", "password": "hunter2" }),
-            None,
+        .oneshot(register_request(
+            "owner@example.com",
+            "correct horse battery",
         ))
         .await
-        .expect("bootstrap one-shot");
-    assert_eq!(setup.status(), StatusCode::OK);
+        .expect("register one-shot");
+    assert_eq!(setup.status(), StatusCode::CREATED);
 
     let response = router
         .oneshot(login_request(
-            json!({ "email": "owner@example.com", "password": "hunter2" }),
+            json!({ "email": "owner@example.com", "password": "correct horse battery" }),
         ))
         .await
         .expect("login one-shot");
@@ -179,13 +205,13 @@ async fn given_wrong_password_when_login_posted_then_401() {
 
     let setup = router
         .clone()
-        .oneshot(credentials_request(
-            json!({ "email": "owner@example.com", "password": "hunter2" }),
-            None,
+        .oneshot(register_request(
+            "owner@example.com",
+            "correct horse battery",
         ))
         .await
-        .expect("bootstrap one-shot");
-    assert_eq!(setup.status(), StatusCode::OK);
+        .expect("register one-shot");
+    assert_eq!(setup.status(), StatusCode::CREATED);
 
     let response = router
         .oneshot(login_request(
@@ -206,7 +232,7 @@ async fn given_no_credentials_set_when_login_posted_then_500() {
 
     let response = router
         .oneshot(login_request(
-            json!({ "email": "owner@example.com", "password": "hunter2" }),
+            json!({ "email": "owner@example.com", "password": "correct horse battery" }),
         ))
         .await
         .expect("login one-shot");

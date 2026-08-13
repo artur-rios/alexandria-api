@@ -1604,6 +1604,82 @@ impl LocalCredentialRepository for FakeLocalCredentialRepository {
         });
         Ok(())
     }
+
+    async fn insert_if_absent(
+        &self,
+        email: &str,
+        password_hash: &str,
+        _updated_at: DateTime<Utc>,
+    ) -> Result<bool, DomainError> {
+        let mut guard = self.credential.lock().unwrap();
+        if guard.is_some() {
+            return Ok(false);
+        }
+        *guard = Some(LocalCredential {
+            email: email.to_string(),
+            password_hash: password_hash.to_string(),
+        });
+        Ok(true)
+    }
+}
+
+/// A `LocalCredentialRepository` that simulates a row appearing between the
+/// existence check and the write (UC-41 fix for the check-then-act race):
+/// `get()` always answers `None`, as if the check ran before the
+/// concurrent write landed, while `insert_if_absent` sees the row that is
+/// "already there" at the storage layer and refuses to overwrite it. Lets a
+/// test drive the race without two real concurrent tasks.
+#[derive(Debug, Clone)]
+pub struct RacingLocalCredentialRepository {
+    credential: Arc<Mutex<LocalCredential>>,
+}
+
+impl RacingLocalCredentialRepository {
+    /// Pre-seed the row that "wins" the race.
+    pub fn new(email: &str, password_hash: &str) -> Self {
+        Self {
+            credential: Arc::new(Mutex::new(LocalCredential {
+                email: email.to_string(),
+                password_hash: password_hash.to_string(),
+            })),
+        }
+    }
+
+    pub fn stored(&self) -> LocalCredential {
+        self.credential.lock().unwrap().clone()
+    }
+}
+
+impl LocalCredentialRepository for RacingLocalCredentialRepository {
+    async fn get(&self) -> Result<Option<LocalCredential>, DomainError> {
+        // Simulates the existence check having run before the concurrent
+        // write landed.
+        Ok(None)
+    }
+
+    async fn upsert(
+        &self,
+        email: &str,
+        password_hash: &str,
+        _updated_at: DateTime<Utc>,
+    ) -> Result<(), DomainError> {
+        *self.credential.lock().unwrap() = LocalCredential {
+            email: email.to_string(),
+            password_hash: password_hash.to_string(),
+        };
+        Ok(())
+    }
+
+    async fn insert_if_absent(
+        &self,
+        _email: &str,
+        _password_hash: &str,
+        _updated_at: DateTime<Utc>,
+    ) -> Result<bool, DomainError> {
+        // The row is already there at the storage layer, regardless of what
+        // `get()` answered — this is the whole point of the fake.
+        Ok(false)
+    }
 }
 
 /// In-memory session repository (UC-34's postcondition: "a session must be
@@ -1641,6 +1717,27 @@ impl SessionRepository for FakeSessionRepository {
             .unwrap()
             .get(&id)
             .is_some_and(|expires_at| now < *expires_at))
+    }
+}
+
+/// A `SessionRepository` whose writes always fail (UC-41 AF-06). Lets a
+/// test drive the "credential row written, session creation failed" path
+/// without a real database.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct FailingSessionRepository;
+
+impl SessionRepository for FailingSessionRepository {
+    async fn create_session(
+        &self,
+        _id: Uuid,
+        _created_at: DateTime<Utc>,
+        _expires_at: DateTime<Utc>,
+    ) -> Result<(), DomainError> {
+        Err(DomainError::Disk("session store unavailable".into()))
+    }
+
+    async fn is_valid(&self, _id: Uuid, _now: DateTime<Utc>) -> Result<bool, DomainError> {
+        Err(DomainError::Disk("session store unavailable".into()))
     }
 }
 

@@ -17,7 +17,7 @@ use alexandria_core::config::Settings;
 use alexandria_core::migrate::migrate_database;
 use alexandria_core::services::build_services;
 use alexandria_ffi::{
-    alexandria_auth_local_login, alexandria_auth_local_set_credentials, alexandria_bookmark_create,
+    alexandria_auth_local_login, alexandria_auth_local_register, alexandria_bookmark_create,
     alexandria_bookmark_purge, alexandria_bookmark_restore, alexandria_bookmark_soft_delete,
     alexandria_bookmark_update, alexandria_bookmarks_list, alexandria_collection_add_items,
     alexandria_collection_create, alexandria_collection_delete, alexandria_collection_list_items,
@@ -8606,10 +8606,12 @@ async fn given_non_text_file_when_edited_via_http_and_ffi_then_both_invalid_inpu
     );
 }
 
-/// UC-34/UC-35 parity — set local credentials then log in through both
-/// transports and assert identical response shapes (Testing Specification
-/// §7.3). Session ids differ by construction (independent databases), so
-/// parity asserts each is present and well-formed rather than equal.
+/// UC-34/UC-35 parity — register local credentials (UC-41, the account's
+/// only bootstrap path since UC-35 became change-only) then log in through
+/// both transports and assert identical response shapes (Testing
+/// Specification §7.3). Session ids differ by construction (independent
+/// databases), so parity asserts each is present and well-formed rather
+/// than equal.
 #[tokio::test]
 async fn given_same_local_credentials_when_set_and_logged_in_via_http_and_ffi_then_bodies_match() {
     let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
@@ -8623,25 +8625,39 @@ async fn given_same_local_credentials_when_set_and_logged_in_via_http_and_ffi_th
         std::sync::Arc::new(build_services(&local_settings(), http_pool.clone()).await);
     let router = app(Settings::default(), http_services);
 
-    let set_req = Request::builder()
+    let register_req = Request::builder()
         .method("POST")
-        .uri("/v1/auth/local/credentials")
+        .uri("/v1/auth/local/register")
         .header("content-type", "application/json")
         .body(Body::from(
-            json!({ "email": "owner@example.com", "password": "hunter2" }).to_string(),
+            json!({
+                "email": "owner@example.com",
+                "password": "correct horse battery",
+                "passwordConfirmation": "correct horse battery",
+            })
+            .to_string(),
         ))
         .unwrap();
-    let set_resp = router.clone().oneshot(set_req).await.expect("http set");
-    assert_eq!(set_resp.status(), axum::http::StatusCode::OK);
-    let http_set_body: serde_json::Value =
-        serde_json::from_slice(&to_bytes(set_resp.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let register_resp = router
+        .clone()
+        .oneshot(register_req)
+        .await
+        .expect("http register");
+    assert_eq!(register_resp.status(), axum::http::StatusCode::CREATED);
+    let http_set_body: serde_json::Value = serde_json::from_slice(
+        &to_bytes(register_resp.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
 
     let login_req = Request::builder()
         .method("POST")
         .uri("/v1/auth/local/login")
         .header("content-type", "application/json")
         .body(Body::from(
-            json!({ "email": "owner@example.com", "password": "hunter2" }).to_string(),
+            json!({ "email": "owner@example.com", "password": "correct horse battery" })
+                .to_string(),
         ))
         .unwrap();
     let login_resp = router.oneshot(login_req).await.expect("http login");
@@ -8661,24 +8677,36 @@ async fn given_same_local_credentials_when_set_and_logged_in_via_http_and_ffi_th
                 alexandria_ffi::INDEX_OK
             );
 
-            let body = CString::new(
-                json!({ "email": "owner@example.com", "password": "hunter2" }).to_string(),
+            let register_body = CString::new(
+                json!({
+                    "email": "owner@example.com",
+                    "password": "correct horse battery",
+                    "passwordConfirmation": "correct horse battery",
+                })
+                .to_string(),
             )
             .unwrap();
-            let empty_token = CString::new("").unwrap();
-            let set_result =
-                alexandria_auth_local_set_credentials(body.as_ptr(), empty_token.as_ptr());
-            assert_eq!(set_result.status, alexandria_ffi::AUTH_OK, "ffi set failed");
-            assert!(!set_result.json.is_null());
-            let set_json = unsafe { CStr::from_ptr(set_result.json) }
+            let register_result = alexandria_auth_local_register(register_body.as_ptr());
+            assert_eq!(
+                register_result.status,
+                alexandria_ffi::AUTH_OK,
+                "ffi register failed"
+            );
+            assert!(!register_result.json.is_null());
+            let set_json = unsafe { CStr::from_ptr(register_result.json) }
                 .to_str()
                 .unwrap()
                 .to_string();
             unsafe {
-                alexandria_free_string(set_result.json);
+                alexandria_free_string(register_result.json);
             }
 
-            let login_result = alexandria_auth_local_login(body.as_ptr());
+            let login_body = CString::new(
+                json!({ "email": "owner@example.com", "password": "correct horse battery" })
+                    .to_string(),
+            )
+            .unwrap();
+            let login_result = alexandria_auth_local_login(login_body.as_ptr());
             assert_eq!(
                 login_result.status,
                 alexandria_ffi::AUTH_OK,
@@ -8702,7 +8730,12 @@ async fn given_same_local_credentials_when_set_and_logged_in_via_http_and_ffi_th
     let ffi_login_body: serde_json::Value = serde_json::from_str(&ffi_login_json).unwrap();
 
     // ---- compare ----
-    assert_eq!(http_set_body, ffi_set_body, "set-credentials body parity");
+    // Registration bodies now carry a per-surface sessionId (UC-41 opens a
+    // session on success), so compare `success`/`email` rather than the
+    // whole body.
+    assert_eq!(http_set_body["success"], ffi_set_body["success"]);
+    assert_eq!(http_set_body["success"], json!(true));
+    assert_eq!(http_set_body["email"], ffi_set_body["email"]);
 
     assert_eq!(http_login_body["success"], ffi_login_body["success"]);
     assert_eq!(http_login_body["success"], serde_json::json!(true));
@@ -10278,4 +10311,106 @@ async fn given_error_conditions_when_played_then_both_surfaces_agree() {
             alexandria_ffi::PLAYBACK_ERR_INVALID_INPUT,
         ]
     );
+}
+
+/// UC-41 parity: registering over HTTP and over FFI must produce the same
+/// body shape, and a second registration must conflict on both surfaces.
+#[tokio::test]
+async fn given_uc41_register_when_called_on_both_surfaces_then_bodies_match() {
+    const PASSWORD: &str = "correct horse battery";
+
+    fn register_body() -> serde_json::Value {
+        json!({
+            "email": "owner@example.com",
+            "password": PASSWORD,
+            "passwordConfirmation": PASSWORD,
+        })
+    }
+
+    // The FFI leg mutates process-global state (`services_slot`), so every
+    // parity test in this file takes `SERIAL` first.
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+
+    // ---- HTTP leg ----
+    let http_dir = tempdir().unwrap();
+    let http_db = db_path(&http_dir, "http.sqlite");
+    let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    seed_session(&http_pool, TEST_TOKEN).await;
+    let http_services =
+        std::sync::Arc::new(build_services(&local_settings(), http_pool.clone()).await);
+    let router = app(Settings::default(), http_services);
+
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/auth/local/register")
+        .header("content-type", "application/json")
+        .body(Body::from(register_body().to_string()))
+        .unwrap();
+    let response = router
+        .clone()
+        .oneshot(request)
+        .await
+        .expect("http register");
+    assert_eq!(response.status(), axum::http::StatusCode::CREATED);
+    let http_body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+
+    let second = Request::builder()
+        .method("POST")
+        .uri("/v1/auth/local/register")
+        .header("content-type", "application/json")
+        .body(Body::from(register_body().to_string()))
+        .unwrap();
+    let second = router.oneshot(second).await.expect("http second register");
+    assert_eq!(second.status(), axum::http::StatusCode::CONFLICT);
+
+    // ---- FFI leg ----
+    let ffi_dir = tempdir().unwrap();
+    let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
+    let (ffi_json, second_status): (String, i32) =
+        tokio::task::spawn_blocking(move || -> (String, i32) {
+            let cdb = CString::new(ffi_db).unwrap();
+            assert_eq!(
+                alexandria_index_init(cdb.as_ptr()),
+                alexandria_ffi::INDEX_OK
+            );
+
+            let body = CString::new(register_body().to_string()).unwrap();
+            let result = alexandria_auth_local_register(body.as_ptr());
+            assert_eq!(
+                result.status,
+                alexandria_ffi::AUTH_OK,
+                "ffi register failed"
+            );
+            assert!(!result.json.is_null());
+            let json = unsafe { CStr::from_ptr(result.json) }
+                .to_str()
+                .unwrap()
+                .to_string();
+            unsafe {
+                alexandria_free_string(result.json);
+            }
+
+            let second = alexandria_auth_local_register(body.as_ptr());
+            (json, second.status)
+        })
+        .await
+        .unwrap();
+
+    let ffi_body: serde_json::Value = serde_json::from_str(&ffi_json).unwrap();
+
+    // ---- compare ----
+    assert_eq!(
+        second_status,
+        alexandria_ffi::AUTH_ERR_CONFLICT,
+        "a second FFI registration must conflict, as HTTP's 409 does"
+    );
+    assert_eq!(http_body["success"], ffi_body["success"]);
+    assert_eq!(http_body["success"], json!(true));
+    assert_eq!(http_body["email"], ffi_body["email"]);
+    // Session ids are random per surface; assert shape, not equality.
+    for body in [&http_body, &ffi_body] {
+        let session_id = body["sessionId"].as_str().expect("sessionId");
+        uuid::Uuid::parse_str(session_id).expect("sessionId must be a uuid");
+    }
 }

@@ -27,6 +27,18 @@ pub struct LocalLoginResult {
     pub session_id: Uuid,
 }
 
+/// Confirmation that the local account was created (UC-41 / FR-AU-10),
+/// carrying the session id registration opened so the caller is
+/// authenticated without a second round-trip through UC-34. Never carries
+/// the password or its hash (FR-AU-06).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalRegisterResult {
+    pub success: bool,
+    pub email: String,
+    pub session_id: Uuid,
+}
+
 /// The single owner's local-login credential row (SRD §4.9). Singleton —
 /// there is exactly one row, `id = 1`.
 #[derive(Debug, Clone)]
@@ -40,7 +52,7 @@ pub struct LocalCredential {
 #[allow(async_fn_in_trait)]
 pub trait LocalCredentialRepository: Send + Sync {
     /// The current credential row, if local login has been set up (UC-34
-    /// AF-03: `None` means "run UC-35 first").
+    /// AF-03: `None` means "run UC-41 first").
     async fn get(&self) -> Result<Option<LocalCredential>, DomainError>;
     /// Create or overwrite the singleton credential row (UC-35 / FR-AU-05).
     async fn upsert(
@@ -49,6 +61,21 @@ pub trait LocalCredentialRepository: Send + Sync {
         password_hash: &str,
         updated_at: DateTime<Utc>,
     ) -> Result<(), DomainError>;
+    /// Create the singleton credential row only if it does not already
+    /// exist, returning `true` when this call created it and `false` when a
+    /// row was already there (UC-41 / FR-AU-10). `get()` followed by
+    /// `upsert` is check-then-act: two concurrent first-time registrations
+    /// can both pass the `get()` check before either writes, and the second
+    /// `upsert` would silently overwrite the first — exactly the
+    /// silent-overwrite failure UC-41 exists to eliminate. This method
+    /// closes that window by making the existence check and the write a
+    /// single atomic operation at the storage layer.
+    async fn insert_if_absent(
+        &self,
+        email: &str,
+        password_hash: &str,
+        updated_at: DateTime<Utc>,
+    ) -> Result<bool, DomainError>;
 }
 
 /// Sessions repository port (UC-34 postcondition: "a session must be
@@ -115,6 +142,25 @@ impl LocalCredentialRepository for SqliteLocalCredentialRepository {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    async fn insert_if_absent(
+        &self,
+        email: &str,
+        password_hash: &str,
+        updated_at: DateTime<Utc>,
+    ) -> Result<bool, DomainError> {
+        let result = sqlx::query(
+            "INSERT INTO local_login_credentials (id, email, password_hash, updated_at) \
+             VALUES (1, ?, ?, ?) \
+             ON CONFLICT (id) DO NOTHING",
+        )
+        .bind(email)
+        .bind(password_hash)
+        .bind(updated_at.to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
     }
 }
 
@@ -204,4 +250,24 @@ where
     fn mode(&self) -> AuthMode {
         AuthMode::Local
     }
+}
+
+/// Mint a session valid for `ttl_hours` from now and persist it
+/// (FR-AU-09). Shared by UC-34 login and UC-41 registration: both open a
+/// session on success, and the expiry arithmetic must not drift between
+/// the two paths.
+pub async fn issue_session<SR, C>(
+    sessions: &SR,
+    clock: &C,
+    ttl_hours: u32,
+) -> Result<Uuid, DomainError>
+where
+    SR: SessionRepository,
+    C: Clock,
+{
+    let session_id = Uuid::new_v4();
+    let now = clock.now();
+    let expires_at = now + chrono::Duration::hours(i64::from(ttl_hours));
+    sessions.create_session(session_id, now, expires_at).await?;
+    Ok(session_id)
 }

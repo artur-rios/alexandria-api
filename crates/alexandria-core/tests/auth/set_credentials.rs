@@ -1,9 +1,9 @@
 //! Unit tests for the UC-35 SetLocalCredentialsHandler (Testing
 //! Specification §6). Each test exercises exactly the handler against trait
-//! fakes — no real DB or auth service. Coverage follows §6.3: happy path for
-//! first-time setup and for changing existing credentials, AF-01 (wrong
-//! mode), AF-02 (invalid email / empty password), and AF-03 (conditional
-//! authorization).
+//! fakes — no real DB or auth service. Coverage follows §6.3: the change
+//! flow for existing credentials, AF-01 (wrong mode), AF-02 (invalid email)
+//! /AF-04 (weak password), and AF-03 (unauthenticated caller — UC-35 is
+//! change-only since UC-41, so authentication is unconditional).
 
 use chrono::{TimeZone, Utc};
 
@@ -35,27 +35,45 @@ fn handler(
 // ---------------- Main flow ----------------
 
 #[tokio::test]
-async fn given_first_time_setup_when_set_then_succeeds_without_authenticating() {
-    // AF-03: no credentials exist yet, so an unauthenticated (denying) auth
-    // service must not block first-time setup.
+async fn given_no_credentials_and_no_authentication_when_set_then_unauthorized() {
+    // UC-35 is change-only since UC-41: bootstrap goes through
+    // registration, so this handler authenticates unconditionally — like
+    // every other handler in the codebase.
     let repo = FakeLocalCredentialRepository::new();
     let h = handler(FakeAuth::Denying, repo.clone(), AuthMode::Local);
 
-    let result = h
-        .set("owner@example.com".to_string(), "hunter2".to_string(), "")
+    let err = h
+        .set(
+            "owner@example.com".to_string(),
+            "correct horse battery".to_string(),
+            "",
+        )
         .await
-        .expect("set");
+        .expect_err("must not bootstrap");
 
-    assert!(result.success);
-    assert_eq!(result.email, "owner@example.com");
-
-    let stored = repo.get().await.unwrap().expect("credential stored");
-    assert_eq!(stored.email, "owner@example.com");
-    assert!(verify_password("hunter2", &stored.password_hash));
-    assert_ne!(
-        stored.password_hash, "hunter2",
-        "the plaintext must never be stored"
+    assert!(matches!(err, DomainError::Unauthorized), "got {err:?}");
+    assert!(
+        repo.get().await.unwrap().is_none(),
+        "nothing may be written on a denied change"
     );
+}
+
+#[tokio::test]
+async fn given_a_weak_password_when_set_then_invalid_input() {
+    // FR-AU-11 applies to changing a password, not only to registering.
+    let repo = FakeLocalCredentialRepository::new();
+    let h = handler(FakeAuth::Allowing, repo, AuthMode::Local);
+
+    let err = h
+        .set(
+            "owner@example.com".to_string(),
+            "short".to_string(),
+            "token",
+        )
+        .await
+        .expect_err("must reject a weak password");
+
+    assert!(matches!(err, DomainError::InvalidInput(_)), "got {err:?}");
 }
 
 #[tokio::test]
@@ -67,7 +85,7 @@ async fn given_existing_credentials_and_authenticated_when_set_then_changed() {
     let result = h
         .set(
             "new@example.com".to_string(),
-            "new-password".to_string(),
+            "another good passphrase".to_string(),
             TOKEN,
         )
         .await
@@ -76,7 +94,10 @@ async fn given_existing_credentials_and_authenticated_when_set_then_changed() {
     assert_eq!(result.email, "new@example.com");
     let stored = repo.get().await.unwrap().unwrap();
     assert_eq!(stored.email, "new@example.com");
-    assert!(verify_password("new-password", &stored.password_hash));
+    assert!(verify_password(
+        "another good passphrase",
+        &stored.password_hash
+    ));
 }
 
 // ---------------- AF-01: wrong mode ----------------
@@ -89,7 +110,7 @@ async fn given_external_auth_mode_when_set_then_invalid_state_and_unchanged() {
     let result = h
         .set(
             "owner@example.com".to_string(),
-            "hunter2".to_string(),
+            "correct horse battery".to_string(),
             TOKEN,
         )
         .await;
@@ -98,7 +119,7 @@ async fn given_external_auth_mode_when_set_then_invalid_state_and_unchanged() {
     assert!(repo.get().await.unwrap().is_none());
 }
 
-// ---------------- AF-03: conditional authorization ----------------
+// ---------------- AF-03: unauthenticated caller ----------------
 
 #[tokio::test]
 async fn given_existing_credentials_and_unauthenticated_when_set_then_unauthorized_and_unchanged() {
@@ -109,7 +130,7 @@ async fn given_existing_credentials_and_unauthenticated_when_set_then_unauthoriz
     let result = h
         .set(
             "new@example.com".to_string(),
-            "new-password".to_string(),
+            "another good passphrase".to_string(),
             "",
         )
         .await;
@@ -124,10 +145,10 @@ async fn given_existing_credentials_and_unauthenticated_when_set_then_unauthoriz
 #[tokio::test]
 async fn given_empty_password_when_set_then_invalid_input_and_unchanged() {
     let repo = FakeLocalCredentialRepository::new();
-    let h = handler(FakeAuth::Denying, repo.clone(), AuthMode::Local);
+    let h = handler(FakeAuth::Allowing, repo.clone(), AuthMode::Local);
 
     let result = h
-        .set("owner@example.com".to_string(), "".to_string(), "")
+        .set("owner@example.com".to_string(), "".to_string(), TOKEN)
         .await;
 
     assert!(matches!(result, Err(DomainError::InvalidInput(_))));
@@ -137,10 +158,14 @@ async fn given_empty_password_when_set_then_invalid_input_and_unchanged() {
 #[tokio::test]
 async fn given_invalid_email_when_set_then_invalid_input_and_unchanged() {
     let repo = FakeLocalCredentialRepository::new();
-    let h = handler(FakeAuth::Denying, repo.clone(), AuthMode::Local);
+    let h = handler(FakeAuth::Allowing, repo.clone(), AuthMode::Local);
 
     let result = h
-        .set("not-an-email".to_string(), "hunter2".to_string(), "")
+        .set(
+            "not-an-email".to_string(),
+            "correct horse battery".to_string(),
+            TOKEN,
+        )
         .await;
 
     assert!(matches!(result, Err(DomainError::InvalidInput(_))));

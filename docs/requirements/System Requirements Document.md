@@ -175,6 +175,8 @@ graph LR
 | FR-AU-07 | The system shall authorize the single owner for every catalog operation and shall reject unauthenticated calls. |
 | FR-AU-08 | The system shall expose authentication operations via both the HTTP and FFI surfaces consistently. |
 | FR-AU-09 | In local mode, a successful login shall create a Session with a configurable expiry (default 24 hours); the caller shall present that session's id on every subsequent request, and the system shall reject an unknown or expired session id as unauthenticated. |
+| FR-AU-10 | In local mode, the system shall provide a registration operation that creates the single owner's credential row when none exists, opens a session for the caller, and rejects any subsequent registration as a conflict. |
+| FR-AU-11 | The system shall reject a local password that is shorter than 12 characters, longer than 128 characters, entirely whitespace, a single repeated character, equal to or containing the submitted email address, or one of a list of common passwords. |
 
 ### 3.8 Media Playback (MP)
 
@@ -313,7 +315,8 @@ type-specific metadata. Representative subtype fields:
 
 ### 4.9 LocalLoginCredential Fields
 
-Single-row table (the owner).
+Single-row table (the owner). The row is created by registration (UC-41) and
+changed thereafter by the credentials operation (UC-35).
 
 | Field | Type | Constraints | Description |
 | --- | --- | --- | --- |
@@ -421,17 +424,21 @@ endpoint requires authentication from the active mode (see §7).
 
 | Method | Path | Description | Requirement |
 | --- | --- | --- | --- |
+| POST | /v1/auth/local/register | Create the owner's local account and open a session (local mode). | FR-AU-10, FR-AU-11 |
 | POST | /v1/auth/local/login | Verify email + password and open a session (local mode). | FR-AU-04, FR-AU-09 |
-| POST | /v1/auth/local/credentials | Set or change local credentials (local mode). | FR-AU-05, FR-AU-06 |
+| POST | /v1/auth/local/credentials | Change existing local credentials (local mode). | FR-AU-05, FR-AU-06 |
 
 External JWT validation (FR-AU-02) is enforced by HTTP middleware on every
 request, not by an endpoint. The same middleware validates the local-mode
 session id (FR-AU-09); both are presented as `Authorization: Bearer <value>`.
 
-Both auth endpoints sit outside the blanket authentication gate, for the
-reasons §7 gives: login is how a caller obtains credentials, and first-time
-credential setup has none yet (UC-35 enforces its own conditional
-authorization once credentials exist).
+The register, login, and credentials endpoints all sit outside the blanket
+authentication gate, for the reasons §7 gives: registration is how the
+owner's account first comes to exist, and login is how a caller obtains a
+session. The credentials endpoint is routed alongside them, but always
+requires an authenticated session — the handler enforces that itself rather
+than relying on the router-level gate (UC-35 is change-only; creating the
+account is UC-41).
 
 ### 5.9 Media Playback
 
@@ -478,6 +485,7 @@ returns a playback descriptor instead of bytes (FR-MP-06).
 | Create / update / delete watchlist and progress | ✅ | ❌ |
 | Create / update / delete reading list and progress | ✅ | ❌ |
 | Local login (local mode) | ✅ (open to verify) | ⚠️ only the login verification endpoint; all other operations denied |
+| Register the local account (local mode) | n/a — no account exists yet to authenticate as | ⚠️ only once, while no local account exists; a second attempt is denied with a conflict (UC-41) |
 | Set or change local credentials (local mode) | ✅ | ❌ |
 | External JWT validation | ✅ | ⚠️ only as the bearer of a valid JWT; invalid tokens denied |
 
@@ -489,9 +497,12 @@ would have been accepted — a malformed body or an unparseable identifier does
 not turn a `401` into a `400`. Both the HTTP and FFI surfaces gate this way
 (FR-AU-07, FR-FC-24).
 
-Note: local-login verification is the one operation that accepts unauthenticated
-input (the credentials being verified); success is what grants owner status for
-every subsequent operation.
+Note: local-login verification and local-account registration are the two
+operations that accept unauthenticated input — the credentials being
+verified, and the owner's own new credentials, respectively. Login success
+grants owner status for every subsequent operation; registration succeeds
+at most once, after which every later attempt is a conflict, not a second
+bootstrap.
 
 ---
 
@@ -539,7 +550,7 @@ The feature identifiers are the milestones the
 | F-06 Bookmark management | FR-BM-01 through FR-BM-06 |
 | F-07 Watchlists | FR-WL-01 through FR-WL-08 |
 | F-08 Reading lists | FR-RL-01 through FR-RL-08 |
-| F-09 Pluggable authentication | FR-AU-01 through FR-AU-09 |
+| F-09 Pluggable authentication | FR-AU-01 through FR-AU-11 |
 | F-10 Media playback | FR-MP-01 through FR-MP-06 |
 
 Dual-transport parity (FR-FC-24, FR-AU-08, FR-MP-06, NFR-09) is not a
