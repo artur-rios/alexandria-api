@@ -70,6 +70,10 @@ where
         }
 
         // AF-02: registration creates the account; it never overwrites one.
+        // This is the fast path — it lets the common case (no account yet)
+        // short-circuit before Argon2 runs, which matters because this
+        // endpoint is unauthenticated. It is not the authoritative check:
+        // see the `insert_if_absent` call below.
         if self.credentials.get().await?.is_some() {
             return Err(DomainError::conflict("a local account already exists"));
         }
@@ -87,9 +91,19 @@ where
         }
 
         let password_hash = hash_password(&password)?;
-        self.credentials
-            .upsert(&email, &password_hash, self.clock.now())
+        // AF-02, authoritative: the existence check above and this write are
+        // two separate statements with no shared transaction, so a second
+        // registration could race between them. `insert_if_absent` closes
+        // that window at the storage layer — it is the atomic
+        // create-if-absent operation that actually makes "succeeds only
+        // once" true, not the check above.
+        let created = self
+            .credentials
+            .insert_if_absent(&email, &password_hash, self.clock.now())
             .await?;
+        if !created {
+            return Err(DomainError::conflict("a local account already exists"));
+        }
 
         // AF-06: if this fails the account still exists — deliberately not
         // rolled back. The two writes would need a shared transaction across

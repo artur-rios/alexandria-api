@@ -36,7 +36,11 @@ error.
    /v1/auth/local/credentials` changes an existing one and always requires
    authentication. Splitting the two lets each carry a single, honest
    authorization rule, and lets "already registered" be a real error instead of
-   a silent overwrite.
+   a silent overwrite. Uniqueness itself is enforced by an atomic
+   create-if-absent write (`insert_if_absent`, `INSERT … ON CONFLICT (id) DO
+   NOTHING`) at the storage layer, not merely by the earlier existence check —
+   `get()` then `upsert()` is check-then-act, and two concurrent first-time
+   registrations could both pass the check before either wrote.
 
 2. **Registration returns a session.** Register mints a session the same way
    UC-34 does and returns its id, so a client is authenticated immediately
@@ -195,7 +199,7 @@ This satisfies FR-AU-08 (dual-surface parity) for the new operation.
 | --- | --- |
 | `alexandria-core/src/errors.rs` | Add `Conflict(String)` and a `DomainError::conflict()` constructor beside `config()` / `internal()`. |
 | `alexandria-core/src/auth/password.rs` | Add `validate_strength` and the common-password `const` list. |
-| `alexandria-core/src/auth/local.rs` | Add `LocalRegisterResult { success, email, session_id }`. Extract session minting from `LocalLoginHandler::login` into `issue_session(sessions, clock, ttl_hours) -> Result<Uuid, DomainError>`. |
+| `alexandria-core/src/auth/local.rs` | Add `LocalRegisterResult { success, email, session_id }`. Extract session minting from `LocalLoginHandler::login` into `issue_session(sessions, clock, ttl_hours) -> Result<Uuid, DomainError>`. Add `LocalCredentialRepository::insert_if_absent`, the atomic create-if-absent write that makes AF-02 authoritative. |
 | `alexandria-core/src/auth/commands/register.rs` (new) | `RegisterLocalAccountHandler<CR, SR, C>` — generic over the credential repository, session repository, and clock, matching `LocalLoginHandler`. No `AuthService` dependency: registration is unauthenticated by definition. |
 | `alexandria-core/src/auth/commands/login.rs` | Call `issue_session` instead of minting inline. |
 | `alexandria-core/src/auth/commands/set_credentials.rs` | Unconditional `authenticate`; call `validate_strength`. |

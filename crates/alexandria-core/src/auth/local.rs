@@ -52,7 +52,7 @@ pub struct LocalCredential {
 #[allow(async_fn_in_trait)]
 pub trait LocalCredentialRepository: Send + Sync {
     /// The current credential row, if local login has been set up (UC-34
-    /// AF-03: `None` means "run UC-35 first").
+    /// AF-03: `None` means "run UC-41 first").
     async fn get(&self) -> Result<Option<LocalCredential>, DomainError>;
     /// Create or overwrite the singleton credential row (UC-35 / FR-AU-05).
     async fn upsert(
@@ -61,6 +61,21 @@ pub trait LocalCredentialRepository: Send + Sync {
         password_hash: &str,
         updated_at: DateTime<Utc>,
     ) -> Result<(), DomainError>;
+    /// Create the singleton credential row only if it does not already
+    /// exist, returning `true` when this call created it and `false` when a
+    /// row was already there (UC-41 / FR-AU-10). `get()` followed by
+    /// `upsert` is check-then-act: two concurrent first-time registrations
+    /// can both pass the `get()` check before either writes, and the second
+    /// `upsert` would silently overwrite the first — exactly the
+    /// silent-overwrite failure UC-41 exists to eliminate. This method
+    /// closes that window by making the existence check and the write a
+    /// single atomic operation at the storage layer.
+    async fn insert_if_absent(
+        &self,
+        email: &str,
+        password_hash: &str,
+        updated_at: DateTime<Utc>,
+    ) -> Result<bool, DomainError>;
 }
 
 /// Sessions repository port (UC-34 postcondition: "a session must be
@@ -127,6 +142,25 @@ impl LocalCredentialRepository for SqliteLocalCredentialRepository {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    async fn insert_if_absent(
+        &self,
+        email: &str,
+        password_hash: &str,
+        updated_at: DateTime<Utc>,
+    ) -> Result<bool, DomainError> {
+        let result = sqlx::query(
+            "INSERT INTO local_login_credentials (id, email, password_hash, updated_at) \
+             VALUES (1, ?, ?, ?) \
+             ON CONFLICT (id) DO NOTHING",
+        )
+        .bind(email)
+        .bind(password_hash)
+        .bind(updated_at.to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
     }
 }
 

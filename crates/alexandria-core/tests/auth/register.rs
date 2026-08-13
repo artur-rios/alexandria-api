@@ -14,6 +14,7 @@ use alexandria_core::errors::DomainError;
 
 use crate::common::{
     FailingSessionRepository, FakeLocalCredentialRepository, FakeSessionRepository,
+    RacingLocalCredentialRepository,
 };
 
 const EMAIL: &str = "owner@example.com";
@@ -91,7 +92,15 @@ async fn given_external_auth_mode_when_register_then_conflict_and_nothing_writte
         .await
         .expect_err("must reject in external mode");
 
-    assert!(matches!(err, DomainError::Conflict(_)), "got {err:?}");
+    match err {
+        DomainError::Conflict(message) => {
+            assert_eq!(
+                message, "local login is not the active auth mode",
+                "AF-01's message must be distinguishable from AF-02's"
+            );
+        }
+        other => panic!("expected Conflict, got {other:?}"),
+    }
     assert!(credentials.get().await.unwrap().is_none());
     assert_eq!(sessions.count(), 0);
 }
@@ -117,7 +126,15 @@ async fn given_an_existing_account_when_register_then_conflict_and_credentials_u
         .await
         .expect_err("must reject a second registration");
 
-    assert!(matches!(err, DomainError::Conflict(_)), "got {err:?}");
+    match &err {
+        DomainError::Conflict(message) => {
+            assert_eq!(
+                message, "a local account already exists",
+                "AF-02's message must be distinguishable from AF-01's"
+            );
+        }
+        other => panic!("expected Conflict, got {other:?}"),
+    }
     let stored = credentials.get().await.unwrap().expect("credential");
     assert_eq!(stored.email, EMAIL, "the stored email must be untouched");
     assert_eq!(stored.password_hash, "existing-hash");
@@ -133,7 +150,8 @@ async fn given_an_existing_account_and_a_weak_password_when_register_then_confli
         .upsert(EMAIL, "existing-hash", clock().0)
         .await
         .unwrap();
-    let h = handler(credentials, FakeSessionRepository::new(), AuthMode::Local);
+    let sessions = FakeSessionRepository::new();
+    let h = handler(credentials.clone(), sessions.clone(), AuthMode::Local);
 
     let err = h
         .register(EMAIL.to_string(), "short".to_string(), "short".to_string())
@@ -141,6 +159,52 @@ async fn given_an_existing_account_and_a_weak_password_when_register_then_confli
         .expect_err("must reject");
 
     assert!(matches!(err, DomainError::Conflict(_)), "got {err:?}");
+    let stored = credentials.get().await.unwrap().expect("credential");
+    assert_eq!(stored.email, EMAIL, "the stored email must be untouched");
+    assert_eq!(stored.password_hash, "existing-hash");
+    assert_eq!(sessions.count(), 0);
+}
+
+#[tokio::test]
+async fn given_a_row_appears_between_the_check_and_the_write_when_register_then_conflict_and_no_overwrite(
+) {
+    // The existence check (`get`) alone is check-then-act: it can pass for
+    // two concurrent first-time registrations before either has written.
+    // This drives that race with a fake whose `get()` always answers `None`
+    // (as if the check ran before the concurrent write landed) while its
+    // `insert_if_absent` already holds a row — simulating the second
+    // caller's atomic insert losing to the first at the storage layer.
+    let credentials = RacingLocalCredentialRepository::new("winner@example.com", "winner-hash");
+    let sessions = FakeSessionRepository::new();
+    let h = RegisterLocalAccountHandler::new(
+        credentials.clone(),
+        sessions.clone(),
+        clock(),
+        AuthMode::Local,
+        TTL_HOURS,
+    );
+
+    let err = h
+        .register(
+            "loser@example.com".to_string(),
+            PASSWORD.to_string(),
+            PASSWORD.to_string(),
+        )
+        .await
+        .expect_err("the losing registration must be rejected");
+
+    assert!(matches!(err, DomainError::Conflict(_)), "got {err:?}");
+    let stored = credentials.stored();
+    assert_eq!(
+        stored.email, "winner@example.com",
+        "the winner's row must not be overwritten"
+    );
+    assert_eq!(stored.password_hash, "winner-hash");
+    assert_eq!(
+        sessions.count(),
+        0,
+        "the loser must not obtain a session for someone else's account"
+    );
 }
 
 // ---------------- AF-03: invalid email ----------------
