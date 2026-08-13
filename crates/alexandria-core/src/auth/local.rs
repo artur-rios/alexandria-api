@@ -205,3 +205,23 @@ where
         AuthMode::Local
     }
 }
+
+/// Mint a session valid for `ttl_hours` from now and persist it
+/// (FR-AU-09). Shared by UC-34 login and UC-41 registration: both open a
+/// session on success, and the expiry arithmetic must not drift between
+/// the two paths.
+pub async fn issue_session<SR, C>(
+    sessions: &SR,
+    clock: &C,
+    ttl_hours: u32,
+) -> Result<Uuid, DomainError>
+where
+    SR: SessionRepository,
+    C: Clock,
+{
+    let session_id = Uuid::new_v4();
+    let now = clock.now();
+    let expires_at = now + chrono::Duration::hours(i64::from(ttl_hours));
+    sessions.create_session(session_id, now, expires_at).await?;
+    Ok(session_id)
+}
