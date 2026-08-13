@@ -17,7 +17,7 @@ use crate::bookmarks::commands::update::UpdateBookmarkHandler;
 use crate::bookmarks::queries::browse::BrowseBookmarksHandler;
 use crate::bookmarks::repos::SqliteBookmarkRepository;
 use crate::catalog::audio_tags::LoftyAudioMetadataReader;
-use crate::catalog::clock::SystemClock;
+use crate::catalog::clock::{Clock, SystemClock};
 use crate::catalog::comic_tags::CbzComicMetadataReader;
 use crate::catalog::commands::edit_content::EditTextFileContentHandler;
 use crate::catalog::commands::edit_metadata::EditMetadataHandler;
@@ -34,7 +34,7 @@ use crate::catalog::image_tags::ExifImageMetadataReader;
 use crate::catalog::queries::browse::BrowseFilesHandler;
 use crate::catalog::queries::read_content::ReadTextFileContentHandler;
 use crate::catalog::repos::SqliteCatalogRepository;
-use crate::catalog::runs::SqliteCatalogRunRepository;
+use crate::catalog::runs::{CatalogRunRepository, SqliteCatalogRunRepository};
 use crate::catalog::video_tags::FfmpegVideoMetadataReader;
 use crate::collections::commands::add_items::AddItemsToCollectionHandler;
 use crate::collections::commands::create::CreateCollectionHandler;
@@ -297,6 +297,21 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
     let credential_repo = SqliteLocalCredentialRepository::new(pool.clone());
     let fs = StdFilesystem;
     let clock = SystemClock;
+    // FR-FC-29: any run still recorded as `running` belongs to a process that
+    // is gone — runs execute in-process and are never resumed. Reconcile them
+    // now, so a client polling one gets a terminal answer instead of waiting
+    // forever. A failure here must not stop startup: the catalog is still
+    // fully usable, and the stale rows are reconciled on the next boot.
+    match run_repo.interrupt_running(clock.now()).await {
+        Ok(0) => {}
+        Ok(reconciled) => {
+            tracing::info!(
+                reconciled,
+                "marked interrupted runs left by a previous process"
+            )
+        }
+        Err(err) => tracing::warn!(error = %err, "could not reconcile interrupted runs"),
+    }
     // FR-AU-01/FR-AU-03: exactly one auth mode is active, selected once here
     // from startup configuration.
     let auth = match settings.auth.mode {

@@ -211,6 +211,30 @@ async fn given_no_running_runs_when_reconciled_then_nothing_changes() {
 }
 
 #[tokio::test]
+async fn given_a_run_left_running_when_services_are_built_then_it_is_interrupted() {
+    // FR-FC-29 end to end: a run recorded as running by a previous process is
+    // reconciled at startup, so a client polling it gets a terminal answer
+    // instead of waiting on a run that cannot finish.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("alexandria.sqlite");
+    let pool = migrate_database(path.to_str().expect("path"))
+        .await
+        .expect("migrate");
+
+    let repo = SqliteCatalogRunRepository::new(pool.clone());
+    let id = Uuid::new_v4();
+    repo.start(id, RunKind::Refresh, None, t(1))
+        .await
+        .expect("start");
+
+    let _services =
+        alexandria_core::services::build_services(&Default::default(), pool.clone()).await;
+
+    let run = repo.get(id).await.expect("get").expect("run exists");
+    assert_eq!(run.status, RunStatus::Interrupted);
+}
+
+#[tokio::test]
 async fn given_an_index_run_when_finished_with_refresh_counts_then_error_and_row_untouched() {
     // Passing the wrong kind's tally would leave the row's real (index)
     // columns NULL and the wrong-kind columns set — a corrupted write that
