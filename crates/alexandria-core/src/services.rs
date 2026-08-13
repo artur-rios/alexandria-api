@@ -3,6 +3,7 @@ use std::sync::Arc;
 use sqlx::sqlite::SqlitePool;
 
 use crate::auth::commands::login::LocalLoginHandler;
+use crate::auth::commands::register::RegisterLocalAccountHandler;
 use crate::auth::commands::set_credentials::SetLocalCredentialsHandler;
 use crate::auth::external::{ExternalAuthService, HttpJwksProvider};
 use crate::auth::local::{
@@ -222,6 +223,12 @@ pub type DefaultSetLocalCredentialsHandler =
 pub type DefaultLocalLoginHandler =
     LocalLoginHandler<SqliteLocalCredentialRepository, SqliteSessionRepository, SystemClock>;
 
+pub type DefaultRegisterLocalAccountHandler = RegisterLocalAccountHandler<
+    SqliteLocalCredentialRepository,
+    SqliteSessionRepository,
+    SystemClock,
+>;
+
 #[derive(Clone)]
 pub struct Services {
     pub index_handler: Arc<DefaultIndexHandler>,
@@ -263,6 +270,7 @@ pub struct Services {
     pub delete_reading_list_handler: Arc<DefaultDeleteReadingListHandler>,
     pub set_local_credentials_handler: Arc<DefaultSetLocalCredentialsHandler>,
     pub local_login_handler: Arc<DefaultLocalLoginHandler>,
+    pub register_local_account_handler: Arc<DefaultRegisterLocalAccountHandler>,
     /// The same auth service the handlers hold, exposed so a transport can
     /// reject an unauthenticated caller *before* it parses a request body or
     /// path (FR-AU-07 / SRD §7). Handlers still authenticate independently —
@@ -504,6 +512,13 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         settings.auth.mode,
     ));
     let local_login_handler = Arc::new(LocalLoginHandler::new(
+        credential_repo.clone(),
+        session_repo.clone(),
+        clock,
+        settings.auth.mode,
+        settings.auth.session_ttl_hours,
+    ));
+    let register_local_account_handler = Arc::new(RegisterLocalAccountHandler::new(
         credential_repo,
         session_repo,
         clock,
@@ -550,6 +565,7 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         delete_reading_list_handler,
         set_local_credentials_handler,
         local_login_handler,
+        register_local_account_handler,
         auth,
         pool,
     }

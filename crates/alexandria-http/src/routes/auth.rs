@@ -4,7 +4,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
 use serde::Deserialize;
 
-use alexandria_core::auth::local::{LocalCredentialsResult, LocalLoginResult};
+use alexandria_core::auth::local::{LocalCredentialsResult, LocalLoginResult, LocalRegisterResult};
 
 use crate::middleware::auth::invalid_input;
 use crate::middleware::error::ApiError;
@@ -71,4 +71,46 @@ pub async fn set_credentials(
         .map_err(ApiError)?;
 
     Ok((StatusCode::OK, Json(result)))
+}
+
+/// Request body for `POST /v1/auth/local/register` (UC-41). Unlike the
+/// other two local-auth endpoints this carries a confirmation field: the
+/// owner's password is unrecoverable, and a typo at registration locks
+/// them out of their own catalog.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalRegisterRequest {
+    pub email: String,
+    pub password: String,
+    pub password_confirmation: String,
+}
+
+/// `POST /v1/auth/local/register` — create the single owner's local
+/// account and open a session for it (UC-41 / FR-AU-10, FR-AU-11).
+/// Deliberately outside the blanket `require_auth` gate: there is nothing
+/// to authenticate with before an account exists. Safe to leave ungated
+/// because it succeeds only once — every later call is AF-02's conflict.
+/// Returns `201` with the `LocalRegisterResult`, or `400` (malformed
+/// email, weak password, mismatched confirmation, or a malformed body —
+/// AF-03/AF-04/AF-05), or `409` (the active auth mode is not local, AF-01,
+/// or an account already exists, AF-02 — distinguished by the message).
+pub async fn register(
+    State(state): State<AppState>,
+    body: Result<Json<LocalRegisterRequest>, JsonRejection>,
+) -> Result<(StatusCode, Json<LocalRegisterResult>), ApiError> {
+    let Json(request) =
+        body.map_err(|err| invalid_input(format!("invalid register body: {err}")))?;
+
+    let result = state
+        .services
+        .register_local_account_handler
+        .register(
+            request.email,
+            request.password,
+            request.password_confirmation,
+        )
+        .await
+        .map_err(ApiError)?;
+
+    Ok((StatusCode::CREATED, Json(result)))
 }
