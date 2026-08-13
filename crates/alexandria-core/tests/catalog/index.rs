@@ -16,9 +16,10 @@ use alexandria_core::catalog::video_tags::{VideoDuration, VideoMetadataReader, V
 use alexandria_core::errors::DomainError;
 
 use crate::common::{
-    existing_file, fixed_clock, now, FailingListFilesystem, FakeAudioMetadataReader, FakeAuth,
-    FakeCatalogRepository, FakeCatalogRunRepository, FakeComicMetadataReader,
-    FakeDocumentMetadataReader, FakeFilesystem, FakeImageMetadataReader, FakeVideoMetadataReader,
+    existing_file, fixed_clock, now, FailingCatalogRunRepository, FailingListFilesystem,
+    FakeAudioMetadataReader, FakeAuth, FakeCatalogRepository, FakeCatalogRunRepository,
+    FakeComicMetadataReader, FakeDocumentMetadataReader, FakeFilesystem, FakeImageMetadataReader,
+    FakeVideoMetadataReader,
 };
 
 const ROOT: &str = "/library";
@@ -159,6 +160,7 @@ async fn given_valid_root_and_authenticated_when_start_then_returns_run_id() {
 #[tokio::test]
 async fn given_missing_root_when_start_then_invalid_input() {
     let fs = FakeFilesystem::builder().build();
+    let runs = FakeCatalogRunRepository::new();
     let handler = handler(
         FakeAuth::Allowing,
         FakeCatalogRepository::new(),
@@ -169,7 +171,7 @@ async fn given_missing_root_when_start_then_invalid_input() {
         FakeDocumentMetadataReader::new(),
         FakeVideoMetadataReader::new(),
         FakeComicMetadataReader::new(),
-        FakeCatalogRunRepository::new(),
+        runs.clone(),
     );
 
     let result = handler
@@ -182,6 +184,13 @@ async fn given_missing_root_when_start_then_invalid_input() {
         .await;
 
     assert!(matches!(result, Err(DomainError::InvalidInput(_))));
+    // FR-FC-27: an invalid root is rejected before the run record opens, so
+    // it never leaves a stray record behind.
+    assert_eq!(
+        runs.count(),
+        0,
+        "a rejected start must not open a run record"
+    );
 }
 
 #[tokio::test]
@@ -1592,6 +1601,16 @@ async fn start_bounded(
     library_root: &std::path::Path,
     requested: &str,
 ) -> Result<IndexStarted, DomainError> {
+    start_bounded_with_runs(library_root, requested, FakeCatalogRunRepository::new()).await
+}
+
+/// Like [`start_bounded`], but takes the run repository fake so a caller can
+/// keep a handle on it and assert what it did or did not record.
+async fn start_bounded_with_runs(
+    library_root: &std::path::Path,
+    requested: &str,
+    runs: FakeCatalogRunRepository,
+) -> Result<IndexStarted, DomainError> {
     let handler = handler_with_library_root(
         FakeAuth::Allowing,
         FakeCatalogRepository::new(),
@@ -1606,7 +1625,7 @@ async fn start_bounded(
             .to_str()
             .expect("utf-8 library root")
             .to_string(),
-        FakeCatalogRunRepository::new(),
+        runs,
     );
     handler
         .start(
@@ -1655,12 +1674,20 @@ async fn given_root_outside_configured_library_root_when_start_then_invalid_inpu
     std::fs::create_dir(&library).expect("create library");
     std::fs::create_dir(&outside).expect("create outside");
     let requested = outside.to_str().expect("utf-8").to_string();
+    let runs = FakeCatalogRunRepository::new();
 
     // Act
-    let result = start_bounded(&library, &requested).await;
+    let result = start_bounded_with_runs(&library, &requested, runs.clone()).await;
 
     // Assert
     assert!(matches!(result, Err(DomainError::InvalidInput(_))));
+    // FR-FC-27: rejected before the run record opens — see the equivalent
+    // assertion in `given_missing_root_when_start_then_invalid_input`.
+    assert_eq!(
+        runs.count(),
+        0,
+        "a rejected start must not open a run record"
+    );
 }
 
 /// The traversal case: the requested root is spelled as a path *inside* the
@@ -1943,4 +1970,44 @@ async fn given_files_that_individually_fail_when_executed_then_the_run_is_comple
     );
     let recorded = runs.get_recorded(started.run_id).expect("run recorded");
     assert_eq!(recorded.status, RunStatus::Complete);
+}
+
+#[tokio::test]
+async fn given_run_completion_cannot_be_recorded_when_executed_then_the_outcome_is_still_returned()
+{
+    // FR-FC-27: the walk itself succeeds; only the bookkeeping write fails.
+    // The caller must still see the outcome it computed — a bookkeeping
+    // failure must not sink a completed walk. `IndexHandler::execute` shares
+    // this path with `RefreshHandler::execute`
+    // (`given_run_completion_cannot_be_recorded_when_executed_then_the_outcome_is_still_returned`
+    // in `refresh.rs`); duplicated bodies are exactly the condition under
+    // which a future edit to one goes uncaught by the other, so both get a
+    // direct regression test. Same fixture as
+    // `given_supported_files_when_execute_then_indexed_with_hash_and_indexedat`.
+    let fs = FakeFilesystem::builder()
+        .with_file(ROOT, "/library/a.mp3", "a.mp3", "h-a")
+        .with_file(ROOT, "/library/b.md", "b.md", "h-b")
+        .build();
+    let handler = handler(
+        FakeAuth::Allowing,
+        FakeCatalogRepository::new(),
+        fs,
+        fixed_clock(now()),
+        FakeAudioMetadataReader::new(),
+        FakeImageMetadataReader::new(),
+        FakeDocumentMetadataReader::new(),
+        FakeVideoMetadataReader::new(),
+        FakeComicMetadataReader::new(),
+        FailingCatalogRunRepository::FinishFails,
+    );
+
+    let outcome = handler
+        .execute(ROOT, Uuid::new_v4())
+        .await
+        .expect("a failed run-completion write must not fail the walk");
+
+    assert_eq!(outcome.scanned, 2);
+    assert_eq!(outcome.indexed, 2);
+    assert_eq!(outcome.skipped, 0);
+    assert_eq!(outcome.failed, 0);
 }

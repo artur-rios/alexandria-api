@@ -251,6 +251,9 @@ impl CatalogRunRepository for SqliteCatalogRunRepository {
             )
             .bind(RunStatus::Complete.as_str())
             .bind(finished_at.to_rfc3339())
+            // These are file counts from a single walk; a library large
+            // enough to overflow `i64` is not reachable, so the narrowing
+            // is not checked at runtime.
             .bind(scanned as i64)
             .bind(indexed as i64)
             .bind(skipped as i64)
@@ -317,6 +320,9 @@ impl CatalogRunRepository for SqliteCatalogRunRepository {
 
         // Counts exist only once a walk has finished. Presence of the first
         // column of the kind's set decides — `finish` writes them together.
+        // The reverse narrowing: these columns hold file counts a single walk
+        // produced, so a stored value large enough to overflow `usize` on a
+        // 32-bit target is not reachable, and the cast is not checked.
         let counts = match kind {
             RunKind::Index => row
                 .try_get::<Option<i64>, _>("scanned")?

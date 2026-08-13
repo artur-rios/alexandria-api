@@ -623,7 +623,7 @@ async fn given_run_completion_cannot_be_recorded_when_executed_then_the_outcome_
         repo,
         fs,
         fixed_clock(now()),
-        FailingCatalogRunRepository,
+        FailingCatalogRunRepository::FinishFails,
     );
 
     let outcome = handler
@@ -635,4 +635,27 @@ async fn given_run_completion_cannot_be_recorded_when_executed_then_the_outcome_
     assert_eq!(outcome.marked_missing, 0);
     assert_eq!(outcome.unchanged, 0);
     assert_eq!(outcome.failed, 0);
+}
+
+#[tokio::test]
+async fn given_run_cannot_be_started_when_start_then_the_error_propagates() {
+    // FR-FC-27: the opposite ruling from the finish/fail case above. A caller
+    // must never receive a run id it can never query, so unlike `finish` and
+    // `fail`, a `start` recording failure must not be swallowed — it has to
+    // reach the caller as an `Err`, not a run id.
+    let fs = FakeFilesystem::builder().build();
+    let handler = refresh_handler(
+        FakeAuth::Allowing,
+        FakeCatalogRepository::new(),
+        fs,
+        fixed_clock(now()),
+        FailingCatalogRunRepository::StartFails,
+    );
+
+    let result = handler.start(TOKEN).await;
+
+    assert!(
+        result.is_err(),
+        "a run-record open failure must propagate, not hand back a run id"
+    );
 }

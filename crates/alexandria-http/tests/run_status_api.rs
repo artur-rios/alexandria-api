@@ -8,9 +8,10 @@ use alexandria_http::app;
 use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
 use serde_json::Value;
+use sha2::Digest;
 use tower::ServiceExt;
 
-use crate::common::{test_app, TEST_TOKEN};
+use crate::common::{file_rows_with_missing, test_app, wait_for_files, write_file, TEST_TOKEN};
 
 fn run_request(run_id: &str, token: Option<&str>) -> Request<Body> {
     let mut builder = Request::builder()
@@ -49,8 +50,33 @@ async fn start_refresh(router: &axum::Router) -> String {
 async fn given_a_started_run_when_polled_to_completion_then_it_reports_complete_with_counts() {
     // The assertion this whole use case exists to make possible: a client can
     // wait for a run to finish instead of guessing from the catalog counts.
+    //
+    // A real library with a changed file and a deleted file is seeded first
+    // so that "complete" can be checked against something: this is the same
+    // assertion the UC-02 parity test could not previously make (design doc
+    // "Testing" section) — that `complete` implies every per-file write, not
+    // just some of them, has actually landed.
     let test = test_app().await;
-    let router = app(Settings::default(), test.services);
+    let lib = tempfile::tempdir().expect("lib tempdir");
+    write_file(&lib, "a.mp3", b"audio-v1");
+    write_file(&lib, "b.md", b"text-v1");
+    let router = app(Settings::default(), test.services.clone());
+
+    let index_req = Request::builder()
+        .method("POST")
+        .uri("/v1/index")
+        .header("authorization", format!("Bearer {TEST_TOKEN}"))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::json!({ "root": lib.path().to_str().unwrap() }).to_string(),
+        ))
+        .unwrap();
+    let index_resp = router.clone().oneshot(index_req).await.expect("index");
+    assert_eq!(index_resp.status(), StatusCode::ACCEPTED);
+    wait_for_files(&test.pool, 2).await;
+
+    write_file(&lib, "a.mp3", b"audio-v2-CHANGED");
+    std::fs::remove_file(lib.path().join("b.md")).expect("remove b.md");
 
     let run_id = start_refresh(&router).await;
 
@@ -90,6 +116,32 @@ async fn given_a_started_run_when_polled_to_completion_then_it_reports_complete_
         !obj.contains_key("root"),
         "a refresh carries no root, and the key must be omitted, not sent as null: {run}"
     );
+
+    // The assertion `complete` exists to make possible: the catalog rows are
+    // fully settled, not just some of them. `RefreshHandler::refresh_one`
+    // processes cataloged paths concurrently, so a status of `complete` must
+    // mean *both* halves of the refresh landed — the re-hash of the changed
+    // file and the missing marker for the deleted one — not just whichever
+    // half happened to finish first.
+    let rows = file_rows_with_missing(&test.pool).await;
+    let by_name: std::collections::BTreeMap<String, (String, Option<String>)> = rows
+        .into_iter()
+        .map(|(_, name, _, hash, missing_at)| (name, (hash, missing_at)))
+        .collect();
+    let (a_hash, a_missing) = by_name.get("a.mp3").expect("a.mp3 row");
+    assert!(a_missing.is_none(), "a.mp3 is still on disk");
+    let expected_a_hash = {
+        let digest = sha2::Sha256::digest(b"audio-v2-CHANGED");
+        let mut hex = String::with_capacity(digest.len() * 2);
+        for byte in digest {
+            use std::fmt::Write;
+            let _ = write!(hex, "{byte:02x}");
+        }
+        hex
+    };
+    assert_eq!(a_hash, &expected_a_hash, "a.mp3 must carry its new hash");
+    let (_, b_missing) = by_name.get("b.md").expect("b.md row");
+    assert!(b_missing.is_some(), "b.md must carry a missing marker");
 }
 
 #[tokio::test]

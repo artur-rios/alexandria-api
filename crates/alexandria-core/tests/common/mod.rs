@@ -2220,14 +2220,26 @@ impl Filesystem for FailingListFilesystem {
     }
 }
 
-/// A `CatalogRunRepository` whose `finish` always fails (UC-42 / FR-FC-27).
-/// Pins the "a bookkeeping failure must not sink a successful walk" behavior:
-/// `execute()` retries the write and, once retries are exhausted, still
-/// returns the outcome it computed rather than propagating the recording
-/// error. `start` and `fail` are not exercised by that test and are left
+/// A `CatalogRunRepository` that fails one lifecycle write on purpose (UC-42
+/// / FR-FC-27).
+///
+/// `FinishFails` pins the "a bookkeeping failure must not sink a successful
+/// walk" behavior: `execute()` retries the write and, once retries are
+/// exhausted, still returns the outcome it computed rather than propagating
+/// the recording error.
+///
+/// `StartFails` pins the opposite ruling for `start`: unlike `finish`/`fail`,
+/// a failure to open the run record must propagate, because a caller must
+/// never receive a run id it can never query.
+///
+/// Each variant implements only the method its test exercises; the rest are
 /// `unimplemented!()`.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct FailingCatalogRunRepository;
+#[derive(Debug, Clone, Copy, Default)]
+pub enum FailingCatalogRunRepository {
+    #[default]
+    FinishFails,
+    StartFails,
+}
 
 impl CatalogRunRepository for FailingCatalogRunRepository {
     async fn start(
@@ -2237,7 +2249,10 @@ impl CatalogRunRepository for FailingCatalogRunRepository {
         _root: Option<&str>,
         _started_at: DateTime<Utc>,
     ) -> Result<(), DomainError> {
-        unimplemented!("not exercised by the finish-always-fails test")
+        match self {
+            Self::StartFails => Err(DomainError::Disk("run store unavailable".into())),
+            Self::FinishFails => unimplemented!("not exercised by the finish-always-fails test"),
+        }
     }
 
     async fn finish(
@@ -2246,7 +2261,10 @@ impl CatalogRunRepository for FailingCatalogRunRepository {
         _counts: RunCounts,
         _finished_at: DateTime<Utc>,
     ) -> Result<(), DomainError> {
-        Err(DomainError::Disk("run store unavailable".into()))
+        match self {
+            Self::FinishFails => Err(DomainError::Disk("run store unavailable".into())),
+            Self::StartFails => unimplemented!("start already failed; finish is never reached"),
+        }
     }
 
     async fn fail(
@@ -2255,14 +2273,14 @@ impl CatalogRunRepository for FailingCatalogRunRepository {
         _error: &str,
         _finished_at: DateTime<Utc>,
     ) -> Result<(), DomainError> {
-        unimplemented!("not exercised by the finish-always-fails test")
+        unimplemented!("not exercised by either failing-repository test")
     }
 
     async fn get(&self, _id: Uuid) -> Result<Option<CatalogRun>, DomainError> {
-        unimplemented!("not exercised by the finish-always-fails test")
+        unimplemented!("not exercised by either failing-repository test")
     }
 
     async fn interrupt_running(&self, _now: DateTime<Utc>) -> Result<u64, DomainError> {
-        unimplemented!("not exercised by the finish-always-fails test")
+        unimplemented!("not exercised by either failing-repository test")
     }
 }

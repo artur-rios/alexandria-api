@@ -362,6 +362,43 @@ async fn given_a_completed_refresh_run_when_serialized_then_counts_are_flattened
 }
 
 #[tokio::test]
+async fn given_a_completed_index_run_when_serialized_then_counts_and_root_are_flattened_top_level()
+{
+    let (repo, _dir) = repo().await;
+    let id = Uuid::new_v4();
+    repo.start(id, RunKind::Index, Some("/library"), t(1))
+        .await
+        .expect("start");
+    repo.finish(
+        id,
+        RunCounts::Index {
+            scanned: 10,
+            indexed: 7,
+            skipped: 2,
+            failed: 1,
+        },
+        t(2),
+    )
+    .await
+    .expect("finish");
+    let run = repo.get(id).await.expect("get").expect("run exists");
+
+    let value = serde_json::to_value(&run).expect("serialize");
+
+    assert_eq!(value.get("root").and_then(|v| v.as_str()), Some("/library"));
+    assert_eq!(value.get("scanned").and_then(|v| v.as_u64()), Some(10));
+    assert_eq!(value.get("indexed").and_then(|v| v.as_u64()), Some(7));
+    assert_eq!(value.get("skipped").and_then(|v| v.as_u64()), Some(2));
+    assert_eq!(value.get("failed").and_then(|v| v.as_u64()), Some(1));
+    assert!(value.get("finishedAt").is_some());
+    // Refresh-only count keys must be absent, not sent as null.
+    assert!(value.get("refreshed").is_none());
+    assert!(value.get("markedMissing").is_none());
+    assert!(value.get("unchanged").is_none());
+    assert!(value.get("error").is_none());
+}
+
+#[tokio::test]
 async fn given_a_failed_run_when_serialized_then_error_present_and_no_counts() {
     let (repo, _dir) = repo().await;
     let id = Uuid::new_v4();
