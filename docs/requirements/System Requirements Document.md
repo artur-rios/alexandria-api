@@ -573,8 +573,8 @@ The feature identifiers are the milestones the
 | Feature | Requirements |
 | --- | --- |
 | F-00 Foundation and operations | IR-01 through IR-06 (Operations & Infrastructure Document §2) |
-| F-01 File indexing | FR-FC-01 through FR-FC-11, FR-FC-25, FR-FC-26, FR-FC-27, FR-FC-29 |
-| F-02 Catalog browsing and metadata editing | FR-FC-12 through FR-FC-18, FR-FC-28 |
+| F-01 File indexing | FR-FC-01 through FR-FC-11, FR-FC-25 through FR-FC-29 |
+| F-02 Catalog browsing and metadata editing | FR-FC-12 through FR-FC-18 |
 | F-03 Renaming and lifecycle management | FR-FC-19 through FR-FC-23 |
 | F-04 Text file content editing | FR-TX-01 through FR-TX-03 |
 | F-05 Collections | FR-CO-01 through FR-CO-07 |

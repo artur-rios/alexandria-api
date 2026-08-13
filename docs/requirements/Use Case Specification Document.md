@@ -1360,7 +1360,7 @@ abandon the rest of the catalog — and this surfaces it.
 | UC-42: Query an index or refresh run | FR-FC-24, FR-FC-27, FR-FC-28, FR-FC-29 |
 
 Every functional requirement in [System Requirements Document](System%20Requirements%20Document.md)
-§3 appears in at least one row above: FR-FC-01..25, FR-CO-01..07, FR-BM-01..06,
+§3 appears in at least one row above: FR-FC-01..29, FR-CO-01..07, FR-BM-01..06,
 FR-WL-01..08, FR-RL-01..08, FR-TX-01..03, FR-AU-01..11, FR-MP-01..06.
 UC-37 (Health check) is specified in the
 [Operations & Infrastructure Document](Operations%20%26%20Infrastructure%20Document.md)
