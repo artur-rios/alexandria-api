@@ -160,8 +160,12 @@ there is evidence it is needed.
 
 ## Domain
 
-A `CatalogRunRepository` port in `catalog/repos.rs`, alongside
-`CatalogRepository`, with the run lifecycle:
+A new module `catalog/runs.rs` holds the run model, its repository port, and
+the SQLite adapter together — the shape `auth/local.rs` already uses for
+credentials and sessions. It does not go in `catalog/repos.rs`, which is
+already 1,200 lines and would only grow less navigable.
+
+The `CatalogRunRepository` port carries the run lifecycle:
 
 - `start(id, kind, root, started_at)` — write the `running` row.
 - `finish(id, outcome, finished_at)` — terminal row from a completed walk.
@@ -170,13 +174,26 @@ A `CatalogRunRepository` port in `catalog/repos.rs`, alongside
 - `interrupt_running(now)` — mark every lingering `running` row `interrupted`,
   returning how many were reconciled.
 
+Both handlers take the run repository as a collaborator, alongside the auth
+service, catalog repository, filesystem and clock they already hold.
 `IndexHandler::start` and `RefreshHandler::start` write the `running` row before
-returning the id they already mint. `execute()` writes the terminal row from the
-outcome it already computes.
+returning the id they already mint. `execute()` writes the terminal row — the
+`complete` row from the outcome it already computes, or the `failed` row on its
+own error path before returning that error.
 
-At the spawn sites in both transports, the `Err` branch that today only logs
-becomes a `fail` write carrying the message — the comment reading "nothing else
-observes this task's result" is exactly the line this design deletes.
+Writing the terminal row inside `execute()` rather than at the spawn sites is
+deliberate. There are four spawn sites — HTTP and FFI, index and refresh — and
+putting the lifecycle in the handler means the recording cannot be forgotten by
+a fifth caller, and cannot drift between transports. It also keeps the whole
+lifecycle in one layer: `start()` mints the id and opens the record, `execute()`
+closes it. The transports keep their existing `tracing::error!` on the `Err`
+branch; the comment reading "nothing else observes this task's result" is what
+this design deletes, since the record now does.
+
+Adding the collaborator changes both handlers' constructors, which ten call
+sites across `services.rs` and the core tests must be updated for. That churn is
+mechanical, and it buys the guarantee that a started run is always a recorded
+run.
 
 `interrupt_running` is called once from `build_services` at startup, before any
 handler is constructed.
