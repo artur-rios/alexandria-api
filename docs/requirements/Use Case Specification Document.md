@@ -1079,9 +1079,9 @@ UC-36's externally issued JWT.
 | **Name** | Set or change local login credentials |
 | **Actors** | Owner |
 | **Description** | Set or change the local-login email and password. |
-| **Preconditions** | The active auth mode is local login; the caller is authenticated as the owner (or no credentials exist yet). |
+| **Preconditions** | The active auth mode is local login; the caller is authenticated as the owner; local credentials already exist. |
 | **Postconditions** | The credential row holds the new email and the new salted password hash. |
-| **Requirements** | FR-AU-05, FR-AU-06, FR-AU-08 |
+| **Requirements** | FR-AU-05, FR-AU-06, FR-AU-07, FR-AU-08, FR-AU-11 |
 
 **Main Flow**
 
@@ -1096,7 +1096,8 @@ UC-36's externally issued JWT.
 | --- | --- | --- |
 | AF-01 | The active auth mode is not local login | The system rejects with an invalid-operation error. |
 | AF-02 | The email format is invalid | The system rejects with an invalid-input error. |
-| AF-03 | The caller is not authenticated and credentials already exist | The system denies with an unauthorized error. |
+| AF-03 | The caller is not authenticated | The system denies with an unauthorized error. Creating the account is UC-41, not this use case. |
+| AF-04 | The password does not satisfy the strength policy | The system rejects with an invalid-input error naming the unmet rule; no plaintext is logged. |
 
 ---
 
@@ -1226,6 +1227,54 @@ UC-36's externally issued JWT.
 
 ---
 
+### UC-41: Register the local account
+
+| Field | Value |
+| --- | --- |
+| **ID** | UC-41 |
+| **Name** | Register the local account |
+| **Actors** | Owner |
+| **Description** | Create the single owner's local-login account when none exists, and open a session for the caller. |
+| **Preconditions** | The active auth mode is local login; no local credentials exist. |
+| **Postconditions** | The credential row holds the submitted email and a salted Argon2 hash of the password, and a Session exists whose id is returned to the caller. On any failure neither is created. |
+| **Requirements** | FR-AU-05, FR-AU-06, FR-AU-08, FR-AU-09, FR-AU-10, FR-AU-11 |
+
+**Main Flow**
+
+1. The caller submits an email, a password, and a password confirmation.
+2. The system confirms the active auth mode is local login.
+3. The system confirms no local credentials exist yet.
+4. The system validates the email format, the password against the strength
+   policy, and that the confirmation matches the password.
+5. The system salts and hashes the password (Argon2) and writes the credential
+   row. Only the hash is stored; the plaintext is never persisted or logged.
+6. The system creates a Session with an expiry `sessionTtlHours` in the future
+   (configurable, default 24) and returns its id, exactly as UC-34 does.
+
+**Alternative Flows**
+
+| ID | Condition | Outcome |
+| --- | --- | --- |
+| AF-01 | The active auth mode is external JWT | The system rejects with an invalid-operation error. |
+| AF-02 | Local credentials already exist | The system rejects with a conflict error; the stored credentials are left untouched. |
+| AF-03 | The email format is invalid | The system rejects with an invalid-input error. |
+| AF-04 | The password fails the strength policy | The system rejects with an invalid-input error naming the unmet rule; no plaintext is logged. |
+| AF-05 | The confirmation does not match the password | The system rejects with an invalid-input error. |
+| AF-06 | The credential row is written but the session cannot be created | The system returns the underlying error; the account exists, and the caller obtains a session through UC-34. |
+
+The checks run in the order listed — mode, then existence, then the three input
+checks. An unauthenticated caller therefore learns only whether an account
+exists, which the conflict error tells them anyway; they never learn anything
+about a stored password by varying the one they submit.
+
+AF-06 is deliberately not a rollback. Both writes go to the same SQLite
+database, but wrapping them in a transaction would require the credential and
+session repository ports to share one, which no other command in the codebase
+does. The failure is a disk or database error, the account it leaves behind is
+exactly the account the caller asked for, and UC-34 completes the job.
+
+---
+
 ## 3. Use Case — Requirements Traceability
 
 | Use Case | Requirements |
@@ -1264,11 +1313,12 @@ UC-36's externally issued JWT.
 | UC-32: Read text file content | FR-TX-01, FR-FC-24 |
 | UC-33: Edit text file content | FR-TX-02, FR-TX-03, FR-FC-24 |
 | UC-34: Local login | FR-AU-01, FR-AU-04, FR-AU-07, FR-AU-08, FR-AU-09 |
-| UC-35: Set or change local login credentials | FR-AU-05, FR-AU-06, FR-AU-08 |
+| UC-35: Set or change local login credentials | FR-AU-05, FR-AU-06, FR-AU-07, FR-AU-08, FR-AU-11 |
 | UC-36: Authenticate via external JWT | FR-AU-01, FR-AU-02, FR-AU-03, FR-AU-07, FR-AU-08 |
 | UC-38: Stream file content | FR-MP-01, FR-MP-02, FR-MP-03, FR-MP-06 |
 | UC-39: Read a comic book page | FR-MP-03, FR-MP-04, FR-MP-06 |
 | UC-40: Get a file thumbnail | FR-MP-05, FR-MP-06 |
+| UC-41: Register the local account | FR-AU-05, FR-AU-06, FR-AU-08, FR-AU-09, FR-AU-10, FR-AU-11 |
 
 Every functional requirement in [System Requirements Document](System%20Requirements%20Document.md)
 §3 appears in at least one row above: FR-FC-01..25, FR-CO-01..07, FR-BM-01..06,
