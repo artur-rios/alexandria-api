@@ -97,3 +97,24 @@ async fn given_an_unauthenticated_caller_when_read_then_unauthorized() {
 
     assert!(matches!(err, DomainError::Unauthorized), "got {err:?}");
 }
+
+#[tokio::test]
+async fn given_an_unauthenticated_caller_and_an_unknown_run_id_when_read_then_unauthorized_not_not_found(
+) {
+    // AF-02: a caller who never authenticated must not learn whether the id
+    // names a run at all — auth is checked before the repository, so an
+    // unknown id behind a denied token must still surface as Unauthorized,
+    // never NotFound.
+    let handler = GetRunStatusHandler::new(FakeAuth::Denying, FakeCatalogRunRepository::new());
+
+    let err = handler
+        .get(Uuid::new_v4(), "")
+        .await
+        .expect_err("must reject an unauthenticated caller");
+
+    assert!(matches!(err, DomainError::Unauthorized), "got {err:?}");
+    assert!(
+        !matches!(err, DomainError::NotFound),
+        "must not leak whether the id names a run to an unauthenticated caller"
+    );
+}
