@@ -1086,7 +1086,7 @@ UC-36's externally issued JWT.
 **Main Flow**
 
 1. The owner submits a new email and password.
-2. The system validates the email format and a non-empty password.
+2. The system validates the email format and the password against the strength policy.
 3. The system salts and hashes the password (Argon2) and writes/updates the credential row. Only the hash is stored — the plaintext is never persisted, so the row is not reversible back to the password.
 4. The system returns confirmation; the plaintext password is never stored or logged.
 

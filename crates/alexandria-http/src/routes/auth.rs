@@ -26,7 +26,7 @@ pub struct LocalCredentialsRequest {
 /// `LocalLoginResult` (including the session id the caller presents on
 /// subsequent requests), or `401` (wrong email/password, AF-02, or the
 /// active auth mode is not local, AF-01), or `500` (local credentials have
-/// not been set — configuration error, AF-03, run UC-35 first).
+/// not been set — configuration error, AF-03, run UC-41 first).
 pub async fn login(
     State(state): State<AppState>,
     body: Result<Json<LocalCredentialsRequest>, JsonRejection>,
@@ -43,16 +43,16 @@ pub async fn login(
     Ok((StatusCode::OK, Json(result)))
 }
 
-/// `POST /v1/auth/local/credentials` — set or change the local-login email
-/// and password (UC-35 / FR-AU-05, FR-AU-06). Deliberately outside the
-/// blanket `require_auth` gate: first-time setup has no credentials yet to
-/// authenticate with. The handler itself enforces the conditional
-/// authorization the use case calls for — unauthenticated is only
-/// accepted when no credentials exist yet (AF-03). Returns `200` with the
-/// `LocalCredentialsResult`, or `400` (invalid email or empty password,
-/// AF-02, or a malformed body), `401` (credentials already exist and the
-/// caller did not authenticate, AF-03), or `409` (the active auth mode is
-/// not local login, AF-01).
+/// `POST /v1/auth/local/credentials` — change the existing local-login
+/// email and password (UC-35 / FR-AU-05, FR-AU-06). Creating the account in
+/// the first place is UC-41's `/register`; this handler always
+/// authenticates the caller before doing anything else (FR-AU-07), and is
+/// outside the blanket `require_auth` gate only because it enforces that
+/// authentication itself rather than relying on the router-level
+/// middleware. Returns `200` with the `LocalCredentialsResult`, or `400`
+/// (a malformed email, a password failing the strength policy, or a
+/// malformed body — AF-02/AF-04), `401` (the caller did not authenticate,
+/// AF-03), or `409` (the active auth mode is not local login, AF-01).
 pub async fn set_credentials(
     State(state): State<AppState>,
     headers: HeaderMap,

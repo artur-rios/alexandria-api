@@ -432,11 +432,13 @@ External JWT validation (FR-AU-02) is enforced by HTTP middleware on every
 request, not by an endpoint. The same middleware validates the local-mode
 session id (FR-AU-09); both are presented as `Authorization: Bearer <value>`.
 
-The register and login endpoints sit outside the blanket authentication gate,
-for the reasons §7 gives: registration is how the owner's account first comes
-to exist, and login is how a caller obtains a session. The credentials
-endpoint sits inside the gate — it always requires an authenticated session
-(UC-35 is change-only; creating the account is UC-41).
+The register, login, and credentials endpoints all sit outside the blanket
+authentication gate, for the reasons §7 gives: registration is how the
+owner's account first comes to exist, and login is how a caller obtains a
+session. The credentials endpoint is routed alongside them, but always
+requires an authenticated session — the handler enforces that itself rather
+than relying on the router-level gate (UC-35 is change-only; creating the
+account is UC-41).
 
 ### 5.9 Media Playback
 
@@ -483,6 +485,7 @@ returns a playback descriptor instead of bytes (FR-MP-06).
 | Create / update / delete watchlist and progress | ✅ | ❌ |
 | Create / update / delete reading list and progress | ✅ | ❌ |
 | Local login (local mode) | ✅ (open to verify) | ⚠️ only the login verification endpoint; all other operations denied |
+| Register the local account (local mode) | n/a — no account exists yet to authenticate as | ⚠️ only once, while no local account exists; a second attempt is denied with a conflict (UC-41) |
 | Set or change local credentials (local mode) | ✅ | ❌ |
 | External JWT validation | ✅ | ⚠️ only as the bearer of a valid JWT; invalid tokens denied |
 
@@ -494,9 +497,12 @@ would have been accepted — a malformed body or an unparseable identifier does
 not turn a `401` into a `400`. Both the HTTP and FFI surfaces gate this way
 (FR-AU-07, FR-FC-24).
 
-Note: local-login verification is the one operation that accepts unauthenticated
-input (the credentials being verified); success is what grants owner status for
-every subsequent operation.
+Note: local-login verification and local-account registration are the two
+operations that accept unauthenticated input — the credentials being
+verified, and the owner's own new credentials, respectively. Login success
+grants owner status for every subsequent operation; registration succeeds
+at most once, after which every later attempt is a conflict, not a second
+bootstrap.
 
 ---
 

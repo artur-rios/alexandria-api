@@ -107,7 +107,7 @@ async fn given_existing_credentials_and_valid_token_when_set_posted_then_200_and
     assert_eq!(body["email"], "new-owner@example.com");
 }
 
-// ---------------- UC-35 AF-03: conditional authorization ----------------
+// ---------------- UC-35 AF-03: unauthenticated caller ----------------
 
 #[tokio::test]
 async fn given_existing_credentials_and_no_token_when_set_posted_then_401_and_unchanged() {

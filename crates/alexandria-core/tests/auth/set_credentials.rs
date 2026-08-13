@@ -1,9 +1,9 @@
 //! Unit tests for the UC-35 SetLocalCredentialsHandler (Testing
 //! Specification §6). Each test exercises exactly the handler against trait
-//! fakes — no real DB or auth service. Coverage follows §6.3: happy path for
-//! first-time setup and for changing existing credentials, AF-01 (wrong
-//! mode), AF-02 (invalid email / empty password), and AF-03 (conditional
-//! authorization).
+//! fakes — no real DB or auth service. Coverage follows §6.3: the change
+//! flow for existing credentials, AF-01 (wrong mode), AF-02 (invalid email)
+//! /AF-04 (weak password), and AF-03 (unauthenticated caller — UC-35 is
+//! change-only since UC-41, so authentication is unconditional).
 
 use chrono::{TimeZone, Utc};
 
@@ -119,7 +119,7 @@ async fn given_external_auth_mode_when_set_then_invalid_state_and_unchanged() {
     assert!(repo.get().await.unwrap().is_none());
 }
 
-// ---------------- AF-03: conditional authorization ----------------
+// ---------------- AF-03: unauthenticated caller ----------------
 
 #[tokio::test]
 async fn given_existing_credentials_and_unauthenticated_when_set_then_unauthorized_and_unchanged() {

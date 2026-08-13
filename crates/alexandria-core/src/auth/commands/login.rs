@@ -58,7 +58,7 @@ where
             return Err(DomainError::Unauthorized);
         }
 
-        // AF-03: local credentials must have been set (run UC-35 first).
+        // AF-03: local credentials must have been set (run UC-41 first).
         let credential = self
             .credentials
             .get()
