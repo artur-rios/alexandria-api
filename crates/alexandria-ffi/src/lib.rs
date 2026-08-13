@@ -3189,8 +3189,8 @@ pub extern "C" fn alexandria_auth_local_login(json_body: *const c_char) -> AuthJ
 
 /// Set or change local-login credentials (UC-35 / FR-AU-05, FR-AU-06).
 /// `json_body` is the JSON body HTTP would send (`email`, `password`).
-/// `token` is optional: required only once credentials already exist
-/// (AF-03) — pass an empty string on first-time setup.
+/// `token` is required: this changes existing credentials. Creating the
+/// account is `alexandria_auth_local_register` (UC-41).
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
 pub extern "C" fn alexandria_auth_local_set_credentials(

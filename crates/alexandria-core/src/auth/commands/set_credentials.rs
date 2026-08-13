@@ -1,5 +1,5 @@
 use crate::auth::local::{LocalCredentialRepository, LocalCredentialsResult};
-use crate::auth::password::hash_password;
+use crate::auth::password::{hash_password, validate_strength};
 use crate::auth::AuthService;
 use crate::catalog::clock::Clock;
 use crate::config::AuthMode;
@@ -47,12 +47,11 @@ pub fn validate_email(email: &str) -> Result<String, DomainError> {
 /// the singleton encrypted credential row. The plaintext password is never
 /// stored or logged.
 ///
-/// Authorization is conditional, unlike every other handler in this
-/// codebase: if no credentials exist yet (first-time setup), the call
-/// proceeds unauthenticated; once credentials exist, the caller must
-/// authenticate as the owner to change them (AF-03). This is the use
-/// case's own bootstrap requirement, not a relaxation of FR-AU-07 — every
-/// other operation still authenticates unconditionally.
+/// The caller must be authenticated as the owner: this changes existing
+/// credentials, never creates them. Creating the account is UC-41
+/// (`RegisterLocalAccountHandler`), which is why the conditional
+/// bootstrap branch this handler used to carry is gone — every handler in
+/// this codebase now authenticates unconditionally (FR-AU-07).
 ///
 /// Generic over the auth service, credential repository, and clock so the
 /// decision logic is unit-tested against trait fakes, then wired with the
@@ -91,17 +90,13 @@ where
             return Err(DomainError::InvalidState);
         }
 
-        // AF-03: unauthenticated is only acceptable when no credentials
-        // exist yet (first-time setup).
-        if self.repo.get().await?.is_some() {
-            self.auth.authenticate(token).await?;
-        }
+        // AF-03: the caller must be authenticated as the owner. Creating
+        // the account is UC-41's job, so there is no bootstrap case left.
+        self.auth.authenticate(token).await?;
 
-        // AF-02: the email must be well-formed.
+        // AF-02: the email must be well-formed and the password strong.
         let email = validate_email(&email)?;
-        if password.is_empty() {
-            return Err(DomainError::InvalidInput("password is required".into()));
-        }
+        validate_strength(&password, &email)?;
 
         let password_hash = hash_password(&password)?;
         let now = self.clock.now();

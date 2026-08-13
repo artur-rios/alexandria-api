@@ -17,11 +17,10 @@ use alexandria_core::config::Settings;
 use alexandria_core::migrate::migrate_database;
 use alexandria_core::services::build_services;
 use alexandria_ffi::{
-    alexandria_auth_local_login, alexandria_auth_local_register,
-    alexandria_auth_local_set_credentials, alexandria_bookmark_create, alexandria_bookmark_purge,
-    alexandria_bookmark_restore, alexandria_bookmark_soft_delete, alexandria_bookmark_update,
-    alexandria_bookmarks_list, alexandria_collection_add_items, alexandria_collection_create,
-    alexandria_collection_delete, alexandria_collection_list_items,
+    alexandria_auth_local_login, alexandria_auth_local_register, alexandria_bookmark_create,
+    alexandria_bookmark_purge, alexandria_bookmark_restore, alexandria_bookmark_soft_delete,
+    alexandria_bookmark_update, alexandria_bookmarks_list, alexandria_collection_add_items,
+    alexandria_collection_create, alexandria_collection_delete, alexandria_collection_list_items,
     alexandria_collection_remove_item, alexandria_collection_rename, alexandria_comic_page,
     alexandria_file_edit_content, alexandria_file_edit_metadata, alexandria_file_get_by_uuid,
     alexandria_file_playback_source, alexandria_file_purge, alexandria_file_purge_on_disk,
@@ -8607,10 +8606,12 @@ async fn given_non_text_file_when_edited_via_http_and_ffi_then_both_invalid_inpu
     );
 }
 
-/// UC-34/UC-35 parity — set local credentials then log in through both
-/// transports and assert identical response shapes (Testing Specification
-/// §7.3). Session ids differ by construction (independent databases), so
-/// parity asserts each is present and well-formed rather than equal.
+/// UC-34/UC-35 parity — register local credentials (UC-41, the account's
+/// only bootstrap path since UC-35 became change-only) then log in through
+/// both transports and assert identical response shapes (Testing
+/// Specification §7.3). Session ids differ by construction (independent
+/// databases), so parity asserts each is present and well-formed rather
+/// than equal.
 #[tokio::test]
 async fn given_same_local_credentials_when_set_and_logged_in_via_http_and_ffi_then_bodies_match() {
     let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
@@ -8624,25 +8625,39 @@ async fn given_same_local_credentials_when_set_and_logged_in_via_http_and_ffi_th
         std::sync::Arc::new(build_services(&local_settings(), http_pool.clone()).await);
     let router = app(Settings::default(), http_services);
 
-    let set_req = Request::builder()
+    let register_req = Request::builder()
         .method("POST")
-        .uri("/v1/auth/local/credentials")
+        .uri("/v1/auth/local/register")
         .header("content-type", "application/json")
         .body(Body::from(
-            json!({ "email": "owner@example.com", "password": "hunter2" }).to_string(),
+            json!({
+                "email": "owner@example.com",
+                "password": "correct horse battery",
+                "passwordConfirmation": "correct horse battery",
+            })
+            .to_string(),
         ))
         .unwrap();
-    let set_resp = router.clone().oneshot(set_req).await.expect("http set");
-    assert_eq!(set_resp.status(), axum::http::StatusCode::OK);
-    let http_set_body: serde_json::Value =
-        serde_json::from_slice(&to_bytes(set_resp.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let register_resp = router
+        .clone()
+        .oneshot(register_req)
+        .await
+        .expect("http register");
+    assert_eq!(register_resp.status(), axum::http::StatusCode::CREATED);
+    let http_set_body: serde_json::Value = serde_json::from_slice(
+        &to_bytes(register_resp.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
 
     let login_req = Request::builder()
         .method("POST")
         .uri("/v1/auth/local/login")
         .header("content-type", "application/json")
         .body(Body::from(
-            json!({ "email": "owner@example.com", "password": "hunter2" }).to_string(),
+            json!({ "email": "owner@example.com", "password": "correct horse battery" })
+                .to_string(),
         ))
         .unwrap();
     let login_resp = router.oneshot(login_req).await.expect("http login");
@@ -8662,24 +8677,36 @@ async fn given_same_local_credentials_when_set_and_logged_in_via_http_and_ffi_th
                 alexandria_ffi::INDEX_OK
             );
 
-            let body = CString::new(
-                json!({ "email": "owner@example.com", "password": "hunter2" }).to_string(),
+            let register_body = CString::new(
+                json!({
+                    "email": "owner@example.com",
+                    "password": "correct horse battery",
+                    "passwordConfirmation": "correct horse battery",
+                })
+                .to_string(),
             )
             .unwrap();
-            let empty_token = CString::new("").unwrap();
-            let set_result =
-                alexandria_auth_local_set_credentials(body.as_ptr(), empty_token.as_ptr());
-            assert_eq!(set_result.status, alexandria_ffi::AUTH_OK, "ffi set failed");
-            assert!(!set_result.json.is_null());
-            let set_json = unsafe { CStr::from_ptr(set_result.json) }
+            let register_result = alexandria_auth_local_register(register_body.as_ptr());
+            assert_eq!(
+                register_result.status,
+                alexandria_ffi::AUTH_OK,
+                "ffi register failed"
+            );
+            assert!(!register_result.json.is_null());
+            let set_json = unsafe { CStr::from_ptr(register_result.json) }
                 .to_str()
                 .unwrap()
                 .to_string();
             unsafe {
-                alexandria_free_string(set_result.json);
+                alexandria_free_string(register_result.json);
             }
 
-            let login_result = alexandria_auth_local_login(body.as_ptr());
+            let login_body = CString::new(
+                json!({ "email": "owner@example.com", "password": "correct horse battery" })
+                    .to_string(),
+            )
+            .unwrap();
+            let login_result = alexandria_auth_local_login(login_body.as_ptr());
             assert_eq!(
                 login_result.status,
                 alexandria_ffi::AUTH_OK,
@@ -8703,7 +8730,12 @@ async fn given_same_local_credentials_when_set_and_logged_in_via_http_and_ffi_th
     let ffi_login_body: serde_json::Value = serde_json::from_str(&ffi_login_json).unwrap();
 
     // ---- compare ----
-    assert_eq!(http_set_body, ffi_set_body, "set-credentials body parity");
+    // Registration bodies now carry a per-surface sessionId (UC-41 opens a
+    // session on success), so compare `success`/`email` rather than the
+    // whole body.
+    assert_eq!(http_set_body["success"], ffi_set_body["success"]);
+    assert_eq!(http_set_body["success"], json!(true));
+    assert_eq!(http_set_body["email"], ffi_set_body["email"]);
 
     assert_eq!(http_login_body["success"], ffi_login_body["success"]);
     assert_eq!(http_login_body["success"], serde_json::json!(true));
