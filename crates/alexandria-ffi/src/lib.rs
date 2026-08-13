@@ -229,9 +229,11 @@ pub extern "C" fn alexandria_index_start(
             let run_id = s.run_id;
             let handler = services.index_handler.clone();
             rt.spawn(async move {
-                // Per-file failures are counted inside `execute`; an `Err` here
-                // means the run could not start at all. Log it — nothing else
-                // observes this task's result.
+                // Per-file failures are counted inside `execute`; an `Err`
+                // here means the run could not start at all. `execute` has
+                // already written the `failed` run record on its own error
+                // path (UC-42), so the failure is recorded, not lost. This
+                // log line is for the operator.
                 if let Err(err) = handler.execute(&root, run_id).await {
                     tracing::error!(%run_id, error = %err, "index run aborted");
                 }
@@ -268,9 +270,11 @@ pub extern "C" fn alexandria_index_refresh_start(token: *const c_char) -> IndexS
             let run_id = s.run_id;
             let handler = services.refresh_handler.clone();
             rt.spawn(async move {
-                // Per-file failures are counted inside `execute`; an `Err` here
-                // means the run could not start at all. Log it — nothing else
-                // observes this task's result.
+                // Per-file failures are counted inside `execute`; an `Err`
+                // here means the run could not start at all. `execute` has
+                // already written the `failed` run record on its own error
+                // path (UC-42), so the failure is recorded, not lost. This
+                // log line is for the operator.
                 if let Err(err) = handler.execute(run_id).await {
                     tracing::error!(%run_id, error = %err, "re-index run aborted");
                 }
@@ -3289,6 +3293,102 @@ pub extern "C" fn alexandria_auth_local_register(json_body: *const c_char) -> Au
             AuthJsonResult::ok(json)
         }
         Err(err) => map_auth_err(err),
+    }
+}
+
+/// FFI status codes returned by run-status operations (UC-42 / FR-FC-28).
+/// Deliberately separate from `INDEX_*`, `FILE_*`, `COLLECTION_*`, `PLAYBACK_*`,
+/// and `AUTH_*` — per the convention established above — so this surface can
+/// grow independently; `RUN_OK == INDEX_OK == 0` by convention.
+pub const RUN_OK: c_int = 0;
+pub const RUN_ERR_INVALID_INPUT: c_int = 1;
+pub const RUN_ERR_UNAUTHORIZED: c_int = 2;
+pub const RUN_ERR_NOT_INITIALIZED: c_int = 3;
+pub const RUN_ERR_NOT_FOUND: c_int = 4;
+pub const RUN_ERR_OTHER: c_int = 9;
+
+/// Result of `alexandria_index_run_status_json` (UC-42). On success `status`
+/// is `RUN_OK` and `json` is a NUL-terminated JSON string of the `CatalogRun`
+/// body — byte-for-byte the same shape HTTP returns from
+/// `GET /v1/index/runs/{runId}` (FR-FC-24 / NFR-09). On failure `json` is
+/// NULL and `status` carries the mapped error code. The caller must free
+/// `json` with `alexandria_free_string`.
+#[repr(C)]
+#[derive(Debug)]
+pub struct RunJsonResult {
+    pub status: c_int,
+    pub json: *mut c_char,
+}
+
+impl RunJsonResult {
+    fn err(status: c_int) -> Self {
+        Self {
+            status,
+            json: std::ptr::null_mut(),
+        }
+    }
+
+    fn ok(json: String) -> Self {
+        let cstring = CString::new(json).unwrap_or_default();
+        Self {
+            status: RUN_OK,
+            json: cstring.into_raw(),
+        }
+    }
+}
+
+fn map_run_err(err: DomainError) -> RunJsonResult {
+    match err {
+        DomainError::NotFound => RunJsonResult::err(RUN_ERR_NOT_FOUND),
+        DomainError::Unauthorized => RunJsonResult::err(RUN_ERR_UNAUTHORIZED),
+        DomainError::InvalidInput(_) => RunJsonResult::err(RUN_ERR_INVALID_INPUT),
+        _ => RunJsonResult::err(RUN_ERR_OTHER),
+    }
+}
+
+/// Report an index or re-index run's status and outcome (UC-42 / FR-FC-28).
+/// `run_id` is the id `alexandria_index_start` or
+/// `alexandria_index_refresh_start` returned. On success `json` carries the
+/// same body the HTTP `GET /v1/index/runs/{runId}` route returns (FR-FC-24).
+///
+/// Returns `RUN_ERR_NOT_FOUND` for an id naming no run (AF-01),
+/// `RUN_ERR_UNAUTHORIZED` for an unauthenticated caller (AF-02), and
+/// `RUN_ERR_INVALID_INPUT` when `run_id` is not a uuid.
+#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
+#[no_mangle]
+pub extern "C" fn alexandria_index_run_status_json(
+    run_id: *const c_char,
+    token: *const c_char,
+) -> RunJsonResult {
+    let services = match services_slot().lock().unwrap().clone() {
+        Some(s) => s,
+        None => return RunJsonResult::err(RUN_ERR_NOT_INITIALIZED),
+    };
+
+    // Deny before touching the payload — an unauthenticated caller must
+    // not learn whether its run id would have parsed.
+    let token = cstr_lossy(token).unwrap_or_default();
+    if !authenticated(&services, &token) {
+        return RunJsonResult::err(RUN_ERR_UNAUTHORIZED);
+    }
+
+    let raw = match cstr_lossy(run_id) {
+        Some(s) => s,
+        None => return RunJsonResult::err(RUN_ERR_INVALID_INPUT),
+    };
+    let Ok(run_id) = uuid::Uuid::parse_str(raw.trim()) else {
+        return RunJsonResult::err(RUN_ERR_INVALID_INPUT);
+    };
+
+    let result =
+        runtime().block_on(async { services.get_run_status_handler.get(run_id, &token).await });
+
+    match result {
+        Ok(run) => {
+            let json = serde_json::to_string(&run).unwrap_or_default();
+            RunJsonResult::ok(json)
+        }
+        Err(err) => map_run_err(err),
     }
 }
 

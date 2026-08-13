@@ -8,6 +8,7 @@ use crate::catalog::clock::Clock;
 use crate::catalog::fs::Filesystem;
 use crate::catalog::model::File;
 use crate::catalog::repos::CatalogRepository;
+use crate::catalog::runs::{CatalogRunRepository, RunCounts, RunKind};
 use crate::errors::DomainError;
 use crate::retry::{retry_on_busy, BUSY_ATTEMPTS};
 
@@ -52,40 +53,53 @@ pub struct RefreshOutcome {
 ///
 /// Generic over collaborators so the decision logic is unit-tested against
 /// trait fakes with no real DB / filesystem / auth service (Testing Spec §6.2).
-pub struct RefreshHandler<A, R, F, C> {
+pub struct RefreshHandler<A, R, F, C, RR> {
     auth: A,
     repo: R,
     fs: F,
     clock: C,
     concurrency: usize,
+    runs: RR,
 }
 
-impl<A, R, F, C> RefreshHandler<A, R, F, C>
+impl<A, R, F, C, RR> RefreshHandler<A, R, F, C, RR>
 where
     A: AuthService,
     R: CatalogRepository,
     F: Filesystem,
     C: Clock,
+    RR: CatalogRunRepository,
 {
     /// `concurrency` is how many cataloged paths `execute` refreshes at a
     /// time; zero is clamped to 1, as in `IndexHandler::new`.
-    pub fn new(auth: A, repo: R, fs: F, clock: C, concurrency: u32) -> Self {
+    pub fn new(auth: A, repo: R, fs: F, clock: C, concurrency: u32, runs: RR) -> Self {
         Self {
             auth,
             repo,
             fs,
             clock,
             concurrency: concurrency.max(1) as usize,
+            runs,
         }
     }
 
     /// Authenticate and return a run id. No input to validate (re-index
     /// touches every cataloged path), so the only failure is AF-02.
+    ///
+    /// FR-FC-27: a started run is always a recorded run — the record opens
+    /// here, where the id is minted, so no caller can start one without it.
+    /// Unlike `finish`/`fail`, this write's failure is not swallowed after
+    /// retrying: if the record cannot be opened at all, the caller must not
+    /// receive a run id it can never query.
     pub async fn start(&self, token: &str) -> Result<RefreshStarted, DomainError> {
         self.auth.authenticate(token).await?;
-        Ok(RefreshStarted {
-            run_id: Uuid::new_v4(),
+        let run_id = Uuid::new_v4();
+        let started_at = self.clock.now();
+        retry_on_busy(BUSY_ATTEMPTS, || {
+            self.runs.start(run_id, RunKind::Refresh, None, started_at)
         })
+        .await?;
+        Ok(RefreshStarted { run_id })
     }
 
     /// Walk every cataloged path and refresh / mark missing.
@@ -101,7 +115,27 @@ where
     /// rest of the catalog. Only a failure to list the catalog at all aborts.
     pub async fn execute(&self, run_id: Uuid) -> Result<RefreshOutcome, DomainError> {
         let now = self.clock.now();
-        let files = self.repo.list_all().await?;
+        let files = match self.repo.list_all().await {
+            Ok(files) => files,
+            Err(err) => {
+                // FR-FC-27: the walk could not proceed at all — that, and
+                // only that, is a `failed` run.
+                let fail_error = err.to_string();
+                let failed_at = self.clock.now();
+                if let Err(record_err) = retry_on_busy(BUSY_ATTEMPTS, || {
+                    self.runs.fail(run_id, &fail_error, failed_at)
+                })
+                .await
+                {
+                    // The walk's own error is the one that matters to the
+                    // caller — a bookkeeping failure on top of it must not
+                    // replace it. The record stays `running` until startup
+                    // reconciliation (FR-FC-29) closes it.
+                    tracing::warn!(%run_id, error = %record_err, "could not record run failure");
+                }
+                return Err(err);
+            }
+        };
 
         let (refreshed, marked_missing, unchanged, failed) = stream::iter(files)
             .map(|file| async move {
@@ -154,6 +188,27 @@ where
             failed = outcome.failed,
             "re-index complete"
         );
+        // FR-FC-27: the walk finished. Per-file failures are inside the
+        // tally and do not make the run failed.
+        let finished_at = self.clock.now();
+        let counts = RunCounts::Refresh {
+            refreshed,
+            marked_missing,
+            unchanged,
+            failed,
+        };
+        if let Err(err) = retry_on_busy(BUSY_ATTEMPTS, || {
+            self.runs.finish(run_id, counts, finished_at)
+        })
+        .await
+        {
+            // FR-FC-27: the walk succeeded — only the bookkeeping write
+            // failed. Reporting the run as failed would be a lie about work
+            // that did happen, and the tally is already in the log line
+            // above. The record stays `running` until startup
+            // reconciliation (FR-FC-29) closes it.
+            tracing::warn!(%run_id, error = %err, "could not record run completion");
+        }
         Ok(outcome)
     }
 

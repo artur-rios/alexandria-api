@@ -11,6 +11,7 @@ pub mod reading_lists;
 pub mod refresh;
 pub mod rename;
 pub mod restore;
+pub mod runs;
 pub mod text_content;
 pub mod watchlists;
 

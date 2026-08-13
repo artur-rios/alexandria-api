@@ -6,11 +6,13 @@ use alexandria_core::catalog::commands::refresh::{RefreshHandler, RefreshStarted
 use alexandria_core::catalog::fs::Filesystem;
 use alexandria_core::catalog::model::FileType;
 use alexandria_core::catalog::repos::CatalogRepository;
+use alexandria_core::catalog::runs::{CatalogRunRepository, RunCounts, RunKind, RunStatus};
 use alexandria_core::errors::DomainError;
 
 use crate::common::{
-    existing_file_with_hash, existing_missing_file, fixed_clock, now, FakeAuth,
-    FakeCatalogRepository, FakeFilesystem,
+    existing_file_with_hash, existing_missing_file, fixed_clock, now, FailingCatalogRepository,
+    FailingCatalogRunRepository, FakeAuth, FakeCatalogRepository, FakeCatalogRunRepository,
+    FakeFilesystem,
 };
 
 const TOKEN: &str = "bearer-token";
@@ -19,14 +21,21 @@ const TOKEN: &str = "bearer-token";
 /// tallies must not depend on how many paths are in flight.
 const TEST_CONCURRENCY: u32 = 4;
 
-fn refresh_handler<A, R, F, C>(auth: A, repo: R, fs: F, clock: C) -> RefreshHandler<A, R, F, C>
+fn refresh_handler<A, R, F, C, RR>(
+    auth: A,
+    repo: R,
+    fs: F,
+    clock: C,
+    runs: RR,
+) -> RefreshHandler<A, R, F, C, RR>
 where
     A: AuthService,
     R: CatalogRepository,
     F: Filesystem,
     C: Clock,
+    RR: CatalogRunRepository,
 {
-    RefreshHandler::new(auth, repo, fs, clock, TEST_CONCURRENCY)
+    RefreshHandler::new(auth, repo, fs, clock, TEST_CONCURRENCY, runs)
 }
 
 #[tokio::test]
@@ -37,6 +46,7 @@ async fn given_authenticated_when_refresh_start_then_returns_run_id() {
         FakeCatalogRepository::new(),
         fs,
         fixed_clock(now()),
+        FakeCatalogRunRepository::new(),
     );
 
     let started: RefreshStarted = handler.start(TOKEN).await.expect("start");
@@ -51,6 +61,7 @@ async fn given_unauthenticated_when_refresh_start_then_unauthorized() {
         FakeCatalogRepository::new(),
         fs,
         fixed_clock(now()),
+        FakeCatalogRunRepository::new(),
     );
 
     let result = handler.start("").await;
@@ -72,7 +83,13 @@ async fn given_changed_hash_when_execute_then_hash_and_indexedat_refreshed() {
     let fs = FakeFilesystem::builder()
         .with_file("/lib", "/lib/a.mp3", "a.mp3", "new-hash")
         .build();
-    let handler = refresh_handler(FakeAuth::Allowing, repo, fs, fixed_clock(now()));
+    let handler = refresh_handler(
+        FakeAuth::Allowing,
+        repo,
+        fs,
+        fixed_clock(now()),
+        FakeCatalogRunRepository::new(),
+    );
 
     let outcome = handler.execute(Uuid::new_v4()).await.expect("execute");
 
@@ -102,7 +119,13 @@ async fn given_unchanged_present_file_when_execute_then_no_write() {
     let fs = FakeFilesystem::builder()
         .with_file("/lib", "/lib/a.md", "a.md", "same-hash")
         .build();
-    let handler = refresh_handler(FakeAuth::Allowing, repo, fs, fixed_clock(now()));
+    let handler = refresh_handler(
+        FakeAuth::Allowing,
+        repo,
+        fs,
+        fixed_clock(now()),
+        FakeCatalogRunRepository::new(),
+    );
 
     let outcome = handler.execute(Uuid::new_v4()).await.expect("execute");
 
@@ -129,7 +152,13 @@ async fn given_disk_missing_path_when_execute_then_marked_missing_record_kept() 
 
     // The file is NOT registered with the filesystem -> path_exists reports false.
     let fs = FakeFilesystem::builder().build();
-    let handler = refresh_handler(FakeAuth::Allowing, repo, fs, fixed_clock(now()));
+    let handler = refresh_handler(
+        FakeAuth::Allowing,
+        repo,
+        fs,
+        fixed_clock(now()),
+        FakeCatalogRunRepository::new(),
+    );
 
     let outcome = handler.execute(Uuid::new_v4()).await.expect("execute");
 
@@ -164,7 +193,13 @@ async fn given_missing_file_returned_on_disk_when_execute_then_missing_cleared_a
     let fs = FakeFilesystem::builder()
         .with_file("/lib", "/lib/back.mp3", "back.mp3", "returned-hash")
         .build();
-    let handler = refresh_handler(FakeAuth::Allowing, repo, fs, fixed_clock(now()));
+    let handler = refresh_handler(
+        FakeAuth::Allowing,
+        repo,
+        fs,
+        fixed_clock(now()),
+        FakeCatalogRunRepository::new(),
+    );
 
     let outcome = handler.execute(Uuid::new_v4()).await.expect("execute");
 
@@ -196,7 +231,13 @@ async fn given_already_missing_and_still_gone_when_execute_then_left_as_is() {
         .missing_at;
 
     let fs = FakeFilesystem::builder().build(); // file still absent
-    let handler = refresh_handler(FakeAuth::Allowing, repo, fs, fixed_clock(now()));
+    let handler = refresh_handler(
+        FakeAuth::Allowing,
+        repo,
+        fs,
+        fixed_clock(now()),
+        FakeCatalogRunRepository::new(),
+    );
 
     let outcome = handler.execute(Uuid::new_v4()).await.expect("execute");
 
@@ -232,7 +273,13 @@ async fn given_unreadable_file_when_execute_then_refresh_continues_and_counts_fa
         .with_file("/lib", "/lib/a.mp3", "a.mp3", "a-new")
         .with_unreadable_file("/lib", "/lib/b.mp3", "b.mp3")
         .build();
-    let handler = refresh_handler(FakeAuth::Allowing, repo, fs, fixed_clock(now()));
+    let handler = refresh_handler(
+        FakeAuth::Allowing,
+        repo,
+        fs,
+        fixed_clock(now()),
+        FakeCatalogRunRepository::new(),
+    );
 
     let outcome = handler
         .execute(Uuid::new_v4())
@@ -276,7 +323,13 @@ async fn given_failing_repository_write_when_execute_then_refresh_continues_and_
         .with_file("/lib", "/lib/a.mp3", "a.mp3", "a-new")
         .with_file("/lib", "/lib/b.mp3", "b.mp3", "b-new")
         .build();
-    let handler = refresh_handler(FakeAuth::Allowing, repo, fs, fixed_clock(now()));
+    let handler = refresh_handler(
+        FakeAuth::Allowing,
+        repo,
+        fs,
+        fixed_clock(now()),
+        FakeCatalogRunRepository::new(),
+    );
 
     let outcome = handler
         .execute(Uuid::new_v4())
@@ -343,6 +396,7 @@ async fn given_any_concurrency_when_execute_then_same_outcome_tallies() {
             fs,
             fixed_clock(now()),
             concurrency,
+            FakeCatalogRunRepository::new(),
         );
 
         let outcome = handler.execute(Uuid::new_v4()).await.expect("execute");
@@ -367,7 +421,14 @@ async fn given_zero_concurrency_when_execute_then_runs_sequentially_rather_than_
     let fs = FakeFilesystem::builder()
         .with_file("/lib", "/lib/a.mp3", "a.mp3", "a-new")
         .build();
-    let handler = RefreshHandler::new(FakeAuth::Allowing, repo, fs, fixed_clock(now()), 0);
+    let handler = RefreshHandler::new(
+        FakeAuth::Allowing,
+        repo,
+        fs,
+        fixed_clock(now()),
+        0,
+        FakeCatalogRunRepository::new(),
+    );
 
     let outcome = handler.execute(Uuid::new_v4()).await.expect("execute");
 
@@ -378,7 +439,13 @@ async fn given_zero_concurrency_when_execute_then_runs_sequentially_rather_than_
 async fn given_no_cataloged_files_when_execute_then_empty_outcome() {
     let repo = FakeCatalogRepository::new();
     let fs = FakeFilesystem::builder().build();
-    let handler = refresh_handler(FakeAuth::Allowing, repo, fs, fixed_clock(now()));
+    let handler = refresh_handler(
+        FakeAuth::Allowing,
+        repo,
+        fs,
+        fixed_clock(now()),
+        FakeCatalogRunRepository::new(),
+    );
 
     let outcome = handler.execute(Uuid::new_v4()).await.expect("execute");
     assert_eq!(outcome.refreshed, 0);
@@ -415,7 +482,13 @@ async fn given_mixed_cataloged_files_when_execute_then_each_handled_correctly() 
         .with_file("/lib", "/lib/b.md", "b.md", "b-hash")
         // c.pdf absent on disk
         .build();
-    let handler = refresh_handler(FakeAuth::Allowing, repo, fs, fixed_clock(now()));
+    let handler = refresh_handler(
+        FakeAuth::Allowing,
+        repo,
+        fs,
+        fixed_clock(now()),
+        FakeCatalogRunRepository::new(),
+    );
 
     let outcome = handler.execute(Uuid::new_v4()).await.expect("execute");
 
@@ -436,4 +509,153 @@ async fn given_mixed_cataloged_files_when_execute_then_each_handled_correctly() 
         .unwrap()
         .missing_at
         .is_some());
+}
+
+// ---------------- Run record lifecycle (UC-42 / FR-FC-27) ----------------
+
+#[tokio::test]
+async fn given_a_started_refresh_when_started_then_the_run_is_recorded_running() {
+    let runs = FakeCatalogRunRepository::new();
+    let handler = refresh_handler(
+        FakeAuth::Allowing,
+        FakeCatalogRepository::new(),
+        FakeFilesystem::builder().build(),
+        fixed_clock(now()),
+        runs.clone(),
+    );
+
+    let started = handler.start(TOKEN).await.expect("start");
+
+    let recorded = runs.get_recorded(started.run_id).expect("run recorded");
+    assert_eq!(recorded.kind, RunKind::Refresh);
+    assert_eq!(recorded.status, RunStatus::Running);
+    assert!(recorded.root.is_none(), "a refresh takes no root");
+}
+
+#[tokio::test]
+async fn given_a_refresh_that_walks_when_executed_then_the_run_is_recorded_complete() {
+    let runs = FakeCatalogRunRepository::new();
+    // Same fixture shape as `given_changed_hash_when_execute_then_hash_and_indexedat_refreshed`:
+    // one cataloged file whose on-disk hash changed.
+    let repo = FakeCatalogRepository::new();
+    repo.seed(existing_file_with_hash(
+        "/lib/a.mp3",
+        "a.mp3",
+        FileType::Audio,
+        "old-hash",
+    ));
+    let fs = FakeFilesystem::builder()
+        .with_file("/lib", "/lib/a.mp3", "a.mp3", "new-hash")
+        .build();
+    let handler = refresh_handler(
+        FakeAuth::Allowing,
+        repo,
+        fs,
+        fixed_clock(now()),
+        runs.clone(),
+    );
+
+    let started = handler.start(TOKEN).await.expect("start");
+    let outcome = handler.execute(started.run_id).await.expect("execute");
+
+    let recorded = runs.get_recorded(started.run_id).expect("run recorded");
+    assert_eq!(recorded.status, RunStatus::Complete);
+    assert_eq!(
+        recorded.counts,
+        Some(RunCounts::Refresh {
+            refreshed: outcome.refreshed,
+            marked_missing: outcome.marked_missing,
+            unchanged: outcome.unchanged,
+            failed: outcome.failed,
+        }),
+        "the recorded tally is the outcome the walk computed"
+    );
+}
+
+#[tokio::test]
+async fn given_a_catalog_that_cannot_be_listed_when_executed_then_the_run_is_recorded_failed() {
+    // FR-FC-27: this is the only case that makes a run `failed` — the walk
+    // could not proceed at all.
+    let runs = FakeCatalogRunRepository::new();
+    let handler = refresh_handler(
+        FakeAuth::Allowing,
+        FailingCatalogRepository,
+        FakeFilesystem::builder().build(),
+        fixed_clock(now()),
+        runs.clone(),
+    );
+
+    let started = handler.start(TOKEN).await.expect("start");
+    let err = handler
+        .execute(started.run_id)
+        .await
+        .expect_err("must fail");
+
+    let recorded = runs.get_recorded(started.run_id).expect("run recorded");
+    assert_eq!(recorded.status, RunStatus::Failed);
+    assert!(
+        recorded.error.is_some(),
+        "a failed run carries the underlying error"
+    );
+    assert!(recorded.counts.is_none());
+    let _ = err;
+}
+
+#[tokio::test]
+async fn given_run_completion_cannot_be_recorded_when_executed_then_the_outcome_is_still_returned()
+{
+    // FR-FC-27: the walk itself succeeds; only the bookkeeping write fails.
+    // The caller must still see the outcome it computed — a bookkeeping
+    // failure must not sink a completed walk. Same single-file fixture as
+    // `given_changed_hash_when_execute_then_hash_and_indexedat_refreshed`.
+    let repo = FakeCatalogRepository::new();
+    repo.seed(existing_file_with_hash(
+        "/lib/a.mp3",
+        "a.mp3",
+        FileType::Audio,
+        "old-hash",
+    ));
+    let fs = FakeFilesystem::builder()
+        .with_file("/lib", "/lib/a.mp3", "a.mp3", "new-hash")
+        .build();
+    let handler = refresh_handler(
+        FakeAuth::Allowing,
+        repo,
+        fs,
+        fixed_clock(now()),
+        FailingCatalogRunRepository::FinishFails,
+    );
+
+    let outcome = handler
+        .execute(Uuid::new_v4())
+        .await
+        .expect("a failed run-completion write must not fail the walk");
+
+    assert_eq!(outcome.refreshed, 1);
+    assert_eq!(outcome.marked_missing, 0);
+    assert_eq!(outcome.unchanged, 0);
+    assert_eq!(outcome.failed, 0);
+}
+
+#[tokio::test]
+async fn given_run_cannot_be_started_when_start_then_the_error_propagates() {
+    // FR-FC-27: the opposite ruling from the finish/fail case above. A caller
+    // must never receive a run id it can never query, so unlike `finish` and
+    // `fail`, a `start` recording failure must not be swallowed — it has to
+    // reach the caller as an `Err`, not a run id.
+    let fs = FakeFilesystem::builder().build();
+    let handler = refresh_handler(
+        FakeAuth::Allowing,
+        FakeCatalogRepository::new(),
+        fs,
+        fixed_clock(now()),
+        FailingCatalogRunRepository::StartFails,
+    );
+
+    let result = handler.start(TOKEN).await;
+
+    assert!(
+        result.is_err(),
+        "a run-record open failure must propagate, not hand back a run id"
+    );
 }

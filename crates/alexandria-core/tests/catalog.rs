@@ -31,5 +31,11 @@ mod rename;
 #[path = "catalog/restore.rs"]
 mod restore;
 
+#[path = "catalog/runs.rs"]
+mod runs;
+
 #[path = "catalog/soft_delete.rs"]
 mod soft_delete;
+
+#[path = "catalog/run_status.rs"]
+mod run_status;

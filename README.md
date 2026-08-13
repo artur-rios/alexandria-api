@@ -24,7 +24,7 @@ its open/closed state, so the tables stay in sync with the board automatically.
 | Milestone | Scope | Progress |
 | --- | --- | :---: |
 | [F-00 Foundation & operations](https://github.com/artur-rios/alexandria-api/milestone/1) | Scaffold, config, migrations, health | 2 / 2 |
-| [F-01 File indexing](https://github.com/artur-rios/alexandria-api/milestone/2) | UC-01 … UC-02 | 2 / 2 |
+| [F-01 File indexing](https://github.com/artur-rios/alexandria-api/milestone/2) | UC-01 … UC-02, UC-42 | 2 / 3 |
 | [F-02 Catalog browsing & metadata editing](https://github.com/artur-rios/alexandria-api/milestone/3) | UC-03 … UC-04 | 2 / 2 |
 | [F-03 Renaming & lifecycle management](https://github.com/artur-rios/alexandria-api/milestone/4) | UC-05 … UC-09 | 5 / 5 |
 | [F-04 Text file content editing](https://github.com/artur-rios/alexandria-api/milestone/5) | UC-32 … UC-33 | 2 / 2 |
@@ -34,7 +34,7 @@ its open/closed state, so the tables stay in sync with the board automatically.
 | [F-08 Reading lists](https://github.com/artur-rios/alexandria-api/milestone/9) | UC-26 … UC-31 | 6 / 6 |
 | [F-09 Pluggable authentication](https://github.com/artur-rios/alexandria-api/milestone/10) | UC-34 … UC-36, UC-41 | 3 / 4 |
 | [F-10 Media playback](https://github.com/artur-rios/alexandria-api/milestone/11) | UC-38 … UC-40 | 3 / 3 |
-| **Total** | | **41 / 42** |
+| **Total** | | **41 / 43** |
 
 ### F-00 — Foundation & operations
 
@@ -54,6 +54,7 @@ catalog current.
 | --- | --- | :---: | --- | --- |
 | [#2](https://github.com/artur-rios/alexandria-api/issues/2) | UC-01 | &#9745; | Index library files | FR-FC-01 … FR-FC-09, FR-FC-24 |
 | [#3](https://github.com/artur-rios/alexandria-api/issues/3) | UC-02 | &#9745; | Re-index and refresh the catalog | FR-FC-08, FR-FC-10, FR-FC-11, FR-FC-24 |
+| [#99](https://github.com/artur-rios/alexandria-api/issues/99) | UC-42 | &#9744; | Query an index or refresh run | FR-FC-24, FR-FC-27, FR-FC-28, FR-FC-29 |
 
 ### F-02 — Catalog browsing & metadata editing
 

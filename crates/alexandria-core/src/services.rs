@@ -17,7 +17,7 @@ use crate::bookmarks::commands::update::UpdateBookmarkHandler;
 use crate::bookmarks::queries::browse::BrowseBookmarksHandler;
 use crate::bookmarks::repos::SqliteBookmarkRepository;
 use crate::catalog::audio_tags::LoftyAudioMetadataReader;
-use crate::catalog::clock::SystemClock;
+use crate::catalog::clock::{Clock, SystemClock};
 use crate::catalog::comic_tags::CbzComicMetadataReader;
 use crate::catalog::commands::edit_content::EditTextFileContentHandler;
 use crate::catalog::commands::edit_metadata::EditMetadataHandler;
@@ -33,7 +33,9 @@ use crate::catalog::fs::StdFilesystem;
 use crate::catalog::image_tags::ExifImageMetadataReader;
 use crate::catalog::queries::browse::BrowseFilesHandler;
 use crate::catalog::queries::read_content::ReadTextFileContentHandler;
+use crate::catalog::queries::run_status::GetRunStatusHandler;
 use crate::catalog::repos::SqliteCatalogRepository;
+use crate::catalog::runs::{CatalogRunRepository, SqliteCatalogRunRepository};
 use crate::catalog::video_tags::FfmpegVideoMetadataReader;
 use crate::collections::commands::add_items::AddItemsToCollectionHandler;
 use crate::collections::commands::create::CreateCollectionHandler;
@@ -77,10 +79,16 @@ pub type DefaultIndexHandler = IndexHandler<
     PdfEpubMetadataReader,
     FfmpegVideoMetadataReader,
     CbzComicMetadataReader,
+    SqliteCatalogRunRepository,
 >;
 
-pub type DefaultRefreshHandler =
-    RefreshHandler<RuntimeAuthService, SqliteCatalogRepository, StdFilesystem, SystemClock>;
+pub type DefaultRefreshHandler = RefreshHandler<
+    RuntimeAuthService,
+    SqliteCatalogRepository,
+    StdFilesystem,
+    SystemClock,
+    SqliteCatalogRunRepository,
+>;
 
 pub type DefaultEditMetadataHandler =
     EditMetadataHandler<RuntimeAuthService, SqliteCatalogRepository>;
@@ -105,6 +113,9 @@ pub type DefaultBrowseFilesHandler =
 
 pub type DefaultReadTextFileContentHandler =
     ReadTextFileContentHandler<RuntimeAuthService, SqliteCatalogRepository, StdFilesystem>;
+
+pub type DefaultGetRunStatusHandler =
+    GetRunStatusHandler<RuntimeAuthService, SqliteCatalogRunRepository>;
 
 pub type DefaultEditTextFileContentHandler = EditTextFileContentHandler<
     RuntimeAuthService,
@@ -241,6 +252,7 @@ pub struct Services {
     pub purge_file_on_disk_handler: Arc<DefaultPurgeFileOnDiskHandler>,
     pub browse_files_handler: Arc<DefaultBrowseFilesHandler>,
     pub read_text_file_content_handler: Arc<DefaultReadTextFileContentHandler>,
+    pub get_run_status_handler: Arc<DefaultGetRunStatusHandler>,
     pub edit_text_file_content_handler: Arc<DefaultEditTextFileContentHandler>,
     pub playback_source_handler: Arc<DefaultPlaybackSourceHandler>,
     pub comic_page_handler: Arc<DefaultComicPageHandler>,
@@ -285,10 +297,26 @@ pub struct Services {
 pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
     let retention_days = settings.deletion.retention_days;
     let repo = SqliteCatalogRepository::new(pool.clone());
+    let run_repo = SqliteCatalogRunRepository::new(pool.clone());
     let session_repo = SqliteSessionRepository::new(pool.clone());
     let credential_repo = SqliteLocalCredentialRepository::new(pool.clone());
     let fs = StdFilesystem;
     let clock = SystemClock;
+    // FR-FC-29: any run still recorded as `running` belongs to a process that
+    // is gone — runs execute in-process and are never resumed. Reconcile them
+    // now, so a client polling one gets a terminal answer instead of waiting
+    // forever. A failure here must not stop startup: the catalog is still
+    // fully usable, and the stale rows are reconciled on the next boot.
+    match run_repo.interrupt_running(clock.now()).await {
+        Ok(0) => {}
+        Ok(reconciled) => {
+            tracing::info!(
+                reconciled,
+                "marked interrupted runs left by a previous process"
+            )
+        }
+        Err(err) => tracing::warn!(error = %err, "could not reconcile interrupted runs"),
+    }
     // FR-AU-01/FR-AU-03: exactly one auth mode is active, selected once here
     // from startup configuration.
     let auth = match settings.auth.mode {
@@ -341,6 +369,7 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         comic_tags,
         indexing_concurrency,
         settings.filesystem.root.clone(),
+        run_repo.clone(),
     ));
     let refresh_handler = Arc::new(RefreshHandler::new(
         auth.clone(),
@@ -348,6 +377,7 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         fs,
         clock,
         indexing_concurrency,
+        run_repo.clone(),
     ));
     let edit_metadata_handler = Arc::new(EditMetadataHandler::new(auth.clone(), repo.clone()));
     let rename_file_handler = Arc::new(RenameFileHandler::new(auth.clone(), repo.clone(), fs));
@@ -376,6 +406,7 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         repo.clone(),
         fs,
     ));
+    let get_run_status_handler = Arc::new(GetRunStatusHandler::new(auth.clone(), run_repo.clone()));
     let edit_text_file_content_handler = Arc::new(EditTextFileContentHandler::new(
         auth.clone(),
         repo.clone(),
@@ -536,6 +567,7 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         purge_file_on_disk_handler,
         browse_files_handler,
         read_text_file_content_handler,
+        get_run_status_handler,
         edit_text_file_content_handler,
         playback_source_handler,
         comic_page_handler,

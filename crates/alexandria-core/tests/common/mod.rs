@@ -30,6 +30,9 @@ use alexandria_core::catalog::model::{
     File, FileState, FileType, NewFile, StateFilter, SubtypeMetadata,
 };
 use alexandria_core::catalog::repos::CatalogRepository;
+use alexandria_core::catalog::runs::{
+    CatalogRun, CatalogRunRepository, RunCounts, RunKind, RunStatus,
+};
 use alexandria_core::catalog::video_tags::{VideoMetadataReader, VideoTags};
 use alexandria_core::collections::model::{Collection, NewCollection};
 use alexandria_core::collections::repos::CollectionRepository;
@@ -1918,5 +1921,366 @@ impl ComicMetadataReader for FakeComicMetadataReader {
     async fn read(&self, path: &str) -> Option<ComicTags> {
         *self.call_count.lock().unwrap() += 1;
         self.tags.lock().unwrap().get(path).cloned()
+    }
+}
+
+/// In-memory `CatalogRunRepository` (UC-42). Lets the index/refresh handler
+/// tests assert the run lifecycle without a database.
+#[derive(Debug, Default, Clone)]
+pub struct FakeCatalogRunRepository {
+    runs: Arc<Mutex<HashMap<Uuid, CatalogRun>>>,
+}
+
+impl FakeCatalogRunRepository {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The recorded run for `id`, for assertions.
+    pub fn get_recorded(&self, id: Uuid) -> Option<CatalogRun> {
+        self.runs.lock().unwrap().get(&id).cloned()
+    }
+
+    pub fn count(&self) -> usize {
+        self.runs.lock().unwrap().len()
+    }
+}
+
+impl CatalogRunRepository for FakeCatalogRunRepository {
+    async fn start(
+        &self,
+        id: Uuid,
+        kind: RunKind,
+        root: Option<&str>,
+        started_at: DateTime<Utc>,
+    ) -> Result<(), DomainError> {
+        self.runs.lock().unwrap().insert(
+            id,
+            CatalogRun {
+                id,
+                kind,
+                status: RunStatus::Running,
+                root: root.map(str::to_string),
+                started_at,
+                finished_at: None,
+                counts: None,
+                error: None,
+            },
+        );
+        Ok(())
+    }
+
+    async fn finish(
+        &self,
+        id: Uuid,
+        counts: RunCounts,
+        finished_at: DateTime<Utc>,
+    ) -> Result<(), DomainError> {
+        let mut runs = self.runs.lock().unwrap();
+        if let Some(run) = runs.get_mut(&id) {
+            // Mirrors the SQLite adapter's guard: the counts variant must
+            // match the run's own kind, or the write is rejected rather than
+            // silently leaving the wrong tally in place.
+            let matches = matches!(
+                (run.kind, &counts),
+                (RunKind::Index, RunCounts::Index { .. })
+                    | (RunKind::Refresh, RunCounts::Refresh { .. })
+            );
+            if !matches {
+                return Err(DomainError::internal(format!(
+                    "counts kind mismatch: run is {:?} but counts are {:?}",
+                    run.kind, counts
+                )));
+            }
+            run.status = RunStatus::Complete;
+            run.counts = Some(counts);
+            run.finished_at = Some(finished_at);
+        }
+        Ok(())
+    }
+
+    async fn fail(
+        &self,
+        id: Uuid,
+        error: &str,
+        finished_at: DateTime<Utc>,
+    ) -> Result<(), DomainError> {
+        let mut runs = self.runs.lock().unwrap();
+        if let Some(run) = runs.get_mut(&id) {
+            run.status = RunStatus::Failed;
+            run.error = Some(error.to_string());
+            run.finished_at = Some(finished_at);
+        }
+        Ok(())
+    }
+
+    async fn get(&self, id: Uuid) -> Result<Option<CatalogRun>, DomainError> {
+        Ok(self.runs.lock().unwrap().get(&id).cloned())
+    }
+
+    async fn interrupt_running(&self, now: DateTime<Utc>) -> Result<u64, DomainError> {
+        let mut runs = self.runs.lock().unwrap();
+        let mut reconciled = 0;
+        for run in runs.values_mut() {
+            if run.status == RunStatus::Running {
+                run.status = RunStatus::Interrupted;
+                run.finished_at = Some(now);
+                reconciled += 1;
+            }
+        }
+        Ok(reconciled)
+    }
+}
+
+/// A `CatalogRepository` whose `list_all` always fails (UC-42 / FR-FC-27).
+/// Drives `RefreshHandler::execute`'s "the walk could not proceed at all"
+/// path, which is the only case that records a run `failed`. Every other
+/// method is unreachable from that path, so it panics loudly if the walk
+/// ever changes to call one of them.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct FailingCatalogRepository;
+
+impl CatalogRepository for FailingCatalogRepository {
+    async fn find_by_path(&self, _path: &str) -> Result<Option<File>, DomainError> {
+        unimplemented!("not reached by the run-fails-to-list path")
+    }
+
+    async fn find_by_uuid(&self, _uuid: Uuid) -> Result<Option<File>, DomainError> {
+        unimplemented!("not reached by the run-fails-to-list path")
+    }
+
+    async fn insert_file(&self, _new_file: NewFile) -> Result<File, DomainError> {
+        unimplemented!("not reached by the run-fails-to-list path")
+    }
+
+    async fn list_all(&self) -> Result<Vec<File>, DomainError> {
+        Err(DomainError::Disk("catalog store unavailable".into()))
+    }
+
+    async fn refresh_hash(
+        &self,
+        _path: &str,
+        _content_hash: &str,
+        _indexed_at: DateTime<Utc>,
+    ) -> Result<(), DomainError> {
+        unimplemented!("not reached by the run-fails-to-list path")
+    }
+
+    async fn mark_missing(
+        &self,
+        _path: &str,
+        _missing_at: DateTime<Utc>,
+    ) -> Result<(), DomainError> {
+        unimplemented!("not reached by the run-fails-to-list path")
+    }
+
+    async fn update_metadata(
+        &self,
+        _uuid: Uuid,
+        _metadata: &SubtypeMetadata,
+    ) -> Result<(), DomainError> {
+        unimplemented!("not reached by the run-fails-to-list path")
+    }
+
+    async fn list_filtered(
+        &self,
+        _file_type: Option<FileType>,
+        _state: StateFilter,
+        _collection_uuid: Option<Uuid>,
+    ) -> Result<Vec<File>, DomainError> {
+        unimplemented!("not reached by the run-fails-to-list path")
+    }
+
+    async fn find_metadata_by_uuid(
+        &self,
+        _uuid: Uuid,
+    ) -> Result<Option<SubtypeMetadata>, DomainError> {
+        unimplemented!("not reached by the run-fails-to-list path")
+    }
+
+    async fn set_image_dimensions(
+        &self,
+        _uuid: Uuid,
+        _width: i64,
+        _height: i64,
+    ) -> Result<(), DomainError> {
+        unimplemented!("not reached by the run-fails-to-list path")
+    }
+
+    async fn find_image_dimensions(&self, _uuid: Uuid) -> Result<Option<(i64, i64)>, DomainError> {
+        unimplemented!("not reached by the run-fails-to-list path")
+    }
+
+    async fn set_document_page_count(
+        &self,
+        _uuid: Uuid,
+        _page_count: i64,
+    ) -> Result<(), DomainError> {
+        unimplemented!("not reached by the run-fails-to-list path")
+    }
+
+    async fn find_document_page_count(&self, _uuid: Uuid) -> Result<Option<i64>, DomainError> {
+        unimplemented!("not reached by the run-fails-to-list path")
+    }
+
+    async fn set_video_duration(
+        &self,
+        _uuid: Uuid,
+        _duration_seconds: f64,
+    ) -> Result<(), DomainError> {
+        unimplemented!("not reached by the run-fails-to-list path")
+    }
+
+    async fn find_video_duration(&self, _uuid: Uuid) -> Result<Option<f64>, DomainError> {
+        unimplemented!("not reached by the run-fails-to-list path")
+    }
+
+    async fn set_comic_page_count(&self, _uuid: Uuid, _page_count: i64) -> Result<(), DomainError> {
+        unimplemented!("not reached by the run-fails-to-list path")
+    }
+
+    async fn find_comic_page_count(&self, _uuid: Uuid) -> Result<Option<i64>, DomainError> {
+        unimplemented!("not reached by the run-fails-to-list path")
+    }
+
+    async fn rename_file(
+        &self,
+        _uuid: Uuid,
+        _new_name: &str,
+        _new_path: &str,
+    ) -> Result<File, DomainError> {
+        unimplemented!("not reached by the run-fails-to-list path")
+    }
+
+    async fn soft_delete(
+        &self,
+        _uuid: Uuid,
+        _deleted_at: DateTime<Utc>,
+    ) -> Result<File, DomainError> {
+        unimplemented!("not reached by the run-fails-to-list path")
+    }
+
+    async fn restore(&self, _uuid: Uuid) -> Result<File, DomainError> {
+        unimplemented!("not reached by the run-fails-to-list path")
+    }
+
+    async fn purge(&self, _uuid: Uuid) -> Result<(), DomainError> {
+        unimplemented!("not reached by the run-fails-to-list path")
+    }
+
+    async fn set_collection(&self, _uuid: Uuid, _collection_uuid: Uuid) -> Result<(), DomainError> {
+        unimplemented!("not reached by the run-fails-to-list path")
+    }
+
+    async fn clear_collection(
+        &self,
+        _uuid: Uuid,
+        _collection_uuid: Uuid,
+    ) -> Result<(), DomainError> {
+        unimplemented!("not reached by the run-fails-to-list path")
+    }
+}
+
+/// A `Filesystem` whose `list_files` always fails, `path_exists` always
+/// answers `true` (so `IndexHandler::start`'s root-exists guard passes and
+/// the failure surfaces from `execute`'s walk instead). Drives the "the walk
+/// could not proceed at all" path (UC-42 / FR-FC-27), the only case that
+/// records an index run `failed`. Every other method is unreachable from
+/// that path.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct FailingListFilesystem;
+
+impl Filesystem for FailingListFilesystem {
+    async fn path_exists(&self, _root: &str) -> bool {
+        true
+    }
+
+    async fn list_files(&self, _root: &str) -> Result<Vec<FileEntry>, DomainError> {
+        Err(DomainError::Disk("filesystem unavailable".into()))
+    }
+
+    async fn content_hash(&self, _path: &str) -> Result<String, DomainError> {
+        unimplemented!("not reached by the run-fails-to-list path")
+    }
+
+    async fn rename(&self, _from: &str, _to: &str) -> Result<(), DomainError> {
+        unimplemented!("not reached by the run-fails-to-list path")
+    }
+
+    async fn remove_file(&self, _path: &str) -> Result<bool, DomainError> {
+        unimplemented!("not reached by the run-fails-to-list path")
+    }
+
+    async fn read_file(&self, _path: &str) -> Result<String, DomainError> {
+        unimplemented!("not reached by the run-fails-to-list path")
+    }
+
+    async fn write_file(&self, _path: &str, _content: &str) -> Result<(), DomainError> {
+        unimplemented!("not reached by the run-fails-to-list path")
+    }
+}
+
+/// A `CatalogRunRepository` that fails one lifecycle write on purpose (UC-42
+/// / FR-FC-27).
+///
+/// `FinishFails` pins the "a bookkeeping failure must not sink a successful
+/// walk" behavior: `execute()` retries the write and, once retries are
+/// exhausted, still returns the outcome it computed rather than propagating
+/// the recording error.
+///
+/// `StartFails` pins the opposite ruling for `start`: unlike `finish`/`fail`,
+/// a failure to open the run record must propagate, because a caller must
+/// never receive a run id it can never query.
+///
+/// Each variant implements only the method its test exercises; the rest are
+/// `unimplemented!()`.
+#[derive(Debug, Clone, Copy, Default)]
+pub enum FailingCatalogRunRepository {
+    #[default]
+    FinishFails,
+    StartFails,
+}
+
+impl CatalogRunRepository for FailingCatalogRunRepository {
+    async fn start(
+        &self,
+        _id: Uuid,
+        _kind: RunKind,
+        _root: Option<&str>,
+        _started_at: DateTime<Utc>,
+    ) -> Result<(), DomainError> {
+        match self {
+            Self::StartFails => Err(DomainError::Disk("run store unavailable".into())),
+            Self::FinishFails => unimplemented!("not exercised by the finish-always-fails test"),
+        }
+    }
+
+    async fn finish(
+        &self,
+        _id: Uuid,
+        _counts: RunCounts,
+        _finished_at: DateTime<Utc>,
+    ) -> Result<(), DomainError> {
+        match self {
+            Self::FinishFails => Err(DomainError::Disk("run store unavailable".into())),
+            Self::StartFails => unimplemented!("start already failed; finish is never reached"),
+        }
+    }
+
+    async fn fail(
+        &self,
+        _id: Uuid,
+        _error: &str,
+        _finished_at: DateTime<Utc>,
+    ) -> Result<(), DomainError> {
+        unimplemented!("not exercised by either failing-repository test")
+    }
+
+    async fn get(&self, _id: Uuid) -> Result<Option<CatalogRun>, DomainError> {
+        unimplemented!("not exercised by either failing-repository test")
+    }
+
+    async fn interrupt_running(&self, _now: DateTime<Utc>) -> Result<u64, DomainError> {
+        unimplemented!("not exercised by either failing-repository test")
     }
 }
