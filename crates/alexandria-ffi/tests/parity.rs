@@ -26,14 +26,14 @@ use alexandria_ffi::{
     alexandria_file_playback_source, alexandria_file_purge, alexandria_file_purge_on_disk,
     alexandria_file_read_content, alexandria_file_rename, alexandria_file_restore,
     alexandria_file_soft_delete, alexandria_file_thumbnail, alexandria_files_list,
-    alexandria_free_string, alexandria_index_count_files, alexandria_index_count_missing,
-    alexandria_index_files_json, alexandria_index_init, alexandria_index_refresh_start,
-    alexandria_index_run_status_json, alexandria_index_start, alexandria_reading_list_add_item,
-    alexandria_reading_list_create, alexandria_reading_list_delete,
-    alexandria_reading_list_remove_item, alexandria_reading_list_update_progress,
-    alexandria_reading_lists_list, alexandria_watchlist_add_video, alexandria_watchlist_create,
-    alexandria_watchlist_delete, alexandria_watchlist_remove_video,
-    alexandria_watchlist_update_progress, alexandria_watchlists_list, IndexStartResult,
+    alexandria_free_string, alexandria_index_count_files, alexandria_index_files_json,
+    alexandria_index_init, alexandria_index_refresh_start, alexandria_index_run_status_json,
+    alexandria_index_start, alexandria_reading_list_add_item, alexandria_reading_list_create,
+    alexandria_reading_list_delete, alexandria_reading_list_remove_item,
+    alexandria_reading_list_update_progress, alexandria_reading_lists_list,
+    alexandria_watchlist_add_video, alexandria_watchlist_create, alexandria_watchlist_delete,
+    alexandria_watchlist_remove_video, alexandria_watchlist_update_progress,
+    alexandria_watchlists_list, IndexStartResult,
 };
 use alexandria_http::app;
 use axum::body::{to_bytes, Body};
@@ -307,15 +307,6 @@ async fn given_same_lib_when_refreshed_via_http_and_ffi_then_rows_and_missing_ma
 
     wait_for_http_files(&http_pool, 2).await;
 
-    // The hash `a.mp3` carries *before* the mutation, so the wait below can
-    // tell "the refresh has rewritten this row" from "the refresh has not
-    // reached it yet".
-    let (http_stale_hash,): (String,) =
-        sqlx::query_as("SELECT content_hash FROM files WHERE name = 'a.mp3'")
-            .fetch_one(&http_pool)
-            .await
-            .unwrap();
-
     mutate(&http_lib);
 
     let refresh_req = Request::builder()
@@ -329,13 +320,24 @@ async fn given_same_lib_when_refreshed_via_http_and_ffi_then_rows_and_missing_ma
         .await
         .expect("http refresh");
     assert_eq!(refresh_resp.status(), axum::http::StatusCode::ACCEPTED);
+    let refresh_body: serde_json::Value = serde_json::from_slice(
+        &to_bytes(refresh_resp.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let http_run_id = refresh_body["runId"]
+        .as_str()
+        .expect("http runId")
+        .to_string();
 
-    wait_for_http_missing(&http_pool, 1).await;
-    // Both halves of the refresh must land before the rows are read: the
-    // marker for the deleted `b.md` above, and the re-hash of the changed
-    // `a.mp3` here. They run concurrently, so the marker alone proves nothing
-    // about the hash.
-    wait_for_http_rehash(&http_pool, "a.mp3", &http_stale_hash).await;
+    // The run record (UC-42) is the actual signal that both halves of the
+    // refresh — the re-hash of the changed file and the missing marker for
+    // the deleted one — have landed. They run concurrently inside
+    // `RefreshHandler::refresh_one`, so polling either row directly (as this
+    // test used to) can observe one half without the other; `complete` means
+    // the whole walk, including both halves, is done.
+    wait_for_http_run_terminal(&http_services, &http_run_id, TEST_TOKEN).await;
 
     let http_rows: Vec<(String, String, String, String, Option<String>)> = sqlx::query_as(
         "SELECT path, name, type, content_hash, missing_at FROM files ORDER BY path",
@@ -364,17 +366,19 @@ async fn given_same_lib_when_refreshed_via_http_and_ffi_then_rows_and_missing_ma
                 assert_eq!(started.status, alexandria_ffi::INDEX_OK);
                 wait_for_ffi_files(2);
 
-                // Same purpose as the HTTP leg's `http_stale_hash`.
-                let ffi_stale_hash = ffi_hash_for("a.mp3").expect("a.mp3 indexed");
-
                 // identical mutation on disk
                 std::fs::write(ffi_lib.path().join("a.mp3"), b"audio-v2-CHANGED").unwrap();
                 std::fs::remove_file(ffi_lib.path().join("b.md")).unwrap();
 
                 let refresh = alexandria_index_refresh_start(token.as_ptr());
                 assert_eq!(refresh.status, alexandria_ffi::INDEX_OK);
-                wait_for_ffi_missing(1);
-                wait_for_ffi_rehash("a.mp3", &ffi_stale_hash);
+                let ffi_run_id = run_id_string(&refresh);
+
+                // Same purpose as the HTTP leg's run-status poll: `complete`
+                // is the signal that both halves of the refresh — the re-hash
+                // and the missing marker, which run concurrently — have
+                // landed, rather than guessing from either row directly.
+                wait_for_ffi_run_terminal(&ffi_run_id, &token);
 
                 let raw = alexandria_index_files_json();
                 assert!(!raw.is_null());
@@ -486,88 +490,78 @@ async fn wait_for_http_audio_title(pool: &sqlx::sqlite::SqlitePool, expected_tit
     }
 }
 
-/// Wait until `name`'s recorded hash is something other than `stale_hash` —
-/// that is, until the refresh pass has actually rewritten that row.
+/// Poll `GET /v1/index/runs/{runId}` (UC-42) until the run leaves `running`.
 ///
-/// `wait_for_*_missing` pins only the *deletion* half of a refresh. The walk
-/// handles each cataloged path concurrently (`RefreshHandler::refresh_one`),
-/// so a removed file's missing marker can land while a changed file's
-/// re-hash is still in flight. A reader that stops at the missing marker can
-/// therefore still observe the pre-refresh hash.
-///
-/// That is exactly how this file's UC-02 parity test used to fail on a loaded
-/// runner: both legs waited only for the marker, one had re-hashed `a.mp3`
-/// and the other had not, and the cross-surface comparison reported two
-/// different hashes for the same content. Waiting on the condition the
-/// assertion actually depends on is the fix.
-async fn wait_for_http_rehash(pool: &sqlx::sqlite::SqlitePool, name: &str, stale_hash: &str) {
+/// This is the real signal that a refresh has finished both halves of its
+/// work — the re-hash of a changed file and the missing marker for a deleted
+/// one, which land in no fixed order (`RefreshHandler::refresh_one` handles
+/// each cataloged path concurrently). `complete` means the whole walk is
+/// done, not just whichever half a caller happened to poll for. Before this
+/// signal existed, this test waited on the missing-count and then on a
+/// hash-specific rehash check; both were guesswork about a signal the run
+/// record now provides directly.
+async fn wait_for_http_run_terminal(
+    services: &std::sync::Arc<alexandria_core::services::Services>,
+    run_id: &str,
+    token: &str,
+) -> serde_json::Value {
     let dl = std::time::Instant::now() + ASYNC_RUN_DEADLINE;
     loop {
-        let row: Option<(String,)> =
-            sqlx::query_as("SELECT content_hash FROM files WHERE name = ?")
-                .bind(name)
-                .fetch_optional(pool)
-                .await
+        let request = Request::builder()
+            .method("GET")
+            .uri(format!("/v1/index/runs/{run_id}"))
+            .header("authorization", &format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        let response = app(Settings::default(), services.clone())
+            .oneshot(request)
+            .await
+            .expect("run status oneshot");
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
                 .unwrap();
-        if row.is_some_and(|(hash,)| hash != stale_hash) {
-            return;
+        if body["status"] != "running" {
+            return body;
         }
         if std::time::Instant::now() > dl {
-            panic!("http never re-hashed {name}");
+            panic!("http run {run_id} never left running");
         }
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
 }
 
-/// The FFI counterpart of [`wait_for_http_rehash`], reading the catalog
-/// through `alexandria_index_files_json` rather than the pool.
-fn wait_for_ffi_rehash(name: &str, stale_hash: &str) {
+/// The FFI counterpart of [`wait_for_http_run_terminal`], polling
+/// `alexandria_index_run_status_json` instead of the HTTP route.
+fn wait_for_ffi_run_terminal(run_id: &str, token: &CString) {
+    let run_id_c = CString::new(run_id).unwrap();
     let dl = std::time::Instant::now() + ASYNC_RUN_DEADLINE;
     loop {
-        if ffi_hash_for(name).is_some_and(|hash| hash != stale_hash) {
+        let result = alexandria_index_run_status_json(run_id_c.as_ptr(), token.as_ptr());
+        assert_eq!(
+            result.status,
+            alexandria_ffi::RUN_OK,
+            "ffi run status failed"
+        );
+        assert!(!result.json.is_null());
+        // SAFETY: `json` is a NUL-terminated string owned by this call.
+        let body = unsafe { CStr::from_ptr(result.json) }
+            .to_str()
+            .unwrap()
+            .to_string();
+        // SAFETY: pointer came from this library and is freed exactly once,
+        // every iteration (not just the last).
+        unsafe {
+            alexandria_free_string(result.json);
+        }
+        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+        if value["status"] != "running" {
             return;
         }
         if std::time::Instant::now() > dl {
-            panic!("ffi never re-hashed {name}");
+            panic!("ffi run {run_id} never left running");
         }
         std::thread::sleep(std::time::Duration::from_millis(25));
-    }
-}
-
-/// The hash the FFI catalog currently records for the file called `name`,
-/// or `None` if no such row exists yet.
-fn ffi_hash_for(name: &str) -> Option<String> {
-    let raw = alexandria_index_files_json();
-    assert!(!raw.is_null());
-    let json = unsafe { CStr::from_ptr(raw) }.to_str().unwrap().to_string();
-    // SAFETY: pointer came from this library and is freed once.
-    unsafe {
-        alexandria_free_string(raw);
-    }
-    let value: serde_json::Value = serde_json::from_str(&json).unwrap();
-    value
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|row| row["name"].as_str() == Some(name))
-        .map(|row| row["hash"].as_str().unwrap().to_string())
-}
-
-async fn wait_for_http_missing(pool: &sqlx::sqlite::SqlitePool, expected: i64) {
-    let dl = std::time::Instant::now() + ASYNC_RUN_DEADLINE;
-    loop {
-        let (c,): (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM files WHERE missing_at IS NOT NULL")
-                .fetch_one(pool)
-                .await
-                .unwrap();
-        if c >= expected {
-            return;
-        }
-        if std::time::Instant::now() > dl {
-            panic!("http never had {expected} missing");
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
 }
 
@@ -579,19 +573,6 @@ fn wait_for_ffi_files(expected: i64) {
         }
         if std::time::Instant::now() > dl {
             panic!("ffi never had {expected} files");
-        }
-        std::thread::sleep(std::time::Duration::from_millis(25));
-    }
-}
-
-fn wait_for_ffi_missing(expected: i64) {
-    let dl = std::time::Instant::now() + ASYNC_RUN_DEADLINE;
-    loop {
-        if alexandria_index_count_missing() >= expected {
-            return;
-        }
-        if std::time::Instant::now() > dl {
-            panic!("ffi never had {expected} missing");
         }
         std::thread::sleep(std::time::Duration::from_millis(25));
     }
