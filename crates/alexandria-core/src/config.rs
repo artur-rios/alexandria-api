@@ -54,6 +54,21 @@ pub struct AuthSettings {
     /// How long a session created by local login (UC-34) stays valid.
     #[serde(default = "default_session_ttl_hours")]
     pub session_ttl_hours: u32,
+    /// How long an e-mail confirmation code stays usable (issue #102 /
+    /// FR-AU-14). Generous, because the owner may not read the message the
+    /// day it arrives, and the code is single-use and unguessable anyway.
+    #[serde(default = "default_confirmation_ttl_hours")]
+    pub confirmation_ttl_hours: u32,
+    /// How long a password-reset token stays usable (FR-AU-16). Short, and
+    /// deliberately shorter than a confirmation code: this one can take over
+    /// the account.
+    #[serde(default = "default_password_reset_ttl_minutes")]
+    pub password_reset_ttl_minutes: u32,
+    /// The shortest gap between two confirmation sends (FR-AU-15). A resend
+    /// inside it is refused as its own outcome, so a client can show a
+    /// countdown rather than an error.
+    #[serde(default = "default_resend_interval_seconds")]
+    pub resend_interval_seconds: u32,
 }
 
 fn default_auth_mode() -> AuthMode {
@@ -64,6 +79,18 @@ fn default_session_ttl_hours() -> u32 {
     24
 }
 
+fn default_confirmation_ttl_hours() -> u32 {
+    24
+}
+
+fn default_password_reset_ttl_minutes() -> u32 {
+    60
+}
+
+fn default_resend_interval_seconds() -> u32 {
+    60
+}
+
 impl Default for AuthSettings {
     fn default() -> Self {
         Self {
@@ -71,8 +98,34 @@ impl Default for AuthSettings {
             jwks_url: String::new(),
             local_db: false,
             session_ttl_hours: default_session_ttl_hours(),
+            confirmation_ttl_hours: default_confirmation_ttl_hours(),
+            password_reset_ttl_minutes: default_password_reset_ttl_minutes(),
+            resend_interval_seconds: default_resend_interval_seconds(),
         }
     }
+}
+
+/// The outbound mail provider (issue #102).
+///
+/// `None` is the default and, until the external mail service is integrated,
+/// the only value: every send is refused with `mail_not_configured` rather
+/// than silently succeeding and delivering nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum MailProvider {
+    #[default]
+    None,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct MailSettings {
+    #[serde(default)]
+    pub provider: MailProvider,
+    /// The address outbound messages are sent from. Unused while `provider`
+    /// is `None`; carried now so the integration is a configuration change
+    /// rather than a schema change.
+    #[serde(default)]
+    pub from_address: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -245,6 +298,8 @@ pub struct Settings {
     pub filesystem: FilesystemSettings,
     #[serde(default)]
     pub playback: PlaybackSettings,
+    #[serde(default)]
+    pub mail: MailSettings,
 }
 
 impl Settings {
@@ -285,6 +340,24 @@ impl Settings {
             if let Ok(parsed) = hours.parse::<u32>() {
                 self.auth.session_ttl_hours = parsed;
             }
+        }
+        if let Ok(hours) = env::var("ALEXANDRIA_AUTH_CONFIRMATION_TTL_HOURS") {
+            if let Ok(parsed) = hours.parse::<u32>() {
+                self.auth.confirmation_ttl_hours = parsed;
+            }
+        }
+        if let Ok(minutes) = env::var("ALEXANDRIA_AUTH_PASSWORD_RESET_TTL_MINUTES") {
+            if let Ok(parsed) = minutes.parse::<u32>() {
+                self.auth.password_reset_ttl_minutes = parsed;
+            }
+        }
+        if let Ok(seconds) = env::var("ALEXANDRIA_AUTH_RESEND_INTERVAL_SECONDS") {
+            if let Ok(parsed) = seconds.parse::<u32>() {
+                self.auth.resend_interval_seconds = parsed;
+            }
+        }
+        if let Ok(from) = env::var("ALEXANDRIA_MAIL_FROM_ADDRESS") {
+            self.mail.from_address = from;
         }
         if let Ok(addr) = env::var("ALEXANDRIA_HTTP_BIND_ADDR") {
             self.http.bind_addr = addr;

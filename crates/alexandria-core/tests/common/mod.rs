@@ -17,6 +17,8 @@ use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
 use alexandria_core::auth::local::{LocalCredential, LocalCredentialRepository, SessionRepository};
+use alexandria_core::auth::mail::{MailSender, OutboundMail, MAIL_NOT_CONFIGURED};
+use alexandria_core::auth::tokens::{AuthToken, AuthTokenRepository, TokenPurpose};
 use alexandria_core::auth::{AuthService, Principal};
 use alexandria_core::bookmarks::model::{Bookmark, BookmarkState, NewBookmark};
 use alexandria_core::bookmarks::repos::BookmarkRepository;
@@ -1586,6 +1588,7 @@ impl FakeLocalCredentialRepository {
         *self.credential.lock().unwrap() = Some(LocalCredential {
             email: email.to_string(),
             password_hash: password_hash.to_string(),
+            email_confirmed_at: None,
         });
     }
 }
@@ -1604,6 +1607,7 @@ impl LocalCredentialRepository for FakeLocalCredentialRepository {
         *self.credential.lock().unwrap() = Some(LocalCredential {
             email: email.to_string(),
             password_hash: password_hash.to_string(),
+            email_confirmed_at: None,
         });
         Ok(())
     }
@@ -1621,8 +1625,29 @@ impl LocalCredentialRepository for FakeLocalCredentialRepository {
         *guard = Some(LocalCredential {
             email: email.to_string(),
             password_hash: password_hash.to_string(),
+            email_confirmed_at: None,
         });
         Ok(true)
+    }
+
+    async fn confirm_email(&self, confirmed_at: DateTime<Utc>) -> Result<(), DomainError> {
+        if let Some(credential) = self.credential.lock().unwrap().as_mut() {
+            // Idempotent, like the real one: the first confirmation's
+            // timestamp is the one that stands.
+            credential.email_confirmed_at.get_or_insert(confirmed_at);
+        }
+        Ok(())
+    }
+
+    async fn set_password_hash(
+        &self,
+        password_hash: &str,
+        _updated_at: DateTime<Utc>,
+    ) -> Result<(), DomainError> {
+        if let Some(credential) = self.credential.lock().unwrap().as_mut() {
+            credential.password_hash = password_hash.to_string();
+        }
+        Ok(())
     }
 }
 
@@ -1644,6 +1669,7 @@ impl RacingLocalCredentialRepository {
             credential: Arc::new(Mutex::new(LocalCredential {
                 email: email.to_string(),
                 password_hash: password_hash.to_string(),
+                email_confirmed_at: None,
             })),
         }
     }
@@ -1669,6 +1695,7 @@ impl LocalCredentialRepository for RacingLocalCredentialRepository {
         *self.credential.lock().unwrap() = LocalCredential {
             email: email.to_string(),
             password_hash: password_hash.to_string(),
+            email_confirmed_at: None,
         };
         Ok(())
     }
@@ -1682,6 +1709,24 @@ impl LocalCredentialRepository for RacingLocalCredentialRepository {
         // The row is already there at the storage layer, regardless of what
         // `get()` answered — this is the whole point of the fake.
         Ok(false)
+    }
+
+    async fn confirm_email(&self, confirmed_at: DateTime<Utc>) -> Result<(), DomainError> {
+        self.credential
+            .lock()
+            .unwrap()
+            .email_confirmed_at
+            .get_or_insert(confirmed_at);
+        Ok(())
+    }
+
+    async fn set_password_hash(
+        &self,
+        password_hash: &str,
+        _updated_at: DateTime<Utc>,
+    ) -> Result<(), DomainError> {
+        self.credential.lock().unwrap().password_hash = password_hash.to_string();
+        Ok(())
     }
 }
 
@@ -1721,6 +1766,11 @@ impl SessionRepository for FakeSessionRepository {
             .get(&id)
             .is_some_and(|expires_at| now < *expires_at))
     }
+
+    async fn delete_all(&self) -> Result<(), DomainError> {
+        self.sessions.lock().unwrap().clear();
+        Ok(())
+    }
 }
 
 /// A `SessionRepository` whose writes always fail (UC-41 AF-06). Lets a
@@ -1740,6 +1790,10 @@ impl SessionRepository for FailingSessionRepository {
     }
 
     async fn is_valid(&self, _id: Uuid, _now: DateTime<Utc>) -> Result<bool, DomainError> {
+        Err(DomainError::Disk("session store unavailable".into()))
+    }
+
+    async fn delete_all(&self) -> Result<(), DomainError> {
         Err(DomainError::Disk("session store unavailable".into()))
     }
 }
@@ -2282,5 +2336,178 @@ impl CatalogRunRepository for FailingCatalogRunRepository {
 
     async fn interrupt_running(&self, _now: DateTime<Utc>) -> Result<u64, DomainError> {
         unimplemented!("not exercised by either failing-repository test")
+    }
+}
+
+/// In-memory token store (issue #102). Backs the confirmation and reset
+/// commands in unit tests with no database.
+#[derive(Debug, Default, Clone)]
+pub struct FakeAuthTokenRepository {
+    rows: Arc<Mutex<Vec<AuthToken>>>,
+    hashes: Arc<Mutex<HashMap<String, i64>>>,
+    next_id: Arc<Mutex<i64>>,
+}
+
+impl FakeAuthTokenRepository {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// How many tokens are stored — used to assert that a token which could
+    /// not be sent left nothing behind.
+    pub fn count(&self) -> usize {
+        self.rows.lock().unwrap().len()
+    }
+
+    /// The hashes stored, so a test can prove no plaintext was written.
+    pub fn stored_hashes(&self) -> Vec<String> {
+        self.hashes.lock().unwrap().keys().cloned().collect()
+    }
+}
+
+impl AuthTokenRepository for FakeAuthTokenRepository {
+    async fn insert(
+        &self,
+        purpose: TokenPurpose,
+        token_hash: &str,
+        email: &str,
+        created_at: DateTime<Utc>,
+        expires_at: DateTime<Utc>,
+    ) -> Result<i64, DomainError> {
+        let mut next_id = self.next_id.lock().unwrap();
+        *next_id += 1;
+        let id = *next_id;
+        self.rows.lock().unwrap().push(AuthToken {
+            id,
+            purpose: purpose.as_str().to_string(),
+            email: email.to_string(),
+            created_at,
+            expires_at,
+            consumed_at: None,
+        });
+        self.hashes
+            .lock()
+            .unwrap()
+            .insert(token_hash.to_string(), id);
+        Ok(id)
+    }
+
+    async fn delete(&self, id: i64) -> Result<(), DomainError> {
+        self.rows.lock().unwrap().retain(|row| row.id != id);
+        self.hashes
+            .lock()
+            .unwrap()
+            .retain(|_, stored| *stored != id);
+        Ok(())
+    }
+
+    async fn find_by_hash(&self, token_hash: &str) -> Result<Option<AuthToken>, DomainError> {
+        let Some(id) = self.hashes.lock().unwrap().get(token_hash).copied() else {
+            return Ok(None);
+        };
+        Ok(self
+            .rows
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|row| row.id == id)
+            .cloned())
+    }
+
+    async fn consume(&self, id: i64, consumed_at: DateTime<Utc>) -> Result<bool, DomainError> {
+        let mut rows = self.rows.lock().unwrap();
+        let Some(row) = rows.iter_mut().find(|row| row.id == id) else {
+            return Ok(false);
+        };
+        if row.consumed_at.is_some() {
+            return Ok(false);
+        }
+        row.consumed_at = Some(consumed_at);
+        Ok(true)
+    }
+
+    async fn last_created_at(
+        &self,
+        purpose: TokenPurpose,
+    ) -> Result<Option<DateTime<Utc>>, DomainError> {
+        Ok(self
+            .rows
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|row| row.purpose == purpose.as_str())
+            .map(|row| row.created_at)
+            .max())
+    }
+
+    async fn invalidate_outstanding(
+        &self,
+        purpose: TokenPurpose,
+        consumed_at: DateTime<Utc>,
+    ) -> Result<(), DomainError> {
+        for row in self
+            .rows
+            .lock()
+            .unwrap()
+            .iter_mut()
+            .filter(|row| row.purpose == purpose.as_str() && row.consumed_at.is_none())
+        {
+            row.consumed_at = Some(consumed_at);
+        }
+        Ok(())
+    }
+}
+
+/// A `MailSender` that records what it was asked to deliver (issue #102).
+/// Stands in for the external service that is not yet integrated, so a test
+/// can assert the *successful* path the provider will one day take.
+#[derive(Debug, Default, Clone)]
+pub struct FakeMailSender {
+    sent: Arc<Mutex<Vec<OutboundMail>>>,
+}
+
+impl FakeMailSender {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn sent(&self) -> Vec<OutboundMail> {
+        self.sent.lock().unwrap().clone()
+    }
+}
+
+impl MailSender for FakeMailSender {
+    async fn send(&self, message: OutboundMail) -> Result<(), DomainError> {
+        self.sent.lock().unwrap().push(message);
+        Ok(())
+    }
+
+    fn available(&self) -> Result<(), DomainError> {
+        Ok(())
+    }
+}
+
+/// A `MailSender` that always refuses, exactly as `UnconfiguredMailSender`
+/// does. Named separately so a test reads as "mail cannot be sent" rather than
+/// as "the production wiring happens to be unconfigured today".
+#[derive(Debug, Default, Clone, Copy)]
+pub struct FailingMailSender;
+
+impl MailSender for FailingMailSender {
+    async fn send(&self, _message: OutboundMail) -> Result<(), DomainError> {
+        Err(Self::refusal())
+    }
+
+    fn available(&self) -> Result<(), DomainError> {
+        Err(Self::refusal())
+    }
+}
+
+impl FailingMailSender {
+    fn refusal() -> DomainError {
+        DomainError::unavailable(
+            MAIL_NOT_CONFIGURED,
+            "outbound mail is not configured, so no message was sent",
+        )
     }
 }

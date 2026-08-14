@@ -145,6 +145,11 @@ keys — a key not listed here does not exist, and only the keys showing an
 | `auth.jwks_url` | config / `ALEXANDRIA_AUTH_JWKS_URL` | external mode only; where JWT keys are fetched. |
 | `auth.local_db` | config | local mode only; flag indicating local credentials are in SQLite. |
 | `auth.session_ttl_hours` | config / `ALEXANDRIA_AUTH_SESSION_TTL_HOURS` | local mode only; how long a login session stays valid; default `24` (FR-AU-09). |
+| `auth.confirmation_ttl_hours` | config / `ALEXANDRIA_AUTH_CONFIRMATION_TTL_HOURS` | local mode only; how long an e-mail confirmation code stays usable; default `24` (FR-AU-14). |
+| `auth.password_reset_ttl_minutes` | config / `ALEXANDRIA_AUTH_PASSWORD_RESET_TTL_MINUTES` | local mode only; how long a password-reset token stays usable; default `60`, deliberately shorter than a confirmation code (FR-AU-16). |
+| `auth.resend_interval_seconds` | config / `ALEXANDRIA_AUTH_RESEND_INTERVAL_SECONDS` | local mode only; the shortest gap between two confirmation sends; default `60` (FR-AU-15). |
+| `mail.provider` | config | the outbound mail provider; `none` is the default and, until the external mail service is integrated, the only value — it never sends and reports `mail_not_configured` (FR-AU-19). |
+| `mail.from_address` | config / `ALEXANDRIA_MAIL_FROM_ADDRESS` | the address outbound messages are sent from; unused while `mail.provider` is `none`. |
 | `http.bind_addr` | config / `ALEXANDRIA_HTTP_BIND_ADDR` | default `127.0.0.1`; loopback by default (IR-03). |
 | `http.port` | config / `ALEXANDRIA_HTTP_PORT` | default `8080`. |
 | `database.path` | config / `ALEXANDRIA_DATABASE_PATH` | SQLite file path; bundled beside the desktop app's data dir. |
