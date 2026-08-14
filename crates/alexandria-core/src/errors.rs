@@ -63,9 +63,25 @@ pub enum DomainError {
     #[error("integrity error: {0}")]
     Integrity(String),
     /// A required external dependency could not be reached (UC-36 AF-03: the
-    /// external auth service is unreachable).
+    /// external auth service is unreachable). Carries no reason code, and its
+    /// message is deliberately not echoed — which of an installation's
+    /// dependencies is down is not a caller's business.
     #[error("service unavailable: {0}")]
     ServiceUnavailable(String),
+    /// A dependency is unavailable for a reason the caller *does* need — the
+    /// mail transport is not configured, so the message it asked for will not
+    /// arrive (issue #102). Stands to `ServiceUnavailable` exactly as
+    /// `Rejected` stands to `InvalidInput`: same class, plus a stable code.
+    #[error("service unavailable: {0}")]
+    Unavailable(Rejection),
+    /// A request refused because it came too soon after the last one
+    /// (issue #102 / FR-AU-15: the confirmation resend interval). Its own
+    /// variant rather than a `Conflict`, because it is not an error the caller
+    /// made — it is a "not yet", and a client that can tell the two apart
+    /// shows a countdown instead of an alarm. Carries the rejection so the
+    /// wait can travel in `params`.
+    #[error("too many requests: {0}")]
+    TooManyRequests(Rejection),
     #[error("database error: {0}")]
     Database(#[from] sqlx::Error),
     #[error("database migration error: {0}")]
@@ -115,13 +131,29 @@ impl DomainError {
         Self::Rejected(Rejection::new(code, message))
     }
 
-    /// Add a parameter to a [`DomainError::Rejected`]. A no-op on any other
-    /// variant, so a `rejected(…).with_param(…)` chain reads straight through
+    /// A dependency is unavailable, named by a stable reason code the caller
+    /// acts on (issue #102).
+    pub fn unavailable(code: &'static str, message: impl Into<String>) -> Self {
+        Self::Unavailable(Rejection::new(code, message))
+    }
+
+    /// Refuse a request that came too soon, naming the reason and the wait
+    /// (issue #102 / FR-AU-15).
+    pub fn too_many_requests(code: &'static str, message: impl Into<String>) -> Self {
+        Self::TooManyRequests(Rejection::new(code, message))
+    }
+
+    /// Add a parameter to any rejection-carrying variant. A no-op on the
+    /// others, so a `rejected(…).with_param(…)` chain reads straight through
     /// without unwrapping.
     #[must_use]
     pub fn with_param(self, key: impl Into<String>, value: impl Into<String>) -> Self {
         match self {
             Self::Rejected(rejection) => Self::Rejected(rejection.with_param(key, value)),
+            Self::Unavailable(rejection) => Self::Unavailable(rejection.with_param(key, value)),
+            Self::TooManyRequests(rejection) => {
+                Self::TooManyRequests(rejection.with_param(key, value))
+            }
             other => other,
         }
     }
@@ -237,6 +269,22 @@ pub fn error_body(err: &DomainError) -> (ErrorClass, ErrorBody) {
         DomainError::ServiceUnavailable(_) => (
             ErrorClass::ServiceUnavailable,
             ErrorBody::plain("service unavailable"),
+        ),
+        DomainError::Unavailable(rejection) => (
+            ErrorClass::ServiceUnavailable,
+            ErrorBody {
+                error: rejection.message.clone(),
+                code: Some(rejection.code),
+                params: rejection.params.clone(),
+            },
+        ),
+        DomainError::TooManyRequests(rejection) => (
+            ErrorClass::TooManyRequests,
+            ErrorBody {
+                error: rejection.message.clone(),
+                code: Some(rejection.code),
+                params: rejection.params.clone(),
+            },
         ),
         DomainError::Database(_) | DomainError::Migration(_) => {
             (ErrorClass::Internal, ErrorBody::plain("database error"))

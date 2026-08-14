@@ -1,7 +1,9 @@
 pub mod commands;
 pub mod external;
 pub mod local;
+pub mod mail;
 pub mod password;
+pub mod tokens;
 
 use crate::config::AuthMode;
 use crate::errors::DomainError;

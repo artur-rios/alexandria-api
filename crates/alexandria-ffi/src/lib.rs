@@ -3087,6 +3087,16 @@ pub const AUTH_ERR_OTHER: c_int = 9;
 /// active auth mode is not local, or an account already exists. The FFI
 /// counterpart of HTTP's `409`.
 pub const AUTH_ERR_CONFLICT: c_int = 10;
+/// Issue #102 / FR-AU-15: refused because it came too soon after the last
+/// one — the confirmation resend interval. The FFI counterpart of HTTP's
+/// `429`. Its own code because it is a "not yet", not a mistake the caller
+/// made: `params.retryAfterSeconds` in the body says how long to wait.
+pub const AUTH_ERR_RATE_LIMITED: c_int = 11;
+/// Issue #102: a dependency the operation needs is unavailable — today,
+/// always the mail transport, which is not yet integrated. The FFI
+/// counterpart of HTTP's `503`; the body's `code` says which
+/// (`mail_not_configured`).
+pub const AUTH_ERR_SERVICE_UNAVAILABLE: c_int = 12;
 
 /// Result of `alexandria_auth_local_login` / `alexandria_auth_local_set_credentials`
 /// (UC-34/UC-35). On success `status` is `AUTH_OK` and `json` is a
@@ -3137,7 +3147,7 @@ impl AuthJsonResult {
 
     /// A rejection produced by this layer rather than by a handler, rendered
     /// through the same core renderer so it carries a code like every other.
-    fn rejected(code: &'static str, message: &str) -> Self {
+    fn rejected(code: &'static str, message: impl Into<String>) -> Self {
         map_auth_err(DomainError::rejected(code, message))
     }
 
@@ -3165,6 +3175,10 @@ fn map_auth_err(err: DomainError) -> AuthJsonResult {
         DomainError::InvalidState => AUTH_ERR_INVALID_STATE,
         DomainError::Config(_) => AUTH_ERR_CONFIG,
         DomainError::Conflict(_) => AUTH_ERR_CONFLICT,
+        DomainError::TooManyRequests(_) => AUTH_ERR_RATE_LIMITED,
+        DomainError::ServiceUnavailable(_) | DomainError::Unavailable(_) => {
+            AUTH_ERR_SERVICE_UNAVAILABLE
+        }
         _ => AUTH_ERR_OTHER,
     };
     let (_, body) = error_body(&err);
@@ -3345,6 +3359,233 @@ pub extern "C" fn alexandria_auth_local_register(json_body: *const c_char) -> Au
     match result {
         Ok(registration) => {
             let json = serde_json::to_string(&registration).unwrap_or_default();
+            AuthJsonResult::ok(json)
+        }
+        Err(err) => map_auth_err(err),
+    }
+}
+
+/// Read one required string member out of a JSON body, or return the rejection
+/// to hand back.
+///
+/// The single-field bodies on this surface would otherwise repeat the same
+/// parsing and the same two refusals, and a client that got a different
+/// message from each would be reading an inconsistency, not a distinction.
+fn string_field(json_body: *const c_char, field: &str) -> Result<String, AuthJsonResult> {
+    let Some(body_str) = cstr_lossy(json_body) else {
+        return Err(AuthJsonResult::rejected(
+            "malformed_body",
+            "request body is missing",
+        ));
+    };
+    serde_json::from_str::<serde_json::Value>(&body_str)
+        .ok()
+        .and_then(|value| {
+            value
+                .as_object()
+                .and_then(|obj| obj.get(field))
+                .and_then(|found| found.as_str())
+                .map(str::to_string)
+        })
+        .ok_or_else(|| {
+            AuthJsonResult::rejected(
+                "malformed_body",
+                format!("invalid body: expected an object with a string '{field}'"),
+            )
+        })
+}
+
+/// Report the authenticated owner's account state (issue #102 / FR-AU-13):
+/// the same body `GET /v1/auth/local/account` returns. `token` is the session
+/// id.
+///
+/// This is the call a client makes to decide whether the address has been
+/// confirmed. The core answers it and gates nothing on the answer.
+#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
+#[no_mangle]
+pub extern "C" fn alexandria_auth_local_account(token: *const c_char) -> AuthJsonResult {
+    let services = match services_slot().lock().unwrap().clone() {
+        Some(s) => s,
+        None => return AuthJsonResult::err(AUTH_ERR_NOT_INITIALIZED),
+    };
+
+    let token = cstr_lossy(token).unwrap_or_default();
+
+    let result = runtime().block_on(async { services.get_local_account_handler.get(&token).await });
+
+    match result {
+        Ok(account) => {
+            let json = serde_json::to_string(&account).unwrap_or_default();
+            AuthJsonResult::ok(json)
+        }
+        Err(err) => map_auth_err(err),
+    }
+}
+
+/// Confirm the owner's e-mail address (issue #102 / FR-AU-14). `json_body` is
+/// the JSON body HTTP would send, an object with a string `code`.
+///
+/// Deliberately takes no `token`: the code is the proof of control, and
+/// requiring a session as well would stop an owner confirming from the device
+/// that received the message. A refusal carries `confirmation_invalid`,
+/// `confirmation_already_used`, or `confirmation_expired` as the body's
+/// `code` — the status is `AUTH_ERR_INVALID_INPUT` for all three.
+#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
+#[no_mangle]
+pub extern "C" fn alexandria_auth_local_confirm_email(json_body: *const c_char) -> AuthJsonResult {
+    let services = match services_slot().lock().unwrap().clone() {
+        Some(s) => s,
+        None => return AuthJsonResult::err(AUTH_ERR_NOT_INITIALIZED),
+    };
+
+    let code = match string_field(json_body, "code") {
+        Ok(code) => code,
+        Err(result) => return result,
+    };
+
+    let result = runtime().block_on(async { services.confirm_email_handler.confirm(&code).await });
+
+    match result {
+        Ok(confirmation) => {
+            let json = serde_json::to_string(&confirmation).unwrap_or_default();
+            AuthJsonResult::ok(json)
+        }
+        Err(err) => map_auth_err(err),
+    }
+}
+
+/// Send a fresh confirmation message to the stored address (issue #102 /
+/// FR-AU-15). `token` is the session id: this takes no address, so it needs an
+/// authenticated caller to have a subject at all.
+///
+/// Until the mail integration ships this always answers
+/// `AUTH_ERR_SERVICE_UNAVAILABLE` with `mail_not_configured` — an honest
+/// refusal rather than a success that delivers nothing.
+#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
+#[no_mangle]
+pub extern "C" fn alexandria_auth_local_resend_confirmation(
+    token: *const c_char,
+) -> AuthJsonResult {
+    let services = match services_slot().lock().unwrap().clone() {
+        Some(s) => s,
+        None => return AuthJsonResult::err(AUTH_ERR_NOT_INITIALIZED),
+    };
+
+    let token = cstr_lossy(token).unwrap_or_default();
+
+    let result =
+        runtime().block_on(async { services.resend_confirmation_handler.resend(&token).await });
+
+    match result {
+        Ok(resend) => {
+            let json = serde_json::to_string(&resend).unwrap_or_default();
+            AuthJsonResult::ok(json)
+        }
+        Err(err) => map_auth_err(err),
+    }
+}
+
+/// Request a password reset (issue #102 / FR-AU-16). `json_body` is the JSON
+/// body HTTP would send, an object with a string `email`.
+///
+/// The outcome is the same whether or not the address is the registered one —
+/// an operation that answered differently would tell anyone who asked whether
+/// a given person owns this library.
+#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
+#[no_mangle]
+pub extern "C" fn alexandria_auth_local_request_password_reset(
+    json_body: *const c_char,
+) -> AuthJsonResult {
+    let services = match services_slot().lock().unwrap().clone() {
+        Some(s) => s,
+        None => return AuthJsonResult::err(AUTH_ERR_NOT_INITIALIZED),
+    };
+
+    let email = match string_field(json_body, "email") {
+        Ok(email) => email,
+        Err(result) => return result,
+    };
+
+    let result = runtime().block_on(async {
+        services
+            .request_password_reset_handler
+            .request(&email)
+            .await
+    });
+
+    match result {
+        Ok(request) => {
+            let json = serde_json::to_string(&request).unwrap_or_default();
+            AuthJsonResult::ok(json)
+        }
+        Err(err) => map_auth_err(err),
+    }
+}
+
+/// Request body for `alexandria_auth_local_complete_password_reset` — the same
+/// JSON the HTTP route takes.
+#[derive(Debug)]
+struct CompletePasswordResetBody {
+    token: String,
+    password: String,
+    password_confirmation: String,
+}
+
+impl CompletePasswordResetBody {
+    fn from_json_str(s: &str) -> Option<Self> {
+        let value: serde_json::Value = serde_json::from_str(s).ok()?;
+        let obj = value.as_object()?;
+        Some(Self {
+            token: obj.get("token")?.as_str()?.to_string(),
+            password: obj.get("password")?.as_str()?.to_string(),
+            password_confirmation: obj.get("passwordConfirmation")?.as_str()?.to_string(),
+        })
+    }
+}
+
+/// Complete a password reset (issue #102 / FR-AU-16). `json_body` is the JSON
+/// body HTTP would send: an object with `token`, `password`, and
+/// `passwordConfirmation`.
+///
+/// Deliberately takes no session token: the reset token is the credential.
+/// Every session is invalidated on success — a reset is what an owner does
+/// when they believe someone else may hold their credentials.
+#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
+#[no_mangle]
+pub extern "C" fn alexandria_auth_local_complete_password_reset(
+    json_body: *const c_char,
+) -> AuthJsonResult {
+    let services = match services_slot().lock().unwrap().clone() {
+        Some(s) => s,
+        None => return AuthJsonResult::err(AUTH_ERR_NOT_INITIALIZED),
+    };
+
+    let body_str = match cstr_lossy(json_body) {
+        Some(s) => s,
+        None => {
+            return AuthJsonResult::rejected("malformed_body", "password reset body is missing")
+        }
+    };
+    let body = match CompletePasswordResetBody::from_json_str(&body_str) {
+        Some(b) => b,
+        None => {
+            return AuthJsonResult::rejected(
+                "malformed_body",
+                "invalid password reset body: expected an object with string 'token', 'password', and 'passwordConfirmation'",
+            )
+        }
+    };
+
+    let result = runtime().block_on(async {
+        services
+            .complete_password_reset_handler
+            .complete(&body.token, body.password, body.password_confirmation)
+            .await
+    });
+
+    match result {
+        Ok(completion) => {
+            let json = serde_json::to_string(&completion).unwrap_or_default();
             AuthJsonResult::ok(json)
         }
         Err(err) => map_auth_err(err),

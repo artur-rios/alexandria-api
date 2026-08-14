@@ -129,6 +129,13 @@ pub fn app(settings: Settings, services: Arc<Services>) -> Router {
     // credentials in the first place (UC-34). Registration is safe ungated
     // because it succeeds only once (UC-41 AF-02); `/credentials` enforces
     // authentication in its own handler (UC-35).
+    //
+    // The confirm and both reset endpoints (issue #102) are outside it for the
+    // same kind of reason: the code or token each one carries *is* its
+    // credential, and requiring a session as well would stop an owner
+    // confirming from the device that received the message, or resetting a
+    // password they cannot log in with. `/account` and `/email/resend` are
+    // routed here but authenticate in their own handlers.
     Router::new()
         .route("/health", get(routes::health::health))
         .route("/v1/auth/local/register", post(routes::auth::register))
@@ -136,6 +143,23 @@ pub fn app(settings: Settings, services: Arc<Services>) -> Router {
         .route(
             "/v1/auth/local/credentials",
             post(routes::auth::set_credentials),
+        )
+        .route("/v1/auth/local/account", get(routes::auth::account))
+        .route(
+            "/v1/auth/local/email/confirm",
+            post(routes::auth::confirm_email),
+        )
+        .route(
+            "/v1/auth/local/email/resend",
+            post(routes::auth::resend_confirmation),
+        )
+        .route(
+            "/v1/auth/local/password/reset",
+            post(routes::auth::request_password_reset),
+        )
+        .route(
+            "/v1/auth/local/password/reset/complete",
+            post(routes::auth::complete_password_reset),
         )
         .merge(v1)
         .layer(TraceLayer::new_for_http())

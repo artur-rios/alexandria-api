@@ -181,6 +181,13 @@ graph LR
 | FR-AU-10 | In local mode, the system shall provide a registration operation that creates the single owner's credential row when none exists, opens a session for the caller, and rejects any subsequent registration as a conflict. |
 | FR-AU-11 | The system shall reject a local password that is shorter than 12 characters, longer than 128 characters, entirely whitespace, a single repeated character, equal to or containing the submitted email address, or one of a list of common passwords. |
 | FR-AU-12 | The system shall report a rejected authentication input with a stable machine-readable reason code and the parameters that reason interpolates, identically over the HTTP and FFI surfaces. A client shall be able to tell the individual FR-AU-11 rejections apart, and to render each in its own language, without parsing the English message. |
+| FR-AU-13 | The system shall record whether the local account's e-mail address has been confirmed, and shall report that state to an authenticated caller and on the results of login and registration. Nothing in the system shall refuse an operation because the address is unconfirmed: the state is reported, and what a product does about it is the client's policy. |
+| FR-AU-14 | The system shall confirm the local account's e-mail address on presentation of a valid confirmation code, without requiring an authenticated session. A code shall be single-use and shall expire after a configurable lifetime, and confirming an already-confirmed account with a known code shall succeed rather than fail. |
+| FR-AU-15 | The system shall, for an authenticated owner whose address is unconfirmed, send a fresh confirmation message on request, and shall refuse a request made within a configurable interval of the previous one as its own outcome, reporting how long remains. |
+| FR-AU-16 | The system shall send a password-reset token to the registered address on request, and shall replace the stored password on presentation of a valid token together with a new password satisfying FR-AU-11. Completing a reset shall invalidate every existing session. The response to a reset request shall not differ according to whether the submitted address is the registered one. |
+| FR-AU-17 | The system shall refuse a presented confirmation code or reset token with a reason that distinguishes an unrecognised value, an already-used value, and an expired value. |
+| FR-AU-18 | The system shall store only a hash of every confirmation code and reset token; the plaintext shall exist only in the outbound message. |
+| FR-AU-19 | The system shall send outbound mail through a configurable provider, and shall report a send it could not perform to the caller as a distinct outcome rather than as a success. An operation whose whole purpose is to send shall fail when it cannot; registration shall succeed and report that the confirmation message was not sent. |
 
 ### 3.8 Media Playback (MP)
 
@@ -328,10 +335,39 @@ changed thereafter by the credentials operation (UC-35).
 | email | text | required, unique, valid email | Owner email. |
 | passwordHash | text | required | Argon2 salted hash; never plaintext. |
 | updatedAt | timestamp | required | Last credential change. |
+| emailConfirmedAt | timestamp | nullable | When the owner proved control of the address, or null if they have not (FR-AU-13). |
 
 The password is stored only as a salted Argon2 hash, which is one-way — the row
 cannot be reversed back to the plaintext password (FR-AU-06, NFR-05). The row
 itself is not separately encrypted at rest.
+
+`emailConfirmedAt` is null for every account created before confirmation
+existed, which is the truthful state: nothing has ever confirmed them. Nothing
+in the system gates on it (FR-AU-13), so no install is locked out by that.
+
+### 4.9.1 AuthToken Fields
+
+The single-use, expiring values behind e-mail confirmation and password reset
+(FR-AU-14, FR-AU-16). One table serves both purposes: they differ only in what
+is generated, how long it lives, and what consuming it does, and separating
+them would duplicate the expiry and single-use rules that must not drift.
+
+| Field | Type | Constraints | Description |
+| --- | --- | --- | --- |
+| id | integer | PK | Row id. |
+| purpose | text | required | `email_confirmation` or `password_reset`. |
+| tokenHash | text | required, unique | SHA-256 of the value; the plaintext is never stored (FR-AU-18). |
+| email | text | required | The address the value was issued for. |
+| createdAt | timestamp | required | When it was issued; the resend interval reads this (FR-AU-15). |
+| expiresAt | timestamp | required | When it stops being usable. |
+| consumedAt | timestamp | nullable | When it was used, or null while it is still live. |
+
+Only the hash is stored, so a database read cannot yield a working reset token
+— the same reasoning that keeps FR-AU-06 from storing a plaintext password.
+Lookups hash the presented value and match on that. A value whose message could
+not be sent is deleted rather than left behind, so nothing usable survives a
+delivery that never happened and the resend interval does not start running for
+a message nobody received.
 
 ### 4.10 Session Fields
 
@@ -459,6 +495,11 @@ endpoint requires authentication from the active mode (see §7).
 | POST | /v1/auth/local/register | Create the owner's local account and open a session (local mode). | FR-AU-10, FR-AU-11 |
 | POST | /v1/auth/local/login | Verify email + password and open a session (local mode). | FR-AU-04, FR-AU-09 |
 | POST | /v1/auth/local/credentials | Change existing local credentials (local mode). | FR-AU-05, FR-AU-06 |
+| GET | /v1/auth/local/account | Report the owner's address and whether it is confirmed. | FR-AU-13 |
+| POST | /v1/auth/local/email/confirm | Confirm the address with the code that was sent to it. | FR-AU-14, FR-AU-17 |
+| POST | /v1/auth/local/email/resend | Send a fresh confirmation message. | FR-AU-15, FR-AU-19 |
+| POST | /v1/auth/local/password/reset | Request a password reset for an address. | FR-AU-16, FR-AU-19 |
+| POST | /v1/auth/local/password/reset/complete | Replace the password with a reset token. | FR-AU-16, FR-AU-17 |
 
 External JWT validation (FR-AU-02) is enforced by HTTP middleware on every
 request, not by an endpoint. The same middleware validates the local-mode
@@ -483,6 +524,19 @@ that has no stable reason yet; the envelope is then `{"error": …}` alone.
 Over FFI the same bytes are returned in the result struct's `json` member,
 which is why the status code there stays a coarse class: the reason is the
 `code`, not the status.
+
+The confirm and both password-reset endpoints sit outside the authentication
+gate as well, and for a related reason: the code or token each one carries *is*
+its credential. Requiring a session in addition would stop an owner confirming
+from the device that received the message, or resetting a password they cannot
+log in with. `/account` and `/email/resend` are routed alongside them but
+authenticate in their own handlers.
+
+Outbound mail is a configurable provider (`[mail]`). Until the external mail
+service is integrated the only provider is one that never sends and reports
+`mail_not_configured`, so `/email/resend` and `/password/reset` answer `503`
+and registration answers `201` with `confirmationSent: false`. Every other part
+of the flow — the state, the tokens, the expiry, the refusals — is live.
 
 The register, login, and credentials endpoints all sit outside the blanket
 authentication gate, for the reasons §7 gives: registration is how the
@@ -602,7 +656,7 @@ The feature identifiers are the milestones the
 | F-06 Bookmark management | FR-BM-01 through FR-BM-06 |
 | F-07 Watchlists | FR-WL-01 through FR-WL-08 |
 | F-08 Reading lists | FR-RL-01 through FR-RL-08 |
-| F-09 Pluggable authentication | FR-AU-01 through FR-AU-12 |
+| F-09 Pluggable authentication | FR-AU-01 through FR-AU-19 |
 | F-10 Media playback | FR-MP-01 through FR-MP-06 |
 
 Dual-transport parity (FR-FC-24, FR-AU-08, FR-MP-06, NFR-09) is not a

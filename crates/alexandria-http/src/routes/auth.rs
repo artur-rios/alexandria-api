@@ -4,7 +4,10 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
 use serde::Deserialize;
 
-use alexandria_core::auth::local::{LocalCredentialsResult, LocalLoginResult, LocalRegisterResult};
+use alexandria_core::auth::local::{
+    CompletePasswordResetResult, ConfirmEmailResult, LocalAccountResult, LocalCredentialsResult,
+    LocalLoginResult, LocalRegisterResult, RequestPasswordResetResult, ResendConfirmationResult,
+};
 
 use crate::middleware::auth::invalid_input;
 use crate::middleware::error::ApiError;
@@ -113,4 +116,150 @@ pub async fn register(
         .map_err(ApiError)?;
 
     Ok((StatusCode::CREATED, Json(result)))
+}
+
+// ---------------- Issue #102: confirmation and password reset ----------------
+
+/// `GET /v1/auth/local/account` — report the authenticated owner's address and
+/// whether it has been confirmed (FR-AU-13). The query the front-end's catalog
+/// lock reads. Returns `200` with the `LocalAccountResult`, `401` (not
+/// authenticated), or `500` (no local account has been created yet).
+pub async fn account(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<(StatusCode, Json<LocalAccountResult>), ApiError> {
+    let token = bearer_token(&headers);
+
+    let result = state
+        .services
+        .get_local_account_handler
+        .get(&token)
+        .await
+        .map_err(ApiError)?;
+
+    Ok((StatusCode::OK, Json(result)))
+}
+
+/// Request body for `POST /v1/auth/local/email/confirm` — the code the
+/// confirmation message carried.
+#[derive(Debug, Deserialize)]
+pub struct ConfirmEmailRequest {
+    pub code: String,
+}
+
+/// `POST /v1/auth/local/email/confirm` — confirm the owner's address with the
+/// code sent to it (FR-AU-14). Unauthenticated: the code is the proof, and
+/// demanding a session as well would stop an owner confirming from the device
+/// that received the message. Returns `200` with the `ConfirmEmailResult`, or
+/// `400` carrying `confirmation_invalid`, `confirmation_already_used`, or
+/// `confirmation_expired` as its reason code, or `409` (the active auth mode
+/// is not local).
+pub async fn confirm_email(
+    State(state): State<AppState>,
+    body: Result<Json<ConfirmEmailRequest>, JsonRejection>,
+) -> Result<(StatusCode, Json<ConfirmEmailResult>), ApiError> {
+    let Json(request) =
+        body.map_err(|err| invalid_input(format!("invalid confirm body: {err}")))?;
+
+    let result = state
+        .services
+        .confirm_email_handler
+        .confirm(&request.code)
+        .await
+        .map_err(ApiError)?;
+
+    Ok((StatusCode::OK, Json(result)))
+}
+
+/// `POST /v1/auth/local/email/resend` — send a fresh confirmation message to
+/// the stored address (FR-AU-15). Authenticated: it takes no address, so it
+/// needs an authenticated caller to have a subject, and that keeps it from
+/// being an open relay. Returns `200` with the `ResendConfirmationResult`, or
+/// `401`, `409` (already confirmed, or the mode is not local), `429`
+/// (`resend_too_soon`, with `retryAfterSeconds`), or `503`
+/// (`mail_not_configured` — today, always: delivery is not yet integrated).
+pub async fn resend_confirmation(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<(StatusCode, Json<ResendConfirmationResult>), ApiError> {
+    let token = bearer_token(&headers);
+
+    let result = state
+        .services
+        .resend_confirmation_handler
+        .resend(&token)
+        .await
+        .map_err(ApiError)?;
+
+    Ok((StatusCode::OK, Json(result)))
+}
+
+/// Request body for `POST /v1/auth/local/password/reset` — the address to send
+/// the reset to.
+#[derive(Debug, Deserialize)]
+pub struct RequestPasswordResetRequest {
+    pub email: String,
+}
+
+/// `POST /v1/auth/local/password/reset` — send a reset token to the address if
+/// it is the registered one (FR-AU-16). Unauthenticated: it is what someone
+/// does when they cannot authenticate.
+///
+/// Answers `202` with the same body whether or not the address matches — an
+/// endpoint that answered differently would tell anyone who asked whether a
+/// given person owns this library. A `503` (`mail_not_configured`) is a
+/// property of the installation, not of the address, so it reveals nothing and
+/// is not hidden.
+pub async fn request_password_reset(
+    State(state): State<AppState>,
+    body: Result<Json<RequestPasswordResetRequest>, JsonRejection>,
+) -> Result<(StatusCode, Json<RequestPasswordResetResult>), ApiError> {
+    let Json(request) =
+        body.map_err(|err| invalid_input(format!("invalid password reset body: {err}")))?;
+
+    let result = state
+        .services
+        .request_password_reset_handler
+        .request(&request.email)
+        .await
+        .map_err(ApiError)?;
+
+    Ok((StatusCode::ACCEPTED, Json(result)))
+}
+
+/// Request body for `POST /v1/auth/local/password/reset/complete` — the token
+/// from the message, plus the new password and its confirmation.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompletePasswordResetRequest {
+    pub token: String,
+    pub password: String,
+    pub password_confirmation: String,
+}
+
+/// `POST /v1/auth/local/password/reset/complete` — replace the credentials
+/// with a new password (FR-AU-16). Unauthenticated: the token is the
+/// credential. Every session is invalidated on success. Returns `200` with the
+/// `CompletePasswordResetResult`, or `400` carrying `reset_invalid`,
+/// `reset_already_used`, `reset_expired`, a password-policy code, or
+/// `password_confirmation_mismatch`, or `409` (the mode is not local).
+pub async fn complete_password_reset(
+    State(state): State<AppState>,
+    body: Result<Json<CompletePasswordResetRequest>, JsonRejection>,
+) -> Result<(StatusCode, Json<CompletePasswordResetResult>), ApiError> {
+    let Json(request) =
+        body.map_err(|err| invalid_input(format!("invalid password reset body: {err}")))?;
+
+    let result = state
+        .services
+        .complete_password_reset_handler
+        .complete(
+            &request.token,
+            request.password,
+            request.password_confirmation,
+        )
+        .await
+        .map_err(ApiError)?;
+
+    Ok((StatusCode::OK, Json(result)))
 }

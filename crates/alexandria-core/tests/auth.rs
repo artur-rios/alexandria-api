@@ -15,3 +15,9 @@ mod password;
 
 #[path = "auth/register.rs"]
 mod register;
+
+#[path = "auth/confirmation.rs"]
+mod confirmation;
+
+#[path = "auth/password_reset.rs"]
+mod password_reset;
