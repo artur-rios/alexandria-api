@@ -10,33 +10,44 @@ use crate::errors::DomainError;
 /// of scope for a single-owner local credential; this rejects the obvious
 /// non-emails (empty, no `@`, empty local/domain part, no `.` in the
 /// domain) without pretending to fully validate deliverability.
+///
+/// The four malformed shapes share one code, `email_malformed` (issue #101):
+/// a client shows "that is not an e-mail address" for all four, so four codes
+/// would be four strings to translate for one user-visible outcome. The
+/// English message still names the rule that failed. Empty and untrimmed keep
+/// their own codes — both have a specific remedy the owner can act on.
 pub fn validate_email(email: &str) -> Result<String, DomainError> {
     if email.is_empty() {
-        return Err(DomainError::InvalidInput("email is required".into()));
+        return Err(DomainError::rejected("email_required", "email is required"));
     }
     if email != email.trim() {
-        return Err(DomainError::InvalidInput(
-            "email must not have leading or trailing whitespace".into(),
+        return Err(DomainError::rejected(
+            "email_untrimmed",
+            "email must not have leading or trailing whitespace",
         ));
     }
     let Some((local, domain)) = email.split_once('@') else {
-        return Err(DomainError::InvalidInput(
-            "email must contain exactly one '@'".into(),
+        return Err(DomainError::rejected(
+            "email_malformed",
+            "email must contain exactly one '@'",
         ));
     };
     if local.is_empty() || domain.is_empty() {
-        return Err(DomainError::InvalidInput(
-            "email must have a non-empty local and domain part".into(),
+        return Err(DomainError::rejected(
+            "email_malformed",
+            "email must have a non-empty local and domain part",
         ));
     }
     if domain.contains('@') {
-        return Err(DomainError::InvalidInput(
-            "email must contain exactly one '@'".into(),
+        return Err(DomainError::rejected(
+            "email_malformed",
+            "email must contain exactly one '@'",
         ));
     }
     if !domain.contains('.') || domain.starts_with('.') || domain.ends_with('.') {
-        return Err(DomainError::InvalidInput(
-            "email domain must contain a '.'".into(),
+        return Err(DomainError::rejected(
+            "email_malformed",
+            "email domain must contain a '.'",
         ));
     }
     Ok(email.to_string())

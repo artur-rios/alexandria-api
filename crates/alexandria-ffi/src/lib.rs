@@ -9,7 +9,7 @@ use tokio::runtime::{Builder, Runtime};
 use alexandria_core::auth::AuthService;
 use alexandria_core::catalog::commands::index::IndexRequest;
 use alexandria_core::config::Settings;
-use alexandria_core::errors::DomainError;
+use alexandria_core::errors::{error_body, DomainError};
 use alexandria_core::migrate::migrate_database;
 use alexandria_core::services::{build_services, Services};
 
@@ -3093,8 +3093,18 @@ pub const AUTH_ERR_CONFLICT: c_int = 10;
 /// NUL-terminated JSON string of the `LocalLoginResult` /
 /// `LocalCredentialsResult` body — byte-for-byte the same shape HTTP
 /// returns from the matching `/v1/auth/local/*` endpoint (FR-FC-24 /
-/// NFR-09). On failure `json` is NULL and `status` carries the mapped
-/// error code. The caller must free `json` with `alexandria_free_string`.
+/// NFR-09).
+///
+/// On failure `status` carries the mapped error code and `json` carries the
+/// same error envelope HTTP returns for that failure (issue #101):
+/// `{"error": …}`, plus `"code"` and `"params"` when the rejection has a
+/// stable reason. `status` is the coarse class; `code` is the reason — six
+/// distinct password-policy rejections all arrive as
+/// `AUTH_ERR_INVALID_INPUT`, and only `code` tells them apart.
+///
+/// `json` is NULL only when the library was never initialized, so there was
+/// no service to answer at all. The caller must free `json` with
+/// `alexandria_free_string` on every path; freeing NULL is a no-op.
 #[repr(C)]
 #[derive(Debug)]
 pub struct AuthJsonResult {
@@ -3103,11 +3113,32 @@ pub struct AuthJsonResult {
 }
 
 impl AuthJsonResult {
+    /// A failure with no readable body — see the NULL case documented above.
     fn err(status: c_int) -> Self {
         Self {
             status,
             json: std::ptr::null_mut(),
         }
+    }
+
+    /// A failure carrying the same error envelope HTTP would send.
+    fn err_body(status: c_int, body: String) -> Self {
+        match CString::new(body) {
+            Ok(cstring) => Self {
+                status,
+                json: cstring.into_raw(),
+            },
+            // Unreachable in practice: the envelope is JSON, which never
+            // contains an interior NUL. Degrade to the code-only failure
+            // rather than panicking across an FFI boundary.
+            Err(_) => Self::err(status),
+        }
+    }
+
+    /// A rejection produced by this layer rather than by a handler, rendered
+    /// through the same core renderer so it carries a code like every other.
+    fn rejected(code: &'static str, message: &str) -> Self {
+        map_auth_err(DomainError::rejected(code, message))
     }
 
     fn ok(json: String) -> Self {
@@ -3119,15 +3150,25 @@ impl AuthJsonResult {
     }
 }
 
+/// Map a `DomainError` to this surface's status code and error body.
+///
+/// The body comes from the core's `error_body`, the same renderer the HTTP
+/// surface uses, so the bytes match (FR-FC-24 / NFR-09). The status stays a
+/// match on the variant rather than on `ErrorClass`: this surface draws
+/// distinctions HTTP does not — `InvalidState` and `Conflict` are both `409`
+/// but different codes here, as are `Config` and the other internal failures —
+/// and collapsing them would be a breaking change to callers for no gain.
 fn map_auth_err(err: DomainError) -> AuthJsonResult {
-    match err {
-        DomainError::Unauthorized => AuthJsonResult::err(AUTH_ERR_UNAUTHORIZED),
-        DomainError::InvalidInput(_) => AuthJsonResult::err(AUTH_ERR_INVALID_INPUT),
-        DomainError::InvalidState => AuthJsonResult::err(AUTH_ERR_INVALID_STATE),
-        DomainError::Config(_) => AuthJsonResult::err(AUTH_ERR_CONFIG),
-        DomainError::Conflict(_) => AuthJsonResult::err(AUTH_ERR_CONFLICT),
-        _ => AuthJsonResult::err(AUTH_ERR_OTHER),
-    }
+    let status = match err {
+        DomainError::Unauthorized => AUTH_ERR_UNAUTHORIZED,
+        DomainError::InvalidInput(_) | DomainError::Rejected(_) => AUTH_ERR_INVALID_INPUT,
+        DomainError::InvalidState => AUTH_ERR_INVALID_STATE,
+        DomainError::Config(_) => AUTH_ERR_CONFIG,
+        DomainError::Conflict(_) => AUTH_ERR_CONFLICT,
+        _ => AUTH_ERR_OTHER,
+    };
+    let (_, body) = error_body(&err);
+    AuthJsonResult::err_body(status, body.to_json())
 }
 
 /// Request body accepted by both `alexandria_auth_local_login` and
@@ -3168,11 +3209,16 @@ pub extern "C" fn alexandria_auth_local_login(json_body: *const c_char) -> AuthJ
 
     let body_str = match cstr_lossy(json_body) {
         Some(s) => s,
-        None => return AuthJsonResult::err(AUTH_ERR_INVALID_INPUT),
+        None => return AuthJsonResult::rejected("malformed_body", "login body is missing"),
     };
     let body = match LocalCredentialsBody::from_json_str(&body_str) {
         Some(b) => b,
-        None => return AuthJsonResult::err(AUTH_ERR_INVALID_INPUT),
+        None => {
+            return AuthJsonResult::rejected(
+                "malformed_body",
+                "invalid login body: expected an object with string 'email' and 'password'",
+            )
+        }
     };
 
     let result = runtime().block_on(async {
@@ -3210,12 +3256,16 @@ pub extern "C" fn alexandria_auth_local_set_credentials(
 
     let body_str = match cstr_lossy(json_body) {
         Some(s) => s,
-        None => return AuthJsonResult::err(AUTH_ERR_INVALID_INPUT),
+        None => return AuthJsonResult::rejected("malformed_body", "credentials body is missing"),
     };
-    let body = match LocalCredentialsBody::from_json_str(&body_str) {
-        Some(b) => b,
-        None => return AuthJsonResult::err(AUTH_ERR_INVALID_INPUT),
-    };
+    let body =
+        match LocalCredentialsBody::from_json_str(&body_str) {
+            Some(b) => b,
+            None => return AuthJsonResult::rejected(
+                "malformed_body",
+                "invalid credentials body: expected an object with string 'email' and 'password'",
+            ),
+        };
 
     let result = runtime().block_on(async {
         services
@@ -3273,11 +3323,16 @@ pub extern "C" fn alexandria_auth_local_register(json_body: *const c_char) -> Au
 
     let body_str = match cstr_lossy(json_body) {
         Some(s) => s,
-        None => return AuthJsonResult::err(AUTH_ERR_INVALID_INPUT),
+        None => return AuthJsonResult::rejected("malformed_body", "register body is missing"),
     };
     let body = match LocalRegisterBody::from_json_str(&body_str) {
         Some(b) => b,
-        None => return AuthJsonResult::err(AUTH_ERR_INVALID_INPUT),
+        None => {
+            return AuthJsonResult::rejected(
+                "malformed_body",
+                "invalid register body: expected an object with string 'email', 'password', and 'passwordConfirmation'",
+            )
+        }
     };
 
     let result = runtime().block_on(async {

@@ -85,8 +85,9 @@ where
         // AF-05: the owner's password is unrecoverable, so a typo here
         // would lock them out of their own catalog.
         if password != password_confirmation {
-            return Err(DomainError::InvalidInput(
-                "password confirmation does not match the password".into(),
+            return Err(DomainError::rejected(
+                "password_confirmation_mismatch",
+                "password confirmation does not match the password",
             ));
         }
 

@@ -1,3 +1,7 @@
+use std::collections::BTreeMap;
+use std::fmt;
+
+use serde::Serialize;
 use thiserror::Error;
 
 /// The `BEGIN` every explicit transaction in this workspace uses.
@@ -31,6 +35,14 @@ pub enum DomainError {
     Unauthorized,
     #[error("invalid input: {0}")]
     InvalidInput(String),
+    /// Input rejected for a reason the caller can act on programmatically
+    /// (issue #101). `InvalidInput` plus a stable `code` and the parameters
+    /// the message interpolates, so a client can render the rejection in its
+    /// own language with the same bound the core enforced. Maps exactly where
+    /// `InvalidInput` maps — `400` over HTTP, `AUTH_ERR_INVALID_INPUT` over
+    /// FFI; the code is the reason, the status is only the class.
+    #[error("invalid input: {0}")]
+    Rejected(Rejection),
     #[error("invalid state transition")]
     InvalidState,
     /// A request that cannot be satisfied because it conflicts with state
@@ -87,5 +99,152 @@ impl DomainError {
 
     pub fn service_unavailable(message: impl Into<String>) -> Self {
         Self::ServiceUnavailable(message.into())
+    }
+
+    /// Reject input with a stable reason code (issue #101). `message` is the
+    /// English fallback a log or a code-unaware client shows; `code` is what a
+    /// client switches on. Add the values the message interpolates with
+    /// [`Rejection::with_param`] so a client can rebuild the sentence itself:
+    ///
+    /// ```
+    /// # use alexandria_core::errors::DomainError;
+    /// DomainError::rejected("password_too_short", "password must be at least 12 characters")
+    ///     .with_param("min", "12");
+    /// ```
+    pub fn rejected(code: &'static str, message: impl Into<String>) -> Self {
+        Self::Rejected(Rejection::new(code, message))
+    }
+
+    /// Add a parameter to a [`DomainError::Rejected`]. A no-op on any other
+    /// variant, so a `rejected(…).with_param(…)` chain reads straight through
+    /// without unwrapping.
+    #[must_use]
+    pub fn with_param(self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        match self {
+            Self::Rejected(rejection) => Self::Rejected(rejection.with_param(key, value)),
+            other => other,
+        }
+    }
+}
+
+/// An input rejection carrying the reason a client acts on (issue #101).
+///
+/// `code` is a stable `snake_case` identifier — never reused for a different
+/// meaning — and `params` holds the values `message` interpolates. Parameters
+/// are strings rather than free-form JSON: every one this surface has is a
+/// bound or a name, and a flat string map is predictable for an FFI caller
+/// parsing it by hand. The `BTreeMap` also sorts deterministically, so the
+/// HTTP and FFI renderings can be compared byte-for-byte in a parity test.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rejection {
+    pub code: &'static str,
+    pub message: String,
+    pub params: BTreeMap<String, String>,
+}
+
+impl Rejection {
+    pub fn new(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+            params: BTreeMap::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn with_param(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.params.insert(key.into(), value.into());
+        self
+    }
+}
+
+impl fmt::Display for Rejection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+/// The transport-independent class of a failure — what every surface agrees a
+/// `DomainError` *is*, before either one names it in its own vocabulary. HTTP
+/// maps this to a status code; FFI maps it to an `*_ERR_*` constant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErrorClass {
+    NotFound,
+    Unauthorized,
+    BadRequest,
+    Conflict,
+    TooManyRequests,
+    ServiceUnavailable,
+    Internal,
+}
+
+/// The error envelope both surfaces emit (issue #101).
+///
+/// `error` is the human-readable English fallback and is always present —
+/// unchanged from what HTTP has always returned. `code` and `params` appear
+/// only for a [`DomainError::Rejected`]; an omitted `code` means this failure
+/// has no stable identifier yet, which is honest and lets the rest of the
+/// surface adopt codes incrementally.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ErrorBody {
+    pub error: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<&'static str>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub params: BTreeMap<String, String>,
+}
+
+impl ErrorBody {
+    fn plain(message: impl Into<String>) -> Self {
+        Self {
+            error: message.into(),
+            code: None,
+            params: BTreeMap::new(),
+        }
+    }
+
+    /// Render as the JSON bytes both surfaces put on the wire.
+    pub fn to_json(&self) -> String {
+        serde_json::to_string(self).unwrap_or_else(|_| r#"{"error":"internal error"}"#.to_string())
+    }
+}
+
+/// Render a `DomainError` as its class and its wire body.
+///
+/// The single place that decides what a failure looks like to a caller, so
+/// parity between HTTP and FFI (FR-FC-24, FR-AU-08, NFR-09) is a property of
+/// the code rather than of two `match` arms staying in step. Internal detail
+/// (a disk path, a SQL error, a configuration value) is deliberately not
+/// echoed: those variants render as their fixed class name and are logged, not
+/// returned.
+pub fn error_body(err: &DomainError) -> (ErrorClass, ErrorBody) {
+    match err {
+        DomainError::NotFound => (ErrorClass::NotFound, ErrorBody::plain("not found")),
+        DomainError::Unauthorized => (ErrorClass::Unauthorized, ErrorBody::plain("unauthorized")),
+        DomainError::InvalidInput(msg) => (ErrorClass::BadRequest, ErrorBody::plain(msg)),
+        DomainError::Rejected(rejection) => (
+            ErrorClass::BadRequest,
+            ErrorBody {
+                error: rejection.message.clone(),
+                code: Some(rejection.code),
+                params: rejection.params.clone(),
+            },
+        ),
+        DomainError::InvalidState => (ErrorClass::Conflict, ErrorBody::plain("invalid state")),
+        DomainError::Conflict(msg) => (ErrorClass::Conflict, ErrorBody::plain(msg)),
+        DomainError::Disk(_) => (ErrorClass::Internal, ErrorBody::plain("disk error")),
+        DomainError::Integrity(_) => (ErrorClass::Internal, ErrorBody::plain("integrity error")),
+        DomainError::ServiceUnavailable(_) => (
+            ErrorClass::ServiceUnavailable,
+            ErrorBody::plain("service unavailable"),
+        ),
+        DomainError::Database(_) | DomainError::Migration(_) => {
+            (ErrorClass::Internal, ErrorBody::plain("database error"))
+        }
+        DomainError::Config(_) => (
+            ErrorClass::Internal,
+            ErrorBody::plain("configuration error"),
+        ),
+        DomainError::Internal(_) => (ErrorClass::Internal, ErrorBody::plain("internal error")),
     }
 }

@@ -180,6 +180,7 @@ graph LR
 | FR-AU-09 | In local mode, a successful login shall create a Session with a configurable expiry (default 24 hours); the caller shall present that session's id on every subsequent request, and the system shall reject an unknown or expired session id as unauthenticated. |
 | FR-AU-10 | In local mode, the system shall provide a registration operation that creates the single owner's credential row when none exists, opens a session for the caller, and rejects any subsequent registration as a conflict. |
 | FR-AU-11 | The system shall reject a local password that is shorter than 12 characters, longer than 128 characters, entirely whitespace, a single repeated character, equal to or containing the submitted email address, or one of a list of common passwords. |
+| FR-AU-12 | The system shall report a rejected authentication input with a stable machine-readable reason code and the parameters that reason interpolates, identically over the HTTP and FFI surfaces. A client shall be able to tell the individual FR-AU-11 rejections apart, and to render each in its own language, without parsing the English message. |
 
 ### 3.8 Media Playback (MP)
 
@@ -463,6 +464,26 @@ External JWT validation (FR-AU-02) is enforced by HTTP middleware on every
 request, not by an endpoint. The same middleware validates the local-mode
 session id (FR-AU-09); both are presented as `Authorization: Bearer <value>`.
 
+#### Error envelope
+
+Every failure on both surfaces renders as one envelope:
+
+```json
+{ "error": "password must be at least 12 characters",
+  "code": "password_too_short",
+  "params": { "min": "12" } }
+```
+
+`error` is the human-readable English fallback and is always present. `code` is
+a stable `snake_case` identifier, never reused for a different meaning, and
+`params` carries the values the message interpolates — together they are what a
+client switches on and translates (FR-AU-12). Both are omitted for a failure
+that has no stable reason yet; the envelope is then `{"error": …}` alone.
+
+Over FFI the same bytes are returned in the result struct's `json` member,
+which is why the status code there stays a coarse class: the reason is the
+`code`, not the status.
+
 The register, login, and credentials endpoints all sit outside the blanket
 authentication gate, for the reasons §7 gives: registration is how the
 owner's account first comes to exist, and login is how a caller obtains a
@@ -581,7 +602,7 @@ The feature identifiers are the milestones the
 | F-06 Bookmark management | FR-BM-01 through FR-BM-06 |
 | F-07 Watchlists | FR-WL-01 through FR-WL-08 |
 | F-08 Reading lists | FR-RL-01 through FR-RL-08 |
-| F-09 Pluggable authentication | FR-AU-01 through FR-AU-11 |
+| F-09 Pluggable authentication | FR-AU-01 through FR-AU-12 |
 | F-10 Media playback | FR-MP-01 through FR-MP-06 |
 
 Dual-transport parity (FR-FC-24, FR-AU-08, FR-MP-06, NFR-09) is not a

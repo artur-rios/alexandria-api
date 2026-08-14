@@ -34,6 +34,10 @@ pub async fn require_auth(State(state): State<AppState>, request: Request, next:
 /// failure on this surface answers `{"error": …}`. A body or path the domain
 /// cannot read is invalid input (`400`), which is also what the FFI surface
 /// reports for the same payload (FR-FC-24 / NFR-09).
+///
+/// Carries the `malformed_body` code (issue #101): a client that cannot parse
+/// the English message still needs to tell "your request was not readable"
+/// apart from "your password is too short", and both arrive as `400`.
 pub fn invalid_input(message: impl Into<String>) -> ApiError {
-    ApiError(DomainError::InvalidInput(message.into()))
+    ApiError(DomainError::rejected("malformed_body", message))
 }

@@ -224,7 +224,10 @@ async fn given_a_malformed_email_when_register_then_invalid_input_and_nothing_wr
         .await
         .expect_err("must reject a malformed email");
 
-    assert!(matches!(err, DomainError::InvalidInput(_)), "got {err:?}");
+    match err {
+        DomainError::Rejected(rejection) => assert_eq!(rejection.code, "email_malformed"),
+        other => panic!("expected Rejected, got {other:?}"),
+    }
     assert!(credentials.get().await.unwrap().is_none());
     assert_eq!(sessions.count(), 0);
 }
@@ -243,11 +246,14 @@ async fn given_a_password_below_the_length_floor_when_register_then_invalid_inpu
         .expect_err("must reject a weak password");
 
     match err {
-        DomainError::InvalidInput(message) => {
+        DomainError::Rejected(rejection) => {
+            assert_eq!(rejection.code, "password_too_short");
+            assert_eq!(rejection.params.get("min").map(String::as_str), Some("12"));
+            let message = rejection.message;
             assert!(message.contains("at least"), "unexpected: {message}");
             assert!(!message.contains("short"), "must not echo the password");
         }
-        other => panic!("expected InvalidInput, got {other:?}"),
+        other => panic!("expected Rejected, got {other:?}"),
     }
     assert!(credentials.get().await.unwrap().is_none());
     assert_eq!(sessions.count(), 0);
@@ -270,7 +276,12 @@ async fn given_a_mismatched_confirmation_when_register_then_invalid_input_and_no
         .await
         .expect_err("must reject a mismatched confirmation");
 
-    assert!(matches!(err, DomainError::InvalidInput(_)), "got {err:?}");
+    match err {
+        DomainError::Rejected(rejection) => {
+            assert_eq!(rejection.code, "password_confirmation_mismatch")
+        }
+        other => panic!("expected Rejected, got {other:?}"),
+    }
     assert!(credentials.get().await.unwrap().is_none());
     assert_eq!(sessions.count(), 0);
 }

@@ -84,24 +84,32 @@ const MIN_LOCAL_PART_FOR_SUBSTRING_CHECK: usize = 3;
 /// the same request — the first thing an attacker tries, so it must not be
 /// the password or appear inside it.
 ///
-/// Every rejection is an `InvalidInput` naming the unmet rule so a client
-/// can render it. The message never echoes the password (FR-AU-06).
+/// Every rejection is a `Rejected` naming the unmet rule twice over: an
+/// English message a log or a code-unaware client shows, and a stable code
+/// plus the bound that was violated, which is the only form a client
+/// translating into another language can use (issue #101). The message never
+/// echoes the password (FR-AU-06).
 pub fn validate_strength(password: &str, email: &str) -> Result<(), DomainError> {
     let length = password.chars().count();
     if length < MIN_PASSWORD_LENGTH {
-        return Err(DomainError::InvalidInput(format!(
-            "password must be at least {MIN_PASSWORD_LENGTH} characters"
-        )));
+        return Err(DomainError::rejected(
+            "password_too_short",
+            format!("password must be at least {MIN_PASSWORD_LENGTH} characters"),
+        )
+        .with_param("min", MIN_PASSWORD_LENGTH.to_string()));
     }
     if length > MAX_PASSWORD_LENGTH {
-        return Err(DomainError::InvalidInput(format!(
-            "password must be at most {MAX_PASSWORD_LENGTH} characters"
-        )));
+        return Err(DomainError::rejected(
+            "password_too_long",
+            format!("password must be at most {MAX_PASSWORD_LENGTH} characters"),
+        )
+        .with_param("max", MAX_PASSWORD_LENGTH.to_string()));
     }
 
     if password.trim().is_empty() {
-        return Err(DomainError::InvalidInput(
-            "password must not be entirely whitespace".into(),
+        return Err(DomainError::rejected(
+            "password_whitespace",
+            "password must not be entirely whitespace",
         ));
     }
 
@@ -112,30 +120,39 @@ pub fn validate_strength(password: &str, email: &str) -> Result<(), DomainError>
         .next()
         .expect("non-empty: length >= MIN_PASSWORD_LENGTH");
     if chars.all(|c| c == first) {
-        return Err(DomainError::InvalidInput(
-            "password must not be a single repeated character".into(),
+        return Err(DomainError::rejected(
+            "password_repeated_character",
+            "password must not be a single repeated character",
         ));
     }
 
     let lowered = password.to_lowercase();
     if COMMON_PASSWORDS.contains(&lowered.as_str()) {
-        return Err(DomainError::InvalidInput(
-            "password is too common; choose a less predictable one".into(),
+        return Err(DomainError::rejected(
+            "password_too_common",
+            "password is too common; choose a less predictable one",
         ));
     }
 
+    // Both shapes below share one code: the remedy an owner needs — pick a
+    // password that has nothing to do with the address — is identical, and a
+    // second code would be a second string for every client to translate for
+    // no difference the owner can see. The English message still tells the
+    // two apart, for a log.
     let email_lowered = email.to_lowercase();
     if !email_lowered.is_empty() && lowered == email_lowered {
-        return Err(DomainError::InvalidInput(
-            "password must not be the email address".into(),
+        return Err(DomainError::rejected(
+            "password_contains_email",
+            "password must not be the email address",
         ));
     }
     let local_part = email_lowered.split('@').next().unwrap_or_default();
     if local_part.chars().count() >= MIN_LOCAL_PART_FOR_SUBSTRING_CHECK
         && lowered.contains(local_part)
     {
-        return Err(DomainError::InvalidInput(
-            "password must not contain the email address".into(),
+        return Err(DomainError::rejected(
+            "password_contains_email",
+            "password must not contain the email address",
         ));
     }
 
