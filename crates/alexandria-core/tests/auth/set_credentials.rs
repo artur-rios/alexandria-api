@@ -73,7 +73,7 @@ async fn given_a_weak_password_when_set_then_invalid_input() {
         .await
         .expect_err("must reject a weak password");
 
-    assert!(matches!(err, DomainError::InvalidInput(_)), "got {err:?}");
+    assert!(matches!(err, DomainError::Rejected(_)), "got {err:?}");
 }
 
 #[tokio::test]
@@ -151,7 +151,7 @@ async fn given_empty_password_when_set_then_invalid_input_and_unchanged() {
         .set("owner@example.com".to_string(), "".to_string(), TOKEN)
         .await;
 
-    assert!(matches!(result, Err(DomainError::InvalidInput(_))));
+    assert!(matches!(result, Err(DomainError::Rejected(_))));
     assert!(repo.get().await.unwrap().is_none());
 }
 
@@ -168,7 +168,7 @@ async fn given_invalid_email_when_set_then_invalid_input_and_unchanged() {
         )
         .await;
 
-    assert!(matches!(result, Err(DomainError::InvalidInput(_))));
+    assert!(matches!(result, Err(DomainError::Rejected(_))));
     assert!(repo.get().await.unwrap().is_none());
 }
 

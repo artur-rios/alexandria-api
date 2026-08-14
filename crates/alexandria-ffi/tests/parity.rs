@@ -10481,6 +10481,91 @@ async fn given_uc41_register_when_called_on_both_surfaces_then_bodies_match() {
     }
 }
 
+/// Issue #101 parity — a *rejected* registration must read identically over
+/// both transports, byte for byte.
+///
+/// This is the half of `AuthJsonResult`'s "same shape HTTP returns" contract
+/// that used to be false: the FFI error path set `json` to NULL, so six
+/// distinct password-policy rejections were indistinguishable from an
+/// unparseable body. Comparing raw bytes rather than parsed values is
+/// deliberate — the two surfaces render through one function in the core, and
+/// this test is what keeps that true.
+#[tokio::test]
+async fn given_a_rejected_registration_when_called_on_both_surfaces_then_error_bodies_match() {
+    fn weak_body() -> serde_json::Value {
+        json!({
+            "email": "owner@example.com",
+            "password": "short",
+            "passwordConfirmation": "short",
+        })
+    }
+
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+
+    // ---- HTTP leg ----
+    let http_dir = tempdir().unwrap();
+    let http_db = db_path(&http_dir, "http.sqlite");
+    let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    seed_session(&http_pool, TEST_TOKEN).await;
+    let http_services =
+        std::sync::Arc::new(build_services(&local_settings(), http_pool.clone()).await);
+    let router = app(Settings::default(), http_services);
+
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/auth/local/register")
+        .header("content-type", "application/json")
+        .body(Body::from(weak_body().to_string()))
+        .unwrap();
+    let response = router.oneshot(request).await.expect("http register");
+    assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+    let http_bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let http_json = String::from_utf8(http_bytes.to_vec()).expect("utf-8");
+
+    // ---- FFI leg ----
+    let ffi_dir = tempdir().unwrap();
+    let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
+    let (ffi_json, ffi_status): (String, i32) =
+        tokio::task::spawn_blocking(move || -> (String, i32) {
+            let cdb = CString::new(ffi_db).unwrap();
+            assert_eq!(
+                alexandria_index_init(cdb.as_ptr()),
+                alexandria_ffi::INDEX_OK
+            );
+
+            let body = CString::new(weak_body().to_string()).unwrap();
+            let result = alexandria_auth_local_register(body.as_ptr());
+            assert!(
+                !result.json.is_null(),
+                "the FFI error path must carry the rejection, not discard it"
+            );
+            let json = unsafe { CStr::from_ptr(result.json) }
+                .to_str()
+                .unwrap()
+                .to_string();
+            unsafe {
+                alexandria_free_string(result.json);
+            }
+            (json, result.status)
+        })
+        .await
+        .unwrap();
+
+    // ---- compare ----
+    assert_eq!(
+        ffi_status,
+        alexandria_ffi::AUTH_ERR_INVALID_INPUT,
+        "the status stays the coarse class; the code is the reason"
+    );
+    assert_eq!(
+        http_json, ffi_json,
+        "the rejection must be byte-for-byte identical on both surfaces"
+    );
+    let body: serde_json::Value = serde_json::from_str(&ffi_json).unwrap();
+    assert_eq!(body["code"], "password_too_short");
+    assert_eq!(body["params"]["min"], "12");
+}
+
 /// UC-42 parity — a run's recorded status must read identically over both
 /// transports. The run ids differ by construction (independent databases), so
 /// parity asserts every field except the id, which is asserted to be the id

@@ -137,6 +137,15 @@ async fn given_an_existing_account_when_register_posted_then_409() {
         body["error"], "a local account already exists",
         "the response must carry the account-already-exists message: {body}"
     );
+    // Not every failure has a stable reason code yet — issue #101 adopts them
+    // for input rejections first. A failure without one must render exactly
+    // as it always has, or an existing client breaks on an envelope that grew
+    // members it never asked for.
+    assert_eq!(
+        body.as_object().expect("object").len(),
+        1,
+        "an error with no code must render only `error`: {body}"
+    );
 
     // The spec's test plan calls for "409 on a second registration with
     // the stored credentials unchanged" — prove it by logging in with the
@@ -169,6 +178,8 @@ async fn given_a_malformed_email_when_register_posted_then_400() {
         .expect("one-shot");
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(response).await;
+    assert_eq!(body["code"], "email_malformed");
 }
 
 #[tokio::test]
@@ -186,6 +197,13 @@ async fn given_a_weak_password_when_register_posted_then_400() {
         .expect("one-shot");
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    // Issue #101: the reason travels as a code and its bound, not only as an
+    // English sentence, so a client can say which rule failed in its own
+    // language without restating the policy.
+    let body = body_json(response).await;
+    assert_eq!(body["code"], "password_too_short");
+    assert_eq!(body["params"]["min"], "12");
+    assert_eq!(body["error"], "password must be at least 12 characters");
 }
 
 #[tokio::test]
@@ -203,6 +221,8 @@ async fn given_a_mismatched_confirmation_when_register_posted_then_400() {
         .expect("one-shot");
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(response).await;
+    assert_eq!(body["code"], "password_confirmation_mismatch");
 }
 
 #[tokio::test]
@@ -219,4 +239,8 @@ async fn given_a_body_missing_the_confirmation_when_register_posted_then_400() {
         .expect("one-shot");
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    // An unreadable body is its own reason: a client cannot tell it from a
+    // policy rejection by the status alone, since both are `400`.
+    let body = body_json(response).await;
+    assert_eq!(body["code"], "malformed_body");
 }
