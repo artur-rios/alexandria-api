@@ -7,9 +7,6 @@ mod set_credentials;
 #[path = "auth/login.rs"]
 mod login;
 
-#[path = "auth/external.rs"]
-mod external;
-
 #[path = "auth/password.rs"]
 mod password;
 

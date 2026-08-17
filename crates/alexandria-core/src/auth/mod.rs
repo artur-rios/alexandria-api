@@ -1,5 +1,4 @@
 pub mod commands;
-pub mod external;
 pub mod heimdall;
 pub mod local;
 pub mod mail;
@@ -53,7 +52,7 @@ pub enum RuntimeAuthService {
     Local(
         local::LocalAuthService<local::SqliteSessionRepository, crate::catalog::clock::SystemClock>,
     ),
-    External(external::ExternalAuthService<external::HttpJwksProvider>),
+    External(heimdall::HeimdallAuthService),
 }
 
 impl AuthService for RuntimeAuthService {

@@ -413,9 +413,8 @@ mod tests {
 
         let service = HeimdallAuthService::from_settings(&settings());
         let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"none","typ":"JWT"}"#);
-        let payload = URL_SAFE_NO_PAD.encode(
-            json!({ "id": PERSON, "scopeId": SCOPE, "exp": epoch(3600) }).to_string(),
-        );
+        let payload = URL_SAFE_NO_PAD
+            .encode(json!({ "id": PERSON, "scopeId": SCOPE, "exp": epoch(3600) }).to_string());
         let token = format!("{header}.{payload}.");
 
         assert!(matches!(

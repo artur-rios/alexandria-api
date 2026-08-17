@@ -10,7 +10,7 @@ use crate::auth::commands::register::RegisterLocalAccountHandler;
 use crate::auth::commands::request_password_reset::RequestPasswordResetHandler;
 use crate::auth::commands::resend_confirmation::ResendConfirmationHandler;
 use crate::auth::commands::set_credentials::SetLocalCredentialsHandler;
-use crate::auth::external::{ExternalAuthService, HttpJwksProvider};
+use crate::auth::heimdall::HeimdallAuthService;
 use crate::auth::local::{
     LocalAuthService, SqliteLocalCredentialRepository, SqliteSessionRepository,
 };
@@ -372,9 +372,13 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         AuthMode::Local => {
             RuntimeAuthService::Local(LocalAuthService::new(session_repo.clone(), clock))
         }
-        AuthMode::External => RuntimeAuthService::External(ExternalAuthService::new(
-            HttpJwksProvider::new(settings.auth.jwks_url.clone()),
-        )),
+        // UC-36: Heimdall signs HS256 with a secret this process is
+        // configured with, so verification is offline and needs no
+        // collaborator. `AuthSettings::validate` has already refused to let a
+        // misconfigured process get this far.
+        AuthMode::External => {
+            RuntimeAuthService::External(HeimdallAuthService::from_settings(&settings.auth))
+        }
     };
     let audio_tags = LoftyAudioMetadataReader;
     let image_tags = ExifImageMetadataReader;

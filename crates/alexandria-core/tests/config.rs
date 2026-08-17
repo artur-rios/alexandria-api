@@ -5,7 +5,6 @@ fn given_example_config_when_parsed_then_defaults_and_overrides_match_spec() {
     let toml = r#"
 [auth]
 mode = "local"
-jwks_url = "https://example.invalid/jwks"
 local_db = true
 session_ttl_hours = 12
 
@@ -31,7 +30,6 @@ level = "debug"
     let settings: Settings = toml::from_str(toml).unwrap();
 
     assert_eq!(settings.auth.mode, AuthMode::Local);
-    assert_eq!(settings.auth.jwks_url, "https://example.invalid/jwks");
     assert!(settings.auth.local_db);
     assert_eq!(settings.auth.session_ttl_hours, 12);
     assert_eq!(settings.http.bind_addr, "127.0.0.1");
@@ -115,7 +113,10 @@ heimdall_audience = "alexandria"
     let settings: Settings = toml::from_str(toml).unwrap();
 
     assert_eq!(settings.auth.mode, AuthMode::External);
-    assert_eq!(settings.auth.heimdall_token_secret.expose(), "current-secret");
+    assert_eq!(
+        settings.auth.heimdall_token_secret.expose(),
+        "current-secret"
+    );
     assert_eq!(
         settings.auth.heimdall_token_secret_previous.expose(),
         "previous-secret"

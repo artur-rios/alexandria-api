@@ -10,10 +10,6 @@
 # The single active authentication mode. One of: "external", "local".
 mode = "external"
 
-# External mode only: the JWKS endpoint of the external auth service used to
-# validate JWTs. Ignored when mode = "local".
-jwks_url = ""
-
 # External mode only: the HS256 secret Heimdall signs its tokens with — the
 # same value as Heimdall's own HEIMDALL_AUTH_TOKEN_SECRET. Required in external
 # mode: Heimdall publishes no key set, so this is the only way to verify one of

@@ -87,8 +87,6 @@ impl fmt::Debug for Secret {
 pub struct AuthSettings {
     #[serde(default = "default_auth_mode")]
     pub mode: AuthMode,
-    #[serde(default)]
-    pub jwks_url: String,
     /// External mode only: the HS256 secret Heimdall signs its tokens with
     /// (its `HEIMDALL_AUTH_TOKEN_SECRET`). Required in external mode —
     /// Heimdall publishes no keys, so this is the only way to verify one of
@@ -163,7 +161,6 @@ impl Default for AuthSettings {
     fn default() -> Self {
         Self {
             mode: default_auth_mode(),
-            jwks_url: String::new(),
             heimdall_token_secret: Secret::default(),
             heimdall_token_secret_previous: Secret::default(),
             heimdall_scope_id: String::new(),
@@ -439,9 +436,6 @@ impl Settings {
             if let Ok(parsed) = match_mode(&mode) {
                 self.auth.mode = parsed;
             }
-        }
-        if let Ok(jwks_url) = env::var("ALEXANDRIA_AUTH_JWKS_URL") {
-            self.auth.jwks_url = jwks_url;
         }
         if let Ok(hours) = env::var("ALEXANDRIA_AUTH_SESSION_TTL_HOURS") {
             if let Ok(parsed) = hours.parse::<u32>() {

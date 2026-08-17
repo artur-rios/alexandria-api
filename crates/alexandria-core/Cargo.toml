@@ -20,7 +20,6 @@ kamadak-exif.workspace = true
 lofty.workspace = true
 lopdf.workspace = true
 quick-xml.workspace = true
-reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
