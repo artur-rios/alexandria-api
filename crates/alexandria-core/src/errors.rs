@@ -62,10 +62,9 @@ pub enum DomainError {
     /// submitted bytes, even after one retry (UC-33 AF-03).
     #[error("integrity error: {0}")]
     Integrity(String),
-    /// A required external dependency could not be reached (UC-36 AF-03: the
-    /// external auth service is unreachable). Carries no reason code, and its
-    /// message is deliberately not echoed — which of an installation's
-    /// dependencies is down is not a caller's business.
+    /// A required external dependency could not be reached. Carries no reason
+    /// code, and its message is deliberately not echoed — which of an
+    /// installation's dependencies is down is not a caller's business.
     #[error("service unavailable: {0}")]
     ServiceUnavailable(String),
     /// A dependency is unavailable for a reason the caller *does* need — the
@@ -111,10 +110,6 @@ impl DomainError {
 
     pub fn integrity(message: impl Into<String>) -> Self {
         Self::Integrity(message.into())
-    }
-
-    pub fn service_unavailable(message: impl Into<String>) -> Self {
-        Self::ServiceUnavailable(message.into())
     }
 
     /// Reject input with a stable reason code (issue #101). `message` is the
