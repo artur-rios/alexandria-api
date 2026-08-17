@@ -146,9 +146,11 @@ fn given_no_heimdall_keys_when_parsed_then_empty() {
 /// logging passwords.
 #[test]
 fn given_configured_secrets_when_debug_formatted_then_redacted() {
-    let mut auth = AuthSettings::default();
-    auth.heimdall_token_secret = Secret::new("super-secret-value");
-    auth.heimdall_token_secret_previous = Secret::new("older-secret-value");
+    let auth = AuthSettings {
+        heimdall_token_secret: Secret::new("super-secret-value"),
+        heimdall_token_secret_previous: Secret::new("older-secret-value"),
+        ..AuthSettings::default()
+    };
 
     let rendered = format!("{auth:?}");
 
