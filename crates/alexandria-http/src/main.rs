@@ -20,6 +20,11 @@ async fn main() -> Result<()> {
 
     init_tracing(&settings.logging.level);
 
+    // UC-36: external mode cannot verify a token without the Heimdall signing
+    // secret and the scope it accepts. Refuse to start rather than answer 401
+    // to every request for the life of the process.
+    settings.auth.validate()?;
+
     let bind_addr = settings.http.socket_addr();
     let auth_mode = settings.auth.mode;
 
