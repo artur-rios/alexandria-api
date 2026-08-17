@@ -1,7 +1,9 @@
 use std::env;
+use std::fmt;
 use std::path::Path;
 
 use serde::Deserialize;
+use uuid::Uuid;
 
 use crate::errors::DomainError;
 
@@ -43,12 +45,78 @@ impl LogLevel {
     }
 }
 
+/// A configuration value that must never reach a log.
+///
+/// `Debug` prints a marker instead of the value, so a config dump or a
+/// `tracing` span cannot emit a signing secret. This is FR-AU-06's ban on
+/// logging passwords applied to the other secret that grants the whole
+/// catalog — with the difference that this one is *shared* with Heimdall, so
+/// leaking it compromises more than Alexandria.
+#[derive(Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(transparent)]
+pub struct Secret(String);
+
+impl Secret {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    /// The plaintext. Named so that every read site is obvious at a glance.
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+
+    /// Whether the secret is unset. Whitespace counts as unset: a key
+    /// configured to `" "` is a mistake, not a secret.
+    pub fn is_empty(&self) -> bool {
+        self.0.trim().is_empty()
+    }
+}
+
+impl fmt::Debug for Secret {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(if self.0.is_empty() {
+            "Secret(unset)"
+        } else {
+            "Secret(redacted)"
+        })
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct AuthSettings {
     #[serde(default = "default_auth_mode")]
     pub mode: AuthMode,
     #[serde(default)]
     pub jwks_url: String,
+    /// External mode only: the HS256 secret Heimdall signs its tokens with
+    /// (its `HEIMDALL_AUTH_TOKEN_SECRET`). Required in external mode —
+    /// Heimdall publishes no keys, so this is the only way to verify one of
+    /// its tokens.
+    #[serde(default)]
+    pub heimdall_token_secret: Secret,
+    /// External mode only: the secret Heimdall is rotating away from (its
+    /// `HEIMDALL_AUTH_TOKEN_SECRET_PREVIOUS`). Accepted alongside the current
+    /// one, mirroring Heimdall's own two-key scheme, so a rotation there does
+    /// not black out Alexandria until this file is edited and the process
+    /// restarted. Ignored when equal to the current secret: the same value
+    /// under two names is not a rotation.
+    #[serde(default)]
+    pub heimdall_token_secret_previous: Secret,
+    /// External mode only: the UUID of the Heimdall scope Alexandria is
+    /// registered in. A token is accepted when it names this scope.
+    #[serde(default)]
+    pub heimdall_scope_id: String,
+    /// External mode only: the `iss` claim to require, checked only when set.
+    /// Heimdall reads its issuer from an environment variable that defaults
+    /// to empty and then signs tokens carrying no `iss` at all, so requiring
+    /// one unconditionally would reject every token from a default install.
+    #[serde(default)]
+    pub heimdall_issuer: String,
+    /// External mode only: the `aud` claim to require, checked only when set,
+    /// for the same reason as `heimdall_issuer`.
+    #[serde(default)]
+    pub heimdall_audience: String,
     #[serde(default)]
     pub local_db: bool,
     /// How long a session created by local login (UC-34) stays valid.
@@ -96,12 +164,51 @@ impl Default for AuthSettings {
         Self {
             mode: default_auth_mode(),
             jwks_url: String::new(),
+            heimdall_token_secret: Secret::default(),
+            heimdall_token_secret_previous: Secret::default(),
+            heimdall_scope_id: String::new(),
+            heimdall_issuer: String::new(),
+            heimdall_audience: String::new(),
             local_db: false,
             session_ttl_hours: default_session_ttl_hours(),
             confirmation_ttl_hours: default_confirmation_ttl_hours(),
             password_reset_ttl_minutes: default_password_reset_ttl_minutes(),
             resend_interval_seconds: default_resend_interval_seconds(),
         }
+    }
+}
+
+impl AuthSettings {
+    /// Startup validation for external mode (UC-36). Each binary calls this
+    /// before building services: a process that cannot verify a token must
+    /// refuse to start, rather than answer `401` to every request forever
+    /// with nothing to say why. Heimdall makes the same choice about the same
+    /// secret, and for the same reason.
+    ///
+    /// Local mode reads none of these keys and always passes.
+    pub fn validate(&self) -> Result<(), DomainError> {
+        if self.mode != AuthMode::External {
+            return Ok(());
+        }
+
+        if self.heimdall_token_secret.is_empty() {
+            return Err(DomainError::Config(
+                "auth.heimdall_token_secret is unset: external mode verifies Heimdall's \
+                 tokens against the secret it signs them with, and Heimdall publishes no \
+                 keys to fetch instead"
+                    .to_string(),
+            ));
+        }
+
+        Uuid::parse_str(self.heimdall_scope_id.trim()).map_err(|_| {
+            DomainError::Config(format!(
+                "auth.heimdall_scope_id is not a UUID: {:?}. External mode accepts a token \
+                 on membership of this Heimdall scope, so it must name one.",
+                self.heimdall_scope_id
+            ))
+        })?;
+
+        Ok(())
     }
 }
 
