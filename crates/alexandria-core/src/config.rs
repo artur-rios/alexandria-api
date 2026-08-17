@@ -197,13 +197,24 @@ impl AuthSettings {
             ));
         }
 
-        Uuid::parse_str(self.heimdall_scope_id.trim()).map_err(|_| {
+        let scope_id = Uuid::parse_str(self.heimdall_scope_id.trim()).map_err(|_| {
             DomainError::Config(format!(
                 "auth.heimdall_scope_id is not a UUID: {:?}. External mode accepts a token \
                  on membership of this Heimdall scope, so it must name one.",
                 self.heimdall_scope_id
             ))
         })?;
+
+        // The nil UUID parses, so it would otherwise start a process that
+        // accepts any token whose `scopeId` is also nil. It is a placeholder
+        // an operator leaves behind, never a scope Heimdall issued.
+        if scope_id.is_nil() {
+            return Err(DomainError::Config(
+                "auth.heimdall_scope_id is the nil UUID: that is a placeholder, not the \
+                 Heimdall scope Alexandria is registered in"
+                    .to_string(),
+            ));
+        }
 
         Ok(())
     }
@@ -456,6 +467,26 @@ impl Settings {
             if let Ok(parsed) = seconds.parse::<u32>() {
                 self.auth.resend_interval_seconds = parsed;
             }
+        }
+        // The external-mode keys take the same overrides as everything else,
+        // and the two secrets especially: a deployment must be able to hand
+        // Alexandria the shared signing key through the environment rather
+        // than write to disk the one value that can mint a token every
+        // Heimdall-backed application will accept.
+        if let Ok(secret) = env::var("ALEXANDRIA_AUTH_HEIMDALL_TOKEN_SECRET") {
+            self.auth.heimdall_token_secret = Secret::new(secret);
+        }
+        if let Ok(secret) = env::var("ALEXANDRIA_AUTH_HEIMDALL_TOKEN_SECRET_PREVIOUS") {
+            self.auth.heimdall_token_secret_previous = Secret::new(secret);
+        }
+        if let Ok(scope_id) = env::var("ALEXANDRIA_AUTH_HEIMDALL_SCOPE_ID") {
+            self.auth.heimdall_scope_id = scope_id;
+        }
+        if let Ok(issuer) = env::var("ALEXANDRIA_AUTH_HEIMDALL_ISSUER") {
+            self.auth.heimdall_issuer = issuer;
+        }
+        if let Ok(audience) = env::var("ALEXANDRIA_AUTH_HEIMDALL_AUDIENCE") {
+            self.auth.heimdall_audience = audience;
         }
         if let Ok(from) = env::var("ALEXANDRIA_MAIL_FROM_ADDRESS") {
             self.mail.from_address = from;

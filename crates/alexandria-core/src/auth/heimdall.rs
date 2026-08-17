@@ -172,6 +172,31 @@ fn non_empty(value: &str) -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
+/// Whether the token is a two-factor challenge token rather than proof of a
+/// completed authentication.
+///
+/// Absent claim means no challenge is pending — Heimdall's authentication
+/// tokens carry no `mfaPending` at all, and rejecting them would refuse every
+/// legitimate token.
+///
+/// Present, the value is read *permissively about its shape and strictly about
+/// its meaning*: it is trimmed and lowercased, and only a value positively
+/// recognised as "not pending" clears the check. Anything else — `"True"`,
+/// `"yes"`, a value that has not been invented yet — counts as pending.
+///
+/// The asymmetry is deliberate. This literal is produced by a .NET codebase in
+/// another repository, where `bool.ToString()` yields `"True"`; matching
+/// `"true"` exactly would turn a refactor there into a silent open door on the
+/// one check standing between a caller who has proved one factor of two and
+/// the entire catalog. Failing closed costs, at worst, a `401` an operator can
+/// see and diagnose.
+fn is_challenge_token(value: Option<&str>) -> bool {
+    match value {
+        None => false,
+        Some(value) => !matches!(value.trim().to_ascii_lowercase().as_str(), "false" | "0"),
+    }
+}
+
 impl AuthService for HeimdallAuthService {
     /// Every refusal is the same `Unauthorized`, with no code and no detail.
     /// Naming which check failed would tell a caller which knob to turn next;
@@ -211,8 +236,9 @@ impl AuthService for HeimdallAuthService {
         // pending, redeemable only at its own `2fa/verify` endpoint, and keeps
         // it away from its own endpoints with a global filter. Alexandria
         // makes the check explicitly rather than relying on the challenge
-        // token happening to carry no scope claim today.
-        if claims.mfa_pending.as_deref() == Some("true") {
+        // token happening to carry no scope claim today. The claim's value is
+        // read fail-closed; see `is_challenge_token`.
+        if is_challenge_token(claims.mfa_pending.as_deref()) {
             return Err(DomainError::Unauthorized);
         }
 
@@ -436,6 +462,42 @@ mod tests {
             service.authenticate(&token).await,
             Err(DomainError::Unauthorized)
         ));
+    }
+
+    /// The literal is written by a .NET codebase in another repository, where
+    /// `bool.ToString()` yields `"True"`. An exact match on `"true"` would let
+    /// a challenge token straight through the moment that changes, so every
+    /// spelling that is not positively "not pending" is refused.
+    #[tokio::test]
+    async fn given_challenge_token_with_an_unrecognised_pending_value_then_unauthorized() {
+        let service = HeimdallAuthService::from_settings(&settings());
+
+        for value in ["True", "TRUE", " true ", "yes", "1", "pending", ""] {
+            let token = token_with(SECRET, Algorithm::HS256, json!({ "mfaPending": value }));
+            assert!(
+                matches!(
+                    service.authenticate(&token).await,
+                    Err(DomainError::Unauthorized)
+                ),
+                "mfaPending={value:?} was not refused"
+            );
+        }
+    }
+
+    /// The other side of the fail-closed rule: a claim that positively says no
+    /// challenge is pending must not refuse an otherwise valid token, however
+    /// it is cased.
+    #[tokio::test]
+    async fn given_token_whose_pending_claim_says_not_pending_then_accepted() {
+        let service = HeimdallAuthService::from_settings(&settings());
+
+        for value in ["false", "False", " FALSE ", "0"] {
+            let token = token_with(SECRET, Algorithm::HS256, json!({ "mfaPending": value }));
+            assert!(
+                service.authenticate(&token).await.is_ok(),
+                "mfaPending={value:?} was not accepted"
+            );
+        }
     }
 
     #[tokio::test]
