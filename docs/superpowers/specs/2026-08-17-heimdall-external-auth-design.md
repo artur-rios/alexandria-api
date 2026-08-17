@@ -106,11 +106,16 @@ one auth mode is active at runtime (FR-AU-01, FR-AU-03).
 5. **A two-factor challenge token is refused.** When 2FA is pending, Heimdall's
    login returns `requiresTwoFactor` with a `challengeToken` **instead of** an
    authentication token, redeemable only at `POST /api/auth/2fa/verify`. That
-   challenge token is a signed JWT carrying the same `id` and scope claims, and
-   is distinguished only by an `mfaPending` claim set to `"true"` — Heimdall
-   itself relies on a global MVC filter to keep it out. Alexandria must make
-   the same check, or a caller who has proved one factor of two would be handed
-   the entire catalog.
+   challenge token is a signed JWT carrying `id` and `role`, marked by an
+   `mfaPending` claim set to the literal `"true"` — Heimdall itself relies on a
+   global MVC filter to keep it away from its own endpoints. Alexandria makes
+   the same check explicitly, or a caller who has proved one factor of two
+   would be handed the entire catalog.
+
+   Today `JwtTwoFactorChallengeTokenIssuer` builds its claims without a scope,
+   so decision 4's check would refuse a challenge token even without this one.
+   That is a property of Heimdall's current implementation rather than a
+   guarantee of its API, and it is not what this check rests on.
 
 6. **The signing algorithm is pinned to HS256.** The algorithm is taken from
    the service's configuration, never from the token's own header. Trusting the
