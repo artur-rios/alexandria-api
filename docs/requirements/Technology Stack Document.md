@@ -55,8 +55,7 @@ choices instead of restating them, so that:
 | **anyhow** | latest stable at implementation time | all crates | error propagation across crate boundaries |
 | **thiserror** | latest stable at implementation time | alexandria-core | typed domain error enums per command/query |
 | **argon2** | latest stable at implementation time | alexandria-core (auth) | salted password hashing for local-login mode |
-| **reqwest** | latest stable at implementation time | alexandria-core (auth) | fetches the external auth service's JWKS in external mode |
-| **jsonwebtoken** | latest stable at implementation time | alexandria-core (auth) | JWT decode/verification for external-auth mode |
+| **jsonwebtoken** | latest stable at implementation time | alexandria-core (auth) | HS256 decode/verification of Heimdall-issued JWTs for external-auth mode |
 | **toml** | latest stable at implementation time | all crates | `config.toml` parsing with env-var overrides |
 | **cbindgen** | latest stable at implementation time | alexandria-ffi (build) | generates the C header consumed by Flutter FFI |
 | **ring** or **sha2** | latest stable at implementation time | alexandria-core | content hashing for indexed files (SHA-256) |

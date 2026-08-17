@@ -144,7 +144,7 @@ Exactly one active auth mode: external JWT **or** local encrypted login.
 | --- | --- | :---: | --- | --- |
 | [#35](https://github.com/artur-rios/alexandria-api/issues/35) | UC-34 | &#9745; | Local login | FR-AU-01, FR-AU-04, FR-AU-07, FR-AU-08 |
 | [#36](https://github.com/artur-rios/alexandria-api/issues/36) | UC-35 | &#9745; | Set or change local login credentials | FR-AU-05, FR-AU-06, FR-AU-07, FR-AU-08, FR-AU-11 |
-| [#37](https://github.com/artur-rios/alexandria-api/issues/37) | UC-36 | &#9745; | Authenticate via external JWT | FR-AU-01, FR-AU-02, FR-AU-03, FR-AU-07, FR-AU-08 |
+| [#37](https://github.com/artur-rios/alexandria-api/issues/37) | UC-36 | &#9745; | Authenticate via Heimdall JWT | FR-AU-01, FR-AU-02, FR-AU-03, FR-AU-07, FR-AU-08 |
 | [#96](https://github.com/artur-rios/alexandria-api/issues/96) | UC-41 | &#9744; | Register the local account | FR-AU-10, FR-AU-11 |
 
 ### F-10 — Media playback
@@ -435,7 +435,9 @@ Both surfaces read the same configuration: `ALEXANDRIA_CONFIG` (default
 `config.toml`) plus `ALEXANDRIA_*` environment overrides.
 
 In external auth mode, set `ALEXANDRIA_AUTH_MODE=external` and
-`ALEXANDRIA_AUTH_JWKS_URL` to the external auth service's JWKS endpoint. In
+`ALEXANDRIA_AUTH_HEIMDALL_TOKEN_SECRET` to the HS256 secret Heimdall signs
+with, and `ALEXANDRIA_AUTH_HEIMDALL_SCOPE_ID` to the UUID of the Heimdall
+scope whose members are accepted as the owner. In
 local login mode (`ALEXANDRIA_AUTH_MODE=local`),
 create the owner's account once via `POST /v1/auth/local/register` (UC-41) —
 it takes `email`, `password`, and `passwordConfirmation`, succeeds only once,
