@@ -1,5 +1,6 @@
 pub mod commands;
 pub mod external;
+pub mod heimdall;
 pub mod local;
 pub mod mail;
 pub mod password;

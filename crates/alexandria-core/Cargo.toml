@@ -34,6 +34,10 @@ walkdir.workspace = true
 zip.workspace = true
 
 [dev-dependencies]
+# Tests only: `jsonwebtoken` will not encode an `alg: none` token — refusing
+# to produce one is the point of the library — so the test that proves we
+# reject it assembles the token by hand.
+base64.workspace = true
 little_exif.workspace = true
 tempfile.workspace = true
 tokio.workspace = true

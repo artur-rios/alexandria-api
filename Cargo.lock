@@ -34,6 +34,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "argon2",
+ "base64",
  "chrono",
  "epub",
  "ffmpeg-next",
