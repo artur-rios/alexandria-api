@@ -98,24 +98,36 @@ impl HeimdallAuthService {
     /// audience check has to be disabled outright when none is configured —
     /// silent defaults are the wrong thing to inherit in the one function
     /// standing between a caller and the whole catalog.
+    ///
+    /// `jsonwebtoken` checks `iss`/`aud` only when the token actually carries
+    /// the claim — configuring one without adding it to
+    /// `required_spec_claims` would let a token that omits it slip past
+    /// unchecked, which defeats the point of configuring it at all. So each
+    /// claim is required exactly when the matching setting is configured.
     fn validation(&self) -> Validation {
         let mut validation = Validation::new(Algorithm::HS256);
         validation.validate_exp = true;
         validation.validate_nbf = true;
-        // `exp` is the only claim Heimdall always writes and the only one
-        // whose absence must not be treated as "fine".
-        validation.required_spec_claims = HashSet::from(["exp".to_string()]);
+        // `exp` is always required. `iss`/`aud` join it only when configured,
+        // so an unconfigured install keeps accepting Heimdall's default
+        // tokens, which carry neither claim.
+        let mut required = HashSet::from(["exp".to_string()]);
 
         // `Validation::new` starts with no issuer, so the unconfigured arm has
         // nothing to undo — unlike the audience, which defaults to being
         // validated.
         if let Some(issuer) = &self.issuer {
             validation.set_issuer(&[issuer]);
+            required.insert("iss".to_string());
         }
         match &self.audience {
-            Some(audience) => validation.set_audience(&[audience]),
+            Some(audience) => {
+                validation.set_audience(&[audience]);
+                required.insert("aud".to_string());
+            }
             None => validation.validate_aud = false,
         }
+        validation.required_spec_claims = required;
 
         validation
     }
@@ -527,6 +539,52 @@ mod tests {
         let service = HeimdallAuthService::from_settings(&settings());
 
         assert!(service.authenticate(&valid_token()).await.is_ok());
+    }
+
+    /// `jsonwebtoken` checks `iss` only when the claim is present, so a
+    /// configured issuer alone does not make the claim required. An operator
+    /// configuring an issuer to fence off a second deployment sharing the
+    /// secret must have a token carrying none of it refused.
+    #[tokio::test]
+    async fn given_configured_issuer_when_token_carries_none_then_unauthorized() {
+        let service = HeimdallAuthService::from_settings(&AuthSettings {
+            heimdall_issuer: "heimdall".to_string(),
+            ..settings()
+        });
+
+        assert!(matches!(
+            service.authenticate(&valid_token()).await,
+            Err(DomainError::Unauthorized)
+        ));
+    }
+
+    #[tokio::test]
+    async fn given_configured_audience_when_token_names_another_then_unauthorized() {
+        let service = HeimdallAuthService::from_settings(&AuthSettings {
+            heimdall_audience: "alexandria".to_string(),
+            ..settings()
+        });
+        let token = token_with(SECRET, Algorithm::HS256, json!({ "aud": "somewhere-else" }));
+
+        assert!(matches!(
+            service.authenticate(&token).await,
+            Err(DomainError::Unauthorized)
+        ));
+    }
+
+    /// Same reasoning as the issuer case: a configured audience must be
+    /// enforced even against a token that omits the claim entirely.
+    #[tokio::test]
+    async fn given_configured_audience_when_token_carries_none_then_unauthorized() {
+        let service = HeimdallAuthService::from_settings(&AuthSettings {
+            heimdall_audience: "alexandria".to_string(),
+            ..settings()
+        });
+
+        assert!(matches!(
+            service.authenticate(&valid_token()).await,
+            Err(DomainError::Unauthorized)
+        ));
     }
 
     #[tokio::test]
