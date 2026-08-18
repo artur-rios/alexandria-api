@@ -3,6 +3,7 @@ pub mod heimdall;
 pub mod local;
 pub mod mail;
 pub mod password;
+pub mod recovery;
 pub mod tokens;
 
 use crate::config::AuthMode;
