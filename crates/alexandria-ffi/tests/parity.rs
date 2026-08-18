@@ -8832,6 +8832,37 @@ async fn given_same_local_credentials_when_set_and_logged_in_via_http_and_ffi_th
     }
 }
 
+/// Sets `ALEXANDRIA_AUTH_MODE=windows` and `ALEXANDRIA_AUTH_WINDOWS_OWNER_SID`
+/// for as long as this guard is alive, and restores both — mode back to
+/// `"local"`, the SID variable removed entirely — on `Drop`. Same reasoning
+/// as `ThumbnailCacheGuard` above: a plain trailing `set_var` back to
+/// `"local"` is skipped if the test unwinds from a failed assertion first,
+/// which would leave `ALEXANDRIA_AUTH_WINDOWS_OWNER_SID` set for the rest of
+/// the process and silently change what `alexandria_index_init` does in
+/// every later test that does not itself override it.
+///
+/// Must be constructed and dropped while still holding `SERIAL` — see
+/// `ThumbnailCacheGuard`.
+#[cfg(windows)]
+struct WindowsAuthEnvGuard;
+
+#[cfg(windows)]
+impl WindowsAuthEnvGuard {
+    fn new(owner_sid: &str) -> Self {
+        std::env::set_var("ALEXANDRIA_AUTH_MODE", "windows");
+        std::env::set_var("ALEXANDRIA_AUTH_WINDOWS_OWNER_SID", owner_sid);
+        Self
+    }
+}
+
+#[cfg(windows)]
+impl Drop for WindowsAuthEnvGuard {
+    fn drop(&mut self) {
+        std::env::set_var("ALEXANDRIA_AUTH_MODE", "local");
+        std::env::remove_var("ALEXANDRIA_AUTH_WINDOWS_OWNER_SID");
+    }
+}
+
 /// UC-45 parity — open a session for the Windows account through both
 /// transports and assert both succeed with a well-formed session id (Testing
 /// Specification §7.3). Session ids differ by construction (independent
@@ -8842,7 +8873,9 @@ async fn given_same_local_credentials_when_set_and_logged_in_via_http_and_ffi_th
 /// reads this process's real account SID through `ProcessWindowsIdentity`,
 /// which only Windows can answer — on every other platform Windows mode can
 /// never finish initializing, so there is nothing for this test to exercise
-/// there.
+/// there. `given_local_mode_when_windows_login_attempted_via_http_and_ffi_
+/// then_both_conflict` below covers the FR-AU-08 both-surfaces claim on
+/// every platform CI actually runs on.
 #[cfg(windows)]
 #[tokio::test]
 async fn given_windows_mode_when_logged_in_via_http_and_ffi_then_both_return_a_session() {
@@ -8884,12 +8917,13 @@ async fn given_windows_mode_when_logged_in_via_http_and_ffi_then_both_return_a_s
     // `alexandria_index_init` loads settings via `load_settings()`
     // (`ALEXANDRIA_*` env), not a `Settings` value the test controls
     // directly — same constraint `setup_ffi_db` documents for local mode.
+    // The guard restores both env vars on drop, including if an assertion
+    // below panics first.
     let ffi_dir = tempdir().unwrap();
     let ffi_db = db_path(&ffi_dir, "ffi.sqlite");
     let ffi_pool = migrate_database(&ffi_db).await.expect("ffi pre-migrate");
     ffi_pool.close().await;
-    std::env::set_var("ALEXANDRIA_AUTH_MODE", "windows");
-    std::env::set_var("ALEXANDRIA_AUTH_WINDOWS_OWNER_SID", &owner_sid);
+    let _env_guard = WindowsAuthEnvGuard::new(&owner_sid);
 
     let ffi_login_json: String = tokio::task::spawn_blocking(move || -> String {
         let cdb = CString::new(ffi_db).unwrap();
@@ -8909,11 +8943,6 @@ async fn given_windows_mode_when_logged_in_via_http_and_ffi_then_both_return_a_s
     .await
     .unwrap();
 
-    // Restore the env var every other test in this file relies on
-    // (`setup_ffi_db` sets it back to "local" too, but this leaves the
-    // process in a consistent state even if this test runs last).
-    std::env::set_var("ALEXANDRIA_AUTH_MODE", "local");
-
     let ffi_login_body: serde_json::Value = serde_json::from_str(&ffi_login_json).unwrap();
 
     assert_eq!(http_login_body["success"], serde_json::json!(true));
@@ -8925,6 +8954,66 @@ async fn given_windows_mode_when_logged_in_via_http_and_ffi_then_both_return_a_s
             "sessionId is a uuid: {session_id}"
         );
     }
+}
+
+/// UC-45 parity, cross-platform — the FR-AU-08 both-surfaces claim, verified
+/// on every platform CI runs on (unlike the Windows-only test above, which
+/// `alexandria_index_init`'s real SID check confines to Windows). Builds
+/// services in `AuthMode::Local` and asserts both surfaces reject a Windows
+/// login with the same shape: HTTP `409`, FFI's `AUTH_ERR_CONFLICT`. This
+/// path never sets the mode to `Windows`, so `alexandria_index_init` never
+/// reaches the SID gate — it proves the route is registered, reachable
+/// without a session (409 rather than 401 or 404), and mapped to the same
+/// error class on both transports.
+#[tokio::test]
+async fn given_local_mode_when_windows_login_attempted_via_http_and_ffi_then_both_conflict() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+
+    // ---- HTTP leg ----
+    let http_dir = tempdir().unwrap();
+    let http_db = db_path(&http_dir, "http.sqlite");
+    let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    let http_services =
+        std::sync::Arc::new(build_services(&local_settings(), http_pool.clone()).await);
+    let router = app(Settings::default(), http_services);
+
+    let login_req = Request::builder()
+        .method("POST")
+        .uri("/v1/auth/windows/login")
+        .body(Body::empty())
+        .unwrap();
+    let login_resp = router.oneshot(login_req).await.expect("http windows login");
+    assert_eq!(login_resp.status(), axum::http::StatusCode::CONFLICT);
+
+    // ---- FFI leg ----
+    let ffi_dir = tempdir().unwrap();
+    let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
+
+    let ffi_status: std::os::raw::c_int = tokio::task::spawn_blocking(move || {
+        let cdb = CString::new(ffi_db).unwrap();
+        assert_eq!(
+            alexandria_index_init(cdb.as_ptr()),
+            alexandria_ffi::INDEX_OK
+        );
+
+        let login_result = alexandria_auth_windows_login(std::ptr::null());
+        assert!(
+            !login_result.json.is_null(),
+            "every auth result must carry a body"
+        );
+        unsafe {
+            alexandria_free_string(login_result.json);
+        }
+        login_result.status
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(
+        ffi_status,
+        alexandria_ffi::AUTH_ERR_CONFLICT,
+        "ffi must reject a windows login while the active mode is local"
+    );
 }
 
 /// Write a minimal valid single-channel 8-bit PCM WAV file (see
