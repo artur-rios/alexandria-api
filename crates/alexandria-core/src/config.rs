@@ -12,6 +12,10 @@ use crate::errors::DomainError;
 pub enum AuthMode {
     External,
     Local,
+    /// The Windows account this process runs as is the credential (UC-45 /
+    /// FR-AU-20). Mutually exclusive with the other two: exactly one mode is
+    /// active at runtime (FR-AU-01).
+    Windows,
 }
 
 impl AuthMode {
@@ -19,6 +23,7 @@ impl AuthMode {
         match self {
             AuthMode::External => "external",
             AuthMode::Local => "local",
+            AuthMode::Windows => "windows",
         }
     }
 }
@@ -120,6 +125,14 @@ pub struct AuthSettings {
     /// How long a session created by local login (UC-34) stays valid.
     #[serde(default = "default_session_ttl_hours")]
     pub session_ttl_hours: u32,
+    /// Windows mode only: the SID of the account this process must run as,
+    /// e.g. `S-1-5-21-1004336348-1177238915-682003330-1001`.
+    ///
+    /// A SID rather than a username because usernames are renameable and
+    /// reusable, while a SID is neither. Not a secret — an identifier — so it
+    /// is a plain `String` rather than a `Secret`.
+    #[serde(default)]
+    pub windows_owner_sid: String,
 }
 
 fn default_auth_mode() -> AuthMode {
@@ -141,6 +154,7 @@ impl Default for AuthSettings {
             heimdall_audience: String::new(),
             local_db: false,
             session_ttl_hours: default_session_ttl_hours(),
+            windows_owner_sid: String::new(),
         }
     }
 }
@@ -154,39 +168,51 @@ impl AuthSettings {
     ///
     /// Local mode reads none of these keys and always passes.
     pub fn validate(&self) -> Result<(), DomainError> {
-        if self.mode != AuthMode::External {
-            return Ok(());
+        match self.mode {
+            AuthMode::Local => Ok(()),
+            AuthMode::External => {
+                if self.heimdall_token_secret.is_empty() {
+                    return Err(DomainError::Config(
+                        "auth.heimdall_token_secret is unset: external mode verifies \
+                         Heimdall's tokens against the secret it signs them with, and \
+                         Heimdall publishes no keys to fetch instead"
+                            .to_string(),
+                    ));
+                }
+
+                let scope_id = Uuid::parse_str(self.heimdall_scope_id.trim()).map_err(|_| {
+                    DomainError::Config(format!(
+                        "auth.heimdall_scope_id is not a UUID: {:?}. External mode accepts a \
+                         token on membership of this Heimdall scope, so it must name one.",
+                        self.heimdall_scope_id
+                    ))
+                })?;
+
+                // The nil UUID parses, so it would otherwise start a process
+                // that accepts any token whose `scopeId` is also nil. It is a
+                // placeholder an operator leaves behind, never a scope
+                // Heimdall issued.
+                if scope_id.is_nil() {
+                    return Err(DomainError::Config(
+                        "auth.heimdall_scope_id is the nil UUID: that is a placeholder, not \
+                         the Heimdall scope Alexandria is registered in"
+                            .to_string(),
+                    ));
+                }
+
+                Ok(())
+            }
+            AuthMode::Windows => {
+                if self.windows_owner_sid.trim().is_empty() {
+                    return Err(DomainError::Config(
+                        "auth.windows_owner_sid is unset: Windows mode authenticates by the \
+                         account this process runs as, so it must name the account it expects"
+                            .to_string(),
+                    ));
+                }
+                Ok(())
+            }
         }
-
-        if self.heimdall_token_secret.is_empty() {
-            return Err(DomainError::Config(
-                "auth.heimdall_token_secret is unset: external mode verifies Heimdall's \
-                 tokens against the secret it signs them with, and Heimdall publishes no \
-                 keys to fetch instead"
-                    .to_string(),
-            ));
-        }
-
-        let scope_id = Uuid::parse_str(self.heimdall_scope_id.trim()).map_err(|_| {
-            DomainError::Config(format!(
-                "auth.heimdall_scope_id is not a UUID: {:?}. External mode accepts a token \
-                 on membership of this Heimdall scope, so it must name one.",
-                self.heimdall_scope_id
-            ))
-        })?;
-
-        // The nil UUID parses, so it would otherwise start a process that
-        // accepts any token whose `scopeId` is also nil. It is a placeholder
-        // an operator leaves behind, never a scope Heimdall issued.
-        if scope_id.is_nil() {
-            return Err(DomainError::Config(
-                "auth.heimdall_scope_id is the nil UUID: that is a placeholder, not the \
-                 Heimdall scope Alexandria is registered in"
-                    .to_string(),
-            ));
-        }
-
-        Ok(())
     }
 }
 
@@ -398,6 +424,9 @@ impl Settings {
                 self.auth.session_ttl_hours = parsed;
             }
         }
+        if let Ok(sid) = env::var("ALEXANDRIA_AUTH_WINDOWS_OWNER_SID") {
+            self.auth.windows_owner_sid = sid;
+        }
         // The external-mode keys take the same overrides as everything else,
         // and the two secrets especially: a deployment must be able to hand
         // Alexandria the shared signing key through the environment rather
@@ -457,6 +486,7 @@ fn match_mode(value: &str) -> Result<AuthMode, ()> {
     match value.trim() {
         "external" => Ok(AuthMode::External),
         "local" => Ok(AuthMode::Local),
+        "windows" => Ok(AuthMode::Windows),
         _ => Err(()),
     }
 }
@@ -480,9 +510,11 @@ mod tests {
     fn given_auth_mode_when_external_lowercase_then_parses() {
         assert_eq!(match_mode("external").unwrap(), AuthMode::External);
         assert_eq!(match_mode("local").unwrap(), AuthMode::Local);
+        assert_eq!(match_mode("windows").unwrap(), AuthMode::Windows);
         assert!(match_mode("bogus").is_err());
         assert_eq!(AuthMode::External.as_str(), "external");
         assert_eq!(AuthMode::Local.as_str(), "local");
+        assert_eq!(AuthMode::Windows.as_str(), "windows");
     }
 
     #[test]

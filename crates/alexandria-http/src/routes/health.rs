@@ -24,6 +24,7 @@ pub async fn health(State(state): State<AppState>) -> impl IntoResponse {
     let auth_mode = match state.settings.auth.mode {
         AuthMode::External => "external",
         AuthMode::Local => "local",
+        AuthMode::Windows => "windows",
     };
 
     // AF-01: the database is unreachable.
