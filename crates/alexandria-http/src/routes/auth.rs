@@ -119,7 +119,7 @@ pub async fn register(
 }
 
 /// `GET /v1/auth/local/account` — report the authenticated owner's address and
-/// how many recovery codes remain unspent (FR-AU-13). The query the
+/// how many recovery codes remain unspent (FR-AU-18). The query the
 /// front-end's catalog lock reads. Returns `200` with the `LocalAccountResult`,
 /// `401` (not authenticated), or `500` (no local account has been created
 /// yet).

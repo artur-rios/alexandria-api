@@ -3367,7 +3367,7 @@ pub extern "C" fn alexandria_auth_local_register(json_body: *const c_char) -> Au
     }
 }
 
-/// Report the authenticated owner's account state (FR-AU-13): the same body
+/// Report the authenticated owner's account state (FR-AU-18): the same body
 /// `GET /v1/auth/local/account` returns. `token` is the session id.
 ///
 /// This is the call a client makes to learn the stored address and how many

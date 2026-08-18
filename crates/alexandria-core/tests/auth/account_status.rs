@@ -1,5 +1,5 @@
-//! Unit tests for the `GetLocalAccountHandler` (FR-AU-13, FR-AU-18). The
-//! handler runs against trait fakes — no real DB.
+//! Unit tests for the `GetLocalAccountHandler` (FR-AU-18). The handler runs
+//! against trait fakes — no real DB.
 
 use chrono::Utc;
 

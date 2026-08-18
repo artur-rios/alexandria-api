@@ -27,7 +27,7 @@ pub struct LocalLoginResult {
     pub session_id: Uuid,
 }
 
-/// The authenticated owner's account state (FR-AU-13). What the front-end's
+/// The authenticated owner's account state (FR-AU-18). What the front-end's
 /// catalog lock reads.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -94,9 +94,9 @@ pub trait LocalCredentialRepository: Send + Sync {
         password_hash: &str,
         updated_at: DateTime<Utc>,
     ) -> Result<bool, DomainError>;
-    /// Replace the stored password after a completed reset or redemption
-    /// (FR-AU-16). Takes no address: this changes the credential, never who
-    /// the account belongs to.
+    /// Replace the stored password after a completed recovery-code
+    /// redemption (FR-AU-14). Takes no address: this changes the
+    /// credential, never who the account belongs to.
     async fn set_password_hash(
         &self,
         password_hash: &str,
@@ -119,7 +119,7 @@ pub trait SessionRepository: Send + Sync {
     ) -> Result<(), DomainError>;
     /// Whether `id` names a session that has not yet expired as of `now`.
     async fn is_valid(&self, id: Uuid, now: DateTime<Utc>) -> Result<bool, DomainError>;
-    /// Delete every session (FR-AU-16).
+    /// Delete every session (FR-AU-14).
     ///
     /// Called after a recovery-code redemption. Redeeming a code is what an
     /// owner does when they believe someone else may hold their credentials;

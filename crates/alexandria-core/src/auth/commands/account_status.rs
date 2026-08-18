@@ -2,7 +2,7 @@ use crate::auth::local::{LocalAccountResult, LocalCredentialRepository, Recovery
 use crate::auth::AuthService;
 use crate::errors::DomainError;
 
-/// Report the authenticated owner's account state (FR-AU-13): the stored
+/// Report the authenticated owner's account state (FR-AU-18): the stored
 /// address and how many recovery codes remain unspent.
 ///
 /// This is the query the front-end's catalog lock reads.
