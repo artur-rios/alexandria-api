@@ -67,18 +67,16 @@ pub enum DomainError {
     /// installation's dependencies is down is not a caller's business.
     #[error("service unavailable: {0}")]
     ServiceUnavailable(String),
-    /// A dependency is unavailable for a reason the caller *does* need — the
-    /// mail transport is not configured, so the message it asked for will not
-    /// arrive (issue #102). Stands to `ServiceUnavailable` exactly as
-    /// `Rejected` stands to `InvalidInput`: same class, plus a stable code.
+    /// A dependency is unavailable for a reason the caller *does* need to
+    /// know. Stands to `ServiceUnavailable` exactly as `Rejected` stands to
+    /// `InvalidInput`: same class, plus a stable code.
     #[error("service unavailable: {0}")]
     Unavailable(Rejection),
-    /// A request refused because it came too soon after the last one
-    /// (issue #102 / FR-AU-15: the confirmation resend interval). Its own
-    /// variant rather than a `Conflict`, because it is not an error the caller
-    /// made — it is a "not yet", and a client that can tell the two apart
-    /// shows a countdown instead of an alarm. Carries the rejection so the
-    /// wait can travel in `params`.
+    /// A request refused because it came too soon after some earlier one —
+    /// a rate limit. Its own variant rather than a `Conflict`, because it is
+    /// not an error the caller made — it is a "not yet", and a client that
+    /// can tell the two apart shows a countdown instead of an alarm. Carries
+    /// the rejection so the wait can travel in `params`.
     #[error("too many requests: {0}")]
     TooManyRequests(Rejection),
     #[error("database error: {0}")]
@@ -127,13 +125,23 @@ impl DomainError {
     }
 
     /// A dependency is unavailable, named by a stable reason code the caller
-    /// acts on (issue #102).
+    /// acts on.
+    ///
+    /// No producer in the workspace calls this today — the mail port was the
+    /// only one, and recovery codes replaced it. Kept because it is generic
+    /// transport infrastructure the error mapping already carries end to end;
+    /// noted so the next reader does not repeat the search.
     pub fn unavailable(code: &'static str, message: impl Into<String>) -> Self {
         Self::Unavailable(Rejection::new(code, message))
     }
 
-    /// Refuse a request that came too soon, naming the reason and the wait
-    /// (issue #102 / FR-AU-15).
+    /// Refuse a request that came too soon, naming the reason and the wait.
+    ///
+    /// No producer in the workspace calls this today — the resend interval on
+    /// the removed e-mail operations was the only one, which also leaves the
+    /// FFI's `AUTH_ERR_RATE_LIMITED` unreachable. Kept for the same reason as
+    /// `unavailable`: generic transport infrastructure, already mapped on both
+    /// surfaces, waiting for the first throttle that needs it.
     pub fn too_many_requests(code: &'static str, message: impl Into<String>) -> Self {
         Self::TooManyRequests(Rejection::new(code, message))
     }

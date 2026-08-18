@@ -1,9 +1,8 @@
 pub mod commands;
 pub mod heimdall;
 pub mod local;
-pub mod mail;
 pub mod password;
-pub mod tokens;
+pub mod recovery;
 
 use crate::config::AuthMode;
 use crate::errors::DomainError;

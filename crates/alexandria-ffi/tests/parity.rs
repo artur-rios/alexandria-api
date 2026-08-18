@@ -17,20 +17,20 @@ use alexandria_core::config::Settings;
 use alexandria_core::migrate::migrate_database;
 use alexandria_core::services::build_services;
 use alexandria_ffi::{
-    alexandria_auth_local_account, alexandria_auth_local_confirm_email,
-    alexandria_auth_local_login, alexandria_auth_local_register,
-    alexandria_auth_local_resend_confirmation, alexandria_bookmark_create,
-    alexandria_bookmark_purge, alexandria_bookmark_restore, alexandria_bookmark_soft_delete,
-    alexandria_bookmark_update, alexandria_bookmarks_list, alexandria_collection_add_items,
-    alexandria_collection_create, alexandria_collection_delete, alexandria_collection_list_items,
-    alexandria_collection_remove_item, alexandria_collection_rename, alexandria_comic_page,
-    alexandria_file_edit_content, alexandria_file_edit_metadata, alexandria_file_get_by_uuid,
-    alexandria_file_playback_source, alexandria_file_purge, alexandria_file_purge_on_disk,
-    alexandria_file_read_content, alexandria_file_rename, alexandria_file_restore,
-    alexandria_file_soft_delete, alexandria_file_thumbnail, alexandria_files_list,
-    alexandria_free_string, alexandria_index_count_files, alexandria_index_files_json,
-    alexandria_index_init, alexandria_index_refresh_start, alexandria_index_run_status_json,
-    alexandria_index_start, alexandria_reading_list_add_item, alexandria_reading_list_create,
+    alexandria_auth_local_login, alexandria_auth_local_redeem_recovery_code,
+    alexandria_auth_local_regenerate_recovery_codes, alexandria_auth_local_register,
+    alexandria_bookmark_create, alexandria_bookmark_purge, alexandria_bookmark_restore,
+    alexandria_bookmark_soft_delete, alexandria_bookmark_update, alexandria_bookmarks_list,
+    alexandria_collection_add_items, alexandria_collection_create, alexandria_collection_delete,
+    alexandria_collection_list_items, alexandria_collection_remove_item,
+    alexandria_collection_rename, alexandria_comic_page, alexandria_file_edit_content,
+    alexandria_file_edit_metadata, alexandria_file_get_by_uuid, alexandria_file_playback_source,
+    alexandria_file_purge, alexandria_file_purge_on_disk, alexandria_file_read_content,
+    alexandria_file_rename, alexandria_file_restore, alexandria_file_soft_delete,
+    alexandria_file_thumbnail, alexandria_files_list, alexandria_free_string,
+    alexandria_index_count_files, alexandria_index_files_json, alexandria_index_init,
+    alexandria_index_refresh_start, alexandria_index_run_status_json, alexandria_index_start,
+    alexandria_reading_list_add_item, alexandria_reading_list_create,
     alexandria_reading_list_delete, alexandria_reading_list_remove_item,
     alexandria_reading_list_update_progress, alexandria_reading_lists_list,
     alexandria_watchlist_add_video, alexandria_watchlist_create, alexandria_watchlist_delete,
@@ -10584,185 +10584,6 @@ async fn given_a_rejected_registration_when_called_on_both_surfaces_then_error_b
     assert_eq!(body["params"]["min"], "12");
 }
 
-/// Issue #102 parity — the confirmation surface must read identically over
-/// both transports: the account state a client polls, the refusal a wrong code
-/// earns, and the honest "nothing was sent" an install without mail gets.
-///
-/// The success path of a confirm needs a code that only a delivered message
-/// carries, and no message can be delivered until the mail integration ships;
-/// that path is covered against a working transport in the core's unit tests.
-/// What is asserted here is everything the two surfaces actually expose today.
-#[tokio::test]
-async fn given_the_confirmation_surface_when_called_on_both_surfaces_then_bodies_match() {
-    const PASSWORD: &str = "correct horse battery";
-
-    fn register_body() -> serde_json::Value {
-        json!({
-            "email": "owner@example.com",
-            "password": PASSWORD,
-            "passwordConfirmation": PASSWORD,
-        })
-    }
-
-    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-
-    // ---- HTTP leg ----
-    let http_dir = tempdir().unwrap();
-    let http_db = db_path(&http_dir, "http.sqlite");
-    let http_pool = migrate_database(&http_db).await.expect("http migrate");
-    seed_session(&http_pool, TEST_TOKEN).await;
-    let http_services =
-        std::sync::Arc::new(build_services(&local_settings(), http_pool.clone()).await);
-    let router = app(Settings::default(), http_services);
-
-    let register = Request::builder()
-        .method("POST")
-        .uri("/v1/auth/local/register")
-        .header("content-type", "application/json")
-        .body(Body::from(register_body().to_string()))
-        .unwrap();
-    let registered = router
-        .clone()
-        .oneshot(register)
-        .await
-        .expect("http register");
-    assert_eq!(registered.status(), axum::http::StatusCode::CREATED);
-    let registered: serde_json::Value =
-        serde_json::from_slice(&to_bytes(registered.into_body(), usize::MAX).await.unwrap())
-            .unwrap();
-    // The account exists and the session is open even though nothing was sent.
-    assert_eq!(registered["confirmationSent"], json!(false));
-    assert_eq!(registered["confirmationError"], "mail_not_configured");
-
-    let account = router
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri("/v1/auth/local/account")
-                .header("authorization", format!("Bearer {TEST_TOKEN}"))
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .expect("http account");
-    assert_eq!(account.status(), axum::http::StatusCode::OK);
-    let http_account = String::from_utf8(
-        to_bytes(account.into_body(), usize::MAX)
-            .await
-            .unwrap()
-            .to_vec(),
-    )
-    .expect("utf-8");
-
-    let confirm = router
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/auth/local/email/confirm")
-                .header("content-type", "application/json")
-                .body(Body::from(json!({ "code": "NOTACODE" }).to_string()))
-                .unwrap(),
-        )
-        .await
-        .expect("http confirm");
-    assert_eq!(confirm.status(), axum::http::StatusCode::BAD_REQUEST);
-    let http_confirm = String::from_utf8(
-        to_bytes(confirm.into_body(), usize::MAX)
-            .await
-            .unwrap()
-            .to_vec(),
-    )
-    .expect("utf-8");
-
-    let resend = router
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/auth/local/email/resend")
-                .header("authorization", format!("Bearer {TEST_TOKEN}"))
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .expect("http resend");
-    assert_eq!(resend.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
-    let http_resend = String::from_utf8(
-        to_bytes(resend.into_body(), usize::MAX)
-            .await
-            .unwrap()
-            .to_vec(),
-    )
-    .expect("utf-8");
-
-    // ---- FFI leg ----
-    let ffi_dir = tempdir().unwrap();
-    let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
-    let (ffi_register, ffi_account, ffi_confirm, confirm_status, ffi_resend, resend_status) =
-        tokio::task::spawn_blocking(move || -> (String, String, String, i32, String, i32) {
-            let cdb = CString::new(ffi_db).unwrap();
-            assert_eq!(
-                alexandria_index_init(cdb.as_ptr()),
-                alexandria_ffi::INDEX_OK
-            );
-
-            let body = CString::new(register_body().to_string()).unwrap();
-            let registered = alexandria_auth_local_register(body.as_ptr());
-            assert_eq!(registered.status, alexandria_ffi::AUTH_OK);
-            let register_json = take_json(registered.json);
-
-            let token = CString::new(TEST_TOKEN).unwrap();
-            let account = alexandria_auth_local_account(token.as_ptr());
-            assert_eq!(account.status, alexandria_ffi::AUTH_OK);
-            let account_json = take_json(account.json);
-
-            let confirm_body = CString::new(json!({ "code": "NOTACODE" }).to_string()).unwrap();
-            let confirm = alexandria_auth_local_confirm_email(confirm_body.as_ptr());
-            let confirm_json = take_json(confirm.json);
-
-            let resend = alexandria_auth_local_resend_confirmation(token.as_ptr());
-            let resend_json = take_json(resend.json);
-
-            (
-                register_json,
-                account_json,
-                confirm_json,
-                confirm.status,
-                resend_json,
-                resend.status,
-            )
-        })
-        .await
-        .unwrap();
-
-    // ---- compare ----
-    let ffi_register: serde_json::Value = serde_json::from_str(&ffi_register).unwrap();
-    assert_eq!(
-        registered["confirmationSent"],
-        ffi_register["confirmationSent"]
-    );
-    assert_eq!(
-        registered["confirmationError"],
-        ffi_register["confirmationError"]
-    );
-    assert_eq!(registered["emailConfirmed"], ffi_register["emailConfirmed"]);
-
-    assert_eq!(http_account, ffi_account, "account state must match");
-    assert_eq!(
-        confirm_status,
-        alexandria_ffi::AUTH_ERR_INVALID_INPUT,
-        "a wrong code is invalid input on both surfaces"
-    );
-    assert_eq!(http_confirm, ffi_confirm, "the refusal must match");
-    assert_eq!(
-        resend_status,
-        alexandria_ffi::AUTH_ERR_SERVICE_UNAVAILABLE,
-        "an unconfigured transport is unavailable on both surfaces"
-    );
-    assert_eq!(http_resend, ffi_resend, "the refusal must match");
-}
-
 /// UC-42 parity — a run's recorded status must read identically over both
 /// transports. The run ids differ by construction (independent databases), so
 /// parity asserts every field except the id, which is asserted to be the id
@@ -10883,4 +10704,254 @@ async fn given_a_completed_refresh_when_status_read_via_http_and_ffi_then_bodies
     for field in ["refreshed", "markedMissing", "unchanged", "failed"] {
         assert_eq!(http_body[field], ffi_body[field], "{field} differs");
     }
+}
+
+/// UC-43/UC-44 parity — redeeming a recovery code and regenerating the set
+/// must read identically over both transports: the successful redemption, an
+/// unissued code's refusal (`recovery_code_unknown`), and the fresh set a
+/// regeneration returns.
+#[tokio::test]
+async fn given_the_recovery_surface_when_called_on_both_surfaces_then_bodies_match() {
+    const PASSWORD: &str = "correct horse battery";
+    const NEW_PASSWORD: &str = "a totally different passphrase";
+
+    fn register_body() -> serde_json::Value {
+        json!({
+            "email": "owner@example.com",
+            "password": PASSWORD,
+            "passwordConfirmation": PASSWORD,
+        })
+    }
+
+    fn login_body() -> serde_json::Value {
+        json!({
+            "email": "owner@example.com",
+            "password": NEW_PASSWORD,
+        })
+    }
+
+    fn unknown_redeem_body() -> serde_json::Value {
+        json!({
+            "code": "ZZZZZ-ZZZZZ",
+            "newPassword": NEW_PASSWORD,
+            "passwordConfirmation": NEW_PASSWORD,
+        })
+    }
+
+    fn redeem_body(code: &str) -> serde_json::Value {
+        json!({
+            "code": code,
+            "newPassword": NEW_PASSWORD,
+            "passwordConfirmation": NEW_PASSWORD,
+        })
+    }
+
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+
+    // ---- HTTP leg ----
+    let http_dir = tempdir().unwrap();
+    let http_db = db_path(&http_dir, "http.sqlite");
+    let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    let http_services =
+        std::sync::Arc::new(build_services(&local_settings(), http_pool.clone()).await);
+    let router = app(Settings::default(), http_services);
+
+    let register = Request::builder()
+        .method("POST")
+        .uri("/v1/auth/local/register")
+        .header("content-type", "application/json")
+        .body(Body::from(register_body().to_string()))
+        .unwrap();
+    let registered = router
+        .clone()
+        .oneshot(register)
+        .await
+        .expect("http register");
+    assert_eq!(registered.status(), axum::http::StatusCode::CREATED);
+    let registered: serde_json::Value =
+        serde_json::from_slice(&to_bytes(registered.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
+    let http_codes: Vec<String> = registered["recoveryCodes"]
+        .as_array()
+        .expect("recoveryCodes")
+        .iter()
+        .map(|c| c.as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(http_codes.len(), 10);
+
+    // A code that was never issued must be refused without consuming a real
+    // one -- this is the rejection whose reason code has to match FFI's.
+    let unknown = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/auth/local/recovery/redeem")
+                .header("content-type", "application/json")
+                .body(Body::from(unknown_redeem_body().to_string()))
+                .unwrap(),
+        )
+        .await
+        .expect("http redeem unknown");
+    assert_eq!(unknown.status(), axum::http::StatusCode::BAD_REQUEST);
+    let http_unknown = String::from_utf8(
+        to_bytes(unknown.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .expect("utf-8");
+
+    let redeem = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/auth/local/recovery/redeem")
+                .header("content-type", "application/json")
+                .body(Body::from(redeem_body(&http_codes[0]).to_string()))
+                .unwrap(),
+        )
+        .await
+        .expect("http redeem");
+    assert_eq!(redeem.status(), axum::http::StatusCode::OK);
+    let http_redeem: serde_json::Value =
+        serde_json::from_slice(&to_bytes(redeem.into_body(), usize::MAX).await.unwrap()).unwrap();
+
+    // The redemption invalidated every session, so a fresh one is needed for
+    // the authenticated regenerate call -- logging in with the new password
+    // is how a real caller would get one too.
+    let login = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/auth/local/login")
+                .header("content-type", "application/json")
+                .body(Body::from(login_body().to_string()))
+                .unwrap(),
+        )
+        .await
+        .expect("http login");
+    assert_eq!(login.status(), axum::http::StatusCode::OK);
+    let login: serde_json::Value =
+        serde_json::from_slice(&to_bytes(login.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let http_session = login["sessionId"].as_str().expect("sessionId").to_string();
+
+    let regenerate = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/auth/local/recovery/regenerate")
+                .header("authorization", format!("Bearer {http_session}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("http regenerate");
+    assert_eq!(regenerate.status(), axum::http::StatusCode::OK);
+    let http_regenerate: serde_json::Value =
+        serde_json::from_slice(&to_bytes(regenerate.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
+
+    // ---- FFI leg ----
+    let ffi_dir = tempdir().unwrap();
+    let ffi_db = db_path(&ffi_dir, "ffi.sqlite");
+    // No session is pre-seeded: registration and login each mint their own,
+    // exactly as the HTTP leg above relies on.
+    let ffi_pool = migrate_database(&ffi_db).await.expect("ffi pre-migrate");
+    ffi_pool.close().await;
+    std::env::set_var("ALEXANDRIA_AUTH_MODE", "local");
+
+    let (ffi_codes, ffi_unknown_json, ffi_unknown_status, ffi_redeem_json, ffi_regenerate_json) =
+        tokio::task::spawn_blocking(move || -> (Vec<String>, String, i32, String, String) {
+            let cdb = CString::new(ffi_db).unwrap();
+            assert_eq!(
+                alexandria_index_init(cdb.as_ptr()),
+                alexandria_ffi::INDEX_OK
+            );
+
+            let body = CString::new(register_body().to_string()).unwrap();
+            let registered = alexandria_auth_local_register(body.as_ptr());
+            assert_eq!(registered.status, alexandria_ffi::AUTH_OK, "ffi register");
+            let register_value: serde_json::Value =
+                serde_json::from_str(&take_json(registered.json)).unwrap();
+            let codes: Vec<String> = register_value["recoveryCodes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|c| c.as_str().unwrap().to_string())
+                .collect();
+
+            let unknown_body = CString::new(unknown_redeem_body().to_string()).unwrap();
+            let unknown = alexandria_auth_local_redeem_recovery_code(unknown_body.as_ptr());
+            let unknown_status = unknown.status;
+            let unknown_json = take_json(unknown.json);
+
+            let redeem_body_c = CString::new(redeem_body(&codes[0]).to_string()).unwrap();
+            let redeem = alexandria_auth_local_redeem_recovery_code(redeem_body_c.as_ptr());
+            assert_eq!(redeem.status, alexandria_ffi::AUTH_OK, "ffi redeem failed");
+            let redeem_json = take_json(redeem.json);
+
+            let login_body_c = CString::new(login_body().to_string()).unwrap();
+            let login = alexandria_auth_local_login(login_body_c.as_ptr());
+            assert_eq!(login.status, alexandria_ffi::AUTH_OK, "ffi login failed");
+            let login_value: serde_json::Value =
+                serde_json::from_str(&take_json(login.json)).unwrap();
+            let session_id = login_value["sessionId"].as_str().unwrap().to_string();
+
+            let token = CString::new(session_id).unwrap();
+            let regenerate = alexandria_auth_local_regenerate_recovery_codes(token.as_ptr());
+            assert_eq!(
+                regenerate.status,
+                alexandria_ffi::AUTH_OK,
+                "ffi regenerate failed"
+            );
+            let regenerate_json = take_json(regenerate.json);
+
+            (
+                codes,
+                unknown_json,
+                unknown_status,
+                redeem_json,
+                regenerate_json,
+            )
+        })
+        .await
+        .unwrap();
+
+    // ---- compare ----
+    assert_eq!(http_codes.len(), ffi_codes.len());
+
+    assert_eq!(
+        ffi_unknown_status,
+        alexandria_ffi::AUTH_ERR_INVALID_INPUT,
+        "an unissued code is invalid input on both surfaces"
+    );
+    let http_unknown_value: serde_json::Value = serde_json::from_str(&http_unknown).unwrap();
+    let ffi_unknown_value: serde_json::Value = serde_json::from_str(&ffi_unknown_json).unwrap();
+    assert_eq!(http_unknown_value["code"], json!("recovery_code_unknown"));
+    assert_eq!(
+        http_unknown_value["code"], ffi_unknown_value["code"],
+        "the reason code must be identical on both surfaces"
+    );
+
+    let ffi_redeem: serde_json::Value = serde_json::from_str(&ffi_redeem_json).unwrap();
+    assert_eq!(http_redeem["success"], ffi_redeem["success"]);
+    assert_eq!(http_redeem["success"], json!(true));
+    assert_eq!(http_redeem["recoveryCodesRemaining"], json!(9));
+    assert_eq!(
+        http_redeem["recoveryCodesRemaining"],
+        ffi_redeem["recoveryCodesRemaining"]
+    );
+
+    let ffi_regenerate: serde_json::Value = serde_json::from_str(&ffi_regenerate_json).unwrap();
+    let http_new_codes = http_regenerate["recoveryCodes"]
+        .as_array()
+        .expect("recoveryCodes");
+    let ffi_new_codes = ffi_regenerate["recoveryCodes"]
+        .as_array()
+        .expect("recoveryCodes");
+    assert_eq!(http_new_codes.len(), 10);
+    assert_eq!(ffi_new_codes.len(), 10);
 }

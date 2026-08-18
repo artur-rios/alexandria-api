@@ -149,11 +149,6 @@ keys — a key not listed here does not exist, and only the keys showing an
 | `auth.heimdall_audience` | config / `ALEXANDRIA_AUTH_HEIMDALL_AUDIENCE` | external mode only; checked only when set. |
 | `auth.local_db` | config | local mode only; flag indicating local credentials are in SQLite. |
 | `auth.session_ttl_hours` | config / `ALEXANDRIA_AUTH_SESSION_TTL_HOURS` | local mode only; how long a login session stays valid; default `24` (FR-AU-09). |
-| `auth.confirmation_ttl_hours` | config / `ALEXANDRIA_AUTH_CONFIRMATION_TTL_HOURS` | local mode only; how long an e-mail confirmation code stays usable; default `24` (FR-AU-14). |
-| `auth.password_reset_ttl_minutes` | config / `ALEXANDRIA_AUTH_PASSWORD_RESET_TTL_MINUTES` | local mode only; how long a password-reset token stays usable; default `60`, deliberately shorter than a confirmation code (FR-AU-16). |
-| `auth.resend_interval_seconds` | config / `ALEXANDRIA_AUTH_RESEND_INTERVAL_SECONDS` | local mode only; the shortest gap between two confirmation sends; default `60` (FR-AU-15). |
-| `mail.provider` | config | the outbound mail provider; `none` is the default and, until the external mail service is integrated, the only value — it never sends and reports `mail_not_configured` (FR-AU-19). |
-| `mail.from_address` | config / `ALEXANDRIA_MAIL_FROM_ADDRESS` | the address outbound messages are sent from; unused while `mail.provider` is `none`. |
 | `http.bind_addr` | config / `ALEXANDRIA_HTTP_BIND_ADDR` | default `127.0.0.1`; loopback by default (IR-03). |
 | `http.port` | config / `ALEXANDRIA_HTTP_PORT` | default `8080`. |
 | `database.path` | config / `ALEXANDRIA_DATABASE_PATH` | SQLite file path; bundled beside the desktop app's data dir. |
@@ -177,6 +172,21 @@ not fetched from Heimdall at request time.
 2. Copy Heimdall's `HEIMDALL_AUTH_TOKEN_SECRET` into Alexandria's `ALEXANDRIA_AUTH_HEIMDALL_TOKEN_SECRET`, and the scope's UUID into `ALEXANDRIA_AUTH_HEIMDALL_SCOPE_ID`.
 3. Smoke-check the pair: log in to Heimdall as a person in that scope (`POST /api/auth/login`, completing two-factor if enabled) and call any authenticated Alexandria endpoint with the returned token. A `200` confirms the claim names and the secret match; a `401` means one of them does not.
 4. To rotate the secret: set `ALEXANDRIA_AUTH_HEIMDALL_TOKEN_SECRET_PREVIOUS` to the secret in use, set the current one to the new value on both sides, restart both, and clear the previous variable after one token lifetime.
+
+#### Recovery codes (local mode)
+
+Registration returns ten single-use recovery codes. They are shown once and
+stored only as hashes, so there is no way to recover them afterwards — an
+owner who loses both their password and their codes has no route back into
+the catalog short of editing the database by hand.
+
+Redeeming a code sets a new password and signs every session out. An owner who
+is running low regenerates from `POST /v1/auth/local/recovery/regenerate`,
+which invalidates the whole previous set, used codes and unused alike.
+
+An account created before this feature holds no codes:
+`GET /v1/auth/local/account` reports `recoveryCodesRemaining: 0`. Its owner
+should log in and regenerate while they still know their password.
 
 ---
 

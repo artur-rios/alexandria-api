@@ -3,19 +3,16 @@ use std::sync::Arc;
 use sqlx::sqlite::SqlitePool;
 
 use crate::auth::commands::account_status::GetLocalAccountHandler;
-use crate::auth::commands::complete_password_reset::CompletePasswordResetHandler;
-use crate::auth::commands::confirm_email::ConfirmEmailHandler;
 use crate::auth::commands::login::LocalLoginHandler;
+use crate::auth::commands::redeem_recovery_code::RedeemRecoveryCodeHandler;
+use crate::auth::commands::regenerate_recovery_codes::RegenerateRecoveryCodesHandler;
 use crate::auth::commands::register::RegisterLocalAccountHandler;
-use crate::auth::commands::request_password_reset::RequestPasswordResetHandler;
-use crate::auth::commands::resend_confirmation::ResendConfirmationHandler;
 use crate::auth::commands::set_credentials::SetLocalCredentialsHandler;
 use crate::auth::heimdall::HeimdallAuthService;
 use crate::auth::local::{
-    LocalAuthService, SqliteLocalCredentialRepository, SqliteSessionRepository,
+    LocalAuthService, SqliteLocalCredentialRepository, SqliteRecoveryCodeRepository,
+    SqliteSessionRepository,
 };
-use crate::auth::mail::{RuntimeMailSender, UnconfiguredMailSender};
-use crate::auth::tokens::SqliteAuthTokenRepository;
 use crate::auth::RuntimeAuthService;
 use crate::bookmarks::commands::create::CreateBookmarkHandler;
 use crate::bookmarks::commands::lifecycle::BookmarkLifecycleHandler;
@@ -51,8 +48,8 @@ use crate::collections::commands::remove_item::RemoveItemFromCollectionHandler;
 use crate::collections::commands::rename::RenameCollectionHandler;
 use crate::collections::queries::list_items::ListCollectionItemsHandler;
 use crate::collections::repos::SqliteCollectionRepository;
+use crate::config::AuthMode;
 use crate::config::Settings;
-use crate::config::{AuthMode, MailProvider};
 use crate::playback::comic_page::{ComicPageHandler, ZipComicArchive};
 use crate::playback::source::PlaybackSourceHandler;
 use crate::playback::thumbnail::{DiskThumbnailCache, ImageThumbnailRenderer, ThumbnailHandler};
@@ -244,36 +241,27 @@ pub type DefaultLocalLoginHandler =
 pub type DefaultRegisterLocalAccountHandler = RegisterLocalAccountHandler<
     SqliteLocalCredentialRepository,
     SqliteSessionRepository,
-    SqliteAuthTokenRepository,
-    RuntimeMailSender,
     SystemClock,
+    SqliteRecoveryCodeRepository,
 >;
 
-pub type DefaultGetLocalAccountHandler =
-    GetLocalAccountHandler<RuntimeAuthService, SqliteLocalCredentialRepository>;
-
-pub type DefaultConfirmEmailHandler =
-    ConfirmEmailHandler<SqliteLocalCredentialRepository, SqliteAuthTokenRepository, SystemClock>;
-
-pub type DefaultResendConfirmationHandler = ResendConfirmationHandler<
+pub type DefaultGetLocalAccountHandler = GetLocalAccountHandler<
     RuntimeAuthService,
     SqliteLocalCredentialRepository,
-    SqliteAuthTokenRepository,
-    RuntimeMailSender,
-    SystemClock,
+    SqliteRecoveryCodeRepository,
 >;
 
-pub type DefaultRequestPasswordResetHandler = RequestPasswordResetHandler<
-    SqliteLocalCredentialRepository,
-    SqliteAuthTokenRepository,
-    RuntimeMailSender,
-    SystemClock,
->;
-
-pub type DefaultCompletePasswordResetHandler = CompletePasswordResetHandler<
+pub type DefaultRedeemRecoveryCodeHandler = RedeemRecoveryCodeHandler<
     SqliteLocalCredentialRepository,
     SqliteSessionRepository,
-    SqliteAuthTokenRepository,
+    SqliteRecoveryCodeRepository,
+    SystemClock,
+>;
+
+pub type DefaultRegenerateRecoveryCodesHandler = RegenerateRecoveryCodesHandler<
+    RuntimeAuthService,
+    SqliteLocalCredentialRepository,
+    SqliteRecoveryCodeRepository,
     SystemClock,
 >;
 
@@ -321,10 +309,8 @@ pub struct Services {
     pub local_login_handler: Arc<DefaultLocalLoginHandler>,
     pub register_local_account_handler: Arc<DefaultRegisterLocalAccountHandler>,
     pub get_local_account_handler: Arc<DefaultGetLocalAccountHandler>,
-    pub confirm_email_handler: Arc<DefaultConfirmEmailHandler>,
-    pub resend_confirmation_handler: Arc<DefaultResendConfirmationHandler>,
-    pub request_password_reset_handler: Arc<DefaultRequestPasswordResetHandler>,
-    pub complete_password_reset_handler: Arc<DefaultCompletePasswordResetHandler>,
+    pub redeem_recovery_code_handler: Arc<DefaultRedeemRecoveryCodeHandler>,
+    pub regenerate_recovery_codes_handler: Arc<DefaultRegenerateRecoveryCodesHandler>,
     /// The same auth service the handlers hold, exposed so a transport can
     /// reject an unauthenticated caller *before* it parses a request body or
     /// path (FR-AU-07 / SRD §7). Handlers still authenticate independently —
@@ -342,13 +328,7 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
     let run_repo = SqliteCatalogRunRepository::new(pool.clone());
     let session_repo = SqliteSessionRepository::new(pool.clone());
     let credential_repo = SqliteLocalCredentialRepository::new(pool.clone());
-    let token_repo = SqliteAuthTokenRepository::new(pool.clone());
-    // Issue #102: the only provider today refuses every send and says why.
-    // The external mail service becomes a second variant here, with no change
-    // to any handler.
-    let mail = match settings.mail.provider {
-        MailProvider::None => RuntimeMailSender::Unconfigured(UnconfiguredMailSender),
-    };
+    let recovery_code_repo = SqliteRecoveryCodeRepository::new(pool.clone());
     let fs = StdFilesystem;
     let clock = SystemClock;
     // FR-FC-29: any run still recorded as `running` belongs to a process that
@@ -605,45 +585,27 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
     let register_local_account_handler = Arc::new(RegisterLocalAccountHandler::new(
         credential_repo.clone(),
         session_repo.clone(),
-        token_repo.clone(),
-        mail,
+        recovery_code_repo.clone(),
         clock,
         settings.auth.mode,
         settings.auth.session_ttl_hours,
-        settings.auth.confirmation_ttl_hours,
     ));
     let get_local_account_handler = Arc::new(GetLocalAccountHandler::new(
         auth.clone(),
         credential_repo.clone(),
+        recovery_code_repo.clone(),
     ));
-    let confirm_email_handler = Arc::new(ConfirmEmailHandler::new(
+    let redeem_recovery_code_handler = Arc::new(RedeemRecoveryCodeHandler::new(
         credential_repo.clone(),
-        token_repo.clone(),
-        clock,
-        settings.auth.mode,
-    ));
-    let resend_confirmation_handler = Arc::new(ResendConfirmationHandler::new(
-        auth.clone(),
-        credential_repo.clone(),
-        token_repo.clone(),
-        mail,
-        clock,
-        settings.auth.mode,
-        settings.auth.confirmation_ttl_hours,
-        settings.auth.resend_interval_seconds,
-    ));
-    let request_password_reset_handler = Arc::new(RequestPasswordResetHandler::new(
-        credential_repo.clone(),
-        token_repo.clone(),
-        mail,
-        clock,
-        settings.auth.mode,
-        settings.auth.password_reset_ttl_minutes,
-    ));
-    let complete_password_reset_handler = Arc::new(CompletePasswordResetHandler::new(
-        credential_repo,
         session_repo,
-        token_repo,
+        recovery_code_repo.clone(),
+        clock,
+        settings.auth.mode,
+    ));
+    let regenerate_recovery_codes_handler = Arc::new(RegenerateRecoveryCodesHandler::new(
+        auth.clone(),
+        credential_repo,
+        recovery_code_repo,
         clock,
         settings.auth.mode,
     ));
@@ -690,10 +652,8 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         local_login_handler,
         register_local_account_handler,
         get_local_account_handler,
-        confirm_email_handler,
-        resend_confirmation_handler,
-        request_password_reset_handler,
-        complete_password_reset_handler,
+        redeem_recovery_code_handler,
+        regenerate_recovery_codes_handler,
         auth,
         pool,
     }

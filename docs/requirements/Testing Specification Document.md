@@ -129,6 +129,7 @@ commands it issues to collaborators.
 | Collaborator | Double |
 | --- | --- |
 | Repository trait (catalog, collections, bookmarks, watchlists, reading lists) | hand-written in-memory fake implementing the trait |
+| Recovery code repository | hand-written in-memory fake implementing the trait |
 | Filesystem port | fake filesystem returning canned bytes / recording writes |
 | Auth service | fake returning canned principal or an unauthorized error; `mockall` for stateful expectations |
 | Time | a `Clock` trait with a fixed faked clock (for retention-window tests) |

@@ -6,22 +6,23 @@
 use chrono::{TimeZone, Utc};
 
 use alexandria_core::auth::commands::register::RegisterLocalAccountHandler;
-use alexandria_core::auth::local::{LocalCredentialRepository, SessionRepository};
+use alexandria_core::auth::local::{
+    LocalCredentialRepository, RecoveryCodeRepository, SessionRepository,
+};
 use alexandria_core::auth::password::verify_password;
+use alexandria_core::auth::recovery::hash_recovery_code;
 use alexandria_core::catalog::clock::FixedClock;
 use alexandria_core::config::AuthMode;
 use alexandria_core::errors::DomainError;
 
 use crate::common::{
-    FailingMailSender, FailingSessionRepository, FakeAuthTokenRepository,
-    FakeLocalCredentialRepository, FakeMailSender, FakeSessionRepository,
-    RacingLocalCredentialRepository,
+    FailingSessionRepository, FakeLocalCredentialRepository, FakeRecoveryCodeRepository,
+    FakeSessionRepository, RacingLocalCredentialRepository,
 };
 
 const EMAIL: &str = "owner@example.com";
 const PASSWORD: &str = "correct horse battery";
 const TTL_HOURS: u32 = 24;
-const CONFIRMATION_TTL_HOURS: u32 = 24;
 
 fn clock() -> FixedClock {
     FixedClock(Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap())
@@ -30,29 +31,43 @@ fn clock() -> FixedClock {
 type TestRegisterHandler = RegisterLocalAccountHandler<
     FakeLocalCredentialRepository,
     FakeSessionRepository,
-    FakeAuthTokenRepository,
-    FakeMailSender,
     FixedClock,
+    FakeRecoveryCodeRepository,
 >;
 
-/// The handler with a mail sender that succeeds — the path the external mail
-/// service will take once it is integrated. The unconfigured-transport path
-/// that every install takes today is covered separately, below.
 fn handler(
     credentials: FakeLocalCredentialRepository,
     sessions: FakeSessionRepository,
+    recovery_codes: FakeRecoveryCodeRepository,
     mode: AuthMode,
 ) -> TestRegisterHandler {
     RegisterLocalAccountHandler::new(
         credentials,
         sessions,
-        FakeAuthTokenRepository::new(),
-        FakeMailSender::new(),
+        recovery_codes,
         clock(),
         mode,
         TTL_HOURS,
-        CONFIRMATION_TTL_HOURS,
     )
+}
+
+/// Fresh credential, session, and recovery-code fakes wired through
+/// `handler` under `AuthMode::Local` — the setup every recovery-code test
+/// below shares.
+fn handler_with_recovery() -> (
+    TestRegisterHandler,
+    FakeLocalCredentialRepository,
+    FakeRecoveryCodeRepository,
+) {
+    let credentials = FakeLocalCredentialRepository::new();
+    let recovery = FakeRecoveryCodeRepository::new();
+    let h = handler(
+        credentials.clone(),
+        FakeSessionRepository::new(),
+        recovery.clone(),
+        AuthMode::Local,
+    );
+    (h, credentials, recovery)
 }
 
 // ---------------- Main flow ----------------
@@ -61,7 +76,12 @@ fn handler(
 async fn given_no_account_when_register_then_stores_the_hash_and_opens_a_session() {
     let credentials = FakeLocalCredentialRepository::new();
     let sessions = FakeSessionRepository::new();
-    let h = handler(credentials.clone(), sessions.clone(), AuthMode::Local);
+    let h = handler(
+        credentials.clone(),
+        sessions.clone(),
+        FakeRecoveryCodeRepository::new(),
+        AuthMode::Local,
+    );
 
     let result = h
         .register(
@@ -103,7 +123,12 @@ async fn given_no_account_when_register_then_stores_the_hash_and_opens_a_session
 async fn given_external_auth_mode_when_register_then_conflict_and_nothing_written() {
     let credentials = FakeLocalCredentialRepository::new();
     let sessions = FakeSessionRepository::new();
-    let h = handler(credentials.clone(), sessions.clone(), AuthMode::External);
+    let h = handler(
+        credentials.clone(),
+        sessions.clone(),
+        FakeRecoveryCodeRepository::new(),
+        AuthMode::External,
+    );
 
     let err = h
         .register(
@@ -137,7 +162,12 @@ async fn given_an_existing_account_when_register_then_conflict_and_credentials_u
         .await
         .unwrap();
     let sessions = FakeSessionRepository::new();
-    let h = handler(credentials.clone(), sessions.clone(), AuthMode::Local);
+    let h = handler(
+        credentials.clone(),
+        sessions.clone(),
+        FakeRecoveryCodeRepository::new(),
+        AuthMode::Local,
+    );
 
     let err = h
         .register(
@@ -173,7 +203,12 @@ async fn given_an_existing_account_and_a_weak_password_when_register_then_confli
         .await
         .unwrap();
     let sessions = FakeSessionRepository::new();
-    let h = handler(credentials.clone(), sessions.clone(), AuthMode::Local);
+    let h = handler(
+        credentials.clone(),
+        sessions.clone(),
+        FakeRecoveryCodeRepository::new(),
+        AuthMode::Local,
+    );
 
     let err = h
         .register(EMAIL.to_string(), "short".to_string(), "short".to_string())
@@ -201,12 +236,10 @@ async fn given_a_row_appears_between_the_check_and_the_write_when_register_then_
     let h = RegisterLocalAccountHandler::new(
         credentials.clone(),
         sessions.clone(),
-        FakeAuthTokenRepository::new(),
-        FakeMailSender::new(),
+        FakeRecoveryCodeRepository::new(),
         clock(),
         AuthMode::Local,
         TTL_HOURS,
-        CONFIRMATION_TTL_HOURS,
     );
 
     let err = h
@@ -238,7 +271,12 @@ async fn given_a_row_appears_between_the_check_and_the_write_when_register_then_
 async fn given_a_malformed_email_when_register_then_invalid_input_and_nothing_written() {
     let credentials = FakeLocalCredentialRepository::new();
     let sessions = FakeSessionRepository::new();
-    let h = handler(credentials.clone(), sessions.clone(), AuthMode::Local);
+    let h = handler(
+        credentials.clone(),
+        sessions.clone(),
+        FakeRecoveryCodeRepository::new(),
+        AuthMode::Local,
+    );
 
     let err = h
         .register(
@@ -263,7 +301,12 @@ async fn given_a_malformed_email_when_register_then_invalid_input_and_nothing_wr
 async fn given_a_password_below_the_length_floor_when_register_then_invalid_input() {
     let credentials = FakeLocalCredentialRepository::new();
     let sessions = FakeSessionRepository::new();
-    let h = handler(credentials.clone(), sessions.clone(), AuthMode::Local);
+    let h = handler(
+        credentials.clone(),
+        sessions.clone(),
+        FakeRecoveryCodeRepository::new(),
+        AuthMode::Local,
+    );
 
     let err = h
         .register(EMAIL.to_string(), "short".to_string(), "short".to_string())
@@ -290,7 +333,12 @@ async fn given_a_password_below_the_length_floor_when_register_then_invalid_inpu
 async fn given_a_mismatched_confirmation_when_register_then_invalid_input_and_nothing_written() {
     let credentials = FakeLocalCredentialRepository::new();
     let sessions = FakeSessionRepository::new();
-    let h = handler(credentials.clone(), sessions.clone(), AuthMode::Local);
+    let h = handler(
+        credentials.clone(),
+        sessions.clone(),
+        FakeRecoveryCodeRepository::new(),
+        AuthMode::Local,
+    );
 
     let err = h
         .register(
@@ -319,12 +367,10 @@ async fn given_session_creation_fails_when_register_then_errors_but_the_account_
     let h = RegisterLocalAccountHandler::new(
         credentials.clone(),
         FailingSessionRepository,
-        FakeAuthTokenRepository::new(),
-        FakeMailSender::new(),
+        FakeRecoveryCodeRepository::new(),
         clock(),
         AuthMode::Local,
         TTL_HOURS,
-        CONFIRMATION_TTL_HOURS,
     );
 
     let err = h
@@ -344,85 +390,64 @@ async fn given_session_creation_fails_when_register_then_errors_but_the_account_
     );
 }
 
-// ---------------- AF-06: the confirmation message (issue #102) ----------------
+// ---------------- FR-AU-13: recovery codes issued at registration ----------------
 
 #[tokio::test]
-async fn given_a_working_transport_when_register_then_a_confirmation_is_sent() {
-    let credentials = FakeLocalCredentialRepository::new();
-    let sessions = FakeSessionRepository::new();
-    let tokens = FakeAuthTokenRepository::new();
-    let mail = FakeMailSender::new();
-    let h = RegisterLocalAccountHandler::new(
-        credentials,
-        sessions,
-        tokens.clone(),
-        mail.clone(),
-        clock(),
-        AuthMode::Local,
-        TTL_HOURS,
-        CONFIRMATION_TTL_HOURS,
-    );
+async fn given_a_first_registration_when_registered_then_ten_distinct_codes_are_returned() {
+    let (handler, _credentials, recovery) = handler_with_recovery();
 
-    let result = h
+    let result = handler
         .register(
-            EMAIL.to_string(),
-            PASSWORD.to_string(),
-            PASSWORD.to_string(),
+            "owner@example.com".to_string(),
+            "correct horse battery".to_string(),
+            "correct horse battery".to_string(),
         )
         .await
-        .expect("registration must succeed");
+        .unwrap();
 
-    assert!(result.confirmation_sent);
-    assert_eq!(result.confirmation_error, None);
-    assert!(
-        !result.email_confirmed,
-        "creating the account never confirms the address"
-    );
-    assert_eq!(mail.sent().len(), 1);
-    assert_eq!(tokens.count(), 1);
+    assert_eq!(result.recovery_codes.len(), 10);
+    let distinct: std::collections::HashSet<&String> = result.recovery_codes.iter().collect();
+    assert_eq!(distinct.len(), 10);
+    assert_eq!(recovery.remaining().await.unwrap(), 10);
 }
 
+/// The plaintext exists only in the response (FR-AU-19).
 #[tokio::test]
-async fn given_no_transport_when_register_then_the_account_survives_and_says_it_was_not_sent() {
-    // UC-01 AF-06 — "the account is created but the core reports that the
-    // confirmation message could not be sent". This is every install today:
-    // delivery is an external service that is not yet integrated.
-    let credentials = FakeLocalCredentialRepository::new();
-    let sessions = FakeSessionRepository::new();
-    let tokens = FakeAuthTokenRepository::new();
-    let h = RegisterLocalAccountHandler::new(
-        credentials.clone(),
-        sessions.clone(),
-        tokens.clone(),
-        FailingMailSender,
-        clock(),
-        AuthMode::Local,
-        TTL_HOURS,
-        CONFIRMATION_TTL_HOURS,
-    );
+async fn given_a_registration_when_codes_are_stored_then_no_stored_value_is_a_code() {
+    let (handler, _credentials, recovery) = handler_with_recovery();
 
-    let result = h
+    let result = handler
         .register(
-            EMAIL.to_string(),
-            PASSWORD.to_string(),
-            PASSWORD.to_string(),
+            "owner@example.com".to_string(),
+            "correct horse battery".to_string(),
+            "correct horse battery".to_string(),
         )
         .await
-        .expect("a failed send must not fail the registration");
+        .unwrap();
 
-    assert!(result.success);
-    assert!(!result.confirmation_sent);
-    assert_eq!(
-        result.confirmation_error.as_deref(),
-        Some("mail_not_configured"),
-        "the caller must learn why, not just that it failed"
-    );
-    // The account is the thing the caller asked for, and it is here.
-    assert!(credentials.get().await.unwrap().is_some());
-    assert_eq!(sessions.count(), 1, "the session is still opened");
-    assert_eq!(
-        tokens.count(),
-        0,
-        "a code for a message that was never sent must not survive"
-    );
+    let stored = recovery.stored_hashes();
+    for code in &result.recovery_codes {
+        assert!(!stored.contains(code), "{code} was stored verbatim");
+        assert!(
+            stored.contains(&hash_recovery_code(code)),
+            "the hash of {code} was not stored"
+        );
+    }
+}
+
+/// A registration that never happens must leave no codes behind.
+#[tokio::test]
+async fn given_a_rejected_registration_when_attempted_then_no_codes_are_stored() {
+    let (handler, _credentials, recovery) = handler_with_recovery();
+
+    let result = handler
+        .register(
+            "owner@example.com".to_string(),
+            "short".to_string(),
+            "short".to_string(),
+        )
+        .await;
+
+    assert!(result.is_err());
+    assert_eq!(recovery.remaining().await.unwrap(), 0);
 }

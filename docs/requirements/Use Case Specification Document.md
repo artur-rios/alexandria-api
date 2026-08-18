@@ -1245,8 +1245,8 @@ UC-36's externally issued JWT.
 | **Actors** | Owner |
 | **Description** | Create the single owner's local-login account when none exists, and open a session for the caller. |
 | **Preconditions** | The active auth mode is local login; no local credentials exist. |
-| **Postconditions** | The credential row holds the submitted email and a salted Argon2 hash of the password, and a Session exists whose id is returned to the caller. On a failure before the credential row is written, neither is created; AF-06 is the one exception — the credential row survives a failed session creation. |
-| **Requirements** | FR-AU-05, FR-AU-06, FR-AU-08, FR-AU-09, FR-AU-10, FR-AU-11 |
+| **Postconditions** | The credential row holds the submitted email and a salted Argon2 hash of the password, ten recovery codes exist with only their hashes stored, and a Session exists whose id is returned to the caller. The recovery codes' plaintext is returned in this response and never again. On a failure before the credential row is written, none of this is created; AF-06 is the one exception — the credential row and its recovery codes survive a failed session creation. |
+| **Requirements** | FR-AU-05, FR-AU-06, FR-AU-08, FR-AU-09, FR-AU-10, FR-AU-11, FR-AU-13, FR-AU-19 |
 
 **Main Flow**
 
@@ -1257,7 +1257,10 @@ UC-36's externally issued JWT.
    policy, and that the confirmation matches the password.
 5. The system salts and hashes the password (Argon2) and writes the credential
    row. Only the hash is stored; the plaintext is never persisted or logged.
-6. The system creates a Session with an expiry `sessionTtlHours` in the future
+6. The system generates ten recovery codes, stores only their hashes, and
+   returns the plaintext codes in this response — the owner's one chance to
+   record them.
+7. The system creates a Session with an expiry `sessionTtlHours` in the future
    (configurable, default 24) and returns its id, exactly as UC-34 does.
 
 **Alternative Flows**
@@ -1269,18 +1272,19 @@ UC-36's externally issued JWT.
 | AF-03 | The email format is invalid | The system rejects with an invalid-input error. |
 | AF-04 | The password fails the strength policy | The system rejects with an invalid-input error naming the unmet rule; no plaintext is logged. |
 | AF-05 | The confirmation does not match the password | The system rejects with an invalid-input error. |
-| AF-06 | The credential row is written but the session cannot be created | The system returns the underlying error; the account exists, and the caller obtains a session through UC-34. |
+| AF-06 | The credential row is written but the recovery codes or the session cannot be created | The system returns the underlying error; the account exists, and the caller obtains a session through UC-34. Recovery codes, if not yet written, can only be obtained afterwards through UC-44. |
 
 The checks run in the order listed — mode, then existence, then the three input
 checks. An unauthenticated caller therefore learns only whether an account
 exists, which the conflict error tells them anyway; they never learn anything
 about a stored password by varying the one they submit.
 
-AF-06 is deliberately not a rollback. Both writes go to the same SQLite
-database, but wrapping them in a transaction would require the credential and
-session repository ports to share one, which no other command in the codebase
-does. The failure is a disk or database error, the account it leaves behind is
-exactly the account the caller asked for, and UC-34 completes the job.
+AF-06 is deliberately not a rollback. The three writes go to the same SQLite
+database, but wrapping them in a transaction would require the credential,
+recovery-code, and session repository ports to share one, which no other
+command in the codebase does. The failure is a disk or database error, the
+account it leaves behind is exactly the account the caller asked for, and
+UC-34 or UC-44 completes the job.
 
 ---
 
@@ -1319,6 +1323,76 @@ those are counted in its `failed` tally and the walk deliberately continues past
 them. `failed` is reserved for a run that could not proceed at all. The
 distinction already exists inside `execute()` — one unreadable file must not
 abandon the rest of the catalog — and this surfaces it.
+
+---
+
+### UC-43: Redeem a recovery code
+
+| Field | Value |
+| --- | --- |
+| **ID** | UC-43 |
+| **Name** | Redeem a recovery code |
+| **Actors** | Owner |
+| **Description** | Replace the local password using one of the account's recovery codes, for an owner who has forgotten their password and holds no session. |
+| **Preconditions** | The active auth mode is local login; an account exists; the caller holds one of its recovery codes. |
+| **Postconditions** | The password is replaced, that code is consumed, and every session is invalidated. |
+| **Requirements** | FR-AU-11, FR-AU-14, FR-AU-15, FR-AU-16 |
+
+**Main Flow**
+
+1. The caller submits a recovery code, a new password, and a confirmation.
+2. The system confirms the active mode is local login.
+3. The system confirms an account exists.
+4. The system validates the new password against the strength policy and its
+   confirmation.
+5. The system consumes the code.
+6. The system replaces the stored password hash and deletes every session.
+7. The system reports how many codes remain.
+
+**Alternative Flows**
+
+| ID | Condition | Outcome |
+| --- | --- | --- |
+| AF-01 | The active auth mode is external JWT | The system rejects with an invalid-operation error. |
+| AF-02 | No local account exists | The system responds with a not-found error. |
+| AF-03 | The new password fails the strength policy | The system rejects naming the unmet rule; no code is consumed. |
+| AF-04 | The confirmation does not match the new password | The system rejects; no code is consumed. |
+| AF-05 | The code was already used | The system rejects with `recovery_code_used`; the password is unchanged. |
+| AF-06 | The code was never issued, or belongs to a regenerated-away set | The system rejects with `recovery_code_unknown`. |
+
+The checks run in the order listed, so a rejected password never reaches the
+code table — a typo in the new password must not spend a code the owner may
+have only one of.
+
+---
+
+### UC-44: Regenerate recovery codes
+
+| Field | Value |
+| --- | --- |
+| **ID** | UC-44 |
+| **Name** | Regenerate recovery codes |
+| **Actors** | Owner |
+| **Description** | Replace an authenticated owner's whole set of recovery codes, so a set that has run low or may have been exposed stops working in full. |
+| **Preconditions** | The active auth mode is local login; the caller is authenticated; an account exists. |
+| **Postconditions** | Every previous code is invalid and ten new ones exist, returned once. |
+| **Requirements** | FR-AU-17, FR-AU-19 |
+
+**Main Flow**
+
+1. The authenticated owner requests a new set.
+2. The system confirms the caller is authenticated.
+3. The system confirms the active mode is local login.
+4. The system confirms an account exists.
+5. The system replaces every code with ten new ones and returns them.
+
+**Alternative Flows**
+
+| ID | Condition | Outcome |
+| --- | --- | --- |
+| AF-01 | The caller is not authenticated | The system denies with an unauthorized error. |
+| AF-02 | The active auth mode is external JWT | The system rejects with an invalid-operation error. |
+| AF-03 | No local account exists | The system responds with a not-found error. |
 
 ---
 
@@ -1365,12 +1439,17 @@ abandon the rest of the catalog — and this surfaces it.
 | UC-38: Stream file content | FR-MP-01, FR-MP-02, FR-MP-03, FR-MP-06 |
 | UC-39: Read a comic book page | FR-MP-03, FR-MP-04, FR-MP-06 |
 | UC-40: Get a file thumbnail | FR-MP-05, FR-MP-06 |
-| UC-41: Register the local account | FR-AU-05, FR-AU-06, FR-AU-08, FR-AU-09, FR-AU-10, FR-AU-11 |
+| UC-41: Register the local account | FR-AU-05, FR-AU-06, FR-AU-08, FR-AU-09, FR-AU-10, FR-AU-11, FR-AU-13, FR-AU-19 |
 | UC-42: Query an index or refresh run | FR-FC-24, FR-FC-27, FR-FC-28, FR-FC-29 |
+| UC-43: Redeem a recovery code | FR-AU-11, FR-AU-14, FR-AU-15, FR-AU-16 |
+| UC-44: Regenerate recovery codes | FR-AU-17, FR-AU-19 |
 
 Every functional requirement in [System Requirements Document](System%20Requirements%20Document.md)
-§3 appears in at least one row above: FR-FC-01..29, FR-CO-01..07, FR-BM-01..06,
-FR-WL-01..08, FR-RL-01..08, FR-TX-01..03, FR-AU-01..11, FR-MP-01..06.
+§3 appears in at least one row above except FR-AU-12 and FR-AU-18, which are
+cross-cutting (the error envelope shape and the account query respectively)
+rather than tied to one use case: FR-FC-01..29, FR-CO-01..07, FR-BM-01..06,
+FR-WL-01..08, FR-RL-01..08, FR-TX-01..03, FR-AU-01..11, FR-AU-13..17,
+FR-AU-19, FR-MP-01..06.
 UC-37 (Health check) is specified in the
 [Operations & Infrastructure Document](Operations%20%26%20Infrastructure%20Document.md)
 §5.3, not here, since it is an operational concern rather than a catalog use case.

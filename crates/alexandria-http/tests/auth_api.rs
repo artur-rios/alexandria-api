@@ -223,6 +223,74 @@ async fn given_wrong_password_when_login_posted_then_401() {
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 }
 
+// ---------------- The self-authenticating routes ----------------
+
+// `/account` and `/recovery/regenerate` are registered *outside* the
+// `route_layer` auth gate (see `app()` in lib.rs) because `/register`,
+// `/login` and `/recovery/redeem` share that group and must stay open. They
+// authenticate inside their own handlers instead. That arrangement is exactly
+// what a router refactor breaks without failing anything, so the 401 is
+// asserted here at the HTTP level rather than only against a denying fake in
+// the core handler tests.
+
+#[tokio::test]
+async fn given_no_token_when_account_requested_then_401() {
+    let test = test_app().await;
+    let router = app(Settings::default(), test.services.clone());
+
+    let first = router
+        .clone()
+        .oneshot(register_request(
+            "owner@example.com",
+            "correct horse battery",
+        ))
+        .await
+        .expect("register one-shot");
+    assert_eq!(first.status(), StatusCode::CREATED);
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/v1/auth/local/account")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("account one-shot");
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn given_no_token_when_regenerate_posted_then_401() {
+    let test = test_app().await;
+    let router = app(Settings::default(), test.services.clone());
+
+    let first = router
+        .clone()
+        .oneshot(register_request(
+            "owner@example.com",
+            "correct horse battery",
+        ))
+        .await
+        .expect("register one-shot");
+    assert_eq!(first.status(), StatusCode::CREATED);
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/auth/local/recovery/regenerate")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("regenerate one-shot");
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
 // ---------------- UC-34 AF-03: no credentials set ----------------
 
 #[tokio::test]

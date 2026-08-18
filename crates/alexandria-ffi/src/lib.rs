@@ -3092,15 +3092,12 @@ pub const AUTH_ERR_OTHER: c_int = 9;
 /// active auth mode is not local, or an account already exists. The FFI
 /// counterpart of HTTP's `409`.
 pub const AUTH_ERR_CONFLICT: c_int = 10;
-/// Issue #102 / FR-AU-15: refused because it came too soon after the last
-/// one — the confirmation resend interval. The FFI counterpart of HTTP's
-/// `429`. Its own code because it is a "not yet", not a mistake the caller
-/// made: `params.retryAfterSeconds` in the body says how long to wait.
+/// Refused because it came too soon after some earlier request — a rate
+/// limit. The FFI counterpart of HTTP's `429`. Its own code because it is a
+/// "not yet", not a mistake the caller made.
 pub const AUTH_ERR_RATE_LIMITED: c_int = 11;
-/// Issue #102: a dependency the operation needs is unavailable — today,
-/// always the mail transport, which is not yet integrated. The FFI
-/// counterpart of HTTP's `503`; the body's `code` says which
-/// (`mail_not_configured`).
+/// A dependency the operation needs is unavailable. The FFI counterpart of
+/// HTTP's `503`; the body's `code` says which.
 pub const AUTH_ERR_SERVICE_UNAVAILABLE: c_int = 12;
 
 /// Result of `alexandria_auth_local_login` / `alexandria_auth_local_set_credentials`
@@ -3370,42 +3367,11 @@ pub extern "C" fn alexandria_auth_local_register(json_body: *const c_char) -> Au
     }
 }
 
-/// Read one required string member out of a JSON body, or return the rejection
-/// to hand back.
+/// Report the authenticated owner's account state (FR-AU-18): the same body
+/// `GET /v1/auth/local/account` returns. `token` is the session id.
 ///
-/// The single-field bodies on this surface would otherwise repeat the same
-/// parsing and the same two refusals, and a client that got a different
-/// message from each would be reading an inconsistency, not a distinction.
-fn string_field(json_body: *const c_char, field: &str) -> Result<String, AuthJsonResult> {
-    let Some(body_str) = cstr_lossy(json_body) else {
-        return Err(AuthJsonResult::rejected(
-            "malformed_body",
-            "request body is missing",
-        ));
-    };
-    serde_json::from_str::<serde_json::Value>(&body_str)
-        .ok()
-        .and_then(|value| {
-            value
-                .as_object()
-                .and_then(|obj| obj.get(field))
-                .and_then(|found| found.as_str())
-                .map(str::to_string)
-        })
-        .ok_or_else(|| {
-            AuthJsonResult::rejected(
-                "malformed_body",
-                format!("invalid body: expected an object with a string '{field}'"),
-            )
-        })
-}
-
-/// Report the authenticated owner's account state (issue #102 / FR-AU-13):
-/// the same body `GET /v1/auth/local/account` returns. `token` is the session
-/// id.
-///
-/// This is the call a client makes to decide whether the address has been
-/// confirmed. The core answers it and gates nothing on the answer.
+/// This is the call a client makes to learn the stored address and how many
+/// recovery codes remain unspent.
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
 pub extern "C" fn alexandria_auth_local_account(token: *const c_char) -> AuthJsonResult {
@@ -3427,137 +3393,37 @@ pub extern "C" fn alexandria_auth_local_account(token: *const c_char) -> AuthJso
     }
 }
 
-/// Confirm the owner's e-mail address (issue #102 / FR-AU-14). `json_body` is
-/// the JSON body HTTP would send, an object with a string `code`.
-///
-/// Deliberately takes no `token`: the code is the proof of control, and
-/// requiring a session as well would stop an owner confirming from the device
-/// that received the message. A refusal carries `confirmation_invalid`,
-/// `confirmation_already_used`, or `confirmation_expired` as the body's
-/// `code` — the status is `AUTH_ERR_INVALID_INPUT` for all three.
-#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
-#[no_mangle]
-pub extern "C" fn alexandria_auth_local_confirm_email(json_body: *const c_char) -> AuthJsonResult {
-    let services = match services_slot().lock().unwrap().clone() {
-        Some(s) => s,
-        None => return AuthJsonResult::err(AUTH_ERR_NOT_INITIALIZED),
-    };
-
-    let code = match string_field(json_body, "code") {
-        Ok(code) => code,
-        Err(result) => return result,
-    };
-
-    let result = runtime().block_on(async { services.confirm_email_handler.confirm(&code).await });
-
-    match result {
-        Ok(confirmation) => {
-            let json = serde_json::to_string(&confirmation).unwrap_or_default();
-            AuthJsonResult::ok(json)
-        }
-        Err(err) => map_auth_err(err),
-    }
-}
-
-/// Send a fresh confirmation message to the stored address (issue #102 /
-/// FR-AU-15). `token` is the session id: this takes no address, so it needs an
-/// authenticated caller to have a subject at all.
-///
-/// Until the mail integration ships this always answers
-/// `AUTH_ERR_SERVICE_UNAVAILABLE` with `mail_not_configured` — an honest
-/// refusal rather than a success that delivers nothing.
-#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
-#[no_mangle]
-pub extern "C" fn alexandria_auth_local_resend_confirmation(
-    token: *const c_char,
-) -> AuthJsonResult {
-    let services = match services_slot().lock().unwrap().clone() {
-        Some(s) => s,
-        None => return AuthJsonResult::err(AUTH_ERR_NOT_INITIALIZED),
-    };
-
-    let token = cstr_lossy(token).unwrap_or_default();
-
-    let result =
-        runtime().block_on(async { services.resend_confirmation_handler.resend(&token).await });
-
-    match result {
-        Ok(resend) => {
-            let json = serde_json::to_string(&resend).unwrap_or_default();
-            AuthJsonResult::ok(json)
-        }
-        Err(err) => map_auth_err(err),
-    }
-}
-
-/// Request a password reset (issue #102 / FR-AU-16). `json_body` is the JSON
-/// body HTTP would send, an object with a string `email`.
-///
-/// The outcome is the same whether or not the address is the registered one —
-/// an operation that answered differently would tell anyone who asked whether
-/// a given person owns this library.
-#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
-#[no_mangle]
-pub extern "C" fn alexandria_auth_local_request_password_reset(
-    json_body: *const c_char,
-) -> AuthJsonResult {
-    let services = match services_slot().lock().unwrap().clone() {
-        Some(s) => s,
-        None => return AuthJsonResult::err(AUTH_ERR_NOT_INITIALIZED),
-    };
-
-    let email = match string_field(json_body, "email") {
-        Ok(email) => email,
-        Err(result) => return result,
-    };
-
-    let result = runtime().block_on(async {
-        services
-            .request_password_reset_handler
-            .request(&email)
-            .await
-    });
-
-    match result {
-        Ok(request) => {
-            let json = serde_json::to_string(&request).unwrap_or_default();
-            AuthJsonResult::ok(json)
-        }
-        Err(err) => map_auth_err(err),
-    }
-}
-
-/// Request body for `alexandria_auth_local_complete_password_reset` — the same
+/// Request body for `alexandria_auth_local_redeem_recovery_code` — the same
 /// JSON the HTTP route takes.
 #[derive(Debug)]
-struct CompletePasswordResetBody {
-    token: String,
-    password: String,
+struct RedeemRecoveryCodeBody {
+    code: String,
+    new_password: String,
     password_confirmation: String,
 }
 
-impl CompletePasswordResetBody {
+impl RedeemRecoveryCodeBody {
     fn from_json_str(s: &str) -> Option<Self> {
         let value: serde_json::Value = serde_json::from_str(s).ok()?;
         let obj = value.as_object()?;
         Some(Self {
-            token: obj.get("token")?.as_str()?.to_string(),
-            password: obj.get("password")?.as_str()?.to_string(),
+            code: obj.get("code")?.as_str()?.to_string(),
+            new_password: obj.get("newPassword")?.as_str()?.to_string(),
             password_confirmation: obj.get("passwordConfirmation")?.as_str()?.to_string(),
         })
     }
 }
 
-/// Complete a password reset (issue #102 / FR-AU-16). `json_body` is the JSON
-/// body HTTP would send: an object with `token`, `password`, and
-/// `passwordConfirmation`.
+/// Redeem a recovery code for a new password (UC-43 / FR-AU-14 … FR-AU-16).
+/// `json_body` is the JSON body HTTP would send: an object with `code`,
+/// `newPassword`, and `passwordConfirmation`.
 ///
-/// Deliberately takes no session token: the reset token is the credential.
-/// Every session is invalidated on success — a reset is what an owner does
-/// when they believe someone else may hold their credentials.
+/// Deliberately takes no session token: the code is the credential, and this
+/// is the operation a caller who cannot authenticate uses to get back in.
+/// Every session is invalidated on success.
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
-pub extern "C" fn alexandria_auth_local_complete_password_reset(
+pub extern "C" fn alexandria_auth_local_redeem_recovery_code(
     json_body: *const c_char,
 ) -> AuthJsonResult {
     let services = match services_slot().lock().unwrap().clone() {
@@ -3568,29 +3434,61 @@ pub extern "C" fn alexandria_auth_local_complete_password_reset(
     let body_str = match cstr_lossy(json_body) {
         Some(s) => s,
         None => {
-            return AuthJsonResult::rejected("malformed_body", "password reset body is missing")
+            return AuthJsonResult::rejected("malformed_body", "recovery redeem body is missing")
         }
     };
-    let body = match CompletePasswordResetBody::from_json_str(&body_str) {
+    let body = match RedeemRecoveryCodeBody::from_json_str(&body_str) {
         Some(b) => b,
         None => {
             return AuthJsonResult::rejected(
                 "malformed_body",
-                "invalid password reset body: expected an object with string 'token', 'password', and 'passwordConfirmation'",
+                "invalid recovery redeem body: expected an object with string 'code', 'newPassword', and 'passwordConfirmation'",
             )
         }
     };
 
     let result = runtime().block_on(async {
         services
-            .complete_password_reset_handler
-            .complete(&body.token, body.password, body.password_confirmation)
+            .redeem_recovery_code_handler
+            .redeem(body.code, body.new_password, body.password_confirmation)
             .await
     });
 
     match result {
-        Ok(completion) => {
-            let json = serde_json::to_string(&completion).unwrap_or_default();
+        Ok(redemption) => {
+            let json = serde_json::to_string(&redemption).unwrap_or_default();
+            AuthJsonResult::ok(json)
+        }
+        Err(err) => map_auth_err(err),
+    }
+}
+
+/// Replace the owner's recovery codes with a fresh set of ten (UC-44 /
+/// FR-AU-17), invalidating every old one. `token` is the session id the
+/// caller authenticates with, exactly as `alexandria_auth_local_account`
+/// takes it.
+#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
+#[no_mangle]
+pub extern "C" fn alexandria_auth_local_regenerate_recovery_codes(
+    token: *const c_char,
+) -> AuthJsonResult {
+    let services = match services_slot().lock().unwrap().clone() {
+        Some(s) => s,
+        None => return AuthJsonResult::err(AUTH_ERR_NOT_INITIALIZED),
+    };
+
+    let token = cstr_lossy(token).unwrap_or_default();
+
+    let result = runtime().block_on(async {
+        services
+            .regenerate_recovery_codes_handler
+            .regenerate(&token)
+            .await
+    });
+
+    match result {
+        Ok(regeneration) => {
+            let json = serde_json::to_string(&regeneration).unwrap_or_default();
             AuthJsonResult::ok(json)
         }
         Err(err) => map_auth_err(err),
