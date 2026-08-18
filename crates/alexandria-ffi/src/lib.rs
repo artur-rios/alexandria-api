@@ -3260,6 +3260,32 @@ pub extern "C" fn alexandria_auth_local_login(json_body: *const c_char) -> AuthJ
     }
 }
 
+/// Windows login (UC-45 / FR-AU-20, FR-AU-22): open a session for the
+/// Windows account this process runs as. Takes no credentials — the account
+/// was already verified against the configured SID at startup. `json_body`
+/// is accepted but ignored: it exists only for signature consistency with
+/// this surface's other `alexandria_auth_*` neighbours, which all take a
+/// body. On success `json` carries the `LocalLoginResult`, the same shape
+/// `alexandria_auth_local_login` returns.
+#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
+#[no_mangle]
+pub extern "C" fn alexandria_auth_windows_login(_json_body: *const c_char) -> AuthJsonResult {
+    let services = match services_slot().lock().unwrap().clone() {
+        Some(s) => s,
+        None => return AuthJsonResult::err(AUTH_ERR_NOT_INITIALIZED),
+    };
+
+    let result = runtime().block_on(async { services.windows_login_handler.login().await });
+
+    match result {
+        Ok(login) => {
+            let json = serde_json::to_string(&login).unwrap_or_default();
+            AuthJsonResult::ok(json)
+        }
+        Err(err) => map_auth_err(err),
+    }
+}
+
 /// Set or change local-login credentials (UC-35 / FR-AU-05, FR-AU-06).
 /// `json_body` is the JSON body HTTP would send (`email`, `password`).
 /// `token` is required: this changes existing credentials. Creating the

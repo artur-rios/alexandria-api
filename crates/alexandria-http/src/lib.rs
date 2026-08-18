@@ -134,10 +134,15 @@ pub fn app(settings: Settings, services: Arc<Services>) -> Router {
     // presented *is* the credential, so it must be reachable by a caller who
     // cannot authenticate. `/account` and `/recovery/regenerate` (UC-44) are
     // routed here too but authenticate in their own handlers.
+    //
+    // `/auth/windows/login` (UC-45) is ungated for the same reason as
+    // `/auth/local/login`: a caller has no session yet, which is the entire
+    // point of the call.
     Router::new()
         .route("/health", get(routes::health::health))
         .route("/v1/auth/local/register", post(routes::auth::register))
         .route("/v1/auth/local/login", post(routes::auth::login))
+        .route("/v1/auth/windows/login", post(routes::auth::windows_login))
         .route(
             "/v1/auth/local/credentials",
             post(routes::auth::set_credentials),

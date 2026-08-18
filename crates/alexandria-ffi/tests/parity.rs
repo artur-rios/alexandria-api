@@ -19,18 +19,18 @@ use alexandria_core::services::build_services;
 use alexandria_ffi::{
     alexandria_auth_local_login, alexandria_auth_local_redeem_recovery_code,
     alexandria_auth_local_regenerate_recovery_codes, alexandria_auth_local_register,
-    alexandria_bookmark_create, alexandria_bookmark_purge, alexandria_bookmark_restore,
-    alexandria_bookmark_soft_delete, alexandria_bookmark_update, alexandria_bookmarks_list,
-    alexandria_collection_add_items, alexandria_collection_create, alexandria_collection_delete,
-    alexandria_collection_list_items, alexandria_collection_remove_item,
-    alexandria_collection_rename, alexandria_comic_page, alexandria_file_edit_content,
-    alexandria_file_edit_metadata, alexandria_file_get_by_uuid, alexandria_file_playback_source,
-    alexandria_file_purge, alexandria_file_purge_on_disk, alexandria_file_read_content,
-    alexandria_file_rename, alexandria_file_restore, alexandria_file_soft_delete,
-    alexandria_file_thumbnail, alexandria_files_list, alexandria_free_string,
-    alexandria_index_count_files, alexandria_index_files_json, alexandria_index_init,
-    alexandria_index_refresh_start, alexandria_index_run_status_json, alexandria_index_start,
-    alexandria_reading_list_add_item, alexandria_reading_list_create,
+    alexandria_auth_windows_login, alexandria_bookmark_create, alexandria_bookmark_purge,
+    alexandria_bookmark_restore, alexandria_bookmark_soft_delete, alexandria_bookmark_update,
+    alexandria_bookmarks_list, alexandria_collection_add_items, alexandria_collection_create,
+    alexandria_collection_delete, alexandria_collection_list_items,
+    alexandria_collection_remove_item, alexandria_collection_rename, alexandria_comic_page,
+    alexandria_file_edit_content, alexandria_file_edit_metadata, alexandria_file_get_by_uuid,
+    alexandria_file_playback_source, alexandria_file_purge, alexandria_file_purge_on_disk,
+    alexandria_file_read_content, alexandria_file_rename, alexandria_file_restore,
+    alexandria_file_soft_delete, alexandria_file_thumbnail, alexandria_files_list,
+    alexandria_free_string, alexandria_index_count_files, alexandria_index_files_json,
+    alexandria_index_init, alexandria_index_refresh_start, alexandria_index_run_status_json,
+    alexandria_index_start, alexandria_reading_list_add_item, alexandria_reading_list_create,
     alexandria_reading_list_delete, alexandria_reading_list_remove_item,
     alexandria_reading_list_update_progress, alexandria_reading_lists_list,
     alexandria_watchlist_add_video, alexandria_watchlist_create, alexandria_watchlist_delete,
@@ -8823,6 +8823,101 @@ async fn given_same_local_credentials_when_set_and_logged_in_via_http_and_ffi_th
 
     assert_eq!(http_login_body["success"], ffi_login_body["success"]);
     assert_eq!(http_login_body["success"], serde_json::json!(true));
+    for body in [&http_login_body, &ffi_login_body] {
+        let session_id = body["sessionId"].as_str().expect("sessionId");
+        assert!(
+            uuid::Uuid::parse_str(session_id).is_ok(),
+            "sessionId is a uuid: {session_id}"
+        );
+    }
+}
+
+/// UC-45 parity — open a session for the Windows account through both
+/// transports and assert both succeed with a well-formed session id (Testing
+/// Specification §7.3). Session ids differ by construction (independent
+/// databases), so parity asserts shape, exactly like the local-login parity
+/// test above.
+///
+/// Windows-only: `alexandria_index_init`'s startup gate (Task 3 / FR-AU-21)
+/// reads this process's real account SID through `ProcessWindowsIdentity`,
+/// which only Windows can answer — on every other platform Windows mode can
+/// never finish initializing, so there is nothing for this test to exercise
+/// there.
+#[cfg(windows)]
+#[tokio::test]
+async fn given_windows_mode_when_logged_in_via_http_and_ffi_then_both_return_a_session() {
+    use alexandria_core::auth::windows_identity::{ProcessWindowsIdentity, WindowsIdentity};
+    use alexandria_core::config::AuthMode;
+
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+
+    // The SID this process actually runs as, so both legs' startup gates
+    // (HTTP does not gate at `app()`, but FFI's `alexandria_index_init`
+    // does) see a configuration that matches reality.
+    let owner_sid = ProcessWindowsIdentity
+        .current_sid()
+        .expect("this process's own account SID must be readable");
+
+    // ---- HTTP leg ----
+    let http_dir = tempdir().unwrap();
+    let http_db = db_path(&http_dir, "http.sqlite");
+    let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    let mut http_settings = Settings::default();
+    http_settings.auth.mode = AuthMode::Windows;
+    http_settings.auth.windows_owner_sid = owner_sid.clone();
+    let http_services =
+        std::sync::Arc::new(build_services(&http_settings, http_pool.clone()).await);
+    let router = app(Settings::default(), http_services);
+
+    let login_req = Request::builder()
+        .method("POST")
+        .uri("/v1/auth/windows/login")
+        .body(Body::empty())
+        .unwrap();
+    let login_resp = router.oneshot(login_req).await.expect("http windows login");
+    assert_eq!(login_resp.status(), axum::http::StatusCode::OK);
+    let http_login_body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(login_resp.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
+
+    // ---- FFI leg ----
+    // `alexandria_index_init` loads settings via `load_settings()`
+    // (`ALEXANDRIA_*` env), not a `Settings` value the test controls
+    // directly — same constraint `setup_ffi_db` documents for local mode.
+    let ffi_dir = tempdir().unwrap();
+    let ffi_db = db_path(&ffi_dir, "ffi.sqlite");
+    let ffi_pool = migrate_database(&ffi_db).await.expect("ffi pre-migrate");
+    ffi_pool.close().await;
+    std::env::set_var("ALEXANDRIA_AUTH_MODE", "windows");
+    std::env::set_var("ALEXANDRIA_AUTH_WINDOWS_OWNER_SID", &owner_sid);
+
+    let ffi_login_json: String = tokio::task::spawn_blocking(move || -> String {
+        let cdb = CString::new(ffi_db).unwrap();
+        assert_eq!(
+            alexandria_index_init(cdb.as_ptr()),
+            alexandria_ffi::INDEX_OK
+        );
+
+        let login_result = alexandria_auth_windows_login(std::ptr::null());
+        assert_eq!(
+            login_result.status,
+            alexandria_ffi::AUTH_OK,
+            "ffi windows login failed"
+        );
+        take_json(login_result.json)
+    })
+    .await
+    .unwrap();
+
+    // Restore the env var every other test in this file relies on
+    // (`setup_ffi_db` sets it back to "local" too, but this leaves the
+    // process in a consistent state even if this test runs last).
+    std::env::set_var("ALEXANDRIA_AUTH_MODE", "local");
+
+    let ffi_login_body: serde_json::Value = serde_json::from_str(&ffi_login_json).unwrap();
+
+    assert_eq!(http_login_body["success"], serde_json::json!(true));
+    assert_eq!(ffi_login_body["success"], serde_json::json!(true));
     for body in [&http_login_body, &ffi_login_body] {
         let session_id = body["sessionId"].as_str().expect("sessionId");
         assert!(

@@ -24,3 +24,6 @@ mod recovery_redeem;
 
 #[path = "auth/recovery_regenerate.rs"]
 mod recovery_regenerate;
+
+#[path = "auth/windows_login.rs"]
+mod windows_login;
