@@ -52,10 +52,11 @@ where
 
     /// Replace the password using one recovery code.
     ///
-    /// The order of the checks is the point. The password is validated before
-    /// the code table is touched, so a typo in the new password leaves every
-    /// code intact and the owner can try the same one again (FR-AU-16). Only
-    /// once the password is known-good is a code spent.
+    /// The order of the checks is the point. The password is validated and
+    /// hashed before the code table is touched, so a typo — or a hashing
+    /// failure — leaves every code intact and the owner can try the same one
+    /// again (FR-AU-16). Only once the new password is fully ready to write
+    /// is a code spent.
     pub async fn redeem(
         &self,
         code: String,
@@ -84,6 +85,12 @@ where
             ));
         }
 
+        // Hash before spending the code: hashing can still fail here, and a
+        // failure after the code table is touched would burn a code for
+        // nothing (decision 6). Computed but not yet written — nothing is
+        // persisted until the code is confirmed spendable.
+        let password_hash = hash_password(&new_password)?;
+
         // AF-05/AF-06: spend the code. The two rejections are deliberately
         // distinguishable — someone working down a printed list needs to know
         // whether they mistyped or already spent it (FR-AU-15).
@@ -108,9 +115,11 @@ where
             }
         }
 
-        let password_hash = hash_password(&new_password)?;
+        // `set_password_hash`, not `upsert`: this changes the credential,
+        // never who the account belongs to, and leaves `email_confirmed_at`
+        // alone for the same reason `CompletePasswordResetHandler` does.
         self.credentials
-            .upsert(&credential.email, &password_hash, now)
+            .set_password_hash(&password_hash, now)
             .await?;
 
         // FR-AU-14: a redemption is what an owner does when they may have lost
