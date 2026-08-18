@@ -8943,10 +8943,7 @@ async fn given_windows_mode_when_logged_in_via_http_and_ffi_then_both_return_a_s
     let unknown_req = Request::builder()
         .method("GET")
         .uri("/v1/files")
-        .header(
-            "authorization",
-            &format!("Bearer {}", uuid::Uuid::new_v4()),
-        )
+        .header("authorization", &format!("Bearer {}", uuid::Uuid::new_v4()))
         .body(Body::empty())
         .unwrap();
     let unknown_resp = app(Settings::default(), http_services.clone())
