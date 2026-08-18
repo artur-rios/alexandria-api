@@ -140,11 +140,10 @@ impl SqliteLocalCredentialRepository {
 
 impl LocalCredentialRepository for SqliteLocalCredentialRepository {
     async fn get(&self) -> Result<Option<LocalCredential>, DomainError> {
-        let row = sqlx::query(
-            "SELECT email, password_hash FROM local_login_credentials WHERE id = 1",
-        )
-        .fetch_optional(&self.pool)
-        .await?;
+        let row =
+            sqlx::query("SELECT email, password_hash FROM local_login_credentials WHERE id = 1")
+                .fetch_optional(&self.pool)
+                .await?;
 
         let Some(row) = row else {
             return Ok(None);

@@ -41,7 +41,14 @@ fn handler(
     recovery_codes: FakeRecoveryCodeRepository,
     mode: AuthMode,
 ) -> TestRegisterHandler {
-    RegisterLocalAccountHandler::new(credentials, sessions, recovery_codes, clock(), mode, TTL_HOURS)
+    RegisterLocalAccountHandler::new(
+        credentials,
+        sessions,
+        recovery_codes,
+        clock(),
+        mode,
+        TTL_HOURS,
+    )
 }
 
 /// Fresh credential, session, and recovery-code fakes wired through
