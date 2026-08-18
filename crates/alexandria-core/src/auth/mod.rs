@@ -3,6 +3,7 @@ pub mod heimdall;
 pub mod local;
 pub mod password;
 pub mod recovery;
+pub mod windows_identity;
 
 use crate::config::AuthMode;
 use crate::errors::DomainError;

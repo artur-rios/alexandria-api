@@ -45,3 +45,6 @@ toml.workspace = true
 # and error, which is worthless without a subscriber to receive it. See
 # `tests/throughput.rs`.
 tracing-subscriber.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
