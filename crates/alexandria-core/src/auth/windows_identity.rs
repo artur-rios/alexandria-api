@@ -58,7 +58,7 @@ impl WindowsIdentity for ProcessWindowsIdentity {
     fn current_sid(&self) -> Result<String, DomainError> {
         use std::ptr;
 
-        use windows_sys::Win32::Foundation::{CloseHandle, LocalFree, HANDLE};
+        use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, LocalFree, HANDLE};
         use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
         use windows_sys::Win32::Security::{
             GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER,
@@ -71,9 +71,11 @@ impl WindowsIdentity for ProcessWindowsIdentity {
         unsafe {
             let mut token: HANDLE = ptr::null_mut();
             if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
-                return Err(DomainError::Config(
-                    "could not open this process's access token to read its account".to_string(),
-                ));
+                return Err(DomainError::Config(format!(
+                    "could not open this process's access token to read its account \
+                     (Win32 error {})",
+                    GetLastError()
+                )));
             }
 
             // Asking with a zero-length buffer is how Win32 reports the size
@@ -81,13 +83,18 @@ impl WindowsIdentity for ProcessWindowsIdentity {
             let mut needed: u32 = 0;
             GetTokenInformation(token, TokenUser, ptr::null_mut(), 0, &mut needed);
             if needed == 0 {
+                let code = GetLastError();
                 CloseHandle(token);
-                return Err(DomainError::Config(
-                    "could not size this process's token information".to_string(),
-                ));
+                return Err(DomainError::Config(format!(
+                    "could not size this process's token information (Win32 error {code})"
+                )));
             }
 
-            let mut buffer = vec![0u8; needed as usize];
+            // A `Vec<u64>` rather than a `Vec<u8>`: `TOKEN_USER` needs 8-byte
+            // alignment, and a byte vector only guarantees one. Rounding the
+            // requested size up to whole `u64`s is the cheapest way to get an
+            // allocation the struct can legally be read out of.
+            let mut buffer: Vec<u64> = vec![0u64; (needed as usize).div_ceil(8)];
             if GetTokenInformation(
                 token,
                 TokenUser,
@@ -96,19 +103,24 @@ impl WindowsIdentity for ProcessWindowsIdentity {
                 &mut needed,
             ) == 0
             {
+                let code = GetLastError();
                 CloseHandle(token);
-                return Err(DomainError::Config(
-                    "could not read this process's token information".to_string(),
-                ));
+                return Err(DomainError::Config(format!(
+                    "could not read this process's token information (Win32 error {code})"
+                )));
             }
             CloseHandle(token);
 
+            // `buffer` is 8-byte aligned (it is a `Vec<u64>`), so this cast is
+            // sound: `TOKEN_USER` only requires 8-byte alignment on x64, and a
+            // `*const u64` pointer already meets it.
             let token_user = &*(buffer.as_ptr() as *const TOKEN_USER);
             let mut raw: *mut u16 = ptr::null_mut();
             if ConvertSidToStringSidW(token_user.User.Sid, &mut raw) == 0 {
-                return Err(DomainError::Config(
-                    "could not convert this process's account SID to text".to_string(),
-                ));
+                return Err(DomainError::Config(format!(
+                    "could not convert this process's account SID to text (Win32 error {})",
+                    GetLastError()
+                )));
             }
 
             let mut len = 0usize;
