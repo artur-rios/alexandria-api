@@ -53,6 +53,13 @@ pub enum RuntimeAuthService {
         local::LocalAuthService<local::SqliteSessionRepository, crate::catalog::clock::SystemClock>,
     ),
     External(heimdall::HeimdallAuthService),
+    /// UC-45. The same session validation `Local` uses, deliberately: the two
+    /// modes differ in how a session is *obtained*, never in how one is
+    /// checked, and a second implementation would be a second place for the
+    /// expiry rule to drift.
+    Windows(
+        local::LocalAuthService<local::SqliteSessionRepository, crate::catalog::clock::SystemClock>,
+    ),
 }
 
 impl AuthService for RuntimeAuthService {
@@ -60,6 +67,7 @@ impl AuthService for RuntimeAuthService {
         match self {
             RuntimeAuthService::Local(service) => service.authenticate(token).await,
             RuntimeAuthService::External(service) => service.authenticate(token).await,
+            RuntimeAuthService::Windows(service) => service.authenticate(token).await,
         }
     }
 
@@ -67,6 +75,7 @@ impl AuthService for RuntimeAuthService {
         match self {
             RuntimeAuthService::Local(_) => AuthMode::Local,
             RuntimeAuthService::External(_) => AuthMode::External,
+            RuntimeAuthService::Windows(_) => AuthMode::Windows,
         }
     }
 }

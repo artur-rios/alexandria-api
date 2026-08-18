@@ -4,6 +4,8 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 
+use alexandria_core::auth::windows_identity::{verify_owner, ProcessWindowsIdentity};
+use alexandria_core::config::AuthMode;
 use alexandria_core::config::Settings;
 use alexandria_core::migrate::migrate_database;
 use alexandria_core::services::build_services;
@@ -25,8 +27,28 @@ async fn main() -> Result<()> {
     // to every request for the life of the process.
     settings.auth.validate()?;
 
+    // UC-45 / FR-AU-21: in Windows mode the account this process runs as *is*
+    // the credential, so a process running as anyone else must not serve the
+    // catalog. Checked once, here, because a process cannot change the account
+    // it runs as.
+    if settings.auth.mode == AuthMode::Windows {
+        verify_owner(&ProcessWindowsIdentity, &settings.auth.windows_owner_sid)?;
+    }
+
     let bind_addr = settings.http.socket_addr();
     let auth_mode = settings.auth.mode;
+
+    // FR-AU-24: Windows mode proves the process was launched by the owner, not
+    // who is calling it — so any caller that can reach the port is authorized.
+    // On loopback that is the owner's own machine. Anywhere else it is the
+    // network, and the operator should hear about it.
+    if settings.auth.mode == AuthMode::Windows && !bind_addr.ip().is_loopback() {
+        tracing::warn!(
+            %bind_addr,
+            "auth.mode is \"windows\" and the bind address is not loopback: in this mode \
+             any caller that can reach the port is authorized"
+        );
+    }
 
     let pool = migrate_database(&settings.database.path).await?;
     tracing::info!("database migrations applied");

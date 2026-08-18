@@ -6,8 +6,10 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use tokio::runtime::{Builder, Runtime};
 
+use alexandria_core::auth::windows_identity::{verify_owner, ProcessWindowsIdentity};
 use alexandria_core::auth::AuthService;
 use alexandria_core::catalog::commands::index::IndexRequest;
+use alexandria_core::config::AuthMode;
 use alexandria_core::config::Settings;
 use alexandria_core::errors::{error_body, DomainError};
 use alexandria_core::migrate::migrate_database;
@@ -175,9 +177,14 @@ pub extern "C" fn alexandria_index_init(db_path: *const c_char) -> c_int {
     };
     let mut settings = load_settings();
     settings.database.path = path.clone();
-    // Same gate as the HTTP binary: a misconfigured external mode is a
-    // startup failure on both surfaces (FR-AU-08).
+    // Same gate as the HTTP binary: a misconfigured mode is a startup failure
+    // on both surfaces (FR-AU-08).
     if settings.auth.validate().is_err() {
+        return INDEX_ERR_OTHER;
+    }
+    if settings.auth.mode == AuthMode::Windows
+        && verify_owner(&ProcessWindowsIdentity, &settings.auth.windows_owner_sid).is_err()
+    {
         return INDEX_ERR_OTHER;
     }
     let _ = runtime();

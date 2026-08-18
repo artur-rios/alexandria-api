@@ -359,13 +359,12 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         AuthMode::External => {
             RuntimeAuthService::External(HeimdallAuthService::from_settings(&settings.auth))
         }
-        // UC-45: the startup account check and the `RuntimeAuthService`
-        // variant this wires to are added by a later task in the same plan
-        // (docs/superpowers/sdd/2026-08-18-windows-credential-login). Nothing
-        // reads `windows_owner_sid` yet, so this arm cannot be reached until
-        // that task lands.
+        // UC-45: the account this process runs as was verified at startup,
+        // before this point. What remains is session validation, which is
+        // exactly local mode's — hence the same service behind a different
+        // variant.
         AuthMode::Windows => {
-            unimplemented!("windows auth mode: wired in a later task (UC-45)")
+            RuntimeAuthService::Windows(LocalAuthService::new(session_repo.clone(), clock))
         }
     };
     let audio_tags = LoftyAudioMetadataReader;
