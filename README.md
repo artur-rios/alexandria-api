@@ -145,7 +145,9 @@ Exactly one active auth mode: external JWT **or** local encrypted login.
 | [#35](https://github.com/artur-rios/alexandria-api/issues/35) | UC-34 | &#9745; | Local login | FR-AU-01, FR-AU-04, FR-AU-07, FR-AU-08 |
 | [#36](https://github.com/artur-rios/alexandria-api/issues/36) | UC-35 | &#9745; | Set or change local login credentials | FR-AU-05, FR-AU-06, FR-AU-07, FR-AU-08, FR-AU-11 |
 | [#37](https://github.com/artur-rios/alexandria-api/issues/37) | UC-36 | &#9745; | Authenticate via Heimdall JWT | FR-AU-01, FR-AU-02, FR-AU-03, FR-AU-07, FR-AU-08 |
-| [#96](https://github.com/artur-rios/alexandria-api/issues/96) | UC-41 | &#9744; | Register the local account | FR-AU-10, FR-AU-11 |
+| [#96](https://github.com/artur-rios/alexandria-api/issues/96) | UC-41 | &#9744; | Register the local account | FR-AU-10, FR-AU-11, FR-AU-13, FR-AU-19 |
+| — | UC-43 | &#9745; | Redeem a recovery code | FR-AU-11, FR-AU-14, FR-AU-15, FR-AU-16 |
+| — | UC-44 | &#9745; | Regenerate recovery codes | FR-AU-17, FR-AU-19 |
 
 ### F-10 — Media playback
 
