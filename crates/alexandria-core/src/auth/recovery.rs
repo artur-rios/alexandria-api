@@ -55,11 +55,25 @@ fn generate_one() -> String {
 /// Upper-cases and drops everything that is not a letter or a digit, so the
 /// hyphen a client printed, the case the owner used, and any spaces they
 /// typed cannot decide whether their code works.
+///
+/// It then applies Crockford's substitution mapping — `O` to `0`, `I` and `L`
+/// to `1` — which is the other half of the same idea. The alphabet excludes
+/// those letters *because* they are confusable with digits, and the person
+/// transcribing a printed code is exactly the one who will write `O` where the
+/// paper says `0`. The mapping is unambiguous and collision-free: none of
+/// `I`, `L`, `O` can appear in a generated code, so nothing that was a valid
+/// character is rewritten. (`U` is excluded from the alphabet too, but for a
+/// different reason — it is not confusable with a digit — so it has no
+/// mapping and stays unrecognised.)
 pub fn normalize_recovery_code(input: &str) -> String {
     input
         .chars()
         .filter(|c| c.is_ascii_alphanumeric())
-        .map(|c| c.to_ascii_uppercase())
+        .map(|c| match c.to_ascii_uppercase() {
+            'O' => '0',
+            'I' | 'L' => '1',
+            upper => upper,
+        })
         .collect()
 }
 
@@ -139,6 +153,17 @@ mod tests {
             .collect();
 
         assert_eq!(hashes.len(), 1);
+    }
+
+    /// Crockford's substitution mapping: a code transcribed with the letters
+    /// the alphabet excludes normalizes back to the digits they resemble.
+    #[test]
+    fn given_a_code_transcribed_with_o_i_and_l_when_normalized_then_it_maps_to_digits() {
+        assert_eq!(normalize_recovery_code("OILab-cdefg"), "011ABCDEFG");
+        assert_eq!(
+            hash_recovery_code("OILab-cdefg"),
+            hash_recovery_code("011AB-CDEFG")
+        );
     }
 
     #[test]

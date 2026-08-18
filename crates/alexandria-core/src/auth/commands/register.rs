@@ -125,11 +125,23 @@ where
             .replace_all(&hashes, self.clock.now())
             .await?;
 
-        // AF-06: if this fails the account still exists — deliberately not
-        // rolled back. The three writes above have no shared transaction
-        // across their two repository ports, and the account left behind is
-        // exactly the one the caller asked for. They obtain a session
-        // through UC-34.
+        // AF-06: the writes above span three repository ports — credentials,
+        // recovery codes, sessions — with no shared transaction, so a failure
+        // part-way leaves what was already written. Neither partial state is
+        // rolled back.
+        //
+        // The worse one is above this line: if `replace_all` fails after
+        // `insert_if_absent` succeeded, the account exists with *zero*
+        // recovery codes. It is not unrecoverable — the owner still knows the
+        // password they just chose — but until they log in and regenerate
+        // (UC-44) they have no way back in if they forget it, and
+        // `recoveryCodesRemaining: 0` on `GET /v1/auth/local/account` is what
+        // tells them so.
+        //
+        // If the session write below fails the account and its codes still
+        // exist, deliberately not rolled back: the account left behind is
+        // exactly the one the caller asked for. They obtain a session through
+        // UC-34.
         let session_id = issue_session(&self.sessions, &self.clock, self.session_ttl_hours).await?;
 
         Ok(LocalRegisterResult {

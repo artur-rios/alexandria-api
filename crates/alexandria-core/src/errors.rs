@@ -126,11 +126,22 @@ impl DomainError {
 
     /// A dependency is unavailable, named by a stable reason code the caller
     /// acts on.
+    ///
+    /// No producer in the workspace calls this today — the mail port was the
+    /// only one, and recovery codes replaced it. Kept because it is generic
+    /// transport infrastructure the error mapping already carries end to end;
+    /// noted so the next reader does not repeat the search.
     pub fn unavailable(code: &'static str, message: impl Into<String>) -> Self {
         Self::Unavailable(Rejection::new(code, message))
     }
 
     /// Refuse a request that came too soon, naming the reason and the wait.
+    ///
+    /// No producer in the workspace calls this today — the resend interval on
+    /// the removed e-mail operations was the only one, which also leaves the
+    /// FFI's `AUTH_ERR_RATE_LIMITED` unreachable. Kept for the same reason as
+    /// `unavailable`: generic transport infrastructure, already mapped on both
+    /// surfaces, waiting for the first throttle that needs it.
     pub fn too_many_requests(code: &'static str, message: impl Into<String>) -> Self {
         Self::TooManyRequests(Rejection::new(code, message))
     }

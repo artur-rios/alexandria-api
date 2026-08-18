@@ -161,6 +161,13 @@ Redemption upper-cases the input and strips hyphens and whitespace before
 hashing, so a code can be typed as printed or as one run of characters, in
 either case. The hyphen is presentation.
 
+It also applies Crockford's substitution mapping — `O` to `0`, `I` and `L` to
+`1` — the other half of excluding those letters. Leaving them out keeps a
+printed code unambiguous; mapping them back handles the person who reads the
+paper correctly and types the letter anyway. The mapping cannot collide,
+because none of the three can occur in a generated code. (`U` is excluded for a
+different reason and has no mapping.)
+
 ### Failure handling
 
 Redemption checks in this order, and every rejection carries a stable reason
@@ -172,16 +179,36 @@ code (FR-AU-12):
 3. The new password satisfies FR-AU-11 and matches its confirmation — otherwise
    the existing password reason codes. **No code is consumed** (decision 6).
 4. The code resolves to an unconsumed code — otherwise `recovery_code_unknown`
-   or `recovery_code_used` (decision 7).
-5. The password hash is replaced, the code is consumed, and every session is
-   deleted.
+   or `recovery_code_used` (decision 7). This is where the code is spent: the
+   consume is the check.
+5. The password hash is replaced and every session is deleted.
 
-Step 5's three writes go to the same database but not through one transaction,
-matching UC-41 AF-06's existing precedent: the repository ports do not share a
-transaction anywhere in this codebase. The order is chosen so a failure part-way
-is safe rather than silent — the password is replaced first, so the worst case is
-an unconsumed code whose redemption already took effect, never a consumed code
-that changed nothing.
+Steps 4 and 5 go to the same database but not through one transaction, matching
+UC-41 AF-06's existing precedent: the repository ports do not share a transaction
+anywhere in this codebase. The code is consumed *before* the password is written,
+and that order is deliberate. `consume` is not a separate bookkeeping write that
+could be deferred — it is the atomic test-and-set that decides whether this
+redemption is allowed at all, and its three-way answer is what distinguishes
+`recovery_code_used` from `recovery_code_unknown`. Writing the password first
+would mean two concurrent redemptions both overwrite it, with the loser told
+`recovery_code_used` after it had already changed the password — contradicting
+UC-43 AF-05, which says the password is unchanged in that case.
+
+The residual risk is stated plainly: if `set_password_hash` fails after the code
+is consumed, one code of ten is burned and nothing changed. The owner retries
+with the next code. That is preferred to the alternative, where a failure leaves
+the password already replaced by a request that was then rejected — a caller told
+"no" while the account silently said "yes" is a far worse failure than a caller
+told "no" who has nine codes left.
+
+The new password is validated against the account's e-mail address
+(`validate_strength(&new_password, &credential.email)`), which means an
+unauthenticated caller can probe the owner's e-mail local part by watching which
+passwords are rejected for containing it. This is accepted, not overlooked: the
+service is single-user and binds to loopback by default (IR-03), the address is
+also the login identifier the owner types anyway, and dropping the check would
+weaken the password policy on exactly the path where a password is chosen without
+proving knowledge of the old one.
 
 ## Requirements
 

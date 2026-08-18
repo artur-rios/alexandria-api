@@ -221,6 +221,43 @@ async fn given_a_code_typed_lower_case_and_unhyphenated_when_redeemed_then_accep
     assert_eq!(recovery.remaining().await.unwrap(), 9);
 }
 
+/// The alphabet drops `I`, `L` and `O` because they are confusable with `1`
+/// and `0` — and the person transcribing a printed code is exactly the one
+/// who will write the letter. Crockford's substitution mapping decodes the
+/// transcription back, so a code copied as `OIL…` still redeems the code
+/// printed as `011…`. Seeded explicitly rather than taken from
+/// `generate_recovery_codes`, because a random code need not contain a `0`
+/// or a `1` at all.
+#[tokio::test]
+async fn given_a_code_transcribed_with_o_i_and_l_when_redeemed_then_accepted() {
+    let credentials = FakeLocalCredentialRepository::new();
+    credentials.seed(EMAIL, "the-old-hash");
+    let recovery = FakeRecoveryCodeRepository::new();
+    recovery
+        .replace_all(&[hash_recovery_code("011AB-CDEFG")], clock().0)
+        .await
+        .expect("seed code");
+
+    let handler = RedeemRecoveryCodeHandler::new(
+        credentials,
+        FakeSessionRepository::new(),
+        recovery.clone(),
+        clock(),
+        AuthMode::Local,
+    );
+
+    handler
+        .redeem(
+            "OILab-cdefg".to_string(),
+            NEW_PASSWORD.to_string(),
+            NEW_PASSWORD.to_string(),
+        )
+        .await
+        .expect("transcribed code redeems");
+
+    assert_eq!(recovery.remaining().await.unwrap(), 0);
+}
+
 #[tokio::test]
 async fn given_no_account_when_redeemed_then_not_found() {
     let handler = handler_without_account();

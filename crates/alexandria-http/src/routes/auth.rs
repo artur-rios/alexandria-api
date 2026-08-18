@@ -184,7 +184,7 @@ pub async fn redeem_recovery_code(
 /// codes with a fresh set of ten, invalidating every old one (UC-44 /
 /// FR-AU-17). Authenticated: this is the owner who still has access,
 /// topping up before they need it, so it enforces authentication in its own
-/// handler like `/account` and `/email/resend` do. Returns `200` with the
+/// handler like `/account` does. Returns `200` with the
 /// `RegenerateRecoveryCodesResult`, or `401`, `404` (no local account
 /// exists), or `409` (the active auth mode is not local).
 pub async fn regenerate_recovery_codes(

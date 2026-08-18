@@ -1246,7 +1246,7 @@ UC-36's externally issued JWT.
 | **Description** | Create the single owner's local-login account when none exists, and open a session for the caller. |
 | **Preconditions** | The active auth mode is local login; no local credentials exist. |
 | **Postconditions** | The credential row holds the submitted email and a salted Argon2 hash of the password, ten recovery codes exist with only their hashes stored, and a Session exists whose id is returned to the caller. The recovery codes' plaintext is returned in this response and never again. On a failure before the credential row is written, none of this is created; AF-06 is the one exception — the credential row and its recovery codes survive a failed session creation. |
-| **Requirements** | FR-AU-05, FR-AU-06, FR-AU-08, FR-AU-09, FR-AU-10, FR-AU-11, FR-AU-13 |
+| **Requirements** | FR-AU-05, FR-AU-06, FR-AU-08, FR-AU-09, FR-AU-10, FR-AU-11, FR-AU-13, FR-AU-19 |
 
 **Main Flow**
 
@@ -1439,7 +1439,7 @@ have only one of.
 | UC-38: Stream file content | FR-MP-01, FR-MP-02, FR-MP-03, FR-MP-06 |
 | UC-39: Read a comic book page | FR-MP-03, FR-MP-04, FR-MP-06 |
 | UC-40: Get a file thumbnail | FR-MP-05, FR-MP-06 |
-| UC-41: Register the local account | FR-AU-05, FR-AU-06, FR-AU-08, FR-AU-09, FR-AU-10, FR-AU-11, FR-AU-13 |
+| UC-41: Register the local account | FR-AU-05, FR-AU-06, FR-AU-08, FR-AU-09, FR-AU-10, FR-AU-11, FR-AU-13, FR-AU-19 |
 | UC-42: Query an index or refresh run | FR-FC-24, FR-FC-27, FR-FC-28, FR-FC-29 |
 | UC-43: Redeem a recovery code | FR-AU-11, FR-AU-14, FR-AU-15, FR-AU-16 |
 | UC-44: Regenerate recovery codes | FR-AU-17, FR-AU-19 |

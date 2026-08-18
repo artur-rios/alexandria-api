@@ -57,6 +57,25 @@ where
     /// failure — leaves every code intact and the owner can try the same one
     /// again (FR-AU-16). Only once the new password is fully ready to write
     /// is a code spent.
+    ///
+    /// Two properties of that ordering are recorded here so they are not
+    /// mistaken for oversights.
+    ///
+    /// Hashing before consuming means every well-formed unauthenticated
+    /// request costs one Argon2 hash whether or not the code is real — a CPU
+    /// amplifier available to anyone who can reach the endpoint. It is
+    /// nonetheless the right trade: it is precisely what stops a hashing
+    /// failure from burning a code. Do not "optimize" the ordering back.
+    /// `MAX_PASSWORD_LENGTH` bounds the cost of a single hash and the API
+    /// binds to loopback by default (IR-03).
+    ///
+    /// `validate_strength(&new_password, &credential.email)` rejects a
+    /// password containing the address, so an unauthenticated caller can
+    /// probe the owner's e-mail local part by watching which passwords are
+    /// refused. Accepted deliberately: low value against a single-user
+    /// loopback service, and removing the check would weaken the password
+    /// policy on the one path that sets a password without knowing the old
+    /// one.
     pub async fn redeem(
         &self,
         code: String,
