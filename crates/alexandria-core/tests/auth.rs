@@ -21,3 +21,6 @@ mod password_reset;
 
 #[path = "auth/recovery_repo.rs"]
 mod recovery_repo;
+
+#[path = "auth/account_status.rs"]
+mod account_status;

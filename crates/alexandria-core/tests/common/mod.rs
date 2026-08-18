@@ -16,7 +16,10 @@ use std::sync::{Arc, Mutex};
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
-use alexandria_core::auth::local::{LocalCredential, LocalCredentialRepository, SessionRepository};
+use alexandria_core::auth::local::{
+    LocalCredential, LocalCredentialRepository, RecoveryCodeOutcome, RecoveryCodeRepository,
+    SessionRepository,
+};
 use alexandria_core::auth::mail::{MailSender, OutboundMail, MAIL_NOT_CONFIGURED};
 use alexandria_core::auth::tokens::{AuthToken, AuthTokenRepository, TokenPurpose};
 use alexandria_core::auth::{AuthService, Principal};
@@ -2509,5 +2512,74 @@ impl FailingMailSender {
             MAIL_NOT_CONFIGURED,
             "outbound mail is not configured, so no message was sent",
         )
+    }
+}
+
+/// One stored recovery-code hash and, once spent, when it was consumed.
+type RecoveryCodeEntry = (String, Option<DateTime<Utc>>);
+
+/// In-memory recovery-code repository (UC-43/UC-44), in the style of
+/// `FakeSessionRepository`. Each stored entry is a `(hash, consumed_at)`
+/// pair, so `consume` can distinguish "never issued" from "already spent" —
+/// the same two failure states `SqliteRecoveryCodeRepository` distinguishes.
+#[derive(Debug, Default, Clone)]
+pub struct FakeRecoveryCodeRepository {
+    codes: Arc<Mutex<Vec<RecoveryCodeEntry>>>,
+}
+
+impl FakeRecoveryCodeRepository {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Every hash currently stored, consumed or not — lets a test prove no
+    /// plaintext code was ever written.
+    pub fn stored_hashes(&self) -> Vec<String> {
+        self.codes
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(hash, _)| hash.clone())
+            .collect()
+    }
+}
+
+impl RecoveryCodeRepository for FakeRecoveryCodeRepository {
+    async fn replace_all(
+        &self,
+        code_hashes: &[String],
+        _created_at: DateTime<Utc>,
+    ) -> Result<(), DomainError> {
+        *self.codes.lock().unwrap() = code_hashes
+            .iter()
+            .map(|hash| (hash.clone(), None))
+            .collect();
+        Ok(())
+    }
+
+    async fn consume(
+        &self,
+        code_hash: &str,
+        now: DateTime<Utc>,
+    ) -> Result<RecoveryCodeOutcome, DomainError> {
+        let mut codes = self.codes.lock().unwrap();
+        let Some((_, consumed_at)) = codes.iter_mut().find(|(hash, _)| hash == code_hash) else {
+            return Ok(RecoveryCodeOutcome::Unknown);
+        };
+        if consumed_at.is_some() {
+            return Ok(RecoveryCodeOutcome::AlreadyUsed);
+        }
+        *consumed_at = Some(now);
+        Ok(RecoveryCodeOutcome::Consumed)
+    }
+
+    async fn remaining(&self) -> Result<u32, DomainError> {
+        Ok(self
+            .codes
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, consumed_at)| consumed_at.is_none())
+            .count() as u32)
     }
 }

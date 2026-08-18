@@ -2,10 +2,12 @@ use chrono::Duration;
 
 use crate::auth::commands::set_credentials::validate_email;
 use crate::auth::local::{
-    issue_session, LocalCredentialRepository, LocalRegisterResult, SessionRepository,
+    issue_session, LocalCredentialRepository, LocalRegisterResult, RecoveryCodeRepository,
+    SessionRepository,
 };
 use crate::auth::mail::{MailKind, MailSender, OutboundMail};
 use crate::auth::password::{hash_password, validate_strength};
+use crate::auth::recovery::{generate_recovery_codes, hash_recovery_code};
 use crate::auth::tokens::{
     generate_confirmation_code, hash_token, AuthTokenRepository, TokenPurpose,
 };
@@ -25,9 +27,10 @@ use crate::errors::DomainError;
 /// Generic over the credential repository, session repository, and clock
 /// so the decision logic is unit-tested against trait fakes, then wired
 /// with the concrete Sqlite/System collaborators at runtime (services.rs).
-pub struct RegisterLocalAccountHandler<CR, SR, TR, M, C> {
+pub struct RegisterLocalAccountHandler<CR, SR, TR, M, C, RR> {
     credentials: CR,
     sessions: SR,
+    recovery_codes: RR,
     tokens: TR,
     mail: M,
     clock: C,
@@ -36,18 +39,20 @@ pub struct RegisterLocalAccountHandler<CR, SR, TR, M, C> {
     confirmation_ttl_hours: u32,
 }
 
-impl<CR, SR, TR, M, C> RegisterLocalAccountHandler<CR, SR, TR, M, C>
+impl<CR, SR, TR, M, C, RR> RegisterLocalAccountHandler<CR, SR, TR, M, C, RR>
 where
     CR: LocalCredentialRepository,
     SR: SessionRepository,
     TR: AuthTokenRepository,
     M: MailSender,
     C: Clock,
+    RR: RecoveryCodeRepository,
 {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         credentials: CR,
         sessions: SR,
+        recovery_codes: RR,
         tokens: TR,
         mail: M,
         clock: C,
@@ -58,6 +63,7 @@ where
         Self {
             credentials,
             sessions,
+            recovery_codes,
             tokens,
             mail,
             clock,
@@ -124,6 +130,18 @@ where
             return Err(DomainError::conflict("a local account already exists"));
         }
 
+        // FR-AU-13: the codes are the account's only recovery path, so they
+        // are written before the caller is told the account exists. Their
+        // plaintext is returned here and nowhere else, ever.
+        let recovery_codes = generate_recovery_codes();
+        let hashes: Vec<String> = recovery_codes
+            .iter()
+            .map(|c| hash_recovery_code(c))
+            .collect();
+        self.recovery_codes
+            .replace_all(&hashes, self.clock.now())
+            .await?;
+
         // AF-06: if this fails the account still exists — deliberately not
         // rolled back. The two writes would need a shared transaction across
         // two repository ports, which no other command here does, and the
@@ -146,6 +164,7 @@ where
             email_confirmed: false,
             confirmation_sent,
             confirmation_error,
+            recovery_codes,
         })
     }
 

@@ -24,7 +24,7 @@ use alexandria_core::errors::DomainError;
 
 use crate::common::{
     FailingMailSender, FakeAuth, FakeAuthTokenRepository, FakeLocalCredentialRepository,
-    FakeMailSender,
+    FakeMailSender, FakeRecoveryCodeRepository,
 };
 
 const EMAIL: &str = "owner@example.com";
@@ -132,7 +132,11 @@ async fn given_a_confirmed_account_when_the_state_is_read_then_it_reports_confir
     let credentials = seeded_credentials();
     let tokens = FakeAuthTokenRepository::new();
     let mail = FakeMailSender::new();
-    let account = GetLocalAccountHandler::new(FakeAuth::Allowing, credentials.clone());
+    let account = GetLocalAccountHandler::new(
+        FakeAuth::Allowing,
+        credentials.clone(),
+        FakeRecoveryCodeRepository::new(),
+    );
 
     let before = account.get("session").await.expect("account state");
     assert_eq!(before.email, EMAIL);

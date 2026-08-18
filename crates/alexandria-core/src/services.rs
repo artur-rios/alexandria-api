@@ -12,7 +12,8 @@ use crate::auth::commands::resend_confirmation::ResendConfirmationHandler;
 use crate::auth::commands::set_credentials::SetLocalCredentialsHandler;
 use crate::auth::heimdall::HeimdallAuthService;
 use crate::auth::local::{
-    LocalAuthService, SqliteLocalCredentialRepository, SqliteSessionRepository,
+    LocalAuthService, SqliteLocalCredentialRepository, SqliteRecoveryCodeRepository,
+    SqliteSessionRepository,
 };
 use crate::auth::mail::{RuntimeMailSender, UnconfiguredMailSender};
 use crate::auth::tokens::SqliteAuthTokenRepository;
@@ -247,10 +248,14 @@ pub type DefaultRegisterLocalAccountHandler = RegisterLocalAccountHandler<
     SqliteAuthTokenRepository,
     RuntimeMailSender,
     SystemClock,
+    SqliteRecoveryCodeRepository,
 >;
 
-pub type DefaultGetLocalAccountHandler =
-    GetLocalAccountHandler<RuntimeAuthService, SqliteLocalCredentialRepository>;
+pub type DefaultGetLocalAccountHandler = GetLocalAccountHandler<
+    RuntimeAuthService,
+    SqliteLocalCredentialRepository,
+    SqliteRecoveryCodeRepository,
+>;
 
 pub type DefaultConfirmEmailHandler =
     ConfirmEmailHandler<SqliteLocalCredentialRepository, SqliteAuthTokenRepository, SystemClock>;
@@ -342,6 +347,7 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
     let run_repo = SqliteCatalogRunRepository::new(pool.clone());
     let session_repo = SqliteSessionRepository::new(pool.clone());
     let credential_repo = SqliteLocalCredentialRepository::new(pool.clone());
+    let recovery_code_repo = SqliteRecoveryCodeRepository::new(pool.clone());
     let token_repo = SqliteAuthTokenRepository::new(pool.clone());
     // Issue #102: the only provider today refuses every send and says why.
     // The external mail service becomes a second variant here, with no change
@@ -605,6 +611,7 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
     let register_local_account_handler = Arc::new(RegisterLocalAccountHandler::new(
         credential_repo.clone(),
         session_repo.clone(),
+        recovery_code_repo.clone(),
         token_repo.clone(),
         mail,
         clock,
@@ -615,6 +622,7 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
     let get_local_account_handler = Arc::new(GetLocalAccountHandler::new(
         auth.clone(),
         credential_repo.clone(),
+        recovery_code_repo,
     ));
     let confirm_email_handler = Arc::new(ConfirmEmailHandler::new(
         credential_repo.clone(),

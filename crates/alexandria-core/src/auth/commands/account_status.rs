@@ -1,4 +1,4 @@
-use crate::auth::local::{LocalAccountResult, LocalCredentialRepository};
+use crate::auth::local::{LocalAccountResult, LocalCredentialRepository, RecoveryCodeRepository};
 use crate::auth::AuthService;
 use crate::errors::DomainError;
 
@@ -15,18 +15,24 @@ use crate::errors::DomainError;
 /// Generic over the auth service and credential repository so the decision
 /// logic is unit-tested against trait fakes, then wired with the concrete
 /// collaborators at runtime (services.rs).
-pub struct GetLocalAccountHandler<A, CR> {
+pub struct GetLocalAccountHandler<A, CR, RR> {
     auth: A,
     credentials: CR,
+    recovery_codes: RR,
 }
 
-impl<A, CR> GetLocalAccountHandler<A, CR>
+impl<A, CR, RR> GetLocalAccountHandler<A, CR, RR>
 where
     A: AuthService,
     CR: LocalCredentialRepository,
+    RR: RecoveryCodeRepository,
 {
-    pub fn new(auth: A, credentials: CR) -> Self {
-        Self { auth, credentials }
+    pub fn new(auth: A, credentials: CR, recovery_codes: RR) -> Self {
+        Self {
+            auth,
+            credentials,
+            recovery_codes,
+        }
     }
 
     pub async fn get(&self, token: &str) -> Result<LocalAccountResult, DomainError> {
@@ -38,9 +44,11 @@ where
             .await?
             .ok_or_else(|| DomainError::config("local credentials have not been set"))?;
 
+        let email_confirmed = credential.email_confirmed();
         Ok(LocalAccountResult {
-            email_confirmed: credential.email_confirmed(),
+            recovery_codes_remaining: self.recovery_codes.remaining().await?,
             email: credential.email,
+            email_confirmed,
         })
     }
 }

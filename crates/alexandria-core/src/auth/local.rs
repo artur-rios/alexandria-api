@@ -39,6 +39,12 @@ pub struct LocalLoginResult {
 pub struct LocalAccountResult {
     pub email: String,
     pub email_confirmed: bool,
+    /// How many recovery codes are still unspent (FR-AU-18).
+    ///
+    /// Zero means the account cannot currently be recovered — either every
+    /// code has been used, or the account predates them — and the owner
+    /// should regenerate while they still know their password.
+    pub recovery_codes_remaining: u32,
 }
 
 /// The outcome of confirming the owner's address (issue #102 / FR-AU-14).
@@ -99,6 +105,10 @@ pub struct LocalRegisterResult {
     /// The reason code when `confirmation_sent` is `false`; `None` otherwise.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub confirmation_error: Option<String>,
+    /// The owner's recovery codes, in plaintext, returned exactly once
+    /// (FR-AU-13). They are not retrievable afterwards: only their hashes are
+    /// stored, so this response is the only chance to record them.
+    pub recovery_codes: Vec<String>,
 }
 
 /// The single owner's local-login credential row (SRD §4.9). Singleton —
