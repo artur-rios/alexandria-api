@@ -18,3 +18,6 @@ mod confirmation;
 
 #[path = "auth/password_reset.rs"]
 mod password_reset;
+
+#[path = "auth/recovery_repo.rs"]
+mod recovery_repo;

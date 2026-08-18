@@ -410,3 +410,136 @@ where
     sessions.create_session(session_id, now, expires_at).await?;
     Ok(session_id)
 }
+
+/// What `RecoveryCodeRepository::consume` found (FR-AU-15).
+///
+/// Three states rather than a boolean, because an owner working down a
+/// printed list needs to know whether they mistyped a code or already spent
+/// it, and only storage can tell those apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecoveryCodeOutcome {
+    /// The code existed, was unused, and is now spent.
+    Consumed,
+    /// The code exists but was already redeemed.
+    AlreadyUsed,
+    /// No such code was ever issued — or it belonged to a set that has since
+    /// been regenerated away.
+    Unknown,
+}
+
+/// Recovery code storage port (UC-43/UC-44). Unit-testable against an
+/// in-memory fake with no database (Testing Specification §6.2).
+#[allow(async_fn_in_trait)]
+pub trait RecoveryCodeRepository: Send + Sync {
+    /// Delete every existing code and store this set.
+    ///
+    /// One method serves registration and regeneration both, because "the
+    /// owner's codes are exactly these ten" is one idea and splitting it
+    /// would let the two paths drift.
+    async fn replace_all(
+        &self,
+        code_hashes: &[String],
+        created_at: DateTime<Utc>,
+    ) -> Result<(), DomainError>;
+
+    /// Spend the code with this hash, reporting what was found.
+    async fn consume(
+        &self,
+        code_hash: &str,
+        now: DateTime<Utc>,
+    ) -> Result<RecoveryCodeOutcome, DomainError>;
+
+    /// How many codes remain unconsumed (FR-AU-18).
+    async fn remaining(&self) -> Result<u32, DomainError>;
+}
+
+#[derive(Clone)]
+pub struct SqliteRecoveryCodeRepository {
+    pool: SqlitePool,
+}
+
+impl SqliteRecoveryCodeRepository {
+    pub fn new(pool: SqlitePool) -> Self {
+        Self { pool }
+    }
+}
+
+impl RecoveryCodeRepository for SqliteRecoveryCodeRepository {
+    async fn replace_all(
+        &self,
+        code_hashes: &[String],
+        created_at: DateTime<Utc>,
+    ) -> Result<(), DomainError> {
+        let created_at = created_at.to_rfc3339();
+        let mut tx = self.pool.begin().await?;
+
+        // One transaction, unlike the cross-port writes elsewhere in this
+        // module: both statements belong to this single repository, so there
+        // is no second port to share it with, and a delete that committed
+        // without its insert would leave the owner with no codes at all.
+        sqlx::query("DELETE FROM recovery_codes")
+            .execute(&mut *tx)
+            .await?;
+
+        for code_hash in code_hashes {
+            sqlx::query(
+                "INSERT INTO recovery_codes (code_hash, created_at, consumed_at) \
+                 VALUES (?, ?, NULL)",
+            )
+            .bind(code_hash)
+            .bind(&created_at)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn consume(
+        &self,
+        code_hash: &str,
+        now: DateTime<Utc>,
+    ) -> Result<RecoveryCodeOutcome, DomainError> {
+        // The conditional UPDATE is the whole concurrency story: two
+        // simultaneous redemptions of one code cannot both affect a row, so
+        // exactly one sees `Consumed`. A read-then-write would let both pass
+        // the read.
+        let updated = sqlx::query(
+            "UPDATE recovery_codes SET consumed_at = ? \
+             WHERE code_hash = ? AND consumed_at IS NULL",
+        )
+        .bind(now.to_rfc3339())
+        .bind(code_hash)
+        .execute(&self.pool)
+        .await?;
+
+        if updated.rows_affected() == 1 {
+            return Ok(RecoveryCodeOutcome::Consumed);
+        }
+
+        // Nothing was updated: either the code is spent, or it was never
+        // issued. Only this second read can say which.
+        let exists = sqlx::query("SELECT 1 FROM recovery_codes WHERE code_hash = ?")
+            .bind(code_hash)
+            .fetch_optional(&self.pool)
+            .await?
+            .is_some();
+
+        Ok(if exists {
+            RecoveryCodeOutcome::AlreadyUsed
+        } else {
+            RecoveryCodeOutcome::Unknown
+        })
+    }
+
+    async fn remaining(&self) -> Result<u32, DomainError> {
+        let row = sqlx::query(
+            "SELECT COUNT(*) AS remaining FROM recovery_codes WHERE consumed_at IS NULL",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        let remaining: i64 = row.try_get("remaining")?;
+        Ok(u32::try_from(remaining).unwrap_or(u32::MAX))
+    }
+}
