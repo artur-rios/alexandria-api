@@ -38,7 +38,7 @@ decided in Phase 2 and recorded in the
 
 ## Authentication
 
-Two configurable modes, selected at startup; only one is active at runtime:
+Three configurable modes, selected at startup; only one is active at runtime:
 
 1. **External JWT** — JWTs issued by an external authentication microservice;
    Alexandria validates them through a pluggable auth service module. The actual
@@ -46,8 +46,11 @@ Two configurable modes, selected at startup; only one is active at runtime:
 2. **Local login** — credentials (email and a salted/hashed password) stored in
    a SQLite row on the local machine, verified by Alexandria. No plaintext
    credentials are ever stored — only the one-way password hash.
+3. **Windows account** — the Windows account the server process runs as.
+   Nothing is typed and nothing is stored; the process reads its own account at
+   startup and compares it to the configured owner.
 
-Both modes authorize the single owner; only the configured mode is accepted.
+All modes authorize the single owner; only the configured mode is accepted.
 
 ## Testing
 

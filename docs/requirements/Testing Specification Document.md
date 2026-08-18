@@ -49,7 +49,7 @@ in the delivery flow is defined in the
 | FFI function | Integration | `alexandria-ffi/tests/` |
 | HTTP ↔ FFI parity for an operation | Parity (contract) | `alexandria-ffi/tests/parity.rs` |
 | Filesystem interactions (indexing, rename, text content) | Integration | integration tests using a temp dir |
-| Auth service (local + external) | Unit + integration | `alexandria-core/tests/auth.rs` |
+| Auth service (local + external + Windows) | Unit + integration | `alexandria-core/tests/auth.rs` |
 
 **Deliberately untested:** plain data-holder structs with no behavior, generated
 OpenAPI scaffolding, and the cbindgen-produced C header (validated at build time

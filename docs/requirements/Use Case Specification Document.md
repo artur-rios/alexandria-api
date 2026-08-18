@@ -1065,7 +1065,7 @@ UC-36's externally issued JWT.
 
 | ID | Condition | Outcome |
 | --- | --- | --- |
-| AF-01 | The active auth mode is external JWT (local login inactive) | The system rejects the local credentials with an unauthorized error. |
+| AF-01 | The active auth mode is not local login | The system rejects the local credentials with an unauthorized error. |
 | AF-02 | The email or password is wrong | The system denies with an unauthorized error; no plaintext is logged. |
 | AF-03 | Local credentials have not been set | The system responds with a configuration error (run UC-35 first). |
 | AF-04 | A later request presents a session id that is unknown or has expired | The system denies that request with an unauthorized error; the caller logs in again to obtain a new session. |
@@ -1126,7 +1126,7 @@ UC-36's externally issued JWT.
 
 | ID | Condition | Outcome |
 | --- | --- | --- |
-| AF-01 | The active auth mode is local login (external JWT inactive) | The system rejects the JWT with an unauthorized error. |
+| AF-01 | The active auth mode is not external JWT | The system rejects the JWT with an unauthorized error. |
 | AF-02 | The JWT is missing, malformed, expired, not yet valid, signed with an unconfigured key, or names an algorithm other than the configured one | The system denies with an unauthorized error. |
 | AF-03 | The JWT is a two-factor challenge token rather than a full authentication token | The system denies with an unauthorized error. |
 | AF-04 | The JWT is valid but names no scope, or a scope other than the configured one | The system denies with an unauthorized error. |
@@ -1268,7 +1268,7 @@ UC-36's externally issued JWT.
 
 | ID | Condition | Outcome |
 | --- | --- | --- |
-| AF-01 | The active auth mode is external JWT | The system rejects with an invalid-operation error. |
+| AF-01 | The active auth mode is not local login | The system rejects with an invalid-operation error. |
 | AF-02 | Local credentials already exist | The system rejects with a conflict error; the stored credentials are left untouched. |
 | AF-03 | The email format is invalid | The system rejects with an invalid-input error. |
 | AF-04 | The password fails the strength policy | The system rejects with an invalid-input error naming the unmet rule; no plaintext is logged. |
@@ -1354,7 +1354,7 @@ abandon the rest of the catalog — and this surfaces it.
 
 | ID | Condition | Outcome |
 | --- | --- | --- |
-| AF-01 | The active auth mode is external JWT | The system rejects with an invalid-operation error. |
+| AF-01 | The active auth mode is not local login | The system rejects with an invalid-operation error. |
 | AF-02 | No local account exists | The system responds with a not-found error. |
 | AF-03 | The new password fails the strength policy | The system rejects naming the unmet rule; no code is consumed. |
 | AF-04 | The confirmation does not match the new password | The system rejects; no code is consumed. |
@@ -1392,7 +1392,7 @@ have only one of.
 | ID | Condition | Outcome |
 | --- | --- | --- |
 | AF-01 | The caller is not authenticated | The system denies with an unauthorized error. |
-| AF-02 | The active auth mode is external JWT | The system rejects with an invalid-operation error. |
+| AF-02 | The active auth mode is not local login | The system rejects with an invalid-operation error. |
 | AF-03 | No local account exists | The system responds with a not-found error. |
 
 ---
