@@ -136,6 +136,11 @@ pub fn app(settings: Settings, services: Arc<Services>) -> Router {
     // confirming from the device that received the message, or resetting a
     // password they cannot log in with. `/account` and `/email/resend` are
     // routed here but authenticate in their own handlers.
+    //
+    // `/recovery/redeem` (UC-43) is the same case as the reset endpoints: the
+    // code presented *is* the credential, so it must be reachable by a
+    // caller who cannot authenticate. `/recovery/regenerate` (UC-44) is the
+    // same case as `/account`: authenticated, but in its own handler.
     Router::new()
         .route("/health", get(routes::health::health))
         .route("/v1/auth/local/register", post(routes::auth::register))
@@ -160,6 +165,14 @@ pub fn app(settings: Settings, services: Arc<Services>) -> Router {
         .route(
             "/v1/auth/local/password/reset/complete",
             post(routes::auth::complete_password_reset),
+        )
+        .route(
+            "/v1/auth/local/recovery/redeem",
+            post(routes::auth::redeem_recovery_code),
+        )
+        .route(
+            "/v1/auth/local/recovery/regenerate",
+            post(routes::auth::regenerate_recovery_codes),
         )
         .merge(v1)
         .layer(TraceLayer::new_for_http())

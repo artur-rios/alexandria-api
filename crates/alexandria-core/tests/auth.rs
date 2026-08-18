@@ -24,3 +24,9 @@ mod recovery_repo;
 
 #[path = "auth/account_status.rs"]
 mod account_status;
+
+#[path = "auth/recovery_redeem.rs"]
+mod recovery_redeem;
+
+#[path = "auth/recovery_regenerate.rs"]
+mod recovery_regenerate;

@@ -2,6 +2,8 @@ pub mod account_status;
 pub mod complete_password_reset;
 pub mod confirm_email;
 pub mod login;
+pub mod redeem_recovery_code;
+pub mod regenerate_recovery_codes;
 pub mod register;
 pub mod request_password_reset;
 pub mod resend_confirmation;

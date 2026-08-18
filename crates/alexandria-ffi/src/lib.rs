@@ -3597,6 +3597,108 @@ pub extern "C" fn alexandria_auth_local_complete_password_reset(
     }
 }
 
+/// Request body for `alexandria_auth_local_redeem_recovery_code` — the same
+/// JSON the HTTP route takes.
+#[derive(Debug)]
+struct RedeemRecoveryCodeBody {
+    code: String,
+    new_password: String,
+    password_confirmation: String,
+}
+
+impl RedeemRecoveryCodeBody {
+    fn from_json_str(s: &str) -> Option<Self> {
+        let value: serde_json::Value = serde_json::from_str(s).ok()?;
+        let obj = value.as_object()?;
+        Some(Self {
+            code: obj.get("code")?.as_str()?.to_string(),
+            new_password: obj.get("newPassword")?.as_str()?.to_string(),
+            password_confirmation: obj.get("passwordConfirmation")?.as_str()?.to_string(),
+        })
+    }
+}
+
+/// Redeem a recovery code for a new password (UC-43 / FR-AU-14 … FR-AU-16).
+/// `json_body` is the JSON body HTTP would send: an object with `code`,
+/// `newPassword`, and `passwordConfirmation`.
+///
+/// Deliberately takes no session token: the code is the credential, and this
+/// is the operation a caller who cannot authenticate uses to get back in.
+/// Every session is invalidated on success.
+#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
+#[no_mangle]
+pub extern "C" fn alexandria_auth_local_redeem_recovery_code(
+    json_body: *const c_char,
+) -> AuthJsonResult {
+    let services = match services_slot().lock().unwrap().clone() {
+        Some(s) => s,
+        None => return AuthJsonResult::err(AUTH_ERR_NOT_INITIALIZED),
+    };
+
+    let body_str = match cstr_lossy(json_body) {
+        Some(s) => s,
+        None => {
+            return AuthJsonResult::rejected("malformed_body", "recovery redeem body is missing")
+        }
+    };
+    let body = match RedeemRecoveryCodeBody::from_json_str(&body_str) {
+        Some(b) => b,
+        None => {
+            return AuthJsonResult::rejected(
+                "malformed_body",
+                "invalid recovery redeem body: expected an object with string 'code', 'newPassword', and 'passwordConfirmation'",
+            )
+        }
+    };
+
+    let result = runtime().block_on(async {
+        services
+            .redeem_recovery_code_handler
+            .redeem(body.code, body.new_password, body.password_confirmation)
+            .await
+    });
+
+    match result {
+        Ok(redemption) => {
+            let json = serde_json::to_string(&redemption).unwrap_or_default();
+            AuthJsonResult::ok(json)
+        }
+        Err(err) => map_auth_err(err),
+    }
+}
+
+/// Replace the owner's recovery codes with a fresh set of ten (UC-44 /
+/// FR-AU-17), invalidating every old one. `token` is the session id the
+/// caller authenticates with, exactly as `alexandria_auth_local_account`
+/// takes it.
+#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
+#[no_mangle]
+pub extern "C" fn alexandria_auth_local_regenerate_recovery_codes(
+    token: *const c_char,
+) -> AuthJsonResult {
+    let services = match services_slot().lock().unwrap().clone() {
+        Some(s) => s,
+        None => return AuthJsonResult::err(AUTH_ERR_NOT_INITIALIZED),
+    };
+
+    let token = cstr_lossy(token).unwrap_or_default();
+
+    let result = runtime().block_on(async {
+        services
+            .regenerate_recovery_codes_handler
+            .regenerate(&token)
+            .await
+    });
+
+    match result {
+        Ok(regeneration) => {
+            let json = serde_json::to_string(&regeneration).unwrap_or_default();
+            AuthJsonResult::ok(json)
+        }
+        Err(err) => map_auth_err(err),
+    }
+}
+
 /// FFI status codes returned by run-status operations (UC-42 / FR-FC-28).
 /// Deliberately separate from `INDEX_*`, `FILE_*`, `COLLECTION_*`, `PLAYBACK_*`,
 /// and `AUTH_*` — per the convention established above — so this surface can

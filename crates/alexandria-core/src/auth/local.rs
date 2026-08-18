@@ -437,6 +437,25 @@ pub enum RecoveryCodeOutcome {
     Unknown,
 }
 
+/// The outcome of redeeming a recovery code (UC-43 / FR-AU-14).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RedeemRecoveryCodeResult {
+    pub success: bool,
+    pub email: String,
+    /// What is left after this redemption. Zero means the next forgotten
+    /// password is unrecoverable, so a client should prompt to regenerate.
+    pub recovery_codes_remaining: u32,
+}
+
+/// The outcome of regenerating the set (UC-44 / FR-AU-17).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RegenerateRecoveryCodesResult {
+    /// The new codes in plaintext, returned exactly once.
+    pub recovery_codes: Vec<String>,
+}
+
 /// Recovery code storage port (UC-43/UC-44). Unit-testable against an
 /// in-memory fake with no database (Testing Specification §6.2).
 #[allow(async_fn_in_trait)]

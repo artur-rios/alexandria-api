@@ -6,7 +6,8 @@ use serde::Deserialize;
 
 use alexandria_core::auth::local::{
     CompletePasswordResetResult, ConfirmEmailResult, LocalAccountResult, LocalCredentialsResult,
-    LocalLoginResult, LocalRegisterResult, RequestPasswordResetResult, ResendConfirmationResult,
+    LocalLoginResult, LocalRegisterResult, RedeemRecoveryCodeResult, RegenerateRecoveryCodesResult,
+    RequestPasswordResetResult, ResendConfirmationResult,
 };
 
 use crate::middleware::auth::invalid_input;
@@ -258,6 +259,70 @@ pub async fn complete_password_reset(
             request.password,
             request.password_confirmation,
         )
+        .await
+        .map_err(ApiError)?;
+
+    Ok((StatusCode::OK, Json(result)))
+}
+
+// ---------------- UC-43/UC-44: recovery codes ----------------
+
+/// Request body for `POST /v1/auth/local/recovery/redeem` — one recovery
+/// code, plus the new password and its confirmation.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RedeemRecoveryCodeRequest {
+    pub code: String,
+    pub new_password: String,
+    pub password_confirmation: String,
+}
+
+/// `POST /v1/auth/local/recovery/redeem` — set a new password using one
+/// recovery code (UC-43 / FR-AU-14 … FR-AU-16). Unauthenticated: the code is
+/// the credential, and this is the operation a caller who cannot
+/// authenticate uses to get back in. Every session is invalidated on
+/// success. Returns `200` with the `RedeemRecoveryCodeResult`, or `400`
+/// carrying `recovery_code_unknown`, `recovery_code_used`, a password-policy
+/// code, or `password_confirmation_mismatch`, `404` (no local account
+/// exists), or `409` (the active auth mode is not local).
+pub async fn redeem_recovery_code(
+    State(state): State<AppState>,
+    body: Result<Json<RedeemRecoveryCodeRequest>, JsonRejection>,
+) -> Result<(StatusCode, Json<RedeemRecoveryCodeResult>), ApiError> {
+    let Json(request) =
+        body.map_err(|err| invalid_input(format!("invalid recovery redeem body: {err}")))?;
+
+    let result = state
+        .services
+        .redeem_recovery_code_handler
+        .redeem(
+            request.code,
+            request.new_password,
+            request.password_confirmation,
+        )
+        .await
+        .map_err(ApiError)?;
+
+    Ok((StatusCode::OK, Json(result)))
+}
+
+/// `POST /v1/auth/local/recovery/regenerate` — replace the owner's recovery
+/// codes with a fresh set of ten, invalidating every old one (UC-44 /
+/// FR-AU-17). Authenticated: this is the owner who still has access,
+/// topping up before they need it, so it enforces authentication in its own
+/// handler like `/account` and `/email/resend` do. Returns `200` with the
+/// `RegenerateRecoveryCodesResult`, or `401`, `404` (no local account
+/// exists), or `409` (the active auth mode is not local).
+pub async fn regenerate_recovery_codes(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<(StatusCode, Json<RegenerateRecoveryCodesResult>), ApiError> {
+    let token = bearer_token(&headers);
+
+    let result = state
+        .services
+        .regenerate_recovery_codes_handler
+        .regenerate(&token)
         .await
         .map_err(ApiError)?;
 

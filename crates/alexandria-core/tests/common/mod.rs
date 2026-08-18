@@ -1594,6 +1594,17 @@ impl FakeLocalCredentialRepository {
             email_confirmed_at: None,
         });
     }
+
+    /// The stored password hash, for a test that only needs to know whether
+    /// it changed rather than what it is.
+    pub fn stored_hash(&self) -> String {
+        self.credential
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|c| c.password_hash.clone())
+            .unwrap_or_default()
+    }
 }
 
 impl LocalCredentialRepository for FakeLocalCredentialRepository {
@@ -1747,6 +1758,12 @@ impl FakeSessionRepository {
 
     pub fn count(&self) -> usize {
         self.sessions.lock().unwrap().len()
+    }
+
+    /// Whether every session is gone — the postcondition a redemption or a
+    /// reset must leave behind.
+    pub fn all_deleted(&self) -> bool {
+        self.count() == 0
     }
 }
 
