@@ -149,7 +149,7 @@ Windows account the server process runs as.
 | [#96](https://github.com/artur-rios/alexandria-api/issues/96) | UC-41 | &#9744; | Register the local account | FR-AU-10, FR-AU-11, FR-AU-13, FR-AU-19 |
 | — | UC-43 | &#9745; | Redeem a recovery code | FR-AU-11, FR-AU-14, FR-AU-15, FR-AU-16 |
 | — | UC-44 | &#9745; | Regenerate recovery codes | FR-AU-17, FR-AU-19 |
-| — | UC-45 | &#9745; | Log in with the Windows account | FR-AU-20, FR-AU-21, FR-AU-22, FR-AU-24 |
+| — | UC-45 | &#9745; | Log in with the Windows account | FR-AU-20, FR-AU-22 |
 
 ### F-10 — Media playback
 

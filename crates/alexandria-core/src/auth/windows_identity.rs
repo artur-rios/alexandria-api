@@ -49,10 +49,10 @@ pub fn verify_owner(
     )))
 }
 
-#[cfg(windows)]
 // The Win32 token API is raw FFI with no safe wrapper; the exception is
 // scoped to this one function, in the same spirit as `alexandria-ffi`'s
 // `#[allow(unsafe_code)]` on its `#[no_mangle]` exports.
+#[cfg(windows)]
 #[allow(unsafe_code)]
 impl WindowsIdentity for ProcessWindowsIdentity {
     fn current_sid(&self) -> Result<String, DomainError> {
@@ -209,6 +209,14 @@ mod tests {
     #[test]
     fn given_surrounding_whitespace_in_the_configured_sid_when_verified_then_ok() {
         assert!(verify_owner(&reporting(OWNER), &format!("  {OWNER}  ")).is_ok());
+    }
+
+    /// The trim is symmetric: an identity implementation that reports a padded
+    /// SID has still named the configured account. Asserted separately because
+    /// trimming only the configured side would pass the test above.
+    #[test]
+    fn given_surrounding_whitespace_in_the_reported_sid_when_verified_then_ok() {
+        assert!(verify_owner(&reporting(&format!("  {OWNER}  ")), OWNER).is_ok());
     }
 
     /// The non-Windows stub's failure must reach the operator as-is, not be

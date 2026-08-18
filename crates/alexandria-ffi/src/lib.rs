@@ -179,13 +179,19 @@ pub extern "C" fn alexandria_index_init(db_path: *const c_char) -> c_int {
     settings.database.path = path.clone();
     // Same gate as the HTTP binary: a misconfigured mode is a startup failure
     // on both surfaces (FR-AU-08).
-    if settings.auth.validate().is_err() {
+    // Both messages are logged rather than discarded: the embedder only gets an
+    // opaque status code back, and FFI is the surface an operator is most
+    // likely to hit a misconfiguration on. A SID names an account rather than
+    // authenticating one, so naming both of them costs nothing (FR-AU-21).
+    if let Err(err) = settings.auth.validate() {
+        tracing::error!(error = %err, "auth configuration is invalid; refusing to initialize");
         return INDEX_ERR_OTHER;
     }
-    if settings.auth.mode == AuthMode::Windows
-        && verify_owner(&ProcessWindowsIdentity, &settings.auth.windows_owner_sid).is_err()
-    {
-        return INDEX_ERR_OTHER;
+    if settings.auth.mode == AuthMode::Windows {
+        if let Err(err) = verify_owner(&ProcessWindowsIdentity, &settings.auth.windows_owner_sid) {
+            tracing::error!(error = %err, "windows-mode startup check failed");
+            return INDEX_ERR_OTHER;
+        }
     }
     let _ = runtime();
     let result = runtime().block_on(async {

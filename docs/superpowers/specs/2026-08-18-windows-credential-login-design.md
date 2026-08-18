@@ -147,10 +147,15 @@ variant wrapping the same session repository and clock the `Local` variant uses.
 - `config.rs`: `AuthMode` gains `Windows`; `AuthSettings` gains
   `windows_owner_sid: String` with an `ALEXANDRIA_AUTH_WINDOWS_OWNER_SID`
   override; `AuthSettings::validate` gains the Windows-mode arm.
-- `services.rs`: a third arm on the `AuthMode` match.
-- The five local-mode handlers already reject a non-local mode; their checks read
-  `mode != AuthMode::Local` and so need no change, which is worth verifying
-  rather than assuming during implementation.
+- `services.rs`: a third arm on the `AuthMode` match. The SID check is *not*
+  here — see Data flow §1 for why it sits in the two binaries instead.
+- `alexandria-http`'s `main.rs` and `alexandria-ffi`'s `alexandria_index_init`:
+  the Windows-mode startup gate, run before services are built.
+- Four of the five local-mode handlers already reject a non-local mode; their
+  checks read `mode != AuthMode::Local` and so need no change. The fifth,
+  `account_status.rs`, held no mode check at all — verifying rather than
+  assuming is what found it — so it gains the same guard and takes the active
+  mode from `services.rs` like its siblings.
 
 ### Configuration
 
@@ -174,9 +179,16 @@ One operation, on both surfaces (FR-AU-08).
 
 ### Data flow
 
-1. **Startup:** `AuthSettings::validate` confirms the key is set; `services.rs`
-   then reads the process SID and compares. A failure at either point stops the
-   process before it binds a port.
+1. **Startup:** `AuthSettings::validate` confirms the key is set; each binary —
+   `alexandria-http`'s `main.rs` and `alexandria-ffi`'s
+   `alexandria_index_init` — then reads the process SID and compares, before it
+   builds services. A failure at either point stops the process before it binds
+   a port (or, on the FFI surface, before initialization returns success).
+   The gate lives in the two binaries rather than in `build_services` because
+   `build_services` returns `Services`, not `Result<Services>`. The consequence
+   is worth stating plainly: `build_services` is public, so any consumer that
+   calls it directly gets Windows mode with no SID check. The gate is an
+   entry-point responsibility, not a library one.
 2. **Login:** the handler confirms the active mode is Windows and mints a session
    with the configured TTL. It does *not* re-read the SID — startup settled that,
    and a per-request read would answer the same question at a syscall's cost.

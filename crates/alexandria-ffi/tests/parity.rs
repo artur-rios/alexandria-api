@@ -8900,7 +8900,7 @@ async fn given_windows_mode_when_logged_in_via_http_and_ffi_then_both_return_a_s
     http_settings.auth.windows_owner_sid = owner_sid.clone();
     let http_services =
         std::sync::Arc::new(build_services(&http_settings, http_pool.clone()).await);
-    let router = app(Settings::default(), http_services);
+    let router = app(Settings::default(), http_services.clone());
 
     let login_req = Request::builder()
         .method("POST")
@@ -8912,6 +8912,52 @@ async fn given_windows_mode_when_logged_in_via_http_and_ffi_then_both_return_a_s
     let http_login_body: serde_json::Value =
         serde_json::from_slice(&to_bytes(login_resp.into_body(), usize::MAX).await.unwrap())
             .unwrap();
+
+    // FR-AU-22: the session the mode mints has to actually admit the caller —
+    // otherwise "Windows mode authenticates you" is asserted nowhere. Present
+    // it on a gated route and require anything but a 401. The status itself is
+    // not the claim (an empty catalog may answer many ways); being let past
+    // `RuntimeAuthService::Windows::authenticate` is.
+    let http_session_id = http_login_body["sessionId"]
+        .as_str()
+        .expect("sessionId")
+        .to_string();
+    let gated_req = Request::builder()
+        .method("GET")
+        .uri("/v1/files")
+        .header("authorization", &format!("Bearer {http_session_id}"))
+        .body(Body::empty())
+        .unwrap();
+    let gated_resp = app(Settings::default(), http_services.clone())
+        .oneshot(gated_req)
+        .await
+        .expect("http gated request");
+    assert_ne!(
+        gated_resp.status(),
+        axum::http::StatusCode::UNAUTHORIZED,
+        "a session minted by windows login must authenticate a later request"
+    );
+
+    // The negative half, so the assertion above cannot pass by the gate being
+    // absent: an id that was never minted is still rejected.
+    let unknown_req = Request::builder()
+        .method("GET")
+        .uri("/v1/files")
+        .header(
+            "authorization",
+            &format!("Bearer {}", uuid::Uuid::new_v4()),
+        )
+        .body(Body::empty())
+        .unwrap();
+    let unknown_resp = app(Settings::default(), http_services.clone())
+        .oneshot(unknown_req)
+        .await
+        .expect("http gated request with an unknown session");
+    assert_eq!(
+        unknown_resp.status(),
+        axum::http::StatusCode::UNAUTHORIZED,
+        "an unminted session id must not authenticate"
+    );
 
     // ---- FFI leg ----
     // `alexandria_index_init` loads settings via `load_settings()`

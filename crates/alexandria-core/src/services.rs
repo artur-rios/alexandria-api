@@ -611,6 +611,7 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         auth.clone(),
         credential_repo.clone(),
         recovery_code_repo.clone(),
+        settings.auth.mode,
     ));
     let redeem_recovery_code_handler = Arc::new(RedeemRecoveryCodeHandler::new(
         credential_repo.clone(),

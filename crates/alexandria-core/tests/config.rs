@@ -380,6 +380,33 @@ windows_owner_sid = "S-1-5-21-1004336348-1177238915-682003330-1001"
     );
 }
 
+/// The Windows keys take environment overrides like every other auth key: the
+/// documented single-user install configures the mode and the owner SID from
+/// the environment, with no config file on disk at all. Both are asserted in
+/// one test, under one lock, because they share the process-global
+/// environment; see `EnvGuard`.
+#[test]
+fn given_windows_environment_variables_when_settings_loaded_then_they_override_the_file() {
+    let _env = EnvGuard::set(&[
+        ("ALEXANDRIA_AUTH_MODE", "windows"),
+        (
+            "ALEXANDRIA_AUTH_WINDOWS_OWNER_SID",
+            "S-1-5-21-1004336348-1177238915-682003330-1001",
+        ),
+    ]);
+
+    let settings = Settings::load_or_default(std::path::Path::new(
+        "no-such-config-file-for-this-test.toml",
+    ));
+
+    assert_eq!(settings.auth.mode, AuthMode::Windows);
+    assert_eq!(
+        settings.auth.windows_owner_sid,
+        "S-1-5-21-1004336348-1177238915-682003330-1001"
+    );
+    assert!(settings.auth.validate().is_ok());
+}
+
 /// A mode that names no account is a mode with no authentication at all: a
 /// process started as the wrong account — SYSTEM, say — would serve the
 /// catalog anyway.
