@@ -46,20 +46,6 @@ local_db = false
 # Ignored when mode = "external".
 session_ttl_hours = 24
 
-# Local mode only: how long an e-mail confirmation code stays usable. Generous,
-# because the owner may not read the message the day it arrives, and the code is
-# single-use and unguessable anyway.
-confirmation_ttl_hours = 24
-
-# Local mode only: how long a password-reset token stays usable. Deliberately
-# shorter than a confirmation code — this one can take over the account.
-password_reset_ttl_minutes = 60
-
-# Local mode only: the shortest gap between two confirmation sends. A resend
-# inside it is refused with 429 and the number of seconds remaining, so a client
-# can show a countdown rather than an error.
-resend_interval_seconds = 60
-
 [http]
 # Bind address. Loopback by default so the API is reachable only from the local
 # machine unless explicitly reconfigured (see IR-03).
@@ -107,14 +93,3 @@ level = "info"
 # file's bytes invalidates its thumbnail automatically. Nothing evicts old
 # entries; delete the directory to reclaim the space.
 thumbnail_cache_dir = "thumbnails"
-[mail]
-# The outbound mail provider. "none" — the default and, until the external mail
-# service is integrated, the only value — never sends and reports
-# `mail_not_configured` to the caller. Confirmation and password reset are fully
-# implemented behind it: the state, the tokens, the expiry, and every refusal
-# are live, and only delivery is missing. Registration still succeeds, reporting
-# `confirmationSent: false`.
-provider = "none"
-
-# The address outbound messages are sent from. Unused while provider = "none".
-from_address = ""

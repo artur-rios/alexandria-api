@@ -75,10 +75,6 @@ where
         Ok(LocalLoginResult {
             success: true,
             session_id,
-            // Issue #102: reported on the call the client already makes. An
-            // unconfirmed address never blocks the login itself — the core
-            // gates nothing on confirmation (FR-AU-13).
-            email_confirmed: credential.email_confirmed(),
         })
     }
 }

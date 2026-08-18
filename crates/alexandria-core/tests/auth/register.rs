@@ -16,15 +16,13 @@ use alexandria_core::config::AuthMode;
 use alexandria_core::errors::DomainError;
 
 use crate::common::{
-    FailingMailSender, FailingSessionRepository, FakeAuthTokenRepository,
-    FakeLocalCredentialRepository, FakeMailSender, FakeRecoveryCodeRepository,
+    FailingSessionRepository, FakeLocalCredentialRepository, FakeRecoveryCodeRepository,
     FakeSessionRepository, RacingLocalCredentialRepository,
 };
 
 const EMAIL: &str = "owner@example.com";
 const PASSWORD: &str = "correct horse battery";
 const TTL_HOURS: u32 = 24;
-const CONFIRMATION_TTL_HOURS: u32 = 24;
 
 fn clock() -> FixedClock {
     FixedClock(Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap())
@@ -33,32 +31,17 @@ fn clock() -> FixedClock {
 type TestRegisterHandler = RegisterLocalAccountHandler<
     FakeLocalCredentialRepository,
     FakeSessionRepository,
-    FakeAuthTokenRepository,
-    FakeMailSender,
     FixedClock,
     FakeRecoveryCodeRepository,
 >;
 
-/// The handler with a mail sender that succeeds — the path the external mail
-/// service will take once it is integrated. The unconfigured-transport path
-/// that every install takes today is covered separately, below.
 fn handler(
     credentials: FakeLocalCredentialRepository,
     sessions: FakeSessionRepository,
     recovery_codes: FakeRecoveryCodeRepository,
     mode: AuthMode,
 ) -> TestRegisterHandler {
-    RegisterLocalAccountHandler::new(
-        credentials,
-        sessions,
-        recovery_codes,
-        FakeAuthTokenRepository::new(),
-        FakeMailSender::new(),
-        clock(),
-        mode,
-        TTL_HOURS,
-        CONFIRMATION_TTL_HOURS,
-    )
+    RegisterLocalAccountHandler::new(credentials, sessions, recovery_codes, clock(), mode, TTL_HOURS)
 }
 
 /// Fresh credential, session, and recovery-code fakes wired through
@@ -247,12 +230,9 @@ async fn given_a_row_appears_between_the_check_and_the_write_when_register_then_
         credentials.clone(),
         sessions.clone(),
         FakeRecoveryCodeRepository::new(),
-        FakeAuthTokenRepository::new(),
-        FakeMailSender::new(),
         clock(),
         AuthMode::Local,
         TTL_HOURS,
-        CONFIRMATION_TTL_HOURS,
     );
 
     let err = h
@@ -381,12 +361,9 @@ async fn given_session_creation_fails_when_register_then_errors_but_the_account_
         credentials.clone(),
         FailingSessionRepository,
         FakeRecoveryCodeRepository::new(),
-        FakeAuthTokenRepository::new(),
-        FakeMailSender::new(),
         clock(),
         AuthMode::Local,
         TTL_HOURS,
-        CONFIRMATION_TTL_HOURS,
     );
 
     let err = h
@@ -403,91 +380,6 @@ async fn given_session_creation_fails_when_register_then_errors_but_the_account_
     assert_eq!(
         stored.email, EMAIL,
         "AF-06: the account exists; the caller obtains a session via UC-34"
-    );
-}
-
-// ---------------- AF-06: the confirmation message (issue #102) ----------------
-
-#[tokio::test]
-async fn given_a_working_transport_when_register_then_a_confirmation_is_sent() {
-    let credentials = FakeLocalCredentialRepository::new();
-    let sessions = FakeSessionRepository::new();
-    let tokens = FakeAuthTokenRepository::new();
-    let mail = FakeMailSender::new();
-    let h = RegisterLocalAccountHandler::new(
-        credentials,
-        sessions,
-        FakeRecoveryCodeRepository::new(),
-        tokens.clone(),
-        mail.clone(),
-        clock(),
-        AuthMode::Local,
-        TTL_HOURS,
-        CONFIRMATION_TTL_HOURS,
-    );
-
-    let result = h
-        .register(
-            EMAIL.to_string(),
-            PASSWORD.to_string(),
-            PASSWORD.to_string(),
-        )
-        .await
-        .expect("registration must succeed");
-
-    assert!(result.confirmation_sent);
-    assert_eq!(result.confirmation_error, None);
-    assert!(
-        !result.email_confirmed,
-        "creating the account never confirms the address"
-    );
-    assert_eq!(mail.sent().len(), 1);
-    assert_eq!(tokens.count(), 1);
-}
-
-#[tokio::test]
-async fn given_no_transport_when_register_then_the_account_survives_and_says_it_was_not_sent() {
-    // UC-01 AF-06 — "the account is created but the core reports that the
-    // confirmation message could not be sent". This is every install today:
-    // delivery is an external service that is not yet integrated.
-    let credentials = FakeLocalCredentialRepository::new();
-    let sessions = FakeSessionRepository::new();
-    let tokens = FakeAuthTokenRepository::new();
-    let h = RegisterLocalAccountHandler::new(
-        credentials.clone(),
-        sessions.clone(),
-        FakeRecoveryCodeRepository::new(),
-        tokens.clone(),
-        FailingMailSender,
-        clock(),
-        AuthMode::Local,
-        TTL_HOURS,
-        CONFIRMATION_TTL_HOURS,
-    );
-
-    let result = h
-        .register(
-            EMAIL.to_string(),
-            PASSWORD.to_string(),
-            PASSWORD.to_string(),
-        )
-        .await
-        .expect("a failed send must not fail the registration");
-
-    assert!(result.success);
-    assert!(!result.confirmation_sent);
-    assert_eq!(
-        result.confirmation_error.as_deref(),
-        Some("mail_not_configured"),
-        "the caller must learn why, not just that it failed"
-    );
-    // The account is the thing the caller asked for, and it is here.
-    assert!(credentials.get().await.unwrap().is_some());
-    assert_eq!(sessions.count(), 1, "the session is still opened");
-    assert_eq!(
-        tokens.count(),
-        0,
-        "a code for a message that was never sent must not survive"
     );
 }
 

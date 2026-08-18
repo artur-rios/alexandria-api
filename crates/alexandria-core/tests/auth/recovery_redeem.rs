@@ -1,7 +1,6 @@
 //! Unit tests for the UC-43 `RedeemRecoveryCodeHandler`: redeem one recovery
 //! code for a new password, against trait fakes — no real DB or auth
-//! service. Modeled on `tests/auth/password_reset.rs`, the closest existing
-//! analogue (also unauthenticated, also invalidates every session).
+//! service. Unauthenticated, and invalidates every session on success.
 
 use chrono::{TimeZone, Utc};
 

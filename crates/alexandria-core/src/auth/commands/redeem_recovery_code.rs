@@ -116,8 +116,7 @@ where
         }
 
         // `set_password_hash`, not `upsert`: this changes the credential,
-        // never who the account belongs to, and leaves `email_confirmed_at`
-        // alone for the same reason `CompletePasswordResetHandler` does.
+        // never who the account belongs to.
         self.credentials
             .set_password_hash(&password_hash, now)
             .await?;
