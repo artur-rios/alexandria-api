@@ -119,7 +119,7 @@ database instead.
 | **F-06** | Bookmark management | Create, update, soft-delete and restore, hard-purge, and browse browser bookmarks organized in bookmark collections. |
 | **F-07** | Watchlists | Create and delete watchlists, add videos, update watch progress (per episode for series), and remove videos. |
 | **F-08** | Reading lists | Create and delete reading lists, add books and comic books, update read progress (per issue for comic series), and remove items. |
-| **F-09** | Pluggable authentication | Authenticate the single owner via either an external JWT service or local hashed-credential login, selected at startup; authorize every operation. |
+| **F-09** | Pluggable authentication | Authenticate the single owner via an external JWT service, local hashed-credential login, or the Windows account the server process runs as, selected at startup; authorize every operation. |
 | **F-10** | Dual-transport parity | Expose the same domain operations over HTTP/REST-JSON and a Rust FFI surface with identical results. |
 
 These `F-xx` IDs are traced to requirement ranges in

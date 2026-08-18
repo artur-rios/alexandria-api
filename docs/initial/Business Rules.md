@@ -54,7 +54,7 @@ The owner is a single implicit principal; entities carry no per-user foreign key
 | **BR-14** | SOLID principles and a Command/Query (CQRS-style) organization are the baseline for the core library's operations. | Mandated design approach from the brainstorm. |
 | **BR-15** | Reading lists apply only to book Documents and ComicBooks. Watchlists apply only to VideoFiles. Reading lists and watchlists never overlap their target file kinds. | Each kind of consumption tracking is meaningful only for its matching media. |
 | **BR-16** | For a comic book series, reading progress is tracked per issue; for a single book, as a single item. | Reflects how books and comics are consumed (parallel to BR-06). |
-| **BR-17** | Exactly one auth mode (external JWT or local login) is active at a time, selected by startup configuration. A caller authenticated by the inactive mode is rejected. | Avoid ambiguity in the trust boundary; keep the model simple per deployment. |
+| **BR-17** | Exactly one auth mode (external JWT, local login, or Windows account) is active at a time, selected by startup configuration. A caller authenticated by an inactive mode is rejected. | Avoid ambiguity in the trust boundary; keep the model simple per deployment. |
 | **BR-18** | Local-login credentials (email and a salted/hashed password) live in a single SQLite row and are set or changed via a local setup command. The plaintext password is never stored and never logged. | Protect the single user's credentials on a local-only desktop deployment. |
 | **BR-19** | Deleting a ReadingList removes its ReadingProgress entries only. Its target Documents and ComicBooks are preserved. | Removing a tracking list should not remove the catalogued items. |
 
@@ -86,7 +86,7 @@ The owner is a single implicit principal; entities carry no per-user foreign key
 | Role | Operations |
 | --- | --- |
 | **Owner (authenticated caller)** | All CRUD on files, bookmarks, collections, watchlists, watch progress, reading lists, and reading progress; initiate indexing; soft and hard delete; explicit purge-on-disk. In local-login mode, also setting/changing the local credentials via a local setup command. |
-| **Unauthenticated caller** | None. Every operation requires a valid credential (a JWT in external mode, or local-login credentials in local mode). |
+| **Unauthenticated caller** | None. Every operation requires a valid credential (a JWT in external mode, local-login credentials in local mode, or a session opened via the Windows account in Windows mode). |
 
 There is a single role — the authenticated owner. No administrative or
 read-only role is distinguished in this scope.
