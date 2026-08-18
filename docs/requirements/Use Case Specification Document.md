@@ -17,7 +17,7 @@ identifier defined in [System Requirements Document](System%20Requirements%20Doc
 | Actor | Description |
 | --- | --- |
 | **Owner** | The single authenticated user performing catalog operations. Authenticated via the active auth mode (external JWT or local login). |
-| **External Auth Service** | An external system that issues JWTs and (via JWKS/shared secret) lets Alexandria validate them. Actor in external mode only. |
+| **External Auth Service** | An external system that issues JWTs and, via a signing secret shared with Alexandria, lets Alexandria verify them offline. Actor in external mode only. |
 | **Local Filesystem** | The on-disk store the system indexes, renames into, and writes text content back to. |
 
 ### 1.3 Use Case Overview
@@ -1108,7 +1108,7 @@ UC-36's externally issued JWT.
 | **ID** | UC-36 |
 | **Name** | Authenticate via external JWT |
 | **Actors** | Owner, External Auth Service |
-| **Description** | Validate the caller's bearer JWT against the external auth service on each request. |
+| **Description** | Verify the caller's bearer JWT offline, on each request, against a configured signing secret shared with the external auth service. |
 | **Preconditions** | The active auth mode is external JWT. |
 | **Postconditions** | On success the caller is authenticated as the owner for the requested operation; on failure the request is denied. |
 | **Requirements** | FR-AU-01, FR-AU-02, FR-AU-03, FR-AU-07, FR-AU-08 |
@@ -1117,16 +1117,25 @@ UC-36's externally issued JWT.
 
 1. The caller presents a bearer JWT on a request.
 2. The system confirms the active auth mode is external JWT.
-3. The system validates the JWT signature and claims against the external auth service's keys.
-4. The system authenticates the caller as the owner and proceeds with the requested operation.
+3. The system verifies the JWT's signature against the configured signing secret, requiring the configured algorithm rather than the one the token's header names, and validates its expiry and not-before times (and its issuer and audience when those are configured).
+4. The system confirms the token is a full authentication token rather than a two-factor challenge, and that it names the configured scope — as the scope its holder belongs to, or as one of the scopes they own.
+5. The system authenticates the caller as the owner and proceeds with the requested operation.
 
 **Alternative Flows**
 
 | ID | Condition | Outcome |
 | --- | --- | --- |
 | AF-01 | The active auth mode is local login (external JWT inactive) | The system rejects the JWT with an unauthorized error. |
-| AF-02 | The JWT is missing, expired, or has an invalid signature | The system denies with an unauthorized error. |
-| AF-03 | The external auth service is unreachable | The system denies with a service-unavailable error. |
+| AF-02 | The JWT is missing, malformed, expired, not yet valid, signed with an unconfigured key, or names an algorithm other than the configured one | The system denies with an unauthorized error. |
+| AF-03 | The JWT is a two-factor challenge token rather than a full authentication token | The system denies with an unauthorized error. |
+| AF-04 | The JWT is valid but names no scope, or a scope other than the configured one | The system denies with an unauthorized error. |
+
+> Every alternative flow answers identically — an unauthorized error with no
+> reason code — so a caller cannot learn which check refused them. External
+> mode makes no call to the external service, so there is no unreachable-service
+> outcome: verification is offline against a configured secret, and Alexandria
+> authenticates whether or not that service is running. Configuration that
+> makes verification impossible is a startup failure, not a per-request one.
 
 ---
 

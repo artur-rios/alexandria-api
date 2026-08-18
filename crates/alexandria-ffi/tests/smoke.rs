@@ -134,6 +134,69 @@ fn wait_for_files(expected: i64) -> i64 {
     }
 }
 
+/// The FFI surface runs the same startup gate as the HTTP binary: external
+/// mode with nothing to verify a token against must refuse to initialize
+/// rather than come up and answer `401` to everything forever (FR-AU-08,
+/// UC-36). Untested, this is easy to lose — `default_auth_mode()` is
+/// `External` and `load_or_default` swallows a missing config file, so every
+/// other test in this file has to force `local` to get past it, and none of
+/// them would notice the gate disappearing.
+///
+/// Serialized behind `serial()` like every other test here, because it writes
+/// the process-global environment `alexandria_index_init` reads and would
+/// otherwise flip the auth mode out from under a concurrent test. It leaves
+/// the mode as it found it, and never reaches the global services slot: the
+/// gate runs before the slot is touched.
+#[test]
+fn given_external_mode_without_a_secret_when_ffi_init_then_refuses_to_start() {
+    // Arrange
+    let _g = serial();
+    let previous_mode = std::env::var("ALEXANDRIA_AUTH_MODE").ok();
+    std::env::set_var("ALEXANDRIA_AUTH_MODE", "external");
+    // The overrides an ambient environment might carry would configure the
+    // very thing this test asserts is missing.
+    for key in [
+        "ALEXANDRIA_AUTH_HEIMDALL_TOKEN_SECRET",
+        "ALEXANDRIA_AUTH_HEIMDALL_TOKEN_SECRET_PREVIOUS",
+        "ALEXANDRIA_AUTH_HEIMDALL_SCOPE_ID",
+    ] {
+        std::env::remove_var(key);
+    }
+    // A config path that does not exist, so `load_or_default` falls back to
+    // defaults rather than reading whatever `config.toml` the working
+    // directory happens to hold.
+    std::env::set_var(
+        "ALEXANDRIA_CONFIG",
+        "no-such-config-file-for-this-test.toml",
+    );
+
+    let dir = tempdir().unwrap();
+    let db = dir.path().join("gate.sqlite");
+    let cpath = CString::new(db.to_str().unwrap()).unwrap();
+
+    // Act
+    let status = alexandria_index_init(cpath.as_ptr());
+
+    // Restore before asserting, so a failure cannot leak `external` into the
+    // rest of the file.
+    std::env::remove_var("ALEXANDRIA_CONFIG");
+    match previous_mode {
+        Some(mode) => std::env::set_var("ALEXANDRIA_AUTH_MODE", mode),
+        None => std::env::remove_var("ALEXANDRIA_AUTH_MODE"),
+    }
+
+    // Assert
+    assert_eq!(
+        status,
+        alexandria_ffi::INDEX_ERR_OTHER,
+        "external mode with no signing secret must fail startup"
+    );
+    assert!(
+        !db.exists(),
+        "the gate runs before the database is created or the services slot is filled"
+    );
+}
+
 #[test]
 fn given_ffi_library_when_version_called_then_returns_version_string() {
     let _g = serial();

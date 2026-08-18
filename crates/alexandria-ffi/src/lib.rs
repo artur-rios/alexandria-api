@@ -175,6 +175,11 @@ pub extern "C" fn alexandria_index_init(db_path: *const c_char) -> c_int {
     };
     let mut settings = load_settings();
     settings.database.path = path.clone();
+    // Same gate as the HTTP binary: a misconfigured external mode is a
+    // startup failure on both surfaces (FR-AU-08).
+    if settings.auth.validate().is_err() {
+        return INDEX_ERR_OTHER;
+    }
     let _ = runtime();
     let result = runtime().block_on(async {
         let pool = migrate_database(&path).await?;

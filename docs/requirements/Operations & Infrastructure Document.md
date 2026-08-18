@@ -142,7 +142,11 @@ keys — a key not listed here does not exist, and only the keys showing an
 | Concern | Mechanism | Notes |
 | --- | --- | --- |
 | `auth.mode` | config / `ALEXANDRIA_AUTH_MODE` | one of `external`, `local`; selects the single active auth mode (FR-AU-01). |
-| `auth.jwks_url` | config / `ALEXANDRIA_AUTH_JWKS_URL` | external mode only; where JWT keys are fetched. |
+| `auth.heimdall_token_secret` | config / `ALEXANDRIA_AUTH_HEIMDALL_TOKEN_SECRET` | external mode only; the HS256 secret Heimdall signs with. Required — startup fails without it. Prefer the environment variable; never commit it. |
+| `auth.heimdall_token_secret_previous` | config / `ALEXANDRIA_AUTH_HEIMDALL_TOKEN_SECRET_PREVIOUS` | external mode only; the secret Heimdall is rotating away from. Both are accepted, so a rotation there causes no outage here. |
+| `auth.heimdall_scope_id` | config / `ALEXANDRIA_AUTH_HEIMDALL_SCOPE_ID` | external mode only; UUID of the Heimdall scope whose members are accepted as the owner. Required — startup fails without it. |
+| `auth.heimdall_issuer` | config / `ALEXANDRIA_AUTH_HEIMDALL_ISSUER` | external mode only; checked only when set. |
+| `auth.heimdall_audience` | config / `ALEXANDRIA_AUTH_HEIMDALL_AUDIENCE` | external mode only; checked only when set. |
 | `auth.local_db` | config | local mode only; flag indicating local credentials are in SQLite. |
 | `auth.session_ttl_hours` | config / `ALEXANDRIA_AUTH_SESSION_TTL_HOURS` | local mode only; how long a login session stays valid; default `24` (FR-AU-09). |
 | `auth.confirmation_ttl_hours` | config / `ALEXANDRIA_AUTH_CONFIRMATION_TTL_HOURS` | local mode only; how long an e-mail confirmation code stays usable; default `24` (FR-AU-14). |
@@ -161,9 +165,18 @@ keys — a key not listed here does not exist, and only the keys showing an
 
 **Secrets:** local-login credentials live only in the SQLite credential row
 (never in config or env), and the password is held there only as a one-way
-salted Argon2 hash — the row cannot be reversed back to the plaintext. JWT
-signing keys are never stored by Alexandria — only the JWKS endpoint URL is
-configured.
+salted Argon2 hash — the row cannot be reversed back to the plaintext. In
+external mode, Alexandria verifies JWTs offline against the Heimdall signing
+secret configured in `auth.heimdall_token_secret` (and, during rotation,
+`auth.heimdall_token_secret_previous`) — the secret is shared configuration,
+not fetched from Heimdall at request time.
+
+#### Registering Alexandria with Heimdall (external mode)
+
+1. In Heimdall, as a Scope Admin who owns the scope, `POST /api/scopes/{scopeId}/applications` with Alexandria's name. This records the relationship; it issues no credential, and Alexandria needs none.
+2. Copy Heimdall's `HEIMDALL_AUTH_TOKEN_SECRET` into Alexandria's `ALEXANDRIA_AUTH_HEIMDALL_TOKEN_SECRET`, and the scope's UUID into `ALEXANDRIA_AUTH_HEIMDALL_SCOPE_ID`.
+3. Smoke-check the pair: log in to Heimdall as a person in that scope (`POST /api/auth/login`, completing two-factor if enabled) and call any authenticated Alexandria endpoint with the returned token. A `200` confirms the claim names and the secret match; a `401` means one of them does not.
+4. To rotate the secret: set `ALEXANDRIA_AUTH_HEIMDALL_TOKEN_SECRET_PREVIOUS` to the secret in use, set the current one to the new value on both sides, restart both, and clear the previous variable after one token lifetime.
 
 ---
 

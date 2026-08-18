@@ -170,7 +170,7 @@ graph LR
 | ID | Requirement |
 | --- | --- |
 | FR-AU-01 | The system shall read the active authentication mode from startup configuration; exactly one mode (external JWT or local login) shall be active at runtime. |
-| FR-AU-02 | In external mode, the system shall validate each caller's JWT against the external authentication service. |
+| FR-AU-02 | In external mode, the system shall verify each caller's JWT against a configured signing secret shared with the external authentication service, and shall accept the caller as the owner only when the token names the configured scope. |
 | FR-AU-03 | The system shall accept only the active auth mode and shall reject credentials presented via the inactive mode. |
 | FR-AU-04 | In local mode, the system shall verify the caller's email and password against the salted Argon2 password hash stored in the SQLite credential row. |
 | FR-AU-05 | The system shall provide a local setup operation to set or change local-login credentials (email and password). |
@@ -501,7 +501,7 @@ endpoint requires authentication from the active mode (see §7).
 | POST | /v1/auth/local/password/reset | Request a password reset for an address. | FR-AU-16, FR-AU-19 |
 | POST | /v1/auth/local/password/reset/complete | Replace the password with a reset token. | FR-AU-16, FR-AU-17 |
 
-External JWT validation (FR-AU-02) is enforced by HTTP middleware on every
+External JWT verification (FR-AU-02) is enforced by HTTP middleware on every
 request, not by an endpoint. The same middleware validates the local-mode
 session id (FR-AU-09); both are presented as `Authorization: Bearer <value>`.
 
