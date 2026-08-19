@@ -19,18 +19,18 @@ use alexandria_core::services::build_services;
 use alexandria_ffi::{
     alexandria_auth_local_login, alexandria_auth_local_redeem_recovery_code,
     alexandria_auth_local_regenerate_recovery_codes, alexandria_auth_local_register,
-    alexandria_bookmark_create, alexandria_bookmark_purge, alexandria_bookmark_restore,
-    alexandria_bookmark_soft_delete, alexandria_bookmark_update, alexandria_bookmarks_list,
-    alexandria_collection_add_items, alexandria_collection_create, alexandria_collection_delete,
-    alexandria_collection_list_items, alexandria_collection_remove_item,
-    alexandria_collection_rename, alexandria_comic_page, alexandria_file_edit_content,
-    alexandria_file_edit_metadata, alexandria_file_get_by_uuid, alexandria_file_playback_source,
-    alexandria_file_purge, alexandria_file_purge_on_disk, alexandria_file_read_content,
-    alexandria_file_rename, alexandria_file_restore, alexandria_file_soft_delete,
-    alexandria_file_thumbnail, alexandria_files_list, alexandria_free_string,
-    alexandria_index_count_files, alexandria_index_files_json, alexandria_index_init,
-    alexandria_index_refresh_start, alexandria_index_run_status_json, alexandria_index_start,
-    alexandria_reading_list_add_item, alexandria_reading_list_create,
+    alexandria_auth_windows_login, alexandria_bookmark_create, alexandria_bookmark_purge,
+    alexandria_bookmark_restore, alexandria_bookmark_soft_delete, alexandria_bookmark_update,
+    alexandria_bookmarks_list, alexandria_collection_add_items, alexandria_collection_create,
+    alexandria_collection_delete, alexandria_collection_list_items,
+    alexandria_collection_remove_item, alexandria_collection_rename, alexandria_comic_page,
+    alexandria_file_edit_content, alexandria_file_edit_metadata, alexandria_file_get_by_uuid,
+    alexandria_file_playback_source, alexandria_file_purge, alexandria_file_purge_on_disk,
+    alexandria_file_read_content, alexandria_file_rename, alexandria_file_restore,
+    alexandria_file_soft_delete, alexandria_file_thumbnail, alexandria_files_list,
+    alexandria_free_string, alexandria_index_count_files, alexandria_index_files_json,
+    alexandria_index_init, alexandria_index_refresh_start, alexandria_index_run_status_json,
+    alexandria_index_start, alexandria_reading_list_add_item, alexandria_reading_list_create,
     alexandria_reading_list_delete, alexandria_reading_list_remove_item,
     alexandria_reading_list_update_progress, alexandria_reading_lists_list,
     alexandria_watchlist_add_video, alexandria_watchlist_create, alexandria_watchlist_delete,
@@ -8830,6 +8830,233 @@ async fn given_same_local_credentials_when_set_and_logged_in_via_http_and_ffi_th
             "sessionId is a uuid: {session_id}"
         );
     }
+}
+
+/// Sets `ALEXANDRIA_AUTH_MODE=windows` and `ALEXANDRIA_AUTH_WINDOWS_OWNER_SID`
+/// for as long as this guard is alive, and restores both — mode back to
+/// `"local"`, the SID variable removed entirely — on `Drop`. Same reasoning
+/// as `ThumbnailCacheGuard` above: a plain trailing `set_var` back to
+/// `"local"` is skipped if the test unwinds from a failed assertion first,
+/// which would leave `ALEXANDRIA_AUTH_WINDOWS_OWNER_SID` set for the rest of
+/// the process and silently change what `alexandria_index_init` does in
+/// every later test that does not itself override it.
+///
+/// Must be constructed and dropped while still holding `SERIAL` — see
+/// `ThumbnailCacheGuard`.
+#[cfg(windows)]
+struct WindowsAuthEnvGuard;
+
+#[cfg(windows)]
+impl WindowsAuthEnvGuard {
+    fn new(owner_sid: &str) -> Self {
+        std::env::set_var("ALEXANDRIA_AUTH_MODE", "windows");
+        std::env::set_var("ALEXANDRIA_AUTH_WINDOWS_OWNER_SID", owner_sid);
+        Self
+    }
+}
+
+#[cfg(windows)]
+impl Drop for WindowsAuthEnvGuard {
+    fn drop(&mut self) {
+        std::env::set_var("ALEXANDRIA_AUTH_MODE", "local");
+        std::env::remove_var("ALEXANDRIA_AUTH_WINDOWS_OWNER_SID");
+    }
+}
+
+/// UC-45 parity — open a session for the Windows account through both
+/// transports and assert both succeed with a well-formed session id (Testing
+/// Specification §7.3). Session ids differ by construction (independent
+/// databases), so parity asserts shape, exactly like the local-login parity
+/// test above.
+///
+/// Windows-only: `alexandria_index_init`'s startup gate (Task 3 / FR-AU-21)
+/// reads this process's real account SID through `ProcessWindowsIdentity`,
+/// which only Windows can answer — on every other platform Windows mode can
+/// never finish initializing, so there is nothing for this test to exercise
+/// there. `given_local_mode_when_windows_login_attempted_via_http_and_ffi_
+/// then_both_conflict` below covers the FR-AU-08 both-surfaces claim on
+/// every platform CI actually runs on.
+#[cfg(windows)]
+#[tokio::test]
+async fn given_windows_mode_when_logged_in_via_http_and_ffi_then_both_return_a_session() {
+    use alexandria_core::auth::windows_identity::{ProcessWindowsIdentity, WindowsIdentity};
+    use alexandria_core::config::AuthMode;
+
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+
+    // The SID this process actually runs as, so both legs' startup gates
+    // (HTTP does not gate at `app()`, but FFI's `alexandria_index_init`
+    // does) see a configuration that matches reality.
+    let owner_sid = ProcessWindowsIdentity
+        .current_sid()
+        .expect("this process's own account SID must be readable");
+
+    // ---- HTTP leg ----
+    let http_dir = tempdir().unwrap();
+    let http_db = db_path(&http_dir, "http.sqlite");
+    let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    let mut http_settings = Settings::default();
+    http_settings.auth.mode = AuthMode::Windows;
+    http_settings.auth.windows_owner_sid = owner_sid.clone();
+    let http_services =
+        std::sync::Arc::new(build_services(&http_settings, http_pool.clone()).await);
+    let router = app(Settings::default(), http_services.clone());
+
+    let login_req = Request::builder()
+        .method("POST")
+        .uri("/v1/auth/windows/login")
+        .body(Body::empty())
+        .unwrap();
+    let login_resp = router.oneshot(login_req).await.expect("http windows login");
+    assert_eq!(login_resp.status(), axum::http::StatusCode::OK);
+    let http_login_body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(login_resp.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
+
+    // FR-AU-22: the session the mode mints has to actually admit the caller —
+    // otherwise "Windows mode authenticates you" is asserted nowhere. Present
+    // it on a gated route and require anything but a 401. The status itself is
+    // not the claim (an empty catalog may answer many ways); being let past
+    // `RuntimeAuthService::Windows::authenticate` is.
+    let http_session_id = http_login_body["sessionId"]
+        .as_str()
+        .expect("sessionId")
+        .to_string();
+    let gated_req = Request::builder()
+        .method("GET")
+        .uri("/v1/files")
+        .header("authorization", &format!("Bearer {http_session_id}"))
+        .body(Body::empty())
+        .unwrap();
+    let gated_resp = app(Settings::default(), http_services.clone())
+        .oneshot(gated_req)
+        .await
+        .expect("http gated request");
+    assert_ne!(
+        gated_resp.status(),
+        axum::http::StatusCode::UNAUTHORIZED,
+        "a session minted by windows login must authenticate a later request"
+    );
+
+    // The negative half, so the assertion above cannot pass by the gate being
+    // absent: an id that was never minted is still rejected.
+    let unknown_req = Request::builder()
+        .method("GET")
+        .uri("/v1/files")
+        .header("authorization", &format!("Bearer {}", uuid::Uuid::new_v4()))
+        .body(Body::empty())
+        .unwrap();
+    let unknown_resp = app(Settings::default(), http_services.clone())
+        .oneshot(unknown_req)
+        .await
+        .expect("http gated request with an unknown session");
+    assert_eq!(
+        unknown_resp.status(),
+        axum::http::StatusCode::UNAUTHORIZED,
+        "an unminted session id must not authenticate"
+    );
+
+    // ---- FFI leg ----
+    // `alexandria_index_init` loads settings via `load_settings()`
+    // (`ALEXANDRIA_*` env), not a `Settings` value the test controls
+    // directly — same constraint `setup_ffi_db` documents for local mode.
+    // The guard restores both env vars on drop, including if an assertion
+    // below panics first.
+    let ffi_dir = tempdir().unwrap();
+    let ffi_db = db_path(&ffi_dir, "ffi.sqlite");
+    let ffi_pool = migrate_database(&ffi_db).await.expect("ffi pre-migrate");
+    ffi_pool.close().await;
+    let _env_guard = WindowsAuthEnvGuard::new(&owner_sid);
+
+    let ffi_login_json: String = tokio::task::spawn_blocking(move || -> String {
+        let cdb = CString::new(ffi_db).unwrap();
+        assert_eq!(
+            alexandria_index_init(cdb.as_ptr()),
+            alexandria_ffi::INDEX_OK
+        );
+
+        let login_result = alexandria_auth_windows_login(std::ptr::null());
+        assert_eq!(
+            login_result.status,
+            alexandria_ffi::AUTH_OK,
+            "ffi windows login failed"
+        );
+        take_json(login_result.json)
+    })
+    .await
+    .unwrap();
+
+    let ffi_login_body: serde_json::Value = serde_json::from_str(&ffi_login_json).unwrap();
+
+    assert_eq!(http_login_body["success"], serde_json::json!(true));
+    assert_eq!(ffi_login_body["success"], serde_json::json!(true));
+    for body in [&http_login_body, &ffi_login_body] {
+        let session_id = body["sessionId"].as_str().expect("sessionId");
+        assert!(
+            uuid::Uuid::parse_str(session_id).is_ok(),
+            "sessionId is a uuid: {session_id}"
+        );
+    }
+}
+
+/// UC-45 parity, cross-platform — the FR-AU-08 both-surfaces claim, verified
+/// on every platform CI runs on (unlike the Windows-only test above, which
+/// `alexandria_index_init`'s real SID check confines to Windows). Builds
+/// services in `AuthMode::Local` and asserts both surfaces reject a Windows
+/// login with the same shape: HTTP `409`, FFI's `AUTH_ERR_CONFLICT`. This
+/// path never sets the mode to `Windows`, so `alexandria_index_init` never
+/// reaches the SID gate — it proves the route is registered, reachable
+/// without a session (409 rather than 401 or 404), and mapped to the same
+/// error class on both transports.
+#[tokio::test]
+async fn given_local_mode_when_windows_login_attempted_via_http_and_ffi_then_both_conflict() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+
+    // ---- HTTP leg ----
+    let http_dir = tempdir().unwrap();
+    let http_db = db_path(&http_dir, "http.sqlite");
+    let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    let http_services =
+        std::sync::Arc::new(build_services(&local_settings(), http_pool.clone()).await);
+    let router = app(Settings::default(), http_services);
+
+    let login_req = Request::builder()
+        .method("POST")
+        .uri("/v1/auth/windows/login")
+        .body(Body::empty())
+        .unwrap();
+    let login_resp = router.oneshot(login_req).await.expect("http windows login");
+    assert_eq!(login_resp.status(), axum::http::StatusCode::CONFLICT);
+
+    // ---- FFI leg ----
+    let ffi_dir = tempdir().unwrap();
+    let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
+
+    let ffi_status: std::os::raw::c_int = tokio::task::spawn_blocking(move || {
+        let cdb = CString::new(ffi_db).unwrap();
+        assert_eq!(
+            alexandria_index_init(cdb.as_ptr()),
+            alexandria_ffi::INDEX_OK
+        );
+
+        let login_result = alexandria_auth_windows_login(std::ptr::null());
+        assert!(
+            !login_result.json.is_null(),
+            "every auth result must carry a body"
+        );
+        unsafe {
+            alexandria_free_string(login_result.json);
+        }
+        login_result.status
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(
+        ffi_status,
+        alexandria_ffi::AUTH_ERR_CONFLICT,
+        "ffi must reject a windows login while the active mode is local"
+    );
 }
 
 /// Write a minimal valid single-channel 8-bit PCM WAV file (see

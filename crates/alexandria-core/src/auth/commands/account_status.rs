@@ -1,5 +1,6 @@
 use crate::auth::local::{LocalAccountResult, LocalCredentialRepository, RecoveryCodeRepository};
 use crate::auth::AuthService;
+use crate::config::AuthMode;
 use crate::errors::DomainError;
 
 /// Report the authenticated owner's account state (FR-AU-18): the stored
@@ -14,6 +15,7 @@ pub struct GetLocalAccountHandler<A, CR, RR> {
     auth: A,
     credentials: CR,
     recovery_codes: RR,
+    mode: AuthMode,
 }
 
 impl<A, CR, RR> GetLocalAccountHandler<A, CR, RR>
@@ -22,15 +24,25 @@ where
     CR: LocalCredentialRepository,
     RR: RecoveryCodeRepository,
 {
-    pub fn new(auth: A, credentials: CR, recovery_codes: RR) -> Self {
+    pub fn new(auth: A, credentials: CR, recovery_codes: RR, mode: AuthMode) -> Self {
         Self {
             auth,
             credentials,
             recovery_codes,
+            mode,
         }
     }
 
     pub async fn get(&self, token: &str) -> Result<LocalAccountResult, DomainError> {
+        // The active auth mode must be local login (FR-AU-03, FR-AU-23): in
+        // external and Windows modes there is no local credential to report,
+        // and the answer is a refusal rather than a configuration error.
+        if self.mode != AuthMode::Local {
+            return Err(DomainError::conflict(
+                "local login is not the active auth mode",
+            ));
+        }
+
         self.auth.authenticate(token).await?;
 
         let credential = self

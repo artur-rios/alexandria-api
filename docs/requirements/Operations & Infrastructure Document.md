@@ -76,7 +76,7 @@ alexandria-api/
 │   │   │   ├── watchlists/
 │   │   │   ├── reading_lists/
 │   │   │   ├── text/          # TextFile content port
-│   │   │   ├── auth/          # external JWT + local login
+│   │   │   ├── auth/          # external JWT + local login + Windows account
 │   │   │   ├── errors.rs      # thiserror domain errors
 │   │   │   └── lib.rs
 │   │   ├── migrations/        # sqlx migrations
@@ -141,7 +141,7 @@ keys — a key not listed here does not exist, and only the keys showing an
 
 | Concern | Mechanism | Notes |
 | --- | --- | --- |
-| `auth.mode` | config / `ALEXANDRIA_AUTH_MODE` | one of `external`, `local`; selects the single active auth mode (FR-AU-01). |
+| `auth.mode` | config / `ALEXANDRIA_AUTH_MODE` | one of `external`, `local`, `windows`; selects the single active auth mode (FR-AU-01). |
 | `auth.heimdall_token_secret` | config / `ALEXANDRIA_AUTH_HEIMDALL_TOKEN_SECRET` | external mode only; the HS256 secret Heimdall signs with. Required — startup fails without it. Prefer the environment variable; never commit it. |
 | `auth.heimdall_token_secret_previous` | config / `ALEXANDRIA_AUTH_HEIMDALL_TOKEN_SECRET_PREVIOUS` | external mode only; the secret Heimdall is rotating away from. Both are accepted, so a rotation there causes no outage here. |
 | `auth.heimdall_scope_id` | config / `ALEXANDRIA_AUTH_HEIMDALL_SCOPE_ID` | external mode only; UUID of the Heimdall scope whose members are accepted as the owner. Required — startup fails without it. |
@@ -149,6 +149,7 @@ keys — a key not listed here does not exist, and only the keys showing an
 | `auth.heimdall_audience` | config / `ALEXANDRIA_AUTH_HEIMDALL_AUDIENCE` | external mode only; checked only when set. |
 | `auth.local_db` | config | local mode only; flag indicating local credentials are in SQLite. |
 | `auth.session_ttl_hours` | config / `ALEXANDRIA_AUTH_SESSION_TTL_HOURS` | local mode only; how long a login session stays valid; default `24` (FR-AU-09). |
+| `auth.windows_owner_sid` | config / `ALEXANDRIA_AUTH_WINDOWS_OWNER_SID` | Windows mode only; required — startup fails unless the process runs on Windows as this account. Find it with `whoami /user`. Not a secret: it is an identifier, not a credential (FR-AU-21). |
 | `http.bind_addr` | config / `ALEXANDRIA_HTTP_BIND_ADDR` | default `127.0.0.1`; loopback by default (IR-03). |
 | `http.port` | config / `ALEXANDRIA_HTTP_PORT` | default `8080`. |
 | `database.path` | config / `ALEXANDRIA_DATABASE_PATH` | SQLite file path; bundled beside the desktop app's data dir. |
@@ -187,6 +188,27 @@ which invalidates the whole previous set, used codes and unused alike.
 An account created before this feature holds no codes:
 `GET /v1/auth/local/account` reports `recoveryCodesRemaining: 0`. Its owner
 should log in and regenerate while they still know their password.
+
+#### The Windows account mode
+
+`auth.mode = "windows"` makes the Windows account the server process runs as the
+credential. Nothing is typed and nothing is stored: the owner's Windows sign-in
+is the authentication, and `POST /v1/auth/windows/login` exchanges it for a
+session.
+
+Be clear about what this proves before enabling it. It proves the **process was
+launched by the configured account** — it does not identify the caller. Once the
+process is running, any caller that can reach the port is the owner. The security
+boundary in this mode is the loopback bind (IR-03), not the credential, and
+startup warns when `http.bind_addr` is anything else.
+
+Startup fails, rather than warns, when the SID is unset, when the platform is not
+Windows, or when the process runs as a different account — the last naming both
+SIDs, since a mismatch is yours to diagnose and neither value is a secret.
+
+In this mode there is no local account: registration, credential changes, and
+recovery-code redemption and regeneration all refuse, exactly as they do in
+external mode.
 
 ---
 

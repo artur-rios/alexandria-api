@@ -34,7 +34,7 @@ health, configuration, deployment) are specified in the
 | **mediaKind** | VideoFile discriminator: `movie` or `series`. |
 | **formatKind** | Document discriminator: `book` or `ebook`. |
 | **Watch/Read state** | Progress state: `Pending`, `Watching`/`Reading`, `Watched`/`Read`. |
-| **Active auth mode** | The single authentication mode (external JWT or local login) selected at startup; the other mode is inactive and its credentials are rejected. |
+| **Active auth mode** | The single authentication mode (external JWT, local login, or Windows account) selected at startup; the other modes are inactive and their credentials are rejected. |
 | **Playback descriptor** | The FFI answer to UC-38: the resolved absolute path, MIME type, and byte size of a File, from which a local client opens the file itself. The FFI surface cannot carry a byte stream. |
 
 ---
@@ -169,7 +169,7 @@ graph LR
 
 | ID | Requirement |
 | --- | --- |
-| FR-AU-01 | The system shall read the active authentication mode from startup configuration; exactly one mode (external JWT or local login) shall be active at runtime. |
+| FR-AU-01 | The system shall read the active authentication mode from startup configuration; exactly one mode (external JWT, local login, or Windows account) shall be active at runtime. |
 | FR-AU-02 | In external mode, the system shall verify each caller's JWT against a configured signing secret shared with the external authentication service, and shall accept the caller as the owner only when the token names the configured scope. |
 | FR-AU-03 | The system shall accept only the active auth mode and shall reject credentials presented via the inactive mode. |
 | FR-AU-04 | In local mode, the system shall verify the caller's email and password against the salted Argon2 password hash stored in the SQLite credential row. |
@@ -188,6 +188,11 @@ graph LR
 | FR-AU-17 | The system shall, for an authenticated owner, replace every recovery code with ten new ones and return them exactly once. |
 | FR-AU-18 | The system shall report to an authenticated owner how many recovery codes remain unconsumed. |
 | FR-AU-19 | The system shall store only a hash of every recovery code; the plaintext shall exist only in the response that issues it. |
+| FR-AU-20 | The system shall support a third authentication mode in which the operating system account running the server process is the credential; exactly one mode remains active at runtime. |
+| FR-AU-21 | In Windows mode, the system shall refuse to start unless it is running on Windows as the account named by the configured owner SID. |
+| FR-AU-22 | In Windows mode, a successful login shall create a Session with the same configurable expiry local mode uses, and the caller shall present that session's id on every subsequent request. |
+| FR-AU-23 | In Windows mode, the system shall refuse every local-mode credential and recovery operation, since no credential is stored. |
+| FR-AU-24 | The system shall warn at startup when Windows mode is active and the HTTP bind address is not a loopback address, because in that mode any caller that can reach the port is authorized. |
 
 ### 3.8 Media Playback (MP)
 
@@ -495,6 +500,7 @@ endpoint requires authentication from the active mode (see §7).
 | GET | /v1/auth/local/account | Report the owner's address and how many recovery codes remain. | FR-AU-18 |
 | POST | /v1/auth/local/recovery/redeem | Replace the password using a recovery code (unauthenticated). | FR-AU-14, FR-AU-15, FR-AU-16 |
 | POST | /v1/auth/local/recovery/regenerate | Replace every recovery code with ten new ones. | FR-AU-17, FR-AU-19 |
+| POST | /v1/auth/windows/login | Open a session on the strength of the Windows account the server process runs as (Windows mode). | FR-AU-22 |
 
 External JWT verification (FR-AU-02) is enforced by HTTP middleware on every
 request, not by an endpoint. The same middleware validates the local-mode
@@ -583,6 +589,7 @@ returns a playback descriptor instead of bytes (FR-MP-06).
 | Register the local account (local mode) | n/a — no account exists yet to authenticate as | ⚠️ only once, while no local account exists; a second attempt is denied with a conflict (UC-41) |
 | Set or change local credentials (local mode) | ✅ | ❌ |
 | External JWT validation | ✅ | ⚠️ only as the bearer of a valid JWT; invalid tokens denied |
+| Windows login (Windows mode) | ✅ (open to verify) | ⚠️ only the login endpoint; all other operations denied (UC-45) |
 
 Legend: ✅ allowed · ⚠️ allowed under a stated condition · ❌ denied.
 
@@ -645,7 +652,7 @@ The feature identifiers are the milestones the
 | F-06 Bookmark management | FR-BM-01 through FR-BM-06 |
 | F-07 Watchlists | FR-WL-01 through FR-WL-08 |
 | F-08 Reading lists | FR-RL-01 through FR-RL-08 |
-| F-09 Pluggable authentication | FR-AU-01 through FR-AU-19 |
+| F-09 Pluggable authentication | FR-AU-01 through FR-AU-24 |
 | F-10 Media playback | FR-MP-01 through FR-MP-06 |
 
 Dual-transport parity (FR-FC-24, FR-AU-08, FR-MP-06, NFR-09) is not a
@@ -663,7 +670,7 @@ ships, which is why each one lands on both surfaces at once.
 | BR-05 watchlists only videos | FR-WL-03 |
 | BR-06 per-episode series tracking | FR-WL-05 |
 | BR-07 dual transport parity | FR-FC-24, FR-AU-08, NFR-09 |
-| BR-08 pluggable auth, external + local | FR-AU-01, FR-AU-02, FR-AU-04, FR-AU-06 |
+| BR-08 pluggable auth, external + local + Windows | FR-AU-01, FR-AU-02, FR-AU-04, FR-AU-06, FR-AU-20 |
 | BR-09 async non-blocking indexing | FR-FC-08, NFR-02 |
 | BR-10 two-phase deletion | FR-FC-20, FR-FC-21, FR-FC-22, NFR-07, NFR-10 |
 | BR-11 hard purge no disk touch; separate purge-on-disk | FR-FC-22, FR-FC-23 |
@@ -672,6 +679,6 @@ ships, which is why each one lands on both surfaces at once.
 | BR-14 SOLID / Command-Query baseline | NFR-03, NFR-04 |
 | BR-15 reading lists only books/comics | FR-RL-03 |
 | BR-16 per-issue comic tracking | FR-RL-05 |
-| BR-17 exactly one active auth mode | FR-AU-01, FR-AU-03 |
+| BR-17 exactly one active auth mode | FR-AU-01, FR-AU-03, FR-AU-20 |
 | BR-18 local credential storage | FR-AU-04, FR-AU-05, FR-AU-06, NFR-05 |
 | BR-19 delete reading list preserves items | FR-RL-07 |

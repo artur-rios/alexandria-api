@@ -6,8 +6,10 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use tokio::runtime::{Builder, Runtime};
 
+use alexandria_core::auth::windows_identity::{verify_owner, ProcessWindowsIdentity};
 use alexandria_core::auth::AuthService;
 use alexandria_core::catalog::commands::index::IndexRequest;
+use alexandria_core::config::AuthMode;
 use alexandria_core::config::Settings;
 use alexandria_core::errors::{error_body, DomainError};
 use alexandria_core::migrate::migrate_database;
@@ -175,10 +177,21 @@ pub extern "C" fn alexandria_index_init(db_path: *const c_char) -> c_int {
     };
     let mut settings = load_settings();
     settings.database.path = path.clone();
-    // Same gate as the HTTP binary: a misconfigured external mode is a
-    // startup failure on both surfaces (FR-AU-08).
-    if settings.auth.validate().is_err() {
+    // Same gate as the HTTP binary: a misconfigured mode is a startup failure
+    // on both surfaces (FR-AU-08).
+    // Both messages are logged rather than discarded: the embedder only gets an
+    // opaque status code back, and FFI is the surface an operator is most
+    // likely to hit a misconfiguration on. A SID names an account rather than
+    // authenticating one, so naming both of them costs nothing (FR-AU-21).
+    if let Err(err) = settings.auth.validate() {
+        tracing::error!(error = %err, "auth configuration is invalid; refusing to initialize");
         return INDEX_ERR_OTHER;
+    }
+    if settings.auth.mode == AuthMode::Windows {
+        if let Err(err) = verify_owner(&ProcessWindowsIdentity, &settings.auth.windows_owner_sid) {
+            tracing::error!(error = %err, "windows-mode startup check failed");
+            return INDEX_ERR_OTHER;
+        }
     }
     let _ = runtime();
     let result = runtime().block_on(async {
@@ -3243,6 +3256,32 @@ pub extern "C" fn alexandria_auth_local_login(json_body: *const c_char) -> AuthJ
             .login(&body.email, &body.password)
             .await
     });
+
+    match result {
+        Ok(login) => {
+            let json = serde_json::to_string(&login).unwrap_or_default();
+            AuthJsonResult::ok(json)
+        }
+        Err(err) => map_auth_err(err),
+    }
+}
+
+/// Windows login (UC-45 / FR-AU-20, FR-AU-22): open a session for the
+/// Windows account this process runs as. Takes no credentials — the account
+/// was already verified against the configured SID at startup. `json_body`
+/// is accepted but ignored: it exists only for signature consistency with
+/// this surface's other `alexandria_auth_*` neighbours, which all take a
+/// body. On success `json` carries the `LocalLoginResult`, the same shape
+/// `alexandria_auth_local_login` returns.
+#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
+#[no_mangle]
+pub extern "C" fn alexandria_auth_windows_login(_json_body: *const c_char) -> AuthJsonResult {
+    let services = match services_slot().lock().unwrap().clone() {
+        Some(s) => s,
+        None => return AuthJsonResult::err(AUTH_ERR_NOT_INITIALIZED),
+    };
+
+    let result = runtime().block_on(async { services.windows_login_handler.login().await });
 
     match result {
         Ok(login) => {

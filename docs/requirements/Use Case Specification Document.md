@@ -16,8 +16,9 @@ identifier defined in [System Requirements Document](System%20Requirements%20Doc
 
 | Actor | Description |
 | --- | --- |
-| **Owner** | The single authenticated user performing catalog operations. Authenticated via the active auth mode (external JWT or local login). |
+| **Owner** | The single authenticated user performing catalog operations. Authenticated via the active auth mode (external JWT, local login, or Windows account). |
 | **External Auth Service** | An external system that issues JWTs and, via a signing secret shared with Alexandria, lets Alexandria verify them offline. Actor in external mode only. |
+| **Operating System** | The Windows account the server process runs as, whose identity the process reads at startup and compares to the configured owner. Actor in Windows mode only. |
 | **Local Filesystem** | The on-disk store the system indexes, renames into, and writes text content back to. |
 
 ### 1.3 Use Case Overview
@@ -1064,7 +1065,7 @@ UC-36's externally issued JWT.
 
 | ID | Condition | Outcome |
 | --- | --- | --- |
-| AF-01 | The active auth mode is external JWT (local login inactive) | The system rejects the local credentials with an unauthorized error. |
+| AF-01 | The active auth mode is not local login | The system rejects the local credentials with an unauthorized error. |
 | AF-02 | The email or password is wrong | The system denies with an unauthorized error; no plaintext is logged. |
 | AF-03 | Local credentials have not been set | The system responds with a configuration error (run UC-35 first). |
 | AF-04 | A later request presents a session id that is unknown or has expired | The system denies that request with an unauthorized error; the caller logs in again to obtain a new session. |
@@ -1125,7 +1126,7 @@ UC-36's externally issued JWT.
 
 | ID | Condition | Outcome |
 | --- | --- | --- |
-| AF-01 | The active auth mode is local login (external JWT inactive) | The system rejects the JWT with an unauthorized error. |
+| AF-01 | The active auth mode is not external JWT | The system rejects the JWT with an unauthorized error. |
 | AF-02 | The JWT is missing, malformed, expired, not yet valid, signed with an unconfigured key, or names an algorithm other than the configured one | The system denies with an unauthorized error. |
 | AF-03 | The JWT is a two-factor challenge token rather than a full authentication token | The system denies with an unauthorized error. |
 | AF-04 | The JWT is valid but names no scope, or a scope other than the configured one | The system denies with an unauthorized error. |
@@ -1267,7 +1268,7 @@ UC-36's externally issued JWT.
 
 | ID | Condition | Outcome |
 | --- | --- | --- |
-| AF-01 | The active auth mode is external JWT | The system rejects with an invalid-operation error. |
+| AF-01 | The active auth mode is not local login | The system rejects with an invalid-operation error. |
 | AF-02 | Local credentials already exist | The system rejects with a conflict error; the stored credentials are left untouched. |
 | AF-03 | The email format is invalid | The system rejects with an invalid-input error. |
 | AF-04 | The password fails the strength policy | The system rejects with an invalid-input error naming the unmet rule; no plaintext is logged. |
@@ -1353,7 +1354,7 @@ abandon the rest of the catalog — and this surfaces it.
 
 | ID | Condition | Outcome |
 | --- | --- | --- |
-| AF-01 | The active auth mode is external JWT | The system rejects with an invalid-operation error. |
+| AF-01 | The active auth mode is not local login | The system rejects with an invalid-operation error. |
 | AF-02 | No local account exists | The system responds with a not-found error. |
 | AF-03 | The new password fails the strength policy | The system rejects naming the unmet rule; no code is consumed. |
 | AF-04 | The confirmation does not match the new password | The system rejects; no code is consumed. |
@@ -1391,8 +1392,42 @@ have only one of.
 | ID | Condition | Outcome |
 | --- | --- | --- |
 | AF-01 | The caller is not authenticated | The system denies with an unauthorized error. |
-| AF-02 | The active auth mode is external JWT | The system rejects with an invalid-operation error. |
+| AF-02 | The active auth mode is not local login | The system rejects with an invalid-operation error. |
 | AF-03 | No local account exists | The system responds with a not-found error. |
+
+---
+
+### UC-45: Log in with the Windows account
+
+| Field | Value |
+| --- | --- |
+| **ID** | UC-45 |
+| **Name** | Log in with the Windows account |
+| **Actors** | Owner, Operating System |
+| **Description** | Open a session on the strength of the Windows account the server process runs as. |
+| **Preconditions** | The active auth mode is the Windows account; the process passed its startup account check. |
+| **Postconditions** | A Session exists whose id is returned to the caller. |
+| **Requirements** | FR-AU-20, FR-AU-22 |
+
+**Main Flow**
+
+1. The caller requests a Windows login, submitting nothing.
+2. The system confirms the active auth mode is the Windows account.
+3. The system creates a Session with an expiry `sessionTtlHours` in the future and returns its id.
+
+**Alternative Flows**
+
+| ID | Condition | Outcome |
+| --- | --- | --- |
+| AF-01 | The active auth mode is local login or external JWT | The system rejects with an invalid-operation error. |
+| AF-02 | The session cannot be created | The system returns the underlying error; no session exists. |
+
+> This use case has no unauthorized flow, and that is the point of it rather
+> than an omission. The account check happens once at startup: a process running
+> as anyone but the configured owner does not reach the point of serving
+> requests. What that proves is that the process was launched by the owner —
+> never who is calling — so in this mode any caller that can reach the port is
+> authorized, and the loopback bind is the security boundary.
 
 ---
 
@@ -1443,13 +1478,16 @@ have only one of.
 | UC-42: Query an index or refresh run | FR-FC-24, FR-FC-27, FR-FC-28, FR-FC-29 |
 | UC-43: Redeem a recovery code | FR-AU-11, FR-AU-14, FR-AU-15, FR-AU-16 |
 | UC-44: Regenerate recovery codes | FR-AU-17, FR-AU-19 |
+| UC-45: Log in with the Windows account | FR-AU-20, FR-AU-22 |
 
 Every functional requirement in [System Requirements Document](System%20Requirements%20Document.md)
-§3 appears in at least one row above except FR-AU-12 and FR-AU-18, which are
-cross-cutting (the error envelope shape and the account query respectively)
-rather than tied to one use case: FR-FC-01..29, FR-CO-01..07, FR-BM-01..06,
+§3 appears in at least one row above except FR-AU-12, FR-AU-18, FR-AU-21,
+FR-AU-23, and FR-AU-24, which are cross-cutting (the error envelope shape, the
+account query, the Windows startup account check, the Windows-mode refusal of
+local-mode operations, and the loopback-bind warning, respectively) rather
+than tied to one use case: FR-FC-01..29, FR-CO-01..07, FR-BM-01..06,
 FR-WL-01..08, FR-RL-01..08, FR-TX-01..03, FR-AU-01..11, FR-AU-13..17,
-FR-AU-19, FR-MP-01..06.
+FR-AU-19, FR-AU-20, FR-AU-22, FR-MP-01..06.
 UC-37 (Health check) is specified in the
 [Operations & Infrastructure Document](Operations%20%26%20Infrastructure%20Document.md)
 §5.3, not here, since it is an operational concern rather than a catalog use case.

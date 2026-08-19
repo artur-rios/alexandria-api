@@ -32,6 +32,9 @@ uuid.workspace = true
 walkdir.workspace = true
 zip.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
+
 [dev-dependencies]
 # Tests only: `jsonwebtoken` will not encode an `alg: none` token — refusing
 # to produce one is the point of the library — so the test that proves we

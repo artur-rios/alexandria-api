@@ -46,6 +46,27 @@ pub async fn login(
     Ok((StatusCode::OK, Json(result)))
 }
 
+/// `POST /v1/auth/windows/login` — open a session for the Windows account
+/// this process runs as (UC-45 / FR-AU-20, FR-AU-22). No request body: the
+/// account was already verified against the configured SID at startup, so
+/// there is no credential left for a caller to present. Deliberately outside
+/// the blanket `require_auth` gate, exactly like `/v1/auth/local/login` — a
+/// caller has no session yet, which is the entire point of the call. Returns
+/// `200` with the `LocalLoginResult`, or `409` (the active auth mode is not
+/// windows, AF-01).
+pub async fn windows_login(
+    State(state): State<AppState>,
+) -> Result<(StatusCode, Json<LocalLoginResult>), ApiError> {
+    let result = state
+        .services
+        .windows_login_handler
+        .login()
+        .await
+        .map_err(ApiError)?;
+
+    Ok((StatusCode::OK, Json(result)))
+}
+
 /// `POST /v1/auth/local/credentials` — change the existing local-login
 /// email and password (UC-35 / FR-AU-05, FR-AU-06). Creating the account in
 /// the first place is UC-41's `/register`; this handler always

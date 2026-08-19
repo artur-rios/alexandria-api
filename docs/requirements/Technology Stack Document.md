@@ -56,6 +56,7 @@ choices instead of restating them, so that:
 | **thiserror** | latest stable at implementation time | alexandria-core | typed domain error enums per command/query |
 | **argon2** | latest stable at implementation time | alexandria-core (auth) | salted password hashing for local-login mode |
 | **jsonwebtoken** | latest stable at implementation time | alexandria-core (auth) | HS256 decode/verification of Heimdall-issued JWTs for external-auth mode |
+| **windows-sys** | latest stable at implementation time | alexandria-core (auth) | reading the process token needs the Win32 bindings; this is the thinnest available — raw FFI declarations with no wrapper layer — and it is declared under `[target.'cfg(windows)'.dependencies]`, so it enters the graph only on Windows targets and no other platform's build is affected |
 | **toml** | latest stable at implementation time | all crates | `config.toml` parsing with env-var overrides |
 | **cbindgen** | latest stable at implementation time | alexandria-ffi (build) | generates the C header consumed by Flutter FFI |
 | **ring** or **sha2** | latest stable at implementation time | alexandria-core | content hashing for indexed files (SHA-256) |
@@ -135,7 +136,7 @@ unit tests substitute in-memory fakes (see the
 | --- | --- | --- | --- |
 | Input validation | hand-written `validate_*` functions in alexandria-core | — | one function per validated value, called by the handler and shared by both transports (see §3) |
 | Logging | **tracing** / **tracing-subscriber** | latest stable at implementation time | structured span-aware logs; see the [Operations & Infrastructure Document](Operations%20%26%20Infrastructure%20Document.md) §4 |
-| Authentication / authorization | pluggable auth module (external JWT via **jsonwebtoken**, local login via **argon2**) | latest stable at implementation time | selected at startup from config; exactly one mode active |
+| Authentication / authorization | pluggable auth module (external JWT via **jsonwebtoken**, local login via **argon2**, Windows account via **windows-sys**) | latest stable at implementation time | selected at startup from config; exactly one mode active |
 | Error / result model | typed domain errors via **thiserror**; **anyhow** at crate boundaries; `Result<T, E>` everywhere | latest stable at implementation time | commands/queries return `Result<T, DomainError>`; the HTTP layer maps `DomainError` to status codes |
 | API documentation | System Requirements Document §5 + rustdoc on each route | — | the endpoint table is the contract; the FFI surface mirrors the same operations. No generated OpenAPI spec (see §3). |
 | Configuration | **toml** + env overrides | latest stable at implementation time | `config.toml` read at startup; the `ALEXANDRIA_*` env namespace overrides keys |

@@ -362,3 +362,91 @@ fn given_external_mode_fully_configured_when_validated_then_ok() {
 
     assert!(auth.validate().is_ok());
 }
+
+#[test]
+fn given_windows_mode_when_parsed_then_mode_and_sid_round_trip() {
+    let toml = r#"
+[auth]
+mode = "windows"
+windows_owner_sid = "S-1-5-21-1004336348-1177238915-682003330-1001"
+"#;
+    let settings: Settings = toml::from_str(toml).unwrap();
+
+    assert_eq!(settings.auth.mode, AuthMode::Windows);
+    assert_eq!(settings.auth.mode.as_str(), "windows");
+    assert_eq!(
+        settings.auth.windows_owner_sid,
+        "S-1-5-21-1004336348-1177238915-682003330-1001"
+    );
+}
+
+/// The Windows keys take environment overrides like every other auth key: the
+/// documented single-user install configures the mode and the owner SID from
+/// the environment, with no config file on disk at all. Both are asserted in
+/// one test, under one lock, because they share the process-global
+/// environment; see `EnvGuard`.
+#[test]
+fn given_windows_environment_variables_when_settings_loaded_then_they_override_the_file() {
+    let _env = EnvGuard::set(&[
+        ("ALEXANDRIA_AUTH_MODE", "windows"),
+        (
+            "ALEXANDRIA_AUTH_WINDOWS_OWNER_SID",
+            "S-1-5-21-1004336348-1177238915-682003330-1001",
+        ),
+    ]);
+
+    let settings = Settings::load_or_default(std::path::Path::new(
+        "no-such-config-file-for-this-test.toml",
+    ));
+
+    assert_eq!(settings.auth.mode, AuthMode::Windows);
+    assert_eq!(
+        settings.auth.windows_owner_sid,
+        "S-1-5-21-1004336348-1177238915-682003330-1001"
+    );
+    assert!(settings.auth.validate().is_ok());
+}
+
+/// A mode that names no account is a mode with no authentication at all: a
+/// process started as the wrong account — SYSTEM, say — would serve the
+/// catalog anyway.
+#[test]
+fn given_windows_mode_without_a_sid_when_validated_then_error_names_the_key() {
+    let auth = AuthSettings {
+        mode: AuthMode::Windows,
+        ..AuthSettings::default()
+    };
+
+    let message = auth.validate().unwrap_err().to_string();
+
+    assert!(message.contains("auth.windows_owner_sid"), "{message}");
+}
+
+#[test]
+fn given_windows_mode_with_a_sid_when_validated_then_ok() {
+    let auth = AuthSettings {
+        mode: AuthMode::Windows,
+        windows_owner_sid: "S-1-5-21-1-2-3-1001".to_string(),
+        ..AuthSettings::default()
+    };
+
+    assert!(auth.validate().is_ok());
+}
+
+/// The other two modes must not start demanding a SID.
+#[test]
+fn given_local_or_external_mode_when_validated_then_the_sid_is_not_required() {
+    let local = AuthSettings {
+        mode: AuthMode::Local,
+        ..AuthSettings::default()
+    };
+    assert!(local.validate().is_ok());
+
+    let external = AuthSettings {
+        mode: AuthMode::External,
+        heimdall_token_secret: Secret::new("secret"),
+        heimdall_scope_id: "0b8d3a6e-4a1f-4c2b-9f1e-7c5d2a9b3e40".to_string(),
+        ..AuthSettings::default()
+    };
+    assert!(external.validate().is_ok());
+}

@@ -9,8 +9,8 @@ over both an HTTP/REST-JSON API and a Flutter FFI surface, so any client in any
 language can drive it and the Flutter desktop front-end can call it in-process.
 
 > Single-user. Metadata + path/content-hash only. No complex media editing.
-> Two-phase soft/hard deletion. Pluggable auth (external JWT **or** local
-> encrypted login).
+> Two-phase soft/hard deletion. Pluggable auth (external JWT, local encrypted
+> login, **or** the Windows account the server process runs as).
 
 ## Project status
 
@@ -138,7 +138,8 @@ Book and comic consumption tracking, per issue for comic series.
 
 ### F-09 — Pluggable authentication
 
-Exactly one active auth mode: external JWT **or** local encrypted login.
+Exactly one active auth mode: external JWT, local encrypted login, or the
+Windows account the server process runs as.
 
 | Issue | Use case | Status | Title | Requirements |
 | --- | --- | :---: | --- | --- |
@@ -148,6 +149,7 @@ Exactly one active auth mode: external JWT **or** local encrypted login.
 | [#96](https://github.com/artur-rios/alexandria-api/issues/96) | UC-41 | &#9744; | Register the local account | FR-AU-10, FR-AU-11, FR-AU-13, FR-AU-19 |
 | — | UC-43 | &#9745; | Redeem a recovery code | FR-AU-11, FR-AU-14, FR-AU-15, FR-AU-16 |
 | — | UC-44 | &#9745; | Regenerate recovery codes | FR-AU-17, FR-AU-19 |
+| — | UC-45 | &#9745; | Log in with the Windows account | FR-AU-20, FR-AU-22 |
 
 ### F-10 — Media playback
 
@@ -450,6 +452,15 @@ Local mode has no bearer token of its own: `POST
 /v1/auth/local/login` returns a `sessionId`, and that id is what subsequent
 requests present as `Authorization: Bearer <sessionId>` until it expires
 (`auth.session_ttl_hours`, default 24).
+
+In Windows mode (`ALEXANDRIA_AUTH_MODE=windows`), set
+`ALEXANDRIA_AUTH_WINDOWS_OWNER_SID` to the SID of the Windows account the
+server process is allowed to run as (find it with `whoami /user`); startup
+fails otherwise. There is no credential to submit: `POST
+/v1/auth/windows/login` takes no body and returns a `sessionId` with the same
+TTL local mode uses. This mode proves the process was launched by that
+account, not who is calling it — keep `http.bind_addr` on loopback, since
+startup only warns, and does not fail, when it is not.
 
 ### Health check
 

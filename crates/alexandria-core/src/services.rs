@@ -8,6 +8,7 @@ use crate::auth::commands::redeem_recovery_code::RedeemRecoveryCodeHandler;
 use crate::auth::commands::regenerate_recovery_codes::RegenerateRecoveryCodesHandler;
 use crate::auth::commands::register::RegisterLocalAccountHandler;
 use crate::auth::commands::set_credentials::SetLocalCredentialsHandler;
+use crate::auth::commands::windows_login::WindowsLoginHandler;
 use crate::auth::heimdall::HeimdallAuthService;
 use crate::auth::local::{
     LocalAuthService, SqliteLocalCredentialRepository, SqliteRecoveryCodeRepository,
@@ -238,6 +239,8 @@ pub type DefaultSetLocalCredentialsHandler =
 pub type DefaultLocalLoginHandler =
     LocalLoginHandler<SqliteLocalCredentialRepository, SqliteSessionRepository, SystemClock>;
 
+pub type DefaultWindowsLoginHandler = WindowsLoginHandler<SqliteSessionRepository, SystemClock>;
+
 pub type DefaultRegisterLocalAccountHandler = RegisterLocalAccountHandler<
     SqliteLocalCredentialRepository,
     SqliteSessionRepository,
@@ -307,6 +310,7 @@ pub struct Services {
     pub delete_reading_list_handler: Arc<DefaultDeleteReadingListHandler>,
     pub set_local_credentials_handler: Arc<DefaultSetLocalCredentialsHandler>,
     pub local_login_handler: Arc<DefaultLocalLoginHandler>,
+    pub windows_login_handler: Arc<DefaultWindowsLoginHandler>,
     pub register_local_account_handler: Arc<DefaultRegisterLocalAccountHandler>,
     pub get_local_account_handler: Arc<DefaultGetLocalAccountHandler>,
     pub redeem_recovery_code_handler: Arc<DefaultRedeemRecoveryCodeHandler>,
@@ -358,6 +362,13 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         // misconfigured process get this far.
         AuthMode::External => {
             RuntimeAuthService::External(HeimdallAuthService::from_settings(&settings.auth))
+        }
+        // UC-45: the account this process runs as was verified at startup,
+        // before this point. What remains is session validation, which is
+        // exactly local mode's — hence the same service behind a different
+        // variant.
+        AuthMode::Windows => {
+            RuntimeAuthService::Windows(LocalAuthService::new(session_repo.clone(), clock))
         }
     };
     let audio_tags = LoftyAudioMetadataReader;
@@ -582,6 +593,12 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         settings.auth.mode,
         settings.auth.session_ttl_hours,
     ));
+    let windows_login_handler = Arc::new(WindowsLoginHandler::new(
+        session_repo.clone(),
+        clock,
+        settings.auth.mode,
+        settings.auth.session_ttl_hours,
+    ));
     let register_local_account_handler = Arc::new(RegisterLocalAccountHandler::new(
         credential_repo.clone(),
         session_repo.clone(),
@@ -594,6 +611,7 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         auth.clone(),
         credential_repo.clone(),
         recovery_code_repo.clone(),
+        settings.auth.mode,
     ));
     let redeem_recovery_code_handler = Arc::new(RedeemRecoveryCodeHandler::new(
         credential_repo.clone(),
@@ -650,6 +668,7 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         delete_reading_list_handler,
         set_local_credentials_handler,
         local_login_handler,
+        windows_login_handler,
         register_local_account_handler,
         get_local_account_handler,
         redeem_recovery_code_handler,

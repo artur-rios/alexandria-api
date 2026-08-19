@@ -7,7 +7,7 @@
 # authoritative table.
 
 [auth]
-# The single active authentication mode. One of: "external", "local".
+# The single active authentication mode. One of: "external", "local", "windows".
 mode = "external"
 
 # External mode only: the HS256 secret Heimdall signs its tokens with — the
@@ -45,6 +45,15 @@ local_db = false
 # (UC-34) stays valid. Callers present that session id on subsequent requests.
 # Ignored when mode = "external".
 session_ttl_hours = 24
+
+# Windows mode only: the SID of the account this process must run as. Startup
+# fails unless the process is running on Windows as this account. Find it with
+# `whoami /user`. Not a secret — it is an identifier, not a credential.
+#
+# Read what this mode does and does not prove before enabling it: it proves the
+# process was launched by this account, never who is calling, so any caller that
+# can reach the port is authorized. Keep `http.bind_addr` on loopback.
+windows_owner_sid = ""
 
 [http]
 # Bind address. Loopback by default so the API is reachable only from the local

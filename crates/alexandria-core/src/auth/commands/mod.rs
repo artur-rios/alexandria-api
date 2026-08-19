@@ -4,3 +4,4 @@ pub mod redeem_recovery_code;
 pub mod regenerate_recovery_codes;
 pub mod register;
 pub mod set_credentials;
+pub mod windows_login;
