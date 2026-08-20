@@ -37,7 +37,9 @@ use alexandria_core::catalog::runs::{
     CatalogRun, CatalogRunRepository, RunCounts, RunKind, RunStatus,
 };
 use alexandria_core::catalog::video_tags::{VideoMetadataReader, VideoTags};
-use alexandria_core::collections::model::{Collection, NewCollection};
+use alexandria_core::collections::model::{
+    Collection, CollectionKind, CollectionSummary, NewCollection,
+};
 use alexandria_core::collections::repos::CollectionRepository;
 use alexandria_core::config::AuthMode;
 use alexandria_core::errors::DomainError;
@@ -627,6 +629,14 @@ pub struct FakeCollectionRepository {
     /// When set, every `delete_collection` fails, simulating a catalog-write
     /// failure in UC-12.
     failing_deletes: Arc<Mutex<bool>>,
+    /// When set, every `list_collections` fails, simulating a read failure in
+    /// UC-46.
+    failing_lists: Arc<Mutex<bool>>,
+    /// The item count `list_collections` reports per collection uuid. A
+    /// collection with no entry counts zero — the fake stores no membership of
+    /// its own, and UC-46's handler does not compute the number either: the
+    /// count is the repository's, so this is where a test states it.
+    item_counts: Arc<Mutex<HashMap<Uuid, i64>>>,
 }
 
 impl FakeCollectionRepository {
@@ -663,6 +673,16 @@ impl FakeCollectionRepository {
     /// Make every `delete_collection` return an `Internal` error.
     pub fn fail_deletes(&self) {
         *self.failing_deletes.lock().unwrap() = true;
+    }
+
+    /// Make every `list_collections` return an `Internal` error.
+    pub fn fail_lists(&self) {
+        *self.failing_lists.lock().unwrap() = true;
+    }
+
+    /// State how many items `list_collections` reports for `uuid` (UC-46).
+    pub fn set_item_count(&self, uuid: Uuid, count: i64) {
+        self.item_counts.lock().unwrap().insert(uuid, count);
     }
 }
 
@@ -706,6 +726,42 @@ impl CollectionRepository for FakeCollectionRepository {
         }
         self.collections.lock().unwrap().remove(&uuid);
         Ok(())
+    }
+
+    async fn list_collections(
+        &self,
+        kind: Option<CollectionKind>,
+    ) -> Result<Vec<CollectionSummary>, DomainError> {
+        if *self.failing_lists.lock().unwrap() {
+            return Err(DomainError::internal("fake list_collections failure"));
+        }
+
+        let counts = self.item_counts.lock().unwrap();
+        let mut summaries: Vec<CollectionSummary> = self
+            .collections
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|c| kind.is_none_or(|k| k == c.kind))
+            .map(|c| CollectionSummary {
+                uuid: c.uuid,
+                name: c.name.clone(),
+                kind: c.kind,
+                item_count: counts.get(&c.uuid).copied().unwrap_or(0),
+            })
+            .collect();
+
+        // The Sqlite repository orders by name; a `HashMap` has no order at
+        // all, so the fake sorts to match. Without it a two-collection test
+        // would pass or fail on hash iteration order.
+        summaries.sort_by(|a, b| {
+            a.name
+                .to_lowercase()
+                .cmp(&b.name.to_lowercase())
+                .then(a.uuid.cmp(&b.uuid))
+        });
+
+        Ok(summaries)
     }
 }
 

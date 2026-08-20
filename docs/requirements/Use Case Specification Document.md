@@ -1431,6 +1431,44 @@ have only one of.
 
 ---
 
+### UC-46: Browse collections
+
+| Field | Value |
+| --- | --- |
+| **ID** | UC-46 |
+| **Name** | Browse collections |
+| **Actors** | Owner |
+| **Description** | List the owner's collections, optionally narrowed to one `kind`, each with the number of items it currently holds. |
+| **Preconditions** | The caller is authenticated. |
+| **Postconditions** | None — this is a read. |
+| **Requirements** | FR-CO-08, FR-FC-24 |
+
+**Main Flow**
+
+1. The caller requests the collections, optionally naming a `kind` to filter by.
+2. The system returns every collection of that kind — or every collection when no
+   kind is given — each carrying its `uuid`, `name`, `kind`, and the number of
+   items it holds.
+
+**Alternative Flows**
+
+| ID | Condition | Outcome |
+| --- | --- | --- |
+| AF-01 | No collection exists, or none of the requested kind | The system returns an empty list. This is a state, not an error. |
+| AF-02 | The `kind` filter is not one the system recognises | The system rejects it as invalid input and queries nothing. |
+| AF-03 | The caller is not authenticated | The system denies with an unauthorized error. |
+
+> The item count is derived by counting the rows that point at the collection,
+> never stored, so it cannot drift from the membership. It counts the same
+> members UC-14's list returns — soft-deleted items are excluded from both.
+
+> The count is returned on this listing and not on the `Collection` payload that
+> UC-10 and UC-11 echo. Those two answer "what did I just write", where a count
+> the caller did not ask about would be a second query on every write; this one
+> answers "what do I have", where the count is the reason to ask.
+
+---
+
 ## 3. Use Case — Requirements Traceability
 
 | Use Case | Requirements |
@@ -1479,6 +1517,7 @@ have only one of.
 | UC-43: Redeem a recovery code | FR-AU-11, FR-AU-14, FR-AU-15, FR-AU-16 |
 | UC-44: Regenerate recovery codes | FR-AU-17, FR-AU-19 |
 | UC-45: Log in with the Windows account | FR-AU-20, FR-AU-22 |
+| UC-46: Browse collections | FR-CO-08, FR-FC-24 |
 
 Every functional requirement in [System Requirements Document](System%20Requirements%20Document.md)
 §3 appears in at least one row above except FR-AU-12, FR-AU-18, FR-AU-21,

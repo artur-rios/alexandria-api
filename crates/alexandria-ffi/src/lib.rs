@@ -1611,6 +1611,92 @@ pub extern "C" fn alexandria_collection_list_items(
     }
 }
 
+/// Filters accepted by `alexandria_collections_list` (UC-46). Mirrors the
+/// query string HTTP takes on the same route, so a caller writes the same
+/// filter for either surface (FR-FC-24 / NFR-09).
+#[derive(Debug, Default)]
+struct CollectionsListFilter {
+    kind: Option<String>,
+}
+
+impl CollectionsListFilter {
+    /// Parse the JSON filter body. An empty string, a JSON `null`, and `{}`
+    /// all mean "no filter"; anything that is not a JSON object is `None`,
+    /// which the caller turns into invalid input.
+    fn from_json_str(s: &str) -> Option<Self> {
+        if s.trim().is_empty() {
+            return Some(Self::default());
+        }
+        let value: serde_json::Value = serde_json::from_str(s).ok()?;
+        if value.is_null() {
+            return Some(Self::default());
+        }
+        let obj = value.as_object()?;
+        Some(Self {
+            kind: obj
+                .get("kind")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+        })
+    }
+}
+
+/// List the owner's collections (UC-46 / FR-CO-08).
+///
+/// `json_filters` is the JSON filter HTTP would build from its query string
+/// (`kind`); an empty string or `null` means every collection. On success
+/// `json` carries a JSON array of `CollectionSummary` — each collection with
+/// the number of items it holds — byte-for-byte the same shape HTTP returns
+/// from `GET /v1/collections` (parity, FR-FC-24 / NFR-09). `token` is the
+/// bearer auth token.
+///
+/// An owner with no collections gets an empty array and `COLLECTION_OK`, not
+/// an error (AF-01). An unrecognised `kind` is `COLLECTION_ERR_INVALID_INPUT`
+/// and nothing is queried (AF-02).
+#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
+#[no_mangle]
+pub extern "C" fn alexandria_collections_list(
+    json_filters: *const c_char,
+    token: *const c_char,
+) -> CollectionJsonResult {
+    let services = match services_slot().lock().unwrap().clone() {
+        Some(s) => s,
+        None => return CollectionJsonResult::err(COLLECTION_ERR_NOT_INITIALIZED),
+    };
+
+    let token = cstr_lossy(token).unwrap_or_default();
+    if !authenticated(&services, &token) {
+        return CollectionJsonResult::err(COLLECTION_ERR_UNAUTHORIZED);
+    }
+
+    let filter_str = cstr_lossy(json_filters).unwrap_or_default();
+    let parsed = match CollectionsListFilter::from_json_str(&filter_str) {
+        Some(f) => f,
+        None => return CollectionJsonResult::err(COLLECTION_ERR_INVALID_INPUT),
+    };
+
+    // AF-02: refused before the handler is reached, exactly as HTTP refuses
+    // the same value while parsing its query string.
+    let kind = match parsed.kind.as_deref().filter(|k| !k.is_empty()) {
+        None => None,
+        Some(value) => match alexandria_core::collections::model::CollectionKind::parse(value) {
+            Some(k) => Some(k),
+            None => return CollectionJsonResult::err(COLLECTION_ERR_INVALID_INPUT),
+        },
+    };
+
+    let result =
+        runtime().block_on(async { services.list_collections_handler.list(kind, &token).await });
+
+    match result {
+        Ok(collections) => {
+            let json = serde_json::to_string(&collections).unwrap_or_default();
+            CollectionJsonResult::ok(json)
+        }
+        Err(err) => map_collection_err(err),
+    }
+}
+
 /// FFI status codes returned by bookmark operations (UC-15+). Deliberately
 /// separate from `COLLECTION_*` — per the convention above — so bookmark use
 /// cases can grow their own set without colliding; `BOOKMARK_OK ==

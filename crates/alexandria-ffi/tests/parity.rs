@@ -23,19 +23,19 @@ use alexandria_ffi::{
     alexandria_bookmark_restore, alexandria_bookmark_soft_delete, alexandria_bookmark_update,
     alexandria_bookmarks_list, alexandria_collection_add_items, alexandria_collection_create,
     alexandria_collection_delete, alexandria_collection_list_items,
-    alexandria_collection_remove_item, alexandria_collection_rename, alexandria_comic_page,
-    alexandria_file_edit_content, alexandria_file_edit_metadata, alexandria_file_get_by_uuid,
-    alexandria_file_playback_source, alexandria_file_purge, alexandria_file_purge_on_disk,
-    alexandria_file_read_content, alexandria_file_rename, alexandria_file_restore,
-    alexandria_file_soft_delete, alexandria_file_thumbnail, alexandria_files_list,
-    alexandria_free_string, alexandria_index_count_files, alexandria_index_files_json,
-    alexandria_index_init, alexandria_index_refresh_start, alexandria_index_run_status_json,
-    alexandria_index_start, alexandria_reading_list_add_item, alexandria_reading_list_create,
-    alexandria_reading_list_delete, alexandria_reading_list_remove_item,
-    alexandria_reading_list_update_progress, alexandria_reading_lists_list,
-    alexandria_watchlist_add_video, alexandria_watchlist_create, alexandria_watchlist_delete,
-    alexandria_watchlist_remove_video, alexandria_watchlist_update_progress,
-    alexandria_watchlists_list, IndexStartResult,
+    alexandria_collection_remove_item, alexandria_collection_rename, alexandria_collections_list,
+    alexandria_comic_page, alexandria_file_edit_content, alexandria_file_edit_metadata,
+    alexandria_file_get_by_uuid, alexandria_file_playback_source, alexandria_file_purge,
+    alexandria_file_purge_on_disk, alexandria_file_read_content, alexandria_file_rename,
+    alexandria_file_restore, alexandria_file_soft_delete, alexandria_file_thumbnail,
+    alexandria_files_list, alexandria_free_string, alexandria_index_count_files,
+    alexandria_index_files_json, alexandria_index_init, alexandria_index_refresh_start,
+    alexandria_index_run_status_json, alexandria_index_start, alexandria_reading_list_add_item,
+    alexandria_reading_list_create, alexandria_reading_list_delete,
+    alexandria_reading_list_remove_item, alexandria_reading_list_update_progress,
+    alexandria_reading_lists_list, alexandria_watchlist_add_video, alexandria_watchlist_create,
+    alexandria_watchlist_delete, alexandria_watchlist_remove_video,
+    alexandria_watchlist_update_progress, alexandria_watchlists_list, IndexStartResult,
 };
 use alexandria_http::app;
 use axum::body::{to_bytes, Body};
@@ -11181,4 +11181,160 @@ async fn given_the_recovery_surface_when_called_on_both_surfaces_then_bodies_mat
         .expect("recoveryCodes");
     assert_eq!(http_new_codes.len(), 10);
     assert_eq!(ffi_new_codes.len(), 10);
+}
+
+/// UC-46 parity — seed the same two collections into each leg's database, list
+/// them over both transports, and assert the returned arrays are identical
+/// (Testing Specification §7.3, FR-CO-08, FR-FC-24).
+///
+/// Seeded with fixed uuids rather than created through UC-10, so the two legs
+/// hold literally the same rows and the bodies can be compared whole — a
+/// created collection mints its own uuid per database, which would force the
+/// comparison to drop the one field this listing exists to hand out.
+///
+/// The unrecognised-`kind` refusal (AF-02) is asserted here too: it is the one
+/// flow the shared handler cannot answer, because both transports reject the
+/// value while parsing their own request, and parity is exactly the claim that
+/// they reject it the same way.
+#[tokio::test]
+async fn given_same_collections_when_listed_via_http_and_ffi_then_bodies_identical() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+
+    const FILMS: &str = "11111111-1111-4111-8111-111111111111";
+    const READING: &str = "22222222-2222-4222-8222-222222222222";
+
+    async fn seed_collections(pool: &sqlx::sqlite::SqlitePool) {
+        for (uuid, name, kind) in [(FILMS, "Films", "file"), (READING, "Reading", "bookmark")] {
+            sqlx::query("INSERT INTO collections (uuid, name, kind) VALUES (?, ?, ?)")
+                .bind(uuid)
+                .bind(name)
+                .bind(kind)
+                .execute(pool)
+                .await
+                .expect("seed collection");
+        }
+
+        // One active member and one soft-deleted member in Films, so the
+        // parity assertion covers the derived count and its exclusion of
+        // deleted rows rather than comparing two zeroes.
+        let films_id: i64 = sqlx::query_scalar("SELECT id FROM collections WHERE uuid = ?")
+            .bind(FILMS)
+            .fetch_one(pool)
+            .await
+            .expect("films id");
+        for (uuid, state) in [
+            ("aaaaaaaa-0000-4000-8000-000000000001", "active"),
+            ("aaaaaaaa-0000-4000-8000-000000000002", "deleted"),
+        ] {
+            sqlx::query(
+                "INSERT INTO files (uuid, path, name, type, content_hash, state, indexed_at, collection_id) \
+                 VALUES (?, ?, ?, 'text', 'hash', ?, ?, ?)",
+            )
+            .bind(uuid)
+            .bind(format!("/lib/{uuid}.txt"))
+            .bind(format!("{uuid}.txt"))
+            .bind(state)
+            .bind(chrono::Utc::now().to_rfc3339())
+            .bind(films_id)
+            .execute(pool)
+            .await
+            .expect("seed file");
+        }
+    }
+
+    // ---- HTTP leg ----
+    let http_dir = tempdir().unwrap();
+    let http_db = db_path(&http_dir, "http.sqlite");
+    let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    seed_session(&http_pool, TEST_TOKEN).await;
+    seed_collections(&http_pool).await;
+    let http_services =
+        std::sync::Arc::new(build_services(&local_settings(), http_pool.clone()).await);
+
+    let req = Request::builder()
+        .method("GET")
+        .uri("/v1/collections")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = app(Settings::default(), http_services.clone())
+        .oneshot(req)
+        .await
+        .expect("http list");
+    assert_eq!(resp.status(), axum::http::StatusCode::OK);
+    let http_body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
+
+    let bad = Request::builder()
+        .method("GET")
+        .uri("/v1/collections?kind=playlist")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
+        .body(Body::empty())
+        .unwrap();
+    let http_bad_status = app(Settings::default(), http_services)
+        .oneshot(bad)
+        .await
+        .expect("http bad kind")
+        .status();
+
+    // ---- FFI leg (off the tokio thread: FFI block_on its own runtime) ----
+    let ffi_dir = tempdir().unwrap();
+    let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
+    let ffi_pool = migrate_database(&ffi_db).await.expect("ffi open");
+    seed_collections(&ffi_pool).await;
+    ffi_pool.close().await;
+
+    let (ffi_body, ffi_bad_status) =
+        tokio::task::spawn_blocking(move || -> (serde_json::Value, std::os::raw::c_int) {
+            let cdb = CString::new(ffi_db).unwrap();
+            assert_eq!(
+                alexandria_index_init(cdb.as_ptr()),
+                alexandria_ffi::INDEX_OK
+            );
+
+            let token = CString::new(TEST_TOKEN).unwrap();
+            let empty = CString::new("").unwrap();
+            let r = alexandria_collections_list(empty.as_ptr(), token.as_ptr());
+            assert_eq!(r.status, alexandria_ffi::COLLECTION_OK, "ffi list");
+            assert!(!r.json.is_null());
+            // SAFETY: pointer came from this library and is freed once below.
+            let s = unsafe { CStr::from_ptr(r.json) }
+                .to_string_lossy()
+                .into_owned();
+            unsafe {
+                alexandria_free_string(r.json);
+            }
+
+            let bad = CString::new(json!({ "kind": "playlist" }).to_string()).unwrap();
+            let bad_result = alexandria_collections_list(bad.as_ptr(), token.as_ptr());
+            assert!(bad_result.json.is_null(), "a refusal carries no body");
+
+            (serde_json::from_str(&s).unwrap(), bad_result.status)
+        })
+        .await
+        .unwrap();
+
+    // ---- compare ----
+    assert_eq!(
+        http_body, ffi_body,
+        "collection listing diverges across surfaces"
+    );
+
+    // The listing itself is worth asserting once, so a parity test over two
+    // identically-wrong answers cannot pass.
+    let items = http_body.as_array().expect("array");
+    assert_eq!(items.len(), 2);
+    assert_eq!(items[0]["uuid"], FILMS);
+    assert_eq!(items[0]["name"], "Films");
+    assert_eq!(items[0]["kind"], "file");
+    assert_eq!(
+        items[0]["itemCount"], 1,
+        "the deleted member is not counted"
+    );
+    assert_eq!(items[1]["uuid"], READING);
+    assert_eq!(items[1]["itemCount"], 0);
+
+    // AF-02 refused the same way on both surfaces.
+    assert_eq!(http_bad_status, axum::http::StatusCode::BAD_REQUEST);
+    assert_eq!(ffi_bad_status, alexandria_ffi::COLLECTION_ERR_INVALID_INPUT);
 }

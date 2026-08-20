@@ -1,5 +1,5 @@
-use axum::extract::rejection::{JsonRejection, PathRejection};
-use axum::extract::{Path, State};
+use axum::extract::rejection::{JsonRejection, PathRejection, QueryRejection};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
 use serde::Deserialize;
@@ -7,7 +7,7 @@ use uuid::Uuid;
 
 use alexandria_core::collections::model::{
     Collection, CollectionItemResult, CollectionItemsResult, CollectionKind,
-    CollectionMembersResult,
+    CollectionMembersResult, CollectionSummary,
 };
 use alexandria_core::errors::DomainError;
 
@@ -15,6 +15,56 @@ use crate::middleware::auth::invalid_input;
 use crate::middleware::error::ApiError;
 use crate::routes::bearer_token;
 use crate::AppState;
+
+/// Query-string parameters for `GET /v1/collections` (UC-46 / FR-CO-08).
+/// `kind` is optional: omitted or empty is every collection, and an
+/// unrecognised value is rejected as `400` invalid input rather than silently
+/// listing everything, matching the FFI surface (FR-FC-24 / NFR-09).
+///
+/// Taken as a `String` rather than as the domain enum so that an unrecognised
+/// value produces this surface's own `{"error": …}` envelope naming the bad
+/// value, instead of axum's bare deserialization rejection.
+#[derive(Debug, Default, Deserialize)]
+pub struct CollectionListParams {
+    #[serde(rename = "kind", default)]
+    pub kind: Option<String>,
+}
+
+/// `GET /v1/collections` — list the owner's collections (UC-46 / FR-CO-08).
+///
+/// The read that makes the rest of F-05 reachable: every other collection
+/// operation addresses a uuid the caller must already hold, and this is where
+/// those uuids come from. Returns `200` with a JSON array of
+/// `CollectionSummary` — each carrying the collection and the number of items
+/// it holds — or `400` (unrecognised `kind`) or `401` (unauthenticated). An
+/// owner with no collections gets an empty array, which is AF-01 and not an
+/// error.
+pub async fn list(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    params: Result<Query<CollectionListParams>, QueryRejection>,
+) -> Result<Json<Vec<CollectionSummary>>, ApiError> {
+    let token = bearer_token(&headers);
+
+    let Query(params) = params.map_err(|err| invalid_input(format!("invalid query: {err}")))?;
+
+    // AF-02: an unrecognised kind is refused here, and nothing is queried.
+    let kind = match params.kind.as_deref().filter(|k| !k.is_empty()) {
+        None => None,
+        Some(value) => Some(CollectionKind::parse(value).ok_or_else(|| {
+            ApiError(DomainError::InvalidInput(format!("unknown kind: {value}")))
+        })?),
+    };
+
+    let collections = state
+        .services
+        .list_collections_handler
+        .list(kind, &token)
+        .await
+        .map_err(ApiError)?;
+
+    Ok(Json(collections))
+}
 
 /// Request body for `POST /v1/collections` (UC-10 / FR-CO-01, FR-CO-02): the
 /// collection's `name` and its `kind` discriminator. Both are required — an

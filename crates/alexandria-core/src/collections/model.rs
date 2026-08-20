@@ -63,6 +63,27 @@ pub struct Collection {
     pub kind: CollectionKind,
 }
 
+/// A collection as UC-46's listing returns it (FR-CO-08): the record plus the
+/// number of items it currently holds.
+///
+/// A summary type rather than a field on [`Collection`], because the two answer
+/// different questions. `Collection` is what UC-10 and UC-11 echo — "what did I
+/// just write" — where a count nobody asked for would cost a second query on
+/// every write. This one answers "what do I have", where the count is the
+/// reason to ask.
+///
+/// The count is derived by counting the rows that point at the collection, so
+/// it cannot drift from the membership, and it counts the same members UC-14
+/// lists: soft-deleted items are excluded from both.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CollectionSummary {
+    pub uuid: Uuid,
+    pub name: String,
+    pub kind: CollectionKind,
+    pub item_count: i64,
+}
+
 /// Result of UC-13 (add items): the collection and the item uuids the
 /// request just linked, echoing the request rather than the collection's
 /// full membership — listing full membership is UC-14's read path

@@ -47,6 +47,7 @@ use crate::collections::commands::create::CreateCollectionHandler;
 use crate::collections::commands::delete::DeleteCollectionHandler;
 use crate::collections::commands::remove_item::RemoveItemFromCollectionHandler;
 use crate::collections::commands::rename::RenameCollectionHandler;
+use crate::collections::queries::list::ListCollectionsHandler;
 use crate::collections::queries::list_items::ListCollectionItemsHandler;
 use crate::collections::repos::SqliteCollectionRepository;
 use crate::config::AuthMode;
@@ -184,6 +185,9 @@ pub type DefaultRemoveItemFromCollectionHandler = RemoveItemFromCollectionHandle
     SqliteBookmarkRepository,
 >;
 
+pub type DefaultListCollectionsHandler =
+    ListCollectionsHandler<RuntimeAuthService, SqliteCollectionRepository>;
+
 pub type DefaultListCollectionItemsHandler = ListCollectionItemsHandler<
     RuntimeAuthService,
     SqliteCollectionRepository,
@@ -296,6 +300,7 @@ pub struct Services {
     pub add_items_to_collection_handler: Arc<DefaultAddItemsToCollectionHandler>,
     pub remove_item_from_collection_handler: Arc<DefaultRemoveItemFromCollectionHandler>,
     pub list_collection_items_handler: Arc<DefaultListCollectionItemsHandler>,
+    pub list_collections_handler: Arc<DefaultListCollectionsHandler>,
     pub create_watchlist_handler: Arc<DefaultCreateWatchlistHandler>,
     pub add_video_to_watchlist_handler: Arc<DefaultAddVideoToWatchlistHandler>,
     pub browse_watchlists_handler: Arc<DefaultBrowseWatchlistsHandler>,
@@ -530,6 +535,10 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         repo.clone(),
         SqliteBookmarkRepository::new(pool.clone()),
     ));
+    let list_collections_handler = Arc::new(ListCollectionsHandler::new(
+        auth.clone(),
+        SqliteCollectionRepository::new(pool.clone()),
+    ));
     let watchlist_repo = SqliteWatchlistRepository::new(pool.clone());
     let create_watchlist_handler = Arc::new(CreateWatchlistHandler::new(
         auth.clone(),
@@ -654,6 +663,7 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         add_items_to_collection_handler,
         remove_item_from_collection_handler,
         list_collection_items_handler,
+        list_collections_handler,
         create_watchlist_handler,
         add_video_to_watchlist_handler,
         browse_watchlists_handler,
