@@ -9,7 +9,9 @@ use uuid::Uuid;
 use alexandria_core::bookmarks::model::{Bookmark, BookmarkState};
 use alexandria_core::catalog::model::{File, FileState, FileType};
 use alexandria_core::collections::commands::add_items::AddItemsToCollectionHandler;
-use alexandria_core::collections::model::{Collection, CollectionKind};
+use alexandria_core::collections::model::{
+    Collection, CollectionItemOutcome, CollectionItemsResult, CollectionKind, ItemRejection,
+};
 use alexandria_core::errors::DomainError;
 
 use crate::common::{
@@ -59,6 +61,21 @@ fn a_bookmark(uuid: Uuid) -> Bookmark {
     }
 }
 
+/// The uuids the result reports as linked, in order.
+fn added_uuids(result: &CollectionItemsResult) -> Vec<Uuid> {
+    result
+        .items
+        .iter()
+        .filter(|item| item.added)
+        .map(|item| item.item_uuid)
+        .collect()
+}
+
+/// What the result says about `uuid`, if it mentions it at all.
+fn outcome_for(result: &CollectionItemsResult, uuid: Uuid) -> Option<&CollectionItemOutcome> {
+    result.items.iter().find(|item| item.item_uuid == uuid)
+}
+
 // ---------------- Main flow ----------------
 
 #[tokio::test]
@@ -88,7 +105,11 @@ async fn given_file_collection_and_existing_files_when_add_then_linked_and_resul
         .expect("add");
 
     assert_eq!(result.collection_uuid, collection_uuid);
-    assert_eq!(result.item_uuids, vec![file_a, file_b]);
+    assert_eq!(
+        added_uuids(&result),
+        vec![file_a, file_b],
+        "both files were linked and reported"
+    );
     assert_eq!(
         catalog_repo.collection_for_file(file_a),
         Some(collection_uuid)
@@ -123,7 +144,7 @@ async fn given_bookmark_collection_and_existing_bookmarks_when_add_then_linked()
         .await
         .expect("add");
 
-    assert_eq!(result.item_uuids, vec![bookmark_uuid]);
+    assert_eq!(added_uuids(&result), vec![bookmark_uuid]);
     assert_eq!(
         bookmark_repo
             .bookmark_for(bookmark_uuid)
@@ -155,9 +176,14 @@ async fn given_bookmark_item_for_file_collection_when_add_then_invalid_input_and
         bookmark_repo,
     );
 
-    let result = h.add(collection_uuid, vec![bookmark_uuid], TOKEN).await;
+    let result = h
+        .add(collection_uuid, vec![bookmark_uuid], TOKEN)
+        .await
+        .expect("the request succeeds; the item is what was rejected");
 
-    assert!(matches!(result, Err(DomainError::InvalidInput(_))));
+    let outcome = outcome_for(&result, bookmark_uuid).expect("reported");
+    assert!(!outcome.added);
+    assert_eq!(outcome.reason, Some(ItemRejection::WrongKind));
     assert_eq!(catalog_repo.collection_for_file(bookmark_uuid), None);
 }
 
@@ -181,15 +207,22 @@ async fn given_file_item_for_bookmark_collection_when_add_then_invalid_input() {
         bookmark_repo,
     );
 
-    let result = h.add(collection_uuid, vec![file_uuid], TOKEN).await;
+    let result = h
+        .add(collection_uuid, vec![file_uuid], TOKEN)
+        .await
+        .expect("the request succeeds; the item is what was rejected");
 
-    assert!(matches!(result, Err(DomainError::InvalidInput(_))));
+    let outcome = outcome_for(&result, file_uuid).expect("reported");
+    assert!(!outcome.added);
+    assert_eq!(outcome.reason, Some(ItemRejection::WrongKind));
 }
 
 #[tokio::test]
-async fn given_one_valid_and_one_wrong_kind_item_when_add_then_entire_request_rejected() {
-    // AF-01: "The system rejects the entire request" — the valid item must
-    // not be linked either.
+async fn given_one_valid_and_one_wrong_kind_item_when_add_then_the_valid_one_is_linked() {
+    // AF-01: the wrong-kind item is reported and the valid one still lands.
+    // This is the behaviour the per-item report exists for — a caller can
+    // tell its owner exactly what happened, which "none of them" never
+    // allowed.
     let collection_repo = FakeCollectionRepository::new();
     let catalog_repo = FakeCatalogRepository::new();
     let bookmark_repo = FakeBookmarkRepository::new();
@@ -212,20 +245,25 @@ async fn given_one_valid_and_one_wrong_kind_item_when_add_then_entire_request_re
 
     let result = h
         .add(collection_uuid, vec![good_file, bad_bookmark], TOKEN)
-        .await;
+        .await
+        .expect("add");
 
-    assert!(matches!(result, Err(DomainError::InvalidInput(_))));
+    assert_eq!(added_uuids(&result), vec![good_file]);
+    assert_eq!(
+        outcome_for(&result, bad_bookmark).and_then(|item| item.reason),
+        Some(ItemRejection::WrongKind)
+    );
     assert_eq!(
         catalog_repo.collection_for_file(good_file),
-        None,
-        "no partial linking on a rejected request"
+        Some(collection_uuid),
+        "one bad item no longer costs the good ones"
     );
 }
 
 // ---------------- AF-02: referenced item does not exist ----------------
 
 #[tokio::test]
-async fn given_unknown_item_uuid_when_add_then_not_found_and_nothing_linked() {
+async fn given_unknown_item_uuid_when_add_then_reported_as_not_found() {
     let collection_repo = FakeCollectionRepository::new();
     let catalog_repo = FakeCatalogRepository::new();
     let collection_uuid = Uuid::new_v4();
@@ -242,10 +280,59 @@ async fn given_unknown_item_uuid_when_add_then_not_found_and_nothing_linked() {
     );
 
     let unknown = Uuid::new_v4();
-    let result = h.add(collection_uuid, vec![unknown], TOKEN).await;
+    let result = h
+        .add(collection_uuid, vec![unknown], TOKEN)
+        .await
+        .expect("the request succeeds; the item is what was rejected");
 
-    assert!(matches!(result, Err(DomainError::NotFound)));
+    let outcome = outcome_for(&result, unknown).expect("reported");
+    assert!(!outcome.added);
+    assert_eq!(
+        outcome.reason,
+        Some(ItemRejection::NotFound),
+        "told apart from the wrong-kind rejection: this uuid names nothing at all"
+    );
     assert_eq!(catalog_repo.collection_for_file(unknown), None);
+}
+
+/// AF-05: nothing was linked, and the caller is told why for each. A request
+/// that reported nothing would be indistinguishable from one that worked.
+#[tokio::test]
+async fn given_every_item_rejected_when_add_then_it_succeeds_with_a_full_report() {
+    let collection_repo = FakeCollectionRepository::new();
+    let catalog_repo = FakeCatalogRepository::new();
+    let bookmark_repo = FakeBookmarkRepository::new();
+    let collection_uuid = Uuid::new_v4();
+    collection_repo.seed(Collection {
+        uuid: collection_uuid,
+        name: "My files".to_string(),
+        kind: CollectionKind::File,
+    });
+    let wrong_kind = Uuid::new_v4();
+    bookmark_repo.seed(a_bookmark(wrong_kind));
+    let unknown = Uuid::new_v4();
+    let h = handler(
+        FakeAuth::Allowing,
+        collection_repo,
+        catalog_repo,
+        bookmark_repo,
+    );
+
+    let result = h
+        .add(collection_uuid, vec![wrong_kind, unknown], TOKEN)
+        .await
+        .expect("reporting is what the call was asked for");
+
+    assert!(added_uuids(&result).is_empty());
+    assert_eq!(result.items.len(), 2);
+    assert_eq!(
+        outcome_for(&result, wrong_kind).and_then(|item| item.reason),
+        Some(ItemRejection::WrongKind)
+    );
+    assert_eq!(
+        outcome_for(&result, unknown).and_then(|item| item.reason),
+        Some(ItemRejection::NotFound)
+    );
 }
 
 // ---------------- AF-03: collection does not exist ----------------

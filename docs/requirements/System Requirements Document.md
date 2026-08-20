@@ -117,7 +117,7 @@ graph LR
 | FR-CO-02 | The system shall create a bookmark collection (name, `kind` = bookmark). |
 | FR-CO-03 | The system shall rename a collection. |
 | FR-CO-04 | The system shall delete a collection by unlinking (preserving) its contained items, not deleting them. |
-| FR-CO-05 | The system shall add items of the matching `kind` to a collection. |
+| FR-CO-05 | The system shall add items of the matching `kind` to a collection, linking those it can and reporting for every submitted item whether it was added and, when it was not, whether it was of the other kind or does not exist. |
 | FR-CO-06 | The system shall remove items from a collection. |
 | FR-CO-07 | The system shall list the items in a collection. |
 | FR-CO-08 | The system shall list the owner's collections, optionally filtered by `kind`, each with the number of items it currently holds. |

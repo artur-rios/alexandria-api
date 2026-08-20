@@ -3,7 +3,9 @@ use uuid::Uuid;
 use crate::auth::AuthService;
 use crate::bookmarks::repos::BookmarkRepository;
 use crate::catalog::repos::CatalogRepository;
-use crate::collections::model::{CollectionItemsResult, CollectionKind};
+use crate::collections::model::{
+    CollectionItemOutcome, CollectionItemsResult, CollectionKind, ItemRejection,
+};
 use crate::collections::repos::CollectionRepository;
 use crate::errors::DomainError;
 
@@ -39,9 +41,17 @@ where
         }
     }
 
-    /// Add `item_uuids` to the collection identified by `collection_uuid`.
-    /// Every item is validated before any is linked, so the request either
-    /// links all of them or none (AF-01's "rejects the entire request").
+    /// Add `item_uuids` to the collection identified by `collection_uuid`,
+    /// reporting what became of each.
+    ///
+    /// Links what it can and reports the rest. AF-01 (wrong kind) and AF-02
+    /// (no such item) are per-item reasons rather than request-level errors:
+    /// a caller that has to explain the outcome cannot do so from "none of
+    /// them, because one was wrong". AF-03 and AF-04 remain errors — neither
+    /// is about an item.
+    ///
+    /// A request whose items are all rejected still succeeds, carrying a
+    /// report that says so. The call did what it was asked: it reported.
     pub async fn add(
         &self,
         collection_uuid: Uuid,
@@ -52,64 +62,70 @@ where
         // collection or items are looked up (FR-AU-07 / SRD §7).
         self.auth.authenticate(token).await?;
 
-        // AF-03: the collection must exist.
+        // AF-03: the collection must exist. Still an error — a request naming
+        // no collection has nothing to report per item.
         let collection = self
             .collection_repo
             .find_by_uuid(collection_uuid)
             .await?
             .ok_or(DomainError::NotFound)?;
 
-        // Validate every item before linking any. Existence in the *other*
-        // table distinguishes AF-01 (wrong kind) from AF-02 (does not exist
-        // at all): the caller submits bare uuids with no declared kind, so a
-        // uuid that resolves in the collection's own table is fine, one that
-        // resolves only in the other table is a type mismatch, and one that
-        // resolves in neither does not exist.
-        for uuid in &item_uuids {
-            match collection.kind {
-                CollectionKind::File => {
-                    if self.catalog_repo.find_by_uuid(*uuid).await?.is_some() {
-                        continue;
-                    }
-                    if self.bookmark_repo.find_by_uuid(*uuid).await?.is_some() {
-                        return Err(DomainError::InvalidInput(format!(
-                            "item {uuid} is a bookmark, not a file"
-                        )));
-                    }
-                    return Err(DomainError::NotFound);
-                }
-                CollectionKind::Bookmark => {
-                    if self.bookmark_repo.find_by_uuid(*uuid).await?.is_some() {
-                        continue;
-                    }
-                    if self.catalog_repo.find_by_uuid(*uuid).await?.is_some() {
-                        return Err(DomainError::InvalidInput(format!(
-                            "item {uuid} is a file, not a bookmark"
-                        )));
-                    }
-                    return Err(DomainError::NotFound);
-                }
-            }
-        }
+        let mut items = Vec::with_capacity(item_uuids.len());
 
-        for uuid in &item_uuids {
+        for uuid in item_uuids {
+            // Existence in the *other* table is what distinguishes AF-01 from
+            // AF-02: the caller submits bare uuids with no declared kind, so a
+            // uuid that resolves in the collection's own table is fine, one
+            // that resolves only in the other table is a type mismatch, and
+            // one that resolves in neither does not exist.
+            let belongs = match collection.kind {
+                CollectionKind::File => self.catalog_repo.find_by_uuid(uuid).await?.is_some(),
+                CollectionKind::Bookmark => self.bookmark_repo.find_by_uuid(uuid).await?.is_some(),
+            };
+
+            if !belongs {
+                let elsewhere = match collection.kind {
+                    CollectionKind::File => self.bookmark_repo.find_by_uuid(uuid).await?.is_some(),
+                    CollectionKind::Bookmark => {
+                        self.catalog_repo.find_by_uuid(uuid).await?.is_some()
+                    }
+                };
+
+                items.push(CollectionItemOutcome {
+                    item_uuid: uuid,
+                    added: false,
+                    reason: Some(if elsewhere {
+                        ItemRejection::WrongKind
+                    } else {
+                        ItemRejection::NotFound
+                    }),
+                });
+                continue;
+            }
+
             match collection.kind {
                 CollectionKind::File => {
                     self.catalog_repo
-                        .set_collection(*uuid, collection_uuid)
+                        .set_collection(uuid, collection_uuid)
                         .await?
                 }
                 CollectionKind::Bookmark => {
                     self.bookmark_repo
-                        .set_collection(*uuid, collection_uuid)
+                        .set_collection(uuid, collection_uuid)
                         .await?
                 }
             }
+
+            items.push(CollectionItemOutcome {
+                item_uuid: uuid,
+                added: true,
+                reason: None,
+            });
         }
 
         Ok(CollectionItemsResult {
             collection_uuid,
-            item_uuids,
+            items,
         })
     }
 }

@@ -454,25 +454,36 @@ The `runId` returned in step 2 is opaque: completion is reported to the log only
 | **ID** | UC-13 |
 | **Name** | Add items to a collection |
 | **Actors** | Owner |
-| **Description** | Add one or more items of the matching `kind` to a collection. |
+| **Description** | Add one or more items of the matching `kind` to a collection, reporting what became of each. |
 | **Preconditions** | The caller is authenticated; the collection exists. |
-| **Postconditions** | Each item's `collectionId` references the collection. |
+| **Postconditions** | Each accepted item's `collectionId` references the collection. A rejected item is unchanged. |
 | **Requirements** | FR-CO-05, FR-FC-24 |
 
 **Main Flow**
 
 1. The owner submits item UUIDs to add to a collection UUID.
-2. The system verifies each item's type matches the collection's `kind`.
-3. The system sets each item's `collectionId` and returns the updated collection contents.
+2. The system checks each item against the collection's `kind`.
+3. The system sets the `collectionId` of every item that matches, and returns what became of each submitted item.
 
 **Alternative Flows**
 
 | ID | Condition | Outcome |
 | --- | --- | --- |
-| AF-01 | An item's type does not match the collection's `kind` | The system rejects the entire request with an invalid-input error. |
-| AF-02 | A referenced item UUID does not exist | The system responds with a not-found error. |
+| AF-01 | An item's type does not match the collection's `kind` | The system reports that item as not added, because it is of the other kind, and links the rest. |
+| AF-02 | A referenced item UUID does not exist | The system reports that item as not added, because there is no such item, and links the rest. |
 | AF-03 | The collection UUID does not exist | The system responds with a not-found error. |
 | AF-04 | The caller is not authenticated | The system denies with an unauthorized error. |
+| AF-05 | Every submitted item is rejected | The system succeeds, carrying a report that says so. Nothing was linked, and the caller is told why for each. |
+
+> AF-01 and AF-02 were request-level errors until the report existed. They are
+> per-item reasons now, and remain distinguishable: a bookmark submitted to a
+> file collection is a different mistake from a uuid that names nothing, and a
+> caller that has to explain the outcome needs to know which it was.
+>
+> A batch that failed whole gave a caller one reason for the lot — "none of
+> them, because one was wrong" — which is not an answer anybody can act on. The
+> Alexandria UI worked around it by sending one call per item, which is a batch
+> endpoint used one row at a time to recover what it had discarded.
 
 ---
 

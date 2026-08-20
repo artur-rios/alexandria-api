@@ -4318,16 +4318,22 @@ async fn given_same_file_when_added_to_collection_via_http_and_ffi_then_bodies_a
             .unwrap();
 
     // ---- compare ----
-    assert_eq!(http_body["itemUuids"], json!([http_file_uuid]));
-    assert_eq!(ffi_body["itemUuids"], json!([ffi_file_uuid]));
+    assert_eq!(
+        http_body["items"],
+        json!([{"itemUuid": http_file_uuid, "added": true}])
+    );
+    assert_eq!(
+        ffi_body["items"],
+        json!([{"itemUuid": ffi_file_uuid, "added": true}])
+    );
     assert!(http_linked.is_some(), "http file linked");
     assert!(ffi_linked.is_some(), "ffi file linked");
 
     ffi_pool.close().await;
 }
 
-/// UC-13 parity — an item that does not exist is rejected as not-found on
-/// both surfaces (HTTP 404, FFI `COLLECTION_ERR_NOT_FOUND`) (AF-02,
+/// UC-13 parity — an item that does not exist is reported as not-found on
+/// both surfaces, in the body rather than as a status (AF-02,
 /// FR-FC-24 / NFR-09).
 #[tokio::test]
 async fn given_unknown_item_when_added_via_http_and_ffi_then_both_not_found() {
@@ -4370,12 +4376,14 @@ async fn given_unknown_item_when_added_via_http_and_ffi_then_both_not_found() {
         .body(Body::from(json!({ "itemUuids": [unknown] }).to_string()))
         .unwrap();
     let add_resp = router.oneshot(add_req).await.expect("http add items");
-    assert_eq!(add_resp.status(), axum::http::StatusCode::NOT_FOUND);
+    assert_eq!(add_resp.status(), axum::http::StatusCode::OK);
+    let http_body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(add_resp.into_body(), usize::MAX).await.unwrap()).unwrap();
 
     // ---- FFI leg ----
     let ffi_dir = tempdir().unwrap();
     let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
-    let ffi_status = tokio::task::spawn_blocking(move || -> i32 {
+    let ffi_body = tokio::task::spawn_blocking(move || -> serde_json::Value {
         let cdb = CString::new(ffi_db).unwrap();
         assert_eq!(
             alexandria_index_init(cdb.as_ptr()),
@@ -4402,17 +4410,29 @@ async fn given_unknown_item_when_added_via_http_and_ffi_then_both_not_found() {
             add_body.as_ptr(),
             token.as_ptr(),
         );
-        assert!(r.json.is_null(), "a rejected add returns no body");
-        r.status
+        assert_eq!(
+            r.status,
+            alexandria_ffi::COLLECTION_OK,
+            "the request succeeds"
+        );
+        assert!(!r.json.is_null());
+        // SAFETY: pointer came from this library and is freed once below.
+        let body = unsafe { CStr::from_ptr(r.json) }
+            .to_string_lossy()
+            .into_owned();
+        unsafe {
+            alexandria_free_string(r.json);
+        }
+        serde_json::from_str(&body).unwrap()
     })
     .await
     .unwrap();
 
-    assert_eq!(
-        ffi_status,
-        alexandria_ffi::COLLECTION_ERR_NOT_FOUND,
-        "ffi must reject an unknown item as not-found (HTTP 404)"
-    );
+    // Both surfaces report the rejection the same way: in the body, per item,
+    // with the reason that tells it apart from a wrong-kind item.
+    let expected = json!([{"itemUuid": unknown, "added": false, "reason": "not_found"}]);
+    assert_eq!(http_body["items"], expected);
+    assert_eq!(ffi_body["items"], expected);
 }
 
 /// UC-14 parity — remove the same linked file from the same collection over
