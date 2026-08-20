@@ -342,6 +342,38 @@ fn files_json_value() -> serde_json::Value {
     serde_json::from_str(&json).unwrap()
 }
 
+/// Wait until the file named `name` carries a hash other than `was`.
+///
+/// A refresh walks the catalog with several writers at once, so one path
+/// finishing says nothing about another: waiting for the deleted file to be
+/// marked missing does not mean the changed file has been re-hashed yet. Under
+/// a loaded machine — a full `cargo test --workspace`, where every test binary
+/// runs at once — reading the hash straight after the missing count is a race,
+/// and this is the condition the assertion actually depends on.
+fn wait_for_rehash(name: &str, was: &str) -> String {
+    let deadline = std::time::Instant::now() + ASYNC_RUN_DEADLINE;
+    loop {
+        let files = files_json_value();
+        let hash = files
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["name"] == name)
+            .and_then(|row| row["hash"].as_str())
+            .map(str::to_string);
+
+        match hash {
+            Some(hash) if hash != was => return hash,
+            _ => {}
+        }
+
+        if std::time::Instant::now() > deadline {
+            panic!("timed out waiting for {name} to be re-hashed");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+}
+
 /// Wait until `missing_at IS NOT NULL` count reaches `expected` missing files.
 fn wait_for_missing(expected: i64) -> i64 {
     let deadline = std::time::Instant::now() + ASYNC_RUN_DEADLINE;
@@ -373,9 +405,20 @@ fn given_changed_and_deleted_files_when_ffi_refresh_then_refreshes_and_marks_mis
     assert_eq!(started.status, STATUS_OK);
     assert_eq!(wait_for_files(2), 2);
 
-    // Capture the pre-refresh hashes via the JSON accessor.
+    // Capture the pre-refresh hash via the JSON accessor. Found by name
+    // rather than by position: the listing's order is the repository's
+    // business, and reading `[0]` would silently compare the wrong file's
+    // hash the day it changes.
     let before = files_json_value();
-    let old_a_hash = before[0]["hash"].as_str().unwrap().to_string();
+    let old_a_hash = before
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["name"] == "a.mp3")
+        .unwrap()["hash"]
+        .as_str()
+        .unwrap()
+        .to_string();
 
     // Mutate on disk: change a, delete b.
     std::fs::write(&a_path, b"audio-v2-CHANGED").unwrap();
@@ -385,8 +428,10 @@ fn given_changed_and_deleted_files_when_ffi_refresh_then_refreshes_and_marks_mis
     assert_eq!(refresh.status, STATUS_OK);
     assert!(!run_id_string(&refresh).is_empty());
 
-    // b must be marked missing.
+    // b must be marked missing, and a must be re-hashed. Both are waited for:
+    // the two paths are refreshed independently, so either can land first.
     assert_eq!(wait_for_missing(1), 1);
+    wait_for_rehash("a.mp3", &old_a_hash);
 
     // a's hash must have changed, and its missingAt must be null.
     let after = files_json_value();
