@@ -23,7 +23,7 @@ its open/closed state, so the tables stay in sync with the board automatically.
 
 | Milestone | Scope | Progress |
 | --- | --- | :---: |
-| [F-00 Foundation & operations](https://github.com/artur-rios/alexandria-api/milestone/1) | Scaffold, config, migrations, health, settings | 2 / 3 |
+| [F-00 Foundation & operations](https://github.com/artur-rios/alexandria-api/milestone/1) | Scaffold, config, migrations, health, settings | 3 / 3 |
 | [F-01 File indexing](https://github.com/artur-rios/alexandria-api/milestone/2) | UC-01 … UC-02, UC-42 | 2 / 3 |
 | [F-02 Catalog browsing & metadata editing](https://github.com/artur-rios/alexandria-api/milestone/3) | UC-03 … UC-04 | 2 / 2 |
 | [F-03 Renaming & lifecycle management](https://github.com/artur-rios/alexandria-api/milestone/4) | UC-05 … UC-09 | 5 / 5 |
@@ -34,7 +34,7 @@ its open/closed state, so the tables stay in sync with the board automatically.
 | [F-08 Reading lists](https://github.com/artur-rios/alexandria-api/milestone/9) | UC-26 … UC-31 | 6 / 6 |
 | [F-09 Pluggable authentication](https://github.com/artur-rios/alexandria-api/milestone/10) | UC-34 … UC-36, UC-41 | 3 / 4 |
 | [F-10 Media playback](https://github.com/artur-rios/alexandria-api/milestone/11) | UC-38 … UC-40 | 3 / 3 |
-| **Total** | | **42 / 45** |
+| **Total** | | **43 / 45** |
 
 ### F-00 — Foundation & operations
 
@@ -44,7 +44,7 @@ Workspace scaffold, configuration, migrations, logging, and the health surface.
 | --- | --- | :---: | --- | --- |
 | [#1](https://github.com/artur-rios/alexandria-api/issues/1) | — | &#9745; | Scaffold and initial infrastructure | IR-01 … IR-06 |
 | [#38](https://github.com/artur-rios/alexandria-api/issues/38) | UC-37 | &#9745; | Health check | IR-03, IR-04, IR-05 |
-| [#108](https://github.com/artur-rios/alexandria-api/issues/108) | UC-47 | &#9744; | Report the retention window | FR-FC-30, FR-FC-24 |
+| [#108](https://github.com/artur-rios/alexandria-api/issues/108) | UC-47 | &#9745; | Report the retention window | FR-FC-30, FR-FC-24 |
 
 ### F-01 — File indexing
 
