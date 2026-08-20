@@ -1469,6 +1469,39 @@ have only one of.
 
 ---
 
+### UC-47: Report the retention window
+
+| Field | Value |
+| --- | --- |
+| **ID** | UC-47 |
+| **Name** | Report the retention window |
+| **Actors** | Owner |
+| **Description** | Report the configuration a client needs to render the catalog correctly — beginning with the soft-delete retention window this server enforces. |
+| **Preconditions** | The caller is authenticated. |
+| **Postconditions** | None — this is a read. |
+| **Requirements** | FR-FC-30, FR-FC-24 |
+
+**Main Flow**
+
+1. The caller requests the settings.
+2. The system returns the retention window, in days, as configured.
+
+**Alternative Flows**
+
+| ID | Condition | Outcome |
+| --- | --- | --- |
+| AF-01 | The caller is not authenticated | The system denies with an unauthorized error. |
+
+> The window is enforced on every restore (UC-07) and every purge (UC-08,
+> UC-19), and until now was published nowhere. A client could not say how long
+> a deleted record remained restorable without assuming the default, and an
+> assumption is wrong the moment an operator configures something else.
+
+> An object rather than a bare number, so that the next client-relevant setting
+> is a field here rather than a second endpoint.
+
+---
+
 ## 3. Use Case — Requirements Traceability
 
 | Use Case | Requirements |
@@ -1518,6 +1551,7 @@ have only one of.
 | UC-44: Regenerate recovery codes | FR-AU-17, FR-AU-19 |
 | UC-45: Log in with the Windows account | FR-AU-20, FR-AU-22 |
 | UC-46: Browse collections | FR-CO-08, FR-FC-24 |
+| UC-47: Report the retention window | FR-FC-30, FR-FC-24 |
 
 Every functional requirement in [System Requirements Document](System%20Requirements%20Document.md)
 §3 appears in at least one row above except FR-AU-12, FR-AU-18, FR-AU-21,

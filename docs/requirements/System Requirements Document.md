@@ -107,6 +107,7 @@ graph LR
 | FR-FC-27 | The system shall record every index and re-index run: its id, kind, start time, terminal status, finish time, and the outcome counts for its kind. A run whose walk completes shall be recorded `complete` even when individual files failed — those are counted in the run's `failed` tally, and one file's failure shall not abandon the rest of the walk. A run that could not proceed at all shall be recorded `failed` with the underlying error. |
 | FR-FC-28 | The system shall expose a run's recorded status and outcome to an authenticated caller, given the run id returned when the run was started, over both the HTTP and FFI surfaces. |
 | FR-FC-29 | The system shall, at startup, mark every run still recorded as running as interrupted; runs execute in-process and are never resumed. |
+| FR-FC-30 | The system shall report the configuration a client needs to render the catalog correctly, beginning with the soft-delete retention window it enforces on every restore and purge. |
 
 ### 3.2 Collections (CO)
 
@@ -430,6 +431,7 @@ endpoint requires authentication from the active mode (see §7).
 | --- | --- | --- | --- |
 | POST | /v1/index | Start an asynchronous indexing scan of a root path. | FR-FC-01..08 |
 | POST | /v1/index/refresh | Re-index existing records (refresh hashes/metadata). | FR-FC-10, FR-FC-11 |
+| GET | /v1/settings | Report the client-relevant configuration, beginning with the retention window. | FR-FC-30 |
 | GET | /v1/index/runs/{runId} | Report an index or re-index run's status and outcome. | FR-FC-27, FR-FC-28 |
 
 ### 5.2 Files

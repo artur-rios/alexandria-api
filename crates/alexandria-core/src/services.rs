@@ -63,6 +63,7 @@ use crate::reading_lists::commands::remove_item::RemoveItemFromReadingListHandle
 use crate::reading_lists::commands::update_progress::UpdateReadingProgressHandler;
 use crate::reading_lists::queries::browse::BrowseReadingListsHandler;
 use crate::reading_lists::repos::SqliteReadingListRepository;
+use crate::settings::GetSettingsHandler;
 use crate::watchlists::commands::add_video::AddVideoToWatchlistHandler;
 use crate::watchlists::commands::create::CreateWatchlistHandler;
 use crate::watchlists::commands::delete::DeleteWatchlistHandler;
@@ -185,6 +186,8 @@ pub type DefaultRemoveItemFromCollectionHandler = RemoveItemFromCollectionHandle
     SqliteBookmarkRepository,
 >;
 
+pub type DefaultGetSettingsHandler = GetSettingsHandler<RuntimeAuthService>;
+
 pub type DefaultListCollectionsHandler =
     ListCollectionsHandler<RuntimeAuthService, SqliteCollectionRepository>;
 
@@ -301,6 +304,7 @@ pub struct Services {
     pub remove_item_from_collection_handler: Arc<DefaultRemoveItemFromCollectionHandler>,
     pub list_collection_items_handler: Arc<DefaultListCollectionItemsHandler>,
     pub list_collections_handler: Arc<DefaultListCollectionsHandler>,
+    pub get_settings_handler: Arc<DefaultGetSettingsHandler>,
     pub create_watchlist_handler: Arc<DefaultCreateWatchlistHandler>,
     pub add_video_to_watchlist_handler: Arc<DefaultAddVideoToWatchlistHandler>,
     pub browse_watchlists_handler: Arc<DefaultBrowseWatchlistsHandler>,
@@ -539,6 +543,7 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         auth.clone(),
         SqliteCollectionRepository::new(pool.clone()),
     ));
+    let get_settings_handler = Arc::new(GetSettingsHandler::new(auth.clone(), settings));
     let watchlist_repo = SqliteWatchlistRepository::new(pool.clone());
     let create_watchlist_handler = Arc::new(CreateWatchlistHandler::new(
         auth.clone(),
@@ -664,6 +669,7 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         remove_item_from_collection_handler,
         list_collection_items_handler,
         list_collections_handler,
+        get_settings_handler,
         create_watchlist_handler,
         add_video_to_watchlist_handler,
         browse_watchlists_handler,
