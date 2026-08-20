@@ -3620,6 +3620,79 @@ pub extern "C" fn alexandria_auth_local_regenerate_recovery_codes(
     }
 }
 
+/// FFI status codes returned by the settings read (UC-47 / FR-FC-30).
+/// Deliberately separate from every other family — per the convention above —
+/// so this surface can grow independently; `SETTINGS_OK == INDEX_OK == 0` by
+/// convention.
+pub const SETTINGS_OK: c_int = 0;
+pub const SETTINGS_ERR_UNAUTHORIZED: c_int = 2;
+pub const SETTINGS_ERR_NOT_INITIALIZED: c_int = 3;
+pub const SETTINGS_ERR_OTHER: c_int = 9;
+
+/// Result of `alexandria_settings_json` (UC-47). On success `status` is
+/// `SETTINGS_OK` and `json` is a NUL-terminated JSON string of the settings
+/// body — byte-for-byte the same shape HTTP returns from `GET /v1/settings`
+/// (FR-FC-24 / NFR-09). On failure `json` is NULL and `status` carries the
+/// mapped error code. The caller must free `json` with
+/// `alexandria_free_string`.
+#[repr(C)]
+#[derive(Debug)]
+pub struct SettingsJsonResult {
+    pub status: c_int,
+    pub json: *mut c_char,
+}
+
+impl SettingsJsonResult {
+    fn err(status: c_int) -> Self {
+        Self {
+            status,
+            json: std::ptr::null_mut(),
+        }
+    }
+
+    fn ok(json: String) -> Self {
+        let cstring = CString::new(json).unwrap_or_default();
+        Self {
+            status: SETTINGS_OK,
+            json: cstring.into_raw(),
+        }
+    }
+}
+
+/// Report the client-relevant configuration (UC-47 / FR-FC-30).
+///
+/// On success `json` carries the same body HTTP returns from
+/// `GET /v1/settings` — today `{"deletion":{"retentionDays":30}}`, the
+/// soft-delete retention window this server enforces on every restore and
+/// purge. `token` is the bearer auth token.
+///
+/// The boundary the number describes is the core's own: elapsed time up to and
+/// including `retentionDays` leaves a record restorable and not yet purgeable;
+/// strictly past it, the record is purgeable and no longer restorable.
+#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
+#[no_mangle]
+pub extern "C" fn alexandria_settings_json(token: *const c_char) -> SettingsJsonResult {
+    let services = match services_slot().lock().unwrap().clone() {
+        Some(s) => s,
+        None => return SettingsJsonResult::err(SETTINGS_ERR_NOT_INITIALIZED),
+    };
+
+    let token = cstr_lossy(token).unwrap_or_default();
+
+    let result = runtime().block_on(async { services.get_settings_handler.get(&token).await });
+
+    match result {
+        Ok(settings) => {
+            let json = serde_json::to_string(&settings).unwrap_or_default();
+            SettingsJsonResult::ok(json)
+        }
+        // AF-01 is the only failure this read has: it reads a value the
+        // process already holds, so there is nothing else to go wrong.
+        Err(DomainError::Unauthorized) => SettingsJsonResult::err(SETTINGS_ERR_UNAUTHORIZED),
+        Err(_) => SettingsJsonResult::err(SETTINGS_ERR_OTHER),
+    }
+}
+
 /// FFI status codes returned by run-status operations (UC-42 / FR-FC-28).
 /// Deliberately separate from `INDEX_*`, `FILE_*`, `COLLECTION_*`, `PLAYBACK_*`,
 /// and `AUTH_*` — per the convention established above — so this surface can

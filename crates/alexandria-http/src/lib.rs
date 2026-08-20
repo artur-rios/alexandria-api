@@ -29,6 +29,7 @@ pub fn app(settings: Settings, services: Arc<Services>) -> Router {
     // the gate before the matched route's extractors, so an unauthenticated
     // caller is denied without its body or path ever being parsed (FR-AU-07).
     let v1 = Router::new()
+        .route("/v1/settings", get(routes::settings::get))
         .route("/v1/index", post(routes::index::index))
         .route("/v1/index/refresh", post(routes::refresh::refresh))
         .route("/v1/index/runs/{run_id}", get(routes::runs::run_status))

@@ -33,8 +33,8 @@ use alexandria_ffi::{
     alexandria_index_run_status_json, alexandria_index_start, alexandria_reading_list_add_item,
     alexandria_reading_list_create, alexandria_reading_list_delete,
     alexandria_reading_list_remove_item, alexandria_reading_list_update_progress,
-    alexandria_reading_lists_list, alexandria_watchlist_add_video, alexandria_watchlist_create,
-    alexandria_watchlist_delete, alexandria_watchlist_remove_video,
+    alexandria_reading_lists_list, alexandria_settings_json, alexandria_watchlist_add_video,
+    alexandria_watchlist_create, alexandria_watchlist_delete, alexandria_watchlist_remove_video,
     alexandria_watchlist_update_progress, alexandria_watchlists_list, IndexStartResult,
 };
 use alexandria_http::app;
@@ -11337,4 +11337,95 @@ async fn given_same_collections_when_listed_via_http_and_ffi_then_bodies_identic
     // AF-02 refused the same way on both surfaces.
     assert_eq!(http_bad_status, axum::http::StatusCode::BAD_REQUEST);
     assert_eq!(ffi_bad_status, alexandria_ffi::COLLECTION_ERR_INVALID_INPUT);
+}
+
+/// UC-47 parity — read the settings over both transports and assert the
+/// bodies are identical (Testing Specification §7.3, FR-FC-30, FR-FC-24).
+///
+/// Both legs run at the default window: what parity asserts is that the two
+/// surfaces answer the same thing, and that a configured value is honoured is
+/// the core and HTTP suites' claim rather than this one's. The FFI leg reads
+/// its settings at `alexandria_index_init`, from the same loader HTTP uses.
+///
+/// The unauthenticated refusal (AF-01) is asserted here too: it is the one
+/// flow the read has, and parity is exactly the claim that both surfaces
+/// refuse the same way.
+#[tokio::test]
+async fn given_the_same_settings_when_read_via_http_and_ffi_then_bodies_identical() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+
+    // ---- HTTP leg ----
+    let http_dir = tempdir().unwrap();
+    let http_db = db_path(&http_dir, "http.sqlite");
+    let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    seed_session(&http_pool, TEST_TOKEN).await;
+    let http_services =
+        std::sync::Arc::new(build_services(&local_settings(), http_pool.clone()).await);
+
+    let req = Request::builder()
+        .method("GET")
+        .uri("/v1/settings")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = app(Settings::default(), http_services.clone())
+        .oneshot(req)
+        .await
+        .expect("http settings");
+    assert_eq!(resp.status(), axum::http::StatusCode::OK);
+    let http_body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
+
+    let anonymous = Request::builder()
+        .method("GET")
+        .uri("/v1/settings")
+        .body(Body::empty())
+        .unwrap();
+    let http_denied = app(Settings::default(), http_services)
+        .oneshot(anonymous)
+        .await
+        .expect("http denied")
+        .status();
+
+    // ---- FFI leg (off the tokio thread: FFI block_on its own runtime) ----
+    let ffi_dir = tempdir().unwrap();
+    let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
+    let (ffi_body, ffi_denied) =
+        tokio::task::spawn_blocking(move || -> (serde_json::Value, std::os::raw::c_int) {
+            let cdb = CString::new(ffi_db).unwrap();
+            assert_eq!(
+                alexandria_index_init(cdb.as_ptr()),
+                alexandria_ffi::INDEX_OK
+            );
+
+            let token = CString::new(TEST_TOKEN).unwrap();
+            let r = alexandria_settings_json(token.as_ptr());
+            assert_eq!(r.status, alexandria_ffi::SETTINGS_OK, "ffi settings");
+            assert!(!r.json.is_null());
+            // SAFETY: pointer came from this library and is freed once below.
+            let s = unsafe { CStr::from_ptr(r.json) }
+                .to_string_lossy()
+                .into_owned();
+            unsafe {
+                alexandria_free_string(r.json);
+            }
+
+            let nobody = CString::new("").unwrap();
+            let denied = alexandria_settings_json(nobody.as_ptr());
+            assert!(denied.json.is_null(), "a refusal carries no body");
+
+            (serde_json::from_str(&s).unwrap(), denied.status)
+        })
+        .await
+        .unwrap();
+
+    // ---- compare ----
+    assert_eq!(http_body, ffi_body, "settings diverge across surfaces");
+
+    // Asserted once, so a parity test over two identically-wrong answers
+    // cannot pass.
+    assert_eq!(http_body["deletion"]["retentionDays"], 30);
+
+    assert_eq!(http_denied, axum::http::StatusCode::UNAUTHORIZED);
+    assert_eq!(ffi_denied, alexandria_ffi::SETTINGS_ERR_UNAUTHORIZED);
 }
