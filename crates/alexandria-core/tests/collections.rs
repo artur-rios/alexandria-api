@@ -18,3 +18,6 @@ mod remove_item;
 
 #[path = "collections/list_items.rs"]
 mod list_items;
+
+#[path = "collections/list.rs"]
+mod list;

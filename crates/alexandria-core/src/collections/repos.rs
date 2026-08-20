@@ -2,7 +2,7 @@ use sqlx::sqlite::SqlitePool;
 use sqlx::Row;
 use uuid::Uuid;
 
-use crate::collections::model::{Collection, CollectionKind, NewCollection};
+use crate::collections::model::{Collection, CollectionKind, CollectionSummary, NewCollection};
 use crate::errors::{DomainError, WRITE_TX};
 
 /// Collections repository port. The create handler depends on this trait so
@@ -35,6 +35,17 @@ pub trait CollectionRepository: Send + Sync {
     /// (UC-12 / FR-CO-04). The caller has already confirmed the collection
     /// exists.
     async fn delete_collection(&self, uuid: Uuid) -> Result<(), DomainError>;
+
+    /// List the collections, optionally narrowed to one `kind`, each with the
+    /// number of items it currently holds (UC-46 / FR-CO-08).
+    ///
+    /// `None` for `kind` is every collection. An empty result is a state and
+    /// not an error (AF-01), so this returns an empty `Vec` rather than
+    /// `Option`.
+    async fn list_collections(
+        &self,
+        kind: Option<CollectionKind>,
+    ) -> Result<Vec<CollectionSummary>, DomainError>;
 }
 
 #[derive(Clone)]
@@ -100,6 +111,63 @@ impl CollectionRepository for SqliteCollectionRepository {
             .await?;
 
         self.find_by_uuid(uuid).await?.ok_or(DomainError::NotFound)
+    }
+
+    async fn list_collections(
+        &self,
+        kind: Option<CollectionKind>,
+    ) -> Result<Vec<CollectionSummary>, DomainError> {
+        // The count is a correlated subquery per table rather than a join with
+        // a GROUP BY: a collection's `kind` fixes which table can hold its
+        // members, and summing both keeps the count right for a row whose
+        // `kind` was written before that invariant was enforced — the same
+        // reason `delete_collection` clears both.
+        //
+        // `state = 'active'` on each: UC-14's listing excludes soft-deleted
+        // members, and a count that included them would disagree with the list
+        // it describes.
+        let mut sql = String::from(
+            "SELECT c.uuid, c.name, c.kind,              (SELECT COUNT(*) FROM files f                 WHERE f.collection_id = c.id AND f.state = 'active')              + (SELECT COUNT(*) FROM bookmarks b                 WHERE b.collection_id = c.id AND b.state = 'active') AS item_count              FROM collections c",
+        );
+        if kind.is_some() {
+            sql.push_str(" WHERE c.kind = ?");
+        }
+        // Ordered by name so the listing is stable between calls; the caller
+        // presents it as it arrives.
+        sql.push_str(" ORDER BY c.name COLLATE NOCASE, c.uuid");
+
+        // sqlx 0.9 refuses a runtime-built SQL string unless the caller
+        // asserts it was audited. `sql` is assembled only from string literals
+        // chosen by the `Option<CollectionKind>` parameter above — no caller
+        // input reaches it, and the kind itself is still a bound `?`
+        // parameter.
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(sql));
+        if let Some(kind) = kind {
+            query = query.bind(kind.as_str());
+        }
+
+        let rows = query.fetch_all(&self.pool).await?;
+
+        let mut summaries = Vec::with_capacity(rows.len());
+        for row in rows {
+            let uuid: String = row.try_get("uuid")?;
+            let name: String = row.try_get("name")?;
+            let kind: String = row.try_get("kind")?;
+            let item_count: i64 = row.try_get("item_count")?;
+
+            summaries.push(CollectionSummary {
+                uuid: Uuid::parse_str(&uuid).map_err(|err| {
+                    DomainError::internal(format!("corrupt collection uuid: {err}"))
+                })?,
+                name,
+                kind: CollectionKind::parse(&kind).ok_or_else(|| {
+                    DomainError::internal(format!("corrupt collection kind: {kind}"))
+                })?,
+                item_count,
+            });
+        }
+
+        Ok(summaries)
     }
 
     async fn delete_collection(&self, uuid: Uuid) -> Result<(), DomainError> {

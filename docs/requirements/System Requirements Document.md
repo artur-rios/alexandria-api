@@ -119,6 +119,7 @@ graph LR
 | FR-CO-05 | The system shall add items of the matching `kind` to a collection. |
 | FR-CO-06 | The system shall remove items from a collection. |
 | FR-CO-07 | The system shall list the items in a collection. |
+| FR-CO-08 | The system shall list the owner's collections, optionally filtered by `kind`, each with the number of items it currently holds. |
 
 ### 3.3 Bookmarks (BM)
 
@@ -277,6 +278,11 @@ type-specific metadata. Representative subtype fields:
 | uuid | UUID | required, unique | Public identifier. |
 | name | text | required, non-empty | Collection name. |
 | kind | enum | required; one of `file`, `bookmark` | Discriminator. |
+
+A collection carries no item count of its own: the number is derived by counting
+the rows that point at it, so it cannot drift from the membership. `FR-CO-08`'s
+listing returns that derived count alongside each collection, excluding
+soft-deleted members — the same members `FR-CO-07` lists.
 
 ### 4.4 Bookmark Fields
 
@@ -450,6 +456,7 @@ endpoint requires authentication from the active mode (see §7).
 
 | Method | Path | Description | Requirement |
 | --- | --- | --- | --- |
+| GET | /v1/collections | List collections, optionally filtered by `kind`. | FR-CO-08 |
 | POST | /v1/collections | Create a collection (file or bookmark). | FR-CO-01, FR-CO-02 |
 | PATCH | /v1/collections/{uuid} | Rename a collection. | FR-CO-03 |
 | DELETE | /v1/collections/{uuid} | Delete a collection (preserves items). | FR-CO-04 |
@@ -648,7 +655,7 @@ The feature identifiers are the milestones the
 | F-02 Catalog browsing and metadata editing | FR-FC-12 through FR-FC-18 |
 | F-03 Renaming and lifecycle management | FR-FC-19 through FR-FC-23 |
 | F-04 Text file content editing | FR-TX-01 through FR-TX-03 |
-| F-05 Collections | FR-CO-01 through FR-CO-07 |
+| F-05 Collections | FR-CO-01 through FR-CO-08 |
 | F-06 Bookmark management | FR-BM-01 through FR-BM-06 |
 | F-07 Watchlists | FR-WL-01 through FR-WL-08 |
 | F-08 Reading lists | FR-RL-01 through FR-RL-08 |
