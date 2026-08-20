@@ -621,7 +621,10 @@ async fn given_file_collection_and_existing_files_when_posted_then_200_and_files
     assert_eq!(response.status(), StatusCode::OK);
     let body = body_json(response).await;
     assert_eq!(body["collectionUuid"], collection_uuid);
-    assert_eq!(body["itemUuids"], json!([file_uuid]));
+    assert_eq!(
+        body["items"],
+        json!([{"itemUuid": file_uuid, "added": true}])
+    );
 
     let (linked_collection_id, collection_id): (Option<i64>, i64) = {
         let linked: Option<i64> =
@@ -670,7 +673,7 @@ async fn given_bookmark_collection_and_existing_bookmark_when_posted_then_200_an
 // ---------------- AF-01: item type does not match collection kind ----------------
 
 #[tokio::test]
-async fn given_bookmark_item_for_file_collection_when_posted_then_400_and_nothing_linked() {
+async fn given_bookmark_item_for_file_collection_when_posted_then_reported_wrong_kind() {
     let test = test_app().await;
     let router = app(Settings::default(), test.services.clone());
     let (router, collection_uuid) = create_collection(router, "My files").await;
@@ -684,7 +687,15 @@ async fn given_bookmark_item_for_file_collection_when_posted_then_400_and_nothin
         .await
         .expect("add items");
 
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    // The request succeeded; the item is what was rejected, and the response
+    // says which kind of mistake it was.
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_json(response).await;
+    assert_eq!(
+        body["items"],
+        json!([{"itemUuid": bookmark_uuid, "added": false, "reason": "wrong_kind"}])
+    );
+
     let linked: Option<i64> =
         sqlx::query_scalar("SELECT collection_id FROM bookmarks WHERE uuid = ?")
             .bind(&bookmark_uuid)
@@ -697,20 +708,27 @@ async fn given_bookmark_item_for_file_collection_when_posted_then_400_and_nothin
 // ---------------- AF-02: referenced item does not exist ----------------
 
 #[tokio::test]
-async fn given_unknown_item_uuid_when_posted_then_404() {
+async fn given_unknown_item_uuid_when_posted_then_reported_not_found() {
     let test = test_app().await;
     let router = app(Settings::default(), test.services);
     let (router, collection_uuid) = create_collection(router, "My files").await;
+    let unknown = uuid::Uuid::new_v4().to_string();
 
     let response = router
         .oneshot(add_items_request(
             &collection_uuid,
-            json!({ "itemUuids": [uuid::Uuid::new_v4().to_string()] }),
+            json!({ "itemUuids": [unknown] }),
         ))
         .await
         .expect("add items");
 
-    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_json(response).await;
+    assert_eq!(
+        body["items"],
+        json!([{"itemUuid": unknown, "added": false, "reason": "not_found"}]),
+        "told apart from the wrong-kind rejection: this uuid names nothing"
+    );
 }
 
 #[tokio::test]

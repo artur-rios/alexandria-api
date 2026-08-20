@@ -84,15 +84,48 @@ pub struct CollectionSummary {
     pub item_count: i64,
 }
 
-/// Result of UC-13 (add items): the collection and the item uuids the
-/// request just linked, echoing the request rather than the collection's
-/// full membership — listing full membership is UC-14's read path
-/// (FR-CO-07), not this write's job.
+/// Why one item was not added (UC-13 AF-01, AF-02).
+///
+/// The two are deliberately distinguishable: a bookmark submitted to a file
+/// collection is a different mistake from a uuid that names nothing, and a
+/// caller that has to explain the outcome needs to know which it was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ItemRejection {
+    /// The item exists, but belongs to the other kind (AF-01).
+    WrongKind,
+
+    /// No item of either kind carries that uuid (AF-02).
+    NotFound,
+}
+
+/// What became of one submitted item (UC-13).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CollectionItemOutcome {
+    pub item_uuid: Uuid,
+    pub added: bool,
+    /// Why it was not added. Absent when it was.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<ItemRejection>,
+}
+
+/// Result of UC-13 (add items): the collection, and what became of every item
+/// the request submitted.
+///
+/// Per item rather than all-or-nothing. The handler links what it can and
+/// reports the rest, because a caller that has to tell its owner what happened
+/// cannot do so from a single request-level error: "none of them, because one
+/// was wrong" is not an answer anybody can act on. AF-01 and AF-02 are
+/// therefore reasons here rather than errors.
+///
+/// It still echoes the request rather than the collection's full membership —
+/// listing that is UC-14's read path (FR-CO-07), not this write's job.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CollectionItemsResult {
     pub collection_uuid: Uuid,
-    pub item_uuids: Vec<Uuid>,
+    pub items: Vec<CollectionItemOutcome>,
 }
 
 /// Result of UC-14's remove (FR-CO-06): the collection and the single item
