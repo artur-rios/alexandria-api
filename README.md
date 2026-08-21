@@ -387,13 +387,21 @@ tells you which step above did not take effect.
 
 #### A note on ffmpeg licensing
 
-Alexandria is proprietary (see [LICENSE](LICENSE)). ffmpeg is LGPL by default,
-but builds configured with `--enable-gpl` — which includes every BtbN `GPL`
-package above, and most convenience builds — are GPL. Linking a GPL library
-into a proprietary binary you distribute is a licensing problem; using one on
-your own machine to develop is not. If Alexandria is ever shipped with ffmpeg
-bundled, that build needs to be an LGPL one (vcpkg's default port, Option B, is
-LGPL). Flagging the distinction, not giving legal advice.
+Alexandria is GPL-3.0-or-later (see [LICENSE](LICENSE)), so linking either
+ffmpeg variant is lawful. This note used to say the opposite, because the
+project was proprietary and only an LGPL build could be linked at all.
+
+The distinction still matters for a different reason. ffmpeg is LGPL by
+default; builds configured with `--enable-gpl` — every BtbN `GPL` package
+above, and most convenience builds — are GPL, and what they add over the LGPL
+build is encoders: x264, x265, xvid. Nothing in Alexandria re-encodes, so an
+LGPL build gives the project every capability it actually uses. Prefer it for
+anything shipped, and treat a GPL build as a development convenience.
+
+What the desktop front end ships on Linux is a separate matter: it carries
+libmpv, which is copyleft wherever it comes from, so those packages are GPL
+regardless of which ffmpeg is in them. Flagging the distinction, not giving
+legal advice.
 
 ```bash
 # Build the whole workspace (core + http + ffi)
@@ -533,11 +541,36 @@ contributor: `docs/initial/Project Overview.md` → `docs/requirements/Vision Do
 
 ## Legal details
 
-This project is **proprietary and confidential**. All rights are reserved by the
-copyright holder. No part of this repository may be reproduced, distributed, or
-used in any form without the prior written permission of the copyright holder.
+Copyright (c) 2026 Artur Rios.
 
-The full license terms are in the [LICENSE](LICENSE) file.
+Alexandria is free software: you can redistribute it and/or modify it under the
+terms of the GNU General Public License as published by the Free Software
+Foundation, either version 3 of the License, or (at your option) any later
+version. The full text is in [LICENSE](LICENSE).
 
-For licensing inquiries, contact the repository owner via the GitHub repository's
-contact channels.
+It is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
+without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
+PARTICULAR PURPOSE. See the GNU General Public License for more details.
+
+### Why this changed
+
+This project was proprietary and all rights were reserved. It is copyleft now
+because of what it links.
+
+The core links ffmpeg, and the desktop front end
+([alexandria-ui](https://github.com/artur-rios/alexandria-ui)) links this core
+in process and plays video through libmpv. Its Linux packages are meant to be
+plug and play: unpack one on a machine with a desktop and it runs, with nothing
+to install first. That means carrying those libraries rather than asking the
+user's distribution for them, and libmpv is copyleft from every distribution
+that ships it, as are the x264 and x265 encoders ffmpeg links whether or not
+anything ever encodes with them.
+
+Distributing a program alongside those libraries puts the whole of it under the
+GPL. The front end and this core are one program in the sense the licence
+means, so they are licensed alike.
+
+The alternative was building LGPL versions of mpv and ffmpeg from source and
+staying closed. That was weighed and not chosen: it trades a licence change for
+a release pipeline that builds two large C projects every time and takes on
+their security patching.

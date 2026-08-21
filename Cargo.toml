@@ -12,6 +12,7 @@ edition = "2021"
 # Floor set by sqlx 0.9, the highest MSRV in the dependency graph.
 rust-version = "1.94"
 authors = ["Artur Rios"]
+license = "GPL-3.0-or-later"
 repository = "https://github.com/artur-rios/alexandria-api"
 
 [workspace.dependencies]
