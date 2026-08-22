@@ -226,6 +226,8 @@ pub(crate) fn a_file(
             .to_string(),
         file_type,
         content_hash: "abc".to_string(),
+        size_bytes: None,
+        mtime: None,
         state,
         deleted_at: None,
         indexed_at: Utc::now(),

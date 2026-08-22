@@ -42,6 +42,8 @@ async fn insert_file(repo: &SqliteCatalogRepository, path: &str, file_type: File
         name: path.rsplit('/').next().unwrap_or(path).to_string(),
         file_type,
         content_hash: "0".repeat(64),
+        size_bytes: None,
+        mtime: None,
         indexed_at: chrono::Utc::now(),
     })
     .await

@@ -69,6 +69,11 @@ pub struct NewFile {
     pub name: String,
     pub file_type: FileType,
     pub content_hash: String,
+    /// The file's size in bytes at index time. With `mtime`, this is what
+    /// re-index compares to decide whether a file changed (FR-FC-10).
+    pub size_bytes: Option<i64>,
+    /// The file's on-disk modification time at index time.
+    pub mtime: Option<DateTime<Utc>>,
     pub indexed_at: DateTime<Utc>,
 }
 
@@ -300,6 +305,11 @@ pub struct File {
     pub name: String,
     pub file_type: FileType,
     pub content_hash: String,
+    /// The file's size in bytes at index time. With `mtime`, this is what
+    /// re-index compares to decide whether a file changed (FR-FC-10).
+    pub size_bytes: Option<i64>,
+    /// The file's on-disk modification time at index time.
+    pub mtime: Option<DateTime<Utc>>,
     pub state: FileState,
     pub deleted_at: Option<DateTime<Utc>>,
     pub indexed_at: DateTime<Utc>,

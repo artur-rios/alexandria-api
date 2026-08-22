@@ -792,6 +792,7 @@ async fn given_same_audio_file_when_metadata_edited_via_http_and_ffi_then_respon
             obj.remove("uuid");
             obj.remove("path");
             obj.remove("indexedAt");
+            obj.remove("mtime");
         }
         f
     };
@@ -1197,6 +1198,7 @@ async fn given_same_file_when_fetched_via_http_and_ffi_then_file_view_bodies_ide
             obj.remove("uuid");
             obj.remove("path");
             obj.remove("indexedAt");
+            obj.remove("mtime");
         }
         f
     };
@@ -1659,6 +1661,7 @@ async fn given_same_file_when_renamed_via_http_and_ffi_then_file_bodies_and_disk
             obj.remove("uuid");
             obj.remove("path");
             obj.remove("indexedAt");
+            obj.remove("mtime");
         }
         f
     };
@@ -1924,6 +1927,7 @@ async fn given_same_file_when_soft_deleted_via_http_and_ffi_then_file_bodies_ide
             obj.remove("uuid");
             obj.remove("path");
             obj.remove("indexedAt");
+            obj.remove("mtime");
             obj.remove("deletedAt");
         }
         f
@@ -2204,6 +2208,7 @@ async fn given_soft_deleted_file_when_restored_via_http_and_ffi_then_file_bodies
             obj.remove("uuid");
             obj.remove("path");
             obj.remove("indexedAt");
+            obj.remove("mtime");
             obj.remove("deletedAt");
         }
         f
@@ -2509,6 +2514,7 @@ async fn given_purgeable_file_when_purged_via_http_and_ffi_then_file_bodies_iden
             obj.remove("uuid");
             obj.remove("path");
             obj.remove("indexedAt");
+            obj.remove("mtime");
             obj.remove("deletedAt");
         }
         f
@@ -2814,6 +2820,7 @@ async fn given_active_file_when_purged_on_disk_via_http_and_ffi_then_file_bodies
             obj.remove("uuid");
             obj.remove("path");
             obj.remove("indexedAt");
+            obj.remove("mtime");
         }
         f
     };
@@ -3126,6 +3133,7 @@ async fn given_missing_disk_file_when_purged_on_disk_via_http_and_ffi_then_both_
             file.remove("uuid");
             file.remove("path");
             file.remove("indexedAt");
+            file.remove("mtime");
         }
         f
     };

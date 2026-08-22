@@ -42,6 +42,8 @@ fn a_file(uuid: Uuid) -> File {
         name: "note.txt".to_string(),
         file_type: FileType::Text,
         content_hash: "hash".to_string(),
+        size_bytes: None,
+        mtime: None,
         state: FileState::Active,
         deleted_at: None,
         indexed_at: chrono::Utc::now(),

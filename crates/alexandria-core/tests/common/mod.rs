@@ -258,6 +258,8 @@ impl CatalogRepository for FakeCatalogRepository {
             name: new_file.name,
             file_type: new_file.file_type,
             content_hash: new_file.content_hash,
+            size_bytes: new_file.size_bytes,
+            mtime: new_file.mtime,
             state: alexandria_core::catalog::model::FileState::Active,
             deleted_at: None,
             indexed_at: new_file.indexed_at,
@@ -772,6 +774,11 @@ pub struct FakeFilesystem {
     roots: std::collections::HashSet<String>,
     entries_by_root: HashMap<String, Vec<FileEntry>>,
     hash_by_path: HashMap<String, String>,
+    /// Stat override seeded by `with_stat`, keyed by path: `(size_bytes,
+    /// modified_at)`. Applied by `list_files` on top of the `FileEntry` a
+    /// `with_file`/`with_unreadable_file` call already pushed, since those
+    /// builder methods run before the stat for the same path is known.
+    stat_by_path: HashMap<String, (i64, Option<DateTime<Utc>>)>,
     /// Paths that exist and are listed but cannot be read (locked / permission
     /// denied). `content_hash` fails for these, simulating the single bad file
     /// that must not abort a whole index or refresh run.
@@ -944,6 +951,21 @@ impl FakeFilesystemBuilder {
         self
     }
 
+    /// Seed the stat a `FileEntry` carries out of the walk. Without this an
+    /// entry reports zero bytes and no modification time — what a filesystem
+    /// that could not answer would give.
+    pub fn with_stat(
+        mut self,
+        path: &str,
+        size_bytes: i64,
+        modified_at: Option<DateTime<Utc>>,
+    ) -> Self {
+        self.fs
+            .stat_by_path
+            .insert(path.to_string(), (size_bytes, modified_at));
+        self
+    }
+
     pub fn build(self) -> FakeFilesystem {
         self.fs
     }
@@ -971,7 +993,20 @@ impl Filesystem for FakeFilesystem {
     }
 
     async fn list_files(&self, root: &str) -> Result<Vec<FileEntry>, DomainError> {
-        Ok(self.entries_by_root.get(root).cloned().unwrap_or_default())
+        Ok(self
+            .entries_by_root
+            .get(root)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|mut entry| {
+                if let Some((size_bytes, modified_at)) = self.stat_by_path.get(&entry.path) {
+                    entry.size_bytes = *size_bytes;
+                    entry.modified_at = *modified_at;
+                }
+                entry
+            })
+            .collect())
     }
 
     async fn content_hash(&self, path: &str) -> Result<String, DomainError> {
@@ -1066,6 +1101,8 @@ pub fn existing_file(path: &str, file_type: FileType) -> File {
         name: "seedy".to_string(),
         file_type,
         content_hash: "preexisting".to_string(),
+        size_bytes: None,
+        mtime: None,
         state: alexandria_core::catalog::model::FileState::Active,
         deleted_at: None,
         indexed_at: now(),
@@ -1100,6 +1137,8 @@ pub fn deleted_file_at(
         name: name.to_string(),
         file_type,
         content_hash: "preexisting".to_string(),
+        size_bytes: None,
+        mtime: None,
         state: alexandria_core::catalog::model::FileState::Deleted,
         deleted_at: Some(deleted_at),
         indexed_at: deleted_at,
@@ -1116,6 +1155,8 @@ pub fn existing_file_with_hash(path: &str, name: &str, file_type: FileType, hash
         name: name.to_string(),
         file_type,
         content_hash: hash.to_string(),
+        size_bytes: None,
+        mtime: None,
         state: alexandria_core::catalog::model::FileState::Active,
         deleted_at: None,
         indexed_at: earlier(),
@@ -1133,6 +1174,8 @@ pub fn existing_missing_file(path: &str, name: &str, file_type: FileType, hash: 
         name: name.to_string(),
         file_type,
         content_hash: hash.to_string(),
+        size_bytes: None,
+        mtime: None,
         state: alexandria_core::catalog::model::FileState::Active,
         deleted_at: None,
         indexed_at: earlier(),

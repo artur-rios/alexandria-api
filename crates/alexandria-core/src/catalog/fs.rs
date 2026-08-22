@@ -1,6 +1,7 @@
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
 
 use crate::errors::DomainError;
@@ -31,11 +32,20 @@ where
     }
 }
 
-/// A discovered file ready to be classified and hashed.
+/// A discovered file ready to be classified and recorded.
+///
+/// `size_bytes` and `modified_at` come from the directory entry's own
+/// metadata, which `walkdir` has already fetched during the walk — reading
+/// them here costs nothing and is what lets the indexer decide whether a file
+/// changed without opening it.
 #[derive(Debug, Clone)]
 pub struct FileEntry {
     pub path: String,
     pub name: String,
+    pub size_bytes: i64,
+    /// `None` when the platform or filesystem could not report a modification
+    /// time. Change detection falls back to size alone for such a file.
+    pub modified_at: Option<DateTime<Utc>>,
 }
 
 /// Filesystem port — the indexer's view of the on-disk store. The real
@@ -150,9 +160,17 @@ impl StdFilesystem {
             if name.is_empty() {
                 continue;
             }
+            let metadata = entry.metadata().ok();
+            let size_bytes = metadata.as_ref().map(|m| m.len() as i64).unwrap_or(0);
+            let modified_at = metadata
+                .as_ref()
+                .and_then(|m| m.modified().ok())
+                .map(DateTime::<Utc>::from);
             entries.push(FileEntry {
                 path: path.to_string_lossy().into_owned(),
                 name,
+                size_bytes,
+                modified_at,
             });
         }
         entries
@@ -232,10 +250,15 @@ impl Filesystem for StdFilesystem {
 }
 
 impl FileEntry {
+    /// Builds an entry with no stat — what a filesystem that could not
+    /// report size or modification time would give. Test fakes that need a
+    /// real stat call `Filesystem::list_files` after seeding one instead.
     pub fn new(path: impl Into<String>, name: impl Into<String>) -> Self {
         Self {
             path: path.into(),
             name: name.into(),
+            size_bytes: 0,
+            modified_at: None,
         }
     }
 }

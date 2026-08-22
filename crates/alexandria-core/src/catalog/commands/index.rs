@@ -372,6 +372,8 @@ where
             name: entry.name,
             file_type,
             content_hash,
+            size_bytes: Some(entry.size_bytes),
+            mtime: entry.modified_at,
             indexed_at: now,
         };
         // Only this one write is retried, and only on a transient busy. The

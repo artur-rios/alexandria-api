@@ -306,6 +306,44 @@ async fn given_supported_files_when_execute_then_indexed_with_hash_and_indexedat
     assert_eq!(b.file_type, FileType::Text);
 }
 
+#[tokio::test]
+async fn given_a_file_on_disk_when_indexed_then_its_size_and_mtime_are_recorded() {
+    let fs = FakeFilesystem::builder()
+        .with_root(ROOT)
+        .with_file(ROOT, "/library/song.txt", "song.txt", "hash-1")
+        .with_stat("/library/song.txt", 10, Some(now()))
+        .build();
+    let repo = FakeCatalogRepository::new();
+    let repo_handle = repo.clone();
+    let handler = handler(
+        FakeAuth::Allowing,
+        repo,
+        fs,
+        fixed_clock(now()),
+        FakeAudioMetadataReader::new(),
+        FakeImageMetadataReader::new(),
+        FakeDocumentMetadataReader::new(),
+        FakeVideoMetadataReader::new(),
+        FakeComicMetadataReader::new(),
+        FakeCatalogRunRepository::new(),
+    );
+
+    let IndexStarted { run_id } = handler
+        .start(IndexRequest { root: ROOT.into() }, TOKEN)
+        .await
+        .unwrap();
+    handler.execute(ROOT, run_id).await.unwrap();
+
+    let file = repo_handle
+        .find_by_path("/library/song.txt")
+        .await
+        .unwrap()
+        .expect("file should be cataloged");
+
+    assert_eq!(file.size_bytes, Some(10));
+    assert_eq!(file.mtime, Some(now()), "mtime is captured from the walk");
+}
+
 // ---------------- Bounded concurrency (FR-FC-08) ----------------
 
 /// The walk processes several files at a time, so the order entries finish in

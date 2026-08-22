@@ -5,6 +5,8 @@ CREATE TABLE IF NOT EXISTS files (
     name          TEXT    NOT NULL,
     type          TEXT    NOT NULL CHECK (type IN ('audio', 'video', 'html', 'text', 'document', 'comic', 'image')),
     content_hash  TEXT    NOT NULL,
+    size_bytes    INTEGER,
+    mtime         TEXT,
     state         TEXT    NOT NULL DEFAULT 'active' CHECK (state IN ('active', 'deleted')),
     deleted_at    TEXT,
     indexed_at    TEXT    NOT NULL,
