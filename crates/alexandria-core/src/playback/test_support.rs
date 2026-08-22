@@ -206,11 +206,13 @@ impl CatalogRepository for FakeRepo {
     }
 }
 
-/// A canned `File`. `content_hash` is always `"abc"` — the thumbnail
-/// module's cache-key tests are written against that exact value, so it is
-/// not a parameter here; `path`, `file_type`, `state`, and `missing_at` are,
-/// because different tests across the four modules genuinely need different
-/// values for those.
+/// A canned `File`. `uuid` is always `Uuid::nil()` and `mtime` starts `None`
+/// — the thumbnail module's cache-key tests are written against that exact
+/// pair, and a test that needs a non-default `mtime` sets `File.mtime`
+/// directly on the returned value, since it is a public field. `path`,
+/// `file_type`, `state`, and `missing_at` are parameters here, because
+/// different tests across the four modules genuinely need different values
+/// for those.
 pub(crate) fn a_file(
     path: &str,
     file_type: FileType,

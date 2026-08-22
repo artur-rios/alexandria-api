@@ -82,9 +82,17 @@ where
     pub async fn thumbnail(&self, uuid: Uuid, token: &str) -> Result<Thumbnail, DomainError> {
         let file = resolve_playable(&self.auth, &self.repo, uuid, token).await?;
 
-        // Keying on the content hash makes re-index invalidation automatic
-        // and free: different bytes, different key.
-        let key = format!("{}-{}", file.content_hash, THUMBNAIL_MAX_DIM);
+        // Keyed on uuid and mtime rather than on the content hash. The hash is
+        // computed on demand now (FR-FC-09), so keying on it would make the
+        // first thumbnail of a multi-gigabyte video pay for hashing the whole
+        // file — moving indexing's old cost into browsing, one unpredictable
+        // stall at a time. The uuid is already unique and stable, and mtime
+        // gives back the invalidation-on-change the hash was providing.
+        let mtime = file
+            .mtime
+            .map(|t| t.to_rfc3339())
+            .unwrap_or_else(|| "none".to_string());
+        let key = format!("{}-{}-{}", file.uuid, mtime, THUMBNAIL_MAX_DIM);
 
         // The cache is consulted before anything is decoded — a hit must
         // cost one read and no rendering at all.
@@ -419,7 +427,15 @@ mod tests {
     use super::*;
     use crate::catalog::model::FileState;
     use crate::playback::test_support::{a_file, FakeAuth, FakeRepo};
+    use chrono::{DateTime, Utc};
     use std::sync::{Arc, Mutex};
+
+    /// A distinct, deterministic `mtime` for a given offset. Two different
+    /// offsets are guaranteed to produce two different timestamps, which is
+    /// all the mtime-keying tests need.
+    fn t(offset_secs: i64) -> DateTime<Utc> {
+        DateTime::from_timestamp(1_700_000_000 + offset_secs, 0).expect("valid timestamp")
+    }
 
     /// Archive fake: pages deliberately supplied out of order, so the
     /// "page 1" assertion proves the ordering rule ran rather than the
@@ -476,18 +492,46 @@ mod tests {
 
     /// In-memory cache fake. Like the renderer log, its entries live behind
     /// an `Arc` the test holds a clone of.
+    ///
+    /// `Clone`: both fields are `Arc`s, so a clone shares state with its
+    /// original rather than starting a fresh, empty cache — needed by tests
+    /// that hand the same cache to more than one handler and then read
+    /// `hits()` back from the instance they kept.
+    #[derive(Clone)]
     struct FakeCache {
         entries: Entries,
+        // Counts `get` calls that found an entry, not calls made. A test
+        // asserting "this must be a miss" wants to know whether the cache
+        // *answered*, not how many times it was asked.
+        hits: Arc<Mutex<usize>>,
+    }
+
+    impl FakeCache {
+        fn new(entries: Entries) -> Self {
+            Self {
+                entries,
+                hits: Arc::new(Mutex::new(0)),
+            }
+        }
+
+        fn hits(&self) -> usize {
+            *self.hits.lock().unwrap()
+        }
     }
 
     impl ThumbnailCache for FakeCache {
         async fn get(&self, key: &str) -> Option<Vec<u8>> {
-            self.entries
+            let found = self
+                .entries
                 .lock()
                 .unwrap()
                 .iter()
                 .find(|(k, _)| k == key)
-                .map(|(_, v)| v.clone())
+                .map(|(_, v)| v.clone());
+            if found.is_some() {
+                *self.hits.lock().unwrap() += 1;
+            }
+            found
         }
 
         async fn put(&self, key: &str, bytes: &[u8]) -> Result<(), DomainError> {
@@ -501,8 +545,9 @@ mod tests {
 
     #[tokio::test]
     async fn given_video_when_thumbnailed_then_video_renderer_used_and_cached() {
-        // Arrange — `content_hash` is `"abc"` in the shared `a_file` helper
-        // on purpose: the cache-key assertions below are written against it.
+        // Arrange — `uuid` is `Uuid::nil()` and `mtime` is `None` in the
+        // shared `a_file` helper on purpose: the cache-key assertion below
+        // is written against that exact pair.
         let repo = FakeRepo::with_file(a_file(
             "/lib/movie.mp4",
             FileType::Video,
@@ -518,9 +563,7 @@ mod tests {
             FakeRenderer {
                 calls: Arc::clone(&calls),
             },
-            FakeCache {
-                entries: Arc::clone(&entries),
-            },
+            FakeCache::new(Arc::clone(&entries)),
         );
 
         // Act
@@ -535,8 +578,69 @@ mod tests {
         );
         assert_eq!(
             *entries.lock().unwrap(),
-            vec![(format!("abc-{THUMBNAIL_MAX_DIM}"), b"JPEG".to_vec())]
+            vec![(
+                format!("{}-none-{THUMBNAIL_MAX_DIM}", Uuid::nil()),
+                b"JPEG".to_vec()
+            )]
         );
+    }
+
+    #[tokio::test]
+    async fn given_a_file_whose_mtime_changed_when_a_thumbnail_is_requested_then_the_cache_is_not_reused(
+    ) {
+        // Arrange — same uuid (`a_file` always uses `Uuid::nil()`), two
+        // different mtimes. A cache still keyed on the content hash alone
+        // would treat these as the same entry; the fix under test must not.
+        // Two handlers share one `FakeCache` (via `Clone`, which shares the
+        // underlying `Arc`s) because `FakeRepo` hands back a fixed `File` —
+        // there is no `set_mtime` to mutate a single handler's view between
+        // requests, so the "file changed on disk" step is modeled as a
+        // second handler over the same cache and a file whose only
+        // difference is `mtime`.
+        let cache = FakeCache::new(Arc::new(Mutex::new(Vec::new())));
+
+        let mut first_file = a_file("/lib/movie.mp4", FileType::Video, FileState::Active, None);
+        first_file.mtime = Some(t(1));
+        let handler_one = ThumbnailHandler::new(
+            FakeAuth { good: "t" },
+            FakeRepo::with_file(first_file),
+            FakeArchive,
+            FakeRenderer {
+                calls: Arc::new(Mutex::new(Vec::new())),
+            },
+            cache.clone(),
+        );
+
+        // Act — first request: nothing is cached yet.
+        let first = handler_one
+            .thumbnail(Uuid::nil(), "t")
+            .await
+            .expect("thumb");
+        assert_eq!(cache.hits(), 0, "first request cannot be a hit");
+
+        let mut second_file = a_file("/lib/movie.mp4", FileType::Video, FileState::Active, None);
+        second_file.mtime = Some(t(2));
+        let handler_two = ThumbnailHandler::new(
+            FakeAuth { good: "t" },
+            FakeRepo::with_file(second_file),
+            FakeArchive,
+            FakeRenderer {
+                calls: Arc::new(Mutex::new(Vec::new())),
+            },
+            cache.clone(),
+        );
+        let second = handler_two
+            .thumbnail(Uuid::nil(), "t")
+            .await
+            .expect("thumb");
+
+        // Assert
+        assert_eq!(
+            cache.hits(),
+            0,
+            "a changed mtime must produce a different cache key"
+        );
+        assert_eq!(first.uuid, second.uuid);
     }
 
     #[tokio::test]
@@ -556,9 +660,7 @@ mod tests {
             FakeRenderer {
                 calls: Arc::clone(&calls),
             },
-            FakeCache {
-                entries: Arc::new(Mutex::new(Vec::new())),
-            },
+            FakeCache::new(Arc::new(Mutex::new(Vec::new()))),
         );
 
         // Act
@@ -631,9 +733,7 @@ mod tests {
             FakeRenderer {
                 calls: Arc::new(Mutex::new(Vec::new())),
             },
-            FakeCache {
-                entries: Arc::new(Mutex::new(Vec::new())),
-            },
+            FakeCache::new(Arc::new(Mutex::new(Vec::new()))),
         );
 
         // Act
@@ -659,9 +759,7 @@ mod tests {
             FakeRenderer {
                 calls: Arc::clone(&calls),
             },
-            FakeCache {
-                entries: Arc::new(Mutex::new(Vec::new())),
-            },
+            FakeCache::new(Arc::new(Mutex::new(Vec::new()))),
         );
         let pages = ComicPageHandler::new(
             FakeAuth { good: "t" },
@@ -695,12 +793,10 @@ mod tests {
             None,
         ));
         let calls = Arc::new(Mutex::new(Vec::new()));
-        let cache = FakeCache {
-            entries: Arc::new(Mutex::new(vec![(
-                format!("{}-{}", "abc", THUMBNAIL_MAX_DIM),
-                b"CACHED".to_vec(),
-            )])),
-        };
+        let cache = FakeCache::new(Arc::new(Mutex::new(vec![(
+            format!("{}-none-{THUMBNAIL_MAX_DIM}", Uuid::nil()),
+            b"CACHED".to_vec(),
+        )])));
         let handler = ThumbnailHandler::new(
             FakeAuth { good: "t" },
             repo,
@@ -736,9 +832,7 @@ mod tests {
             FakeRenderer {
                 calls: Arc::new(Mutex::new(Vec::new())),
             },
-            FakeCache {
-                entries: Arc::new(Mutex::new(Vec::new())),
-            },
+            FakeCache::new(Arc::new(Mutex::new(Vec::new()))),
         );
 
         // Act
@@ -767,9 +861,7 @@ mod tests {
             FakeRenderer {
                 calls: Arc::clone(&calls),
             },
-            FakeCache {
-                entries: Arc::new(Mutex::new(Vec::new())),
-            },
+            FakeCache::new(Arc::new(Mutex::new(Vec::new()))),
         );
 
         // Act
