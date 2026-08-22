@@ -2463,6 +2463,7 @@ fn control_handler(
         runs,
         fixed_clock(now()),
         registry,
+        TEST_CONCURRENCY,
     ))
 }
 
@@ -2687,5 +2688,128 @@ async fn given_a_run_paused_during_discovery_when_execute_then_no_entry_is_proce
     assert!(
         recorded.counts.is_none(),
         "a paused run writes no tally — a resume supersedes it"
+    );
+}
+
+#[tokio::test]
+async fn given_a_paused_index_run_when_resumed_then_it_re_walks_and_finishes_the_library() {
+    // The owner-visible promise, end to end: a run stopped partway through is
+    // picked up again under the same run id and gets through the rest of the
+    // library. There is no cursor and no checkpoint — the second segment
+    // re-walks the whole root, and the prefix the first one indexed falls out
+    // as `already_cataloged` on a single indexed-path lookup each.
+    let runs = FakeCatalogRunRepository::new();
+    let registry = RunRegistry::new();
+    let catalog = FakeCatalogRepository::new();
+    let run_id = Uuid::new_v4();
+    runs.start(run_id, RunKind::Index, Some(ROOT), now())
+        .await
+        .unwrap();
+    let pause_mid_walk = control_interrupt(
+        control_handler(runs.clone(), registry.clone()),
+        run_id,
+        ControlVerb::Pause,
+    );
+    let first_segment = handler_with_registry(
+        FakeAuth::Allowing,
+        catalog.clone(),
+        audio_library(),
+        fixed_clock(now()),
+        InterruptingAudioMetadataReader::new(pause_mid_walk),
+        FakeImageMetadataReader::new(),
+        FakeDocumentMetadataReader::new(),
+        FakeVideoMetadataReader::new(),
+        FakeComicMetadataReader::new(),
+        runs.clone(),
+        registry.clone(),
+    );
+
+    let first = first_segment
+        .execute(ROOT, run_id)
+        .await
+        .expect("first segment");
+    assert!(
+        first.indexed > 0 && first.indexed < HALT_WALK_FILES,
+        "the first segment must have got some of the way, not all of it: {first:?}"
+    );
+    assert_eq!(
+        runs.get_recorded(run_id).expect("run").status,
+        RunStatus::Paused
+    );
+
+    let resumed = control_handler(runs.clone(), registry.clone())
+        .resume(run_id, TOKEN)
+        .await
+        .expect("resume");
+    assert_eq!(resumed.run_id, run_id);
+    assert_eq!(
+        resumed.root.as_deref(),
+        Some(ROOT),
+        "the caller is told which root to spawn the walk over"
+    );
+    assert_eq!(
+        runs.get_recorded(run_id).expect("run").processed,
+        Some(0),
+        "the resumed segment counts from zero — `processed` was never an offset"
+    );
+
+    let second_segment = handler_with_registry(
+        FakeAuth::Allowing,
+        catalog.clone(),
+        audio_library(),
+        fixed_clock(now()),
+        FakeAudioMetadataReader::new(),
+        FakeImageMetadataReader::new(),
+        FakeDocumentMetadataReader::new(),
+        FakeVideoMetadataReader::new(),
+        FakeComicMetadataReader::new(),
+        runs.clone(),
+        registry.clone(),
+    );
+
+    let second = second_segment
+        .execute(ROOT, run_id)
+        .await
+        .expect("second segment");
+
+    assert_eq!(
+        second.scanned, HALT_WALK_FILES,
+        "the whole root is re-walked"
+    );
+    assert_eq!(
+        second.already_cataloged, first.indexed,
+        "everything the first segment indexed is re-encountered, and counted as \
+         already cataloged rather than skipped"
+    );
+    assert_eq!(
+        second.indexed + second.already_cataloged,
+        HALT_WALK_FILES,
+        "a client reading `in the library` as indexed + alreadyCataloged lands on \
+         the real total"
+    );
+    assert_eq!(second.failed, 0);
+    assert_eq!(
+        catalog.count(),
+        HALT_WALK_FILES,
+        "and every file in the library really is in the catalog now"
+    );
+    let recorded = runs.get_recorded(run_id).expect("run");
+    assert_eq!(
+        recorded.status,
+        RunStatus::Complete,
+        "the resumed run finishes as any other run does"
+    );
+    assert!(recorded.paused_at.is_none(), "it is not paused any more");
+    assert_eq!(
+        recorded.counts,
+        Some(RunCounts::Index {
+            scanned: HALT_WALK_FILES,
+            indexed: second.indexed,
+            skipped: 0,
+            already_cataloged: second.already_cataloged,
+            failed: 0,
+        }),
+        "the recorded tally describes the segment that finished, which is what \
+         decision 9 of the design says it should"
     );
 }

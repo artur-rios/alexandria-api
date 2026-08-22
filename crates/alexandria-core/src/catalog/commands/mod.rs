@@ -54,7 +54,7 @@ where
 /// terminal writes, and its failure is logged rather than propagated for the
 /// reason `finish`'s is — the work the run did actually happened, and the
 /// caller's own result must not be replaced by a bookkeeping error. The row
-/// stays `running` until startup reconciliation (FR-FC-29) closes it.
+/// stays `running` until startup reconciliation (FR-FC-29) pauses it.
 ///
 /// `counts` is the partial tally the walk reached. Cancel keeps it — a
 /// cancelled run is never resumed, so what it got through is final. Pause
@@ -94,12 +94,27 @@ pub(crate) async fn record_halt<RR>(
             }
         }
         RunSignal::Cancel => {
-            if let Err(err) = retry_on_busy(BUSY_ATTEMPTS, || {
+            match retry_on_busy(BUSY_ATTEMPTS, || {
                 runs.cancel(run_id, Some(counts), ended_at)
             })
             .await
             {
-                tracing::warn!(%run_id, error = %err, "could not record that the run was cancelled");
+                // Refused because the row is no longer `running` or `paused`:
+                // something else closed this run while the walk was between
+                // dropping its cell and getting here. That write stands and
+                // this one is dropped, exactly as on the pause branch above.
+                // What is lost is this walk's partial tally; the row's last
+                // flushed `processed`/`total` still say how far it got, and
+                // overwriting a closed run to recover four numbers would be
+                // the misreport the guard exists to prevent.
+                Ok(false) => tracing::warn!(
+                    %run_id,
+                    "run was closed by another caller before it could be cancelled"
+                ),
+                Ok(true) => {}
+                Err(err) => {
+                    tracing::warn!(%run_id, error = %err, "could not record that the run was cancelled")
+                }
             }
         }
     }

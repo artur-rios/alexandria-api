@@ -265,6 +265,32 @@ impl RunRegistry {
         self.lock().remove(&run_id);
     }
 
+    /// Drop `run_id`'s cell only if the registered cell is `cell` itself.
+    ///
+    /// What [`RunCellGuard`]'s `Drop` uses, and the reason it does not simply
+    /// call [`RunRegistry::close`]. Run ids are reused: resume re-runs
+    /// `execute` under the *same* id, so a paused segment's guard and the
+    /// resumed segment's guard can exist at the same time if the first task
+    /// was aborted without being awaited. Closing by id alone would let the
+    /// stale guard evict the live segment's cell on its way out, and that run
+    /// would then report no live progress for the rest of its life — a
+    /// silent, permanent loss with nothing in the logs.
+    ///
+    /// Identity is `Arc::ptr_eq` rather than a generation counter because it
+    /// answers the question directly and needs no second piece of state to
+    /// keep in step. It cannot be fooled by an address reused after a free:
+    /// the guard holds a strong reference to its own cell for as long as it
+    /// exists, so that allocation cannot have been handed out again.
+    fn close_if_owned(&self, run_id: Uuid, cell: &Arc<RunCell>) {
+        let mut cells = self.lock();
+        if cells
+            .get(&run_id)
+            .is_some_and(|registered| Arc::ptr_eq(registered, cell))
+        {
+            cells.remove(&run_id);
+        }
+    }
+
     /// A poisoned lock is recovered from rather than propagated: the map is a
     /// plain `HashMap` with no invariant a panic mid-insert could have left
     /// broken, and refusing every future progress read because one unrelated
@@ -309,7 +335,10 @@ impl std::ops::Deref for RunCellGuard {
 
 impl Drop for RunCellGuard {
     fn drop(&mut self) {
-        self.registry.close(self.run_id);
+        // Only if this guard still owns the registered cell: a stale guard
+        // for a run id that has since been reopened must not evict the live
+        // segment's cell. See [`RunRegistry::close_if_owned`].
+        self.registry.close_if_owned(self.run_id, &self.cell);
     }
 }
 
@@ -401,6 +430,49 @@ mod tests {
         let second = registry.open(run_id);
 
         assert_eq!(second.snapshot().processed, 0);
+    }
+
+    #[test]
+    fn given_a_reopened_run_when_the_stale_guard_drops_then_the_live_cell_survives() {
+        // Resume re-runs `execute` under the *same* run id, so two guards for
+        // one id can exist at once: the paused segment's, if its task was
+        // aborted without being awaited, and the resumed segment's. A `Drop`
+        // that closed by id alone would let the stale one evict the live
+        // one's cell, and that run would then report no live progress for the
+        // rest of its life.
+        let registry = RunRegistry::new();
+        let run_id = Uuid::new_v4();
+        let stale = registry.open(run_id);
+        let live = registry.open(run_id);
+        live.advance();
+
+        drop(stale);
+
+        let cell = registry
+            .get(run_id)
+            .expect("the live run must keep its cell");
+        assert!(
+            Arc::ptr_eq(live.cell(), &cell),
+            "the surviving cell must be the live guard's own, not the stale one's"
+        );
+        assert_eq!(cell.snapshot().processed, 1, "and its progress is intact");
+    }
+
+    #[test]
+    fn given_a_reopened_run_when_the_live_guard_drops_then_the_cell_is_gone() {
+        // The other half of the ownership check: the guard that *does* own the
+        // registered cell still closes it, so a reopened run is not left
+        // leaking a cell once its own segment ends.
+        let registry = RunRegistry::new();
+        let run_id = Uuid::new_v4();
+        let stale = registry.open(run_id);
+        let live = registry.open(run_id);
+
+        drop(live);
+
+        assert!(registry.get(run_id).is_none());
+        drop(stale);
+        assert!(registry.get(run_id).is_none());
     }
 
     #[test]

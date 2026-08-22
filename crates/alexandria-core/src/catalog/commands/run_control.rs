@@ -3,7 +3,7 @@ use uuid::Uuid;
 use crate::auth::AuthService;
 use crate::catalog::clock::Clock;
 use crate::catalog::run_registry::{RunRegistry, RunSignal};
-use crate::catalog::runs::{CatalogRunRepository, RunStatus};
+use crate::catalog::runs::{CatalogRunRepository, RunKind, RunStatus};
 use crate::errors::DomainError;
 use crate::retry::{retry_on_busy, BUSY_ATTEMPTS};
 
@@ -33,6 +33,29 @@ pub struct RunControlHandler<A, RR, C> {
     runs: RR,
     clock: C,
     registry: RunRegistry,
+    /// The width to resume a run at when its own row records none
+    /// (`indexing.concurrency`). A run started before the priority column was
+    /// ever written has no stored width, and resuming it at the configured
+    /// default is the only answer available that is not invented.
+    default_concurrency: u32,
+}
+
+/// What a caller needs to put a resumed run back to work (UC-42).
+///
+/// `resume` records the state change and hands this back rather than spawning
+/// anything, mirroring how `start` and `execute` are already separated: the
+/// FFI and HTTP layers own the runtime, and a handler that spawned would take
+/// that decision away from them and force `Send + 'static` onto collaborators
+/// that have no other reason to carry it.
+///
+/// `kind` is what says which handler's `execute` to spawn, and `root` is
+/// `None` for a refresh, which takes none.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunResumed {
+    pub run_id: Uuid,
+    pub root: Option<String>,
+    pub kind: RunKind,
+    pub concurrency: u32,
 }
 
 /// Which verb was asked for. Private, and deliberately not [`RunSignal`]:
@@ -75,12 +98,19 @@ where
     RR: CatalogRunRepository,
     C: Clock,
 {
-    pub fn new(auth: A, runs: RR, clock: C, registry: RunRegistry) -> Self {
+    pub fn new(
+        auth: A,
+        runs: RR,
+        clock: C,
+        registry: RunRegistry,
+        default_concurrency: u32,
+    ) -> Self {
         Self {
             auth,
             runs,
             clock,
             registry,
+            default_concurrency,
         }
     }
 
@@ -92,6 +122,68 @@ where
     /// Abandon a run. Terminal — a cancelled run is not resumed.
     pub async fn cancel(&self, run_id: Uuid, token: &str) -> Result<(), DomainError> {
         self.control(run_id, token, Verb::Cancel).await
+    }
+
+    /// Put a paused run back to work, and tell the caller what to spawn.
+    ///
+    /// The state machine's one edge back into `running`, and the only verb
+    /// that is not a [`Verb`]: it raises no signal — a paused run has no loop
+    /// left to read one — and it answers with a value rather than with
+    /// nothing. `paused → running` is the whole of its legality; a run
+    /// already running has nothing to resume, and the three terminal statuses
+    /// have no run left at all.
+    ///
+    /// Nothing is walked here. The caller spawns `execute` on the returned
+    /// [`RunResumed`], and that walk starts over from the root: there is no
+    /// cursor to resume from and none is wanted. Per-file work is a stat and
+    /// a header read (FR-FC-09/FR-FC-10), so everything an earlier segment
+    /// cataloged falls out as `AlreadyCataloged` in seconds, which leaves no
+    /// checkpoint to keep honest and no drift to correct.
+    pub async fn resume(&self, run_id: Uuid, token: &str) -> Result<RunResumed, DomainError> {
+        // Ahead of the lookup, for the reason `control` does it: a caller
+        // with a bad token must learn neither that the run exists nor what
+        // state it is in.
+        self.auth.authenticate(token).await?;
+        let run = self.runs.get(run_id).await?.ok_or(DomainError::NotFound)?;
+        if run.status != RunStatus::Paused {
+            return Err(DomainError::InvalidState);
+        }
+
+        // Bank the pause that is ending. `active_millis` is elapsed wall time
+        // minus this total, so a run that sat paused overnight must not
+        // report the night as work — and it accumulates rather than replaces,
+        // because a run may be paused and resumed any number of times.
+        //
+        // `paused_at` should always be set on a paused row, and a missing one
+        // banks nothing rather than failing the resume: refusing to put a run
+        // back to work over a bookkeeping field would be the worse answer,
+        // and `active_millis` is clamped at zero regardless.
+        let now = self.clock.now();
+        let this_pause = run
+            .paused_at
+            .map(|paused_at| (now - paused_at).num_milliseconds())
+            .unwrap_or(0);
+        let paused_millis = run.paused_millis + this_pause;
+
+        let applied =
+            retry_on_busy(BUSY_ATTEMPTS, || self.runs.resume(run_id, paused_millis)).await?;
+        if !applied {
+            // The run stopped being `paused` between the lookup above and
+            // this write — in practice a cancel that landed in between.
+            // Reported rather than swallowed, exactly as a refused pause is:
+            // the caller must not be told a run is running again when the row
+            // says it was abandoned.
+            return Err(DomainError::InvalidState);
+        }
+
+        Ok(RunResumed {
+            run_id,
+            root: run.root,
+            kind: run.kind,
+            // A run whose row records no width — every run, until run
+            // priority writes the column — resumes at the configured one.
+            concurrency: run.concurrency.unwrap_or(self.default_concurrency),
+        })
     }
 
     async fn control(&self, run_id: Uuid, token: &str, verb: Verb) -> Result<(), DomainError> {
@@ -139,9 +231,15 @@ where
         // `RunCell::raise`'s no-downgrade guard cannot help — the cell is
         // already gone. What holds the line is `pause` being conditional on
         // the row still reading `running`, so the late pause is refused and
-        // the cancel stands. The reverse order is unproblematic: this call
-        // would have read `cancelled`/`complete` at its lookup above and
-        // returned `InvalidState`.
+        // the cancel stands.
+        //
+        // That covers only the ordering where this call's write lands first.
+        // The other one — this call's *lookup* reading `running`, the walk
+        // then closing the run, and this call's write landing last — is not
+        // covered by the lookup, which has already happened. It is covered by
+        // the same shape of guard on each verb's own write: `pause` is
+        // conditional on `running`, `cancel` on `running` or `paused`, and
+        // both report a refusal below.
         //
         // Unlike the walk's own best-effort bookkeeping, a failure here is
         // reported: the caller asked for the run to stop, and must not be
@@ -161,7 +259,15 @@ where
             // `None`: this caller holds no partial tally. The walk that does
             // passes its own through `record_halt`.
             Verb::Cancel => {
-                retry_on_busy(BUSY_ATTEMPTS, || self.runs.cancel(run_id, None, now)).await?
+                let applied =
+                    retry_on_busy(BUSY_ATTEMPTS, || self.runs.cancel(run_id, None, now)).await?;
+                if !applied {
+                    // The run closed itself between the lookup and this
+                    // write. Refusing is what keeps a completed run from
+                    // being rewritten as `cancelled` with a fresh finish time
+                    // while its caller is told `Ok`.
+                    return Err(DomainError::InvalidState);
+                }
             }
         }
         Ok(())

@@ -37,21 +37,23 @@ impl RunKind {
 ///
 /// `Complete` means the walk finished — including when individual files
 /// failed, which are counted in the run's own `failed` tally. `Failed` is
-/// reserved for a run that could not proceed at all. `Interrupted` is what
-/// startup reconciliation leaves behind for a run whose process stopped.
+/// reserved for a run that could not proceed at all.
 ///
-/// `Paused` and `Cancelled` are what an owner asked for. `Paused` is the only
-/// non-terminal one of the five: the run stopped where it was and can be
-/// picked up again, so it carries no `finished_at` and keeps the `phase` that
-/// says where it stopped. `Cancelled` is terminal, exactly like `Complete`
-/// and `Failed`.
+/// `Paused` is the only non-terminal one of the four: the run stopped where
+/// it was and can be picked up again, so it carries no `finished_at`. It is
+/// what an owner asks for *and* what startup reconciliation leaves behind for
+/// a run whose process stopped (FR-FC-29) — closing the application mid-scan
+/// leaves work to resume rather than work to redo, which is why there is no
+/// longer an `Interrupted` status naming the loss.
+///
+/// `Cancelled` is what an owner asks for when they will not come back to a
+/// run. Terminal, exactly like `Complete` and `Failed`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RunStatus {
     Running,
     Complete,
     Failed,
-    Interrupted,
     Paused,
     Cancelled,
 }
@@ -62,7 +64,6 @@ impl RunStatus {
             RunStatus::Running => "running",
             RunStatus::Complete => "complete",
             RunStatus::Failed => "failed",
-            RunStatus::Interrupted => "interrupted",
             RunStatus::Paused => "paused",
             RunStatus::Cancelled => "cancelled",
         }
@@ -73,7 +74,6 @@ impl RunStatus {
             "running" => Ok(RunStatus::Running),
             "complete" => Ok(RunStatus::Complete),
             "failed" => Ok(RunStatus::Failed),
-            "interrupted" => Ok(RunStatus::Interrupted),
             "paused" => Ok(RunStatus::Paused),
             "cancelled" => Ok(RunStatus::Cancelled),
             other => Err(DomainError::internal(format!(
@@ -154,11 +154,22 @@ pub struct CatalogRun {
     /// When the run was paused, for a run that is paused right now.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub paused_at: Option<DateTime<Utc>>,
-    /// Total time the run has spent paused. Not serialized: it is the input
-    /// `active_millis` is derived from, and a client holding `activeMillis`
-    /// has no use for it.
+    /// Total time the run has spent paused, accumulated across every segment.
+    /// Not serialized: it is the input `active_millis` is derived from, and a
+    /// client holding `activeMillis` has no use for it.
     #[serde(skip)]
     pub paused_millis: i64,
+    /// How many entries at a time the run was started with, so a resumed run
+    /// continues at the width it was started with rather than at whatever the
+    /// configuration happens to say later.
+    ///
+    /// `None` for every run so far — nothing writes the column until run
+    /// priority exists, and a resume then falls back to the configured
+    /// default. Not serialized, for the reason `paused_millis` is not: the
+    /// run body is what a client draws a progress bar from, and this is an
+    /// input to how the run is spawned, not a fact about its progress.
+    #[serde(skip)]
+    pub concurrency: Option<u32>,
 }
 
 /// Run records repository port (UC-42). Unit-testable against an in-memory
@@ -243,13 +254,55 @@ pub trait CatalogRunRepository: Send + Sync {
     /// than final.)
     ///
     /// Rejects a `counts` whose variant does not match the run's own kind, for
-    /// the reason [`CatalogRunRepository::finish`] does.
+    /// the reason [`CatalogRunRepository::finish`] does. That check is
+    /// answered before the state guard below, so a caller passing the wrong
+    /// tally is told so rather than quietly getting `Ok(false)`.
+    ///
+    /// **Conditional on the run still being `running` or `paused`**, and
+    /// `Ok(false)` when it was not — the mirror of [`CatalogRunRepository::pause`]'s
+    /// guard, and there for the same race seen from the other verb. A control
+    /// call reads `running`, the walk then writes `finish`, and the cancel
+    /// lands last: unguarded it rewrites a run that got through all of its
+    /// work into a `cancelled` one with a fresh `finished_at`, and answers
+    /// `Ok`. The row stays internally coherent, so nothing downstream notices
+    /// — it is a misreport rather than a corruption, which is exactly what
+    /// makes it worth guarding rather than leaving to be found later.
+    ///
+    /// The condition is a set rather than a single value because `paused` is
+    /// a legal source too: abandoning a paused run is the whole reason to
+    /// cancel rather than pause.
+    ///
+    /// Callers must not ignore the `false`. See `record_halt`, which logs it,
+    /// and `RunControlHandler`, which reports it.
     async fn cancel(
         &self,
         id: Uuid,
         counts: Option<RunCounts>,
         cancelled_at: DateTime<Utc>,
-    ) -> Result<(), DomainError>;
+    ) -> Result<bool, DomainError>;
+
+    /// Put a paused run back to `running`, ready to be walked again.
+    ///
+    /// The segment counters are reset rather than carried: `processed` goes
+    /// to 0, `total` to NULL, and `phase` back to `discovering`. That is not
+    /// housekeeping — it is what keeps resume honest. `processed` counts the
+    /// entries one segment folded; it is not a position in the walk, and
+    /// there is no position to resume from, because resume re-walks the root
+    /// from the start and lets everything an earlier segment cataloged fall
+    /// out as `AlreadyCataloged` in seconds. A resumed segment that inherited
+    /// the old counters would report a run further along than it is, against
+    /// a denominator it has not yet rediscovered.
+    ///
+    /// `paused_millis` is the *new accumulated total*, computed by the caller:
+    /// the repository has no business asking what time it is, exactly as it
+    /// does not for `active_millis`. The caller adds the pause that is ending
+    /// to whatever was already banked and passes the sum.
+    ///
+    /// **Conditional on the run still being `paused`**, and `Ok(false)` when
+    /// it was not — the same guard `pause` and `cancel` carry. A resume that
+    /// landed after someone else's cancel would revive a run its owner had
+    /// just abandoned.
+    async fn resume(&self, id: Uuid, paused_millis: i64) -> Result<bool, DomainError>;
 
     /// Flush a run's live progress into its record (FR-FC-28).
     ///
@@ -263,10 +316,24 @@ pub trait CatalogRunRepository: Send + Sync {
     /// One run's record, or `None` for an unknown id (UC-42 AF-01).
     async fn get(&self, id: Uuid) -> Result<Option<CatalogRun>, DomainError>;
 
-    /// Mark every run still `running` as `interrupted`, returning how many
-    /// were reconciled (FR-FC-29). Runs execute in-process and are never
-    /// resumed, so a `running` row seen at startup has no task behind it.
-    async fn interrupt_running(&self, now: DateTime<Utc>) -> Result<u64, DomainError>;
+    /// Pause every run still `running`, returning how many were reconciled
+    /// (FR-FC-29).
+    ///
+    /// Runs execute in-process, so a `running` row seen at startup provably
+    /// has no task behind it. It becomes `paused` rather than terminal: the
+    /// walk it belongs to can be resumed, and closing the application
+    /// mid-scan should leave an owner a run they are offered rather than a
+    /// loss they are informed of. Nothing is started here — resuming is an
+    /// explicit act.
+    ///
+    /// Stamps `paused_at` like any other pause, so the time the process spent
+    /// down is banked and not later reported as work, and writes no
+    /// `finished_at`, because the run has not finished.
+    ///
+    /// Unlike an owner's pause, this one clears `phase`. A paused run keeps
+    /// its phase to say where its still-live walk stopped; this run's process
+    /// is gone, so it is not in a phase at all until it resumes.
+    async fn pause_running(&self, now: DateTime<Utc>) -> Result<u64, DomainError>;
 }
 
 #[derive(Clone)]
@@ -306,24 +373,77 @@ fn check_counts_match_kind(kind: RunKind, counts: &RunCounts) -> Result<(), Doma
     }
 }
 
+/// The `WHERE` suffix that makes a close conditional on the row still being
+/// cancellable. A macro rather than a `const` because it is `concat!`ed into
+/// the statements below, and `concat!` takes literals only.
+macro_rules! cancellable_guard {
+    () => {
+        " AND status IN (?, ?)"
+    };
+}
+
+/// The statement that closes an index run with its tally, with `$guard`
+/// appended.
+///
+/// `phase = NULL` because the run is terminal: a row reading
+/// `status = 'complete', phase = 'processing'` tells a client two
+/// contradictory things. `total` and `processed` stay — those are the tally,
+/// and they remain true.
+macro_rules! close_index_sql {
+    ($guard:expr) => {
+        concat!(
+            "UPDATE catalog_runs SET status = ?, finished_at = ?, phase = NULL, \
+             scanned = ?, indexed = ?, skipped = ?, already_cataloged = ?, failed = ? \
+             WHERE id = ?",
+            $guard
+        )
+    };
+}
+
+/// The same for a refresh run's tally. `phase = NULL`: terminal, as above.
+macro_rules! close_refresh_sql {
+    ($guard:expr) => {
+        concat!(
+            "UPDATE catalog_runs SET status = ?, finished_at = ?, phase = NULL, \
+             refreshed = ?, marked_missing = ?, unchanged = ?, failed = ? \
+             WHERE id = ?",
+            $guard
+        )
+    };
+}
+
+/// The statuses a `cancel` may be written from. See the trait doc: `paused`
+/// is in the set because abandoning a paused run is the whole reason to
+/// cancel rather than pause.
+const CANCELLABLE_FROM: [RunStatus; 2] = [RunStatus::Running, RunStatus::Paused];
+
 impl SqliteCatalogRunRepository {
     /// Close a run terminally with its tally.
     ///
     /// Shared by `finish` and `cancel`, which differ only in the status they
-    /// write: both are terminal, both stamp `finished_at`, both clear `phase`,
-    /// and both keep the four counts. Sharing it is what stops the two from
-    /// drifting on any of that.
+    /// write and in what they will write it over: both are terminal, both
+    /// stamp `finished_at`, both clear `phase`, and both keep the four counts.
+    /// Sharing it is what stops the two from drifting on any of that.
+    ///
+    /// `guarded` says whether the write is conditional on the row still
+    /// being cancellable. `finish` is unconditional — it is the walk
+    /// recording its own completion, and there is no writer it should lose
+    /// to. `cancel` is conditional; the trait doc says why. Returns whether
+    /// the write applied, which is only ever `false` for a guarded one.
     async fn close_with_counts(
         &self,
         id: Uuid,
         status: RunStatus,
         counts: RunCounts,
         finished_at: DateTime<Utc>,
-    ) -> Result<(), DomainError> {
+        guarded: bool,
+    ) -> Result<bool, DomainError> {
         // Guard against a caller passing the wrong kind's tally: writing it
         // would leave the row's own kind's columns NULL, and `get` would then
         // report a terminal run with no counts — a corrupted write that looks
-        // like "no counts yet" instead of failing loudly.
+        // like "no counts yet" instead of failing loudly. Answered ahead of
+        // the state guard below, so a caller that passed the wrong tally is
+        // told so rather than handed a plain `false`.
         let row = sqlx::query("SELECT kind FROM catalog_runs WHERE id = ?")
             .bind(id.to_string())
             .fetch_optional(&self.pool)
@@ -333,53 +453,57 @@ impl SqliteCatalogRunRepository {
             check_counts_match_kind(kind, &counts)?;
         }
 
+        // Four literal statements rather than one assembled at runtime: sqlx
+        // takes a `&'static str`, and dynamic SQL is something this
+        // repository has never had. The macros are what keep the guarded and
+        // unguarded form of each from drifting in anything but the guard.
+        let sql = match (&counts, guarded) {
+            (RunCounts::Index { .. }, false) => close_index_sql!(""),
+            (RunCounts::Index { .. }, true) => close_index_sql!(cancellable_guard!()),
+            (RunCounts::Refresh { .. }, false) => close_refresh_sql!(""),
+            (RunCounts::Refresh { .. }, true) => close_refresh_sql!(cancellable_guard!()),
+        };
+        let query = sqlx::query(sql)
+            .bind(status.as_str())
+            .bind(finished_at.to_rfc3339());
         let query = match counts {
+            // These are file counts from a single walk; a library large
+            // enough to overflow `i64` is not reachable, so the narrowing is
+            // not checked at runtime.
             RunCounts::Index {
                 scanned,
                 indexed,
                 skipped,
                 already_cataloged,
                 failed,
-            } => sqlx::query(
-                // `phase = NULL` because the run is terminal: a row reading
-                // `status = 'complete', phase = 'processing'` tells a client
-                // two contradictory things. `total` and `processed` stay —
-                // those are the tally, and they remain true.
-                "UPDATE catalog_runs SET status = ?, finished_at = ?, phase = NULL, \
-                 scanned = ?, indexed = ?, skipped = ?, already_cataloged = ?, failed = ? \
-                 WHERE id = ?",
-            )
-            .bind(status.as_str())
-            .bind(finished_at.to_rfc3339())
-            // These are file counts from a single walk; a library large
-            // enough to overflow `i64` is not reachable, so the narrowing
-            // is not checked at runtime.
-            .bind(scanned as i64)
-            .bind(indexed as i64)
-            .bind(skipped as i64)
-            .bind(already_cataloged as i64)
-            .bind(failed as i64)
-            .bind(id.to_string()),
+            } => query
+                .bind(scanned as i64)
+                .bind(indexed as i64)
+                .bind(skipped as i64)
+                .bind(already_cataloged as i64)
+                .bind(failed as i64),
             RunCounts::Refresh {
                 refreshed,
                 marked_missing,
                 unchanged,
                 failed,
-            } => sqlx::query(
-                // `phase = NULL`: terminal, as above.
-                "UPDATE catalog_runs SET status = ?, finished_at = ?, phase = NULL, \
-                 refreshed = ?, marked_missing = ?, unchanged = ?, failed = ? WHERE id = ?",
-            )
-            .bind(status.as_str())
-            .bind(finished_at.to_rfc3339())
-            .bind(refreshed as i64)
-            .bind(marked_missing as i64)
-            .bind(unchanged as i64)
-            .bind(failed as i64)
-            .bind(id.to_string()),
+            } => query
+                .bind(refreshed as i64)
+                .bind(marked_missing as i64)
+                .bind(unchanged as i64)
+                .bind(failed as i64),
         };
-        query.execute(&self.pool).await?;
-        Ok(())
+        let query = query.bind(id.to_string());
+        // Bound after the id, matching the order the placeholders appear in.
+        let query = if guarded {
+            query
+                .bind(CANCELLABLE_FROM[0].as_str())
+                .bind(CANCELLABLE_FROM[1].as_str())
+        } else {
+            query
+        };
+        let result = query.execute(&self.pool).await?;
+        Ok(result.rows_affected() > 0)
     }
 }
 
@@ -411,8 +535,11 @@ impl CatalogRunRepository for SqliteCatalogRunRepository {
         counts: RunCounts,
         finished_at: DateTime<Utc>,
     ) -> Result<(), DomainError> {
-        self.close_with_counts(id, RunStatus::Complete, counts, finished_at)
-            .await
+        // Unconditional: this is the walk recording its own completion, and
+        // there is no writer it should lose to.
+        self.close_with_counts(id, RunStatus::Complete, counts, finished_at, false)
+            .await?;
+        Ok(())
     }
 
     async fn fail(
@@ -463,25 +590,53 @@ impl CatalogRunRepository for SqliteCatalogRunRepository {
         id: Uuid,
         counts: Option<RunCounts>,
         cancelled_at: DateTime<Utc>,
-    ) -> Result<(), DomainError> {
+    ) -> Result<bool, DomainError> {
         let Some(counts) = counts else {
             // No tally on offer — the control handler acting on a run no
             // process is executing. `phase = NULL`: terminal, exactly as in
-            // `finish` and `fail`.
-            sqlx::query(
-                "UPDATE catalog_runs SET status = ?, finished_at = ?, phase = NULL WHERE id = ?",
-            )
+            // `finish` and `fail`. The `status IN (…)` guard is the trait
+            // doc's: a cancel must not rewrite a run that closed itself
+            // between this caller's lookup and this write.
+            let result = sqlx::query(concat!(
+                "UPDATE catalog_runs SET status = ?, finished_at = ?, phase = NULL \
+                 WHERE id = ?",
+                cancellable_guard!()
+            ))
             .bind(RunStatus::Cancelled.as_str())
             .bind(cancelled_at.to_rfc3339())
             .bind(id.to_string())
+            .bind(CANCELLABLE_FROM[0].as_str())
+            .bind(CANCELLABLE_FROM[1].as_str())
             .execute(&self.pool)
             .await?;
-            return Ok(());
+            return Ok(result.rows_affected() > 0);
         };
         // A cancelled run is never resumed, so the tally it reached is final —
         // it is kept for exactly the reason a completed run's is.
-        self.close_with_counts(id, RunStatus::Cancelled, counts, cancelled_at)
+        self.close_with_counts(id, RunStatus::Cancelled, counts, cancelled_at, true)
             .await
+    }
+
+    async fn resume(&self, id: Uuid, paused_millis: i64) -> Result<bool, DomainError> {
+        // One statement, so a resume either happens completely or not at all:
+        // a row left `running` with a stale `paused_at` would go on banking
+        // the same pause on every subsequent resume.
+        //
+        // `processed = 0, total = NULL, phase = 'discovering'` puts the run
+        // back where every run starts. See the trait doc — those counters
+        // describe a segment, not a position, and resume re-walks.
+        let result = sqlx::query(
+            "UPDATE catalog_runs SET status = ?, paused_at = NULL, paused_millis = ?, \
+             processed = 0, total = NULL, phase = ? WHERE id = ? AND status = ?",
+        )
+        .bind(RunStatus::Running.as_str())
+        .bind(paused_millis)
+        .bind(RunPhase::Discovering.as_str())
+        .bind(id.to_string())
+        .bind(RunStatus::Paused.as_str())
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
     }
 
     async fn record_progress(&self, id: Uuid, progress: &RunProgress) -> Result<(), DomainError> {
@@ -502,7 +657,7 @@ impl CatalogRunRepository for SqliteCatalogRunRepository {
         let row = sqlx::query(
             "SELECT kind, status, root, started_at, finished_at, scanned, indexed, \
              skipped, already_cataloged, refreshed, marked_missing, unchanged, failed, error, \
-             phase, total, processed, paused_at, paused_millis \
+             phase, total, processed, paused_at, paused_millis, concurrency \
              FROM catalog_runs WHERE id = ?",
         )
         .bind(id.to_string())
@@ -585,15 +740,22 @@ impl CatalogRunRepository for SqliteCatalogRunRepository {
             active_millis: 0,
             paused_at,
             paused_millis: row.try_get("paused_millis")?,
+            // The reverse narrowing of `start`'s: a concurrency wider than
+            // `u32` was never written, so the cast cannot lose anything.
+            concurrency: row
+                .try_get::<Option<i64>, _>("concurrency")?
+                .map(|concurrency| concurrency as u32),
         }))
     }
 
-    async fn interrupt_running(&self, now: DateTime<Utc>) -> Result<u64, DomainError> {
+    async fn pause_running(&self, now: DateTime<Utc>) -> Result<u64, DomainError> {
+        // No `finished_at`: this run is being offered for resume, not closed.
+        // `phase = NULL` because its process is gone — see the trait doc for
+        // why this is the one pause that clears it.
         let result = sqlx::query(
-            "UPDATE catalog_runs SET status = ?, finished_at = ?, phase = NULL \
-                 WHERE status = ?",
+            "UPDATE catalog_runs SET status = ?, paused_at = ?, phase = NULL WHERE status = ?",
         )
-        .bind(RunStatus::Interrupted.as_str())
+        .bind(RunStatus::Paused.as_str())
         .bind(now.to_rfc3339())
         .bind(RunStatus::Running.as_str())
         .execute(&self.pool)

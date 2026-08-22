@@ -347,7 +347,7 @@ where
                     // The walk's own error is the one that matters to the
                     // caller — a bookkeeping failure on top of it must not
                     // replace it. The record stays `running` until startup
-                    // reconciliation (FR-FC-29) closes it.
+                    // reconciliation (FR-FC-29) pauses it for resume.
                     tracing::warn!(%run_id, error = %record_err, "could not record run failure");
                 }
                 return Err(err);
@@ -535,7 +535,7 @@ where
                 // failed. Reporting the run as failed would be a lie about
                 // work that did happen, and the tally is already in the log
                 // line above. The record stays `running` until startup
-                // reconciliation (FR-FC-29) closes it.
+                // reconciliation (FR-FC-29) pauses it for resume.
                 tracing::warn!(%run_id, error = %err, "could not record run completion");
             }
         } else {

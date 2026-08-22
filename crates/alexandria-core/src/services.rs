@@ -354,19 +354,23 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
     let fs = StdFilesystem;
     let clock = SystemClock;
     // FR-FC-29: any run still recorded as `running` belongs to a process that
-    // is gone — runs execute in-process and are never resumed. Reconcile them
-    // now, so a client polling one gets a terminal answer instead of waiting
-    // forever. A failure here must not stop startup: the catalog is still
+    // is gone — runs execute in-process, so nothing is walking it. Reconcile
+    // them into `paused`, so a client polling one gets a definite answer
+    // instead of waiting forever, and the owner is offered the run back
+    // rather than told it was lost. Nothing is started here: resuming is an
+    // explicit act. A failure must not stop startup — the catalog is still
     // fully usable, and the stale rows are reconciled on the next boot.
-    match run_repo.interrupt_running(clock.now()).await {
+    match run_repo.pause_running(clock.now()).await {
         Ok(0) => {}
         Ok(reconciled) => {
             tracing::info!(
                 reconciled,
-                "marked interrupted runs left by a previous process"
+                "paused runs left by a previous process; they can be resumed"
             )
         }
-        Err(err) => tracing::warn!(error = %err, "could not reconcile interrupted runs"),
+        Err(err) => {
+            tracing::warn!(error = %err, "could not reconcile runs left by a previous process")
+        }
     }
     // FR-AU-01/FR-AU-03: exactly one auth mode is active, selected once here
     // from startup configuration.
@@ -484,6 +488,10 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         run_repo.clone(),
         clock,
         run_registry,
+        // What a resumed run whose row records no width goes back to — the
+        // same `indexing.concurrency` both walks are built with, so a resume
+        // cannot end up wider or narrower than a start.
+        indexing_concurrency,
     ));
     let edit_text_file_content_handler = Arc::new(EditTextFileContentHandler::new(
         auth.clone(),
