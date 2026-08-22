@@ -2295,8 +2295,9 @@ impl FakeCatalogRunRepository {
         self.progress_history.lock().unwrap().clone()
     }
 
-    /// Stand in for the pause/resume bookkeeping that writes `paused_millis`,
-    /// so `active_millis`'s arithmetic can be asserted before it exists.
+    /// Bank a paused stretch directly, without going through the pause and
+    /// resume that would produce it — so a test about `active_millis`'s
+    /// arithmetic states the one number it is about and nothing else.
     pub fn set_paused_millis(&self, id: Uuid, paused_millis: i64) {
         if let Some(run) = self.runs.lock().unwrap().get_mut(&id) {
             run.paused_millis = paused_millis;
