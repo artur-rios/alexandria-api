@@ -5,9 +5,11 @@ use uuid::Uuid;
 
 use crate::auth::AuthService;
 use crate::catalog::clock::Clock;
+use crate::catalog::commands::{flush_progress, PROGRESS_FLUSH_SECONDS};
 use crate::catalog::fs::Filesystem;
 use crate::catalog::model::File;
 use crate::catalog::repos::CatalogRepository;
+use crate::catalog::run_registry::{RunPhase, RunRegistry};
 use crate::catalog::runs::{CatalogRunRepository, RunCounts, RunKind};
 use crate::errors::DomainError;
 use crate::retry::{retry_on_busy, BUSY_ATTEMPTS};
@@ -67,6 +69,9 @@ pub struct RefreshHandler<A, R, F, C, RR> {
     clock: C,
     concurrency: usize,
     runs: RR,
+    /// Where `execute` publishes this run's live progress (FR-FC-28). Shared
+    /// with `GetRunStatusHandler`, which reads it back.
+    registry: RunRegistry,
 }
 
 impl<A, R, F, C, RR> RefreshHandler<A, R, F, C, RR>
@@ -79,7 +84,15 @@ where
 {
     /// `concurrency` is how many cataloged paths `execute` refreshes at a
     /// time; zero is clamped to 1, as in `IndexHandler::new`.
-    pub fn new(auth: A, repo: R, fs: F, clock: C, concurrency: u32, runs: RR) -> Self {
+    pub fn new(
+        auth: A,
+        repo: R,
+        fs: F,
+        clock: C,
+        concurrency: u32,
+        runs: RR,
+        registry: RunRegistry,
+    ) -> Self {
         Self {
             auth,
             repo,
@@ -87,6 +100,7 @@ where
             clock,
             concurrency: concurrency.max(1) as usize,
             runs,
+            registry,
         }
     }
 
@@ -122,9 +136,14 @@ where
     /// rest of the catalog. Only a failure to list the catalog at all aborts.
     pub async fn execute(&self, run_id: Uuid) -> Result<RefreshOutcome, DomainError> {
         let now = self.clock.now();
+        // FR-FC-28: a refresh's discovery is `list_all` rather than a
+        // filesystem walk, but it is the same shape — a phase with no
+        // denominator, then a phase with one — so it gets the same treatment.
+        let cell = self.registry.open(run_id);
         let files = match self.repo.list_all().await {
             Ok(files) => files,
             Err(err) => {
+                self.registry.close(run_id);
                 // FR-FC-27: the walk could not proceed at all — that, and
                 // only that, is a `failed` run.
                 let fail_error = err.to_string();
@@ -144,7 +163,15 @@ where
             }
         };
 
-        let (refreshed, marked_missing, unchanged, failed) = stream::iter(files)
+        // Discovery is done: the denominator is known. Flushed immediately
+        // rather than waiting out an interval, so a client that reads the row
+        // right after the listing sees the phase it is actually in.
+        let cell = cell.as_ref();
+        cell.set_total(files.len());
+        cell.set_phase(RunPhase::Processing);
+        flush_progress(&self.runs, run_id, &cell.snapshot()).await;
+
+        let tally = stream::iter(files)
             .map(|file| async move {
                 match self.refresh_one(&file, now).await {
                     Ok(outcome) => outcome,
@@ -160,25 +187,38 @@ where
                 }
             })
             .buffer_unordered(self.concurrency)
-            .fold(
-                (0usize, 0usize, 0usize, 0usize),
-                |counts, outcome| async move {
-                    let (refreshed, marked_missing, unchanged, failed) = counts;
-                    match outcome {
-                        PathOutcome::Refreshed => {
-                            (refreshed + 1, marked_missing, unchanged, failed)
-                        }
-                        PathOutcome::MarkedMissing => {
-                            (refreshed, marked_missing + 1, unchanged, failed)
-                        }
-                        PathOutcome::Unchanged => {
-                            (refreshed, marked_missing, unchanged + 1, failed)
-                        }
-                        PathOutcome::Failed => (refreshed, marked_missing, unchanged, failed + 1),
-                    }
-                },
-            )
+            .fold(RefreshTally::new(now), |mut tally, outcome| async move {
+                match outcome {
+                    PathOutcome::Refreshed => tally.refreshed += 1,
+                    PathOutcome::MarkedMissing => tally.marked_missing += 1,
+                    PathOutcome::Unchanged => tally.unchanged += 1,
+                    PathOutcome::Failed => tally.failed += 1,
+                }
+                // FR-FC-28: one cataloged path done, whatever it resolved to.
+                cell.advance();
+                // Inline rather than on a spawned timer, for the reasons
+                // `IndexHandler::execute` gives: no `Send + 'static` bounds
+                // forced onto the collaborators, and no task whose lifetime
+                // has to be tied back to this run.
+                let now = self.clock.now();
+                if (now - tally.last_flush).num_seconds() >= PROGRESS_FLUSH_SECONDS {
+                    flush_progress(&self.runs, run_id, &cell.snapshot()).await;
+                    tally.last_flush = now;
+                }
+                tally
+            })
             .await;
+        let RefreshTally {
+            refreshed,
+            marked_missing,
+            unchanged,
+            failed,
+            ..
+        } = tally;
+
+        // The run is over: publish the final tally before the cell goes away.
+        flush_progress(&self.runs, run_id, &cell.snapshot()).await;
+        self.registry.close(run_id);
 
         let outcome = RefreshOutcome {
             run_id,
@@ -274,4 +314,30 @@ enum PathOutcome {
     MarkedMissing,
     Unchanged,
     Failed,
+}
+
+/// What `execute`'s processing loop carries from one path to the next: the
+/// outcome tally, and when it last flushed progress. The counterpart of
+/// `IndexHandler`'s `IndexTally`, and `last_flush` rides in the accumulator
+/// for the same reason — the spawned `execute` future has to be `Send`.
+struct RefreshTally {
+    refreshed: usize,
+    marked_missing: usize,
+    unchanged: usize,
+    failed: usize,
+    last_flush: DateTime<Utc>,
+}
+
+impl RefreshTally {
+    /// `started` is when the processing loop began, so the first flush lands
+    /// one interval into the pass rather than on the first path.
+    fn new(started: DateTime<Utc>) -> Self {
+        Self {
+            refreshed: 0,
+            marked_missing: 0,
+            unchanged: 0,
+            failed: 0,
+            last_flush: started,
+        }
+    }
 }

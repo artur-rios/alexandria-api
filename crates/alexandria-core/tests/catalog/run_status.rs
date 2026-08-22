@@ -1,11 +1,14 @@
 //! Unit tests for the UC-42 GetRunStatusHandler against trait fakes — no
 //! database. Coverage: the main flow plus AF-01 (unknown id) and AF-02
-//! (unauthenticated), and AF-03's "running runs carry no counts".
+//! (unauthenticated), AF-03's "running runs carry no counts", and FR-FC-28's
+//! live progress overlay.
 
 use chrono::{TimeZone, Utc};
 use uuid::Uuid;
 
+use alexandria_core::catalog::clock::FixedClock;
 use alexandria_core::catalog::queries::run_status::GetRunStatusHandler;
+use alexandria_core::catalog::run_registry::{RunPhase, RunProgress, RunRegistry};
 use alexandria_core::catalog::runs::{CatalogRunRepository, RunCounts, RunKind, RunStatus};
 use alexandria_core::errors::DomainError;
 
@@ -15,6 +18,13 @@ const TOKEN: &str = "owner-token";
 
 fn t(hour: u32) -> chrono::DateTime<Utc> {
     Utc.with_ymd_and_hms(2026, 1, 1, hour, 0, 0).unwrap()
+}
+
+/// A clock reading `hour:minute:second` on the same day [`t`] uses, so a test
+/// can assert an exact `active_millis` rather than a range.
+fn at(hour: u32, minute: u32, second: u32) -> chrono::DateTime<Utc> {
+    Utc.with_ymd_and_hms(2026, 1, 1, hour, minute, second)
+        .unwrap()
 }
 
 #[tokio::test]
@@ -34,7 +44,12 @@ async fn given_a_completed_run_when_read_then_it_is_returned_with_its_counts() {
     )
     .await
     .unwrap();
-    let handler = GetRunStatusHandler::new(FakeAuth::Allowing, runs);
+    let handler = GetRunStatusHandler::new(
+        FakeAuth::Allowing,
+        runs,
+        FixedClock(t(3)),
+        RunRegistry::new(),
+    );
 
     let run = handler.get(id, TOKEN).await.expect("get");
 
@@ -60,7 +75,12 @@ async fn given_a_running_run_when_read_then_it_has_no_counts_yet() {
     runs.start(id, RunKind::Index, Some("/library"), t(1))
         .await
         .unwrap();
-    let handler = GetRunStatusHandler::new(FakeAuth::Allowing, runs);
+    let handler = GetRunStatusHandler::new(
+        FakeAuth::Allowing,
+        runs,
+        FixedClock(t(3)),
+        RunRegistry::new(),
+    );
 
     let run = handler.get(id, TOKEN).await.expect("get");
 
@@ -72,7 +92,12 @@ async fn given_a_running_run_when_read_then_it_has_no_counts_yet() {
 #[tokio::test]
 async fn given_an_unknown_run_id_when_read_then_not_found() {
     // AF-01.
-    let handler = GetRunStatusHandler::new(FakeAuth::Allowing, FakeCatalogRunRepository::new());
+    let handler = GetRunStatusHandler::new(
+        FakeAuth::Allowing,
+        FakeCatalogRunRepository::new(),
+        FixedClock(t(3)),
+        RunRegistry::new(),
+    );
 
     let err = handler
         .get(Uuid::new_v4(), TOKEN)
@@ -88,7 +113,12 @@ async fn given_an_unauthenticated_caller_when_read_then_unauthorized() {
     let runs = FakeCatalogRunRepository::new();
     let id = Uuid::new_v4();
     runs.start(id, RunKind::Refresh, None, t(1)).await.unwrap();
-    let handler = GetRunStatusHandler::new(FakeAuth::Denying, runs);
+    let handler = GetRunStatusHandler::new(
+        FakeAuth::Denying,
+        runs,
+        FixedClock(t(3)),
+        RunRegistry::new(),
+    );
 
     let err = handler
         .get(id, "")
@@ -105,7 +135,12 @@ async fn given_an_unauthenticated_caller_and_an_unknown_run_id_when_read_then_un
     // names a run at all — auth is checked before the repository, so an
     // unknown id behind a denied token must still surface as Unauthorized,
     // never NotFound.
-    let handler = GetRunStatusHandler::new(FakeAuth::Denying, FakeCatalogRunRepository::new());
+    let handler = GetRunStatusHandler::new(
+        FakeAuth::Denying,
+        FakeCatalogRunRepository::new(),
+        FixedClock(t(3)),
+        RunRegistry::new(),
+    );
 
     let err = handler
         .get(Uuid::new_v4(), "")
@@ -117,4 +152,203 @@ async fn given_an_unauthenticated_caller_and_an_unknown_run_id_when_read_then_un
         !matches!(err, DomainError::NotFound),
         "must not leak whether the id names a run to an unauthenticated caller"
     );
+}
+
+#[tokio::test]
+async fn given_a_running_run_with_a_live_cell_when_read_then_it_reports_live_progress() {
+    // FR-FC-28: the live cell is authoritative while the run executes. The
+    // persisted row deliberately carries a *stale* tally here — an earlier
+    // flush — so a pass proves the overlay read the cell rather than the row.
+    let runs = FakeCatalogRunRepository::new();
+    let id = Uuid::new_v4();
+    runs.start(id, RunKind::Index, Some("/library"), t(1))
+        .await
+        .unwrap();
+    runs.record_progress(
+        id,
+        &RunProgress {
+            phase: RunPhase::Processing,
+            total: Some(12_264),
+            processed: 4_000,
+        },
+    )
+    .await
+    .unwrap();
+
+    let registry = RunRegistry::new();
+    let cell = registry.open(id);
+    cell.set_phase(RunPhase::Processing);
+    cell.set_total(12_264);
+    for _ in 0..8_412 {
+        cell.advance();
+    }
+    let handler = GetRunStatusHandler::new(FakeAuth::Allowing, runs, FixedClock(t(3)), registry);
+
+    let run = handler.get(id, TOKEN).await.expect("get");
+
+    assert_eq!(run.phase, Some(RunPhase::Processing));
+    assert_eq!(run.total, Some(12_264));
+    assert_eq!(
+        run.processed,
+        Some(8_412),
+        "the live cell must win over the last flush"
+    );
+}
+
+#[tokio::test]
+async fn given_a_discovering_run_with_a_live_cell_when_read_then_the_total_is_still_unknown() {
+    // Discovery has not counted the root yet, so there is no denominator to
+    // publish — the client is told "unknown", not zero.
+    let runs = FakeCatalogRunRepository::new();
+    let id = Uuid::new_v4();
+    runs.start(id, RunKind::Index, Some("/library"), t(1))
+        .await
+        .unwrap();
+    let registry = RunRegistry::new();
+    registry.open(id);
+    let handler = GetRunStatusHandler::new(FakeAuth::Allowing, runs, FixedClock(t(3)), registry);
+
+    let run = handler.get(id, TOKEN).await.expect("get");
+
+    assert_eq!(run.phase, Some(RunPhase::Discovering));
+    assert_eq!(run.total, None);
+    assert_eq!(run.processed, Some(0));
+}
+
+#[tokio::test]
+async fn given_a_run_with_no_live_cell_when_read_then_it_reports_the_persisted_progress() {
+    // The process restarted, or the run stopped: nothing is executing under
+    // this id, so the last flush is the best answer there is.
+    let runs = FakeCatalogRunRepository::new();
+    let id = Uuid::new_v4();
+    runs.start(id, RunKind::Index, Some("/library"), t(1))
+        .await
+        .unwrap();
+    runs.record_progress(
+        id,
+        &RunProgress {
+            phase: RunPhase::Processing,
+            total: Some(12_264),
+            processed: 8_412,
+        },
+    )
+    .await
+    .unwrap();
+    let handler = GetRunStatusHandler::new(
+        FakeAuth::Allowing,
+        runs,
+        FixedClock(t(3)),
+        RunRegistry::new(),
+    );
+
+    let run = handler.get(id, TOKEN).await.expect("get");
+
+    assert_eq!(run.phase, Some(RunPhase::Processing));
+    assert_eq!(run.total, Some(12_264));
+    assert_eq!(
+        run.processed,
+        Some(8_412),
+        "a restart falls back to the last flush"
+    );
+}
+
+#[tokio::test]
+async fn given_a_run_that_never_flushed_when_read_then_it_reports_no_progress() {
+    // A run that stopped inside discovery has no flush behind it. That is
+    // "unknown", not zero-of-zero.
+    let runs = FakeCatalogRunRepository::new();
+    let id = Uuid::new_v4();
+    runs.start(id, RunKind::Index, Some("/library"), t(1))
+        .await
+        .unwrap();
+    let handler = GetRunStatusHandler::new(
+        FakeAuth::Allowing,
+        runs,
+        FixedClock(t(3)),
+        RunRegistry::new(),
+    );
+
+    let run = handler.get(id, TOKEN).await.expect("get");
+
+    assert_eq!(run.phase, None);
+    assert_eq!(run.total, None);
+    assert_eq!(run.processed, None);
+}
+
+#[tokio::test]
+async fn given_a_running_run_when_read_then_active_millis_counts_up_to_now() {
+    // A running run has no `finished_at`, so the clock stands in for it —
+    // which is why the handler holds one.
+    let runs = FakeCatalogRunRepository::new();
+    let id = Uuid::new_v4();
+    runs.start(id, RunKind::Index, Some("/library"), at(1, 0, 0))
+        .await
+        .unwrap();
+    let handler = GetRunStatusHandler::new(
+        FakeAuth::Allowing,
+        runs,
+        FixedClock(at(1, 0, 30)),
+        RunRegistry::new(),
+    );
+
+    let run = handler.get(id, TOKEN).await.expect("get");
+
+    assert_eq!(run.active_millis, 30_000);
+}
+
+#[tokio::test]
+async fn given_a_finished_run_when_read_then_active_millis_stops_at_finished_at() {
+    let runs = FakeCatalogRunRepository::new();
+    let id = Uuid::new_v4();
+    runs.start(id, RunKind::Refresh, None, at(1, 0, 0))
+        .await
+        .unwrap();
+    runs.finish(
+        id,
+        RunCounts::Refresh {
+            refreshed: 1,
+            marked_missing: 0,
+            unchanged: 0,
+            failed: 0,
+        },
+        at(1, 0, 10),
+    )
+    .await
+    .unwrap();
+    let handler = GetRunStatusHandler::new(
+        FakeAuth::Allowing,
+        runs,
+        // Far past the finish: a finished run's elapsed time must not keep
+        // growing with the wall clock.
+        FixedClock(at(5, 0, 0)),
+        RunRegistry::new(),
+    );
+
+    let run = handler.get(id, TOKEN).await.expect("get");
+
+    assert_eq!(run.active_millis, 10_000);
+}
+
+#[tokio::test]
+async fn given_a_run_that_spent_time_paused_when_read_then_active_millis_excludes_it() {
+    // `active_millis` is time the run was *working*: wall time minus the time
+    // it spent paused. Task 8's pause/resume is what populates
+    // `paused_millis`; this asserts the arithmetic it feeds.
+    let runs = FakeCatalogRunRepository::new();
+    let id = Uuid::new_v4();
+    runs.start(id, RunKind::Index, Some("/library"), at(1, 0, 0))
+        .await
+        .unwrap();
+    runs.set_paused_millis(id, 20_000);
+    let handler = GetRunStatusHandler::new(
+        FakeAuth::Allowing,
+        runs,
+        FixedClock(at(1, 0, 30)),
+        RunRegistry::new(),
+    );
+
+    let run = handler.get(id, TOKEN).await.expect("get");
+
+    assert_eq!(run.active_millis, 10_000);
+    assert_eq!(run.paused_millis, 20_000);
 }

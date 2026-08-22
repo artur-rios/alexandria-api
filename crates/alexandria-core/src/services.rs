@@ -40,6 +40,7 @@ use crate::catalog::queries::browse::BrowseFilesHandler;
 use crate::catalog::queries::read_content::ReadTextFileContentHandler;
 use crate::catalog::queries::run_status::GetRunStatusHandler;
 use crate::catalog::repos::SqliteCatalogRepository;
+use crate::catalog::run_registry::RunRegistry;
 use crate::catalog::runs::{CatalogRunRepository, SqliteCatalogRunRepository};
 use crate::catalog::video_tags::FfmpegVideoMetadataReader;
 use crate::collections::commands::add_items::AddItemsToCollectionHandler;
@@ -122,7 +123,7 @@ pub type DefaultReadTextFileContentHandler =
     ReadTextFileContentHandler<RuntimeAuthService, SqliteCatalogRepository, StdFilesystem>;
 
 pub type DefaultGetRunStatusHandler =
-    GetRunStatusHandler<RuntimeAuthService, SqliteCatalogRunRepository>;
+    GetRunStatusHandler<RuntimeAuthService, SqliteCatalogRunRepository, SystemClock>;
 
 pub type DefaultEditTextFileContentHandler = EditTextFileContentHandler<
     RuntimeAuthService,
@@ -339,6 +340,9 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
     let retention_days = settings.deletion.retention_days;
     let repo = SqliteCatalogRepository::new(pool.clone());
     let run_repo = SqliteCatalogRunRepository::new(pool.clone());
+    // FR-FC-28: one registry, shared by the handlers that publish live run
+    // progress and the query that reads it back.
+    let run_registry = RunRegistry::new();
     let session_repo = SqliteSessionRepository::new(pool.clone());
     let credential_repo = SqliteLocalCredentialRepository::new(pool.clone());
     let recovery_code_repo = SqliteRecoveryCodeRepository::new(pool.clone());
@@ -423,6 +427,7 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         indexing_concurrency,
         settings.filesystem.root.clone(),
         run_repo.clone(),
+        run_registry.clone(),
     ));
     let refresh_handler = Arc::new(RefreshHandler::new(
         auth.clone(),
@@ -431,6 +436,7 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         clock,
         indexing_concurrency,
         run_repo.clone(),
+        run_registry.clone(),
     ));
     let edit_metadata_handler = Arc::new(EditMetadataHandler::new(auth.clone(), repo.clone()));
     let rename_file_handler = Arc::new(RenameFileHandler::new(auth.clone(), repo.clone(), fs));
@@ -459,7 +465,12 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         repo.clone(),
         fs,
     ));
-    let get_run_status_handler = Arc::new(GetRunStatusHandler::new(auth.clone(), run_repo.clone()));
+    let get_run_status_handler = Arc::new(GetRunStatusHandler::new(
+        auth.clone(),
+        run_repo.clone(),
+        clock,
+        run_registry,
+    ));
     let edit_text_file_content_handler = Arc::new(EditTextFileContentHandler::new(
         auth.clone(),
         repo.clone(),

@@ -11,6 +11,7 @@
 #![allow(dead_code)]
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
@@ -33,6 +34,7 @@ use alexandria_core::catalog::model::{
     File, FileState, FileType, NewFile, StateFilter, SubtypeMetadata,
 };
 use alexandria_core::catalog::repos::CatalogRepository;
+use alexandria_core::catalog::run_registry::RunProgress;
 use alexandria_core::catalog::runs::{
     CatalogRun, CatalogRunRepository, RunCounts, RunKind, RunStatus,
 };
@@ -2212,11 +2214,36 @@ impl ComicMetadataReader for FakeComicMetadataReader {
 #[derive(Debug, Default, Clone)]
 pub struct FakeCatalogRunRepository {
     runs: Arc<Mutex<HashMap<Uuid, CatalogRun>>>,
+    /// When set, every `record_progress` fails. A progress flush is
+    /// best-effort (FR-FC-28), so this is what proves a run survives one.
+    progress_fails: Arc<AtomicBool>,
+    progress_calls: Arc<AtomicUsize>,
 }
 
 impl FakeCatalogRunRepository {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A repository whose progress flushes always fail — everything else
+    /// works, so a run against it exercises exactly the flush failure.
+    pub fn with_failing_progress() -> Self {
+        let repo = Self::default();
+        repo.progress_fails.store(true, Ordering::Relaxed);
+        repo
+    }
+
+    /// How many times a flush was attempted, failing ones included.
+    pub fn progress_calls(&self) -> usize {
+        self.progress_calls.load(Ordering::Relaxed)
+    }
+
+    /// Stand in for the pause/resume bookkeeping that writes `paused_millis`,
+    /// so `active_millis`'s arithmetic can be asserted before it exists.
+    pub fn set_paused_millis(&self, id: Uuid, paused_millis: i64) {
+        if let Some(run) = self.runs.lock().unwrap().get_mut(&id) {
+            run.paused_millis = paused_millis;
+        }
     }
 
     /// The recorded run for `id`, for assertions.
@@ -2248,6 +2275,12 @@ impl CatalogRunRepository for FakeCatalogRunRepository {
                 finished_at: None,
                 counts: None,
                 error: None,
+                phase: None,
+                total: None,
+                processed: None,
+                active_millis: 0,
+                paused_at: None,
+                paused_millis: 0,
             },
         );
         Ok(())
@@ -2293,6 +2326,19 @@ impl CatalogRunRepository for FakeCatalogRunRepository {
             run.status = RunStatus::Failed;
             run.error = Some(error.to_string());
             run.finished_at = Some(finished_at);
+        }
+        Ok(())
+    }
+
+    async fn record_progress(&self, id: Uuid, progress: &RunProgress) -> Result<(), DomainError> {
+        self.progress_calls.fetch_add(1, Ordering::Relaxed);
+        if self.progress_fails.load(Ordering::Relaxed) {
+            return Err(DomainError::Disk("run store unavailable".into()));
+        }
+        if let Some(run) = self.runs.lock().unwrap().get_mut(&id) {
+            run.phase = Some(progress.phase);
+            run.total = progress.total;
+            run.processed = Some(progress.processed);
         }
         Ok(())
     }
@@ -2573,6 +2619,13 @@ impl CatalogRunRepository for FailingCatalogRunRepository {
         _finished_at: DateTime<Utc>,
     ) -> Result<(), DomainError> {
         unimplemented!("not exercised by either failing-repository test")
+    }
+
+    async fn record_progress(&self, _id: Uuid, _progress: &RunProgress) -> Result<(), DomainError> {
+        // A flush is best-effort, so failing one here would not change what
+        // either failing-repository test observes; succeeding keeps their
+        // subject the write they are actually about.
+        Ok(())
     }
 
     async fn get(&self, _id: Uuid) -> Result<Option<CatalogRun>, DomainError> {

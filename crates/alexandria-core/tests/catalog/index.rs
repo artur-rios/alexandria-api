@@ -11,6 +11,7 @@ use alexandria_core::catalog::fs::Filesystem;
 use alexandria_core::catalog::image_tags::{ImageMetadataReader, ImageTags};
 use alexandria_core::catalog::model::{FileType, FormatKind, SubtypeMetadata};
 use alexandria_core::catalog::repos::CatalogRepository;
+use alexandria_core::catalog::run_registry::{RunPhase, RunRegistry};
 use alexandria_core::catalog::runs::{CatalogRunRepository, RunCounts, RunKind, RunStatus};
 use alexandria_core::catalog::video_tags::{VideoDuration, VideoMetadataReader, VideoTags};
 use alexandria_core::errors::DomainError;
@@ -114,6 +115,54 @@ where
         TEST_CONCURRENCY,
         library_root,
         runs,
+        // Progress goes somewhere no test reads. The tests that do read it
+        // build their handler with [`handler_with_registry`].
+        RunRegistry::new(),
+    )
+}
+
+/// Same as [`handler`], but sharing a registry the test can read live
+/// progress out of (FR-FC-28).
+#[allow(clippy::too_many_arguments)]
+fn handler_with_registry<A, R, F, C, M, N, O, P, Q, RR>(
+    auth: A,
+    repo: R,
+    fs: F,
+    clock: C,
+    audio_tags: M,
+    image_tags: N,
+    document_tags: O,
+    video_tags: P,
+    comic_tags: Q,
+    runs: RR,
+    registry: RunRegistry,
+) -> IndexHandler<A, R, F, C, M, N, O, P, Q, RR>
+where
+    A: AuthService,
+    R: CatalogRepository,
+    F: Filesystem,
+    C: Clock,
+    M: AudioMetadataReader,
+    N: ImageMetadataReader,
+    O: DocumentMetadataReader,
+    P: VideoMetadataReader,
+    Q: ComicMetadataReader,
+    RR: CatalogRunRepository,
+{
+    IndexHandler::new(
+        auth,
+        repo,
+        fs,
+        clock,
+        audio_tags,
+        image_tags,
+        document_tags,
+        video_tags,
+        comic_tags,
+        TEST_CONCURRENCY,
+        String::new(),
+        runs,
+        registry,
     )
 }
 
@@ -436,6 +485,7 @@ async fn given_any_concurrency_when_execute_then_same_counts_and_same_catalog() 
             concurrency,
             String::new(),
             FakeCatalogRunRepository::new(),
+            RunRegistry::new(),
         );
 
         let outcome = handler
@@ -482,6 +532,7 @@ async fn given_zero_concurrency_when_execute_then_runs_sequentially_rather_than_
         0,
         String::new(),
         FakeCatalogRunRepository::new(),
+        RunRegistry::new(),
     );
 
     let outcome = handler
@@ -2167,4 +2218,127 @@ async fn given_a_cataloged_file_and_an_unsupported_one_when_indexed_then_the_two
         "song.txt is already in the catalog"
     );
     assert_eq!(outcome.skipped, 1, "notes.xyz has an unsupported extension");
+}
+
+#[tokio::test]
+async fn given_a_completed_index_when_execute_then_the_final_progress_is_flushed_and_the_cell_closed(
+) {
+    // FR-FC-28: the last thing a run does is publish where it actually
+    // finished, so a read after the cell is gone falls back to the truth
+    // rather than to whatever the last interval flush caught.
+    let fs = FakeFilesystem::builder()
+        .with_file(ROOT, "/library/a.mp3", "a.mp3", "unused")
+        .with_file(ROOT, "/library/b.txt", "b.txt", "unused")
+        .with_file(ROOT, "/library/c.bin", "c.bin", "unused")
+        .build();
+    let runs = FakeCatalogRunRepository::new();
+    let registry = RunRegistry::new();
+    let handler = handler_with_registry(
+        FakeAuth::Allowing,
+        FakeCatalogRepository::new(),
+        fs,
+        fixed_clock(now()),
+        FakeAudioMetadataReader::new(),
+        FakeImageMetadataReader::new(),
+        FakeDocumentMetadataReader::new(),
+        FakeVideoMetadataReader::new(),
+        FakeComicMetadataReader::new(),
+        runs.clone(),
+        registry.clone(),
+    );
+    let run_id = Uuid::new_v4();
+    runs.start(run_id, RunKind::Index, Some(ROOT), now())
+        .await
+        .unwrap();
+
+    handler.execute(ROOT, run_id).await.expect("execute");
+
+    let recorded = runs.get_recorded(run_id).expect("recorded run");
+    assert_eq!(recorded.phase, Some(RunPhase::Processing));
+    assert_eq!(
+        recorded.total,
+        Some(3),
+        "every entry counts toward the total"
+    );
+    assert_eq!(
+        recorded.processed,
+        Some(3),
+        "an unsupported extension is still an entry the run is done with"
+    );
+    assert!(
+        registry.get(run_id).is_none(),
+        "a terminated run must not leave its cell behind"
+    );
+}
+
+#[tokio::test]
+async fn given_a_progress_flush_that_fails_when_execute_then_the_run_still_completes() {
+    // FR-FC-28: the in-memory cell is authoritative, so a failed flush costs
+    // accuracy after a restart, not correctness. Failing the run over it
+    // would throw away work that actually happened.
+    let fs = FakeFilesystem::builder()
+        .with_file(ROOT, "/library/a.mp3", "a.mp3", "unused")
+        .build();
+    let runs = FakeCatalogRunRepository::with_failing_progress();
+    let handler = handler(
+        FakeAuth::Allowing,
+        FakeCatalogRepository::new(),
+        fs,
+        fixed_clock(now()),
+        FakeAudioMetadataReader::new(),
+        FakeImageMetadataReader::new(),
+        FakeDocumentMetadataReader::new(),
+        FakeVideoMetadataReader::new(),
+        FakeComicMetadataReader::new(),
+        runs.clone(),
+    );
+    let run_id = Uuid::new_v4();
+    runs.start(run_id, RunKind::Index, Some(ROOT), now())
+        .await
+        .unwrap();
+
+    let outcome = handler.execute(ROOT, run_id).await.expect("execute");
+
+    assert_eq!(outcome.indexed, 1);
+    assert!(
+        runs.progress_calls() >= 2,
+        "both the phase change and the completion must have been attempted"
+    );
+    let recorded = runs.get_recorded(run_id).expect("recorded run");
+    assert_eq!(
+        recorded.status,
+        RunStatus::Complete,
+        "a failed flush must not fail the run"
+    );
+}
+
+#[tokio::test]
+async fn given_a_run_that_cannot_list_its_root_when_execute_then_the_cell_is_closed() {
+    // The only failure that aborts a run still has to give the cell back.
+    let runs = FakeCatalogRunRepository::new();
+    let registry = RunRegistry::new();
+    let handler = handler_with_registry(
+        FakeAuth::Allowing,
+        FakeCatalogRepository::new(),
+        FailingListFilesystem,
+        fixed_clock(now()),
+        FakeAudioMetadataReader::new(),
+        FakeImageMetadataReader::new(),
+        FakeDocumentMetadataReader::new(),
+        FakeVideoMetadataReader::new(),
+        FakeComicMetadataReader::new(),
+        runs.clone(),
+        registry.clone(),
+    );
+    let run_id = Uuid::new_v4();
+    runs.start(run_id, RunKind::Index, Some(ROOT), now())
+        .await
+        .unwrap();
+
+    handler
+        .execute(ROOT, run_id)
+        .await
+        .expect_err("the walk could not proceed");
+
+    assert!(registry.get(run_id).is_none());
 }

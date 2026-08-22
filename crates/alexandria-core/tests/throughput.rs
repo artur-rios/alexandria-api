@@ -58,6 +58,7 @@ use alexandria_core::catalog::fs::StdFilesystem;
 use alexandria_core::catalog::image_tags::ExifImageMetadataReader;
 use alexandria_core::catalog::queries::browse::{BrowseFilesHandler, FileFilter};
 use alexandria_core::catalog::repos::SqliteCatalogRepository;
+use alexandria_core::catalog::run_registry::RunRegistry;
 use alexandria_core::catalog::runs::SqliteCatalogRunRepository;
 use alexandria_core::catalog::video_tags::FfmpegVideoMetadataReader;
 use alexandria_core::migrate::migrate_database;
@@ -413,6 +414,7 @@ async fn build(
         concurrency,
         String::new(),
         run_repo,
+        RunRegistry::new(),
     );
     (handler, repo)
 }

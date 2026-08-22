@@ -5,6 +5,7 @@ use alexandria_core::catalog::clock::Clock;
 use alexandria_core::catalog::commands::refresh::{RefreshHandler, RefreshStarted};
 use alexandria_core::catalog::fs::Filesystem;
 use alexandria_core::catalog::repos::CatalogRepository;
+use alexandria_core::catalog::run_registry::{RunPhase, RunRegistry};
 use alexandria_core::catalog::runs::{CatalogRunRepository, RunCounts, RunKind, RunStatus};
 use alexandria_core::errors::DomainError;
 
@@ -34,7 +35,17 @@ where
     C: Clock,
     RR: CatalogRunRepository,
 {
-    RefreshHandler::new(auth, repo, fs, clock, TEST_CONCURRENCY, runs)
+    RefreshHandler::new(
+        auth,
+        repo,
+        fs,
+        clock,
+        TEST_CONCURRENCY,
+        runs,
+        // Progress goes somewhere no test reads; the ones that do read it
+        // build the handler with their own registry.
+        RunRegistry::new(),
+    )
 }
 
 #[tokio::test]
@@ -406,6 +417,7 @@ async fn given_any_concurrency_when_execute_then_same_outcome_tallies() {
             fixed_clock(now()),
             concurrency,
             FakeCatalogRunRepository::new(),
+            RunRegistry::new(),
         );
 
         let outcome = handler.execute(Uuid::new_v4()).await.expect("execute");
@@ -438,6 +450,7 @@ async fn given_zero_concurrency_when_execute_then_runs_sequentially_rather_than_
         fixed_clock(now()),
         0,
         FakeCatalogRunRepository::new(),
+        RunRegistry::new(),
     );
 
     let outcome = handler.execute(Uuid::new_v4()).await.expect("execute");
@@ -673,5 +686,79 @@ async fn given_run_cannot_be_started_when_start_then_the_error_propagates() {
     assert!(
         result.is_err(),
         "a run-record open failure must propagate, not hand back a run id"
+    );
+}
+
+#[tokio::test]
+async fn given_a_completed_refresh_when_execute_then_the_final_progress_is_flushed_and_the_cell_closed(
+) {
+    // FR-FC-28: a refresh's discovery is `list_all` rather than a filesystem
+    // walk, but it publishes progress exactly as an index does.
+    let repo = FakeCatalogRepository::new();
+    repo.seed(a_cataloged_file("/library/a.mp3", 8192, Some(now())));
+    // Absent on disk: it is still an entry the run got through, so it counts
+    // toward `processed` like any other.
+    repo.seed(a_cataloged_file("/library/b.mp3", 4096, Some(now())));
+    let fs = FakeFilesystem::builder()
+        .with_stat("/library/a.mp3", 8192, Some(now()))
+        .build();
+    let runs = FakeCatalogRunRepository::new();
+    let registry = RunRegistry::new();
+    let handler = RefreshHandler::new(
+        FakeAuth::Allowing,
+        repo,
+        fs,
+        fixed_clock(now()),
+        TEST_CONCURRENCY,
+        runs.clone(),
+        registry.clone(),
+    );
+    let run_id = Uuid::new_v4();
+    runs.start(run_id, RunKind::Refresh, None, now())
+        .await
+        .unwrap();
+
+    handler.execute(run_id).await.expect("execute");
+
+    let recorded = runs.get_recorded(run_id).expect("recorded run");
+    assert_eq!(recorded.phase, Some(RunPhase::Processing));
+    assert_eq!(recorded.total, Some(2));
+    assert_eq!(recorded.processed, Some(2));
+    assert!(
+        registry.get(run_id).is_none(),
+        "a terminated run must not leave its cell behind"
+    );
+}
+
+#[tokio::test]
+async fn given_a_progress_flush_that_fails_when_execute_then_the_refresh_still_completes() {
+    // A flush is best-effort: the cell is authoritative while the run runs,
+    // so a failed write must not fail the run.
+    let repo = FakeCatalogRepository::new();
+    repo.seed(a_cataloged_file("/library/a.mp3", 8192, Some(now())));
+    let fs = FakeFilesystem::builder()
+        .with_stat("/library/a.mp3", 8192, Some(now()))
+        .build();
+    let runs = FakeCatalogRunRepository::with_failing_progress();
+    let handler = refresh_handler(
+        FakeAuth::Allowing,
+        repo,
+        fs,
+        fixed_clock(now()),
+        runs.clone(),
+    );
+    let run_id = Uuid::new_v4();
+    runs.start(run_id, RunKind::Refresh, None, now())
+        .await
+        .unwrap();
+
+    handler.execute(run_id).await.expect("execute");
+
+    assert!(runs.progress_calls() >= 2);
+    let recorded = runs.get_recorded(run_id).expect("recorded run");
+    assert_eq!(
+        recorded.status,
+        RunStatus::Complete,
+        "a failed flush must not fail the run"
     );
 }

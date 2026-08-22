@@ -8,11 +8,13 @@ use crate::catalog::audio_tags::AudioMetadataReader;
 use crate::catalog::classify::classify_by_extension;
 use crate::catalog::clock::Clock;
 use crate::catalog::comic_tags::ComicMetadataReader;
+use crate::catalog::commands::{flush_progress, PROGRESS_FLUSH_SECONDS};
 use crate::catalog::document_tags::DocumentMetadataReader;
 use crate::catalog::fs::{FileEntry, Filesystem};
 use crate::catalog::image_tags::ImageMetadataReader;
 use crate::catalog::model::{FileType, NewFile};
 use crate::catalog::repos::CatalogRepository;
+use crate::catalog::run_registry::{RunPhase, RunRegistry};
 use crate::catalog::runs::{CatalogRunRepository, RunCounts, RunKind};
 use crate::catalog::video_tags::VideoMetadataReader;
 use crate::errors::DomainError;
@@ -90,6 +92,9 @@ pub struct IndexHandler<A, R, F, C, M, N, O, P, Q, RR> {
     /// leaves indexing unconstrained — the historical behaviour.
     library_root: Option<String>,
     runs: RR,
+    /// Where `execute` publishes this run's live progress (FR-FC-28). Shared
+    /// with `GetRunStatusHandler`, which reads it back.
+    registry: RunRegistry,
 }
 
 /// The client-facing rejection message for FR-FC-26 when the *requested*
@@ -123,6 +128,35 @@ enum EntryOutcome {
     Skipped,
     AlreadyCataloged,
     Failed,
+}
+
+/// What `execute`'s processing loop carries from one entry to the next: the
+/// outcome tally, and when it last flushed progress.
+///
+/// `last_flush` rides along in the fold's accumulator rather than sitting in a
+/// `Cell` outside it because the resulting future has to be `Send` — the
+/// HTTP and FFI layers spawn `execute` onto the runtime — and a shared
+/// `Cell` is not.
+struct IndexTally {
+    indexed: usize,
+    skipped: usize,
+    already_cataloged: usize,
+    failed: usize,
+    last_flush: DateTime<Utc>,
+}
+
+impl IndexTally {
+    /// `started` is when the processing loop began, so the first flush lands
+    /// one interval into the walk rather than on the first entry.
+    fn new(started: DateTime<Utc>) -> Self {
+        Self {
+            indexed: 0,
+            skipped: 0,
+            already_cataloged: 0,
+            failed: 0,
+            last_flush: started,
+        }
+    }
 }
 
 impl<A, R, F, C, M, N, O, P, Q, RR> IndexHandler<A, R, F, C, M, N, O, P, Q, RR>
@@ -162,6 +196,7 @@ where
         concurrency: u32,
         library_root: String,
         runs: RR,
+        registry: RunRegistry,
     ) -> Self {
         let library_root = {
             let trimmed = library_root.trim();
@@ -184,6 +219,7 @@ where
             concurrency: concurrency.max(1) as usize,
             library_root,
             runs,
+            registry,
         }
     }
 
@@ -276,9 +312,15 @@ where
     /// rest of the library. Only a failure to list the root at all aborts.
     pub async fn execute(&self, root: &str, run_id: Uuid) -> Result<IndexOutcome, DomainError> {
         let now = self.clock.now();
+        // FR-FC-28: the run becomes observable here and stops being so at
+        // every one of this function's exits. A fresh cell reads as
+        // `Discovering` with no total, which is exactly where the walk below
+        // starts.
+        let cell = self.registry.open(run_id);
         let entries = match self.fs.list_files(root).await {
             Ok(entries) => entries,
             Err(err) => {
+                self.registry.close(run_id);
                 // FR-FC-27: the walk could not proceed at all — that, and
                 // only that, is a `failed` run.
                 let fail_error = err.to_string();
@@ -298,8 +340,16 @@ where
             }
         };
         let scanned = entries.len();
+        // Discovery is done: the denominator is known, so both halves of the
+        // progress fraction are meaningful from here on. Flushed immediately
+        // rather than waiting out an interval, so a client that reads the row
+        // right after the walk sees the phase it is actually in.
+        let cell = cell.as_ref();
+        cell.set_total(scanned);
+        cell.set_phase(RunPhase::Processing);
+        flush_progress(&self.runs, run_id, &cell.snapshot()).await;
 
-        let (indexed, skipped, already_cataloged, failed) = stream::iter(entries)
+        let tally = stream::iter(entries)
             .map(|entry| async move {
                 let Some(file_type) = classify_by_extension(&entry.name) else {
                     return EntryOutcome::Skipped;
@@ -319,21 +369,45 @@ where
                 }
             })
             .buffer_unordered(self.concurrency)
-            .fold(
-                (0usize, 0usize, 0usize, 0usize),
-                |counts, outcome| async move {
-                    let (indexed, skipped, already_cataloged, failed) = counts;
-                    match outcome {
-                        EntryOutcome::Indexed => (indexed + 1, skipped, already_cataloged, failed),
-                        EntryOutcome::Skipped => (indexed, skipped + 1, already_cataloged, failed),
-                        EntryOutcome::AlreadyCataloged => {
-                            (indexed, skipped, already_cataloged + 1, failed)
-                        }
-                        EntryOutcome::Failed => (indexed, skipped, already_cataloged, failed + 1),
-                    }
-                },
-            )
+            .fold(IndexTally::new(now), |mut tally, outcome| async move {
+                match outcome {
+                    EntryOutcome::Indexed => tally.indexed += 1,
+                    EntryOutcome::Skipped => tally.skipped += 1,
+                    EntryOutcome::AlreadyCataloged => tally.already_cataloged += 1,
+                    EntryOutcome::Failed => tally.failed += 1,
+                }
+                // FR-FC-28: one entry done, whatever it resolved to. A
+                // progress bar that stalled on the skipped and unreadable
+                // files would misreport how far along the run is.
+                cell.advance();
+                // The flush is inline rather than on a timer task of its own:
+                // `execute` is generic over its collaborators, and spawning
+                // would force `Send + 'static` onto every one of them and
+                // leave a task whose lifetime has to be tied back to this
+                // run. Checking the elapsed time here costs one clock read
+                // per entry — nothing beside the file work each entry just
+                // did — and the flushing stops exactly when the loop does.
+                let now = self.clock.now();
+                if (now - tally.last_flush).num_seconds() >= PROGRESS_FLUSH_SECONDS {
+                    flush_progress(&self.runs, run_id, &cell.snapshot()).await;
+                    tally.last_flush = now;
+                }
+                tally
+            })
             .await;
+        let IndexTally {
+            indexed,
+            skipped,
+            already_cataloged,
+            failed,
+            ..
+        } = tally;
+
+        // The run is over: publish the final tally before the cell goes away,
+        // so a read after this point falls back to the true end state rather
+        // than to whatever the last interval flush happened to catch.
+        flush_progress(&self.runs, run_id, &cell.snapshot()).await;
+        self.registry.close(run_id);
 
         tracing::info!(
             %run_id,

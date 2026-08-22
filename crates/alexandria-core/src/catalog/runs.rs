@@ -4,6 +4,7 @@ use sqlx::sqlite::SqlitePool;
 use sqlx::Row;
 use uuid::Uuid;
 
+use crate::catalog::run_registry::{RunPhase, RunProgress};
 use crate::errors::DomainError;
 
 /// Which command produced a run (FR-FC-27). The two share a lifecycle but not
@@ -114,6 +115,35 @@ pub struct CatalogRun {
     pub counts: Option<RunCounts>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Which half of the run is executing (FR-FC-28). `None` for a run that
+    /// never published one — nothing flushed before it stopped.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub phase: Option<RunPhase>,
+    /// How many entries the run has to get through, once discovery has
+    /// counted them. `None` while discovery is still counting.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total: Option<usize>,
+    /// How many entries the run has finished with — indexed, skipped, and
+    /// failed alike. `None` for a run that never published progress.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub processed: Option<usize>,
+    /// How long the run has spent *working*: elapsed wall time (to
+    /// `finished_at`, or to now for a run still going) minus the time it
+    /// spent paused.
+    ///
+    /// Computed by `GetRunStatusHandler`, which holds the clock — a
+    /// repository has no business asking what time it is, and a running run's
+    /// elapsed time is not a stored value. Repository implementations leave
+    /// this at 0.
+    pub active_millis: i64,
+    /// When the run was paused, for a run that is paused right now.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub paused_at: Option<DateTime<Utc>>,
+    /// Total time the run has spent paused. Not serialized: it is the input
+    /// `active_millis` is derived from, and a client holding `activeMillis`
+    /// has no use for it.
+    #[serde(skip)]
+    pub paused_millis: i64,
 }
 
 /// Run records repository port (UC-42). Unit-testable against an in-memory
@@ -152,6 +182,15 @@ pub trait CatalogRunRepository: Send + Sync {
         error: &str,
         finished_at: DateTime<Utc>,
     ) -> Result<(), DomainError>;
+
+    /// Flush a run's live progress into its record (FR-FC-28).
+    ///
+    /// Called periodically while the run executes, not once per entry: the
+    /// in-memory cell is authoritative for a live run, and this write only
+    /// exists so a run this process is no longer executing can still report
+    /// how far it got. A failure is therefore not fatal — see the handlers,
+    /// which log it and carry on.
+    async fn record_progress(&self, id: Uuid, progress: &RunProgress) -> Result<(), DomainError>;
 
     /// One run's record, or `None` for an unknown id (UC-42 AF-01).
     async fn get(&self, id: Uuid) -> Result<Option<CatalogRun>, DomainError>;
@@ -300,10 +339,25 @@ impl CatalogRunRepository for SqliteCatalogRunRepository {
         Ok(())
     }
 
+    async fn record_progress(&self, id: Uuid, progress: &RunProgress) -> Result<(), DomainError> {
+        sqlx::query("UPDATE catalog_runs SET phase = ?, total = ?, processed = ? WHERE id = ?")
+            .bind(progress.phase.as_str())
+            // File counts from a single walk; a library large enough to
+            // overflow `i64` is not reachable, so the narrowing is unchecked
+            // exactly as it is in `finish`.
+            .bind(progress.total.map(|total| total as i64))
+            .bind(progress.processed as i64)
+            .bind(id.to_string())
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     async fn get(&self, id: Uuid) -> Result<Option<CatalogRun>, DomainError> {
         let row = sqlx::query(
             "SELECT kind, status, root, started_at, finished_at, scanned, indexed, \
-             skipped, already_cataloged, refreshed, marked_missing, unchanged, failed, error \
+             skipped, already_cataloged, refreshed, marked_missing, unchanged, failed, error, \
+             phase, total, processed, paused_at, paused_millis \
              FROM catalog_runs WHERE id = ?",
         )
         .bind(id.to_string())
@@ -353,6 +407,19 @@ impl CatalogRunRepository for SqliteCatalogRunRepository {
                 .transpose()?,
         };
 
+        // The last flushed progress (FR-FC-28). A stored `phase` that parses
+        // to nothing is dropped rather than failing the read: progress is a
+        // display field, and refusing to answer at all would be a worse
+        // outcome than answering without it.
+        let phase = row
+            .try_get::<Option<String>, _>("phase")?
+            .as_deref()
+            .and_then(RunPhase::parse);
+        let paused_at = row
+            .try_get::<Option<String>, _>("paused_at")?
+            .map(|raw| parse_time(&raw, "paused_at"))
+            .transpose()?;
+
         Ok(Some(CatalogRun {
             id,
             kind,
@@ -362,6 +429,17 @@ impl CatalogRunRepository for SqliteCatalogRunRepository {
             finished_at,
             counts,
             error: row.try_get("error")?,
+            phase,
+            total: row
+                .try_get::<Option<i64>, _>("total")?
+                .map(|total| total as usize),
+            processed: row
+                .try_get::<Option<i64>, _>("processed")?
+                .map(|processed| processed as usize),
+            // Derived by `GetRunStatusHandler`, which holds the clock.
+            active_millis: 0,
+            paused_at,
+            paused_millis: row.try_get("paused_millis")?,
         }))
     }
 
