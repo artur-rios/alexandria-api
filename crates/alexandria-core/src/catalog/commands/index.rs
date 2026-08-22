@@ -36,6 +36,12 @@ pub struct IndexOutcome {
     pub scanned: usize,
     pub indexed: usize,
     pub skipped: usize,
+    /// Entries whose path was already in the catalog (AF-03) — distinct from
+    /// `skipped`, which is an unsupported extension. Resume re-walks a root
+    /// and re-encounters everything an earlier segment already indexed, so
+    /// without this split a resumed run would report thousands of files as
+    /// `skipped`, a tally that misdescribes what happened.
+    pub already_cataloged: usize,
     /// Entries that could not be indexed because an operation against that one
     /// file failed (unreadable bytes, or a repository write error). The run
     /// continues past them; each is logged at `warn`.
@@ -105,10 +111,17 @@ const LIBRARY_ROOT_UNRESOLVABLE: &str =
 
 /// What one scanned entry resolved to. Returned by the per-entry future so
 /// the concurrent walk can tally outcomes without sharing a counter.
+///
+/// `Skipped` and `AlreadyCataloged` are two different facts and were one
+/// counter until resume existed. A resumed run re-walks and re-skips
+/// everything a previous segment indexed, so folding the two together made a
+/// resumed run report thousands of files as "skipped" — a tally that
+/// misdescribes what happened.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EntryOutcome {
     Indexed,
     Skipped,
+    AlreadyCataloged,
     Failed,
 }
 
@@ -286,15 +299,14 @@ where
         };
         let scanned = entries.len();
 
-        let (indexed, skipped, failed) = stream::iter(entries)
+        let (indexed, skipped, already_cataloged, failed) = stream::iter(entries)
             .map(|entry| async move {
                 let Some(file_type) = classify_by_extension(&entry.name) else {
                     return EntryOutcome::Skipped;
                 };
                 let path = entry.path.clone();
                 match self.index_entry(entry, file_type, now).await {
-                    Ok(true) => EntryOutcome::Indexed,
-                    Ok(false) => EntryOutcome::Skipped,
+                    Ok(outcome) => outcome,
                     Err(err) => {
                         tracing::warn!(
                             %run_id,
@@ -307,17 +319,31 @@ where
                 }
             })
             .buffer_unordered(self.concurrency)
-            .fold((0usize, 0usize, 0usize), |counts, outcome| async move {
-                let (indexed, skipped, failed) = counts;
-                match outcome {
-                    EntryOutcome::Indexed => (indexed + 1, skipped, failed),
-                    EntryOutcome::Skipped => (indexed, skipped + 1, failed),
-                    EntryOutcome::Failed => (indexed, skipped, failed + 1),
-                }
-            })
+            .fold(
+                (0usize, 0usize, 0usize, 0usize),
+                |counts, outcome| async move {
+                    let (indexed, skipped, already_cataloged, failed) = counts;
+                    match outcome {
+                        EntryOutcome::Indexed => (indexed + 1, skipped, already_cataloged, failed),
+                        EntryOutcome::Skipped => (indexed, skipped + 1, already_cataloged, failed),
+                        EntryOutcome::AlreadyCataloged => {
+                            (indexed, skipped, already_cataloged + 1, failed)
+                        }
+                        EntryOutcome::Failed => (indexed, skipped, already_cataloged, failed + 1),
+                    }
+                },
+            )
             .await;
 
-        tracing::info!(%run_id, scanned, indexed, skipped, failed, "indexing complete");
+        tracing::info!(
+            %run_id,
+            scanned,
+            indexed,
+            skipped,
+            already_cataloged,
+            failed,
+            "indexing complete"
+        );
         // FR-FC-27: the walk finished. Per-file failures are inside the
         // tally and do not make the run failed.
         let finished_at = self.clock.now();
@@ -325,6 +351,7 @@ where
             scanned,
             indexed,
             skipped,
+            already_cataloged,
             failed,
         };
         if let Err(err) = retry_on_busy(BUSY_ATTEMPTS, || {
@@ -344,13 +371,18 @@ where
             scanned,
             indexed,
             skipped,
+            already_cataloged,
             failed,
         })
     }
 
-    /// Index one already-classified entry. `Ok(true)` means a record was
-    /// created, `Ok(false)` that the path was already cataloged (AF-03), and
-    /// `Err` that this one file failed — the caller counts it and moves on.
+    /// Index one already-classified entry. `Ok(EntryOutcome::Indexed)` means a
+    /// record was created, `Ok(EntryOutcome::AlreadyCataloged)` that the path
+    /// was already in the catalog (AF-03), and `Err` that this one file
+    /// failed — the caller counts it and moves on. Never returns
+    /// `EntryOutcome::Skipped`: that outcome belongs to `execute`'s
+    /// classification branch, which never calls this method for an
+    /// unsupported extension.
     ///
     /// The `insert_file` write is wrapped in [`retry_on_busy`]: with several
     /// files in flight and a client reading throughout, a loaded machine can
@@ -361,9 +393,9 @@ where
         entry: FileEntry,
         file_type: FileType,
         now: DateTime<Utc>,
-    ) -> Result<bool, DomainError> {
+    ) -> Result<EntryOutcome, DomainError> {
         if self.repo.find_by_path(&entry.path).await?.is_some() {
-            return Ok(false);
+            return Ok(EntryOutcome::AlreadyCataloged);
         }
         let new_file = NewFile {
             uuid: Uuid::new_v4(),
@@ -570,6 +602,6 @@ where
                 }
             }
         }
-        Ok(true)
+        Ok(EntryOutcome::Indexed)
     }
 }

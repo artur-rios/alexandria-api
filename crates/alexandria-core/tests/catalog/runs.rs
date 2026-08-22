@@ -54,9 +54,10 @@ async fn given_a_running_index_run_when_finished_then_it_is_complete_with_its_co
     repo.finish(
         id,
         RunCounts::Index {
-            scanned: 10,
+            scanned: 13,
             indexed: 7,
             skipped: 2,
+            already_cataloged: 3,
             failed: 1,
         },
         t(2),
@@ -70,9 +71,10 @@ async fn given_a_running_index_run_when_finished_then_it_is_complete_with_its_co
     assert_eq!(
         run.counts,
         Some(RunCounts::Index {
-            scanned: 10,
+            scanned: 13,
             indexed: 7,
             skipped: 2,
+            already_cataloged: 3,
             failed: 1
         })
     );
@@ -280,6 +282,7 @@ async fn given_a_refresh_run_when_finished_with_index_counts_then_error_and_row_
                 scanned: 1,
                 indexed: 1,
                 skipped: 0,
+                already_cataloged: 0,
                 failed: 0,
             },
             t(2),
@@ -322,6 +325,7 @@ async fn given_a_running_index_run_when_serialized_then_only_running_fields_pres
     assert!(value.get("scanned").is_none());
     assert!(value.get("indexed").is_none());
     assert!(value.get("skipped").is_none());
+    assert!(value.get("alreadyCataloged").is_none());
     assert!(value.get("failed").is_none());
     assert!(value.get("error").is_none());
 }
@@ -357,6 +361,7 @@ async fn given_a_completed_refresh_run_when_serialized_then_counts_are_flattened
     assert!(value.get("scanned").is_none());
     assert!(value.get("indexed").is_none());
     assert!(value.get("skipped").is_none());
+    assert!(value.get("alreadyCataloged").is_none());
     assert!(value.get("root").is_none(), "a refresh has no root");
     assert!(value.get("error").is_none());
 }
@@ -372,9 +377,10 @@ async fn given_a_completed_index_run_when_serialized_then_counts_and_root_are_fl
     repo.finish(
         id,
         RunCounts::Index {
-            scanned: 10,
+            scanned: 13,
             indexed: 7,
             skipped: 2,
+            already_cataloged: 3,
             failed: 1,
         },
         t(2),
@@ -386,9 +392,13 @@ async fn given_a_completed_index_run_when_serialized_then_counts_and_root_are_fl
     let value = serde_json::to_value(&run).expect("serialize");
 
     assert_eq!(value.get("root").and_then(|v| v.as_str()), Some("/library"));
-    assert_eq!(value.get("scanned").and_then(|v| v.as_u64()), Some(10));
+    assert_eq!(value.get("scanned").and_then(|v| v.as_u64()), Some(13));
     assert_eq!(value.get("indexed").and_then(|v| v.as_u64()), Some(7));
     assert_eq!(value.get("skipped").and_then(|v| v.as_u64()), Some(2));
+    assert_eq!(
+        value.get("alreadyCataloged").and_then(|v| v.as_u64()),
+        Some(3)
+    );
     assert_eq!(value.get("failed").and_then(|v| v.as_u64()), Some(1));
     assert!(value.get("finishedAt").is_some());
     // Refresh-only count keys must be absent, not sent as null.
@@ -424,6 +434,7 @@ async fn given_a_failed_run_when_serialized_then_error_present_and_no_counts() {
     assert!(value.get("scanned").is_none());
     assert!(value.get("indexed").is_none());
     assert!(value.get("skipped").is_none());
+    assert!(value.get("alreadyCataloged").is_none());
     assert!(
         value.get("failed").is_none(),
         "no failed-count key on a run with no tally"

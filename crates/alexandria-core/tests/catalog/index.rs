@@ -222,7 +222,7 @@ async fn given_unauthenticated_when_start_then_unauthorized() {
 }
 
 #[tokio::test]
-async fn given_already_cataloged_path_when_execute_then_skipped_no_duplicate() {
+async fn given_already_cataloged_path_when_execute_then_already_cataloged_no_duplicate() {
     let existing_path = "/library/a.mp3";
     let fs = FakeFilesystem::builder()
         .with_file(ROOT, existing_path, "a.mp3", "h-a")
@@ -256,7 +256,11 @@ async fn given_already_cataloged_path_when_execute_then_skipped_no_duplicate() {
         outcome.indexed, 1,
         "the already-cataloged path must be skipped"
     );
-    assert_eq!(outcome.skipped, 1);
+    assert_eq!(
+        outcome.already_cataloged, 1,
+        "the existing path is already in the catalog, not an unsupported extension"
+    );
+    assert_eq!(outcome.skipped, 0);
     assert_eq!(
         repo_handle.count(),
         2,
@@ -1983,6 +1987,7 @@ async fn given_an_index_that_walks_when_executed_then_the_run_is_recorded_comple
             scanned: outcome.scanned,
             indexed: outcome.indexed,
             skipped: outcome.skipped,
+            already_cataloged: outcome.already_cataloged,
             failed: outcome.failed,
         }),
         "the recorded tally is the outcome the walk computed"
@@ -2119,4 +2124,47 @@ async fn given_run_completion_cannot_be_recorded_when_executed_then_the_outcome_
     assert_eq!(outcome.indexed, 2);
     assert_eq!(outcome.skipped, 0);
     assert_eq!(outcome.failed, 0);
+}
+
+#[tokio::test]
+async fn given_a_cataloged_file_and_an_unsupported_one_when_indexed_then_the_two_are_counted_apart()
+{
+    let fs = FakeFilesystem::builder()
+        .with_root(ROOT)
+        .with_file(ROOT, "/library/song.txt", "song.txt", "hash-1")
+        .with_file(ROOT, "/library/notes.xyz", "notes.xyz", "hash-2")
+        .build();
+    let handler = handler(
+        FakeAuth::Allowing,
+        FakeCatalogRepository::new(),
+        fs,
+        fixed_clock(now()),
+        FakeAudioMetadataReader::new(),
+        FakeImageMetadataReader::new(),
+        FakeDocumentMetadataReader::new(),
+        FakeVideoMetadataReader::new(),
+        FakeComicMetadataReader::new(),
+        FakeCatalogRunRepository::new(),
+    );
+
+    // Index once so song.txt is already cataloged, then again over the same
+    // root — which is exactly what resume does.
+    let IndexStarted { run_id } = handler
+        .start(IndexRequest { root: ROOT.into() }, TOKEN)
+        .await
+        .unwrap();
+    handler.execute(ROOT, run_id).await.unwrap();
+
+    let IndexStarted { run_id } = handler
+        .start(IndexRequest { root: ROOT.into() }, TOKEN)
+        .await
+        .unwrap();
+    let outcome = handler.execute(ROOT, run_id).await.unwrap();
+
+    assert_eq!(outcome.indexed, 0);
+    assert_eq!(
+        outcome.already_cataloged, 1,
+        "song.txt is already in the catalog"
+    );
+    assert_eq!(outcome.skipped, 1, "notes.xyz has an unsupported extension");
 }

@@ -81,6 +81,7 @@ pub enum RunCounts {
         scanned: usize,
         indexed: usize,
         skipped: usize,
+        already_cataloged: usize,
         failed: usize,
     },
     #[serde(rename_all = "camelCase")]
@@ -244,10 +245,12 @@ impl CatalogRunRepository for SqliteCatalogRunRepository {
                 scanned,
                 indexed,
                 skipped,
+                already_cataloged,
                 failed,
             } => sqlx::query(
                 "UPDATE catalog_runs SET status = ?, finished_at = ?, \
-                 scanned = ?, indexed = ?, skipped = ?, failed = ? WHERE id = ?",
+                 scanned = ?, indexed = ?, skipped = ?, already_cataloged = ?, failed = ? \
+                 WHERE id = ?",
             )
             .bind(RunStatus::Complete.as_str())
             .bind(finished_at.to_rfc3339())
@@ -257,6 +260,7 @@ impl CatalogRunRepository for SqliteCatalogRunRepository {
             .bind(scanned as i64)
             .bind(indexed as i64)
             .bind(skipped as i64)
+            .bind(already_cataloged as i64)
             .bind(failed as i64)
             .bind(id.to_string()),
             RunCounts::Refresh {
@@ -299,7 +303,7 @@ impl CatalogRunRepository for SqliteCatalogRunRepository {
     async fn get(&self, id: Uuid) -> Result<Option<CatalogRun>, DomainError> {
         let row = sqlx::query(
             "SELECT kind, status, root, started_at, finished_at, scanned, indexed, \
-             skipped, refreshed, marked_missing, unchanged, failed, error \
+             skipped, already_cataloged, refreshed, marked_missing, unchanged, failed, error \
              FROM catalog_runs WHERE id = ?",
         )
         .bind(id.to_string())
@@ -331,6 +335,7 @@ impl CatalogRunRepository for SqliteCatalogRunRepository {
                         scanned: scanned as usize,
                         indexed: row.try_get::<i64, _>("indexed")? as usize,
                         skipped: row.try_get::<i64, _>("skipped")? as usize,
+                        already_cataloged: row.try_get::<i64, _>("already_cataloged")? as usize,
                         failed: row.try_get::<i64, _>("failed")? as usize,
                     })
                 })

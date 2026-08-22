@@ -16,6 +16,7 @@ CREATE TABLE IF NOT EXISTS catalog_runs (
     scanned         INTEGER,
     indexed         INTEGER,
     skipped         INTEGER,
+    already_cataloged INTEGER,
     refreshed       INTEGER,
     marked_missing  INTEGER,
     unchanged       INTEGER,
