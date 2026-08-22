@@ -344,10 +344,17 @@ impl DiskThumbnailCache {
         Self { root }
     }
 
-    /// The cache key is a hex content hash plus a number, so it is always a
-    /// safe filename — no path separators can appear in it.
+    /// An RFC 3339 mtime (part of the cache key) carries `:`, which Windows
+    /// refuses in a path component. `_` is not itself part of the key
+    /// alphabet (uuids are hex and hyphens, timestamps are digits, `T`, `.`,
+    /// `+`, `-`, and `:`), so substituting it cannot make two distinct keys
+    /// collide.
+    fn sanitize(key: &str) -> String {
+        key.replace(':', "_")
+    }
+
     fn path_for(&self, key: &str) -> std::path::PathBuf {
-        std::path::Path::new(&self.root).join(format!("{key}.jpg"))
+        std::path::Path::new(&self.root).join(format!("{}.jpg", Self::sanitize(key)))
     }
 
     /// A scratch path in the *same* directory as the target, so the rename
@@ -357,7 +364,11 @@ impl DiskThumbnailCache {
     fn temp_path_for(&self, key: &str) -> std::path::PathBuf {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        std::path::Path::new(&self.root).join(format!("{key}.{}.{n}.tmp", std::process::id()))
+        std::path::Path::new(&self.root).join(format!(
+            "{}.{}.{n}.tmp",
+            Self::sanitize(key),
+            std::process::id()
+        ))
     }
 }
 
