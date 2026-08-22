@@ -16,6 +16,7 @@ use alexandria_core::migrate::migrate_database;
 use alexandria_core::services::{self, Services};
 use sqlx::sqlite::SqlitePool;
 use tempfile::TempDir;
+use tower::ServiceExt;
 
 pub struct TestApp {
     pub services: std::sync::Arc<Services>,
@@ -127,6 +128,50 @@ pub async fn file_rows_with_missing(
     .fetch_all(pool)
     .await
     .expect("rows")
+}
+
+/// Poll `GET /v1/index/runs/{runId}` (UC-42) until the run leaves `running`,
+/// then return its parsed body.
+///
+/// `RefreshHandler::refresh_one` processes cataloged paths concurrently, so
+/// polling an individual row (or a raw missing-count) says nothing about
+/// whether the *other* path's write has landed yet. The run record's own
+/// `complete` status is the real signal that the whole walk — every path,
+/// not just whichever one happened to finish first — is done, which is what
+/// `catalog_api.rs`'s and `run_status_api.rs`'s refresh tests actually need
+/// to wait on before reading final row state or a run's tally.
+pub async fn wait_for_run_terminal(
+    services: &std::sync::Arc<Services>,
+    run_id: &str,
+    token: &str,
+) -> serde_json::Value {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let request = axum::http::Request::builder()
+            .method("GET")
+            .uri(format!("/v1/index/runs/{run_id}"))
+            .header("authorization", format!("Bearer {token}"))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let response = alexandria_http::app(Settings::default(), services.clone())
+            .oneshot(request)
+            .await
+            .expect("run status oneshot");
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        if body["status"] != "running" {
+            return body;
+        }
+        if std::time::Instant::now() > deadline {
+            panic!("run {run_id} never left running");
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
 }
 
 pub fn write_file(dir: &tempfile::TempDir, name: &str, contents: &[u8]) -> std::path::PathBuf {

@@ -8,7 +8,6 @@ use alexandria_http::app;
 use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
 use serde_json::Value;
-use sha2::Digest;
 use tower::ServiceExt;
 
 use crate::common::{file_rows_with_missing, test_app, wait_for_files, write_file, TEST_TOKEN};
@@ -103,10 +102,15 @@ async fn given_a_started_run_when_polled_to_completion_then_it_reports_complete_
     assert_eq!(run["kind"], "refresh");
     assert_eq!(run["status"], "complete");
     assert!(run["finishedAt"].is_string());
-    // A completed refresh carries its four counts and no index counts.
-    for field in ["refreshed", "markedMissing", "unchanged", "failed"] {
-        assert!(run[field].is_number(), "missing {field}: {run}");
-    }
+    // A completed refresh carries its four counts and no index counts. Task
+    // 4 made re-index compare `stat` (size + mtime) rather than a recomputed
+    // hash — a's changed size is what `refreshed` counts here, not a hash
+    // difference — so the exact tally is asserted, not just that the fields
+    // are present.
+    assert_eq!(run["refreshed"], 1, "a's changed size is detected via stat");
+    assert_eq!(run["markedMissing"], 1);
+    assert_eq!(run["unchanged"], 0);
+    assert_eq!(run["failed"], 0);
     let obj = run.as_object().expect("response body is a JSON object");
     assert!(
         !obj.contains_key("scanned"),
@@ -120,9 +124,13 @@ async fn given_a_started_run_when_polled_to_completion_then_it_reports_complete_
     // The assertion `complete` exists to make possible: the catalog rows are
     // fully settled, not just some of them. `RefreshHandler::refresh_one`
     // processes cataloged paths concurrently, so a status of `complete` must
-    // mean *both* halves of the refresh landed — the re-hash of the changed
-    // file and the missing marker for the deleted one — not just whichever
-    // half happened to finish first.
+    // mean *both* halves of the refresh landed — a's stat-detected change and
+    // b's missing marker — not just whichever half happened to finish first.
+    //
+    // Task 3 stopped indexing from computing a hash at all, and Task 4's
+    // refresh never computes a new one either: a detected change clears
+    // `content_hash` rather than replacing it (FR-FC-10), so a.mp3's hash
+    // here is asserted empty, not equal to some freshly recomputed SHA-256.
     let rows = file_rows_with_missing(&test.pool).await;
     let by_name: std::collections::BTreeMap<String, (String, Option<String>)> = rows
         .into_iter()
@@ -130,16 +138,10 @@ async fn given_a_started_run_when_polled_to_completion_then_it_reports_complete_
         .collect();
     let (a_hash, a_missing) = by_name.get("a.mp3").expect("a.mp3 row");
     assert!(a_missing.is_none(), "a.mp3 is still on disk");
-    let expected_a_hash = {
-        let digest = sha2::Sha256::digest(b"audio-v2-CHANGED");
-        let mut hex = String::with_capacity(digest.len() * 2);
-        for byte in digest {
-            use std::fmt::Write;
-            let _ = write!(hex, "{byte:02x}");
-        }
-        hex
-    };
-    assert_eq!(a_hash, &expected_a_hash, "a.mp3 must carry its new hash");
+    assert!(
+        a_hash.is_empty(),
+        "refresh clears the hash rather than recomputing one"
+    );
     let (_, b_missing) = by_name.get("b.md").expect("b.md row");
     assert!(b_missing.is_some(), "b.md must carry a missing marker");
 }

@@ -18,12 +18,23 @@ use crate::errors::DomainError;
 /// After a successful write it recomputes the SHA-256 hash from the bytes
 /// actually on disk and compares it against the hash of the submitted
 /// content; a mismatch triggers exactly one retry before surfacing an
-/// integrity error (AF-03). Only once the hash is confirmed does it update
-/// the catalog's `content_hash`/`indexed_at` (FR-TX-03) and return the
+/// integrity error (AF-03). Only once the hash is confirmed does it stat the
+/// file it just wrote and update the catalog's `content_hash`/`size_bytes`/
+/// `mtime`/`indexed_at` (FR-TX-03) via `refresh_hash`, then return the
 /// refreshed record. This post-write `refresh_hash` is the only writer of
 /// `content_hash` left after Task 3: indexing never computes one (FR-FC-09),
 /// so a file's `content_hash` is `None` until — and unless — this handler
 /// edits it; that is expected, not a gap.
+///
+/// The write also changes the file's size and mtime, so `refresh_hash`
+/// records those too (Task 4 correction) — not just the hash. Re-index (Task
+/// 4's `RefreshHandler`) now decides "changed?" purely from stat, never from
+/// bytes; if this handler only updated `content_hash` and left the row's
+/// stale size/mtime behind, the very next re-index would see a stat
+/// mismatch, count this unedited-since file as changed, and null out the
+/// hash just verified above. The stat is read via the same `Filesystem::stat`
+/// re-index uses (Task 4), rather than introducing a second way to answer
+/// "what are this file's stats" that could drift from it.
 ///
 /// Generic over auth, catalog repository, filesystem, and clock so the same
 /// decision logic is unit-tested against trait fakes (no real DB, fs, or
@@ -103,9 +114,25 @@ where
             }
         }
 
+        // Read back the stat of the bytes just verified above, so the
+        // catalog's size/mtime move together with the hash they describe
+        // (Task 4 correction — see the doc comment above).
+        let stat = self.fs.stat(&file.path).await?.ok_or_else(|| {
+            DomainError::disk(format!(
+                "{} vanished immediately after being written",
+                file.path
+            ))
+        })?;
+
         let now = self.clock.now();
         self.repo
-            .refresh_hash(&file.path, &actual_hash, now)
+            .refresh_hash(
+                &file.path,
+                &actual_hash,
+                stat.size_bytes,
+                stat.modified_at,
+                now,
+            )
             .await?;
 
         self.repo

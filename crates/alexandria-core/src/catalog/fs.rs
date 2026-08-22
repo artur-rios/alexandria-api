@@ -48,6 +48,14 @@ pub struct FileEntry {
     pub modified_at: Option<DateTime<Utc>>,
 }
 
+/// One file's change signal (FR-FC-10). `None` from `stat` means the file is
+/// not there at all, which is UC-02 AF-01's "marked missing".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileStat {
+    pub size_bytes: i64,
+    pub modified_at: Option<DateTime<Utc>>,
+}
+
 /// Filesystem port — the indexer's view of the on-disk store. The real
 /// implementation walks the tree and streams bytes through SHA-256; unit
 /// tests substitute an in-memory fake returning canned entries and hashes
@@ -57,6 +65,13 @@ pub trait Filesystem: Send + Sync {
     async fn path_exists(&self, root: &str) -> bool;
     async fn list_files(&self, root: &str) -> Result<Vec<FileEntry>, DomainError>;
     async fn content_hash(&self, path: &str) -> Result<String, DomainError>;
+    /// The file's size and modification time, or `None` when it is gone
+    /// (UC-02 AF-01). One `stat` syscall — this is what replaced reading and
+    /// hashing every byte to answer "did this change?" (Task 4). Also used
+    /// by UC-33's post-write refresh (`EditTextFileContentHandler`) to record
+    /// the new size/mtime alongside the hash it just verified, so the very
+    /// next re-index sees them match and does not clobber a hash it stored.
+    async fn stat(&self, path: &str) -> Result<Option<FileStat>, DomainError>;
     /// Rename `from` to `to` on disk (UC-05 / FR-FC-19). Atomic on a single
     /// volume; fails with `Disk` when the source is missing, the parent
     /// directory is not writable, or the target already exists (the latter is
@@ -209,6 +224,19 @@ impl Filesystem for StdFilesystem {
     async fn content_hash(&self, path: &str) -> Result<String, DomainError> {
         let path = path.to_string();
         blocking(move || hash_file_blocking(&path)).await
+    }
+
+    async fn stat(&self, path: &str) -> Result<Option<FileStat>, DomainError> {
+        let path = path.to_string();
+        blocking(move || match std::fs::metadata(&path) {
+            Ok(metadata) => Ok(Some(FileStat {
+                size_bytes: metadata.len() as i64,
+                modified_at: metadata.modified().ok().map(DateTime::<Utc>::from),
+            })),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(err) => Err(DomainError::disk(format!("stat {path:?}: {err}"))),
+        })
+        .await
     }
 
     async fn rename(&self, from: &str, to: &str) -> Result<(), DomainError> {

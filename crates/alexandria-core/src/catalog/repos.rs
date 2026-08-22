@@ -19,12 +19,34 @@ pub trait CatalogRepository: Send + Sync {
     async fn insert_file(&self, new_file: NewFile) -> Result<File, DomainError>;
     /// Every cataloged record (UC-02 re-index iterates these).
     async fn list_all(&self) -> Result<Vec<File>, DomainError>;
-    /// Refresh a file's content hash + `indexed_at` and clear the missing marker
-    /// (the on-disk file returned / is present). `state`/`deleted_at` untouched.
+    /// Refresh a file's content hash, size, and mtime + `indexed_at`, and
+    /// clear the missing marker. **UC-33's writer only**
+    /// (`EditTextFileContentHandler`) — a text edit changes the file's bytes,
+    /// size, *and* mtime all at once. Recording only the hash and not the new
+    /// size/mtime would leave the row's stats stale, so the very next
+    /// re-index would see a stat mismatch, treat the file as changed, and
+    /// null out the hash this call just verified and stored (see
+    /// `refresh_stat` below, which is what re-index calls). `state` /
+    /// `deleted_at` untouched.
     async fn refresh_hash(
         &self,
         path: &str,
         content_hash: &str,
+        size_bytes: i64,
+        mtime: Option<DateTime<Utc>>,
+        indexed_at: DateTime<Utc>,
+    ) -> Result<(), DomainError>;
+    /// Refresh a file's size and mtime + `indexed_at`, clear its (now stale)
+    /// `content_hash`, and clear the missing marker. **UC-02's writer only**
+    /// (`RefreshHandler`) — re-index compares stat, not bytes (Task 4 /
+    /// FR-FC-10), so it never has a fresh hash to record; the recorded one
+    /// described bytes that changed, so it is nulled rather than left to be
+    /// served as current. `state` / `deleted_at` untouched.
+    async fn refresh_stat(
+        &self,
+        path: &str,
+        size_bytes: i64,
+        mtime: Option<DateTime<Utc>>,
         indexed_at: DateTime<Utc>,
     ) -> Result<(), DomainError>;
     /// Mark a cataloged path's disk file as gone (UC-02 AF-01). Sets
@@ -376,13 +398,37 @@ impl CatalogRepository for SqliteCatalogRepository {
         &self,
         path: &str,
         content_hash: &str,
+        size_bytes: i64,
+        mtime: Option<DateTime<Utc>>,
         indexed_at: DateTime<Utc>,
     ) -> Result<(), DomainError> {
         sqlx::query(
-            "UPDATE files SET content_hash = ?, indexed_at = ?, missing_at = NULL \
-             WHERE path = ?",
+            "UPDATE files SET content_hash = ?, size_bytes = ?, mtime = ?, \
+             indexed_at = ?, missing_at = NULL WHERE path = ?",
         )
         .bind(content_hash)
+        .bind(size_bytes)
+        .bind(mtime.map(|t| t.to_rfc3339()))
+        .bind(indexed_at.to_rfc3339())
+        .bind(path)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn refresh_stat(
+        &self,
+        path: &str,
+        size_bytes: i64,
+        mtime: Option<DateTime<Utc>>,
+        indexed_at: DateTime<Utc>,
+    ) -> Result<(), DomainError> {
+        sqlx::query(
+            "UPDATE files SET size_bytes = ?, mtime = ?, content_hash = NULL, \
+             indexed_at = ?, missing_at = NULL WHERE path = ?",
+        )
+        .bind(size_bytes)
+        .bind(mtime.map(|t| t.to_rfc3339()))
         .bind(indexed_at.to_rfc3339())
         .bind(path)
         .execute(&self.pool)

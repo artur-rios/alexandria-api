@@ -39,17 +39,24 @@ pub struct RefreshOutcome {
 ///
 /// `start` authenticates the caller and returns a fresh run id immediately;
 /// `execute` iterates every cataloged path (no tree walk — discovery of *new*
-/// files is UC-01's job), recomputes each present file's SHA-256, and:
-///   * refreshes hash + `indexed_at` (clearing `missing_at`) when the hash
-///     changed or the file returned to disk after being marked missing
-///     (FR-FC-10), and
+/// files is UC-01's job), stats each present file, and:
+///   * refreshes size/mtime + `indexed_at` (clearing `content_hash` and
+///     `missing_at`) when the stat changed or the file returned to disk after
+///     being marked missing (FR-FC-10), and
 ///   * marks `missing_at` (leaving `state` untouched — soft-delete is UC-06)
 ///     when the on-disk file is gone (FR-FC-11 / AF-01).
 ///
+/// Task 4 replaced the SHA-256 comparison this used to make with a single
+/// `stat` call: cost used to scale with the library's total *size* (every
+/// byte of every file, every run); now it scales with its file *count* (one
+/// syscall per file). A cataloged file's `content_hash` is `None` unless
+/// UC-33 has edited it — refresh never restores it, since it never reads
+/// bytes to compute one.
+///
 /// Like `IndexHandler`, `execute` processes up to `concurrency` cataloged
 /// paths at a time (`indexing.concurrency`, the same setting — a re-index is
-/// the same hash-every-file workload as an index, so splitting the two knobs
-/// would only invite them to disagree).
+/// the same one-stat-per-file workload as an index, so splitting the two
+/// knobs would only invite them to disagree).
 ///
 /// Generic over collaborators so the decision logic is unit-tested against
 /// trait fakes with no real DB / filesystem / auth service (Testing Spec §6.2).
@@ -228,32 +235,33 @@ where
         file: &File,
         now: DateTime<Utc>,
     ) -> Result<PathOutcome, DomainError> {
-        if self.fs.path_exists(&file.path).await {
-            let new_hash = self.fs.content_hash(&file.path).await?;
-            // Task 3 made `content_hash` nullable and stopped indexing from
-            // computing it, so `file.content_hash` is `Some` only for a file
-            // UC-33 has edited. `None` means "unknown", which must count as
-            // changed — treating it as equal-to-anything would let a freshly
-            // indexed file's real hash go unrecorded forever, since refresh
-            // is the only other path that still hashes (until Task 4 stops
-            // that too).
-            if file.content_hash.as_deref() != Some(new_hash.as_str()) || file.missing_at.is_some()
-            {
-                retry_on_busy(BUSY_ATTEMPTS, || {
-                    self.repo.refresh_hash(&file.path, &new_hash, now)
-                })
-                .await?;
-                Ok(PathOutcome::Refreshed)
+        let Some(stat) = self.fs.stat(&file.path).await? else {
+            // UC-02 AF-01 / FR-FC-11: the on-disk file is gone.
+            return if file.missing_at.is_none() {
+                retry_on_busy(BUSY_ATTEMPTS, || self.repo.mark_missing(&file.path, now)).await?;
+                Ok(PathOutcome::MarkedMissing)
             } else {
+                // Already marked missing and still gone — leave as-is.
                 Ok(PathOutcome::Unchanged)
-            }
-        } else if file.missing_at.is_none() {
-            retry_on_busy(BUSY_ATTEMPTS, || self.repo.mark_missing(&file.path, now)).await?;
-            Ok(PathOutcome::MarkedMissing)
-        } else {
-            // Already marked missing and still gone — leave as-is.
-            Ok(PathOutcome::Unchanged)
+            };
+        };
+
+        // FR-FC-10: size and mtime are the change signal — no bytes read. A
+        // file that returned to disk while marked missing is refreshed even
+        // when its stats match, because `missing_at` has to be cleared.
+        let unchanged = file.size_bytes == Some(stat.size_bytes)
+            && file.mtime == stat.modified_at
+            && file.missing_at.is_none();
+        if unchanged {
+            return Ok(PathOutcome::Unchanged);
         }
+
+        retry_on_busy(BUSY_ATTEMPTS, || {
+            self.repo
+                .refresh_stat(&file.path, stat.size_bytes, stat.modified_at, now)
+        })
+        .await?;
+        Ok(PathOutcome::Refreshed)
     }
 }
 

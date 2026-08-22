@@ -46,7 +46,7 @@ use alexandria_ffi::{
     alexandria_file_rename, alexandria_file_restore, alexandria_file_soft_delete,
     alexandria_free_string, alexandria_index_count_files, alexandria_index_count_missing,
     alexandria_index_files_json, alexandria_index_init, alexandria_index_refresh_start,
-    alexandria_index_start, FileMetadataResult, IndexStartResult,
+    alexandria_index_run_status_json, alexandria_index_start, FileMetadataResult, IndexStartResult,
 };
 
 const STATUS_OK: i32 = alexandria_ffi::INDEX_OK;
@@ -342,33 +342,42 @@ fn files_json_value() -> serde_json::Value {
     serde_json::from_str(&json).unwrap()
 }
 
-/// Wait until the file named `name` carries a hash other than `was`.
+/// Poll `alexandria_index_run_status_json` until `run_id` leaves `running`,
+/// then return its parsed body (UC-42 / FR-FC-27/28).
 ///
-/// A refresh walks the catalog with several writers at once, so one path
-/// finishing says nothing about another: waiting for the deleted file to be
-/// marked missing does not mean the changed file has been re-hashed yet. Under
-/// a loaded machine — a full `cargo test --workspace`, where every test binary
-/// runs at once — reading the hash straight after the missing count is a race,
-/// and this is the condition the assertion actually depends on.
-fn wait_for_rehash(name: &str, was: &str) -> String {
+/// A refresh walks the catalog with several writers at once, so the missing
+/// count landing says nothing about whether the run record itself has been
+/// closed out with its final tally yet — the assertions here need the
+/// *finished* run's `refreshed`/`markedMissing` counts, not just the
+/// individual row effects, so they poll the run record directly rather than
+/// racing it via `files_json_value()`.
+fn wait_for_run_terminal(run_id: &str, token: &CString) -> serde_json::Value {
+    let run_id_c = CString::new(run_id).unwrap();
     let deadline = std::time::Instant::now() + ASYNC_RUN_DEADLINE;
     loop {
-        let files = files_json_value();
-        let hash = files
-            .as_array()
+        let result = alexandria_index_run_status_json(run_id_c.as_ptr(), token.as_ptr());
+        assert_eq!(
+            result.status,
+            alexandria_ffi::RUN_OK,
+            "ffi run status failed"
+        );
+        assert!(!result.json.is_null());
+        // SAFETY: `json` is a NUL-terminated string owned by this call.
+        let body = unsafe { CStr::from_ptr(result.json) }
+            .to_str()
             .unwrap()
-            .iter()
-            .find(|row| row["name"] == name)
-            .and_then(|row| row["hash"].as_str())
-            .map(str::to_string);
-
-        match hash {
-            Some(hash) if hash != was => return hash,
-            _ => {}
+            .to_string();
+        // SAFETY: pointer came from this library and is freed exactly once,
+        // every iteration (not just the last).
+        unsafe {
+            alexandria_free_string(result.json);
         }
-
+        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+        if value["status"] != "running" {
+            return value;
+        }
         if std::time::Instant::now() > deadline {
-            panic!("timed out waiting for {name} to be re-hashed");
+            panic!("run {run_id} never left running");
         }
         std::thread::sleep(std::time::Duration::from_millis(25));
     }
@@ -389,6 +398,20 @@ fn wait_for_missing(expected: i64) -> i64 {
     }
 }
 
+/// Task 4 rewrote what a re-index detects a change *by* — a `stat` call
+/// (size + mtime), not a recomputed SHA-256 — so this test's old premise
+/// (capture `a.mp3`'s pre-refresh hash, then wait for refresh to produce a
+/// *different* hash) is dead twice over: Task 3 already stopped indexing
+/// from computing a hash at all (a freshly indexed file's `content_hash` is
+/// `null`), and Task 4's refresh never computes a new one either — a
+/// detected change now clears `content_hash` to `null` rather than
+/// replacing it (FR-FC-10), so there is neither an old hash to capture nor a
+/// new one to compare against.
+///
+/// What refresh actually guarantees now: `a.mp3`'s changed size is detected
+/// via `stat` and counted in the run's `refreshed` tally, `b.md`'s absence
+/// is counted in `markedMissing`, and `a.mp3`'s `content_hash` comes back
+/// `null` (not a new hash) while its `missingAt` is cleared.
 #[test]
 fn given_changed_and_deleted_files_when_ffi_refresh_then_refreshes_and_marks_missing() {
     let _g = serial();
@@ -405,35 +428,28 @@ fn given_changed_and_deleted_files_when_ffi_refresh_then_refreshes_and_marks_mis
     assert_eq!(started.status, STATUS_OK);
     assert_eq!(wait_for_files(2), 2);
 
-    // Capture the pre-refresh hash via the JSON accessor. Found by name
-    // rather than by position: the listing's order is the repository's
-    // business, and reading `[0]` would silently compare the wrong file's
-    // hash the day it changes.
-    let before = files_json_value();
-    let old_a_hash = before
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|row| row["name"] == "a.mp3")
-        .unwrap()["hash"]
-        .as_str()
-        .unwrap()
-        .to_string();
-
-    // Mutate on disk: change a, delete b.
+    // Mutate on disk: change a's bytes — and with them its size — delete b.
     std::fs::write(&a_path, b"audio-v2-CHANGED").unwrap();
     std::fs::remove_file(&b_path).unwrap();
 
     let refresh = alexandria_index_refresh_start(token.as_ptr());
     assert_eq!(refresh.status, STATUS_OK);
-    assert!(!run_id_string(&refresh).is_empty());
+    let run_id = run_id_string(&refresh);
+    assert!(!run_id.is_empty());
 
-    // b must be marked missing, and a must be re-hashed. Both are waited for:
-    // the two paths are refreshed independently, so either can land first.
+    // b must be marked missing, and the run itself must report exactly one
+    // stat-detected change (a) and one missing file (b) once it completes.
     assert_eq!(wait_for_missing(1), 1);
-    wait_for_rehash("a.mp3", &old_a_hash);
+    let run = wait_for_run_terminal(&run_id, &token);
+    assert_eq!(run["status"], "complete");
+    assert_eq!(run["refreshed"], 1, "a's changed size is detected via stat");
+    assert_eq!(run["markedMissing"], 1);
+    assert_eq!(run["unchanged"], 0);
+    assert_eq!(run["failed"], 0);
 
-    // a's hash must have changed, and its missingAt must be null.
+    // a's content_hash is cleared by refresh_stat (Task 4 / FR-FC-10: a
+    // refreshed file's now-stale hash must not be served as current), and
+    // its missingAt is cleared. b's missingAt is set.
     let after = files_json_value();
     let a_row = after
         .as_array()
@@ -447,7 +463,10 @@ fn given_changed_and_deleted_files_when_ffi_refresh_then_refreshes_and_marks_mis
         .iter()
         .find(|o| o["name"] == "b.md")
         .unwrap();
-    assert_ne!(a_row["hash"].as_str().unwrap(), old_a_hash);
+    assert!(
+        a_row["hash"].as_str().unwrap().is_empty(),
+        "refresh clears the hash rather than recomputing one"
+    );
     assert!(a_row["missingAt"].is_null(), "a missingAt cleared");
     assert!(b_row["missingAt"].is_string(), "b missingAt set");
 }

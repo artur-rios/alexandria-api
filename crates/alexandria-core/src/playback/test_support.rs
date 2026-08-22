@@ -86,6 +86,18 @@ impl CatalogRepository for FakeRepo {
         &self,
         _path: &str,
         _content_hash: &str,
+        _size_bytes: i64,
+        _mtime: Option<DateTime<Utc>>,
+        _indexed_at: DateTime<Utc>,
+    ) -> Result<(), DomainError> {
+        unimplemented!()
+    }
+
+    async fn refresh_stat(
+        &self,
+        _path: &str,
+        _size_bytes: i64,
+        _mtime: Option<DateTime<Utc>>,
         _indexed_at: DateTime<Utc>,
     ) -> Result<(), DomainError> {
         unimplemented!()

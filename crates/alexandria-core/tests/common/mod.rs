@@ -27,7 +27,7 @@ use alexandria_core::catalog::audio_tags::{AudioMetadataReader, AudioTags};
 use alexandria_core::catalog::clock::FixedClock;
 use alexandria_core::catalog::comic_tags::{ComicMetadataReader, ComicTags};
 use alexandria_core::catalog::document_tags::{DocumentMetadataReader, DocumentTags};
-use alexandria_core::catalog::fs::{FileEntry, Filesystem};
+use alexandria_core::catalog::fs::{FileEntry, FileStat, Filesystem};
 use alexandria_core::catalog::image_tags::{ImageMetadataReader, ImageTags};
 use alexandria_core::catalog::model::{
     File, FileState, FileType, NewFile, StateFilter, SubtypeMetadata,
@@ -84,9 +84,10 @@ impl AuthService for FakeAuth {
 pub struct FakeCatalogRepository {
     files: Arc<Mutex<HashMap<String, File>>>,
     metadata: Arc<Mutex<HashMap<Uuid, SubtypeMetadata>>>,
-    /// Paths whose `insert_file` / `refresh_hash` / `mark_missing` must fail,
-    /// simulating a per-file repository error mid-run (UC-01 / UC-02: the run
-    /// counts the failure and continues rather than aborting).
+    /// Paths whose `insert_file` / `refresh_hash` / `refresh_stat` /
+    /// `mark_missing` must fail, simulating a per-file repository error
+    /// mid-run (UC-01 / UC-02: the run counts the failure and continues
+    /// rather than aborting).
     failing_paths: Arc<Mutex<std::collections::HashSet<String>>>,
     /// UUIDs whose `rename_file` must fail with a Database error, simulating
     /// the post-rename catalog-failure branch of UC-05.
@@ -282,6 +283,8 @@ impl CatalogRepository for FakeCatalogRepository {
         &self,
         path: &str,
         content_hash: &str,
+        size_bytes: i64,
+        mtime: Option<chrono::DateTime<chrono::Utc>>,
         indexed_at: chrono::DateTime<chrono::Utc>,
     ) -> Result<(), DomainError> {
         if self.fails(path) {
@@ -290,6 +293,29 @@ impl CatalogRepository for FakeCatalogRepository {
         let mut files = self.files.lock().unwrap();
         if let Some(file) = files.get_mut(path) {
             file.content_hash = Some(content_hash.to_string());
+            file.size_bytes = Some(size_bytes);
+            file.mtime = mtime;
+            file.indexed_at = indexed_at;
+            file.missing_at = None;
+        }
+        Ok(())
+    }
+
+    async fn refresh_stat(
+        &self,
+        path: &str,
+        size_bytes: i64,
+        mtime: Option<chrono::DateTime<chrono::Utc>>,
+        indexed_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), DomainError> {
+        if self.fails(path) {
+            return Err(DomainError::internal("fake refresh failure"));
+        }
+        let mut files = self.files.lock().unwrap();
+        if let Some(file) = files.get_mut(path) {
+            file.content_hash = None;
+            file.size_bytes = Some(size_bytes);
+            file.mtime = mtime;
             file.indexed_at = indexed_at;
             file.missing_at = None;
         }
@@ -1042,6 +1068,42 @@ impl Filesystem for FakeFilesystem {
             .unwrap_or_else(|| format!("hash-of-{path}")))
     }
 
+    async fn stat(&self, path: &str) -> Result<Option<FileStat>, DomainError> {
+        // Mirrors `path_exists`, plus a path `write_file` has stored bytes
+        // for — a file UC-33 just wrote is "present" even though it was
+        // never registered as a root, a hashed file, or a disk-only entry.
+        // Without this, `EditTextFileContentHandler`'s post-write `stat`
+        // call (Task 4 correction) would see the file it just wrote as gone.
+        let state = self.state.lock().unwrap();
+        let moved_from = state.renames.iter().any(|(f, _)| f == path)
+            && !state.renames.iter().any(|(_, t)| t == path);
+        let moved_to = state.renames.iter().any(|(_, t)| t == path);
+        let disk = state.disk_paths.contains(path);
+        let removed = state.removed.iter().any(|p| p == path);
+        let written = state.written.contains_key(path);
+        drop(state);
+        let exists = !removed
+            && (self.roots.contains(path)
+                || self.hash_by_path.contains_key(path)
+                || self.unreadable.contains(path)
+                || disk
+                || written
+                || (moved_to && !moved_from));
+        if !exists {
+            return Ok(None);
+        }
+        if let Some((size_bytes, modified_at)) = self.stat_by_path.get(path) {
+            return Ok(Some(FileStat {
+                size_bytes: *size_bytes,
+                modified_at: *modified_at,
+            }));
+        }
+        Ok(Some(FileStat {
+            size_bytes: 0,
+            modified_at: None,
+        }))
+    }
+
     async fn rename(&self, from: &str, to: &str) -> Result<(), DomainError> {
         let mut state = self.state.lock().unwrap();
         if state.failing_renames_from.contains(from) {
@@ -1199,6 +1261,60 @@ pub fn existing_missing_file(path: &str, name: &str, file_type: FileType, hash: 
         deleted_at: None,
         indexed_at: earlier(),
         missing_at: Some(earlier()),
+    }
+}
+
+/// A cataloged file with a known size/mtime and no content hash — what a
+/// normally-indexed file looks like after Task 3 (indexing never hashes).
+/// `existing_file_with_hash`/`existing_missing_file` above carry
+/// `size_bytes: None, mtime: None`, which can never compare equal to a real
+/// on-disk stat; UC-02 refresh's stat-comparison tests (Task 4) need a
+/// fixture whose stats are explicit and controllable instead.
+#[allow(dead_code)]
+pub fn a_cataloged_file(path: &str, size_bytes: i64, mtime: Option<DateTime<Utc>>) -> File {
+    File {
+        uuid: Uuid::new_v4(),
+        path: path.to_string(),
+        name: path.rsplit('/').next().unwrap_or(path).to_string(),
+        file_type: FileType::Audio,
+        content_hash: None,
+        size_bytes: Some(size_bytes),
+        mtime,
+        state: FileState::Active,
+        deleted_at: None,
+        indexed_at: earlier(),
+        missing_at: None,
+    }
+}
+
+/// As [`a_cataloged_file`], but with a stored content hash — as if UC-33 had
+/// edited it, or to pin that a refresh must null out a now-stale one.
+#[allow(dead_code)]
+pub fn a_cataloged_file_with_hash(
+    path: &str,
+    size_bytes: i64,
+    mtime: Option<DateTime<Utc>>,
+    hash: &str,
+) -> File {
+    File {
+        content_hash: Some(hash.to_string()),
+        ..a_cataloged_file(path, size_bytes, mtime)
+    }
+}
+
+/// As [`a_cataloged_file_with_hash`], but already marked missing (the
+/// on-disk file was gone at a prior re-index) — used to test the "file came
+/// back" path of UC-02 with explicit, controllable stats.
+#[allow(dead_code)]
+pub fn a_cataloged_missing_file(
+    path: &str,
+    size_bytes: i64,
+    mtime: Option<DateTime<Utc>>,
+    hash: &str,
+) -> File {
+    File {
+        missing_at: Some(earlier()),
+        ..a_cataloged_file_with_hash(path, size_bytes, mtime, hash)
     }
 }
 
@@ -2228,6 +2344,18 @@ impl CatalogRepository for FailingCatalogRepository {
         &self,
         _path: &str,
         _content_hash: &str,
+        _size_bytes: i64,
+        _mtime: Option<DateTime<Utc>>,
+        _indexed_at: DateTime<Utc>,
+    ) -> Result<(), DomainError> {
+        unimplemented!("not reached by the run-fails-to-list path")
+    }
+
+    async fn refresh_stat(
+        &self,
+        _path: &str,
+        _size_bytes: i64,
+        _mtime: Option<DateTime<Utc>>,
         _indexed_at: DateTime<Utc>,
     ) -> Result<(), DomainError> {
         unimplemented!("not reached by the run-fails-to-list path")
@@ -2367,6 +2495,10 @@ impl Filesystem for FailingListFilesystem {
     }
 
     async fn content_hash(&self, _path: &str) -> Result<String, DomainError> {
+        unimplemented!("not reached by the run-fails-to-list path")
+    }
+
+    async fn stat(&self, _path: &str) -> Result<Option<FileStat>, DomainError> {
         unimplemented!("not reached by the run-fails-to-list path")
     }
 

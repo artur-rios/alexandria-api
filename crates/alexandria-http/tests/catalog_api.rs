@@ -10,6 +10,7 @@ use tower::ServiceExt;
 
 use crate::common::{
     file_rows, file_rows_with_missing, file_rows_with_uuid, test_app, wait_for_files,
+    wait_for_run_terminal,
 };
 
 /// The editable columns of an `audio_files` row, in the order every
@@ -212,6 +213,20 @@ async fn given_subtype_rows_when_indexed_then_each_file_has_subtype_row() {
     assert_eq!(document.0, 1);
 }
 
+/// Task 4 rewrote what a re-index detects a change *by* — a `stat` call
+/// (size + mtime), not a recomputed SHA-256 — so this test's old premise
+/// (capture `a.mp3`'s pre-refresh hash, then poll rows until refresh
+/// produces a *different* hash) is dead twice over: Task 3 already stopped
+/// indexing from computing a hash at all (a freshly indexed file's
+/// `content_hash` is `null`), and Task 4's refresh never computes a new one
+/// either — a detected change now clears `content_hash` rather than
+/// replacing it (FR-FC-10), so there is neither an old hash to capture nor a
+/// new one to compare against.
+///
+/// What refresh actually guarantees now: `a.mp3`'s changed size is detected
+/// via `stat` and counted in the run's `refreshed` tally, `b.md`'s absence
+/// is counted in `markedMissing`, and `a.mp3`'s `content_hash` comes back
+/// cleared (not a new hash) while its `missingAt` is cleared.
 #[tokio::test]
 async fn given_changed_and_deleted_files_when_refresh_posted_then_refreshes_and_marks_missing() {
     let lib = tempdir().unwrap();
@@ -226,20 +241,7 @@ async fn given_changed_and_deleted_files_when_refresh_posted_then_refreshes_and_
         .expect("index one-shot");
     wait_for_files(&test.pool, 2).await;
 
-    let before = file_rows(&test.pool).await;
-    assert_eq!(before.len(), 2);
-    let old_a_hash = before
-        .iter()
-        .find(|r| r.1 == "a.mp3")
-        .map(|r| r.3.clone())
-        .expect("a indexed");
-    let old_b_hash = before
-        .iter()
-        .find(|r| r.1 == "b.md")
-        .map(|r| r.3.clone())
-        .expect("b indexed");
-
-    // Mutate: change a's bytes on disk, delete b from disk.
+    // Mutate: change a's bytes — and with them its size — on disk, delete b.
     std::fs::write(&a, b"audio-v2-CHANGED").unwrap();
     std::fs::remove_file(lib.path().join("b.md")).unwrap();
 
@@ -251,29 +253,29 @@ async fn given_changed_and_deleted_files_when_refresh_posted_then_refreshes_and_
     assert_eq!(response.status(), StatusCode::ACCEPTED);
     let body: Value =
         serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
-    assert!(!body["runId"].as_str().unwrap().is_empty());
+    let run_id = body["runId"].as_str().unwrap().to_string();
+    assert!(!run_id.is_empty());
 
-    // Wait for the refresh to settle: a's hash must differ from the old one,
-    // and b must have a missing_at set.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    loop {
-        let rows = file_rows_with_missing(&test.pool).await;
-        let a_row = rows.iter().find(|r| r.1 == "a.mp3").expect("a");
-        let b_row = rows.iter().find(|r| r.1 == "b.md").expect("b");
-        let a_refreshed = a_row.3 != old_a_hash;
-        let b_marked = b_row.4.is_some();
-        if a_refreshed && b_marked {
-            assert_ne!(a_row.3, old_a_hash, "a hash refreshed");
-            assert_eq!(a_row.4, None, "a missing marker cleared");
-            assert_eq!(b_row.3, old_b_hash, "b hash untouched when missing");
-            assert!(b_row.4.is_some(), "b marked missing");
-            break;
-        }
-        if std::time::Instant::now() > deadline {
-            panic!("refresh never settled; a refreshed={a_refreshed}, b marked={b_marked}");
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-    }
+    // Wait for the run record itself to report `complete` — the real signal
+    // that both halves of the refresh (a's stat-detected change, b's missing
+    // marker) have landed, since `RefreshHandler::refresh_one` processes
+    // cataloged paths concurrently and either can finish first.
+    let run = wait_for_run_terminal(&test.services, &run_id, common::TEST_TOKEN).await;
+    assert_eq!(run["status"], "complete");
+    assert_eq!(run["refreshed"], 1, "a's changed size is detected via stat");
+    assert_eq!(run["markedMissing"], 1);
+    assert_eq!(run["unchanged"], 0);
+    assert_eq!(run["failed"], 0);
+
+    let rows = file_rows_with_missing(&test.pool).await;
+    let a_row = rows.iter().find(|r| r.1 == "a.mp3").expect("a");
+    let b_row = rows.iter().find(|r| r.1 == "b.md").expect("b");
+    assert!(
+        a_row.3.is_empty(),
+        "refresh clears the hash rather than recomputing one"
+    );
+    assert_eq!(a_row.4, None, "a missing marker cleared");
+    assert!(b_row.4.is_some(), "b marked missing");
 }
 
 #[tokio::test]
