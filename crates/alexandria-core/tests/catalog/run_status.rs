@@ -353,3 +353,68 @@ async fn given_a_run_that_spent_time_paused_when_read_then_active_millis_exclude
     assert_eq!(run.active_millis, 10_000);
     assert_eq!(run.paused_millis, 20_000);
 }
+
+#[tokio::test]
+async fn given_a_paused_run_when_read_later_then_active_millis_does_not_grow_with_the_pause() {
+    // `paused_millis` only holds pauses that have *ended* — a resume banks
+    // them — so the stretch a run is sitting in right now has to be
+    // subtracted separately or it is counted as work. This is not a corner
+    // case: startup reconciliation pauses a run left over from a previous
+    // launch and writes no `finished_at`, so without this the run's clock
+    // runs for every day the application stays shut, and a client dividing
+    // `processed` by `active_millis` to estimate what is left gets an answer
+    // that degrades the longer the owner leaves the run alone.
+    let runs = FakeCatalogRunRepository::new();
+    let id = Uuid::new_v4();
+    runs.start(id, RunKind::Index, Some("/library"), at(1, 0, 0))
+        .await
+        .unwrap();
+    assert!(runs.pause(id, at(1, 10, 0)).await.expect("pause"));
+
+    // Ten minutes of work, then a pause of no particular length. Every read
+    // must give the same answer, whenever it happens.
+    for read_at in [at(1, 10, 0), at(1, 40, 0), at(5, 0, 0)] {
+        let handler = GetRunStatusHandler::new(
+            FakeAuth::Allowing,
+            runs.clone(),
+            FixedClock(read_at),
+            RunRegistry::new(),
+        );
+
+        let run = handler.get(id, TOKEN).await.expect("get");
+
+        assert_eq!(
+            run.active_millis,
+            10 * 60 * 1000,
+            "a run reads the same at {read_at} as it did the moment it paused"
+        );
+    }
+}
+
+#[tokio::test]
+async fn given_a_run_cancelled_while_paused_when_read_then_its_clock_is_frozen() {
+    // Cancel does not clear `paused_at`, so the open pause above has to be
+    // measured to the finish time rather than to now — otherwise a terminal
+    // run's elapsed time would start moving again, in the wrong direction.
+    let runs = FakeCatalogRunRepository::new();
+    let id = Uuid::new_v4();
+    runs.start(id, RunKind::Index, Some("/library"), at(1, 0, 0))
+        .await
+        .unwrap();
+    assert!(runs.pause(id, at(1, 10, 0)).await.expect("pause"));
+    assert!(runs.cancel(id, None, at(1, 20, 0)).await.expect("cancel"));
+    let handler = GetRunStatusHandler::new(
+        FakeAuth::Allowing,
+        runs.clone(),
+        FixedClock(at(9, 0, 0)),
+        RunRegistry::new(),
+    );
+
+    let run = handler.get(id, TOKEN).await.expect("get");
+
+    assert_eq!(
+        run.active_millis,
+        10 * 60 * 1000,
+        "twenty minutes elapsed to the cancel, of which the last ten were paused"
+    );
+}

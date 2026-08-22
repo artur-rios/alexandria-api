@@ -99,14 +99,17 @@ pub(crate) async fn record_halt<RR>(
             })
             .await
             {
-                // Refused because the row is no longer `running` or `paused`:
-                // something else closed this run while the walk was between
-                // dropping its cell and getting here. That write stands and
-                // this one is dropped, exactly as on the pause branch above.
-                // What is lost is this walk's partial tally; the row's last
-                // flushed `processed`/`total` still say how far it got, and
-                // overwriting a closed run to recover four numbers would be
+                // Refused because the row reads `complete` or `failed`:
+                // the walk closed itself while this cancel was in flight.
+                // That write stands and this one is dropped — rewriting a run
+                // that got through all of its work into a cancelled one is
                 // the misreport the guard exists to prevent.
+                //
+                // A cancel that a *control call* already wrote is not refused
+                // here: `cancelled` is in this branch's guard set, so the
+                // walk lands on top and fills in the four counts the control
+                // call had none of. Losing them was avoidable, and a cancel
+                // is supposed to keep its tally for the record.
                 Ok(false) => tracing::warn!(
                     %run_id,
                     "run was closed by another caller before it could be cancelled"

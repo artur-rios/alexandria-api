@@ -68,14 +68,36 @@ where
         // spent paused. A finished run's clock stops at `finished_at`; a
         // running one's keeps going, which is why this needs a clock at all.
         //
+        // Two subtractions, not one. `paused_millis` holds the pauses that
+        // have *ended* — only a resume banks one — so a run sitting paused
+        // right now has a stretch that is in neither term, and without the
+        // second one its `active_millis` would climb with the wall clock for
+        // as long as it stayed paused. That is not a corner case since
+        // startup reconciliation began pausing rather than closing runs: a
+        // run left over from a previous launch is paused with no
+        // `finished_at`, so its clock would run for every day the
+        // application stayed shut, and a client dividing `processed` by this
+        // to estimate what is left would get an answer that degrades the
+        // longer the owner leaves the run alone.
+        //
+        // The open pause is measured to `elapsed_to` rather than to now, so
+        // it freezes with everything else for a terminal run — a run
+        // cancelled while paused keeps a `paused_at`, and measuring that one
+        // to now would make its finished clock move again.
+        //
         // Clamped at zero. The subtraction can go negative if the system
-        // clock steps backwards mid-run, or if a future resume path
-        // over-accumulates `paused_millis`, and "this run has been working
-        // for minus four seconds" is nonsense on a display field — better to
-        // report no elapsed time than a negative duration.
+        // clock steps backwards mid-run, or if a resume over-accumulates
+        // `paused_millis`, and "this run has been working for minus four
+        // seconds" is nonsense on a display field — better to report no
+        // elapsed time than a negative duration.
         let elapsed_to = run.finished_at.unwrap_or_else(|| self.clock.now());
+        let open_pause = run
+            .paused_at
+            .map(|paused_at| (elapsed_to - paused_at).num_milliseconds().max(0))
+            .unwrap_or(0);
         run.active_millis =
-            ((elapsed_to - run.started_at).num_milliseconds() - run.paused_millis).max(0);
+            ((elapsed_to - run.started_at).num_milliseconds() - run.paused_millis - open_pause)
+                .max(0);
 
         Ok(run)
     }

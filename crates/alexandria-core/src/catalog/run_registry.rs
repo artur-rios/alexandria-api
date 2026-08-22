@@ -254,13 +254,19 @@ impl RunRegistry {
         self.lock().get(&run_id).map(Arc::clone)
     }
 
-    /// Drop `run_id`'s cell. Closing an id that is not open is a no-op, so a
-    /// guard whose run already closed explicitly costs nothing.
+    /// Drop `run_id`'s cell, whoever it belongs to.
     ///
-    /// Prefer letting [`RunCellGuard`] do this: a run that ends by panic or
-    /// task abort never reaches an explicit call, and the leaked entry would
-    /// make a dead run report live progress for the rest of the process's
-    /// life — exactly the failure the registry exists to avoid.
+    /// Test-only, and deliberately: this is the by-id close whose use in
+    /// `RunCellGuard`'s `Drop` let a stale guard evict a live segment's cell
+    /// once run ids started being reused by resume. Production code closes a
+    /// run by dropping its guard, which goes through
+    /// [`RunRegistry::close_if_owned`]. Leaving this `pub` for the whole
+    /// crate is the one way that hazard comes back.
+    ///
+    /// It survives for the one test that covers a handler closing explicitly
+    /// and then dropping its guard at end of scope — the double close that is
+    /// the normal path, not an edge case.
+    #[cfg(test)]
     pub fn close(&self, run_id: Uuid) {
         self.lock().remove(&run_id);
     }

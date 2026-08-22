@@ -601,3 +601,37 @@ async fn given_a_run_completed_between_the_lookup_and_the_write_when_cancelled_t
         "the completion stands — the late cancel must not have overwritten it"
     );
 }
+
+#[tokio::test]
+async fn given_a_cancelled_run_when_a_walks_cancel_lands_afterwards_then_the_fake_keeps_its_tally()
+{
+    // The fake must mirror the adapter's *wider* guard on the tally branch,
+    // or the handler tests would be passing against a repository that drops a
+    // cancelled run's counts where the real one keeps them.
+    let runs = FakeCatalogRunRepository::new();
+    let run_id = Uuid::new_v4();
+    runs.start(run_id, RunKind::Index, Some("/library"), t(1))
+        .await
+        .expect("start");
+    assert!(runs
+        .cancel(run_id, None, t(2))
+        .await
+        .expect("control cancel"));
+
+    let counts = RunCounts::Index {
+        scanned: 13,
+        indexed: 4,
+        skipped: 1,
+        already_cataloged: 0,
+        failed: 1,
+    };
+    let applied = runs
+        .cancel(run_id, Some(counts), t(3))
+        .await
+        .expect("walk cancel");
+
+    assert!(applied);
+    let run = runs.get_recorded(run_id).expect("run");
+    assert_eq!(run.status, RunStatus::Cancelled);
+    assert_eq!(run.counts, Some(counts), "the walk's tally is kept");
+}

@@ -1109,3 +1109,91 @@ async fn given_a_paused_run_when_cancelled_then_the_write_applies() {
     assert_eq!(run.status, RunStatus::Cancelled);
     assert_eq!(run.finished_at, Some(t(3)));
 }
+
+#[tokio::test]
+async fn given_a_cancelled_run_when_the_walks_own_cancel_lands_afterwards_then_its_tally_is_kept() {
+    // The half of the cancel guard that must *not* refuse. A control call
+    // that finds no live cell writes `cancelled` with no tally, because it
+    // holds none; the walk it stopped then reaches its own `record_halt`
+    // carrying the four numbers it actually computed. Refusing that second
+    // write would leave the row cancelled with `counts` NULL forever, and the
+    // design asks a cancel to keep its tally for the record. The status does
+    // not change and only the finish time moves, to when the walk really
+    // stopped.
+    let (repo, _dir) = repo().await;
+    let id = Uuid::new_v4();
+    repo.start(id, RunKind::Index, Some("/library"), t(1))
+        .await
+        .expect("start");
+    assert!(repo.cancel(id, None, t(2)).await.expect("control cancel"));
+    assert!(
+        repo.get(id).await.unwrap().unwrap().counts.is_none(),
+        "the control call had no tally to write"
+    );
+
+    let applied = repo
+        .cancel(
+            id,
+            Some(RunCounts::Index {
+                scanned: 13,
+                indexed: 4,
+                skipped: 1,
+                already_cataloged: 0,
+                failed: 1,
+            }),
+            t(3),
+        )
+        .await
+        .expect("walk cancel");
+
+    assert!(
+        applied,
+        "the walk fills in the tally the control call had none of"
+    );
+    let run = repo.get(id).await.expect("get").expect("run exists");
+    assert_eq!(run.status, RunStatus::Cancelled, "still cancelled");
+    assert_eq!(
+        run.counts,
+        Some(RunCounts::Index {
+            scanned: 13,
+            indexed: 4,
+            skipped: 1,
+            already_cataloged: 0,
+            failed: 1
+        })
+    );
+    assert_eq!(run.finished_at, Some(t(3)));
+}
+
+#[tokio::test]
+async fn given_a_failed_run_when_a_cancel_with_a_tally_lands_afterwards_then_it_is_refused() {
+    // The wider set for the walk's branch admits `cancelled` and nothing
+    // else: a run that closed itself is still not one a cancel may rewrite.
+    let (repo, _dir) = repo().await;
+    let id = Uuid::new_v4();
+    repo.start(id, RunKind::Index, Some("/library"), t(1))
+        .await
+        .expect("start");
+    repo.fail(id, "root unreadable", t(2)).await.expect("fail");
+
+    let applied = repo
+        .cancel(
+            id,
+            Some(RunCounts::Index {
+                scanned: 13,
+                indexed: 4,
+                skipped: 0,
+                already_cataloged: 0,
+                failed: 0,
+            }),
+            t(3),
+        )
+        .await
+        .expect("cancel");
+
+    assert!(!applied);
+    let run = repo.get(id).await.expect("get").expect("run exists");
+    assert_eq!(run.status, RunStatus::Failed);
+    assert!(run.counts.is_none());
+    assert_eq!(run.finished_at, Some(t(2)));
+}

@@ -2247,11 +2247,18 @@ impl ComicMetadataReader for FakeComicMetadataReader {
     }
 }
 
-/// The statuses a cancel may be written from, mirroring the SQLite adapter's
-/// own guard. Without it the fake would be more permissive than the real
-/// repository, and a late cancel overwriting a completed run would be
+/// The statuses a tally-less cancel may be written from, mirroring the SQLite
+/// adapter's own guard. Without it the fake would be more permissive than the
+/// real repository, and a late cancel overwriting a completed run would be
 /// invisible in every handler test.
 const CANCELLABLE_FROM: [RunStatus; 2] = [RunStatus::Running, RunStatus::Paused];
+
+/// The wider set a cancel carrying a tally may be written from, mirroring the
+/// adapter again: a walk landing behind a control call that already cancelled
+/// the row fills in the counts that call had none of, rather than dropping
+/// them.
+const TALLY_CANCELLABLE_FROM: [RunStatus; 3] =
+    [RunStatus::Running, RunStatus::Paused, RunStatus::Cancelled];
 
 /// In-memory `CatalogRunRepository` (UC-42). Lets the index/refresh handler
 /// tests assert the run lifecycle without a database.
@@ -2458,7 +2465,7 @@ impl CatalogRunRepository for FakeCatalogRunRepository {
                 // Mirrors the adapter: the kind check is answered before
                 // the state guard, so a mismatched tally is an error rather
                 // than a silent refusal whatever state the row is in.
-                if !CANCELLABLE_FROM.contains(&run.status) {
+                if !TALLY_CANCELLABLE_FROM.contains(&run.status) {
                     return Ok(false);
                 }
                 // A cancelled run is never resumed, so its partial tally is

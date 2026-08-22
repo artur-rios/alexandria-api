@@ -258,8 +258,8 @@ pub trait CatalogRunRepository: Send + Sync {
     /// answered before the state guard below, so a caller passing the wrong
     /// tally is told so rather than quietly getting `Ok(false)`.
     ///
-    /// **Conditional on the run still being `running` or `paused`**, and
-    /// `Ok(false)` when it was not — the mirror of [`CatalogRunRepository::pause`]'s
+    /// **Conditional on the run's current status**, and `Ok(false)` when the
+    /// write was refused — the mirror of [`CatalogRunRepository::pause`]'s
     /// guard, and there for the same race seen from the other verb. A control
     /// call reads `running`, the walk then writes `finish`, and the cancel
     /// lands last: unguarded it rewrites a run that got through all of its
@@ -268,9 +268,22 @@ pub trait CatalogRunRepository: Send + Sync {
     /// — it is a misreport rather than a corruption, which is exactly what
     /// makes it worth guarding rather than leaving to be found later.
     ///
-    /// The condition is a set rather than a single value because `paused` is
-    /// a legal source too: abandoning a paused run is the whole reason to
-    /// cancel rather than pause.
+    /// What the guard admits depends on whether a tally came with the call,
+    /// because the two callers are refusing different things:
+    ///
+    /// * With `None` — the control handler, holding no tally — `running` and
+    ///   `paused`. `paused` is in the set because abandoning a paused run is
+    ///   the whole reason to cancel rather than pause.
+    /// * With a tally — the walk, recording the cancel it was told to make —
+    ///   `cancelled` as well. A control call that found no live cell may have
+    ///   written the row already, and letting the walk land on top of it
+    ///   replaces `counts: NULL` with the four numbers the walk actually
+    ///   computed. The row's status does not change, and its `finished_at`
+    ///   moves to when the walk really stopped. Keeping the tally is what the
+    ///   design asks of a cancel, and it is only ever lost by refusing here.
+    ///
+    /// Neither set admits `complete` or `failed`: a run that closed itself is
+    /// not one an owner's cancel may rewrite, whichever caller is asking.
     ///
     /// Callers must not ignore the `false`. See `record_halt`, which logs it,
     /// and `RunControlHandler`, which reports it.
@@ -382,6 +395,14 @@ macro_rules! cancellable_guard {
     };
 }
 
+/// The same for a cancel that carries a tally, whose set is one wider. See
+/// [`TALLY_CANCELLABLE_FROM`].
+macro_rules! tally_cancellable_guard {
+    () => {
+        " AND status IN (?, ?, ?)"
+    };
+}
+
 /// The statement that closes an index run with its tally, with `$guard`
 /// appended.
 ///
@@ -412,10 +433,18 @@ macro_rules! close_refresh_sql {
     };
 }
 
-/// The statuses a `cancel` may be written from. See the trait doc: `paused`
-/// is in the set because abandoning a paused run is the whole reason to
-/// cancel rather than pause.
+/// The statuses a tally-less `cancel` may be written from — the control
+/// handler's. See the trait doc: `paused` is in the set because abandoning a
+/// paused run is the whole reason to cancel rather than pause.
 const CANCELLABLE_FROM: [RunStatus; 2] = [RunStatus::Running, RunStatus::Paused];
+
+/// The statuses a `cancel` *carrying a tally* may be written from — the
+/// walk's. [`CANCELLABLE_FROM`] plus `cancelled`, so a walk landing behind a
+/// control call that already wrote the row replaces its empty tally with the
+/// four numbers the walk computed rather than dropping them. See the trait
+/// doc.
+const TALLY_CANCELLABLE_FROM: [RunStatus; 3] =
+    [RunStatus::Running, RunStatus::Paused, RunStatus::Cancelled];
 
 impl SqliteCatalogRunRepository {
     /// Close a run terminally with its tally.
@@ -425,11 +454,14 @@ impl SqliteCatalogRunRepository {
     /// stamp `finished_at`, both clear `phase`, and both keep the four counts.
     /// Sharing it is what stops the two from drifting on any of that.
     ///
-    /// `guarded` says whether the write is conditional on the row still
-    /// being cancellable. `finish` is unconditional — it is the walk
-    /// recording its own completion, and there is no writer it should lose
-    /// to. `cancel` is conditional; the trait doc says why. Returns whether
-    /// the write applied, which is only ever `false` for a guarded one.
+    /// `guarded` says whether the write is conditional on the row still being
+    /// cancellable *with a tally* — [`TALLY_CANCELLABLE_FROM`], the only set
+    /// this method is ever asked for, since the other one belongs to the
+    /// branch that has no counts to write. `finish` is unconditional: it is
+    /// the walk recording its own completion, and there is no writer it
+    /// should lose to. `cancel` is guarded; the trait doc says why. Returns
+    /// whether the write applied, which is only ever `false` for a guarded
+    /// one.
     async fn close_with_counts(
         &self,
         id: Uuid,
@@ -459,9 +491,11 @@ impl SqliteCatalogRunRepository {
         // unguarded form of each from drifting in anything but the guard.
         let sql = match (&counts, guarded) {
             (RunCounts::Index { .. }, false) => close_index_sql!(""),
-            (RunCounts::Index { .. }, true) => close_index_sql!(cancellable_guard!()),
+            (RunCounts::Index { .. }, true) => close_index_sql!(tally_cancellable_guard!()),
             (RunCounts::Refresh { .. }, false) => close_refresh_sql!(""),
-            (RunCounts::Refresh { .. }, true) => close_refresh_sql!(cancellable_guard!()),
+            (RunCounts::Refresh { .. }, true) => {
+                close_refresh_sql!(tally_cancellable_guard!())
+            }
         };
         let query = sqlx::query(sql)
             .bind(status.as_str())
@@ -496,9 +530,9 @@ impl SqliteCatalogRunRepository {
         let query = query.bind(id.to_string());
         // Bound after the id, matching the order the placeholders appear in.
         let query = if guarded {
-            query
-                .bind(CANCELLABLE_FROM[0].as_str())
-                .bind(CANCELLABLE_FROM[1].as_str())
+            TALLY_CANCELLABLE_FROM
+                .iter()
+                .fold(query, |query, status| query.bind(status.as_str()))
         } else {
             query
         };
