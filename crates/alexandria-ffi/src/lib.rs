@@ -2655,16 +2655,32 @@ pub extern "C" fn alexandria_index_count_missing() -> i64 {
     })
 }
 
-/// JSON array of `{"path","name","type","hash"}` for every indexed file, or a
-/// NUL pointer on error. Caller must free it with `alexandria_free_string`.
+/// JSON array of `{"path","name","type","hash","missingAt"}` for every
+/// indexed file, or a NUL pointer on error. Caller must free it with
+/// `alexandria_free_string`.
+///
+/// `content_hash` is nullable (Task 3: indexing never computes one; Task 4:
+/// neither does refresh) and is decoded as `Option<String>` — not `String` —
+/// so a `NULL` row serializes as JSON `null` here, matching what the shared
+/// `File`/`FileView` model emits over HTTP for the same column
+/// (`GET /v1/files`, `catalog/model.rs`). Decoding it as a bare `String`
+/// used to silently turn a SQL `NULL` into `""` instead (sqlx does not error
+/// on that mismatch for this driver), which was a byte-for-byte parity
+/// violation (FR-FC-24) for every indexed or refreshed file — not an edge
+/// case, since neither indexing nor refresh have computed a hash since
+/// Task 3/4.
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
 pub extern "C" fn alexandria_index_files_json() -> *mut c_char {
+    // `(path, name, type, content_hash, missing_at)` — `content_hash` and
+    // `missing_at` both nullable.
+    type FileRow = (String, String, String, Option<String>, Option<String>);
+
     let services = match services_slot().lock().unwrap().clone() {
         Some(s) => s,
         None => return std::ptr::null_mut(),
     };
-    let rows: Vec<(String, String, String, String, Option<String>)> = runtime()
+    let rows: Vec<FileRow> = runtime()
         .block_on(async {
             sqlx::query_as(
                 "SELECT path, name, type, content_hash, missing_at \

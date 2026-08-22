@@ -464,8 +464,10 @@ fn given_changed_and_deleted_files_when_ffi_refresh_then_refreshes_and_marks_mis
         .find(|o| o["name"] == "b.md")
         .unwrap();
     assert!(
-        a_row["hash"].as_str().unwrap().is_empty(),
-        "refresh clears the hash rather than recomputing one"
+        a_row["hash"].is_null(),
+        "refresh clears the hash rather than recomputing one — and a NULL \
+         content_hash must serialize as JSON null, not \"\", to match what \
+         HTTP's File/FileView model emits for the same column (FR-FC-24)"
     );
     assert!(a_row["missingAt"].is_null(), "a missingAt cleared");
     assert!(b_row["missingAt"].is_string(), "b missingAt set");

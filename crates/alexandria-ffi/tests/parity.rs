@@ -100,6 +100,11 @@ type AudioMetadataRow = (
 /// reduced to whenever the two legs' catalogs are compared.
 type FileTriples = Vec<(String, String, String)>;
 
+/// `(path, name, type, content_hash, missing_at)` — `content_hash` and
+/// `missing_at` both nullable — the row shape UC-01/UC-02 parity tests
+/// compare between the HTTP and FFI legs.
+type RefreshFileRow = (String, String, String, Option<String>, Option<String>);
+
 fn db_path(dir: &TempDir, name: &str) -> String {
     dir.path().join(name).to_str().unwrap().to_string()
 }
@@ -209,7 +214,7 @@ async fn given_same_lib_when_indexed_via_http_and_ffi_then_files_rows_identical(
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
 
-    let http_rows: Vec<(String, String, String, String)> =
+    let http_rows: Vec<(String, String, String, Option<String>)> =
         sqlx::query_as("SELECT path, name, type, content_hash FROM files ORDER BY path")
             .fetch_all(&http_pool)
             .await
@@ -259,7 +264,7 @@ async fn given_same_lib_when_indexed_via_http_and_ffi_then_files_rows_identical(
 
     // ---- compare ----
     let ffi_value: serde_json::Value = serde_json::from_str(&ffi_json).unwrap();
-    let ffi_rows: Vec<(String, String, String, String)> = ffi_value
+    let ffi_rows: Vec<(String, String, String, Option<String>)> = ffi_value
         .as_array()
         .unwrap()
         .iter()
@@ -268,7 +273,7 @@ async fn given_same_lib_when_indexed_via_http_and_ffi_then_files_rows_identical(
                 o["path"].as_str().unwrap().to_string(),
                 o["name"].as_str().unwrap().to_string(),
                 o["type"].as_str().unwrap().to_string(),
-                o["hash"].as_str().unwrap().to_string(),
+                o["hash"].as_str().map(|s| s.to_string()),
             )
         })
         .collect();
@@ -357,7 +362,7 @@ async fn given_same_lib_when_refreshed_via_http_and_ffi_then_rows_and_missing_ma
     // the whole walk, including both halves, is done.
     wait_for_http_run_terminal(&http_services, &http_run_id, TEST_TOKEN).await;
 
-    let http_rows: Vec<(String, String, String, String, Option<String>)> = sqlx::query_as(
+    let http_rows: Vec<RefreshFileRow> = sqlx::query_as(
         "SELECT path, name, type, content_hash, missing_at FROM files ORDER BY path",
     )
     .fetch_all(&http_pool)
@@ -369,58 +374,56 @@ async fn given_same_lib_when_refreshed_via_http_and_ffi_then_rows_and_missing_ma
     let ffi_dir = tempdir().unwrap();
     let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
     let ffi_lib_path = ffi_lib.path().to_str().unwrap().to_string();
-    let ffi_rows: Vec<(String, String, String, String, Option<String>)> =
-        tokio::task::spawn_blocking(
-            move || -> Vec<(String, String, String, String, Option<String>)> {
-                let cdb = CString::new(ffi_db).unwrap();
-                assert_eq!(
-                    alexandria_index_init(cdb.as_ptr()),
-                    alexandria_ffi::INDEX_OK
-                );
+    let ffi_rows: Vec<RefreshFileRow> =
+        tokio::task::spawn_blocking(move || -> Vec<RefreshFileRow> {
+            let cdb = CString::new(ffi_db).unwrap();
+            assert_eq!(
+                alexandria_index_init(cdb.as_ptr()),
+                alexandria_ffi::INDEX_OK
+            );
 
-                let root = CString::new(ffi_lib_path.clone()).unwrap();
-                let token = CString::new(TEST_TOKEN).unwrap();
-                let started = alexandria_index_start(root.as_ptr(), token.as_ptr());
-                assert_eq!(started.status, alexandria_ffi::INDEX_OK);
-                wait_for_ffi_files(2);
+            let root = CString::new(ffi_lib_path.clone()).unwrap();
+            let token = CString::new(TEST_TOKEN).unwrap();
+            let started = alexandria_index_start(root.as_ptr(), token.as_ptr());
+            assert_eq!(started.status, alexandria_ffi::INDEX_OK);
+            wait_for_ffi_files(2);
 
-                // identical mutation on disk
-                std::fs::write(ffi_lib.path().join("a.mp3"), b"audio-v2-CHANGED").unwrap();
-                std::fs::remove_file(ffi_lib.path().join("b.md")).unwrap();
+            // identical mutation on disk
+            std::fs::write(ffi_lib.path().join("a.mp3"), b"audio-v2-CHANGED").unwrap();
+            std::fs::remove_file(ffi_lib.path().join("b.md")).unwrap();
 
-                let refresh = alexandria_index_refresh_start(token.as_ptr());
-                assert_eq!(refresh.status, alexandria_ffi::INDEX_OK);
-                let ffi_run_id = run_id_string(&refresh);
+            let refresh = alexandria_index_refresh_start(token.as_ptr());
+            assert_eq!(refresh.status, alexandria_ffi::INDEX_OK);
+            let ffi_run_id = run_id_string(&refresh);
 
-                // Same purpose as the HTTP leg's run-status poll: `complete`
-                // is the signal that both halves of the refresh — the re-hash
-                // and the missing marker, which run concurrently — have
-                // landed, rather than guessing from either row directly.
-                wait_for_ffi_run_terminal(&ffi_run_id, &token);
+            // Same purpose as the HTTP leg's run-status poll: `complete`
+            // is the signal that both halves of the refresh — the re-hash
+            // and the missing marker, which run concurrently — have
+            // landed, rather than guessing from either row directly.
+            wait_for_ffi_run_terminal(&ffi_run_id, &token);
 
-                let raw = alexandria_index_files_json();
-                assert!(!raw.is_null());
-                let json = unsafe { CStr::from_ptr(raw) }.to_str().unwrap().to_string();
-                // SAFETY: pointer came from this library and is freed once.
-                unsafe {
-                    alexandria_free_string(raw);
-                }
-                let v: serde_json::Value = serde_json::from_str(&json).unwrap();
-                v.as_array()
-                    .unwrap()
-                    .iter()
-                    .map(|o| {
-                        (
-                            o["path"].as_str().unwrap().to_string(),
-                            o["name"].as_str().unwrap().to_string(),
-                            o["type"].as_str().unwrap().to_string(),
-                            o["hash"].as_str().unwrap().to_string(),
-                            o["missingAt"].as_str().map(|s| s.to_string()),
-                        )
-                    })
-                    .collect()
-            },
-        )
+            let raw = alexandria_index_files_json();
+            assert!(!raw.is_null());
+            let json = unsafe { CStr::from_ptr(raw) }.to_str().unwrap().to_string();
+            // SAFETY: pointer came from this library and is freed once.
+            unsafe {
+                alexandria_free_string(raw);
+            }
+            let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+            v.as_array()
+                .unwrap()
+                .iter()
+                .map(|o| {
+                    (
+                        o["path"].as_str().unwrap().to_string(),
+                        o["name"].as_str().unwrap().to_string(),
+                        o["type"].as_str().unwrap().to_string(),
+                        o["hash"].as_str().map(|s| s.to_string()),
+                        o["missingAt"].as_str().map(|s| s.to_string()),
+                    )
+                })
+                .collect()
+        })
         .await
         .unwrap();
 
@@ -429,15 +432,14 @@ async fn given_same_lib_when_refreshed_via_http_and_ffi_then_rows_and_missing_ma
     // timestamp fires at different wall-clock instants on the two surfaces
     // (like a random run id), so parity asserts the marker's *presence*, not
     // its value.
-    let norm =
-        |rows: &[(String, String, String, String, Option<String>)]| -> Vec<(String, String, bool)> {
-            let mut v: Vec<(String, String, bool)> = rows
-                .iter()
-                .map(|r| (r.1.clone(), r.3.clone(), r.4.is_some()))
-                .collect();
-            v.sort();
-            v
-        };
+    let norm = |rows: &[RefreshFileRow]| -> Vec<(String, Option<String>, bool)> {
+        let mut v: Vec<(String, Option<String>, bool)> = rows
+            .iter()
+            .map(|r| (r.1.clone(), r.3.clone(), r.4.is_some()))
+            .collect();
+        v.sort();
+        v
+    };
     let http_n = norm(&http_rows);
     let ffi_n = norm(&ffi_rows);
     assert_eq!(
@@ -446,14 +448,144 @@ async fn given_same_lib_when_refreshed_via_http_and_ffi_then_rows_and_missing_ma
     );
 
     // Both sides: a present & refreshed (missingAt null), b marked missing.
-    let by_name = |rows: &[(String, String, String, String, Option<String>)]| -> std::collections::BTreeMap<String,(String,bool)> {
-        rows.iter().map(|r| (r.1.clone(), (r.3.clone(), r.4.is_some()))).collect()
-    };
+    let by_name =
+        |rows: &[RefreshFileRow]| -> std::collections::BTreeMap<String, (Option<String>, bool)> {
+            rows.iter()
+                .map(|r| (r.1.clone(), (r.3.clone(), r.4.is_some())))
+                .collect()
+        };
     let h = by_name(&http_rows);
     let f = by_name(&ffi_rows);
     assert!(!h["a.mp3"].1 && !f["a.mp3"].1, "a missingAt null on both");
     assert!(h["b.md"].1 && f["b.md"].1, "b missingAt set on both");
     assert_eq!(h["a.mp3"].0, f["a.mp3"].0, "a refreshed hash parity");
+}
+
+/// UC-01/UC-42 parity — `content_hash` is nullable and, since Task 3/4, is
+/// `null` for every freshly indexed or refreshed file (indexing never
+/// computes one, FR-FC-09; neither does refresh, FR-FC-10). HTTP's real
+/// `GET /v1/files` serializes that through `FileView.contentHash` as JSON
+/// `null`. `alexandria_index_files_json` used to decode the same `NULL`
+/// column into a non-optional Rust `String`, which sqlx quietly turned into
+/// `""` rather than erroring — so the FFI body carried `"hash": ""` for
+/// every file while HTTP carried `"contentHash": null` for the identical
+/// row: a byte-for-byte parity violation (FR-FC-24) that every other parity
+/// test in this file missed, because they each compare FFI's JSON against a
+/// *raw SQL read* for the HTTP leg (which has the very same non-optional-
+/// `String`-decodes-NULL-as-`""` quirk when written that way, masking the
+/// difference) rather than against HTTP's actual response body. This test
+/// is the one that goes through both real accessors and would have caught
+/// the regression.
+#[tokio::test]
+async fn given_a_freshly_indexed_file_when_hash_read_via_http_and_ffi_then_both_report_null() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+
+    // ---- HTTP leg: the real GET /v1/files response body ----
+    let http_lib = tempdir().unwrap();
+    std::fs::write(http_lib.path().join("song.mp3"), b"audio").unwrap();
+
+    let http_dir = tempdir().unwrap();
+    let http_db = db_path(&http_dir, "http.sqlite");
+    let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    seed_session(&http_pool, TEST_TOKEN).await;
+    let http_services =
+        std::sync::Arc::new(build_services(&local_settings(), http_pool.clone()).await);
+
+    let index_req = Request::builder()
+        .method("POST")
+        .uri("/v1/index")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({ "root": http_lib.path().to_str().unwrap() }).to_string(),
+        ))
+        .unwrap();
+    let _ = app(Settings::default(), http_services.clone())
+        .oneshot(index_req)
+        .await
+        .expect("http index");
+    wait_for_http_files(&http_pool, 1).await;
+
+    let list_req = Request::builder()
+        .method("GET")
+        .uri("/v1/files")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
+        .body(Body::empty())
+        .unwrap();
+    let list_resp = app(Settings::default(), http_services.clone())
+        .oneshot(list_req)
+        .await
+        .expect("http list");
+    let http_body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(list_resp.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
+    let http_hash = http_body
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["name"] == "song.mp3")
+        .expect("song.mp3 in http listing")["contentHash"]
+        .clone();
+
+    // ---- FFI leg: the real alexandria_index_files_json accessor ----
+    let ffi_lib = tempdir().unwrap();
+    std::fs::write(ffi_lib.path().join("song.mp3"), b"audio").unwrap();
+    let ffi_dir = tempdir().unwrap();
+    let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
+    let ffi_lib_path = ffi_lib.path().to_str().unwrap().to_string();
+
+    let ffi_hash: serde_json::Value = tokio::task::spawn_blocking(move || -> serde_json::Value {
+        let cdb = CString::new(ffi_db).unwrap();
+        assert_eq!(
+            alexandria_index_init(cdb.as_ptr()),
+            alexandria_ffi::INDEX_OK
+        );
+
+        let root = CString::new(ffi_lib_path).unwrap();
+        let token = CString::new(TEST_TOKEN).unwrap();
+        let started = alexandria_index_start(root.as_ptr(), token.as_ptr());
+        assert_eq!(started.status, alexandria_ffi::INDEX_OK, "ffi start failed");
+
+        let dl = std::time::Instant::now() + ASYNC_RUN_DEADLINE;
+        loop {
+            if alexandria_index_count_files() >= 1 {
+                break;
+            }
+            if std::time::Instant::now() > dl {
+                panic!("ffi never persisted 1 file");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+
+        let raw = alexandria_index_files_json();
+        assert!(!raw.is_null());
+        // SAFETY: returned by the FFI accessor as a NUL-terminated string.
+        let json = unsafe { CStr::from_ptr(raw) }.to_str().unwrap().to_string();
+        // SAFETY: pointer came from this library and is freed once.
+        unsafe {
+            alexandria_free_string(raw);
+        }
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        value
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["name"] == "song.mp3")
+            .expect("song.mp3 in ffi listing")["hash"]
+            .clone()
+    })
+    .await
+    .unwrap();
+
+    assert!(
+        http_hash.is_null(),
+        "a freshly indexed file's contentHash is null over HTTP (FR-FC-09): {http_hash}"
+    );
+    assert_eq!(
+        ffi_hash, http_hash,
+        "alexandria_index_files_json must report the same null hash HTTP does, \
+         not \"\" (FR-FC-24)"
+    );
 }
 
 fn wait_for_http_files(
