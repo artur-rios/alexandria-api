@@ -31,6 +31,9 @@ mod rename;
 #[path = "catalog/restore.rs"]
 mod restore;
 
+#[path = "catalog/run_control.rs"]
+mod run_control;
+
 #[path = "catalog/runs.rs"]
 mod runs;
 

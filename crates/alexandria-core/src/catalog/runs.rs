@@ -39,6 +39,12 @@ impl RunKind {
 /// failed, which are counted in the run's own `failed` tally. `Failed` is
 /// reserved for a run that could not proceed at all. `Interrupted` is what
 /// startup reconciliation leaves behind for a run whose process stopped.
+///
+/// `Paused` and `Cancelled` are what an owner asked for. `Paused` is the only
+/// non-terminal one of the five: the run stopped where it was and can be
+/// picked up again, so it carries no `finished_at` and keeps the `phase` that
+/// says where it stopped. `Cancelled` is terminal, exactly like `Complete`
+/// and `Failed`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RunStatus {
@@ -46,6 +52,8 @@ pub enum RunStatus {
     Complete,
     Failed,
     Interrupted,
+    Paused,
+    Cancelled,
 }
 
 impl RunStatus {
@@ -55,6 +63,8 @@ impl RunStatus {
             RunStatus::Complete => "complete",
             RunStatus::Failed => "failed",
             RunStatus::Interrupted => "interrupted",
+            RunStatus::Paused => "paused",
+            RunStatus::Cancelled => "cancelled",
         }
     }
 
@@ -64,6 +74,8 @@ impl RunStatus {
             "complete" => Ok(RunStatus::Complete),
             "failed" => Ok(RunStatus::Failed),
             "interrupted" => Ok(RunStatus::Interrupted),
+            "paused" => Ok(RunStatus::Paused),
+            "cancelled" => Ok(RunStatus::Cancelled),
             other => Err(DomainError::internal(format!(
                 "unknown run status: {other}"
             ))),
@@ -185,6 +197,26 @@ pub trait CatalogRunRepository: Send + Sync {
         error: &str,
         finished_at: DateTime<Utc>,
     ) -> Result<(), DomainError>;
+
+    /// Stop a run's record short, leaving it resumable.
+    ///
+    /// The one transition that is *not* terminal, which is why it is the one
+    /// that writes neither `finished_at` nor a tally, and the one that leaves
+    /// `phase` alone: `finish`, `fail`, and `cancel` clear it because
+    /// `status = 'complete'` beside `phase = 'processing'` is a
+    /// contradiction, but `status = 'paused'` beside it is exactly the fact a
+    /// client needs — the run stopped mid-walk, not mid-discovery.
+    ///
+    /// `paused_at` is when it stopped: the input a later resume subtracts to
+    /// keep `active_millis` honest about time spent working.
+    async fn pause(&self, id: Uuid, paused_at: DateTime<Utc>) -> Result<(), DomainError>;
+
+    /// Close a run's record as `cancelled` — the owner abandoned it.
+    ///
+    /// Terminal, so it stamps `finished_at` and clears `phase` exactly as
+    /// `finish` and `fail` do. The progress columns stay: how far a cancelled
+    /// run got is still true, and still worth reporting.
+    async fn cancel(&self, id: Uuid, cancelled_at: DateTime<Utc>) -> Result<(), DomainError>;
 
     /// Flush a run's live progress into its record (FR-FC-28).
     ///
@@ -344,6 +376,33 @@ impl CatalogRunRepository for SqliteCatalogRunRepository {
         .bind(RunStatus::Failed.as_str())
         .bind(finished_at.to_rfc3339())
         .bind(error)
+        .bind(id.to_string())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn pause(&self, id: Uuid, paused_at: DateTime<Utc>) -> Result<(), DomainError> {
+        // No `phase = NULL` here, unlike every other transition below and
+        // above: a paused run is not terminal, so its phase is not a
+        // contradiction but the very thing that says where it stopped.
+        // No `finished_at` either — it has not finished.
+        sqlx::query("UPDATE catalog_runs SET status = ?, paused_at = ? WHERE id = ?")
+            .bind(RunStatus::Paused.as_str())
+            .bind(paused_at.to_rfc3339())
+            .bind(id.to_string())
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn cancel(&self, id: Uuid, cancelled_at: DateTime<Utc>) -> Result<(), DomainError> {
+        // `phase = NULL`: terminal, exactly as in `finish` and `fail`.
+        sqlx::query(
+            "UPDATE catalog_runs SET status = ?, finished_at = ?, phase = NULL WHERE id = ?",
+        )
+        .bind(RunStatus::Cancelled.as_str())
+        .bind(cancelled_at.to_rfc3339())
         .bind(id.to_string())
         .execute(&self.pool)
         .await?;

@@ -1,18 +1,21 @@
+use std::sync::Arc;
+
 use uuid::Uuid;
 
 use alexandria_core::auth::AuthService;
 use alexandria_core::catalog::clock::Clock;
 use alexandria_core::catalog::commands::refresh::{RefreshHandler, RefreshStarted};
+use alexandria_core::catalog::commands::run_control::RunControlHandler;
 use alexandria_core::catalog::fs::Filesystem;
 use alexandria_core::catalog::repos::CatalogRepository;
-use alexandria_core::catalog::run_registry::RunRegistry;
+use alexandria_core::catalog::run_registry::{RunPhase, RunRegistry};
 use alexandria_core::catalog::runs::{CatalogRunRepository, RunCounts, RunKind, RunStatus};
 use alexandria_core::errors::DomainError;
 
 use crate::common::{
-    a_cataloged_file, a_cataloged_file_with_hash, a_cataloged_missing_file, fixed_clock, now,
-    FailingCatalogRepository, FailingCatalogRunRepository, FakeAuth, FakeCatalogRepository,
-    FakeCatalogRunRepository, FakeFilesystem,
+    a_cataloged_file, a_cataloged_file_with_hash, a_cataloged_missing_file, fixed_clock, interrupt,
+    now, FailingCatalogRepository, FailingCatalogRunRepository, FakeAuth, FakeCatalogRepository,
+    FakeCatalogRunRepository, FakeFilesystem, InterruptingFilesystem, Seam,
 };
 
 const TOKEN: &str = "bearer-token";
@@ -763,5 +766,84 @@ async fn given_a_progress_flush_that_fails_when_execute_then_the_refresh_still_c
         recorded.status,
         RunStatus::Complete,
         "a failed flush must not fail the run"
+    );
+}
+
+/// How many cataloged paths the pause walk below is given. Comfortably more
+/// than [`TEST_CONCURRENCY`], so that even if every path already in flight
+/// when the signal is raised passes its check, paths are still guaranteed to
+/// be left unprocessed.
+const HALT_WALK_PATHS: usize = 10;
+
+#[tokio::test]
+async fn given_a_refresh_walk_in_flight_when_paused_then_it_stops_with_paths_unprocessed() {
+    // A refresh is the same shape as an index — a discovery, then a per-entry
+    // loop — so it honours the signal in the same place. The interrupt fires
+    // inside the first path's `stat`, which is the first thing `refresh_one`
+    // does, so the walk is genuinely under way when the real control handler
+    // pauses it.
+    let repo = FakeCatalogRepository::new();
+    for n in 0..HALT_WALK_PATHS {
+        repo.seed(a_cataloged_file(&format!("/library/{n}.mp3"), 1, None));
+    }
+    let runs = FakeCatalogRunRepository::new();
+    let registry = RunRegistry::new();
+    let run_id = Uuid::new_v4();
+    runs.start(run_id, RunKind::Refresh, None, now())
+        .await
+        .unwrap();
+    let control = Arc::new(RunControlHandler::new(
+        FakeAuth::Allowing,
+        runs.clone(),
+        fixed_clock(now()),
+        registry.clone(),
+    ));
+    let pause_mid_walk = interrupt(move || {
+        let control = Arc::clone(&control);
+        async move { control.pause(run_id, TOKEN).await.expect("pause") }
+    });
+    let handler = RefreshHandler::new(
+        FakeAuth::Allowing,
+        repo.clone(),
+        InterruptingFilesystem::new(
+            FakeFilesystem::builder().build(),
+            Seam::FirstStat,
+            pause_mid_walk,
+        ),
+        fixed_clock(now()),
+        TEST_CONCURRENCY,
+        runs.clone(),
+        registry.clone(),
+    );
+
+    let outcome = handler.execute(run_id).await.expect("execute");
+
+    let tallied = outcome.refreshed + outcome.marked_missing + outcome.unchanged + outcome.failed;
+    assert!(
+        tallied > 0,
+        "the walk must have got started before it was paused"
+    );
+    assert!(
+        tallied < HALT_WALK_PATHS,
+        "paths must have been left unprocessed, got {tallied} of {HALT_WALK_PATHS}"
+    );
+    let recorded = runs.get_recorded(run_id).expect("recorded run");
+    assert_eq!(recorded.status, RunStatus::Paused);
+    assert!(recorded.paused_at.is_some());
+    assert!(recorded.finished_at.is_none());
+    assert_eq!(
+        recorded.processed,
+        Some(tallied),
+        "the tally survives the pause, and counts only paths actually processed"
+    );
+    assert_eq!(recorded.total, Some(HALT_WALK_PATHS));
+    assert_eq!(
+        recorded.phase,
+        Some(RunPhase::Processing),
+        "pause is not terminal, so its phase says where the run stopped"
+    );
+    assert!(
+        registry.get(run_id).is_none(),
+        "a run that stopped must not leave its cell behind"
     );
 }

@@ -8,13 +8,13 @@ use crate::catalog::audio_tags::AudioMetadataReader;
 use crate::catalog::classify::classify_by_extension;
 use crate::catalog::clock::Clock;
 use crate::catalog::comic_tags::ComicMetadataReader;
-use crate::catalog::commands::{flush_progress, PROGRESS_FLUSH_SECONDS};
+use crate::catalog::commands::{flush_progress, record_halt, PROGRESS_FLUSH_SECONDS};
 use crate::catalog::document_tags::DocumentMetadataReader;
 use crate::catalog::fs::{FileEntry, Filesystem};
 use crate::catalog::image_tags::ImageMetadataReader;
 use crate::catalog::model::{FileType, NewFile};
 use crate::catalog::repos::CatalogRepository;
-use crate::catalog::run_registry::{RunCell, RunPhase, RunRegistry};
+use crate::catalog::run_registry::{RunCell, RunPhase, RunRegistry, RunSignal};
 use crate::catalog::runs::{CatalogRunRepository, RunCounts, RunKind};
 use crate::catalog::video_tags::VideoMetadataReader;
 use crate::errors::DomainError;
@@ -128,6 +128,16 @@ enum EntryOutcome {
     Skipped,
     AlreadyCataloged,
     Failed,
+    /// The run was paused or cancelled before this entry did any work.
+    ///
+    /// It contributes to no counter, and does not advance `processed`
+    /// either — the run never touched it. That deliberately breaks the tally
+    /// invariant the other four keep: for a halted run, `scanned` exceeds
+    /// `indexed + skipped + already_cataloged + failed`, because the
+    /// difference is the entries that were never processed. Counting them
+    /// anywhere would be worse — it would tell a client, and Task 8's
+    /// resume, that the run got through files it never opened.
+    Halted,
 }
 
 /// What `execute`'s processing loop carries from one entry to the next: the
@@ -344,11 +354,32 @@ where
             }
         };
         let scanned = entries.len();
+        let cell: &RunCell = &run_cell;
+        // Discovery is checked exactly once, here: `walkdir`'s collect above
+        // is a single blocking call with no interruption point, and discovery
+        // is seconds against a walk of minutes. The flush comes first so the
+        // row keeps `phase = 'discovering'` — for a pause, that is what tells
+        // a client the run stopped before the processing loop ever began.
+        let signal = cell.signal();
+        if signal != RunSignal::None {
+            flush_progress(&self.runs, run_id, &cell.snapshot()).await;
+            // Closed before the terminal write, as on every other exit.
+            drop(run_cell);
+            record_halt(&self.runs, run_id, signal, self.clock.now()).await;
+            tracing::info!(%run_id, scanned, ?signal, "indexing stopped during discovery");
+            return Ok(IndexOutcome {
+                run_id,
+                scanned,
+                indexed: 0,
+                skipped: 0,
+                already_cataloged: 0,
+                failed: 0,
+            });
+        }
         // Discovery is done: the denominator is known, so both halves of the
         // progress fraction are meaningful from here on. Flushed immediately
         // rather than waiting out an interval, so a client that reads the row
         // right after the walk sees the phase it is actually in.
-        let cell: &RunCell = &run_cell;
         cell.set_total(scanned);
         cell.set_phase(RunPhase::Processing);
         flush_progress(&self.runs, run_id, &cell.snapshot()).await;
@@ -360,6 +391,14 @@ where
 
         let tally = stream::iter(entries)
             .map(|entry| async move {
+                match cell.signal() {
+                    RunSignal::None => {}
+                    // The window drains rather than aborting: entries already
+                    // in flight are a stat and a header read each, so this
+                    // costs milliseconds. Draining is what lets the tally be
+                    // written once, correctly, after the last one lands.
+                    RunSignal::Pause | RunSignal::Cancel => return EntryOutcome::Halted,
+                }
                 let Some(file_type) = classify_by_extension(&entry.name) else {
                     return EntryOutcome::Skipped;
                 };
@@ -386,6 +425,12 @@ where
                         EntryOutcome::Skipped => tally.skipped += 1,
                         EntryOutcome::AlreadyCataloged => tally.already_cataloged += 1,
                         EntryOutcome::Failed => tally.failed += 1,
+                        // Counted nowhere, and not advanced past either: this
+                        // entry was never processed, and a paused run
+                        // reporting `processed == total` would be claiming it
+                        // got through files it never opened — which is
+                        // exactly the number a resume reads.
+                        EntryOutcome::Halted => return tally,
                     }
                     // FR-FC-28: one entry done, whatever it resolved to. A
                     // progress bar that stalled on the skipped and unreadable
@@ -420,11 +465,16 @@ where
             ..
         } = tally;
 
+        // Whether the walk ran to the end or was stopped partway through.
+        // Read once, after the window has drained, so the log line and the
+        // row below cannot disagree about what happened.
+        let signal = cell.signal();
+
         // The run is over: publish the final tally before the cell goes away,
         // so a read after this point falls back to the true end state rather
         // than to whatever the last interval flush happened to catch. Then
-        // close, ahead of the `finish` write below, so no reader can overlay
-        // a live cell on a run that is already complete.
+        // close, ahead of the terminal write below, so no reader can overlay
+        // a live cell on a run that has already stopped.
         flush_progress(&self.runs, run_id, &cell.snapshot()).await;
         drop(run_cell);
 
@@ -435,29 +485,42 @@ where
             skipped,
             already_cataloged,
             failed,
-            "indexing complete"
+            // For a halted run these five do not add up: `scanned` counts
+            // every entry discovery found, and the difference is the entries
+            // that were never processed. See `EntryOutcome::Halted`.
+            ?signal,
+            "{}",
+            match signal {
+                RunSignal::None => "indexing complete",
+                RunSignal::Pause => "indexing paused",
+                RunSignal::Cancel => "indexing cancelled",
+            }
         );
-        // FR-FC-27: the walk finished. Per-file failures are inside the
-        // tally and do not make the run failed.
-        let finished_at = self.clock.now();
-        let counts = RunCounts::Index {
-            scanned,
-            indexed,
-            skipped,
-            already_cataloged,
-            failed,
-        };
-        if let Err(err) = retry_on_busy(BUSY_ATTEMPTS, || {
-            self.runs.finish(run_id, counts, finished_at)
-        })
-        .await
-        {
-            // FR-FC-27: the walk succeeded — only the bookkeeping write
-            // failed. Reporting the run as failed would be a lie about work
-            // that did happen, and the tally is already in the log line
-            // above. The record stays `running` until startup
-            // reconciliation (FR-FC-29) closes it.
-            tracing::warn!(%run_id, error = %err, "could not record run completion");
+        let ended_at = self.clock.now();
+        if signal == RunSignal::None {
+            // FR-FC-27: the walk finished. Per-file failures are inside the
+            // tally and do not make the run failed.
+            let counts = RunCounts::Index {
+                scanned,
+                indexed,
+                skipped,
+                already_cataloged,
+                failed,
+            };
+            if let Err(err) =
+                retry_on_busy(BUSY_ATTEMPTS, || self.runs.finish(run_id, counts, ended_at)).await
+            {
+                // FR-FC-27: the walk succeeded — only the bookkeeping write
+                // failed. Reporting the run as failed would be a lie about
+                // work that did happen, and the tally is already in the log
+                // line above. The record stays `running` until startup
+                // reconciliation (FR-FC-29) closes it.
+                tracing::warn!(%run_id, error = %err, "could not record run completion");
+            }
+        } else {
+            // No `finish`: the walk did not finish, so writing a tally that
+            // claims it did would misreport a partial pass as a complete one.
+            record_halt(&self.runs, run_id, signal, ended_at).await;
         }
         Ok(IndexOutcome {
             run_id,

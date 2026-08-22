@@ -1,11 +1,14 @@
+use std::sync::Arc;
+
 use uuid::Uuid;
 
 use alexandria_core::auth::AuthService;
 use alexandria_core::catalog::audio_tags::{AudioMetadataReader, AudioTags};
 use alexandria_core::catalog::classify::classify_by_extension;
-use alexandria_core::catalog::clock::Clock;
+use alexandria_core::catalog::clock::{Clock, FixedClock};
 use alexandria_core::catalog::comic_tags::{ComicMetadataReader, ComicTags};
 use alexandria_core::catalog::commands::index::{IndexHandler, IndexRequest, IndexStarted};
+use alexandria_core::catalog::commands::run_control::RunControlHandler;
 use alexandria_core::catalog::document_tags::{DocumentMetadataReader, DocumentTags};
 use alexandria_core::catalog::fs::Filesystem;
 use alexandria_core::catalog::image_tags::{ImageMetadataReader, ImageTags};
@@ -17,10 +20,11 @@ use alexandria_core::catalog::video_tags::{VideoDuration, VideoMetadataReader, V
 use alexandria_core::errors::DomainError;
 
 use crate::common::{
-    existing_file, fixed_clock, now, FailingCatalogRunRepository, FailingListFilesystem,
+    existing_file, fixed_clock, interrupt, now, FailingCatalogRunRepository, FailingListFilesystem,
     FakeAudioMetadataReader, FakeAuth, FakeCatalogRepository, FakeCatalogRunRepository,
     FakeComicMetadataReader, FakeDocumentMetadataReader, FakeFilesystem, FakeImageMetadataReader,
-    FakeVideoMetadataReader, SteppingClock,
+    FakeVideoMetadataReader, Interrupt, InterruptingAudioMetadataReader, InterruptingFilesystem,
+    Seam, SteppingClock,
 };
 
 const ROOT: &str = "/library";
@@ -2419,5 +2423,242 @@ async fn given_a_walk_longer_than_the_flush_interval_when_execute_then_intermedi
         history.last().map(|progress| progress.processed),
         Some(6),
         "the last flush is the true end state"
+    );
+}
+
+/// How many entries the pause/cancel walks below are given. Comfortably more
+/// than [`TEST_CONCURRENCY`], so that even if every entry already in flight
+/// when the signal is raised passes its check, entries are still guaranteed
+/// to be left unprocessed.
+const HALT_WALK_FILES: usize = 10;
+
+/// A filesystem of `HALT_WALK_FILES` audio files under [`ROOT`], so every
+/// entry reaches the audio tag reader — which is where the halt walks below
+/// hang their interrupt.
+fn audio_library() -> FakeFilesystem {
+    let mut builder = FakeFilesystem::builder();
+    for n in 0..HALT_WALK_FILES {
+        builder = builder.with_file(
+            ROOT,
+            &format!("/library/{n}.mp3"),
+            &format!("{n}.mp3"),
+            "unused",
+        );
+    }
+    builder.build()
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ControlVerb {
+    Pause,
+    Cancel,
+}
+
+fn control_handler(
+    runs: FakeCatalogRunRepository,
+    registry: RunRegistry,
+) -> Arc<RunControlHandler<FakeAuth, FakeCatalogRunRepository, FixedClock>> {
+    Arc::new(RunControlHandler::new(
+        FakeAuth::Allowing,
+        runs,
+        fixed_clock(now()),
+        registry,
+    ))
+}
+
+/// An [`Interrupt`] that calls the real `RunControlHandler` — so the walks
+/// below are stopped the way a client stops one, not by poking the registry.
+fn control_interrupt(
+    control: Arc<RunControlHandler<FakeAuth, FakeCatalogRunRepository, FixedClock>>,
+    run_id: Uuid,
+    verb: ControlVerb,
+) -> Interrupt {
+    interrupt(move || {
+        let control = Arc::clone(&control);
+        async move {
+            match verb {
+                ControlVerb::Pause => control.pause(run_id, TOKEN).await.expect("pause"),
+                ControlVerb::Cancel => control.cancel(run_id, TOKEN).await.expect("cancel"),
+            }
+        }
+    })
+}
+
+#[tokio::test]
+async fn given_an_index_walk_in_flight_when_paused_then_it_stops_with_entries_unprocessed() {
+    // The point of pause is not that it flips a status on a run that already
+    // ended — it is that it stops one that is still going. The interrupt
+    // fires inside the first entry's tag read, so the walk is genuinely under
+    // way when the real control handler pauses it, and every entry the loop
+    // has not started yet is halted before it does any work.
+    let runs = FakeCatalogRunRepository::new();
+    let registry = RunRegistry::new();
+    let catalog = FakeCatalogRepository::new();
+    let run_id = Uuid::new_v4();
+    runs.start(run_id, RunKind::Index, Some(ROOT), now())
+        .await
+        .unwrap();
+    let pause_mid_walk = control_interrupt(
+        control_handler(runs.clone(), registry.clone()),
+        run_id,
+        ControlVerb::Pause,
+    );
+    let handler = handler_with_registry(
+        FakeAuth::Allowing,
+        catalog.clone(),
+        audio_library(),
+        fixed_clock(now()),
+        InterruptingAudioMetadataReader::new(pause_mid_walk),
+        FakeImageMetadataReader::new(),
+        FakeDocumentMetadataReader::new(),
+        FakeVideoMetadataReader::new(),
+        FakeComicMetadataReader::new(),
+        runs.clone(),
+        registry.clone(),
+    );
+
+    let outcome = handler.execute(ROOT, run_id).await.expect("execute");
+
+    assert_eq!(outcome.scanned, HALT_WALK_FILES, "discovery found them all");
+    let tallied = outcome.indexed + outcome.skipped + outcome.already_cataloged + outcome.failed;
+    assert!(
+        tallied > 0,
+        "the walk must have got started before it was paused"
+    );
+    // Deliberate, and the reason `scanned` is not the sum of the rest for a
+    // halted run: a halted entry was never processed, so it contributes to no
+    // counter. See `EntryOutcome::Halted`.
+    assert!(
+        tallied < HALT_WALK_FILES,
+        "entries must have been left unprocessed, got {tallied} of {HALT_WALK_FILES}"
+    );
+    assert_eq!(
+        catalog.count(),
+        outcome.indexed,
+        "a halted entry did no work at all — nothing of it reached the catalog"
+    );
+
+    let recorded = runs.get_recorded(run_id).expect("recorded run");
+    assert_eq!(recorded.status, RunStatus::Paused);
+    assert!(recorded.paused_at.is_some());
+    assert!(
+        recorded.finished_at.is_none(),
+        "a paused run has not finished — it can still be resumed"
+    );
+    assert_eq!(
+        recorded.processed,
+        Some(tallied),
+        "the tally survives the pause, and counts only entries actually processed"
+    );
+    assert_eq!(
+        recorded.total,
+        Some(HALT_WALK_FILES),
+        "the denominator is what discovery found, not what the walk got through"
+    );
+    assert_eq!(
+        recorded.phase,
+        Some(RunPhase::Processing),
+        "pause is not terminal, so its phase says where the run stopped"
+    );
+    assert!(
+        registry.get(run_id).is_none(),
+        "a run that stopped must not leave its cell behind"
+    );
+}
+
+#[tokio::test]
+async fn given_an_index_walk_in_flight_when_cancelled_then_it_stops_and_is_terminal() {
+    let runs = FakeCatalogRunRepository::new();
+    let registry = RunRegistry::new();
+    let run_id = Uuid::new_v4();
+    runs.start(run_id, RunKind::Index, Some(ROOT), now())
+        .await
+        .unwrap();
+    let cancel_mid_walk = control_interrupt(
+        control_handler(runs.clone(), registry.clone()),
+        run_id,
+        ControlVerb::Cancel,
+    );
+    let handler = handler_with_registry(
+        FakeAuth::Allowing,
+        FakeCatalogRepository::new(),
+        audio_library(),
+        fixed_clock(now()),
+        InterruptingAudioMetadataReader::new(cancel_mid_walk),
+        FakeImageMetadataReader::new(),
+        FakeDocumentMetadataReader::new(),
+        FakeVideoMetadataReader::new(),
+        FakeComicMetadataReader::new(),
+        runs.clone(),
+        registry.clone(),
+    );
+
+    let outcome = handler.execute(ROOT, run_id).await.expect("execute");
+
+    let tallied = outcome.indexed + outcome.skipped + outcome.already_cataloged + outcome.failed;
+    assert!(tallied < HALT_WALK_FILES, "entries were left unprocessed");
+    let recorded = runs.get_recorded(run_id).expect("recorded run");
+    assert_eq!(recorded.status, RunStatus::Cancelled);
+    assert!(
+        recorded.finished_at.is_some(),
+        "cancel is terminal, so the run has a finish time"
+    );
+    assert_eq!(
+        recorded.phase, None,
+        "a terminal run publishes no phase — unlike a paused one"
+    );
+    assert_eq!(
+        recorded.processed,
+        Some(tallied),
+        "how far a cancelled run got is still worth reporting"
+    );
+}
+
+#[tokio::test]
+async fn given_a_run_paused_during_discovery_when_execute_then_no_entry_is_processed() {
+    // `walkdir`'s collect is one blocking call with no interruption point, so
+    // discovery is checked exactly once, the moment it returns. A run stopped
+    // there has processed nothing, and its phase says so.
+    let runs = FakeCatalogRunRepository::new();
+    let registry = RunRegistry::new();
+    let catalog = FakeCatalogRepository::new();
+    let run_id = Uuid::new_v4();
+    runs.start(run_id, RunKind::Index, Some(ROOT), now())
+        .await
+        .unwrap();
+    let pause_during_discovery = control_interrupt(
+        control_handler(runs.clone(), registry.clone()),
+        run_id,
+        ControlVerb::Pause,
+    );
+    let handler = handler_with_registry(
+        FakeAuth::Allowing,
+        catalog.clone(),
+        InterruptingFilesystem::new(audio_library(), Seam::Discovery, pause_during_discovery),
+        fixed_clock(now()),
+        FakeAudioMetadataReader::new(),
+        FakeImageMetadataReader::new(),
+        FakeDocumentMetadataReader::new(),
+        FakeVideoMetadataReader::new(),
+        FakeComicMetadataReader::new(),
+        runs.clone(),
+        registry.clone(),
+    );
+
+    let outcome = handler.execute(ROOT, run_id).await.expect("execute");
+
+    assert_eq!(
+        outcome.scanned, HALT_WALK_FILES,
+        "discovery finished; it is the processing loop that never began"
+    );
+    assert_eq!(outcome.indexed, 0);
+    assert_eq!(catalog.count(), 0, "no entry was touched");
+    let recorded = runs.get_recorded(run_id).expect("recorded run");
+    assert_eq!(recorded.status, RunStatus::Paused);
+    assert_eq!(recorded.processed, Some(0));
+    assert_eq!(
+        recorded.phase,
+        Some(RunPhase::Discovering),
+        "a run paused in discovery must be distinguishable from one paused mid-walk"
     );
 }

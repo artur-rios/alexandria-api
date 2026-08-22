@@ -1,7 +1,9 @@
+use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
-use crate::catalog::run_registry::RunProgress;
+use crate::catalog::run_registry::{RunProgress, RunSignal};
 use crate::catalog::runs::CatalogRunRepository;
+use crate::retry::{retry_on_busy, BUSY_ATTEMPTS};
 
 pub mod edit_content;
 pub mod edit_metadata;
@@ -11,6 +13,7 @@ pub mod purge_on_disk;
 pub mod refresh;
 pub mod rename;
 pub mod restore;
+pub mod run_control;
 pub mod soft_delete;
 
 /// How often an in-flight run flushes its progress into its record
@@ -40,5 +43,34 @@ where
 {
     if let Err(err) = runs.record_progress(run_id, progress).await {
         tracing::warn!(%run_id, error = %err, "could not flush run progress");
+    }
+}
+
+/// Record a run that its control signal stopped, best-effort.
+///
+/// Shared by both walks, which reach it identically: the signal is read once
+/// after the in-flight window has drained, and the row is written once, with
+/// the tally already flushed. Retried on a busy database like the other
+/// terminal writes, and its failure is logged rather than propagated for the
+/// reason `finish`'s is — the work the run did actually happened, and the
+/// caller's own result must not be replaced by a bookkeeping error. The row
+/// stays `running` until startup reconciliation (FR-FC-29) closes it.
+pub(crate) async fn record_halt<RR>(
+    runs: &RR,
+    run_id: Uuid,
+    signal: RunSignal,
+    ended_at: DateTime<Utc>,
+) where
+    RR: CatalogRunRepository,
+{
+    let recorded = match signal {
+        // Not a halt: both call sites branch on the signal before they get
+        // here, and a run nobody stopped has nothing to record either way.
+        RunSignal::None => return,
+        RunSignal::Pause => retry_on_busy(BUSY_ATTEMPTS, || runs.pause(run_id, ended_at)).await,
+        RunSignal::Cancel => retry_on_busy(BUSY_ATTEMPTS, || runs.cancel(run_id, ended_at)).await,
+    };
+    if let Err(err) = recorded {
+        tracing::warn!(%run_id, ?signal, error = %err, "could not record that the run stopped");
     }
 }

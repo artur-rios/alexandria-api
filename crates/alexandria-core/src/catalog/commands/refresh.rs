@@ -5,11 +5,11 @@ use uuid::Uuid;
 
 use crate::auth::AuthService;
 use crate::catalog::clock::Clock;
-use crate::catalog::commands::{flush_progress, PROGRESS_FLUSH_SECONDS};
+use crate::catalog::commands::{flush_progress, record_halt, PROGRESS_FLUSH_SECONDS};
 use crate::catalog::fs::Filesystem;
 use crate::catalog::model::File;
 use crate::catalog::repos::CatalogRepository;
-use crate::catalog::run_registry::{RunCell, RunPhase, RunRegistry};
+use crate::catalog::run_registry::{RunCell, RunPhase, RunRegistry, RunSignal};
 use crate::catalog::runs::{CatalogRunRepository, RunCounts, RunKind};
 use crate::errors::DomainError;
 use crate::retry::{retry_on_busy, BUSY_ATTEMPTS};
@@ -165,10 +165,28 @@ where
             }
         };
 
+        let cell: &RunCell = &run_cell;
+        // Checked once, the moment discovery returns — see
+        // `IndexHandler::execute`, which does the same for the same reasons.
+        let signal = cell.signal();
+        if signal != RunSignal::None {
+            flush_progress(&self.runs, run_id, &cell.snapshot()).await;
+            // Closed before the terminal write, as on every other exit.
+            drop(run_cell);
+            record_halt(&self.runs, run_id, signal, self.clock.now()).await;
+            tracing::info!(%run_id, ?signal, "re-index stopped during discovery");
+            return Ok(RefreshOutcome {
+                run_id,
+                refreshed: 0,
+                marked_missing: 0,
+                unchanged: 0,
+                failed: 0,
+            });
+        }
+
         // Discovery is done: the denominator is known. Flushed immediately
         // rather than waiting out an interval, so a client that reads the row
         // right after the listing sees the phase it is actually in.
-        let cell: &RunCell = &run_cell;
         cell.set_total(files.len());
         cell.set_phase(RunPhase::Processing);
         flush_progress(&self.runs, run_id, &cell.snapshot()).await;
@@ -178,6 +196,12 @@ where
 
         let tally = stream::iter(files)
             .map(|file| async move {
+                match cell.signal() {
+                    RunSignal::None => {}
+                    // The window drains rather than aborting — a stat each,
+                    // milliseconds. See `IndexHandler::execute`.
+                    RunSignal::Pause | RunSignal::Cancel => return PathOutcome::Halted,
+                }
                 match self.refresh_one(&file, now).await {
                     Ok(outcome) => outcome,
                     Err(err) => {
@@ -200,6 +224,9 @@ where
                         PathOutcome::MarkedMissing => tally.marked_missing += 1,
                         PathOutcome::Unchanged => tally.unchanged += 1,
                         PathOutcome::Failed => tally.failed += 1,
+                        // Counted nowhere and not advanced past: this path
+                        // was never processed. See `EntryOutcome::Halted`.
+                        PathOutcome::Halted => return tally,
                     }
                     // FR-FC-28: one cataloged path done, whatever it resolved to.
                     cell.advance();
@@ -226,9 +253,14 @@ where
             ..
         } = tally;
 
+        // Whether the pass ran to the end or was stopped partway through.
+        // Read once, after the window has drained — see
+        // `IndexHandler::execute`.
+        let signal = cell.signal();
+
         // The run is over: publish the final tally before the cell goes away,
-        // then close ahead of the `finish` write below so no reader can
-        // overlay a live cell on a run that is already complete.
+        // then close ahead of the terminal write below so no reader can
+        // overlay a live cell on a run that has already stopped.
         flush_progress(&self.runs, run_id, &cell.snapshot()).await;
         drop(run_cell);
 
@@ -245,28 +277,41 @@ where
             marked_missing = outcome.marked_missing,
             unchanged = outcome.unchanged,
             failed = outcome.failed,
-            "re-index complete"
+            // For a halted run these do not account for every cataloged path:
+            // the difference is the paths that were never processed. See
+            // `PathOutcome::Halted`.
+            ?signal,
+            "{}",
+            match signal {
+                RunSignal::None => "re-index complete",
+                RunSignal::Pause => "re-index paused",
+                RunSignal::Cancel => "re-index cancelled",
+            }
         );
-        // FR-FC-27: the walk finished. Per-file failures are inside the
-        // tally and do not make the run failed.
-        let finished_at = self.clock.now();
-        let counts = RunCounts::Refresh {
-            refreshed,
-            marked_missing,
-            unchanged,
-            failed,
-        };
-        if let Err(err) = retry_on_busy(BUSY_ATTEMPTS, || {
-            self.runs.finish(run_id, counts, finished_at)
-        })
-        .await
-        {
-            // FR-FC-27: the walk succeeded — only the bookkeeping write
-            // failed. Reporting the run as failed would be a lie about work
-            // that did happen, and the tally is already in the log line
-            // above. The record stays `running` until startup
-            // reconciliation (FR-FC-29) closes it.
-            tracing::warn!(%run_id, error = %err, "could not record run completion");
+        let ended_at = self.clock.now();
+        if signal == RunSignal::None {
+            // FR-FC-27: the walk finished. Per-file failures are inside the
+            // tally and do not make the run failed.
+            let counts = RunCounts::Refresh {
+                refreshed,
+                marked_missing,
+                unchanged,
+                failed,
+            };
+            if let Err(err) =
+                retry_on_busy(BUSY_ATTEMPTS, || self.runs.finish(run_id, counts, ended_at)).await
+            {
+                // FR-FC-27: the walk succeeded — only the bookkeeping write
+                // failed. Reporting the run as failed would be a lie about
+                // work that did happen, and the tally is already in the log
+                // line above. The record stays `running` until startup
+                // reconciliation (FR-FC-29) closes it.
+                tracing::warn!(%run_id, error = %err, "could not record run completion");
+            }
+        } else {
+            // No `finish`: the pass did not finish, so writing a tally that
+            // claims it did would misreport a partial pass as a complete one.
+            record_halt(&self.runs, run_id, signal, ended_at).await;
         }
         Ok(outcome)
     }
@@ -326,6 +371,10 @@ enum PathOutcome {
     MarkedMissing,
     Unchanged,
     Failed,
+    /// The run was paused or cancelled before this path did any work. The
+    /// counterpart of `EntryOutcome::Halted` — it contributes to no counter
+    /// and does not advance `processed`, for the reasons documented there.
+    Halted,
 }
 
 /// What `execute`'s processing loop carries from one path to the next: the

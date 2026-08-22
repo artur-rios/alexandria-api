@@ -2381,6 +2381,29 @@ impl CatalogRunRepository for FakeCatalogRunRepository {
         Ok(())
     }
 
+    async fn pause(&self, id: Uuid, paused_at: DateTime<Utc>) -> Result<(), DomainError> {
+        let mut runs = self.runs.lock().unwrap();
+        if let Some(run) = runs.get_mut(&id) {
+            run.status = RunStatus::Paused;
+            run.paused_at = Some(paused_at);
+            // Mirrors the SQLite adapter: pause is the one non-terminal
+            // transition, so unlike `finish` / `fail` / `cancel` it leaves
+            // `phase` describing where the run actually stopped.
+        }
+        Ok(())
+    }
+
+    async fn cancel(&self, id: Uuid, cancelled_at: DateTime<Utc>) -> Result<(), DomainError> {
+        let mut runs = self.runs.lock().unwrap();
+        if let Some(run) = runs.get_mut(&id) {
+            run.status = RunStatus::Cancelled;
+            run.finished_at = Some(cancelled_at);
+            // Terminal, so the phase clears exactly as `finish`'s does.
+            run.phase = None;
+        }
+        Ok(())
+    }
+
     async fn record_progress(&self, id: Uuid, progress: &RunProgress) -> Result<(), DomainError> {
         self.progress_history.lock().unwrap().push(*progress);
         if self.progress_fails.load(Ordering::Relaxed) {
@@ -2680,12 +2703,151 @@ impl CatalogRunRepository for FailingCatalogRunRepository {
         Ok(())
     }
 
+    async fn pause(&self, _id: Uuid, _paused_at: DateTime<Utc>) -> Result<(), DomainError> {
+        unimplemented!("not exercised by either failing-repository test")
+    }
+
+    async fn cancel(&self, _id: Uuid, _cancelled_at: DateTime<Utc>) -> Result<(), DomainError> {
+        unimplemented!("not exercised by either failing-repository test")
+    }
+
     async fn get(&self, _id: Uuid) -> Result<Option<CatalogRun>, DomainError> {
         unimplemented!("not exercised by either failing-repository test")
     }
 
     async fn interrupt_running(&self, _now: DateTime<Utc>) -> Result<u64, DomainError> {
         unimplemented!("not exercised by either failing-repository test")
+    }
+}
+
+/// An async action a collaborator runs from *inside* a walk that is already
+/// under way.
+///
+/// The interesting question about pause is not what it does to a run that has
+/// already stopped — it is whether it stops one mid-flight, leaving entries
+/// unprocessed. There is no seam between "the walk started" and "the walk
+/// ended" other than the collaborators the per-entry work calls, so the
+/// doubles below take one of these and run it once, on their first call.
+///
+/// Boxed rather than a generic parameter because the future has to outlive
+/// the call that made it, and a `Fn() -> impl Future` field cannot say that.
+pub type Interrupt = Arc<dyn Fn() -> futures_util::future::BoxFuture<'static, ()> + Send + Sync>;
+
+/// Wrap an async closure into an [`Interrupt`].
+pub fn interrupt<F, Fut>(action: F) -> Interrupt
+where
+    F: Fn() -> Fut + Send + Sync + 'static,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    Arc::new(move || Box::pin(action()))
+}
+
+/// Which call an [`InterruptingFilesystem`] fires its action on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Seam {
+    /// `list_files`, before it answers — the run is still discovering, and
+    /// has not processed a single entry.
+    Discovery,
+    /// The first per-path `stat` — the run is inside its processing loop,
+    /// which is where `RefreshHandler::refresh_one` starts each path.
+    FirstStat,
+}
+
+/// Runs an [`Interrupt`] once, at the chosen [`Seam`], then delegates every
+/// call to the [`FakeFilesystem`] it wraps.
+pub struct InterruptingFilesystem {
+    inner: FakeFilesystem,
+    seam: Seam,
+    interrupt: Interrupt,
+    fired: AtomicBool,
+}
+
+impl InterruptingFilesystem {
+    pub fn new(inner: FakeFilesystem, seam: Seam, interrupt: Interrupt) -> Self {
+        Self {
+            inner,
+            seam,
+            interrupt,
+            fired: AtomicBool::new(false),
+        }
+    }
+
+    /// Run the action unless it has already run. `swap` rather than a
+    /// load-then-store so two entries in flight at once cannot both fire it.
+    async fn fire_once(&self) {
+        if !self.fired.swap(true, Ordering::Relaxed) {
+            (self.interrupt)().await;
+        }
+    }
+}
+
+impl Filesystem for InterruptingFilesystem {
+    async fn path_exists(&self, root: &str) -> bool {
+        self.inner.path_exists(root).await
+    }
+
+    async fn list_files(&self, root: &str) -> Result<Vec<FileEntry>, DomainError> {
+        if self.seam == Seam::Discovery {
+            self.fire_once().await;
+        }
+        self.inner.list_files(root).await
+    }
+
+    async fn content_hash(&self, path: &str) -> Result<String, DomainError> {
+        self.inner.content_hash(path).await
+    }
+
+    async fn stat(&self, path: &str) -> Result<Option<FileStat>, DomainError> {
+        if self.seam == Seam::FirstStat {
+            self.fire_once().await;
+        }
+        self.inner.stat(path).await
+    }
+
+    async fn rename(&self, from: &str, to: &str) -> Result<(), DomainError> {
+        self.inner.rename(from, to).await
+    }
+
+    async fn remove_file(&self, path: &str) -> Result<bool, DomainError> {
+        self.inner.remove_file(path).await
+    }
+
+    async fn read_file(&self, path: &str) -> Result<String, DomainError> {
+        self.inner.read_file(path).await
+    }
+
+    async fn write_file(&self, path: &str, content: &str) -> Result<(), DomainError> {
+        self.inner.write_file(path, content).await
+    }
+}
+
+/// Runs an [`Interrupt`] the first time it is asked to read audio tags, then
+/// answers `None` like an unseeded [`FakeAudioMetadataReader`] would.
+///
+/// This is the index walk's counterpart to [`InterruptingFilesystem`]:
+/// indexing does not stat per entry, and `CatalogRepository` is far too wide
+/// to wrap, but every audio entry reaches the tag reader inside `index_entry`
+/// — so a walk of `.mp3` files has its seam here.
+pub struct InterruptingAudioMetadataReader {
+    interrupt: Interrupt,
+    fired: AtomicBool,
+}
+
+impl InterruptingAudioMetadataReader {
+    pub fn new(interrupt: Interrupt) -> Self {
+        Self {
+            interrupt,
+            fired: AtomicBool::new(false),
+        }
+    }
+}
+
+impl AudioMetadataReader for InterruptingAudioMetadataReader {
+    async fn read(&self, _path: &str) -> Option<AudioTags> {
+        if !self.fired.swap(true, Ordering::Relaxed) {
+            (self.interrupt)().await;
+        }
+        None
     }
 }
 

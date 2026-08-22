@@ -631,6 +631,108 @@ async fn given_an_interrupted_run_when_read_then_it_publishes_no_phase() {
 }
 
 #[tokio::test]
+async fn given_a_running_run_with_progress_when_paused_then_it_keeps_its_phase_and_stamps_paused_at(
+) {
+    // Pause is the one non-terminal transition, so it is the one that keeps
+    // its phase: a client reading `paused` beside `processing` learns the run
+    // stopped mid-walk rather than mid-discovery, which is exactly what it
+    // needs to know before resuming.
+    let (repo, _dir) = repo().await;
+    let id = Uuid::new_v4();
+    repo.start(id, RunKind::Index, Some("/library"), t(1))
+        .await
+        .expect("start");
+    repo.record_progress(
+        id,
+        &RunProgress {
+            phase: RunPhase::Processing,
+            total: Some(9),
+            processed: 4,
+        },
+    )
+    .await
+    .expect("record progress");
+
+    repo.pause(id, t(2)).await.expect("pause");
+
+    let run = repo.get(id).await.expect("get").expect("run exists");
+    assert_eq!(run.status, RunStatus::Paused);
+    assert_eq!(run.paused_at, Some(t(2)));
+    assert_eq!(
+        run.phase,
+        Some(RunPhase::Processing),
+        "a paused run is not terminal, so its phase still describes where it stopped"
+    );
+    assert_eq!(run.processed, Some(4), "the tally survives the pause");
+    assert!(
+        run.finished_at.is_none(),
+        "a paused run has not finished — it can still be resumed"
+    );
+    let value = serde_json::to_value(&run).expect("serialize");
+    assert_eq!(value.get("status").and_then(|v| v.as_str()), Some("paused"));
+    assert!(value.get("pausedAt").is_some());
+}
+
+#[tokio::test]
+async fn given_a_run_with_progress_when_cancelled_then_it_is_terminal_and_clears_its_phase() {
+    // Cancel is terminal, so it clears the phase for the same reason `finish`
+    // and `fail` do: `status = cancelled` beside `phase = processing` would
+    // tell a client two contradictory things.
+    let (repo, _dir) = repo().await;
+    let id = Uuid::new_v4();
+    repo.start(id, RunKind::Refresh, None, t(1))
+        .await
+        .expect("start");
+    repo.record_progress(
+        id,
+        &RunProgress {
+            phase: RunPhase::Processing,
+            total: Some(9),
+            processed: 4,
+        },
+    )
+    .await
+    .expect("record progress");
+
+    repo.cancel(id, t(2)).await.expect("cancel");
+
+    let run = repo.get(id).await.expect("get").expect("run exists");
+    assert_eq!(run.status, RunStatus::Cancelled);
+    assert_eq!(run.finished_at, Some(t(2)));
+    assert_eq!(run.phase, None, "a terminal run publishes no phase");
+    assert_eq!(
+        run.processed,
+        Some(4),
+        "how far a cancelled run got is still worth reporting"
+    );
+    let value = serde_json::to_value(&run).expect("serialize");
+    assert_eq!(
+        value.get("status").and_then(|v| v.as_str()),
+        Some("cancelled")
+    );
+}
+
+#[tokio::test]
+async fn given_a_paused_run_when_startup_reconciles_then_it_is_left_paused() {
+    // FR-FC-29 reconciles `running` rows, and a paused run must not be one of
+    // them: it stopped deliberately, and its row is what a later resume has
+    // to work from.
+    let (repo, _dir) = repo().await;
+    let id = Uuid::new_v4();
+    repo.start(id, RunKind::Index, Some("/library"), t(1))
+        .await
+        .expect("start");
+    repo.pause(id, t(2)).await.expect("pause");
+
+    let reconciled = repo.interrupt_running(t(3)).await.expect("interrupt");
+
+    assert_eq!(reconciled, 0, "a paused run is not a running one");
+    let run = repo.get(id).await.expect("get").expect("run exists");
+    assert_eq!(run.status, RunStatus::Paused);
+    assert_eq!(run.paused_at, Some(t(2)));
+}
+
+#[tokio::test]
 async fn given_a_row_with_pause_columns_set_when_read_then_they_come_back_off_the_row() {
     // `paused_at` / `paused_millis` are read by real SQL here and written by
     // the pause/resume command in a later task. Seeded directly so the read

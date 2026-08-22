@@ -32,6 +32,7 @@ use crate::catalog::commands::purge_on_disk::PurgeFileOnDiskHandler;
 use crate::catalog::commands::refresh::RefreshHandler;
 use crate::catalog::commands::rename::RenameFileHandler;
 use crate::catalog::commands::restore::RestoreFileHandler;
+use crate::catalog::commands::run_control::RunControlHandler;
 use crate::catalog::commands::soft_delete::SoftDeleteFileHandler;
 use crate::catalog::document_tags::PdfEpubMetadataReader;
 use crate::catalog::fs::StdFilesystem;
@@ -124,6 +125,9 @@ pub type DefaultReadTextFileContentHandler =
 
 pub type DefaultGetRunStatusHandler =
     GetRunStatusHandler<RuntimeAuthService, SqliteCatalogRunRepository, SystemClock>;
+
+pub type DefaultRunControlHandler =
+    RunControlHandler<RuntimeAuthService, SqliteCatalogRunRepository, SystemClock>;
 
 pub type DefaultEditTextFileContentHandler = EditTextFileContentHandler<
     RuntimeAuthService,
@@ -289,6 +293,7 @@ pub struct Services {
     pub browse_files_handler: Arc<DefaultBrowseFilesHandler>,
     pub read_text_file_content_handler: Arc<DefaultReadTextFileContentHandler>,
     pub get_run_status_handler: Arc<DefaultGetRunStatusHandler>,
+    pub run_control_handler: Arc<DefaultRunControlHandler>,
     pub edit_text_file_content_handler: Arc<DefaultEditTextFileContentHandler>,
     pub playback_source_handler: Arc<DefaultPlaybackSourceHandler>,
     pub comic_page_handler: Arc<DefaultComicPageHandler>,
@@ -466,6 +471,15 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         fs,
     ));
     let get_run_status_handler = Arc::new(GetRunStatusHandler::new(
+        auth.clone(),
+        run_repo.clone(),
+        clock,
+        run_registry.clone(),
+    ));
+    // The same registry the two walks publish into: pausing a run means
+    // writing a signal into the very cell its own loop is reading, so a
+    // second registry here would signal nothing at all.
+    let run_control_handler = Arc::new(RunControlHandler::new(
         auth.clone(),
         run_repo.clone(),
         clock,
@@ -664,6 +678,7 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         browse_files_handler,
         read_text_file_content_handler,
         get_run_status_handler,
+        run_control_handler,
         edit_text_file_content_handler,
         playback_source_handler,
         comic_page_handler,

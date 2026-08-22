@@ -71,6 +71,44 @@ impl RunPhase {
     }
 }
 
+/// What a run has been told to do, if anything.
+///
+/// One signal serves both verbs because the run reads them identically: stop
+/// taking new entries. What differs is only what is *recorded* afterwards —
+/// a pause the run can be resumed from, or a terminal cancel — and that
+/// decision belongs to the handler writing the row, not to the loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunSignal {
+    None,
+    Pause,
+    Cancel,
+}
+
+impl RunSignal {
+    /// The `AtomicU8` encoding. Private, like [`RunPhase::as_code`] — these
+    /// discriminants are an implementation detail of [`RunCell`].
+    ///
+    /// The values are ordered by severity, which [`RunCell::raise`] relies
+    /// on: `None` < `Pause` < `Cancel`.
+    fn as_code(self) -> u8 {
+        match self {
+            RunSignal::None => 0,
+            RunSignal::Pause => 1,
+            RunSignal::Cancel => 2,
+        }
+    }
+
+    fn from_code(code: u8) -> Self {
+        match code {
+            1 => RunSignal::Pause,
+            2 => RunSignal::Cancel,
+            // A cell is born `None` and only ever set to a value `as_code`
+            // produced, so this arm is unreachable in practice.
+            _ => RunSignal::None,
+        }
+    }
+}
+
 /// One read of a [`RunCell`]. `total` is `None` while discovery is still
 /// counting — see [`TOTAL_UNKNOWN`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -105,6 +143,16 @@ pub struct RunCell {
     processed: AtomicUsize,
     total: AtomicUsize,
     phase: AtomicU8,
+    /// What the run has been told to do, raised by `RunControlHandler` and
+    /// read by the processing loop before each entry.
+    ///
+    /// `Relaxed` like the rest, and for the same reason: nothing else is
+    /// published through it. A reader that sees the signal one poll late has
+    /// halted one entry later than it might have — a stat and a header read,
+    /// microseconds — and the atomic itself still guarantees the write
+    /// arrives. There is no other state whose visibility has to be ordered
+    /// against it, so an `Acquire`/`Release` pair would buy nothing.
+    signal: AtomicU8,
 }
 
 impl RunCell {
@@ -113,7 +161,27 @@ impl RunCell {
             processed: AtomicUsize::new(0),
             total: AtomicUsize::new(TOTAL_UNKNOWN),
             phase: AtomicU8::new(RunPhase::Discovering.as_code()),
+            signal: AtomicU8::new(RunSignal::None.as_code()),
         }
+    }
+
+    /// Tell the run to stop.
+    ///
+    /// Never downgrades: a signal already raised stays at least as severe as
+    /// it was. Without that, a `pause` racing a `cancel` could turn the
+    /// cancel into a pause — the control handler reads the run's *row* to
+    /// decide whether a transition is legal, and the row still says `running`
+    /// for the moment between a cancel being raised and the loop writing it.
+    /// A cancel that quietly became a pause would leave a run the owner asked
+    /// to abandon sitting there resumable.
+    pub fn raise(&self, signal: RunSignal) {
+        self.signal.fetch_max(signal.as_code(), Ordering::Relaxed);
+    }
+
+    /// What the run has been told to do. `RunSignal::None` is the overwhelming
+    /// case — this is read once per entry.
+    pub fn signal(&self) -> RunSignal {
+        RunSignal::from_code(self.signal.load(Ordering::Relaxed))
     }
 
     pub fn set_phase(&self, phase: RunPhase) {
@@ -360,6 +428,81 @@ mod tests {
         writer.get(run_id).unwrap().advance();
 
         assert_eq!(reader.get(run_id).unwrap().snapshot().processed, 1);
+    }
+
+    #[test]
+    fn given_a_fresh_cell_when_its_signal_is_read_then_the_run_is_told_nothing() {
+        let registry = RunRegistry::new();
+        let cell = registry.open(Uuid::new_v4());
+
+        assert_eq!(cell.signal(), RunSignal::None);
+    }
+
+    #[test]
+    fn given_a_live_run_when_a_signal_is_raised_then_every_holder_of_the_cell_sees_it() {
+        // The control handler raises through `get`; the processing loop reads
+        // through the guard it already holds. Both must be the same cell.
+        let registry = RunRegistry::new();
+        let run_id = Uuid::new_v4();
+        let guard = registry.open(run_id);
+
+        registry.get(run_id).unwrap().raise(RunSignal::Pause);
+
+        assert_eq!(guard.signal(), RunSignal::Pause);
+    }
+
+    #[test]
+    fn given_a_cancelled_run_when_pause_is_raised_then_the_cancel_stands() {
+        // A pause arriving behind a cancel must not downgrade it: the run was
+        // told to be abandoned, and turning that into a resumable pause would
+        // leave behind exactly the run the owner asked to be rid of.
+        let registry = RunRegistry::new();
+        let cell = registry.open(Uuid::new_v4());
+        cell.raise(RunSignal::Cancel);
+
+        cell.raise(RunSignal::Pause);
+
+        assert_eq!(cell.signal(), RunSignal::Cancel);
+    }
+
+    #[test]
+    fn given_a_paused_run_when_cancel_is_raised_then_it_escalates() {
+        // The other direction does apply: a run paused and then cancelled in
+        // the same drain must end up cancelled.
+        let registry = RunRegistry::new();
+        let cell = registry.open(Uuid::new_v4());
+        cell.raise(RunSignal::Pause);
+
+        cell.raise(RunSignal::Cancel);
+
+        assert_eq!(cell.signal(), RunSignal::Cancel);
+    }
+
+    #[test]
+    fn given_a_signalled_run_when_reopened_then_the_new_run_is_told_nothing() {
+        // Resume reopens the same id (Task 8). It must not inherit the signal
+        // that stopped the previous segment.
+        let registry = RunRegistry::new();
+        let run_id = Uuid::new_v4();
+        let first = registry.open(run_id);
+        first.raise(RunSignal::Cancel);
+        drop(first);
+
+        let second = registry.open(run_id);
+
+        assert_eq!(second.signal(), RunSignal::None);
+    }
+
+    #[test]
+    fn given_two_runs_when_one_is_signalled_then_the_other_keeps_going() {
+        let registry = RunRegistry::new();
+        let (first, second) = (Uuid::new_v4(), Uuid::new_v4());
+        let first_cell = registry.open(first);
+        let second_cell = registry.open(second);
+
+        first_cell.raise(RunSignal::Cancel);
+
+        assert_eq!(second_cell.signal(), RunSignal::None);
     }
 
     #[test]
