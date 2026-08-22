@@ -2,7 +2,7 @@ use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
 use crate::catalog::run_registry::{RunProgress, RunSignal};
-use crate::catalog::runs::CatalogRunRepository;
+use crate::catalog::runs::{CatalogRunRepository, RunCounts};
 use crate::retry::{retry_on_busy, BUSY_ATTEMPTS};
 
 pub mod edit_content;
@@ -55,22 +55,52 @@ where
 /// reason `finish`'s is — the work the run did actually happened, and the
 /// caller's own result must not be replaced by a bookkeeping error. The row
 /// stays `running` until startup reconciliation (FR-FC-29) closes it.
+///
+/// `counts` is the partial tally the walk reached. Cancel keeps it — a
+/// cancelled run is never resumed, so what it got through is final. Pause
+/// discards it: a paused run is resumed and re-walks, so a partial tally
+/// written now would be superseded, and a resumed run's `already_cataloged`
+/// is what describes the re-encountered prefix instead.
 pub(crate) async fn record_halt<RR>(
     runs: &RR,
     run_id: Uuid,
     signal: RunSignal,
+    counts: RunCounts,
     ended_at: DateTime<Utc>,
 ) where
     RR: CatalogRunRepository,
 {
-    let recorded = match signal {
+    match signal {
         // Not a halt: both call sites branch on the signal before they get
         // here, and a run nobody stopped has nothing to record either way.
-        RunSignal::None => return,
-        RunSignal::Pause => retry_on_busy(BUSY_ATTEMPTS, || runs.pause(run_id, ended_at)).await,
-        RunSignal::Cancel => retry_on_busy(BUSY_ATTEMPTS, || runs.cancel(run_id, ended_at)).await,
-    };
-    if let Err(err) = recorded {
-        tracing::warn!(%run_id, ?signal, error = %err, "could not record that the run stopped");
+        RunSignal::None => {}
+        RunSignal::Pause => {
+            match retry_on_busy(BUSY_ATTEMPTS, || runs.pause(run_id, ended_at)).await {
+                // The pause was refused because the row is no longer
+                // `running`: something else closed this run while the walk was
+                // between dropping its cell and getting here — in practice a
+                // `cancel` that found no live cell and wrote itself directly.
+                // That write stands, deliberately, and this one is dropped.
+                // Logged rather than swallowed: silence here would hide the
+                // next bug of this shape, which is how this one was found.
+                Ok(false) => tracing::warn!(
+                    %run_id,
+                    "run was closed by another caller before it could be paused"
+                ),
+                Ok(true) => {}
+                Err(err) => {
+                    tracing::warn!(%run_id, error = %err, "could not record that the run paused")
+                }
+            }
+        }
+        RunSignal::Cancel => {
+            if let Err(err) = retry_on_busy(BUSY_ATTEMPTS, || {
+                runs.cancel(run_id, Some(counts), ended_at)
+            })
+            .await
+            {
+                tracing::warn!(%run_id, error = %err, "could not record that the run was cancelled");
+            }
+        }
     }
 }

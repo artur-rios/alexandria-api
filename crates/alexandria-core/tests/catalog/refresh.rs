@@ -843,6 +843,10 @@ async fn given_a_refresh_walk_in_flight_when_paused_then_it_stops_with_paths_unp
         "pause is not terminal, so its phase says where the run stopped"
     );
     assert!(
+        recorded.counts.is_none(),
+        "a paused run writes no tally — a resume supersedes it"
+    );
+    assert!(
         registry.get(run_id).is_none(),
         "a run that stopped must not leave its cell behind"
     );

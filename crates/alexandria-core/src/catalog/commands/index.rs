@@ -355,17 +355,32 @@ where
         };
         let scanned = entries.len();
         let cell: &RunCell = &run_cell;
-        // Discovery is checked exactly once, here: `walkdir`'s collect above
-        // is a single blocking call with no interruption point, and discovery
-        // is seconds against a walk of minutes. The flush comes first so the
-        // row keeps `phase = 'discovering'` — for a pause, that is what tells
-        // a client the run stopped before the processing loop ever began.
+        // Discovery is done: the denominator is known, so both halves of the
+        // progress fraction are meaningful from here on. Published before the
+        // signal check below, not after, so a run stopped right here still
+        // records what discovery counted rather than a NULL total.
+        cell.set_total(scanned);
+        // Checked exactly once, here: `walkdir`'s collect above is a single
+        // blocking call with no interruption point, and discovery is seconds
+        // against a walk of minutes. The phase is deliberately *not* advanced
+        // to `Processing` first — for a pause, `phase = 'discovering'` is what
+        // tells a client the run stopped before the processing loop ever
+        // began.
         let signal = cell.signal();
         if signal != RunSignal::None {
             flush_progress(&self.runs, run_id, &cell.snapshot()).await;
             // Closed before the terminal write, as on every other exit.
             drop(run_cell);
-            record_halt(&self.runs, run_id, signal, self.clock.now()).await;
+            // An all-zero tally, which is the truth: discovery counted
+            // `scanned` entries and the loop processed none of them.
+            let counts = RunCounts::Index {
+                scanned,
+                indexed: 0,
+                skipped: 0,
+                already_cataloged: 0,
+                failed: 0,
+            };
+            record_halt(&self.runs, run_id, signal, counts, self.clock.now()).await;
             tracing::info!(%run_id, scanned, ?signal, "indexing stopped during discovery");
             return Ok(IndexOutcome {
                 run_id,
@@ -376,11 +391,9 @@ where
                 failed: 0,
             });
         }
-        // Discovery is done: the denominator is known, so both halves of the
-        // progress fraction are meaningful from here on. Flushed immediately
-        // rather than waiting out an interval, so a client that reads the row
-        // right after the walk sees the phase it is actually in.
-        cell.set_total(scanned);
+        // Flushed immediately rather than waiting out an interval, so a client
+        // that reads the row right after the walk sees the phase it is
+        // actually in.
         cell.set_phase(RunPhase::Processing);
         flush_progress(&self.runs, run_id, &cell.snapshot()).await;
         // The interval is measured from here, not from the clock read at the
@@ -468,6 +481,14 @@ where
         // Whether the walk ran to the end or was stopped partway through.
         // Read once, after the window has drained, so the log line and the
         // row below cannot disagree about what happened.
+        //
+        // A signal raised after the last entry folded is honoured all the
+        // same: no entry was halted, the tally is complete, and yet the run
+        // records `paused` at `processed == total` and never writes a `finish`
+        // tally. That is intended rather than a gap. Resuming such a run finds
+        // nothing left to do, so nothing is lost — but the run does read
+        // `paused` until someone resumes or cancels it, which is the honest
+        // answer to a pause that arrived before the run had recorded itself.
         let signal = cell.signal();
 
         // The run is over: publish the final tally before the cell goes away,
@@ -518,9 +539,18 @@ where
                 tracing::warn!(%run_id, error = %err, "could not record run completion");
             }
         } else {
-            // No `finish`: the walk did not finish, so writing a tally that
-            // claims it did would misreport a partial pass as a complete one.
-            record_halt(&self.runs, run_id, signal, ended_at).await;
+            // No `finish`: the walk did not finish, so a `complete` status
+            // would misreport a partial pass. The tally still travels —
+            // `record_halt` keeps it for a cancel, whose partial counts are
+            // final, and drops it for a pause, whose are not.
+            let counts = RunCounts::Index {
+                scanned,
+                indexed,
+                skipped,
+                already_cataloged,
+                failed,
+            };
+            record_halt(&self.runs, run_id, signal, counts, ended_at).await;
         }
         Ok(IndexOutcome {
             run_id,

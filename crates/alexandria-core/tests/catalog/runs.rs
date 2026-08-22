@@ -653,8 +653,9 @@ async fn given_a_running_run_with_progress_when_paused_then_it_keeps_its_phase_a
     .await
     .expect("record progress");
 
-    repo.pause(id, t(2)).await.expect("pause");
+    let applied = repo.pause(id, t(2)).await.expect("pause");
 
+    assert!(applied, "a running run accepts a pause");
     let run = repo.get(id).await.expect("get").expect("run exists");
     assert_eq!(run.status, RunStatus::Paused);
     assert_eq!(run.paused_at, Some(t(2)));
@@ -694,7 +695,7 @@ async fn given_a_run_with_progress_when_cancelled_then_it_is_terminal_and_clears
     .await
     .expect("record progress");
 
-    repo.cancel(id, t(2)).await.expect("cancel");
+    repo.cancel(id, None, t(2)).await.expect("cancel");
 
     let run = repo.get(id).await.expect("get").expect("run exists");
     assert_eq!(run.status, RunStatus::Cancelled);
@@ -722,7 +723,7 @@ async fn given_a_paused_run_when_startup_reconciles_then_it_is_left_paused() {
     repo.start(id, RunKind::Index, Some("/library"), t(1))
         .await
         .expect("start");
-    repo.pause(id, t(2)).await.expect("pause");
+    assert!(repo.pause(id, t(2)).await.expect("pause"));
 
     let reconciled = repo.interrupt_running(t(3)).await.expect("interrupt");
 
@@ -760,4 +761,140 @@ async fn given_a_row_with_pause_columns_set_when_read_then_they_come_back_off_th
         value.get("pausedMillis").is_none(),
         "pausedMillis is the input activeMillis is derived from, not a client field"
     );
+}
+
+#[tokio::test]
+async fn given_a_cancelled_run_when_a_pause_write_lands_afterwards_then_the_cancel_stands() {
+    // The window the `AND status = 'running'` guard exists for. A walk closes
+    // its cell *before* its own terminal write; a cancel arriving in that gap
+    // finds no live cell and writes the row directly, and the walk's own
+    // `pause` then lands second. Unguarded, that pause would leave `paused`
+    // beside the `finished_at` the cancel stamped, and a run the owner asked
+    // to abandon would look resumable.
+    let (repo, _dir) = repo().await;
+    let id = Uuid::new_v4();
+    repo.start(id, RunKind::Index, Some("/library"), t(1))
+        .await
+        .expect("start");
+    repo.cancel(id, None, t(2)).await.expect("cancel");
+
+    let applied = repo.pause(id, t(3)).await.expect("pause");
+
+    assert!(!applied, "a pause must not apply to a run already closed");
+    let run = repo.get(id).await.expect("get").expect("run exists");
+    assert_eq!(run.status, RunStatus::Cancelled, "the cancel stands");
+    assert_eq!(run.finished_at, Some(t(2)));
+    assert!(
+        run.paused_at.is_none(),
+        "the refused pause must not have stamped a pause time either"
+    );
+}
+
+#[tokio::test]
+async fn given_a_completed_run_when_a_pause_write_lands_afterwards_then_it_is_refused() {
+    // The same guard seen from the ordinary direction: a walk that finished
+    // between a control call's lookup and its write.
+    let (repo, _dir) = repo().await;
+    let id = Uuid::new_v4();
+    repo.start(id, RunKind::Refresh, None, t(1))
+        .await
+        .expect("start");
+    repo.finish(
+        id,
+        RunCounts::Refresh {
+            refreshed: 1,
+            marked_missing: 0,
+            unchanged: 0,
+            failed: 0,
+        },
+        t(2),
+    )
+    .await
+    .expect("finish");
+
+    let applied = repo.pause(id, t(3)).await.expect("pause");
+
+    assert!(!applied);
+    assert_eq!(
+        repo.get(id).await.unwrap().unwrap().status,
+        RunStatus::Complete
+    );
+}
+
+#[tokio::test]
+async fn given_a_cancelled_run_with_a_tally_when_read_then_the_counts_are_kept() {
+    // A cancelled run is never resumed, so the tally it reached is final —
+    // and a client deserves the same four numbers a completed run gives it,
+    // not just `processed` from the last flush.
+    let (repo, _dir) = repo().await;
+    let id = Uuid::new_v4();
+    repo.start(id, RunKind::Index, Some("/library"), t(1))
+        .await
+        .expect("start");
+
+    repo.cancel(
+        id,
+        Some(RunCounts::Index {
+            scanned: 13,
+            indexed: 4,
+            skipped: 1,
+            already_cataloged: 0,
+            failed: 1,
+        }),
+        t(2),
+    )
+    .await
+    .expect("cancel");
+
+    let run = repo.get(id).await.expect("get").expect("run exists");
+    assert_eq!(run.status, RunStatus::Cancelled);
+    assert_eq!(
+        run.counts,
+        Some(RunCounts::Index {
+            scanned: 13,
+            indexed: 4,
+            skipped: 1,
+            already_cataloged: 0,
+            failed: 1
+        })
+    );
+    assert_eq!(run.phase, None, "still terminal, so still no phase");
+    let value = serde_json::to_value(&run).expect("serialize");
+    assert_eq!(value.get("scanned").and_then(|v| v.as_u64()), Some(13));
+    assert_eq!(value.get("indexed").and_then(|v| v.as_u64()), Some(4));
+    assert!(
+        value.get("scanned").and_then(|v| v.as_u64())
+            > value.get("indexed").and_then(|v| v.as_u64()),
+        "a cancelled run's scanned exceeds what it processed — that is the point"
+    );
+}
+
+#[tokio::test]
+async fn given_an_index_run_when_cancelled_with_refresh_counts_then_error_and_row_untouched() {
+    // Cancel keeps a tally now, so it inherits `finish`'s kind guard: writing
+    // the wrong variant would leave the row's real columns NULL.
+    let (repo, _dir) = repo().await;
+    let id = Uuid::new_v4();
+    repo.start(id, RunKind::Index, Some("/library"), t(1))
+        .await
+        .expect("start");
+
+    let result = repo
+        .cancel(
+            id,
+            Some(RunCounts::Refresh {
+                refreshed: 1,
+                marked_missing: 0,
+                unchanged: 0,
+                failed: 0,
+            }),
+            t(2),
+        )
+        .await;
+
+    assert!(result.is_err(), "mismatched counts kind must be rejected");
+    let run = repo.get(id).await.expect("get").expect("run exists");
+    assert_eq!(run.status, RunStatus::Running, "the row is left untouched");
+    assert!(run.counts.is_none());
+    assert!(run.finished_at.is_none());
 }

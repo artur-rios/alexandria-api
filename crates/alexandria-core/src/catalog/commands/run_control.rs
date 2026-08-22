@@ -120,9 +120,7 @@ where
         // there is no loop to write the row and this call has to. In practice
         // that is a `paused` run being cancelled, or the brief window in
         // which a walk has closed its cell but not yet written its own
-        // terminal row — where whichever write lands second wins, and both
-        // orders are correct (the walk's own outcome if it got there first,
-        // this one if it did not).
+        // terminal row.
         //
         // Pause is still recorded as a pause here rather than refused or
         // escalated to a cancel: the run has already stopped, so the only
@@ -131,13 +129,40 @@ where
         // `running` row nothing will ever advance, and cancelling would throw
         // away a resume the owner did not ask to give up.
         //
-        // Unlike the walk's own best-effort bookkeeping, this failure is
+        // About that window, precisely — because the obvious claim, that
+        // whichever write lands second wins and both orders are fine, is
+        // wrong. A `cancel` landing here while a walk is between dropping its
+        // cell and recording its own `pause` must not then be overwritten by
+        // that pause: `pause`'s SQL touches neither `finished_at` nor `phase`,
+        // so the row would end up `paused` with a finish time already stamped,
+        // and a run the owner asked to abandon would look resumable.
+        // `RunCell::raise`'s no-downgrade guard cannot help — the cell is
+        // already gone. What holds the line is `pause` being conditional on
+        // the row still reading `running`, so the late pause is refused and
+        // the cancel stands. The reverse order is unproblematic: this call
+        // would have read `cancelled`/`complete` at its lookup above and
+        // returned `InvalidState`.
+        //
+        // Unlike the walk's own best-effort bookkeeping, a failure here is
         // reported: the caller asked for the run to stop, and must not be
         // told it did when the row says otherwise.
         let now = self.clock.now();
         match verb {
-            Verb::Pause => retry_on_busy(BUSY_ATTEMPTS, || self.runs.pause(run_id, now)).await?,
-            Verb::Cancel => retry_on_busy(BUSY_ATTEMPTS, || self.runs.cancel(run_id, now)).await?,
+            Verb::Pause => {
+                let applied = retry_on_busy(BUSY_ATTEMPTS, || self.runs.pause(run_id, now)).await?;
+                if !applied {
+                    // The run stopped being `running` between the lookup above
+                    // and this write. Reporting the transition as refused is
+                    // the honest answer, and the same one the caller would
+                    // have got had it arrived a moment later.
+                    return Err(DomainError::InvalidState);
+                }
+            }
+            // `None`: this caller holds no partial tally. The walk that does
+            // passes its own through `record_halt`.
+            Verb::Cancel => {
+                retry_on_busy(BUSY_ATTEMPTS, || self.runs.cancel(run_id, None, now)).await?
+            }
         }
         Ok(())
     }

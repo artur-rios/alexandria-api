@@ -69,8 +69,10 @@ impl ControlHarness {
             RunStatus::Interrupted => {
                 runs.interrupt_running(t(2)).await.expect("interrupt");
             }
-            RunStatus::Paused => runs.pause(run_id, t(2)).await.expect("pause"),
-            RunStatus::Cancelled => runs.cancel(run_id, t(2)).await.expect("cancel"),
+            RunStatus::Paused => {
+                assert!(runs.pause(run_id, t(2)).await.expect("pause"));
+            }
+            RunStatus::Cancelled => runs.cancel(run_id, None, t(2)).await.expect("cancel"),
         }
         let registry = RunRegistry::new();
         Self {
@@ -312,4 +314,55 @@ async fn given_an_unauthenticated_caller_when_cancelling_an_unknown_run_then_una
     let result = control.cancel(Uuid::new_v4(), "bad-token").await;
 
     assert!(matches!(result, Err(DomainError::Unauthorized)));
+}
+
+#[tokio::test]
+async fn given_a_cancelled_run_when_a_pause_write_lands_afterwards_then_the_fake_refuses_it_too() {
+    // The fake must mirror the SQLite adapter's `AND status = 'running'`
+    // guard, or every handler test above would be passing against a
+    // repository more permissive than the real one — and the race the guard
+    // exists for would be invisible here.
+    let runs = FakeCatalogRunRepository::new();
+    let run_id = Uuid::new_v4();
+    runs.start(run_id, RunKind::Index, Some("/library"), t(1))
+        .await
+        .expect("start");
+    runs.cancel(run_id, None, t(2)).await.expect("cancel");
+
+    let applied = runs.pause(run_id, t(3)).await.expect("pause");
+
+    assert!(!applied, "a pause must not apply to a run already closed");
+    let run = runs.get_recorded(run_id).expect("run");
+    assert_eq!(run.status, RunStatus::Cancelled, "the cancel stands");
+    assert_eq!(run.finished_at, Some(t(2)));
+    assert!(run.paused_at.is_none());
+}
+
+#[tokio::test]
+async fn given_a_run_closed_between_the_lookup_and_the_write_when_paused_then_invalid_state() {
+    // The handler's own half of the race guard, and the only test that
+    // reaches it: the run reads `running` at the lookup, and is closed by
+    // someone else before this call's write lands. Closing it *before* the
+    // call would prove something different — the state machine's rejection
+    // rather than the write's — so the fake is armed to move the row on
+    // immediately after it answers the lookup.
+    let harness = ControlHarness::with_run(RunStatus::Running).await;
+    harness.runs.cancel_after_next_get(harness.run_id);
+
+    let result = harness.control.pause(harness.run_id, TOKEN).await;
+
+    assert!(
+        matches!(result, Err(DomainError::InvalidState)),
+        "a pause whose write is refused must be reported, not silently swallowed; got {result:?}"
+    );
+    assert_eq!(
+        harness.recorded_status(),
+        RunStatus::Cancelled,
+        "the cancel stands — the late pause must not have overwritten it"
+    );
+    let run = harness.runs.get_recorded(harness.run_id).expect("run");
+    assert!(
+        run.paused_at.is_none(),
+        "and it must not have stamped a pause time on a cancelled run"
+    );
 }

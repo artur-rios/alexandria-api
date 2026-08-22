@@ -165,16 +165,31 @@ where
             }
         };
 
+        let cataloged = files.len();
         let cell: &RunCell = &run_cell;
-        // Checked once, the moment discovery returns — see
-        // `IndexHandler::execute`, which does the same for the same reasons.
+        // Discovery is done: the denominator is known. Published before the
+        // signal check, so a run stopped right here still records what the
+        // listing counted — see `IndexHandler::execute`, which does all of
+        // this for the same reasons.
+        cell.set_total(cataloged);
         let signal = cell.signal();
         if signal != RunSignal::None {
             flush_progress(&self.runs, run_id, &cell.snapshot()).await;
             // Closed before the terminal write, as on every other exit.
             drop(run_cell);
-            record_halt(&self.runs, run_id, signal, self.clock.now()).await;
-            tracing::info!(%run_id, ?signal, "re-index stopped during discovery");
+            // An all-zero tally: the listing found `cataloged` paths and the
+            // loop processed none of them.
+            let counts = RunCounts::Refresh {
+                refreshed: 0,
+                marked_missing: 0,
+                unchanged: 0,
+                failed: 0,
+            };
+            record_halt(&self.runs, run_id, signal, counts, self.clock.now()).await;
+            // `cataloged` is logged for the same reason the index walk logs
+            // `scanned`: without a quantity an operator cannot tell how large
+            // the run that stopped was.
+            tracing::info!(%run_id, cataloged, ?signal, "re-index stopped during discovery");
             return Ok(RefreshOutcome {
                 run_id,
                 refreshed: 0,
@@ -184,10 +199,9 @@ where
             });
         }
 
-        // Discovery is done: the denominator is known. Flushed immediately
-        // rather than waiting out an interval, so a client that reads the row
-        // right after the listing sees the phase it is actually in.
-        cell.set_total(files.len());
+        // Flushed immediately rather than waiting out an interval, so a client
+        // that reads the row right after the listing sees the phase it is
+        // actually in.
         cell.set_phase(RunPhase::Processing);
         flush_progress(&self.runs, run_id, &cell.snapshot()).await;
         // The interval runs from here, not from the clock read at the top of
@@ -255,7 +269,8 @@ where
 
         // Whether the pass ran to the end or was stopped partway through.
         // Read once, after the window has drained — see
-        // `IndexHandler::execute`.
+        // `IndexHandler::execute`, including what happens to a signal that
+        // arrives after the last path has folded.
         let signal = cell.signal();
 
         // The run is over: publish the final tally before the cell goes away,
@@ -309,9 +324,16 @@ where
                 tracing::warn!(%run_id, error = %err, "could not record run completion");
             }
         } else {
-            // No `finish`: the pass did not finish, so writing a tally that
-            // claims it did would misreport a partial pass as a complete one.
-            record_halt(&self.runs, run_id, signal, ended_at).await;
+            // No `finish`: the pass did not finish, so a `complete` status
+            // would misreport it. The tally still travels — kept for a cancel,
+            // dropped for a pause. See `record_halt`.
+            let counts = RunCounts::Refresh {
+                refreshed,
+                marked_missing,
+                unchanged,
+                failed,
+            };
+            record_halt(&self.runs, run_id, signal, counts, ended_at).await;
         }
         Ok(outcome)
     }

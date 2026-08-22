@@ -2255,6 +2255,9 @@ pub struct FakeCatalogRunRepository {
     /// When set, every `record_progress` fails. A progress flush is
     /// best-effort (FR-FC-28), so this is what proves a run survives one.
     progress_fails: Arc<AtomicBool>,
+    /// Armed by `cancel_after_next_get`: the run to close once, right after
+    /// the next `get` has answered.
+    cancel_after_get: Arc<Mutex<Option<Uuid>>>,
     /// Every flush the handler attempted, in order, failed ones included.
     /// The row only ever holds the newest, so this is the only way a test can
     /// see that an *intermediate* flush happened at all — which is what the
@@ -2291,6 +2294,18 @@ impl FakeCatalogRunRepository {
         if let Some(run) = self.runs.lock().unwrap().get_mut(&id) {
             run.paused_millis = paused_millis;
         }
+    }
+
+    /// Cancel `id` the next time it is read, after the read has answered.
+    ///
+    /// Simulates the one window the pause guard exists for: a control call
+    /// reads a `running` run, and the row is closed by someone else before
+    /// that call's own write lands. Nothing else can produce that ordering
+    /// against an in-memory fake, and asserting it by closing the run *before*
+    /// the call would prove something different — the state machine's
+    /// rejection rather than the write's.
+    pub fn cancel_after_next_get(&self, id: Uuid) {
+        *self.cancel_after_get.lock().unwrap() = Some(id);
     }
 
     /// The recorded run for `id`, for assertions.
@@ -2381,21 +2396,50 @@ impl CatalogRunRepository for FakeCatalogRunRepository {
         Ok(())
     }
 
-    async fn pause(&self, id: Uuid, paused_at: DateTime<Utc>) -> Result<(), DomainError> {
+    async fn pause(&self, id: Uuid, paused_at: DateTime<Utc>) -> Result<bool, DomainError> {
         let mut runs = self.runs.lock().unwrap();
-        if let Some(run) = runs.get_mut(&id) {
-            run.status = RunStatus::Paused;
-            run.paused_at = Some(paused_at);
-            // Mirrors the SQLite adapter: pause is the one non-terminal
-            // transition, so unlike `finish` / `fail` / `cancel` it leaves
-            // `phase` describing where the run actually stopped.
+        let Some(run) = runs.get_mut(&id) else {
+            return Ok(false);
+        };
+        // Mirrors the SQLite adapter's `AND status = 'running'`. Without it
+        // the fake would be more permissive than the real repository, and the
+        // handler tests would pass against a guard that does not exist.
+        if run.status != RunStatus::Running {
+            return Ok(false);
         }
-        Ok(())
+        run.status = RunStatus::Paused;
+        run.paused_at = Some(paused_at);
+        // Also mirrors the adapter: pause is the one non-terminal transition,
+        // so unlike `finish` / `fail` / `cancel` it leaves `phase` describing
+        // where the run actually stopped, and writes no `finished_at`.
+        Ok(true)
     }
 
-    async fn cancel(&self, id: Uuid, cancelled_at: DateTime<Utc>) -> Result<(), DomainError> {
+    async fn cancel(
+        &self,
+        id: Uuid,
+        counts: Option<RunCounts>,
+        cancelled_at: DateTime<Utc>,
+    ) -> Result<(), DomainError> {
         let mut runs = self.runs.lock().unwrap();
         if let Some(run) = runs.get_mut(&id) {
+            if let Some(counts) = counts {
+                // Mirrors the adapter's shared `close_with_counts` guard.
+                let matches = matches!(
+                    (run.kind, &counts),
+                    (RunKind::Index, RunCounts::Index { .. })
+                        | (RunKind::Refresh, RunCounts::Refresh { .. })
+                );
+                if !matches {
+                    return Err(DomainError::internal(format!(
+                        "counts kind mismatch: run is {:?} but counts are {:?}",
+                        run.kind, counts
+                    )));
+                }
+                // A cancelled run is never resumed, so its partial tally is
+                // final and is kept for the record.
+                run.counts = Some(counts);
+            }
             run.status = RunStatus::Cancelled;
             run.finished_at = Some(cancelled_at);
             // Terminal, so the phase clears exactly as `finish`'s does.
@@ -2418,7 +2462,20 @@ impl CatalogRunRepository for FakeCatalogRunRepository {
     }
 
     async fn get(&self, id: Uuid) -> Result<Option<CatalogRun>, DomainError> {
-        Ok(self.runs.lock().unwrap().get(&id).cloned())
+        let answer = self.runs.lock().unwrap().get(&id).cloned();
+        // The read answers first, then the row moves on — which is exactly the
+        // interleaving a control call meets when someone else closes the run
+        // between its lookup and its write. One-shot, so a later `get` in the
+        // same test sees the closed row rather than re-closing it.
+        let armed = self.cancel_after_get.lock().unwrap().take();
+        if armed == Some(id) {
+            if let Some(run) = self.runs.lock().unwrap().get_mut(&id) {
+                run.status = RunStatus::Cancelled;
+                run.finished_at = Some(run.started_at);
+                run.phase = None;
+            }
+        }
+        Ok(answer)
     }
 
     async fn interrupt_running(&self, now: DateTime<Utc>) -> Result<u64, DomainError> {
@@ -2703,11 +2760,16 @@ impl CatalogRunRepository for FailingCatalogRunRepository {
         Ok(())
     }
 
-    async fn pause(&self, _id: Uuid, _paused_at: DateTime<Utc>) -> Result<(), DomainError> {
+    async fn pause(&self, _id: Uuid, _paused_at: DateTime<Utc>) -> Result<bool, DomainError> {
         unimplemented!("not exercised by either failing-repository test")
     }
 
-    async fn cancel(&self, _id: Uuid, _cancelled_at: DateTime<Utc>) -> Result<(), DomainError> {
+    async fn cancel(
+        &self,
+        _id: Uuid,
+        _counts: Option<RunCounts>,
+        _cancelled_at: DateTime<Utc>,
+    ) -> Result<(), DomainError> {
         unimplemented!("not exercised by either failing-repository test")
     }
 

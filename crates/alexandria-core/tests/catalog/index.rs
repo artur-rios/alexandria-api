@@ -2561,6 +2561,10 @@ async fn given_an_index_walk_in_flight_when_paused_then_it_stops_with_entries_un
         "pause is not terminal, so its phase says where the run stopped"
     );
     assert!(
+        recorded.counts.is_none(),
+        "a paused run writes no tally: it is resumed and re-walked, so a partial one would be superseded"
+    );
+    assert!(
         registry.get(run_id).is_none(),
         "a run that stopped must not leave its cell behind"
     );
@@ -2612,6 +2616,20 @@ async fn given_an_index_walk_in_flight_when_cancelled_then_it_stops_and_is_termi
         Some(tallied),
         "how far a cancelled run got is still worth reporting"
     );
+    // A cancelled run is never resumed, so the partial tally it reached is
+    // final — kept for the record, exactly as a completed run's is. A pause
+    // writes none, because a resumed run supersedes it.
+    assert_eq!(
+        recorded.counts,
+        Some(RunCounts::Index {
+            scanned: outcome.scanned,
+            indexed: outcome.indexed,
+            skipped: outcome.skipped,
+            already_cataloged: outcome.already_cataloged,
+            failed: outcome.failed,
+        }),
+        "a cancelled run keeps the four counts the walk computed"
+    );
 }
 
 #[tokio::test]
@@ -2657,8 +2675,17 @@ async fn given_a_run_paused_during_discovery_when_execute_then_no_entry_is_proce
     assert_eq!(recorded.status, RunStatus::Paused);
     assert_eq!(recorded.processed, Some(0));
     assert_eq!(
+        recorded.total,
+        Some(HALT_WALK_FILES),
+        "discovery had already counted them, so the row must not record a NULL total"
+    );
+    assert_eq!(
         recorded.phase,
         Some(RunPhase::Discovering),
         "a run paused in discovery must be distinguishable from one paused mid-walk"
+    );
+    assert!(
+        recorded.counts.is_none(),
+        "a paused run writes no tally — a resume supersedes it"
     );
 }
