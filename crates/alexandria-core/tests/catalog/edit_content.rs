@@ -64,8 +64,9 @@ async fn given_text_file_when_edited_then_content_written_and_hash_refreshed() {
 
 /// A file indexed after Task 3 carries `content_hash: None` — indexing never
 /// hashes bytes. Editing it must still succeed and end with the *new*
-/// content's hash stored, resolving the unknown pre-edit hash via
-/// `ensure_content_hash` along the way rather than choking on the `None`.
+/// content's hash stored: the handler never reads the pre-edit
+/// `content_hash` at all, so starting from `None` is no different from
+/// starting from a real value.
 #[tokio::test]
 async fn given_a_file_with_no_stored_hash_when_content_is_edited_then_the_hash_is_computed_first() {
     let repo = FakeCatalogRepository::new();

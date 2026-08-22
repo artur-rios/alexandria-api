@@ -33,14 +33,14 @@
 | `crates/alexandria-core/migrations/00000000000001_catalog.sql` | `files` gains `size_bytes`, `mtime`; `content_hash` becomes nullable |
 | `crates/alexandria-core/migrations/00000000000011_catalog_runs.sql` | `catalog_runs` gains progress, pause, priority columns |
 | `crates/alexandria-core/src/catalog/model.rs` | `File`/`NewFile` carry stat fields; `content_hash` optional |
-| `crates/alexandria-core/src/catalog/repos.rs` | Persist and read stat fields; `ensure_content_hash` |
+| `crates/alexandria-core/src/catalog/repos.rs` | Persist and read stat fields |
 | `crates/alexandria-core/src/catalog/fs.rs` | `FileEntry` carries size and mtime from the walk |
 | `crates/alexandria-core/src/catalog/runs.rs` | Statuses, counters, progress persistence, `pause_running`, `list_active` |
 | `crates/alexandria-core/src/catalog/commands/index.rs` | No byte reads; honours the signal; publishes progress |
 | `crates/alexandria-core/src/catalog/commands/refresh.rs` | Stat comparison; honours the signal; publishes progress |
 | `crates/alexandria-core/src/catalog/queries/run_status.rs` | Overlays the live registry cell onto the persisted row |
 | `crates/alexandria-core/src/playback/thumbnail.rs` | Cache key becomes `uuid-mtime-maxdim` |
-| `crates/alexandria-core/src/catalog/commands/edit_content.rs` | Uses `ensure_content_hash` |
+| `crates/alexandria-core/src/catalog/commands/edit_content.rs` | Unchanged — its post-write refresh is the only writer of `content_hash` (see Task 3's correction) |
 | `crates/alexandria-core/src/config.rs` | `indexing.low_priority_concurrency` |
 | `crates/alexandria-core/src/services.rs` | Wires the registry and the three control handlers |
 
@@ -330,6 +330,25 @@ invalidation-on-change the hash was providing."
 ### Task 3: Make `content_hash` nullable and computed on demand
 
 This is where the speedup lands. After this task an index run reads no file bytes at all.
+
+> **⚠️ Corrected during execution — read before following Steps 5, 7, and 10.**
+> This task's steps below call for a `CatalogRepository::ensure_content_hash`
+> helper, justified by "UC-33's optimistic-concurrency check on a text edit"
+> as its one remaining caller. **That premise is false.** `edit_content.rs`
+> has never had such a check — it writes the file, verifies the *post-write*
+> bytes against what the caller submitted, and stores that hash; it never
+> reads the stored `content_hash` as a precondition, and no HTTP route or FFI
+> entry point does either.
+>
+> The helper was implemented as written (`1c5df30`), found by review to have
+> no consumer, and removed again in a follow-up commit by human ruling.
+> **Skip Step 5 entirely, skip Step 7, and drop the commit message's claim
+> about UC-33.** Keep everything else: the nullable column, `index_entry`
+> writing `None`, and the `hash_calls() == 0` assertion — which is the most
+> valuable test in this task.
+>
+> The steps are left as written rather than rewritten, so the record shows
+> what was attempted and why it changed.
 
 **Files:**
 - Modify: `crates/alexandria-core/migrations/00000000000001_catalog.sql:7`

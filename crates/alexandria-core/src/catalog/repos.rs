@@ -2,7 +2,6 @@ use chrono::{DateTime, Utc};
 use sqlx::sqlite::SqlitePool;
 use uuid::Uuid;
 
-use crate::catalog::fs::Filesystem;
 use crate::catalog::model::{
     File, FileState, FileType, FormatKind, MediaKind, NewFile, StateFilter, SubtypeMetadata,
 };
@@ -191,16 +190,6 @@ pub trait CatalogRepository: Send + Sync {
     /// AF-01) — the two cases are indistinguishable from the caller's
     /// perspective and the specification maps both to the same error.
     async fn clear_collection(&self, uuid: Uuid, collection_uuid: Uuid) -> Result<(), DomainError>;
-
-    /// The file's content hash, computing and storing it if it is not yet
-    /// known. Returns `NotFound` when no file row carries the UUID.
-    ///
-    /// Hashing is deliberately not part of indexing (FR-FC-09), so this is
-    /// where the cost lands: on the one caller that needs the value, for the
-    /// one file it needs it for, while a person is already waiting on that
-    /// file. Callers that only need to know whether a file *changed* must use
-    /// `size_bytes` and `mtime` instead and must not call this.
-    async fn ensure_content_hash(&self, uuid: Uuid) -> Result<String, DomainError>;
 }
 
 #[derive(Clone)]
@@ -1183,30 +1172,6 @@ impl CatalogRepository for SqliteCatalogRepository {
             return Err(DomainError::NotFound);
         }
         Ok(())
-    }
-
-    async fn ensure_content_hash(&self, uuid: Uuid) -> Result<String, DomainError> {
-        let file = self
-            .find_by_uuid(uuid)
-            .await?
-            .ok_or(DomainError::NotFound)?;
-        if let Some(hash) = file.content_hash {
-            return Ok(hash);
-        }
-        // `StdFilesystem` is named directly rather than threading a
-        // `Filesystem` into the repository's dependencies: every other
-        // method here would carry a parameter it never uses, just so this
-        // one on-demand path can hash. It costs nothing — the type is a
-        // zero-sized unit struct.
-        let hash = crate::catalog::fs::StdFilesystem
-            .content_hash(&file.path)
-            .await?;
-        sqlx::query("UPDATE files SET content_hash = ? WHERE uuid = ?")
-            .bind(&hash)
-            .bind(uuid.to_string())
-            .execute(&self.pool)
-            .await?;
-        Ok(hash)
     }
 }
 

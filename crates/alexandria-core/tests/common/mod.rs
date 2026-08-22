@@ -119,13 +119,6 @@ pub struct FakeCatalogRepository {
     /// Page count last written for `uuid` via `set_comic_page_count`
     /// (issue #44 comic slice).
     comic_page_counts: Arc<Mutex<HashMap<Uuid, i64>>>,
-    /// Hash `ensure_content_hash` returns for a `uuid` whose file has no
-    /// stored `content_hash` yet, seeded by `seed_content_hash`. A `uuid`
-    /// with no seed still succeeds — falling back to a deterministic value
-    /// derived from the file's path, mirroring `FakeFilesystem::content_hash`
-    /// — so a test exercising the "no stored hash" path does not have to seed
-    /// this map just to make the call succeed.
-    content_hashes: Arc<Mutex<HashMap<Uuid, String>>>,
 }
 
 impl FakeCatalogRepository {
@@ -243,16 +236,6 @@ impl FakeCatalogRepository {
     /// `None` means no call has landed for that file yet.
     pub fn comic_page_count_for(&self, uuid: Uuid) -> Option<i64> {
         self.comic_page_counts.lock().unwrap().get(&uuid).copied()
-    }
-
-    /// State the hash `ensure_content_hash` returns (and persists) for
-    /// `uuid` the next time it is called with no stored `content_hash`.
-    #[allow(dead_code)]
-    pub fn seed_content_hash(&self, uuid: Uuid, hash: &str) {
-        self.content_hashes
-            .lock()
-            .unwrap()
-            .insert(uuid, hash.to_string());
     }
 }
 
@@ -628,34 +611,6 @@ impl CatalogRepository for FakeCatalogRepository {
         }
         links.remove(&uuid);
         Ok(())
-    }
-
-    async fn ensure_content_hash(&self, uuid: Uuid) -> Result<String, DomainError> {
-        let mut files = self.files.lock().unwrap();
-        let file = files
-            .values()
-            .find(|f| f.uuid == uuid)
-            .cloned()
-            .ok_or(DomainError::NotFound)?;
-        if let Some(hash) = file.content_hash.clone() {
-            return Ok(hash);
-        }
-        // Mirrors the real repository: no stored hash means fall back to a
-        // seeded one, or synthesize a deterministic value (matching
-        // `FakeFilesystem::content_hash`'s own fallback) so an unseeded call
-        // still succeeds — and persist it, the same side effect the Sqlite
-        // implementation's `UPDATE` has.
-        let hash = self
-            .content_hashes
-            .lock()
-            .unwrap()
-            .get(&uuid)
-            .cloned()
-            .unwrap_or_else(|| format!("hash-of-{}", file.path));
-        if let Some(entry) = files.get_mut(&file.path) {
-            entry.content_hash = Some(hash.clone());
-        }
-        Ok(hash)
     }
 }
 
@@ -2389,10 +2344,6 @@ impl CatalogRepository for FailingCatalogRepository {
         _uuid: Uuid,
         _collection_uuid: Uuid,
     ) -> Result<(), DomainError> {
-        unimplemented!("not reached by the run-fails-to-list path")
-    }
-
-    async fn ensure_content_hash(&self, _uuid: Uuid) -> Result<String, DomainError> {
         unimplemented!("not reached by the run-fails-to-list path")
     }
 }

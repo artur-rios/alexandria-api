@@ -68,11 +68,12 @@ pub struct NewFile {
     pub path: String,
     pub name: String,
     pub file_type: FileType,
-    /// SHA-256 of the file's bytes, lowercase hex. `None` means "not computed
-    /// yet": indexing never reads file bytes (FR-FC-09), so the hash is filled
-    /// in by `ensure_content_hash` the first time something genuinely needs
-    /// it — which, after re-index stopped hashing, is only UC-33's
-    /// optimistic-concurrency check on a text edit.
+    /// SHA-256 of the file's bytes, lowercase hex. Indexing never reads
+    /// file bytes (FR-FC-09), so this is `None` for most files — the only
+    /// writer is UC-33's text-content edit, which recomputes it from the
+    /// bytes it just wrote and verified (FR-TX-03). `None` is the normal,
+    /// expected state for a file nothing has ever edited, not a gap to be
+    /// filled in.
     pub content_hash: Option<String>,
     /// The file's size in bytes at index time. With `mtime`, this is what
     /// re-index compares to decide whether a file changed (FR-FC-10).
@@ -309,11 +310,12 @@ pub struct File {
     pub path: String,
     pub name: String,
     pub file_type: FileType,
-    /// SHA-256 of the file's bytes, lowercase hex. `None` means "not computed
-    /// yet": indexing never reads file bytes (FR-FC-09), so the hash is filled
-    /// in by `ensure_content_hash` the first time something genuinely needs
-    /// it — which, after re-index stopped hashing, is only UC-33's
-    /// optimistic-concurrency check on a text edit.
+    /// SHA-256 of the file's bytes, lowercase hex. Indexing never reads
+    /// file bytes (FR-FC-09), so this is `None` for most files — the only
+    /// writer is UC-33's text-content edit, which recomputes it from the
+    /// bytes it just wrote and verified (FR-TX-03). `None` is the normal,
+    /// expected state for a file nothing has ever edited, not a gap to be
+    /// filled in.
     pub content_hash: Option<String>,
     /// The file's size in bytes at index time. With `mtime`, this is what
     /// re-index compares to decide whether a file changed (FR-FC-10).

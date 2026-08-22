@@ -371,9 +371,10 @@ where
             name: entry.name,
             file_type,
             // Not computed here, and deliberately: reading every byte of every
-            // file is what made a 418 GB library take tens of minutes. Size and
-            // mtime are the change signal now (FR-FC-10), and the hash is
-            // filled in on demand by `ensure_content_hash`.
+            // file is what made a 418 GB library take tens of minutes. Size
+            // and mtime are the change signal now (FR-FC-10). `content_hash`
+            // stays `None` unless and until UC-33 edits this file — nothing
+            // else writes it (FR-FC-09).
             content_hash: None,
             size_bytes: Some(entry.size_bytes),
             mtime: entry.modified_at,

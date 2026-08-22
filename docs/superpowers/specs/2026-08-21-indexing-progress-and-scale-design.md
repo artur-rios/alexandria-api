@@ -68,13 +68,33 @@ separately in `alexandria-ui`.
    length with its mtime preserved reads as unchanged. Producing that takes
    deliberate effort, and a manual re-index is the escape hatch.
 
-2. **`content_hash` becomes nullable and is computed on demand.**
-   `NULL` means "not computed". A repository helper, `ensure_content_hash`,
-   computes and stores it the first time something genuinely needs it. After
-   decision 3, the only caller is UC-33's optimistic-concurrency check on a
-   text edit, which operates on one small file while the owner is already
-   waiting on that specific file. Refresh is deliberately not a caller — see
-   decision 1.
+2. **`content_hash` becomes nullable and nothing computes it on demand.**
+   `NULL` means "no hash is known", which after this change is the normal
+   state for an indexed file.
+
+   > **Corrected during implementation (Task 3).** This decision originally
+   > called for a repository helper, `ensure_content_hash`, computing the
+   > value the first time something needed it — justified by "UC-33's
+   > optimistic-concurrency check on a text edit" as the one remaining
+   > caller. **That premise was false.** `edit_content.rs` has never had such
+   > a check: it writes the file, verifies the *post-write* bytes against
+   > what the caller submitted, and stores that hash. It never reads the
+   > stored `content_hash` as a precondition, and neither does any HTTP route
+   > or FFI entry point — the field is only ever serialized out or
+   > overwritten. The helper was therefore built, reviewed, and removed
+   > again, because it had no consumer.
+
+   The only writer left is UC-33's existing post-write refresh: after a text
+   edit, the handler stores the hash of bytes it actually verified. That is a
+   genuine integrity record and it stays. Everything else — indexing and
+   re-index alike — leaves the column `NULL`, and nothing reads it back as a
+   decision input.
+
+   The consequence worth stating plainly: `content_hash` is now a
+   mostly-empty, informational field. It is still serialized on both
+   surfaces, so a client sees `null` for most files. Removing the column
+   outright was not done here; it is a larger change than this work needs,
+   and the value is real for the text files that carry one.
 
    The column is made nullable by amending the baseline migration rather than
    by stacking a new one. `sqlx::migrate!` checksums migration files, so this
