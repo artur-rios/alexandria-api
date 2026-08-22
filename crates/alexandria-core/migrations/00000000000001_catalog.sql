@@ -4,7 +4,7 @@ CREATE TABLE IF NOT EXISTS files (
     path          TEXT    NOT NULL UNIQUE,
     name          TEXT    NOT NULL,
     type          TEXT    NOT NULL CHECK (type IN ('audio', 'video', 'html', 'text', 'document', 'comic', 'image')),
-    content_hash  TEXT    NOT NULL,
+    content_hash  TEXT,
     size_bytes    INTEGER,
     mtime         TEXT,
     state         TEXT    NOT NULL DEFAULT 'active' CHECK (state IN ('active', 'deleted')),

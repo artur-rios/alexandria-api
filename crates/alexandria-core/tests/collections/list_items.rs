@@ -41,7 +41,7 @@ fn a_file(uuid: Uuid) -> File {
         path: format!("/lib/{uuid}.txt"),
         name: "note.txt".to_string(),
         file_type: FileType::Text,
-        content_hash: "hash".to_string(),
+        content_hash: Some("hash".to_string()),
         size_bytes: None,
         mtime: None,
         state: FileState::Active,

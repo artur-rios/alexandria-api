@@ -68,7 +68,12 @@ pub struct NewFile {
     pub path: String,
     pub name: String,
     pub file_type: FileType,
-    pub content_hash: String,
+    /// SHA-256 of the file's bytes, lowercase hex. `None` means "not computed
+    /// yet": indexing never reads file bytes (FR-FC-09), so the hash is filled
+    /// in by `ensure_content_hash` the first time something genuinely needs
+    /// it — which, after re-index stopped hashing, is only UC-33's
+    /// optimistic-concurrency check on a text edit.
+    pub content_hash: Option<String>,
     /// The file's size in bytes at index time. With `mtime`, this is what
     /// re-index compares to decide whether a file changed (FR-FC-10).
     pub size_bytes: Option<i64>,
@@ -304,7 +309,12 @@ pub struct File {
     pub path: String,
     pub name: String,
     pub file_type: FileType,
-    pub content_hash: String,
+    /// SHA-256 of the file's bytes, lowercase hex. `None` means "not computed
+    /// yet": indexing never reads file bytes (FR-FC-09), so the hash is filled
+    /// in by `ensure_content_hash` the first time something genuinely needs
+    /// it — which, after re-index stopped hashing, is only UC-33's
+    /// optimistic-concurrency check on a text edit.
+    pub content_hash: Option<String>,
     /// The file's size in bytes at index time. With `mtime`, this is what
     /// re-index compares to decide whether a file changed (FR-FC-10).
     pub size_bytes: Option<i64>,

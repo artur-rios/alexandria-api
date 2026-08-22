@@ -13,14 +13,23 @@ use crate::errors::DomainError;
 /// The handler authenticates the caller (AF-05), looks the file up by its
 /// public UUID (AF-04), rejects edits on a soft-deleted record (restore via
 /// UC-07 first, mirroring `EditMetadataHandler`), verifies the file is a
-/// TextFile (AF-01), and writes the new content to disk before touching the
-/// catalog (AF-02 — if the write fails, no catalog change is ever made).
-/// After a successful write it recomputes the SHA-256 hash from the bytes
-/// actually on disk and compares it against the hash of the submitted
-/// content; a mismatch triggers exactly one retry before surfacing an
-/// integrity error (AF-03). Only once the hash is confirmed does it update
-/// the catalog's `content_hash`/`indexed_at` (FR-TX-03) and return the
-/// refreshed record.
+/// TextFile (AF-01), and resolves its content hash via
+/// `CatalogRepository::ensure_content_hash` before touching anything —
+/// indexing no longer computes a hash at all (FR-FC-09), so a freshly
+/// indexed text file's `content_hash` is `None` until something needs it.
+/// This is that one caller: the owner is already waiting on this exact file,
+/// so the cost of hashing its pre-edit bytes lands here rather than during a
+/// bulk index/refresh pass, and — on the AF-02/AF-03 failure paths below,
+/// where no further catalog write happens — it leaves a real hash of the
+/// file's last-known-good content behind instead of `None`.
+///
+/// It then writes the new content to disk before touching the catalog
+/// (AF-02 — if the write fails, no catalog change is ever made). After a
+/// successful write it recomputes the SHA-256 hash from the bytes actually
+/// on disk and compares it against the hash of the submitted content; a
+/// mismatch triggers exactly one retry before surfacing an integrity error
+/// (AF-03). Only once the hash is confirmed does it update the catalog's
+/// `content_hash`/`indexed_at` (FR-TX-03) and return the refreshed record.
 ///
 /// Generic over auth, catalog repository, filesystem, and clock so the same
 /// decision logic is unit-tested against trait fakes (no real DB, fs, or
@@ -80,6 +89,17 @@ where
                 "file {uuid} is not a text file"
             )));
         }
+
+        // The file's content_hash may still be unknown — indexing no longer
+        // computes it (FR-FC-09) — so this is where it gets filled in: the
+        // one caller that needs it, for the one file it needs it for, while
+        // the owner is already waiting on this exact edit. Its return value
+        // is not otherwise consulted below: on success it is immediately
+        // superseded by the post-write hash refreshed at the end of this
+        // method; on an AF-02/AF-03 failure below, this call is what leaves
+        // a real hash (of the pre-edit bytes) in the catalog instead of the
+        // `None` indexing would have left there.
+        self.repo.ensure_content_hash(file.uuid).await?;
 
         let expected_hash = sha256_hex(content.as_bytes());
 

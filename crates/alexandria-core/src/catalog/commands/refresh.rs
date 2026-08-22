@@ -230,7 +230,15 @@ where
     ) -> Result<PathOutcome, DomainError> {
         if self.fs.path_exists(&file.path).await {
             let new_hash = self.fs.content_hash(&file.path).await?;
-            if new_hash != file.content_hash || file.missing_at.is_some() {
+            // Task 3 made `content_hash` nullable and stopped indexing from
+            // computing it, so `file.content_hash` is `Some` only for a file
+            // UC-33 has edited. `None` means "unknown", which must count as
+            // changed — treating it as equal-to-anything would let a freshly
+            // indexed file's real hash go unrecorded forever, since refresh
+            // is the only other path that still hashes (until Task 4 stops
+            // that too).
+            if file.content_hash.as_deref() != Some(new_hash.as_str()) || file.missing_at.is_some()
+            {
                 retry_on_busy(BUSY_ATTEMPTS, || {
                     self.repo.refresh_hash(&file.path, &new_hash, now)
                 })

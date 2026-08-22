@@ -100,7 +100,7 @@ async fn given_changed_hash_when_execute_then_hash_and_indexedat_refreshed() {
     let a = repo_handle
         .file_for("/lib/a.mp3")
         .expect("a still cataloged");
-    assert_eq!(a.content_hash, "new-hash");
+    assert_eq!(a.content_hash, Some("new-hash".to_string()));
     assert_eq!(a.indexed_at, now());
     assert!(a.missing_at.is_none(), "refresh clears missing marker");
 }
@@ -136,7 +136,11 @@ async fn given_unchanged_present_file_when_execute_then_no_write() {
     let a = repo_handle
         .file_for("/lib/a.md")
         .expect("a still cataloged");
-    assert_eq!(a.content_hash, "same-hash", "hash untouched");
+    assert_eq!(
+        a.content_hash,
+        Some("same-hash".to_string()),
+        "hash untouched"
+    );
 }
 
 #[tokio::test]
@@ -173,7 +177,11 @@ async fn given_disk_missing_path_when_execute_then_marked_missing_record_kept() 
         alexandria_core::catalog::model::FileState::Active,
         "state is NOT set to deleted (soft-delete is UC-06)"
     );
-    assert_eq!(gone.content_hash, "old-hash", "hash untouched when missing");
+    assert_eq!(
+        gone.content_hash,
+        Some("old-hash".to_string()),
+        "hash untouched when missing"
+    );
 }
 
 #[tokio::test]
@@ -207,7 +215,7 @@ async fn given_missing_file_returned_on_disk_when_execute_then_missing_cleared_a
     assert_eq!(outcome.marked_missing, 0);
 
     let back = repo_handle.file_for("/lib/back.mp3").expect("record kept");
-    assert_eq!(back.content_hash, "returned-hash");
+    assert_eq!(back.content_hash, Some("returned-hash".to_string()));
     assert!(
         back.missing_at.is_none(),
         "missing marker cleared on return"
@@ -292,11 +300,11 @@ async fn given_unreadable_file_when_execute_then_refresh_continues_and_counts_fa
 
     assert_eq!(
         repo_handle.file_for("/lib/a.mp3").unwrap().content_hash,
-        "a-new"
+        Some("a-new".to_string())
     );
     assert_eq!(
         repo_handle.file_for("/lib/b.mp3").unwrap().content_hash,
-        "b-old",
+        Some("b-old".to_string()),
         "the unreadable file keeps its prior hash"
     );
 }
@@ -340,7 +348,7 @@ async fn given_failing_repository_write_when_execute_then_refresh_continues_and_
     assert_eq!(outcome.failed, 1);
     assert_eq!(
         repo_handle.file_for("/lib/b.mp3").unwrap().content_hash,
-        "b-new"
+        Some("b-new".to_string())
     );
 }
 
@@ -498,11 +506,11 @@ async fn given_mixed_cataloged_files_when_execute_then_each_handled_correctly() 
 
     assert_eq!(
         repo_handle.file_for("/lib/a.mp3").unwrap().content_hash,
-        "a-new"
+        Some("a-new".to_string())
     );
     assert_eq!(
         repo_handle.file_for("/lib/b.md").unwrap().content_hash,
-        "b-hash"
+        Some("b-hash".to_string())
     );
     assert!(repo_handle
         .file_for("/lib/c.pdf")

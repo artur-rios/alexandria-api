@@ -267,7 +267,7 @@ async fn given_already_cataloged_path_when_execute_then_skipped_no_duplicate() {
 }
 
 #[tokio::test]
-async fn given_supported_files_when_execute_then_indexed_with_hash_and_indexedat() {
+async fn given_supported_files_when_execute_then_indexed_with_no_hash_and_indexedat() {
     let fs = FakeFilesystem::builder()
         .with_file(ROOT, "/library/a.mp3", "a.mp3", "h-a")
         .with_file(ROOT, "/library/b.md", "b.md", "h-b")
@@ -298,8 +298,11 @@ async fn given_supported_files_when_execute_then_indexed_with_hash_and_indexedat
 
     let a = repo_handle.file_for("/library/a.mp3").expect("a indexed");
     let b = repo_handle.file_for("/library/b.md").expect("b indexed");
-    assert_eq!(a.content_hash, "h-a");
-    assert_eq!(b.content_hash, "h-b");
+    assert_eq!(
+        a.content_hash, None,
+        "indexing never hashes bytes (FR-FC-09)"
+    );
+    assert_eq!(b.content_hash, None);
     assert_eq!(a.indexed_at, now());
     assert_eq!(b.indexed_at, now());
     assert_eq!(a.file_type, FileType::Audio);
@@ -344,12 +347,65 @@ async fn given_a_file_on_disk_when_indexed_then_its_size_and_mtime_are_recorded(
     assert_eq!(file.mtime, Some(now()), "mtime is captured from the walk");
 }
 
+#[tokio::test]
+async fn given_a_file_when_indexed_then_no_content_hash_is_computed() {
+    let fs = FakeFilesystem::builder()
+        .with_root(ROOT)
+        .with_file(ROOT, "/library/song.txt", "song.txt", "hash-1")
+        .build();
+    let fs_handle = fs.clone();
+    let repo = FakeCatalogRepository::new();
+    let repo_handle = repo.clone();
+    let handler = handler(
+        FakeAuth::Allowing,
+        repo,
+        fs,
+        fixed_clock(now()),
+        FakeAudioMetadataReader::new(),
+        FakeImageMetadataReader::new(),
+        FakeDocumentMetadataReader::new(),
+        FakeVideoMetadataReader::new(),
+        FakeComicMetadataReader::new(),
+        FakeCatalogRunRepository::new(),
+    );
+
+    let IndexStarted { run_id } = handler
+        .start(IndexRequest { root: ROOT.into() }, TOKEN)
+        .await
+        .unwrap();
+    handler.execute(ROOT, run_id).await.unwrap();
+
+    let file = repo_handle
+        .find_by_path("/library/song.txt")
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(
+        file.content_hash, None,
+        "indexing must not read file bytes; the hash is computed on demand"
+    );
+    assert_eq!(
+        fs_handle.hash_calls(),
+        0,
+        "the filesystem's hash port is never reached"
+    );
+}
+
 // ---------------- Bounded concurrency (FR-FC-08) ----------------
 
 /// The walk processes several files at a time, so the order entries finish in
 /// is unspecified — but the tallies are not. Running the same library at every
 /// concurrency from sequential to wider-than-the-library must produce
 /// identical counts and identical catalog contents.
+///
+/// `c.mp3` is seeded unreadable (its bytes cannot be hashed), but that no
+/// longer matters to indexing at all (Task 3 / FR-FC-09): `index_entry`
+/// never calls the hash port, so an unreadable-but-listable file is indexed
+/// exactly like a readable one. `failing_for` on the repository — not an
+/// unreadable filesystem entry — is what still produces a per-file `failed`
+/// after this task; see
+/// `given_failing_repository_write_when_execute_then_run_continues_and_counts_failure`.
 #[tokio::test]
 async fn given_any_concurrency_when_execute_then_same_counts_and_same_catalog() {
     // 1 (sequential), 3 (narrower than the library), 4 (exactly), and 16
@@ -384,18 +440,18 @@ async fn given_any_concurrency_when_execute_then_same_counts_and_same_catalog() 
             .expect("execute");
 
         assert_eq!(outcome.scanned, 4, "concurrency {concurrency}");
-        assert_eq!(outcome.indexed, 2, "concurrency {concurrency}");
+        assert_eq!(
+            outcome.indexed, 3,
+            "the unreadable mp3 is indexed too — its bytes are never read (concurrency {concurrency})"
+        );
         assert_eq!(
             outcome.skipped, 1,
             "the .zip is unsupported (concurrency {concurrency})"
         );
-        assert_eq!(
-            outcome.failed, 1,
-            "the unreadable mp3 (concurrency {concurrency})"
-        );
+        assert_eq!(outcome.failed, 0, "concurrency {concurrency}");
         assert!(repo_handle.has_path("/library/a.mp3"));
         assert!(repo_handle.has_path("/library/b.md"));
-        assert!(!repo_handle.has_path("/library/c.mp3"));
+        assert!(repo_handle.has_path("/library/c.mp3"));
         assert!(!repo_handle.has_path("/library/d.zip"));
     }
 }
@@ -462,10 +518,13 @@ async fn given_unsupported_extension_when_execute_then_skipped() {
     assert_eq!(outcome.skipped, 2);
 }
 
+/// The payoff of Task 3 (FR-FC-09): a file whose bytes cannot be read is no
+/// obstacle to indexing at all, because `index_entry` never calls the hash
+/// port. Before this task, `b.mp3` here would have failed to hash and been
+/// counted in `failed`; now it is indexed exactly like its readable
+/// neighbours.
 #[tokio::test]
-async fn given_unreadable_file_when_execute_then_run_continues_and_counts_failure() {
-    // b.mp3 sits between two readable files and cannot be hashed. The run must
-    // index a and c anyway rather than aborting at b.
+async fn given_unreadable_file_when_execute_then_it_is_indexed_anyway() {
     let fs = FakeFilesystem::builder()
         .with_file(ROOT, "/library/a.mp3", "a.mp3", "h-a")
         .with_unreadable_file(ROOT, "/library/b.mp3", "b.mp3")
@@ -492,17 +551,27 @@ async fn given_unreadable_file_when_execute_then_run_continues_and_counts_failur
         .expect("an unreadable file must not fail the whole run");
 
     assert_eq!(outcome.scanned, 3);
-    assert_eq!(outcome.indexed, 2, "the two readable files are indexed");
     assert_eq!(
-        outcome.failed, 1,
-        "the unreadable file is counted as failed"
+        outcome.indexed, 3,
+        "every file is indexed, including the unreadable one"
     );
-    assert_eq!(outcome.skipped, 0, "failed is not the same as skipped");
+    assert_eq!(
+        outcome.failed, 0,
+        "indexing never reads bytes, so nothing fails here"
+    );
+    assert_eq!(outcome.skipped, 0);
     assert!(repo_handle.has_path("/library/a.mp3"));
     assert!(repo_handle.has_path("/library/c.mp3"));
     assert!(
-        !repo_handle.has_path("/library/b.mp3"),
-        "the unreadable file is not cataloged"
+        repo_handle.has_path("/library/b.mp3"),
+        "the unreadable file is cataloged too, with content_hash left None"
+    );
+    assert_eq!(
+        repo_handle
+            .file_for("/library/b.mp3")
+            .expect("b indexed")
+            .content_hash,
+        None
     );
 }
 
@@ -1872,7 +1941,7 @@ async fn given_a_started_index_when_started_then_the_run_is_recorded_running() {
 #[tokio::test]
 async fn given_an_index_that_walks_when_executed_then_the_run_is_recorded_complete() {
     let runs = FakeCatalogRunRepository::new();
-    // Same fixture as `given_supported_files_when_execute_then_indexed_with_hash_and_indexedat`:
+    // Same fixture as `given_supported_files_when_execute_then_indexed_with_no_hash_and_indexedat`:
     // two supported, readable files.
     let fs = FakeFilesystem::builder()
         .with_file(ROOT, "/library/a.mp3", "a.mp3", "h-a")
@@ -1964,17 +2033,19 @@ async fn given_a_root_that_cannot_be_listed_when_executed_then_the_run_is_record
 
 #[tokio::test]
 async fn given_files_that_individually_fail_when_executed_then_the_run_is_complete_not_failed() {
-    // FR-FC-27: per-file failures are counted, not escalated. One unreadable
-    // file must not report the whole run as failed. Same fixture as
-    // `given_unreadable_file_when_execute_then_run_continues_and_counts_failure`:
-    // b.mp3 is unreadable, a.mp3 and c.mp3 are not.
+    // FR-FC-27: per-file failures are counted, not escalated. One file whose
+    // repository write fails must not report the whole run as failed. Same
+    // fixture as
+    // `given_failing_repository_write_when_execute_then_run_continues_and_counts_failure`:
+    // a.mp3's write fails, b.mp3's does not. (Task 3: an unreadable file no
+    // longer produces a per-file failure at index time — see
+    // `given_unreadable_file_when_execute_then_it_is_indexed_anyway`.)
     let runs = FakeCatalogRunRepository::new();
     let fs = FakeFilesystem::builder()
         .with_file(ROOT, "/library/a.mp3", "a.mp3", "h-a")
-        .with_unreadable_file(ROOT, "/library/b.mp3", "b.mp3")
-        .with_file(ROOT, "/library/c.mp3", "c.mp3", "h-c")
+        .with_file(ROOT, "/library/b.mp3", "b.mp3", "h-b")
         .build();
-    let repo = FakeCatalogRepository::new();
+    let repo = FakeCatalogRepository::new().failing_for("/library/a.mp3");
     let handler = handler(
         FakeAuth::Allowing,
         repo,
@@ -2021,7 +2092,7 @@ async fn given_run_completion_cannot_be_recorded_when_executed_then_the_outcome_
     // in `refresh.rs`); duplicated bodies are exactly the condition under
     // which a future edit to one goes uncaught by the other, so both get a
     // direct regression test. Same fixture as
-    // `given_supported_files_when_execute_then_indexed_with_hash_and_indexedat`.
+    // `given_supported_files_when_execute_then_indexed_with_no_hash_and_indexedat`.
     let fs = FakeFilesystem::builder()
         .with_file(ROOT, "/library/a.mp3", "a.mp3", "h-a")
         .with_file(ROOT, "/library/b.md", "b.md", "h-b")

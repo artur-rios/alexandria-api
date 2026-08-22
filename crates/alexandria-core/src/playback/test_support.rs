@@ -204,6 +204,10 @@ impl CatalogRepository for FakeRepo {
     ) -> Result<(), DomainError> {
         unimplemented!()
     }
+
+    async fn ensure_content_hash(&self, _uuid: Uuid) -> Result<String, DomainError> {
+        unimplemented!()
+    }
 }
 
 /// A canned `File`. `uuid` is always `Uuid::nil()` and `mtime` starts `None`
@@ -227,7 +231,7 @@ pub(crate) fn a_file(
             .map_or(path, |(_, name)| name)
             .to_string(),
         file_type,
-        content_hash: "abc".to_string(),
+        content_hash: Some("abc".to_string()),
         size_bytes: None,
         mtime: None,
         state,

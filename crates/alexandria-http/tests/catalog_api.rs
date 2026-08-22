@@ -78,7 +78,15 @@ async fn given_supported_files_when_index_posted_then_returns_202_with_run_id() 
     assert_eq!(rows[0].2, "text");
     assert_eq!(rows[1].1, "song.mp3");
     assert_eq!(rows[1].2, "audio");
-    assert!(!rows[0].3.is_empty(), "content hash is stored");
+    // FR-FC-09 (Task 3): indexing never reads file bytes, so content_hash
+    // stays unset. The raw SQL row decodes a NULL TEXT column as an empty
+    // `String` here (this helper predates the nullable column and was never
+    // updated to `Option<String>`), so "unset" surfaces as `""` rather than
+    // `None`.
+    assert!(
+        rows[0].3.is_empty(),
+        "content hash is not computed at index time"
+    );
 }
 
 #[tokio::test]

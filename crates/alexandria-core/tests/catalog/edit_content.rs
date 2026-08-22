@@ -55,9 +55,38 @@ async fn given_text_file_when_edited_then_content_written_and_hash_refreshed() {
         Some("new content")
     );
     let expected_hash = alexandria_core::catalog::fs::sha256_hex("new content".as_bytes());
-    assert_eq!(result.content_hash, expected_hash);
+    assert_eq!(result.content_hash, Some(expected_hash.clone()));
     let persisted = repo.file_for_uuid(uuid).expect("persisted");
-    assert_eq!(persisted.content_hash, expected_hash);
+    assert_eq!(persisted.content_hash, Some(expected_hash));
+}
+
+// ---------------- Nullable content_hash (Task 3 / FR-FC-09) ----------------
+
+/// A file indexed after Task 3 carries `content_hash: None` — indexing never
+/// hashes bytes. Editing it must still succeed and end with the *new*
+/// content's hash stored, resolving the unknown pre-edit hash via
+/// `ensure_content_hash` along the way rather than choking on the `None`.
+#[tokio::test]
+async fn given_a_file_with_no_stored_hash_when_content_is_edited_then_the_hash_is_computed_first() {
+    let repo = FakeCatalogRepository::new();
+    let mut file = existing_file("/lib/notes.txt", FileType::Text);
+    file.content_hash = None;
+    let uuid = file.uuid;
+    repo.seed(file);
+    let fs = FakeFilesystem::builder()
+        .with_text_content("/lib/notes.txt", "hello")
+        .build();
+    let h = handler(FakeAuth::Allowing, repo.clone(), fs);
+
+    h.edit(uuid, "goodbye".to_string(), TOKEN)
+        .await
+        .expect("edit should succeed");
+
+    let file = repo.file_for_uuid(uuid).expect("persisted");
+    assert_eq!(
+        file.content_hash,
+        Some(alexandria_core::catalog::fs::sha256_hex(b"goodbye"))
+    );
 }
 
 // ---------------- AF-01: invalid input (wrong file type) ----------------
@@ -95,7 +124,7 @@ async fn given_write_failure_when_edited_then_disk_error_and_catalog_unchanged()
     assert!(matches!(result, Err(DomainError::Disk(_))));
     assert_eq!(
         repo.file_for_uuid(uuid).expect("persisted").content_hash,
-        "preexisting"
+        Some("preexisting".to_string())
     );
 }
 
@@ -118,7 +147,7 @@ async fn given_corrupted_write_when_edited_then_integrity_error_after_retry() {
     assert!(matches!(result, Err(DomainError::Integrity(_))));
     assert_eq!(
         repo.file_for_uuid(uuid).expect("persisted").content_hash,
-        "preexisting"
+        Some("preexisting".to_string())
     );
 }
 

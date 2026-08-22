@@ -2,6 +2,7 @@ use chrono::{DateTime, Utc};
 use sqlx::sqlite::SqlitePool;
 use uuid::Uuid;
 
+use crate::catalog::fs::Filesystem;
 use crate::catalog::model::{
     File, FileState, FileType, FormatKind, MediaKind, NewFile, StateFilter, SubtypeMetadata,
 };
@@ -190,6 +191,16 @@ pub trait CatalogRepository: Send + Sync {
     /// AF-01) — the two cases are indistinguishable from the caller's
     /// perspective and the specification maps both to the same error.
     async fn clear_collection(&self, uuid: Uuid, collection_uuid: Uuid) -> Result<(), DomainError>;
+
+    /// The file's content hash, computing and storing it if it is not yet
+    /// known. Returns `NotFound` when no file row carries the UUID.
+    ///
+    /// Hashing is deliberately not part of indexing (FR-FC-09), so this is
+    /// where the cost lands: on the one caller that needs the value, for the
+    /// one file it needs it for, while a person is already waiting on that
+    /// file. Callers that only need to know whether a file *changed* must use
+    /// `size_bytes` and `mtime` instead and must not call this.
+    async fn ensure_content_hash(&self, uuid: Uuid) -> Result<String, DomainError>;
 }
 
 #[derive(Clone)]
@@ -263,12 +274,13 @@ fn parse_type_str(s: &str) -> Result<FileType, DomainError> {
 /// uuid, path, name, type, content_hash, state, deleted_at, indexed_at,
 /// missing_at, size_bytes, mtime. Named so the four read paths share one
 /// shape and `parse_file_row` has a single source of truth for it.
+/// `content_hash` is nullable (Task 3): `None` means "not computed yet".
 type FileRow = (
     String,
     String,
     String,
     String,
-    String,
+    Option<String>,
     String,
     Option<String>,
     String,
@@ -328,7 +340,7 @@ impl CatalogRepository for SqliteCatalogRepository {
         .bind(&new_file.path)
         .bind(&new_file.name)
         .bind(new_file.file_type.as_str())
-        .bind(&new_file.content_hash)
+        .bind(new_file.content_hash.as_deref())
         .bind(new_file.size_bytes)
         .bind(new_file.mtime.map(|t| t.to_rfc3339()))
         .bind(new_file.indexed_at.to_rfc3339())
@@ -1172,6 +1184,30 @@ impl CatalogRepository for SqliteCatalogRepository {
         }
         Ok(())
     }
+
+    async fn ensure_content_hash(&self, uuid: Uuid) -> Result<String, DomainError> {
+        let file = self
+            .find_by_uuid(uuid)
+            .await?
+            .ok_or(DomainError::NotFound)?;
+        if let Some(hash) = file.content_hash {
+            return Ok(hash);
+        }
+        // `StdFilesystem` is named directly rather than threading a
+        // `Filesystem` into the repository's dependencies: every other
+        // method here would carry a parameter it never uses, just so this
+        // one on-demand path can hash. It costs nothing — the type is a
+        // zero-sized unit struct.
+        let hash = crate::catalog::fs::StdFilesystem
+            .content_hash(&file.path)
+            .await?;
+        sqlx::query("UPDATE files SET content_hash = ? WHERE uuid = ?")
+            .bind(&hash)
+            .bind(uuid.to_string())
+            .execute(&self.pool)
+            .await?;
+        Ok(hash)
+    }
 }
 
 /// Build a `File` from a catalog row.
@@ -1180,8 +1216,10 @@ impl CatalogRepository for SqliteCatalogRepository {
 /// unknown `type` — means the row is corrupt. Returning an error surfaces that
 /// as a `500`; silently substituting the nil UUID or `text` would hand the
 /// caller a plausible-looking record that does not correspond to reality.
-/// Nullable columns (`deleted_at`, `missing_at`) are absent-or-valid: a NULL is
-/// legitimately `None`, but a present-and-unparseable value is corruption.
+/// Nullable columns (`deleted_at`, `missing_at`, `content_hash`) are
+/// absent-or-valid: a NULL is legitimately `None`, but a present-and-
+/// unparseable value is corruption (`content_hash` has no parse step, so
+/// there is nothing to fail — every non-NULL value is accepted as-is).
 fn parse_file_row(row: FileRow) -> Result<File, DomainError> {
     let (
         uuid_str,

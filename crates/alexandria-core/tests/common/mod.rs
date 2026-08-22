@@ -119,6 +119,13 @@ pub struct FakeCatalogRepository {
     /// Page count last written for `uuid` via `set_comic_page_count`
     /// (issue #44 comic slice).
     comic_page_counts: Arc<Mutex<HashMap<Uuid, i64>>>,
+    /// Hash `ensure_content_hash` returns for a `uuid` whose file has no
+    /// stored `content_hash` yet, seeded by `seed_content_hash`. A `uuid`
+    /// with no seed still succeeds — falling back to a deterministic value
+    /// derived from the file's path, mirroring `FakeFilesystem::content_hash`
+    /// — so a test exercising the "no stored hash" path does not have to seed
+    /// this map just to make the call succeed.
+    content_hashes: Arc<Mutex<HashMap<Uuid, String>>>,
 }
 
 impl FakeCatalogRepository {
@@ -237,6 +244,16 @@ impl FakeCatalogRepository {
     pub fn comic_page_count_for(&self, uuid: Uuid) -> Option<i64> {
         self.comic_page_counts.lock().unwrap().get(&uuid).copied()
     }
+
+    /// State the hash `ensure_content_hash` returns (and persists) for
+    /// `uuid` the next time it is called with no stored `content_hash`.
+    #[allow(dead_code)]
+    pub fn seed_content_hash(&self, uuid: Uuid, hash: &str) {
+        self.content_hashes
+            .lock()
+            .unwrap()
+            .insert(uuid, hash.to_string());
+    }
 }
 
 impl CatalogRepository for FakeCatalogRepository {
@@ -289,7 +306,7 @@ impl CatalogRepository for FakeCatalogRepository {
         }
         let mut files = self.files.lock().unwrap();
         if let Some(file) = files.get_mut(path) {
-            file.content_hash = content_hash.to_string();
+            file.content_hash = Some(content_hash.to_string());
             file.indexed_at = indexed_at;
             file.missing_at = None;
         }
@@ -612,6 +629,34 @@ impl CatalogRepository for FakeCatalogRepository {
         links.remove(&uuid);
         Ok(())
     }
+
+    async fn ensure_content_hash(&self, uuid: Uuid) -> Result<String, DomainError> {
+        let mut files = self.files.lock().unwrap();
+        let file = files
+            .values()
+            .find(|f| f.uuid == uuid)
+            .cloned()
+            .ok_or(DomainError::NotFound)?;
+        if let Some(hash) = file.content_hash.clone() {
+            return Ok(hash);
+        }
+        // Mirrors the real repository: no stored hash means fall back to a
+        // seeded one, or synthesize a deterministic value (matching
+        // `FakeFilesystem::content_hash`'s own fallback) so an unseeded call
+        // still succeeds — and persist it, the same side effect the Sqlite
+        // implementation's `UPDATE` has.
+        let hash = self
+            .content_hashes
+            .lock()
+            .unwrap()
+            .get(&uuid)
+            .cloned()
+            .unwrap_or_else(|| format!("hash-of-{}", file.path));
+        if let Some(entry) = files.get_mut(&file.path) {
+            entry.content_hash = Some(hash.clone());
+        }
+        Ok(hash)
+    }
 }
 
 /// In-memory collections repository (UC-10). Backed by a shared
@@ -816,6 +861,10 @@ struct FakeFsState {
     /// `read_file` and `content_hash` prefer this over the builder-seeded
     /// `content_by_path`/`hash_by_path` once a write has happened.
     written: HashMap<String, String>,
+    /// Count of `content_hash` calls so far (Task 3 / Task 4). Indexing must
+    /// never reach this port at all — `IndexHandler::index_entry` no longer
+    /// hashes bytes — so a test can assert it stayed at zero.
+    hash_calls: std::sync::atomic::AtomicUsize,
 }
 
 impl FakeFilesystem {
@@ -901,6 +950,16 @@ impl FakeFilesystem {
     /// Count of successful removals the fake has performed so far.
     pub fn remove_count(&self) -> usize {
         self.state.lock().unwrap().removed.len()
+    }
+
+    /// Count of `content_hash` calls so far. Indexing must never reach the
+    /// hash port at all (Task 3); refresh stops reaching it too (Task 4).
+    pub fn hash_calls(&self) -> usize {
+        self.state
+            .lock()
+            .unwrap()
+            .hash_calls
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 }
 
@@ -1010,6 +1069,11 @@ impl Filesystem for FakeFilesystem {
     }
 
     async fn content_hash(&self, path: &str) -> Result<String, DomainError> {
+        self.state
+            .lock()
+            .unwrap()
+            .hash_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if self.unreadable.contains(path) {
             return Err(DomainError::internal(format!("failed to read {path}")));
         }
@@ -1100,7 +1164,7 @@ pub fn existing_file(path: &str, file_type: FileType) -> File {
         path: path.to_string(),
         name: "seedy".to_string(),
         file_type,
-        content_hash: "preexisting".to_string(),
+        content_hash: Some("preexisting".to_string()),
         size_bytes: None,
         mtime: None,
         state: alexandria_core::catalog::model::FileState::Active,
@@ -1136,7 +1200,7 @@ pub fn deleted_file_at(
         path: path.to_string(),
         name: name.to_string(),
         file_type,
-        content_hash: "preexisting".to_string(),
+        content_hash: Some("preexisting".to_string()),
         size_bytes: None,
         mtime: None,
         state: alexandria_core::catalog::model::FileState::Deleted,
@@ -1154,7 +1218,7 @@ pub fn existing_file_with_hash(path: &str, name: &str, file_type: FileType, hash
         path: path.to_string(),
         name: name.to_string(),
         file_type,
-        content_hash: hash.to_string(),
+        content_hash: Some(hash.to_string()),
         size_bytes: None,
         mtime: None,
         state: alexandria_core::catalog::model::FileState::Active,
@@ -1173,7 +1237,7 @@ pub fn existing_missing_file(path: &str, name: &str, file_type: FileType, hash: 
         path: path.to_string(),
         name: name.to_string(),
         file_type,
-        content_hash: hash.to_string(),
+        content_hash: Some(hash.to_string()),
         size_bytes: None,
         mtime: None,
         state: alexandria_core::catalog::model::FileState::Active,
@@ -2325,6 +2389,10 @@ impl CatalogRepository for FailingCatalogRepository {
         _uuid: Uuid,
         _collection_uuid: Uuid,
     ) -> Result<(), DomainError> {
+        unimplemented!("not reached by the run-fails-to-list path")
+    }
+
+    async fn ensure_content_hash(&self, _uuid: Uuid) -> Result<String, DomainError> {
         unimplemented!("not reached by the run-fails-to-list path")
     }
 }
