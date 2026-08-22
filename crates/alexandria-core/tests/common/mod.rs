@@ -11,7 +11,7 @@
 #![allow(dead_code)]
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
@@ -25,7 +25,7 @@ use alexandria_core::auth::{AuthService, Principal};
 use alexandria_core::bookmarks::model::{Bookmark, BookmarkState, NewBookmark};
 use alexandria_core::bookmarks::repos::BookmarkRepository;
 use alexandria_core::catalog::audio_tags::{AudioMetadataReader, AudioTags};
-use alexandria_core::catalog::clock::FixedClock;
+use alexandria_core::catalog::clock::{Clock, FixedClock};
 use alexandria_core::catalog::comic_tags::{ComicMetadataReader, ComicTags};
 use alexandria_core::catalog::document_tags::{DocumentMetadataReader, DocumentTags};
 use alexandria_core::catalog::fs::{FileEntry, FileStat, Filesystem};
@@ -1165,6 +1165,44 @@ impl Filesystem for FakeFilesystem {
     }
 }
 
+/// A clock that moves forward a fixed amount on every read.
+///
+/// `FixedClock` cannot exercise anything that measures an elapsed interval —
+/// every subtraction against it is zero — which makes it blind to the
+/// two-second progress flush in `IndexHandler::execute`'s processing loop.
+/// This advances by `step` per `now()` call, and the loop reads the clock
+/// once per entry, so a walk of N entries covers N steps of simulated time
+/// and crosses the interval deterministically, with no real waiting and no
+/// dependence on how fast the machine runs.
+///
+/// Reads are counted with `SeqCst` rather than `Relaxed`: unlike the display
+/// counters in `RunRegistry`, the *value* this returns is derived from the
+/// count, and a test asserting on flush timing needs each concurrent reader
+/// to see a distinct, monotonically increasing instant.
+#[derive(Debug, Clone)]
+pub struct SteppingClock {
+    start: DateTime<Utc>,
+    step: chrono::Duration,
+    reads: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl SteppingClock {
+    pub fn new(start: DateTime<Utc>, step_seconds: i64) -> Self {
+        Self {
+            start,
+            step: chrono::Duration::seconds(step_seconds),
+            reads: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }
+    }
+}
+
+impl Clock for SteppingClock {
+    fn now(&self) -> DateTime<Utc> {
+        let reads = self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.start + self.step * (reads as i32)
+    }
+}
+
 /// Fixed clock wrapper for tests.
 pub fn fixed_clock(now: DateTime<Utc>) -> FixedClock {
     FixedClock(now)
@@ -2217,7 +2255,11 @@ pub struct FakeCatalogRunRepository {
     /// When set, every `record_progress` fails. A progress flush is
     /// best-effort (FR-FC-28), so this is what proves a run survives one.
     progress_fails: Arc<AtomicBool>,
-    progress_calls: Arc<AtomicUsize>,
+    /// Every flush the handler attempted, in order, failed ones included.
+    /// The row only ever holds the newest, so this is the only way a test can
+    /// see that an *intermediate* flush happened at all — which is what the
+    /// two-second interval exists to produce.
+    progress_history: Arc<Mutex<Vec<RunProgress>>>,
 }
 
 impl FakeCatalogRunRepository {
@@ -2235,7 +2277,12 @@ impl FakeCatalogRunRepository {
 
     /// How many times a flush was attempted, failing ones included.
     pub fn progress_calls(&self) -> usize {
-        self.progress_calls.load(Ordering::Relaxed)
+        self.progress_history.lock().unwrap().len()
+    }
+
+    /// Every attempted flush, in order.
+    pub fn progress_history(&self) -> Vec<RunProgress> {
+        self.progress_history.lock().unwrap().clone()
     }
 
     /// Stand in for the pause/resume bookkeeping that writes `paused_millis`,
@@ -2311,6 +2358,9 @@ impl CatalogRunRepository for FakeCatalogRunRepository {
             run.status = RunStatus::Complete;
             run.counts = Some(counts);
             run.finished_at = Some(finished_at);
+            // Mirrors the SQLite adapter: a terminal run has no phase, so a
+            // client is never told `complete` and `processing` at once.
+            run.phase = None;
         }
         Ok(())
     }
@@ -2326,12 +2376,13 @@ impl CatalogRunRepository for FakeCatalogRunRepository {
             run.status = RunStatus::Failed;
             run.error = Some(error.to_string());
             run.finished_at = Some(finished_at);
+            run.phase = None;
         }
         Ok(())
     }
 
     async fn record_progress(&self, id: Uuid, progress: &RunProgress) -> Result<(), DomainError> {
-        self.progress_calls.fetch_add(1, Ordering::Relaxed);
+        self.progress_history.lock().unwrap().push(*progress);
         if self.progress_fails.load(Ordering::Relaxed) {
             return Err(DomainError::Disk("run store unavailable".into()));
         }
@@ -2354,6 +2405,7 @@ impl CatalogRunRepository for FakeCatalogRunRepository {
             if run.status == RunStatus::Running {
                 run.status = RunStatus::Interrupted;
                 run.finished_at = Some(now);
+                run.phase = None;
                 reconciled += 1;
             }
         }

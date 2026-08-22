@@ -9,7 +9,7 @@ use crate::catalog::commands::{flush_progress, PROGRESS_FLUSH_SECONDS};
 use crate::catalog::fs::Filesystem;
 use crate::catalog::model::File;
 use crate::catalog::repos::CatalogRepository;
-use crate::catalog::run_registry::{RunPhase, RunRegistry};
+use crate::catalog::run_registry::{RunCell, RunPhase, RunRegistry};
 use crate::catalog::runs::{CatalogRunRepository, RunCounts, RunKind};
 use crate::errors::DomainError;
 use crate::retry::{retry_on_busy, BUSY_ATTEMPTS};
@@ -139,11 +139,13 @@ where
         // FR-FC-28: a refresh's discovery is `list_all` rather than a
         // filesystem walk, but it is the same shape — a phase with no
         // denominator, then a phase with one — so it gets the same treatment.
-        let cell = self.registry.open(run_id);
+        let run_cell = self.registry.open(run_id);
         let files = match self.repo.list_all().await {
             Ok(files) => files,
             Err(err) => {
-                self.registry.close(run_id);
+                // Closed before the terminal write rather than at end of
+                // scope, as in `IndexHandler::execute`.
+                drop(run_cell);
                 // FR-FC-27: the walk could not proceed at all — that, and
                 // only that, is a `failed` run.
                 let fail_error = err.to_string();
@@ -166,10 +168,13 @@ where
         // Discovery is done: the denominator is known. Flushed immediately
         // rather than waiting out an interval, so a client that reads the row
         // right after the listing sees the phase it is actually in.
-        let cell = cell.as_ref();
+        let cell: &RunCell = &run_cell;
         cell.set_total(files.len());
         cell.set_phase(RunPhase::Processing);
         flush_progress(&self.runs, run_id, &cell.snapshot()).await;
+        // The interval runs from here, not from the clock read at the top of
+        // `execute` — see `IndexHandler::execute`.
+        let loop_started = self.clock.now();
 
         let tally = stream::iter(files)
             .map(|file| async move {
@@ -187,26 +192,31 @@ where
                 }
             })
             .buffer_unordered(self.concurrency)
-            .fold(RefreshTally::new(now), |mut tally, outcome| async move {
-                match outcome {
-                    PathOutcome::Refreshed => tally.refreshed += 1,
-                    PathOutcome::MarkedMissing => tally.marked_missing += 1,
-                    PathOutcome::Unchanged => tally.unchanged += 1,
-                    PathOutcome::Failed => tally.failed += 1,
-                }
-                // FR-FC-28: one cataloged path done, whatever it resolved to.
-                cell.advance();
-                // Inline rather than on a spawned timer, for the reasons
-                // `IndexHandler::execute` gives: no `Send + 'static` bounds
-                // forced onto the collaborators, and no task whose lifetime
-                // has to be tied back to this run.
-                let now = self.clock.now();
-                if (now - tally.last_flush).num_seconds() >= PROGRESS_FLUSH_SECONDS {
-                    flush_progress(&self.runs, run_id, &cell.snapshot()).await;
-                    tally.last_flush = now;
-                }
-                tally
-            })
+            .fold(
+                RefreshTally::new(loop_started),
+                |mut tally, outcome| async move {
+                    match outcome {
+                        PathOutcome::Refreshed => tally.refreshed += 1,
+                        PathOutcome::MarkedMissing => tally.marked_missing += 1,
+                        PathOutcome::Unchanged => tally.unchanged += 1,
+                        PathOutcome::Failed => tally.failed += 1,
+                    }
+                    // FR-FC-28: one cataloged path done, whatever it resolved to.
+                    cell.advance();
+                    // Inline rather than on a spawned timer, for the reasons
+                    // `IndexHandler::execute` gives — including the one that
+                    // costs something: the entry that crosses the interval
+                    // awaits a SQLite write while `buffer_unordered` polls none
+                    // of its in-flight futures, so the pass stalls for that
+                    // write once every two seconds.
+                    let now = self.clock.now();
+                    if (now - tally.last_flush).num_seconds() >= PROGRESS_FLUSH_SECONDS {
+                        flush_progress(&self.runs, run_id, &cell.snapshot()).await;
+                        tally.last_flush = now;
+                    }
+                    tally
+                },
+            )
             .await;
         let RefreshTally {
             refreshed,
@@ -216,9 +226,11 @@ where
             ..
         } = tally;
 
-        // The run is over: publish the final tally before the cell goes away.
+        // The run is over: publish the final tally before the cell goes away,
+        // then close ahead of the `finish` write below so no reader can
+        // overlay a live cell on a run that is already complete.
         flush_progress(&self.runs, run_id, &cell.snapshot()).await;
-        self.registry.close(run_id);
+        drop(run_cell);
 
         let outcome = RefreshOutcome {
             run_id,
@@ -329,8 +341,9 @@ struct RefreshTally {
 }
 
 impl RefreshTally {
-    /// `started` is when the processing loop began, so the first flush lands
-    /// one interval into the pass rather than on the first path.
+    /// `started` is when the processing loop began — after the listing and
+    /// after the unconditional flush that ends it — so the first interval
+    /// flush lands one interval into the loop rather than on its first path.
     fn new(started: DateTime<Utc>) -> Self {
         Self {
             refreshed: 0,

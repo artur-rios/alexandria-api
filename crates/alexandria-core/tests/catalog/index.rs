@@ -20,7 +20,7 @@ use crate::common::{
     existing_file, fixed_clock, now, FailingCatalogRunRepository, FailingListFilesystem,
     FakeAudioMetadataReader, FakeAuth, FakeCatalogRepository, FakeCatalogRunRepository,
     FakeComicMetadataReader, FakeDocumentMetadataReader, FakeFilesystem, FakeImageMetadataReader,
-    FakeVideoMetadataReader,
+    FakeVideoMetadataReader, SteppingClock,
 };
 
 const ROOT: &str = "/library";
@@ -2254,11 +2254,14 @@ async fn given_a_completed_index_when_execute_then_the_final_progress_is_flushed
     handler.execute(ROOT, run_id).await.expect("execute");
 
     let recorded = runs.get_recorded(run_id).expect("recorded run");
-    assert_eq!(recorded.phase, Some(RunPhase::Processing));
+    assert_eq!(
+        recorded.phase, None,
+        "a terminal run has no phase — `complete` and `processing` at once          would tell a client two contradictory things"
+    );
     assert_eq!(
         recorded.total,
         Some(3),
-        "every entry counts toward the total"
+        "every entry counts toward the total, and the tally outlives the phase"
     );
     assert_eq!(
         recorded.processed,
@@ -2341,4 +2344,80 @@ async fn given_a_run_that_cannot_list_its_root_when_execute_then_the_cell_is_clo
         .expect_err("the walk could not proceed");
 
     assert!(registry.get(run_id).is_none());
+}
+
+#[tokio::test]
+async fn given_a_walk_longer_than_the_flush_interval_when_execute_then_intermediate_progress_persists(
+) {
+    // FR-FC-28: the interval flush is the whole reason the progress columns
+    // exist — it is what lets a run this process is no longer executing still
+    // report how far it got. Every other test here uses `fixed_clock`, where
+    // `now - last_flush` is always zero and this branch never runs, so it
+    // needs a clock that actually advances.
+    //
+    // `SteppingClock` moves one second per read and the loop reads once per
+    // entry, so six entries cover six seconds of simulated time and cross the
+    // two-second interval three times — deterministically, with no sleeping.
+    let mut builder = FakeFilesystem::builder();
+    for name in ["a", "b", "c", "d", "e", "f"] {
+        builder = builder.with_file(
+            ROOT,
+            &format!("/library/{name}.mp3"),
+            &format!("{name}.mp3"),
+            "unused",
+        );
+    }
+    let runs = FakeCatalogRunRepository::new();
+    let handler = handler(
+        FakeAuth::Allowing,
+        FakeCatalogRepository::new(),
+        builder.build(),
+        SteppingClock::new(now(), 1),
+        FakeAudioMetadataReader::new(),
+        FakeImageMetadataReader::new(),
+        FakeDocumentMetadataReader::new(),
+        FakeVideoMetadataReader::new(),
+        FakeComicMetadataReader::new(),
+        runs.clone(),
+    );
+    let run_id = Uuid::new_v4();
+    runs.start(run_id, RunKind::Index, Some(ROOT), now())
+        .await
+        .unwrap();
+
+    let outcome = handler.execute(ROOT, run_id).await.expect("execute");
+
+    assert_eq!(outcome.indexed, 6);
+    // Each entry of the history is a write the repository actually performed
+    // against the row; the row itself only keeps the newest, so this is how a
+    // test sees that intermediate values were persisted along the way.
+    let history = runs.progress_history();
+    assert!(
+        history.len() > 2,
+        "expected interval flushes on top of the two unconditional ones, got {history:?}"
+    );
+    let intermediate: Vec<usize> = history
+        .iter()
+        .map(|progress| progress.processed)
+        .filter(|processed| *processed > 0 && *processed < 6)
+        .collect();
+    assert!(
+        !intermediate.is_empty(),
+        "no flush landed mid-walk; the interval branch never ran: {history:?}"
+    );
+    assert!(
+        intermediate.windows(2).all(|pair| pair[0] < pair[1]),
+        "progress must only ever climb, got {intermediate:?}"
+    );
+    assert!(
+        history
+            .iter()
+            .all(|progress| progress.total == Some(6) && progress.phase == RunPhase::Processing),
+        "every flush after discovery carries the denominator and the phase: {history:?}"
+    );
+    assert_eq!(
+        history.last().map(|progress| progress.processed),
+        Some(6),
+        "the last flush is the true end state"
+    );
 }

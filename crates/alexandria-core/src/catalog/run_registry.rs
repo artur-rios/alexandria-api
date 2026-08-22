@@ -162,12 +162,21 @@ impl RunRegistry {
         Self::default()
     }
 
-    /// Register `run_id` as live and hand back its cell. Re-opening an id
-    /// replaces its cell, so a run always starts from zero.
-    pub fn open(&self, run_id: Uuid) -> Arc<RunCell> {
+    /// Register `run_id` as live and hand back a guard over its cell.
+    /// Re-opening an id replaces its cell, so a run always starts from zero.
+    ///
+    /// The guard is what closes the run: see [`RunCellGuard`]. A caller that
+    /// wants the cell gone at a specific point — before a terminal write, so
+    /// no reader can overlay live progress on a finished row — drops the
+    /// guard there rather than calling [`RunRegistry::close`] directly.
+    pub fn open(&self, run_id: Uuid) -> RunCellGuard {
         let cell = Arc::new(RunCell::new());
         self.lock().insert(run_id, Arc::clone(&cell));
-        cell
+        RunCellGuard {
+            registry: self.clone(),
+            run_id,
+            cell,
+        }
     }
 
     /// The live cell for `run_id`, or `None` when no run by that id is
@@ -177,8 +186,13 @@ impl RunRegistry {
         self.lock().get(&run_id).map(Arc::clone)
     }
 
-    /// Drop `run_id`'s cell. Called when a run terminates, however it
-    /// terminates, so the map does not grow with the process's uptime.
+    /// Drop `run_id`'s cell. Closing an id that is not open is a no-op, so a
+    /// guard whose run already closed explicitly costs nothing.
+    ///
+    /// Prefer letting [`RunCellGuard`] do this: a run that ends by panic or
+    /// task abort never reaches an explicit call, and the leaked entry would
+    /// make a dead run report live progress for the rest of the process's
+    /// life — exactly the failure the registry exists to avoid.
     pub fn close(&self, run_id: Uuid) {
         self.lock().remove(&run_id);
     }
@@ -192,13 +206,53 @@ impl RunRegistry {
     }
 }
 
+/// A live run's cell, which closes the run when it goes out of scope.
+///
+/// `execute` has several exits — the discovery failure, the normal end, and
+/// any panic or task abort in between — and a cell left in the registry
+/// outlives its run: a status query would keep reading it and reporting a
+/// dead run as live progress forever. Tying the removal to a scope makes that
+/// unreachable by construction instead of dependent on every exit remembering
+/// to call [`RunRegistry::close`].
+///
+/// Derefs to the cell, so a holder calls `advance()` / `set_total()` /
+/// `snapshot()` on it directly.
+#[derive(Debug)]
+pub struct RunCellGuard {
+    registry: RunRegistry,
+    run_id: Uuid,
+    cell: Arc<RunCell>,
+}
+
+impl RunCellGuard {
+    /// The cell itself — the same `Arc` [`RunRegistry::get`] hands out.
+    pub fn cell(&self) -> &Arc<RunCell> {
+        &self.cell
+    }
+}
+
+impl std::ops::Deref for RunCellGuard {
+    type Target = RunCell;
+
+    fn deref(&self) -> &RunCell {
+        &self.cell
+    }
+}
+
+impl Drop for RunCellGuard {
+    fn drop(&mut self) {
+        self.registry.close(self.run_id);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn given_a_fresh_cell_when_snapshotted_then_it_is_discovering_with_no_total() {
-        let cell = RunRegistry::new().open(Uuid::new_v4());
+        let registry = RunRegistry::new();
+        let cell = registry.open(Uuid::new_v4());
 
         let progress = cell.snapshot();
 
@@ -209,7 +263,8 @@ mod tests {
 
     #[test]
     fn given_a_counted_run_when_advanced_then_the_snapshot_reports_both_numbers() {
-        let cell = RunRegistry::new().open(Uuid::new_v4());
+        let registry = RunRegistry::new();
+        let cell = registry.open(Uuid::new_v4());
         cell.set_phase(RunPhase::Processing);
         cell.set_total(12_264);
         for _ in 0..8_412 {
@@ -227,27 +282,57 @@ mod tests {
     fn given_an_open_run_when_fetched_then_the_same_cell_is_returned() {
         let registry = RunRegistry::new();
         let run_id = Uuid::new_v4();
-        let cell = registry.open(run_id);
-        cell.advance();
+        let guard = registry.open(run_id);
+        guard.advance();
 
         let fetched = registry.get(run_id).expect("an open run has a cell");
 
         assert_eq!(fetched.snapshot().processed, 1);
         assert!(
-            Arc::ptr_eq(&cell, &fetched),
+            Arc::ptr_eq(guard.cell(), &fetched),
             "get must hand out the writer's own cell, not a copy"
         );
     }
 
     #[test]
-    fn given_a_closed_run_when_fetched_then_there_is_no_cell() {
+    fn given_an_open_run_when_its_guard_is_dropped_then_the_cell_is_gone() {
+        // The guard is the only thing a run has to get right: every exit,
+        // including a panic, closes through this.
         let registry = RunRegistry::new();
         let run_id = Uuid::new_v4();
-        registry.open(run_id);
 
-        registry.close(run_id);
+        drop(registry.open(run_id));
 
         assert!(registry.get(run_id).is_none());
+    }
+
+    #[test]
+    fn given_a_closed_run_when_its_guard_drops_later_then_nothing_breaks() {
+        // A handler closes explicitly before its terminal write and the guard
+        // then drops at end of scope, so the double close is the normal path,
+        // not an edge case.
+        let registry = RunRegistry::new();
+        let run_id = Uuid::new_v4();
+        let guard = registry.open(run_id);
+
+        registry.close(run_id);
+        assert!(registry.get(run_id).is_none());
+        drop(guard);
+
+        assert!(registry.get(run_id).is_none());
+    }
+
+    #[test]
+    fn given_a_run_reopened_after_closing_when_read_then_it_starts_from_zero() {
+        let registry = RunRegistry::new();
+        let run_id = Uuid::new_v4();
+        let first = registry.open(run_id);
+        first.advance();
+        drop(first);
+
+        let second = registry.open(run_id);
+
+        assert_eq!(second.snapshot().processed, 0);
     }
 
     #[test]
@@ -255,7 +340,7 @@ mod tests {
         let registry = RunRegistry::new();
         let (first, second) = (Uuid::new_v4(), Uuid::new_v4());
         let first_cell = registry.open(first);
-        registry.open(second);
+        let _second_cell = registry.open(second);
 
         first_cell.advance();
 
@@ -271,7 +356,8 @@ mod tests {
         let reader = writer.clone();
         let run_id = Uuid::new_v4();
 
-        writer.open(run_id).advance();
+        let _guard = writer.open(run_id);
+        writer.get(run_id).unwrap().advance();
 
         assert_eq!(reader.get(run_id).unwrap().snapshot().processed, 1);
     }

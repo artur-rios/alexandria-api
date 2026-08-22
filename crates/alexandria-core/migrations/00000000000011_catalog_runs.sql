@@ -18,7 +18,16 @@
 --
 -- `paused_at` and `paused_millis` are what `active_millis` is derived from:
 -- elapsed wall time minus the time the run spent paused. `paused_millis`
--- defaults to 0 so a run that was never paused needs no special case.
+-- defaults to 0 so a run that was never paused needs no special case. Only
+-- the read side exists so far: `active_millis` divides by them today, and the
+-- pause/resume command is what will write them.
+--
+-- `concurrency` records how many entries the run was processing at a time, so
+-- a resumed run continues at the width it was started with rather than at
+-- whatever the configuration happens to say later. Nothing writes it yet —
+-- pause/resume does. It is declared here rather than in a later migration
+-- because this baseline file is amended in place, never stacked, so the
+-- table's shape is settled in one edit.
 CREATE TABLE IF NOT EXISTS catalog_runs (
     id              TEXT PRIMARY KEY,
     kind            TEXT    NOT NULL,

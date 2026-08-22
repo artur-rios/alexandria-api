@@ -205,7 +205,8 @@ async fn given_a_discovering_run_with_a_live_cell_when_read_then_the_total_is_st
         .await
         .unwrap();
     let registry = RunRegistry::new();
-    registry.open(id);
+    // Bound, not dropped: the guard is what keeps the run open.
+    let _cell = registry.open(id);
     let handler = GetRunStatusHandler::new(FakeAuth::Allowing, runs, FixedClock(t(3)), registry);
 
     let run = handler.get(id, TOKEN).await.expect("get");

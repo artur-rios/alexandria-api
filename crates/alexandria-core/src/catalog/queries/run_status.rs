@@ -67,8 +67,15 @@ where
         // Time the run spent working: elapsed wall time, minus the time it
         // spent paused. A finished run's clock stops at `finished_at`; a
         // running one's keeps going, which is why this needs a clock at all.
+        //
+        // Clamped at zero. The subtraction can go negative if the system
+        // clock steps backwards mid-run, or if a future resume path
+        // over-accumulates `paused_millis`, and "this run has been working
+        // for minus four seconds" is nonsense on a display field — better to
+        // report no elapsed time than a negative duration.
         let elapsed_to = run.finished_at.unwrap_or_else(|| self.clock.now());
-        run.active_millis = (elapsed_to - run.started_at).num_milliseconds() - run.paused_millis;
+        run.active_millis =
+            ((elapsed_to - run.started_at).num_milliseconds() - run.paused_millis).max(0);
 
         Ok(run)
     }

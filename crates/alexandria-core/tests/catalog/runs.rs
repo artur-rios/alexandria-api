@@ -5,18 +5,31 @@
 use chrono::{TimeZone, Utc};
 use uuid::Uuid;
 
+use alexandria_core::catalog::run_registry::{RunPhase, RunProgress};
 use alexandria_core::catalog::runs::{
     CatalogRunRepository, RunCounts, RunKind, RunStatus, SqliteCatalogRunRepository,
 };
 use alexandria_core::migrate::migrate_database;
 
 async fn repo() -> (SqliteCatalogRunRepository, tempfile::TempDir) {
+    let (repo, _pool, dir) = repo_with_pool().await;
+    (repo, dir)
+}
+
+/// As [`repo`], but keeping the pool as well - for the pause columns, which
+/// real SQL reads back but no command writes yet (pause/resume is a later
+/// task), so the only way to exercise that read is to seed the row directly.
+async fn repo_with_pool() -> (
+    SqliteCatalogRunRepository,
+    sqlx::sqlite::SqlitePool,
+    tempfile::TempDir,
+) {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("alexandria.sqlite");
     let pool = migrate_database(path.to_str().expect("path"))
         .await
         .expect("migrate");
-    (SqliteCatalogRunRepository::new(pool), dir)
+    (SqliteCatalogRunRepository::new(pool.clone()), pool, dir)
 }
 
 fn t(hour: u32) -> chrono::DateTime<Utc> {
@@ -438,5 +451,211 @@ async fn given_a_failed_run_when_serialized_then_error_present_and_no_counts() {
     assert!(
         value.get("failed").is_none(),
         "no failed-count key on a run with no tally"
+    );
+}
+
+#[tokio::test]
+async fn given_a_running_run_when_progress_is_recorded_then_it_reads_back_from_the_row() {
+    // FR-FC-28: the flush is the only durable record of how far a run got, so
+    // its own UPDATE and the `get` that reads it have to round-trip against
+    // real SQL, not just against the in-memory fake.
+    let (repo, _dir) = repo().await;
+    let id = Uuid::new_v4();
+    repo.start(id, RunKind::Index, Some("/library"), t(1))
+        .await
+        .expect("start");
+
+    repo.record_progress(
+        id,
+        &RunProgress {
+            phase: RunPhase::Processing,
+            total: Some(12_264),
+            processed: 8_412,
+        },
+    )
+    .await
+    .expect("record progress");
+
+    let run = repo.get(id).await.expect("get").expect("run exists");
+    assert_eq!(run.phase, Some(RunPhase::Processing));
+    assert_eq!(run.total, Some(12_264));
+    assert_eq!(run.processed, Some(8_412));
+    assert_eq!(
+        run.status,
+        RunStatus::Running,
+        "a flush is not a transition"
+    );
+    assert_eq!(
+        run.paused_millis, 0,
+        "a run that was never paused needs no special case"
+    );
+    assert!(run.paused_at.is_none());
+}
+
+#[tokio::test]
+async fn given_a_run_still_discovering_when_progress_is_recorded_then_the_total_is_null() {
+    // Discovery has no denominator yet: the sentinel must reach the row as
+    // NULL and read back as `None`, not as some large number.
+    let (repo, _dir) = repo().await;
+    let id = Uuid::new_v4();
+    repo.start(id, RunKind::Index, Some("/library"), t(1))
+        .await
+        .expect("start");
+
+    repo.record_progress(
+        id,
+        &RunProgress {
+            phase: RunPhase::Discovering,
+            total: None,
+            processed: 0,
+        },
+    )
+    .await
+    .expect("record progress");
+
+    let run = repo.get(id).await.expect("get").expect("run exists");
+    assert_eq!(run.phase, Some(RunPhase::Discovering));
+    assert_eq!(run.total, None);
+    assert_eq!(run.processed, Some(0));
+}
+
+#[tokio::test]
+async fn given_a_run_with_progress_when_finished_then_the_phase_clears_and_the_tally_stays() {
+    // A terminal run has no phase: `status = complete` beside
+    // `phase = processing` would tell a client two contradictory things. The
+    // numbers are still true, so they stay.
+    let (repo, _dir) = repo().await;
+    let id = Uuid::new_v4();
+    repo.start(id, RunKind::Index, Some("/library"), t(1))
+        .await
+        .expect("start");
+    repo.record_progress(
+        id,
+        &RunProgress {
+            phase: RunPhase::Processing,
+            total: Some(13),
+            processed: 13,
+        },
+    )
+    .await
+    .expect("record progress");
+
+    repo.finish(
+        id,
+        RunCounts::Index {
+            scanned: 13,
+            indexed: 7,
+            skipped: 2,
+            already_cataloged: 3,
+            failed: 1,
+        },
+        t(2),
+    )
+    .await
+    .expect("finish");
+
+    let run = repo.get(id).await.expect("get").expect("run exists");
+    assert_eq!(run.status, RunStatus::Complete);
+    assert_eq!(run.phase, None, "a terminal run publishes no phase");
+    assert_eq!(run.total, Some(13));
+    assert_eq!(run.processed, Some(13));
+    let value = serde_json::to_value(&run).expect("serialize");
+    assert!(
+        value.get("phase").is_none(),
+        "an absent phase is omitted, not sent as null"
+    );
+}
+
+#[tokio::test]
+async fn given_a_run_with_progress_when_it_fails_then_the_phase_clears() {
+    let (repo, _dir) = repo().await;
+    let id = Uuid::new_v4();
+    repo.start(id, RunKind::Refresh, None, t(1))
+        .await
+        .expect("start");
+    repo.record_progress(
+        id,
+        &RunProgress {
+            phase: RunPhase::Processing,
+            total: Some(4),
+            processed: 1,
+        },
+    )
+    .await
+    .expect("record progress");
+
+    repo.fail(id, "catalog unreadable", t(2))
+        .await
+        .expect("fail");
+
+    let run = repo.get(id).await.expect("get").expect("run exists");
+    assert_eq!(run.status, RunStatus::Failed);
+    assert_eq!(run.phase, None);
+    assert_eq!(
+        run.processed,
+        Some(1),
+        "how far a failed run got is still worth reporting"
+    );
+}
+
+#[tokio::test]
+async fn given_an_interrupted_run_when_read_then_it_publishes_no_phase() {
+    // Startup reconciliation (FR-FC-29) makes a run terminal too, so it has
+    // to clear the phase for the same reason `finish` and `fail` do.
+    let (repo, _dir) = repo().await;
+    let id = Uuid::new_v4();
+    repo.start(id, RunKind::Index, Some("/library"), t(1))
+        .await
+        .expect("start");
+    repo.record_progress(
+        id,
+        &RunProgress {
+            phase: RunPhase::Processing,
+            total: Some(9),
+            processed: 5,
+        },
+    )
+    .await
+    .expect("record progress");
+
+    repo.interrupt_running(t(2)).await.expect("interrupt");
+
+    let run = repo.get(id).await.expect("get").expect("run exists");
+    assert_eq!(run.status, RunStatus::Interrupted);
+    assert_eq!(run.phase, None);
+    assert_eq!(
+        run.processed,
+        Some(5),
+        "the last flush is what an interrupted run has to show for itself"
+    );
+}
+
+#[tokio::test]
+async fn given_a_row_with_pause_columns_set_when_read_then_they_come_back_off_the_row() {
+    // `paused_at` / `paused_millis` are read by real SQL here and written by
+    // the pause/resume command in a later task. Seeded directly so the read
+    // path - including the RFC 3339 parse of `paused_at` - is covered now
+    // rather than resting on a test-only fake setter.
+    let (repo, pool, _dir) = repo_with_pool().await;
+    let id = Uuid::new_v4();
+    repo.start(id, RunKind::Index, Some("/library"), t(1))
+        .await
+        .expect("start");
+
+    sqlx::query("UPDATE catalog_runs SET paused_at = ?, paused_millis = ? WHERE id = ?")
+        .bind(t(2).to_rfc3339())
+        .bind(90_000_i64)
+        .bind(id.to_string())
+        .execute(&pool)
+        .await
+        .expect("seed the pause columns");
+
+    let run = repo.get(id).await.expect("get").expect("run exists");
+    assert_eq!(run.paused_at, Some(t(2)));
+    assert_eq!(run.paused_millis, 90_000);
+    let value = serde_json::to_value(&run).expect("serialize");
+    assert!(
+        value.get("pausedMillis").is_none(),
+        "pausedMillis is the input activeMillis is derived from, not a client field"
     );
 }

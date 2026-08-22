@@ -116,7 +116,10 @@ pub struct CatalogRun {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     /// Which half of the run is executing (FR-FC-28). `None` for a run that
-    /// never published one — nothing flushed before it stopped.
+    /// never published one, and `None` again once the run is terminal:
+    /// `status = "complete"` alongside `phase = "processing"` would tell a
+    /// client two contradictory things. `total` and `processed` survive that
+    /// transition — those are the tally, and they stay true.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub phase: Option<RunPhase>,
     /// How many entries the run has to get through, once discovery has
@@ -287,7 +290,11 @@ impl CatalogRunRepository for SqliteCatalogRunRepository {
                 already_cataloged,
                 failed,
             } => sqlx::query(
-                "UPDATE catalog_runs SET status = ?, finished_at = ?, \
+                // `phase = NULL` because the run is terminal: a row reading
+                // `status = 'complete', phase = 'processing'` tells a client
+                // two contradictory things. `total` and `processed` stay —
+                // those are the tally, and they remain true.
+                "UPDATE catalog_runs SET status = ?, finished_at = ?, phase = NULL, \
                  scanned = ?, indexed = ?, skipped = ?, already_cataloged = ?, failed = ? \
                  WHERE id = ?",
             )
@@ -308,7 +315,8 @@ impl CatalogRunRepository for SqliteCatalogRunRepository {
                 unchanged,
                 failed,
             } => sqlx::query(
-                "UPDATE catalog_runs SET status = ?, finished_at = ?, \
+                // `phase = NULL`: terminal, as above.
+                "UPDATE catalog_runs SET status = ?, finished_at = ?, phase = NULL, \
                  refreshed = ?, marked_missing = ?, unchanged = ?, failed = ? WHERE id = ?",
             )
             .bind(RunStatus::Complete.as_str())
@@ -329,13 +337,16 @@ impl CatalogRunRepository for SqliteCatalogRunRepository {
         error: &str,
         finished_at: DateTime<Utc>,
     ) -> Result<(), DomainError> {
-        sqlx::query("UPDATE catalog_runs SET status = ?, finished_at = ?, error = ? WHERE id = ?")
-            .bind(RunStatus::Failed.as_str())
-            .bind(finished_at.to_rfc3339())
-            .bind(error)
-            .bind(id.to_string())
-            .execute(&self.pool)
-            .await?;
+        sqlx::query(
+            "UPDATE catalog_runs SET status = ?, finished_at = ?, error = ?, phase = NULL \
+             WHERE id = ?",
+        )
+        .bind(RunStatus::Failed.as_str())
+        .bind(finished_at.to_rfc3339())
+        .bind(error)
+        .bind(id.to_string())
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -444,13 +455,15 @@ impl CatalogRunRepository for SqliteCatalogRunRepository {
     }
 
     async fn interrupt_running(&self, now: DateTime<Utc>) -> Result<u64, DomainError> {
-        let result =
-            sqlx::query("UPDATE catalog_runs SET status = ?, finished_at = ? WHERE status = ?")
-                .bind(RunStatus::Interrupted.as_str())
-                .bind(now.to_rfc3339())
-                .bind(RunStatus::Running.as_str())
-                .execute(&self.pool)
-                .await?;
+        let result = sqlx::query(
+            "UPDATE catalog_runs SET status = ?, finished_at = ?, phase = NULL \
+                 WHERE status = ?",
+        )
+        .bind(RunStatus::Interrupted.as_str())
+        .bind(now.to_rfc3339())
+        .bind(RunStatus::Running.as_str())
+        .execute(&self.pool)
+        .await?;
         Ok(result.rows_affected())
     }
 }

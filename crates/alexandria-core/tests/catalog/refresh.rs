@@ -5,7 +5,7 @@ use alexandria_core::catalog::clock::Clock;
 use alexandria_core::catalog::commands::refresh::{RefreshHandler, RefreshStarted};
 use alexandria_core::catalog::fs::Filesystem;
 use alexandria_core::catalog::repos::CatalogRepository;
-use alexandria_core::catalog::run_registry::{RunPhase, RunRegistry};
+use alexandria_core::catalog::run_registry::RunRegistry;
 use alexandria_core::catalog::runs::{CatalogRunRepository, RunCounts, RunKind, RunStatus};
 use alexandria_core::errors::DomainError;
 
@@ -721,7 +721,10 @@ async fn given_a_completed_refresh_when_execute_then_the_final_progress_is_flush
     handler.execute(run_id).await.expect("execute");
 
     let recorded = runs.get_recorded(run_id).expect("recorded run");
-    assert_eq!(recorded.phase, Some(RunPhase::Processing));
+    assert_eq!(
+        recorded.phase, None,
+        "a terminal run has no phase, but keeps its tally"
+    );
     assert_eq!(recorded.total, Some(2));
     assert_eq!(recorded.processed, Some(2));
     assert!(
