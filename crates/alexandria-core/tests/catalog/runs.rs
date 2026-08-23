@@ -731,7 +731,7 @@ async fn given_a_run_with_progress_when_cancelled_then_it_is_terminal_and_clears
     .await
     .expect("record progress");
 
-    repo.cancel(id, None, t(2)).await.expect("cancel");
+    repo.cancel(id, None, t(2), None).await.expect("cancel");
 
     let run = repo.get(id).await.expect("get").expect("run exists");
     assert_eq!(run.status, RunStatus::Cancelled);
@@ -812,7 +812,7 @@ async fn given_a_cancelled_run_when_a_pause_write_lands_afterwards_then_the_canc
     repo.start(id, RunKind::Index, Some("/library"), t(1), 4)
         .await
         .expect("start");
-    repo.cancel(id, None, t(2)).await.expect("cancel");
+    repo.cancel(id, None, t(2), None).await.expect("cancel");
 
     let applied = repo.pause(id, t(3), None).await.expect("pause");
 
@@ -863,6 +863,61 @@ async fn given_a_resumed_run_when_the_previous_segments_pause_lands_then_it_is_r
     );
     assert!(run.paused_at.is_none());
     assert_eq!(run.segment, segment + 1, "resume opened a new segment");
+}
+
+#[tokio::test]
+async fn given_a_resumed_run_when_the_previous_segments_cancel_lands_then_it_is_refused() {
+    // The pause race's terminal twin, and the worse of the two: an old
+    // segment's cancel landing on a resumed row marks the run `cancelled`
+    // while the new segment walks on against it, and only that segment's
+    // unconditional `finish` — minutes later — contradicts it.
+    // `TALLY_CANCELLABLE_FROM` admits `running`, so the status guard alone
+    // lets it through.
+    let (repo, _dir) = repo().await;
+    let id = Uuid::new_v4();
+    repo.start(id, RunKind::Index, Some("/library"), t(1), 4)
+        .await
+        .expect("start");
+    let segment = repo
+        .get(id)
+        .await
+        .expect("get")
+        .expect("run exists")
+        .segment;
+    assert!(repo.pause(id, t(2), None).await.expect("pause"));
+    assert!(repo.resume(id, 0, None).await.expect("resume"));
+
+    let applied = repo
+        .cancel(
+            id,
+            Some(RunCounts::Index {
+                scanned: 13,
+                indexed: 4,
+                skipped: 1,
+                already_cataloged: 0,
+                failed: 1,
+            }),
+            t(3),
+            Some(segment),
+        )
+        .await
+        .expect("walk cancel");
+
+    assert!(
+        !applied,
+        "a segment that has already stopped must not cancel the one that replaced it"
+    );
+    let run = repo.get(id).await.expect("get").expect("run exists");
+    assert_eq!(
+        run.status,
+        RunStatus::Running,
+        "the resumed segment is still walking"
+    );
+    assert!(run.finished_at.is_none());
+    assert!(
+        run.counts.is_none(),
+        "nor may it write the stopped segment's tally over a run still working"
+    );
 }
 
 #[tokio::test]
@@ -942,6 +997,7 @@ async fn given_a_cancelled_run_with_a_tally_when_read_then_the_counts_are_kept()
             failed: 1,
         }),
         t(2),
+        None,
     )
     .await
     .expect("cancel");
@@ -989,6 +1045,7 @@ async fn given_an_index_run_when_cancelled_with_refresh_counts_then_error_and_ro
                 failed: 0,
             }),
             t(2),
+            None,
         )
         .await;
 
@@ -1111,7 +1168,9 @@ async fn given_a_run_that_is_not_paused_when_resumed_then_the_write_is_refused()
     repo.start(cancelled, RunKind::Index, Some("/library"), t(1), 4)
         .await
         .expect("start");
-    repo.cancel(cancelled, None, t(2)).await.expect("cancel");
+    repo.cancel(cancelled, None, t(2), None)
+        .await
+        .expect("cancel");
 
     assert!(
         !repo.resume(running, 0, None).await.expect("resume"),
@@ -1162,7 +1221,7 @@ async fn given_a_completed_run_when_a_cancel_write_lands_afterwards_then_the_com
     .await
     .expect("finish");
 
-    let applied = repo.cancel(id, None, t(3)).await.expect("cancel");
+    let applied = repo.cancel(id, None, t(3), None).await.expect("cancel");
 
     assert!(!applied, "a cancel must not apply to a run already closed");
     let run = repo.get(id).await.expect("get").expect("run exists");
@@ -1209,6 +1268,7 @@ async fn given_a_completed_run_when_a_cancel_with_a_tally_lands_afterwards_then_
                 failed: 0,
             }),
             t(3),
+            None,
         )
         .await
         .expect("cancel");
@@ -1241,7 +1301,7 @@ async fn given_a_paused_run_when_cancelled_then_the_write_applies() {
         .expect("start");
     assert!(repo.pause(id, t(2), None).await.expect("pause"));
 
-    let applied = repo.cancel(id, None, t(3)).await.expect("cancel");
+    let applied = repo.cancel(id, None, t(3), None).await.expect("cancel");
 
     assert!(applied);
     let run = repo.get(id).await.expect("get").expect("run exists");
@@ -1264,7 +1324,19 @@ async fn given_a_cancelled_run_when_the_walks_own_cancel_lands_afterwards_then_i
     repo.start(id, RunKind::Index, Some("/library"), t(1), 4)
         .await
         .expect("start");
-    assert!(repo.cancel(id, None, t(2)).await.expect("control cancel"));
+    // What the walk captured when it began, and what it names below. The
+    // point is that the control cancel does not move it — only a resume does,
+    // and none happens here — so the walk's write still matches.
+    let segment = repo
+        .get(id)
+        .await
+        .expect("get")
+        .expect("run exists")
+        .segment;
+    assert!(repo
+        .cancel(id, None, t(2), None)
+        .await
+        .expect("control cancel"));
     assert!(
         repo.get(id).await.unwrap().unwrap().counts.is_none(),
         "the control call had no tally to write"
@@ -1281,6 +1353,7 @@ async fn given_a_cancelled_run_when_the_walks_own_cancel_lands_afterwards_then_i
                 failed: 1,
             }),
             t(3),
+            Some(segment),
         )
         .await
         .expect("walk cancel");
@@ -1326,6 +1399,7 @@ async fn given_a_failed_run_when_a_cancel_with_a_tally_lands_afterwards_then_it_
                 failed: 0,
             }),
             t(3),
+            None,
         )
         .await
         .expect("cancel");
@@ -1402,7 +1476,10 @@ async fn given_runs_in_every_terminal_status_when_active_runs_are_listed_then_no
     repo.start(cancelled, RunKind::Index, Some("/library"), t(1), 4)
         .await
         .expect("start");
-    assert!(repo.cancel(cancelled, None, t(2)).await.expect("cancel"));
+    assert!(repo
+        .cancel(cancelled, None, t(2), None)
+        .await
+        .expect("cancel"));
 
     let active = repo.list_active().await.expect("list_active");
 

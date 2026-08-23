@@ -40,11 +40,14 @@
 -- `segment` counts how many times the run has been put back to work: 0 for the
 -- segment `start()` opened, and one more for every `resume`. It exists because
 -- `status` alone cannot tell "still running" from "running again". A walk drops
--- its in-memory cell before recording that it was paused, and a pause and a
--- resume can both land in that gap — leaving the walk's own late pause facing a
--- row that reads `running` because a *different* segment is now walking it. The
--- walk captures this number when it starts and `pause` matches on it, so the
--- late write is refused instead of pausing a run that is actively working.
+-- its in-memory cell before recording how it stopped, and a pause and a resume
+-- can both land in that gap — leaving the walk's own late write facing a row
+-- that reads `running` because a *different* segment is now walking it. The
+-- walk captures this number when it starts and both halt verbs match on it, so
+-- the late write is refused instead of pausing, or terminally cancelling, a run
+-- that is actively working. Only `resume` advances it, which is what lets a
+-- walk's cancel still land behind a control call's to fill in the tally that
+-- call had none of.
 CREATE TABLE IF NOT EXISTS catalog_runs (
     id              TEXT PRIMARY KEY,
     kind            TEXT    NOT NULL,

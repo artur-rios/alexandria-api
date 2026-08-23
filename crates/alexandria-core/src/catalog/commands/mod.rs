@@ -62,13 +62,15 @@ where
 /// written now would be superseded, and a resumed run's `already_cataloged`
 /// is what describes the re-encountered prefix instead.
 ///
-/// `segment` is the one the calling walk captured before it began, and the
-/// pause is made conditional on it. By the time this runs the walk's cell is
+/// `segment` is the one the calling walk captured before it began, and *both*
+/// writes are made conditional on it. By the time this runs the walk's cell is
 /// gone, so a pause *and* a resume can both have landed in between — leaving a
 /// row that reads `running` because a different segment is walking it, which
-/// the status guard alone would accept. See [`CatalogRunRepository::pause`].
-/// `None` waives the check, leaving only that status guard: it is what a walk
-/// with no row to have read a segment from passes.
+/// the status guards alone would accept. Cancel needs it as much as pause and
+/// arguably more, being terminal: see [`CatalogRunRepository::cancel`], which
+/// also explains why the check does not cost the tally backfill. `None` waives
+/// it, leaving only the status guard: it is what a walk with no row to have
+/// read a segment from passes.
 pub(crate) async fn record_halt<RR>(
     runs: &RR,
     run_id: Uuid,
@@ -108,24 +110,30 @@ pub(crate) async fn record_halt<RR>(
         }
         RunSignal::Cancel => {
             match retry_on_busy(BUSY_ATTEMPTS, || {
-                runs.cancel(run_id, Some(counts), ended_at)
+                runs.cancel(run_id, Some(counts), ended_at, segment)
             })
             .await
             {
-                // Refused because the row reads `complete` or `failed`:
-                // the walk closed itself while this cancel was in flight.
-                // That write stands and this one is dropped — rewriting a run
-                // that got through all of its work into a cancelled one is
-                // the misreport the guard exists to prevent.
+                // Refused for one of two reasons. Either the row reads
+                // `complete` or `failed` — the walk closed itself while this
+                // cancel was in flight, and rewriting a run that got through
+                // all of its work into a cancelled one is the misreport that
+                // guard exists to prevent. Or the row is on a later segment,
+                // because a pause and a resume both landed in the gap above,
+                // and this cancel is about a run that is already walking
+                // again. Either way that write stands and this one is
+                // dropped.
                 //
-                // A cancel that a *control call* already wrote is not refused
-                // here: `cancelled` is in this branch's guard set, so the
-                // walk lands on top and fills in the four counts the control
-                // call had none of. Losing them was avoidable, and a cancel
-                // is supposed to keep its tally for the record.
+                // A cancel that a *control call* already wrote is still not
+                // refused: `cancelled` is in this branch's status set and
+                // such a call does not move the segment, so the walk lands on
+                // top and fills in the four counts the control call had none
+                // of. Losing them was avoidable, and a cancel is supposed to
+                // keep its tally for the record.
                 Ok(false) => tracing::warn!(
                     %run_id,
-                    "run was closed by another caller before it could be cancelled"
+                    ?segment,
+                    "run was closed or resumed by another caller before it could be cancelled"
                 ),
                 Ok(true) => {}
                 Err(err) => {

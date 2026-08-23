@@ -96,7 +96,7 @@ impl ControlHarness {
                 assert!(runs.pause(run_id, t(2), None).await.expect("pause"));
             }
             RunStatus::Cancelled => {
-                assert!(runs.cancel(run_id, None, t(2)).await.expect("cancel"));
+                assert!(runs.cancel(run_id, None, t(2), None).await.expect("cancel"));
             }
         }
         let registry = RunRegistry::new();
@@ -369,7 +369,7 @@ async fn given_a_cancelled_run_when_a_pause_write_lands_afterwards_then_the_fake
     )
     .await
     .expect("start");
-    runs.cancel(run_id, None, t(2)).await.expect("cancel");
+    runs.cancel(run_id, None, t(2), None).await.expect("cancel");
 
     let applied = runs.pause(run_id, t(3), None).await.expect("pause");
 
@@ -846,8 +846,12 @@ async fn given_a_cancelled_run_when_a_walks_cancel_lands_afterwards_then_the_fak
     )
     .await
     .expect("start");
+    // What the walk captured when it began. The control cancel below does not
+    // move it — only a resume does — so the walk's own cancel still matches
+    // and still backfills.
+    let segment = runs.get_recorded(run_id).expect("run").segment;
     assert!(runs
-        .cancel(run_id, None, t(2))
+        .cancel(run_id, None, t(2), None)
         .await
         .expect("control cancel"));
 
@@ -859,7 +863,7 @@ async fn given_a_cancelled_run_when_a_walks_cancel_lands_afterwards_then_the_fak
         failed: 1,
     };
     let applied = runs
-        .cancel(run_id, Some(counts), t(3))
+        .cancel(run_id, Some(counts), t(3), Some(segment))
         .await
         .expect("walk cancel");
 

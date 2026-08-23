@@ -2838,7 +2838,7 @@ async fn given_a_run_resumed_before_a_walks_pause_lands_when_it_lands_then_the_p
     );
     // Someone else pauses and resumes the run in the gap, after the walk has
     // closed its cell and before its own pause is evaluated.
-    runs.pause_and_resume_before_next_pause(run_id);
+    runs.pause_and_resume_before_next_halt(run_id);
 
     handler.execute(ROOT, run_id).await.expect("execute");
 
@@ -2851,6 +2851,62 @@ async fn given_a_run_resumed_before_a_walks_pause_lands_when_it_lands_then_the_p
     assert!(
         recorded.paused_at.is_none(),
         "and it must not have stamped a pause time on a run that is running"
+    );
+}
+
+#[tokio::test]
+async fn given_a_run_resumed_before_a_walks_cancel_lands_when_it_lands_then_the_cancel_is_refused()
+{
+    // The same gap as the pause test above, with the worse outcome: `cancel`
+    // is terminal. A predecessor segment's late cancel landing on a resumed
+    // row marks the run `cancelled` while the new segment keeps walking
+    // against it, and the row stays wrong for the whole remaining duration of
+    // that scan — only the new segment's unconditional `finish` clears it,
+    // minutes later. `TALLY_CANCELLABLE_FROM` admits `running`, so the status
+    // guard alone lets it through.
+    let runs = FakeCatalogRunRepository::new();
+    let registry = RunRegistry::new();
+    let run_id = Uuid::new_v4();
+    runs.start(run_id, RunKind::Index, Some(ROOT), now(), TEST_CONCURRENCY)
+        .await
+        .unwrap();
+    let cancel_mid_walk = control_interrupt(
+        control_handler(runs.clone(), registry.clone()),
+        run_id,
+        ControlVerb::Cancel,
+    );
+    let handler = handler_with_registry(
+        FakeAuth::Allowing,
+        FakeCatalogRepository::new(),
+        audio_library(),
+        fixed_clock(now()),
+        InterruptingAudioMetadataReader::new(cancel_mid_walk),
+        FakeImageMetadataReader::new(),
+        FakeDocumentMetadataReader::new(),
+        FakeVideoMetadataReader::new(),
+        FakeComicMetadataReader::new(),
+        runs.clone(),
+        registry.clone(),
+    );
+    // Someone else pauses and resumes the run in the gap, after the walk has
+    // closed its cell and before its own cancel is evaluated.
+    runs.pause_and_resume_before_next_halt(run_id);
+
+    handler.execute(ROOT, run_id).await.expect("execute");
+
+    let recorded = runs.get_recorded(run_id).expect("recorded run");
+    assert_eq!(
+        recorded.status,
+        RunStatus::Running,
+        "the resumed segment is walking — the old walk's cancel must not have applied"
+    );
+    assert!(
+        recorded.finished_at.is_none(),
+        "and it must not have stamped a finish time on a run that is running"
+    );
+    assert!(
+        recorded.counts.is_none(),
+        "nor written the stopped segment's tally over a run that is still working"
     );
 }
 

@@ -985,7 +985,7 @@ async fn given_a_run_resumed_before_a_refreshs_pause_lands_when_it_lands_then_th
     );
     // Someone else pauses and resumes the run in the gap, after the walk has
     // closed its cell and before its own pause is evaluated.
-    runs.pause_and_resume_before_next_pause(run_id);
+    runs.pause_and_resume_before_next_halt(run_id);
 
     handler.execute(run_id).await.expect("execute");
 
@@ -998,5 +998,68 @@ async fn given_a_run_resumed_before_a_refreshs_pause_lands_when_it_lands_then_th
     assert!(
         recorded.paused_at.is_none(),
         "and it must not have stamped a pause time on a run that is running"
+    );
+}
+
+#[tokio::test]
+async fn given_a_run_resumed_before_a_refreshs_cancel_lands_when_it_lands_then_it_is_refused() {
+    // The index walk's terminal-write race, seen at the identical site in a
+    // refresh — see `given_a_run_resumed_before_a_walks_cancel_lands_…` in the
+    // index tests for why a late cancel is the worse of the two halt verbs.
+    let repo = FakeCatalogRepository::new();
+    for n in 0..HALT_WALK_PATHS {
+        repo.seed(a_cataloged_file(&format!("/library/{n}.mp3"), 1, None));
+    }
+    let runs = FakeCatalogRunRepository::new();
+    let registry = RunRegistry::new();
+    let run_id = Uuid::new_v4();
+    runs.start(run_id, RunKind::Refresh, None, now(), TEST_CONCURRENCY)
+        .await
+        .unwrap();
+    let control = Arc::new(RunControlHandler::new(
+        FakeAuth::Allowing,
+        runs.clone(),
+        fixed_clock(now()),
+        registry.clone(),
+        TEST_CONCURRENCY,
+        TEST_LOW_PRIORITY_CONCURRENCY,
+    ));
+    let cancel_mid_walk = interrupt(move || {
+        let control = Arc::clone(&control);
+        async move { control.cancel(run_id, TOKEN).await.expect("cancel") }
+    });
+    let handler = RefreshHandler::new(
+        FakeAuth::Allowing,
+        repo.clone(),
+        InterruptingFilesystem::new(
+            FakeFilesystem::builder().build(),
+            Seam::FirstStat,
+            cancel_mid_walk,
+        ),
+        fixed_clock(now()),
+        TEST_CONCURRENCY,
+        TEST_LOW_PRIORITY_CONCURRENCY,
+        runs.clone(),
+        registry.clone(),
+    );
+    // Someone else pauses and resumes the run in the gap, after the walk has
+    // closed its cell and before its own cancel is evaluated.
+    runs.pause_and_resume_before_next_halt(run_id);
+
+    handler.execute(run_id).await.expect("execute");
+
+    let recorded = runs.get_recorded(run_id).expect("recorded run");
+    assert_eq!(
+        recorded.status,
+        RunStatus::Running,
+        "the resumed segment is walking — the old walk's cancel must not have applied"
+    );
+    assert!(
+        recorded.finished_at.is_none(),
+        "and it must not have stamped a finish time on a run that is running"
+    );
+    assert!(
+        recorded.counts.is_none(),
+        "nor written the stopped segment's tally over a run that is still working"
     );
 }

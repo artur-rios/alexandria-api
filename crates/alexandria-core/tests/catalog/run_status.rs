@@ -407,7 +407,10 @@ async fn given_a_run_cancelled_while_paused_when_read_then_its_clock_is_frozen()
         .await
         .unwrap();
     assert!(runs.pause(id, at(1, 10, 0), None).await.expect("pause"));
-    assert!(runs.cancel(id, None, at(1, 20, 0)).await.expect("cancel"));
+    assert!(runs
+        .cancel(id, None, at(1, 20, 0), None)
+        .await
+        .expect("cancel"));
     let handler = GetRunStatusHandler::new(
         FakeAuth::Allowing,
         runs.clone(),
@@ -483,7 +486,7 @@ impl ActiveRunsHarness {
                 .unwrap(),
             RunStatus::Failed => self.runs.fail(id, "root unreadable", t(2)).await.unwrap(),
             RunStatus::Cancelled => {
-                assert!(self.runs.cancel(id, None, t(2)).await.unwrap());
+                assert!(self.runs.cancel(id, None, t(2), None).await.unwrap());
             }
         }
         id

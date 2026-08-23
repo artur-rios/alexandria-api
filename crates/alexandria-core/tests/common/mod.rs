@@ -2277,10 +2277,10 @@ pub struct FakeCatalogRunRepository {
     /// see that an *intermediate* flush happened at all — which is what the
     /// two-second interval exists to produce.
     progress_history: Arc<Mutex<Vec<RunProgress>>>,
-    /// Armed by `pause_and_resume_before_next_pause`: the run to put through
-    /// a pause and a resume once, immediately before the next `pause` write
-    /// is evaluated.
-    resume_before_pause: Arc<Mutex<Option<Uuid>>>,
+    /// Armed by `pause_and_resume_before_next_halt`: the run to put through a
+    /// pause and a resume once, immediately before the next `pause` or
+    /// `cancel` write is evaluated.
+    resume_before_halt: Arc<Mutex<Option<Uuid>>>,
 }
 
 impl FakeCatalogRunRepository {
@@ -2346,19 +2346,39 @@ impl FakeCatalogRunRepository {
         *self.close_after_get.lock().unwrap() = Some((id, RunStatus::Complete));
     }
 
-    /// Pause and resume `id` the next time a pause is written, in between
-    /// that write being asked for and being evaluated.
+    /// Pause and resume `id` the next time a halt is written — `pause` or
+    /// `cancel` — in between that write being asked for and being evaluated.
     ///
     /// Simulates the one window the segment guard exists for: a walk drops
     /// its run cell, a control-path pause finds no live cell and writes
     /// `paused` itself, a client sees that and resumes, and only then does
-    /// the walk's own `record_halt` pause land — against a row that is
-    /// `running` again. Nothing else can produce that ordering against an
-    /// in-memory fake, and arming it on `get` (as the cancel race does)
-    /// would prove something different: the gap this one is about opens
-    /// *after* the walk's last read of the row.
-    pub fn pause_and_resume_before_next_pause(&self, id: Uuid) {
-        *self.resume_before_pause.lock().unwrap() = Some(id);
+    /// the walk's own `record_halt` land — against a row that is `running`
+    /// again, because a different segment is now walking it. Both halt verbs
+    /// meet it, and a late `cancel` is the worse of the two: it is terminal.
+    ///
+    /// Nothing else can produce that ordering against an in-memory fake, and
+    /// arming it on `get` (as the close-during-lookup races do) would prove
+    /// something different: the gap this one is about opens *after* the
+    /// walk's last read of the row.
+    pub fn pause_and_resume_before_next_halt(&self, id: Uuid) {
+        *self.resume_before_halt.lock().unwrap() = Some(id);
+    }
+
+    /// Apply an armed [`pause_and_resume_before_next_halt`], if it names `id`.
+    ///
+    /// The net effect of a control-path pause followed by a resume, applied
+    /// as one step rather than by re-entering those two methods, whose lock
+    /// the caller already holds: the row is `running` again, on a new
+    /// segment, with no pause time left on it.
+    fn apply_armed_resume(&self, runs: &mut HashMap<Uuid, CatalogRun>, id: Uuid) {
+        if self.resume_before_halt.lock().unwrap().take() != Some(id) {
+            return;
+        }
+        if let Some(run) = runs.get_mut(&id) {
+            run.status = RunStatus::Running;
+            run.paused_at = None;
+            run.segment += 1;
+        }
     }
 
     /// The recorded run for `id`, for assertions.
@@ -2462,20 +2482,8 @@ impl CatalogRunRepository for FakeCatalogRunRepository {
         paused_at: DateTime<Utc>,
         expected_segment: Option<i64>,
     ) -> Result<bool, DomainError> {
-        let armed = self.resume_before_pause.lock().unwrap().take();
         let mut runs = self.runs.lock().unwrap();
-        if armed == Some(id) {
-            if let Some(run) = runs.get_mut(&id) {
-                // The net effect of a control-path pause followed by a
-                // resume, applied as one step rather than by re-entering
-                // those two methods, whose lock this call already holds: the
-                // row is `running` again, on a new segment, with no pause
-                // time left on it.
-                run.status = RunStatus::Running;
-                run.paused_at = None;
-                run.segment += 1;
-            }
-        }
+        self.apply_armed_resume(&mut runs, id);
         let Some(run) = runs.get_mut(&id) else {
             return Ok(false);
         };
@@ -2504,10 +2512,16 @@ impl CatalogRunRepository for FakeCatalogRunRepository {
         id: Uuid,
         counts: Option<RunCounts>,
         cancelled_at: DateTime<Utc>,
+        expected_segment: Option<i64>,
     ) -> Result<bool, DomainError> {
         let mut runs = self.runs.lock().unwrap();
+        self.apply_armed_resume(&mut runs, id);
         if let Some(run) = runs.get_mut(&id) {
-            if let Some(counts) = counts {
+            // Every guard is answered before anything is written, so a
+            // refused cancel leaves the row exactly as it found it — the
+            // adapter gets that for free from doing it in one UPDATE, and the
+            // fake has to be written for it.
+            let accepted = if let Some(counts) = counts {
                 // Mirrors the adapter's shared `close_with_counts` guard.
                 let matches = matches!(
                     (run.kind, &counts),
@@ -2526,11 +2540,26 @@ impl CatalogRunRepository for FakeCatalogRunRepository {
                 if !TALLY_CANCELLABLE_FROM.contains(&run.status) {
                     return Ok(false);
                 }
+                Some(counts)
+            } else {
+                if !CANCELLABLE_FROM.contains(&run.status) {
+                    return Ok(false);
+                }
+                None
+            };
+            // Mirrors the `segment_guard!()` both adapter `cancel` statements
+            // carry: a walk's late cancel must not land on the segment that
+            // replaced it, and `running` is what the row reads either way. A
+            // control call binds `None` and is unaffected — including the
+            // control-cancel-then-walk-backfill path, since cancelling does
+            // not move the segment.
+            if expected_segment.is_some_and(|expected| expected != run.segment) {
+                return Ok(false);
+            }
+            if let Some(counts) = accepted {
                 // A cancelled run is never resumed, so its partial tally is
                 // final and is kept for the record.
                 run.counts = Some(counts);
-            } else if !CANCELLABLE_FROM.contains(&run.status) {
-                return Ok(false);
             }
             run.status = RunStatus::Cancelled;
             run.finished_at = Some(cancelled_at);
@@ -2958,6 +2987,7 @@ impl CatalogRunRepository for FailingCatalogRunRepository {
         _id: Uuid,
         _counts: Option<RunCounts>,
         _cancelled_at: DateTime<Utc>,
+        _expected_segment: Option<i64>,
     ) -> Result<bool, DomainError> {
         Ok(false)
     }

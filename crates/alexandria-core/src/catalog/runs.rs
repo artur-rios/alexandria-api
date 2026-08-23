@@ -362,6 +362,28 @@ pub trait CatalogRunRepository: Send + Sync {
     /// Neither set admits `complete` or `failed`: a run that closed itself is
     /// not one an owner's cancel may rewrite, whichever caller is asking.
     ///
+    /// `expected_segment` is the same second half of the guard
+    /// [`pause`](CatalogRunRepository::pause) takes, against the same race and
+    /// with the same meaning: `Some(n)` from a walk, naming the segment it
+    /// captured when it began, and `None` from the control path, whose subject
+    /// is the row as it stands. A cancel needs it for the reason a pause does
+    /// — a pause and a resume can both land in the gap between a walk dropping
+    /// its cell and reaching its terminal write, and `running` is then what the
+    /// row reads because a *different* segment is walking it. Cancel is the
+    /// worse of the two to get wrong: it is terminal, so the run reads
+    /// `cancelled` with a `finished_at` for the whole remaining duration of a
+    /// scan that is still going, until the live segment's unconditional
+    /// `finish` eventually contradicts it.
+    ///
+    /// It does not cost the backfill described above, which is why the two
+    /// can coexist. A control call cancelling a `running` run does not move
+    /// the segment — only [`resume`](CatalogRunRepository::resume) does — so
+    /// the walk landing behind it still matches on the segment it captured,
+    /// and still replaces `counts: NULL` with its four numbers. What the check
+    /// refuses is only the case where a resume *did* intervene, which is
+    /// exactly the one where the walk is talking about a run that no longer
+    /// exists as it knew it.
+    ///
     /// Callers must not ignore the `false`. See `record_halt`, which logs it,
     /// and `RunControlHandler`, which reports it.
     async fn cancel(
@@ -369,6 +391,7 @@ pub trait CatalogRunRepository: Send + Sync {
         id: Uuid,
         counts: Option<RunCounts>,
         cancelled_at: DateTime<Utc>,
+        expected_segment: Option<i64>,
     ) -> Result<bool, DomainError>;
 
     /// Put a paused run back to `running`, ready to be walked again.
@@ -635,6 +658,21 @@ macro_rules! tally_cancellable_guard {
     };
 }
 
+/// The clause that pins a halt to the segment the caller was executing, for
+/// the statements that take one. Shared by `pause` and both `cancel` forms,
+/// which face the identical race and must not drift on how they answer it.
+///
+/// A bound `NULL` waives it — the control path, whose subject is the row as it
+/// stands. `Some(n)` requires the row to still be on segment `n`, which is how
+/// a walk says "the run I was walking", not "whatever this run is now". Two
+/// binds of the one value rather than a numbered parameter: sqlx counts
+/// positional `?`s, and mixing the two forms is how that goes wrong.
+macro_rules! segment_guard {
+    () => {
+        " AND (? IS NULL OR segment = ?)"
+    };
+}
+
 /// The statement that closes an index run with its tally, with `$guard`
 /// appended.
 ///
@@ -694,6 +732,11 @@ impl SqliteCatalogRunRepository {
     /// should lose to. `cancel` is guarded; the trait doc says why. Returns
     /// whether the write applied, which is only ever `false` for a guarded
     /// one.
+    ///
+    /// `expected_segment` rides inside that same guard when there is one —
+    /// see [`segment_guard`] and [`CatalogRunRepository::cancel`]. It is
+    /// bound only for a guarded write; an unguarded one has nothing to lose
+    /// to and no clause to bind it to.
     async fn close_with_counts(
         &self,
         id: Uuid,
@@ -701,6 +744,7 @@ impl SqliteCatalogRunRepository {
         counts: RunCounts,
         finished_at: DateTime<Utc>,
         guarded: bool,
+        expected_segment: Option<i64>,
     ) -> Result<bool, DomainError> {
         // Guard against a caller passing the wrong kind's tally: writing it
         // would leave the row's own kind's columns NULL, and `get` would then
@@ -723,10 +767,12 @@ impl SqliteCatalogRunRepository {
         // unguarded form of each from drifting in anything but the guard.
         let sql = match (&counts, guarded) {
             (RunCounts::Index { .. }, false) => close_index_sql!(""),
-            (RunCounts::Index { .. }, true) => close_index_sql!(tally_cancellable_guard!()),
+            (RunCounts::Index { .. }, true) => {
+                close_index_sql!(concat!(tally_cancellable_guard!(), segment_guard!()))
+            }
             (RunCounts::Refresh { .. }, false) => close_refresh_sql!(""),
             (RunCounts::Refresh { .. }, true) => {
-                close_refresh_sql!(tally_cancellable_guard!())
+                close_refresh_sql!(concat!(tally_cancellable_guard!(), segment_guard!()))
             }
         };
         let query = sqlx::query(sql)
@@ -762,9 +808,11 @@ impl SqliteCatalogRunRepository {
         let query = query.bind(id.to_string());
         // Bound after the id, matching the order the placeholders appear in.
         let query = if guarded {
-            TALLY_CANCELLABLE_FROM
+            let query = TALLY_CANCELLABLE_FROM
                 .iter()
-                .fold(query, |query, status| query.bind(status.as_str()))
+                .fold(query, |query, status| query.bind(status.as_str()));
+            // Last, matching where `segment_guard!()` is concatenated.
+            query.bind(expected_segment).bind(expected_segment)
         } else {
             query
         };
@@ -806,8 +854,9 @@ impl CatalogRunRepository for SqliteCatalogRunRepository {
         finished_at: DateTime<Utc>,
     ) -> Result<(), DomainError> {
         // Unconditional: this is the walk recording its own completion, and
-        // there is no writer it should lose to.
-        self.close_with_counts(id, RunStatus::Complete, counts, finished_at, false)
+        // there is no writer it should lose to. `None` for the segment
+        // follows from that — an unguarded write binds no segment clause.
+        self.close_with_counts(id, RunStatus::Complete, counts, finished_at, false, None)
             .await?;
         Ok(())
     }
@@ -849,18 +898,17 @@ impl CatalogRunRepository for SqliteCatalogRunRepository {
         // `paused` beside a `finished_at` the pause never wrote, and a run the
         // owner abandoned looking resumable.
         //
-        // `AND (? IS NULL OR segment = ?)` is the other half, and the half
-        // `status` cannot express: `running` is also what the row reads when
-        // somebody paused *and resumed* it inside that same window, and a
-        // walk's late pause landing on the resumed segment stops nothing and
-        // misreports everything. See the trait doc. The bound `NULL` waives
-        // it for the control path, whose subject is the row as it stands. Two
-        // binds of one value rather than a numbered parameter: sqlx counts
-        // positional `?`s, and mixing the two forms is how that goes wrong.
-        let result = sqlx::query(
+        // [`segment_guard`] is the other half, and the half `status` cannot
+        // express: `running` is also what the row reads when somebody paused
+        // *and resumed* it inside that same window, and a walk's late pause
+        // landing on the resumed segment stops nothing and misreports
+        // everything. See the trait doc. Both `cancel` forms carry the same
+        // clause, against the same race.
+        let result = sqlx::query(concat!(
             "UPDATE catalog_runs SET status = ?, paused_at = ? \
-             WHERE id = ? AND status = ? AND (? IS NULL OR segment = ?)",
-        )
+             WHERE id = ? AND status = ?",
+            segment_guard!()
+        ))
         .bind(RunStatus::Paused.as_str())
         .bind(paused_at.to_rfc3339())
         .bind(id.to_string())
@@ -877,6 +925,7 @@ impl CatalogRunRepository for SqliteCatalogRunRepository {
         id: Uuid,
         counts: Option<RunCounts>,
         cancelled_at: DateTime<Utc>,
+        expected_segment: Option<i64>,
     ) -> Result<bool, DomainError> {
         let Some(counts) = counts else {
             // No tally on offer — the control handler acting on a run no
@@ -884,24 +933,39 @@ impl CatalogRunRepository for SqliteCatalogRunRepository {
             // `finish` and `fail`. The `status IN (…)` guard is the trait
             // doc's: a cancel must not rewrite a run that closed itself
             // between this caller's lookup and this write.
+            //
+            // [`segment_guard`] joins it here as it does on `pause`. This
+            // caller binds `NULL` in practice, but the clause is on the
+            // statement rather than on the caller so the two `cancel` forms
+            // cannot drift on what they guard against.
             let result = sqlx::query(concat!(
                 "UPDATE catalog_runs SET status = ?, finished_at = ?, phase = NULL \
                  WHERE id = ?",
-                cancellable_guard!()
+                cancellable_guard!(),
+                segment_guard!()
             ))
             .bind(RunStatus::Cancelled.as_str())
             .bind(cancelled_at.to_rfc3339())
             .bind(id.to_string())
             .bind(CANCELLABLE_FROM[0].as_str())
             .bind(CANCELLABLE_FROM[1].as_str())
+            .bind(expected_segment)
+            .bind(expected_segment)
             .execute(&self.pool)
             .await?;
             return Ok(result.rows_affected() > 0);
         };
         // A cancelled run is never resumed, so the tally it reached is final —
         // it is kept for exactly the reason a completed run's is.
-        self.close_with_counts(id, RunStatus::Cancelled, counts, cancelled_at, true)
-            .await
+        self.close_with_counts(
+            id,
+            RunStatus::Cancelled,
+            counts,
+            cancelled_at,
+            true,
+            expected_segment,
+        )
+        .await
     }
 
     async fn resume(

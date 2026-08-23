@@ -323,11 +323,13 @@ where
                     return Err(DomainError::InvalidState);
                 }
             }
-            // `None`: this caller holds no partial tally. The walk that does
-            // passes its own through `record_halt`.
+            // `None` twice over: this caller holds no partial tally — the
+            // walk that does passes its own through `record_halt` — and no
+            // segment either, for the reason the pause arm above gives.
             Verb::Cancel => {
                 let applied =
-                    retry_on_busy(BUSY_ATTEMPTS, || self.runs.cancel(run_id, None, now)).await?;
+                    retry_on_busy(BUSY_ATTEMPTS, || self.runs.cancel(run_id, None, now, None))
+                        .await?;
                 if !applied {
                     // The run closed itself between the lookup and this
                     // write. Refusing is what keeps a completed run from
