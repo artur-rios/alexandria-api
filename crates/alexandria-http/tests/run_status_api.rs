@@ -130,16 +130,16 @@ async fn given_a_started_run_when_polled_to_completion_then_it_reports_complete_
     // Task 3 stopped indexing from computing a hash at all, and Task 4's
     // refresh never computes a new one either: a detected change clears
     // `content_hash` rather than replacing it (FR-FC-10), so a.mp3's hash
-    // here is asserted empty, not equal to some freshly recomputed SHA-256.
+    // here is asserted absent, not equal to some freshly recomputed SHA-256.
     let rows = file_rows_with_missing(&test.pool).await;
-    let by_name: std::collections::BTreeMap<String, (String, Option<String>)> = rows
+    let by_name: std::collections::BTreeMap<String, (Option<String>, Option<String>)> = rows
         .into_iter()
         .map(|(_, name, _, hash, missing_at)| (name, (hash, missing_at)))
         .collect();
     let (a_hash, a_missing) = by_name.get("a.mp3").expect("a.mp3 row");
     assert!(a_missing.is_none(), "a.mp3 is still on disk");
-    assert!(
-        a_hash.is_empty(),
+    assert_eq!(
+        a_hash, &None,
         "refresh clears the hash rather than recomputing one"
     );
     let (_, b_missing) = by_name.get("b.md").expect("b.md row");

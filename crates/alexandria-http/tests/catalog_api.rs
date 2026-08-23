@@ -80,12 +80,10 @@ async fn given_supported_files_when_index_posted_then_returns_202_with_run_id() 
     assert_eq!(rows[1].1, "song.mp3");
     assert_eq!(rows[1].2, "audio");
     // FR-FC-09 (Task 3): indexing never reads file bytes, so content_hash
-    // stays unset. The raw SQL row decodes a NULL TEXT column as an empty
-    // `String` here (this helper predates the nullable column and was never
-    // updated to `Option<String>`), so "unset" surfaces as `""` rather than
-    // `None`.
-    assert!(
-        rows[0].3.is_empty(),
+    // stays unset — `None`, the column's own NULL, and not an empty string
+    // standing in for one.
+    assert_eq!(
+        rows[0].3, None,
         "content hash is not computed at index time"
     );
 }
@@ -270,8 +268,8 @@ async fn given_changed_and_deleted_files_when_refresh_posted_then_refreshes_and_
     let rows = file_rows_with_missing(&test.pool).await;
     let a_row = rows.iter().find(|r| r.1 == "a.mp3").expect("a");
     let b_row = rows.iter().find(|r| r.1 == "b.md").expect("b");
-    assert!(
-        a_row.3.is_empty(),
+    assert_eq!(
+        a_row.3, None,
         "refresh clears the hash rather than recomputing one"
     );
     assert_eq!(a_row.4, None, "a missing marker cleared");

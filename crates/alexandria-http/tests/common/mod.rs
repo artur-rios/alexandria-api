@@ -97,7 +97,15 @@ pub async fn wait_for_files(pool: &SqlitePool, expected: i64) {
     }
 }
 
-pub async fn file_rows(pool: &SqlitePool) -> Vec<(String, String, String, String)> {
+/// `(path, name, type, content_hash)` ordered by path.
+///
+/// `content_hash` is `Option<String>` because the column is nullable and, since
+/// indexing stopped hashing whole files (FR-FC-09), usually NULL. Typing it
+/// `String` decodes NULL as `""`, which is the exact mistake that shipped as a
+/// production parity defect in the FFI accessor (`cf78144`) — a hash that was
+/// never computed became indistinguishable from an empty one. A test helper
+/// wearing that shape keeps the trap loaded.
+pub async fn file_rows(pool: &SqlitePool) -> Vec<(String, String, String, Option<String>)> {
     sqlx::query_as("SELECT path, name, type, content_hash FROM files ORDER BY path")
         .fetch_all(pool)
         .await
@@ -106,10 +114,11 @@ pub async fn file_rows(pool: &SqlitePool) -> Vec<(String, String, String, String
 
 /// `(uuid, path, name, type, content_hash)` ordered by path. Used by UC-04
 /// integration tests to resolve a cataloged file's public UUID for the
-/// `PATCH /v1/files/{uuid}/metadata` request.
+/// `PATCH /v1/files/{uuid}/metadata` request. `content_hash` is nullable for
+/// the reason [`file_rows`] gives.
 pub async fn file_rows_with_uuid(
     pool: &SqlitePool,
-) -> Vec<(String, String, String, String, String)> {
+) -> Vec<(String, String, String, String, Option<String>)> {
     sqlx::query_as("SELECT uuid, path, name, type, content_hash FROM files ORDER BY path")
         .fetch_all(pool)
         .await
@@ -117,10 +126,11 @@ pub async fn file_rows_with_uuid(
 }
 
 /// `(path, name, type, content_hash, missing_at)` — `missing_at` is NULL when
-/// the on-disk file was present at last refresh.
+/// the on-disk file was present at last refresh, and `content_hash` is
+/// nullable for the reason [`file_rows`] gives.
 pub async fn file_rows_with_missing(
     pool: &SqlitePool,
-) -> Vec<(String, String, String, String, Option<String>)> {
+) -> Vec<(String, String, String, Option<String>, Option<String>)> {
     sqlx::query_as(
         "SELECT path, name, type, content_hash, missing_at \
          FROM files ORDER BY path",
