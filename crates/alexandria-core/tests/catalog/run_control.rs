@@ -599,6 +599,36 @@ async fn given_a_low_priority_run_when_resumed_without_a_priority_then_it_keeps_
     );
 }
 
+/// The zero clamp, which resume is the first thing to make reachable for
+/// `low_priority_concurrency`: a misconfigured `0` must resume the run at 1,
+/// not write a width at which the walk would process nothing at all.
+/// `IndexHandler` and `RefreshHandler` clamp the same two settings the same
+/// way, and before this task the value never left this handler.
+#[tokio::test]
+async fn given_a_zero_low_priority_width_when_resumed_at_low_then_the_run_is_paced_at_one() {
+    let (_, runs, run_id) = paused_run_at_width(DEFAULT_CONCURRENCY).await;
+    let control = RunControlHandler::new(
+        FakeAuth::Allowing,
+        runs.clone(),
+        FixedClock(t(3)),
+        RunRegistry::new(),
+        DEFAULT_CONCURRENCY,
+        0,
+    );
+
+    let resumed = control
+        .resume(run_id, TOKEN, Some(RunPriority::Low))
+        .await
+        .expect("resume");
+
+    assert_eq!(resumed.concurrency, 1);
+    assert_eq!(
+        runs.get_recorded(run_id).expect("run").concurrency,
+        Some(1),
+        "a width of zero is not a slower walk, it is no walk — the row must          never record one"
+    );
+}
+
 /// Naming a priority buys a resume no new legality: `paused` is still the
 /// only status with an edge back into `running`, and a refused resume still
 /// re-paces nothing.

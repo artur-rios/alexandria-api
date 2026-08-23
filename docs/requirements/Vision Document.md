@@ -111,7 +111,7 @@ database instead.
 
 | ID | Feature | Description |
 | --- | --- | --- |
-| **F-01** | File indexing | Scan a directory tree and create type-aware catalog records for supported file types, recording each file's path, size, and modification time without reading its contents. Runs asynchronously without blocking reads, report their progress while they go, and can be started at a chosen priority, paused, resumed, and cancelled. |
+| **F-01** | File indexing | Scan a directory tree and create type-aware catalog records for supported file types, recording each file's path, size, and modification time without reading its contents. Runs asynchronously without blocking reads, report their progress while they go, and can be started at a chosen priority, paused, resumed — optionally at a new priority — and cancelled. |
 | **F-02** | Catalog browsing and metadata editing | List, query, view, and edit the metadata of any supported file type; edit comic-book, video, audio, document, and image metadata; browse by type and collection. |
 | **F-03** | Renaming and lifecycle management | Rename files (which renames them on disk), soft-delete records with restore, hard-purge records, and explicitly purge a file on disk. |
 | **F-04** | Text file content editing | Read Markdown and text file content and write edited content back to the file on disk. |

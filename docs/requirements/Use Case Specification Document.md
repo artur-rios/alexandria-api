@@ -1613,12 +1613,14 @@ have only one of.
 > is `indexed + alreadyCataloged`, which lands on the right number — and it is
 > exactly why FR-FC-27 keeps `alreadyCataloged` apart from `skipped`.
 
-> A run's priority cannot be changed part-way through. The concurrency bound
-> is fixed when the walk is built, and a resume reuses the width the run was
-> started with rather than taking a new one (FR-FC-31). An owner who picked
-> the wrong priority cancels the run and starts a fresh one at the other
-> priority; that is nearly free, because everything the abandoned run had
-> cataloged falls straight through the new one as `alreadyCataloged`.
+> A run's priority cannot be changed *while a segment is walking*: the
+> concurrency bound is fixed when the walk is built. It can be changed
+> **between** segments — a resume may name a priority of its own, and the run
+> walks its next segment at that width and remembers it (FR-FC-33, step 4
+> above). An owner who picked the wrong priority therefore pauses and resumes
+> rather than cancelling: the run keeps its id, its record, and everything it
+> has already cataloged. Resuming without naming a priority keeps the width
+> the run already has (FR-FC-31).
 
 ---
 

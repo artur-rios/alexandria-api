@@ -32,7 +32,7 @@ health, configuration, deployment) are specified in the
 | **Content hash** | SHA-256 hash of a File's bytes. Informational, and usually absent: indexing and re-index never compute one (FR-FC-09, FR-FC-10). The only thing that writes it is the post-write verification of a text edit (FR-TX-03). |
 | **Stat pair** | A File's `sizeBytes` and `mtime`, both taken from the directory entry during the walk. Together they are the change signal a re-index compares (FR-FC-10). |
 | **Run** | One index or re-index execution, recorded and addressable by a run id (FR-FC-27). Non-terminal statuses are `running` and `paused`; terminal ones are `complete`, `failed`, and `cancelled`. |
-| **Run priority** | How hard a run pushes: `normal` or `low`, chosen when the run is started (FR-FC-31) and reused when it is resumed. |
+| **Run priority** | How hard a run pushes: `normal` or `low`, chosen when the run is started (FR-FC-31) and again, optionally, each time it is resumed (FR-FC-33). Fixed for the length of one segment, not for the life of the run; a resume that names none keeps the width the run already has. |
 | **State** | A File or Bookmark lifecycle state: `active`, `deleted` (soft), or purged. |
 | **mediaKind** | VideoFile discriminator: `movie` or `series`. |
 | **formatKind** | Document discriminator: `book` or `ebook`. |
@@ -421,7 +421,7 @@ kept indefinitely.
 | processed | integer | nullable | How many entries the current segment has finished with, of any outcome. |
 | pausedAt | timestamp | nullable | When the current pause began; `NULL` unless the run is `paused`. |
 | pausedMillis | integer | required | Time the run has spent paused, accumulated across segments. Internal: it is the input `activeMillis` is derived from, and is not itself reported. |
-| concurrency | integer | nullable | The width the run's priority (FR-FC-31) resolved to, so a resume reuses it. Internal; `NULL` only for a run started before priority existed, which resumes at the configured default. |
+| concurrency | integer | nullable | The width the run's priority (FR-FC-31) resolved to. Written at start, and rewritten by a resume that names a priority of its own (FR-FC-33) — that write is what re-paces the run, since the next segment is walked at whatever this column says. A resume naming no priority leaves it alone. Internal; `NULL` only for a run started before priority existed, which resumes at the configured default. |
 | scanned | integer | nullable | Index only: entries scanned. |
 | indexed | integer | nullable | Index only: files newly indexed. |
 | skipped | integer | nullable | Index only: entries classified out (an unsupported extension). |

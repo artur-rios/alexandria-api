@@ -1761,6 +1761,68 @@ fn given_a_paused_run_when_resumed_over_ffi_then_same_run_id_and_it_finishes() {
     assert_eq!(body["status"], "complete");
 }
 
+/// The FFI twin of the HTTP `..._resumed_with_normal_priority_then_it_is_widened`
+/// case (Task 15). `"low"` over FFI is covered end to end by `parity.rs`, and
+/// NULL by the resume tests above; without this, `"normal"` over FFI rested
+/// only on a unit test of `parse_resume_priority` plus the shared core
+/// handler — and `"normal"` is the whole reason the wire value is three-valued
+/// rather than a boolean, so it is the one that most needs proving through
+/// the real entry point.
+///
+/// The stored `concurrency` is the only place a resolved priority is
+/// observable (`CatalogRun::concurrency` is `#[serde(skip)]`), so this reads
+/// the column, exactly as the start-priority smoke tests above do.
+#[test]
+fn given_a_low_priority_paused_run_when_resumed_at_normal_over_ffi_then_it_is_widened() {
+    let _g = serial();
+    let (_db_dir, db_path) = init_temp_db();
+    let lib = tempdir().unwrap();
+    write_library(lib.path(), 500);
+
+    let root = c(lib.path().to_str().unwrap());
+    let token = c(TEST_TOKEN);
+    let low = c("low");
+    let started = alexandria_index_start(root.as_ptr(), token.as_ptr(), low.as_ptr());
+    assert_eq!(started.status, STATUS_OK);
+    let run_id = run_id_string(&started);
+    assert_eq!(
+        run_concurrency(&db_path, &run_id),
+        Some(1),
+        "sanity: it started at indexing.low_priority_concurrency"
+    );
+
+    wait_for_run_cell_live(&run_id, &token);
+    let run_id_c = c(&run_id);
+    assert_eq!(
+        alexandria_index_pause(run_id_c.as_ptr(), token.as_ptr()),
+        STATUS_RUN_OK
+    );
+    assert_eq!(
+        wait_for_run_terminal_or_paused(&run_id, &token)["status"],
+        "paused"
+    );
+
+    let normal = c("normal");
+    let resumed = alexandria_index_resume(run_id_c.as_ptr(), token.as_ptr(), normal.as_ptr());
+    assert_eq!(resumed.status, STATUS_RUN_OK);
+    assert_eq!(
+        run_id_string(&resumed),
+        run_id,
+        "a re-paced resume still continues the same run"
+    );
+    assert_eq!(
+        run_concurrency(&db_path, &run_id),
+        Some(4),
+        "\"normal\" must widen the run to indexing.concurrency; sending nothing would \
+         have left it at 1, which is what makes this a real request rather than a \
+         synonym for silence"
+    );
+    assert_eq!(
+        wait_for_run_terminal_or_paused(&run_id, &token)["status"],
+        "complete"
+    );
+}
+
 #[test]
 fn given_a_running_run_when_resumed_over_ffi_then_invalid_state() {
     let _g = serial();
