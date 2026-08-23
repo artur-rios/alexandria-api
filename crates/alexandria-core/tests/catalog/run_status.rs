@@ -374,7 +374,7 @@ async fn given_a_paused_run_when_read_later_then_active_millis_does_not_grow_wit
     runs.start(id, RunKind::Index, Some("/library"), at(1, 0, 0), 4)
         .await
         .unwrap();
-    assert!(runs.pause(id, at(1, 10, 0)).await.expect("pause"));
+    assert!(runs.pause(id, at(1, 10, 0), None).await.expect("pause"));
 
     // Ten minutes of work, then a pause of no particular length. Every read
     // must give the same answer, whenever it happens.
@@ -406,7 +406,7 @@ async fn given_a_run_cancelled_while_paused_when_read_then_its_clock_is_frozen()
     runs.start(id, RunKind::Index, Some("/library"), at(1, 0, 0), 4)
         .await
         .unwrap();
-    assert!(runs.pause(id, at(1, 10, 0)).await.expect("pause"));
+    assert!(runs.pause(id, at(1, 10, 0), None).await.expect("pause"));
     assert!(runs.cancel(id, None, at(1, 20, 0)).await.expect("cancel"));
     let handler = GetRunStatusHandler::new(
         FakeAuth::Allowing,
@@ -464,7 +464,7 @@ impl ActiveRunsHarness {
         match status {
             RunStatus::Running => {}
             RunStatus::Paused => {
-                assert!(self.runs.pause(id, t(2)).await.unwrap());
+                assert!(self.runs.pause(id, t(2), None).await.unwrap());
             }
             RunStatus::Complete => self
                 .runs

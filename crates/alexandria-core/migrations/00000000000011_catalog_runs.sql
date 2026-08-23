@@ -1,3 +1,9 @@
+-- Pre-release baseline: amended in place, never stacked. sqlx checksums a
+-- migration's file content, so any edit here — a comment included — makes an
+-- existing database fail startup with `DomainError::Migration`. That is the
+-- accepted trade while the project is pre-release (Operations & Infrastructure
+-- Document §2.5): an existing database is deleted and rebuilt, not migrated.
+--
 -- UC-42: the lifecycle and outcome of each UC-01 index and UC-02 re-index run
 -- (FR-FC-27). `start()` mints a run id and the caller is handed it; before
 -- this table nothing recorded what became of that run, so a client could not
@@ -30,6 +36,15 @@
 -- back to the configured default. It is declared here rather than in a later
 -- migration because this baseline file is amended in place, never stacked, so
 -- the table's shape is settled in one edit.
+--
+-- `segment` counts how many times the run has been put back to work: 0 for the
+-- segment `start()` opened, and one more for every `resume`. It exists because
+-- `status` alone cannot tell "still running" from "running again". A walk drops
+-- its in-memory cell before recording that it was paused, and a pause and a
+-- resume can both land in that gap — leaving the walk's own late pause facing a
+-- row that reads `running` because a *different* segment is now walking it. The
+-- walk captures this number when it starts and `pause` matches on it, so the
+-- late write is refused instead of pausing a run that is actively working.
 CREATE TABLE IF NOT EXISTS catalog_runs (
     id              TEXT PRIMARY KEY,
     kind            TEXT    NOT NULL,
@@ -51,7 +66,8 @@ CREATE TABLE IF NOT EXISTS catalog_runs (
     processed       INTEGER,
     paused_at       TEXT,
     paused_millis   INTEGER NOT NULL DEFAULT 0,
-    concurrency     INTEGER
+    concurrency     INTEGER,
+    segment         INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_catalog_runs_started_at ON catalog_runs (started_at);

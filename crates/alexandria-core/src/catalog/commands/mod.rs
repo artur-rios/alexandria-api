@@ -61,12 +61,21 @@ where
 /// discards it: a paused run is resumed and re-walks, so a partial tally
 /// written now would be superseded, and a resumed run's `already_cataloged`
 /// is what describes the re-encountered prefix instead.
+///
+/// `segment` is the one the calling walk captured before it began, and the
+/// pause is made conditional on it. By the time this runs the walk's cell is
+/// gone, so a pause *and* a resume can both have landed in between — leaving a
+/// row that reads `running` because a different segment is walking it, which
+/// the status guard alone would accept. See [`CatalogRunRepository::pause`].
+/// `None` waives the check, leaving only that status guard: it is what a walk
+/// with no row to have read a segment from passes.
 pub(crate) async fn record_halt<RR>(
     runs: &RR,
     run_id: Uuid,
     signal: RunSignal,
     counts: RunCounts,
     ended_at: DateTime<Utc>,
+    segment: Option<i64>,
 ) where
     RR: CatalogRunRepository,
 {
@@ -75,17 +84,21 @@ pub(crate) async fn record_halt<RR>(
         // here, and a run nobody stopped has nothing to record either way.
         RunSignal::None => {}
         RunSignal::Pause => {
-            match retry_on_busy(BUSY_ATTEMPTS, || runs.pause(run_id, ended_at)).await {
-                // The pause was refused because the row is no longer
-                // `running`: something else closed this run while the walk was
-                // between dropping its cell and getting here — in practice a
-                // `cancel` that found no live cell and wrote itself directly.
-                // That write stands, deliberately, and this one is dropped.
-                // Logged rather than swallowed: silence here would hide the
-                // next bug of this shape, which is how this one was found.
+            match retry_on_busy(BUSY_ATTEMPTS, || runs.pause(run_id, ended_at, segment)).await {
+                // The pause was refused. Either the row is no longer
+                // `running` — something else closed this run while the walk
+                // was between dropping its cell and getting here, in practice
+                // a `cancel` that found no live cell and wrote itself
+                // directly — or it is `running` again on a later segment,
+                // because a pause and a resume both landed in that same gap.
+                // Both writes stand, deliberately, and this one is dropped.
+                // Logged rather than swallowed in either case: silence here
+                // would hide the next bug of this shape, which is how both of
+                // these were found.
                 Ok(false) => tracing::warn!(
                     %run_id,
-                    "run was closed by another caller before it could be paused"
+                    ?segment,
+                    "run was closed or resumed by another caller before it could be paused"
                 ),
                 Ok(true) => {}
                 Err(err) => {

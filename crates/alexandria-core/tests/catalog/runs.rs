@@ -689,7 +689,7 @@ async fn given_a_running_run_with_progress_when_paused_then_it_keeps_its_phase_a
     .await
     .expect("record progress");
 
-    let applied = repo.pause(id, t(2)).await.expect("pause");
+    let applied = repo.pause(id, t(2), None).await.expect("pause");
 
     assert!(applied, "a running run accepts a pause");
     let run = repo.get(id).await.expect("get").expect("run exists");
@@ -759,7 +759,7 @@ async fn given_a_paused_run_when_startup_reconciles_then_it_is_left_paused() {
     repo.start(id, RunKind::Index, Some("/library"), t(1), 4)
         .await
         .expect("start");
-    assert!(repo.pause(id, t(2)).await.expect("pause"));
+    assert!(repo.pause(id, t(2), None).await.expect("pause"));
 
     let reconciled = repo.pause_running(t(3)).await.expect("pause running");
 
@@ -814,7 +814,7 @@ async fn given_a_cancelled_run_when_a_pause_write_lands_afterwards_then_the_canc
         .expect("start");
     repo.cancel(id, None, t(2)).await.expect("cancel");
 
-    let applied = repo.pause(id, t(3)).await.expect("pause");
+    let applied = repo.pause(id, t(3), None).await.expect("pause");
 
     assert!(!applied, "a pause must not apply to a run already closed");
     let run = repo.get(id).await.expect("get").expect("run exists");
@@ -824,6 +824,70 @@ async fn given_a_cancelled_run_when_a_pause_write_lands_afterwards_then_the_canc
         run.paused_at.is_none(),
         "the refused pause must not have stamped a pause time either"
     );
+}
+
+#[tokio::test]
+async fn given_a_resumed_run_when_the_previous_segments_pause_lands_then_it_is_refused() {
+    // The window `AND (? IS NULL OR segment = ?)` exists for, and the one the
+    // status guard above cannot cover: *both* a pause and a resume land while
+    // the walk is between dropping its cell and recording itself, so the row
+    // reads `running` again — a different segment. The old walk's pause would
+    // otherwise apply, leaving `paused` on a run a live segment is walking.
+    let (repo, _dir) = repo().await;
+    let id = Uuid::new_v4();
+    repo.start(id, RunKind::Index, Some("/library"), t(1), 4)
+        .await
+        .expect("start");
+    let segment = repo
+        .get(id)
+        .await
+        .expect("get")
+        .expect("run exists")
+        .segment;
+    // The gap: someone pauses the run the walk had already stopped, a client
+    // sees `paused`, and resumes — spawning the segment now walking it.
+    assert!(repo.pause(id, t(2), None).await.expect("pause"));
+    assert!(repo.resume(id, 0, None).await.expect("resume"));
+
+    let applied = repo.pause(id, t(3), Some(segment)).await.expect("pause");
+
+    assert!(
+        !applied,
+        "a segment that has already stopped must not pause the one that replaced it"
+    );
+    let run = repo.get(id).await.expect("get").expect("run exists");
+    assert_eq!(
+        run.status,
+        RunStatus::Running,
+        "the resumed segment is still walking"
+    );
+    assert!(run.paused_at.is_none());
+    assert_eq!(run.segment, segment + 1, "resume opened a new segment");
+}
+
+#[tokio::test]
+async fn given_a_running_run_when_its_own_segments_pause_lands_then_it_applies() {
+    // The legal path the guard must not cost anything: a walk pausing the
+    // segment it is actually executing. The only difference from the test
+    // above is that nobody resumed in between.
+    let (repo, _dir) = repo().await;
+    let id = Uuid::new_v4();
+    repo.start(id, RunKind::Refresh, None, t(1), 4)
+        .await
+        .expect("start");
+    let segment = repo
+        .get(id)
+        .await
+        .expect("get")
+        .expect("run exists")
+        .segment;
+
+    let applied = repo.pause(id, t(2), Some(segment)).await.expect("pause");
+
+    assert!(applied);
+    let run = repo.get(id).await.expect("get").expect("run exists");
+    assert_eq!(run.status, RunStatus::Paused);
+    assert_eq!(run.paused_at, Some(t(2)));
 }
 
 #[tokio::test]
@@ -848,7 +912,7 @@ async fn given_a_completed_run_when_a_pause_write_lands_afterwards_then_it_is_re
     .await
     .expect("finish");
 
-    let applied = repo.pause(id, t(3)).await.expect("pause");
+    let applied = repo.pause(id, t(3), None).await.expect("pause");
 
     assert!(!applied);
     assert_eq!(
@@ -958,7 +1022,7 @@ async fn given_a_paused_run_with_progress_when_resumed_then_the_segment_counters
     )
     .await
     .expect("record progress");
-    assert!(repo.pause(id, t(2)).await.expect("pause"));
+    assert!(repo.pause(id, t(2), None).await.expect("pause"));
 
     let applied = repo.resume(id, 90_000, None).await.expect("resume");
 
@@ -996,7 +1060,7 @@ async fn given_a_paused_run_when_resumed_with_a_width_then_the_stored_concurrenc
     repo.start(id, RunKind::Index, Some("/library"), t(1), 4)
         .await
         .expect("start");
-    assert!(repo.pause(id, t(2)).await.expect("pause"));
+    assert!(repo.pause(id, t(2), None).await.expect("pause"));
 
     assert!(repo.resume(id, 0, Some(1)).await.expect("resume"));
 
@@ -1026,7 +1090,7 @@ async fn given_a_run_with_no_stored_width_when_resumed_without_one_then_it_stays
         .execute(&pool)
         .await
         .expect("clear concurrency");
-    assert!(repo.pause(id, t(2)).await.expect("pause"));
+    assert!(repo.pause(id, t(2), None).await.expect("pause"));
 
     assert!(repo.resume(id, 0, None).await.expect("resume"));
 
@@ -1175,7 +1239,7 @@ async fn given_a_paused_run_when_cancelled_then_the_write_applies() {
     repo.start(id, RunKind::Index, Some("/library"), t(1), 4)
         .await
         .expect("start");
-    assert!(repo.pause(id, t(2)).await.expect("pause"));
+    assert!(repo.pause(id, t(2), None).await.expect("pause"));
 
     let applied = repo.cancel(id, None, t(3)).await.expect("cancel");
 
@@ -1356,7 +1420,7 @@ async fn given_a_running_and_a_paused_run_when_active_runs_are_listed_then_both_
     repo.start(paused, RunKind::Refresh, None, t(2), 4)
         .await
         .expect("start paused");
-    assert!(repo.pause(paused, t(3)).await.expect("pause"));
+    assert!(repo.pause(paused, t(3), None).await.expect("pause"));
 
     let active = repo.list_active().await.expect("list_active");
 

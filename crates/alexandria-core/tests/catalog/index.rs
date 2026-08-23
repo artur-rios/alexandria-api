@@ -2803,6 +2803,58 @@ async fn given_an_index_walk_in_flight_when_paused_then_it_stops_with_entries_un
 }
 
 #[tokio::test]
+async fn given_a_run_resumed_before_a_walks_pause_lands_when_it_lands_then_the_pause_is_refused() {
+    // The gap between `drop(run_cell)` and `record_halt` is a full
+    // busy-backoff wide under contention, and both a control-path pause and
+    // a resume can land inside it. When they do, the row is `running` again
+    // — a *different* segment — and a status guard alone cannot tell that
+    // apart from the run this walk was told to pause. Applying the walk's
+    // pause there leaves the row `paused` while a live segment is walking
+    // it, offers it for resume, and lets a second segment be spawned under
+    // one run id.
+    let runs = FakeCatalogRunRepository::new();
+    let registry = RunRegistry::new();
+    let run_id = Uuid::new_v4();
+    runs.start(run_id, RunKind::Index, Some(ROOT), now(), TEST_CONCURRENCY)
+        .await
+        .unwrap();
+    let pause_mid_walk = control_interrupt(
+        control_handler(runs.clone(), registry.clone()),
+        run_id,
+        ControlVerb::Pause,
+    );
+    let handler = handler_with_registry(
+        FakeAuth::Allowing,
+        FakeCatalogRepository::new(),
+        audio_library(),
+        fixed_clock(now()),
+        InterruptingAudioMetadataReader::new(pause_mid_walk),
+        FakeImageMetadataReader::new(),
+        FakeDocumentMetadataReader::new(),
+        FakeVideoMetadataReader::new(),
+        FakeComicMetadataReader::new(),
+        runs.clone(),
+        registry.clone(),
+    );
+    // Someone else pauses and resumes the run in the gap, after the walk has
+    // closed its cell and before its own pause is evaluated.
+    runs.pause_and_resume_before_next_pause(run_id);
+
+    handler.execute(ROOT, run_id).await.expect("execute");
+
+    let recorded = runs.get_recorded(run_id).expect("recorded run");
+    assert_eq!(
+        recorded.status,
+        RunStatus::Running,
+        "the resumed segment is walking — the old walk's pause must not have applied"
+    );
+    assert!(
+        recorded.paused_at.is_none(),
+        "and it must not have stamped a pause time on a run that is running"
+    );
+}
+
+#[tokio::test]
 async fn given_an_index_walk_in_flight_when_cancelled_then_it_stops_and_is_terminal() {
     let runs = FakeCatalogRunRepository::new();
     let registry = RunRegistry::new();
@@ -3080,7 +3132,7 @@ async fn given_a_resumed_run_when_executed_then_it_walks_at_the_width_it_was_sta
     )
     .await
     .unwrap();
-    assert!(runs.pause(run_id, now()).await.expect("pause"));
+    assert!(runs.pause(run_id, now(), None).await.expect("pause"));
 
     let resumed = control_handler(runs.clone(), registry.clone())
         .resume(run_id, TOKEN, None)
@@ -3162,7 +3214,7 @@ async fn given_a_paused_run_when_resumed_at_low_priority_then_it_walks_at_the_ne
     )
     .await
     .unwrap();
-    assert!(runs.pause(run_id, now()).await.expect("pause"));
+    assert!(runs.pause(run_id, now(), None).await.expect("pause"));
 
     let resumed =
         control_handler_with_low_width(runs.clone(), registry.clone(), RESUMED_AT_LOW_CONCURRENCY)

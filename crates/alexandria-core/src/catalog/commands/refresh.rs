@@ -172,22 +172,27 @@ where
         // costs (one extra SELECT per run), and why a failed read (unlike an
         // absent row) is worth a `warn` — it must still fall back rather than
         // abort a walk that could perfectly well run at the default width.
-        let concurrency = match self.runs.get(run_id).await {
-            Ok(Some(run)) => run
-                .concurrency
-                .map(|c| c.max(1) as usize)
-                .unwrap_or(self.concurrency),
-            Ok(None) => self.concurrency,
-            Err(err) => {
-                tracing::warn!(
-                    %run_id,
-                    error = %err,
-                    "could not read the run's configured concurrency; falling back to \
-                     indexing.concurrency"
-                );
-                self.concurrency
-            }
-        };
+        // The same comment covers why the read is retried on a busy database,
+        // and why it also yields the run's segment for `record_halt` below.
+        let (concurrency, segment) =
+            match retry_on_busy(BUSY_ATTEMPTS, || self.runs.get(run_id)).await {
+                Ok(Some(run)) => (
+                    run.concurrency
+                        .map(|c| c.max(1) as usize)
+                        .unwrap_or(self.concurrency),
+                    Some(run.segment),
+                ),
+                Ok(None) => (self.concurrency, None),
+                Err(err) => {
+                    tracing::warn!(
+                        %run_id,
+                        error = %err,
+                        "could not read the run's configured concurrency; falling back to \
+                         indexing.concurrency"
+                    );
+                    (self.concurrency, None)
+                }
+            };
         // FR-FC-28: a refresh's discovery is `list_all` rather than a
         // filesystem walk, but it is the same shape — a phase with no
         // denominator, then a phase with one — so it gets the same treatment.
@@ -237,7 +242,15 @@ where
                 unchanged: 0,
                 failed: 0,
             };
-            record_halt(&self.runs, run_id, signal, counts, self.clock.now()).await;
+            record_halt(
+                &self.runs,
+                run_id,
+                signal,
+                counts,
+                self.clock.now(),
+                segment,
+            )
+            .await;
             // `cataloged` is logged for the same reason the index walk logs
             // `scanned`: without a quantity an operator cannot tell how large
             // the run that stopped was.
@@ -385,7 +398,7 @@ where
                 unchanged,
                 failed,
             };
-            record_halt(&self.runs, run_id, signal, counts, ended_at).await;
+            record_halt(&self.runs, run_id, signal, counts, ended_at, segment).await;
         }
         Ok(outcome)
     }

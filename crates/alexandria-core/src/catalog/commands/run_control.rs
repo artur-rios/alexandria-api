@@ -306,7 +306,15 @@ where
         let now = self.clock.now();
         match verb {
             Verb::Pause => {
-                let applied = retry_on_busy(BUSY_ATTEMPTS, || self.runs.pause(run_id, now)).await?;
+                // `None` for the segment: this caller's subject is the run as
+                // the row has it now, whichever execution that is. Matching a
+                // segment is a *walk's* guard — it exists so an execution
+                // that has already stopped cannot pause the one that replaced
+                // it (see `CatalogRunRepository::pause`), and this call holds
+                // no stale segment to be wrong about. The status guard below
+                // is what covers its own race.
+                let applied =
+                    retry_on_busy(BUSY_ATTEMPTS, || self.runs.pause(run_id, now, None)).await?;
                 if !applied {
                     // The run stopped being `running` between the lookup above
                     // and this write. Reporting the transition as refused is

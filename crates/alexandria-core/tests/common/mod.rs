@@ -2277,6 +2277,10 @@ pub struct FakeCatalogRunRepository {
     /// see that an *intermediate* flush happened at all — which is what the
     /// two-second interval exists to produce.
     progress_history: Arc<Mutex<Vec<RunProgress>>>,
+    /// Armed by `pause_and_resume_before_next_pause`: the run to put through
+    /// a pause and a resume once, immediately before the next `pause` write
+    /// is evaluated.
+    resume_before_pause: Arc<Mutex<Option<Uuid>>>,
 }
 
 impl FakeCatalogRunRepository {
@@ -2342,6 +2346,21 @@ impl FakeCatalogRunRepository {
         *self.close_after_get.lock().unwrap() = Some((id, RunStatus::Complete));
     }
 
+    /// Pause and resume `id` the next time a pause is written, in between
+    /// that write being asked for and being evaluated.
+    ///
+    /// Simulates the one window the segment guard exists for: a walk drops
+    /// its run cell, a control-path pause finds no live cell and writes
+    /// `paused` itself, a client sees that and resumes, and only then does
+    /// the walk's own `record_halt` pause land — against a row that is
+    /// `running` again. Nothing else can produce that ordering against an
+    /// in-memory fake, and arming it on `get` (as the cancel race does)
+    /// would prove something different: the gap this one is about opens
+    /// *after* the walk's last read of the row.
+    pub fn pause_and_resume_before_next_pause(&self, id: Uuid) {
+        *self.resume_before_pause.lock().unwrap() = Some(id);
+    }
+
     /// The recorded run for `id`, for assertions.
     pub fn get_recorded(&self, id: Uuid) -> Option<CatalogRun> {
         self.runs.lock().unwrap().get(&id).cloned()
@@ -2381,6 +2400,9 @@ impl CatalogRunRepository for FakeCatalogRunRepository {
                 // Mirrors the SQLite adapter: the width the caller's
                 // `RunPriority` resolved to, so a resume can reuse it.
                 concurrency: Some(concurrency),
+                // The first execution of the run, as the column's default
+                // says. `resume` counts from here.
+                segment: 0,
             },
         );
         Ok(())
@@ -2434,8 +2456,26 @@ impl CatalogRunRepository for FakeCatalogRunRepository {
         Ok(())
     }
 
-    async fn pause(&self, id: Uuid, paused_at: DateTime<Utc>) -> Result<bool, DomainError> {
+    async fn pause(
+        &self,
+        id: Uuid,
+        paused_at: DateTime<Utc>,
+        expected_segment: Option<i64>,
+    ) -> Result<bool, DomainError> {
+        let armed = self.resume_before_pause.lock().unwrap().take();
         let mut runs = self.runs.lock().unwrap();
+        if armed == Some(id) {
+            if let Some(run) = runs.get_mut(&id) {
+                // The net effect of a control-path pause followed by a
+                // resume, applied as one step rather than by re-entering
+                // those two methods, whose lock this call already holds: the
+                // row is `running` again, on a new segment, with no pause
+                // time left on it.
+                run.status = RunStatus::Running;
+                run.paused_at = None;
+                run.segment += 1;
+            }
+        }
         let Some(run) = runs.get_mut(&id) else {
             return Ok(false);
         };
@@ -2443,6 +2483,12 @@ impl CatalogRunRepository for FakeCatalogRunRepository {
         // the fake would be more permissive than the real repository, and the
         // handler tests would pass against a guard that does not exist.
         if run.status != RunStatus::Running {
+            return Ok(false);
+        }
+        // Mirrors the adapter's `AND (? IS NULL OR segment = ?)`, for the same
+        // reason: a walk's late pause must not land on the segment that
+        // replaced it, and `running` is what the row reads either way.
+        if expected_segment.is_some_and(|expected| expected != run.segment) {
             return Ok(false);
         }
         run.status = RunStatus::Paused;
@@ -2521,6 +2567,10 @@ impl CatalogRunRepository for FakeCatalogRunRepository {
         run.status = RunStatus::Running;
         run.paused_at = None;
         run.paused_millis = paused_millis;
+        // Mirrors the adapter's `segment = segment + 1`, inside the same
+        // guard: the run goes back to work as a new execution, and this is
+        // what lets the previous one's late `pause` be told apart from it.
+        run.segment += 1;
         // The segment counters restart: resume re-walks, so `processed` is a
         // fresh count and `total` is rediscovered.
         run.processed = Some(0);
@@ -2819,13 +2869,19 @@ impl Filesystem for FailingListFilesystem {
 /// -- only the *pacing* depends on the answer, not the work.
 ///
 /// Each variant implements only the methods its test exercises with a
-/// meaningful failure; the rest answer a harmless success/empty value rather
-/// than panicking, because `execute`'s own shape has changed under this
-/// double before (this file) and will again -- a method that happens to go
-/// unread by every *current* test is not a promise it stays that way, and a
-/// double that panics on first contact with a new caller is a worse failure
-/// mode than one that quietly hands back a plausible answer no test happens
-/// to check.
+/// meaningful failure; the rest answer a harmless *refusal* -- `Ok(false)`,
+/// `0` -- rather than panicking, because `execute`'s own shape has changed
+/// under this double before (this file) and will again: a method that happens
+/// to go unread by every *current* test is not a promise it stays that way,
+/// and a double that panics on first contact with a new caller is a worse
+/// failure mode than one that visibly declines to do anything.
+///
+/// That reasoning turns on the answer reading as a refusal. `list_active` has
+/// no such answer -- `Ok(vec![])` is what a *working* repository says about an
+/// idle catalog, so a future test written to prove this double's error
+/// propagates through a listing would pass having never seen an error at all.
+/// It panics instead, the way `FailingCatalogRepository`'s unreachable methods
+/// do, and whoever needs it next gives it a failure worth asserting on.
 #[derive(Debug, Clone, Copy, Default)]
 // The shared `Fails` postfix is the point, not an accident: each variant
 // names the one operation this double fails, and `FinishFails`/`StartFails`/
@@ -2888,7 +2944,12 @@ impl CatalogRunRepository for FailingCatalogRunRepository {
         Ok(())
     }
 
-    async fn pause(&self, _id: Uuid, _paused_at: DateTime<Utc>) -> Result<bool, DomainError> {
+    async fn pause(
+        &self,
+        _id: Uuid,
+        _paused_at: DateTime<Utc>,
+        _expected_segment: Option<i64>,
+    ) -> Result<bool, DomainError> {
         Ok(false)
     }
 
@@ -2930,9 +2991,12 @@ impl CatalogRunRepository for FailingCatalogRunRepository {
     }
 
     async fn list_active(&self) -> Result<Vec<CatalogRun>, DomainError> {
-        // Not exercised by any current test against this double — every
-        // variant's test drives a single walk directly rather than listing.
-        Ok(Vec::new())
+        // Not reached by any variant's test: each drives a single walk
+        // directly rather than listing. Panics rather than answering
+        // `Ok(vec![])` — see the type doc: an empty list is what success
+        // looks like here, so a failure-injection double handing one back
+        // would let the next error-propagation test pass vacuously.
+        unimplemented!("not reached by the single-walk paths this double exists for")
     }
 }
 

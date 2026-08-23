@@ -201,6 +201,22 @@ pub struct CatalogRun {
     /// progress.
     #[serde(skip)]
     pub concurrency: Option<u32>,
+    /// Which segment of the run is executing: 0 for the one `start` opened,
+    /// and one more for every [`resume`].
+    ///
+    /// A run's identity outlives the walk executing it, and `status` alone
+    /// cannot tell a walk that is *still* running from one that is running
+    /// *again*. This can. A walk captures the number when it begins and hands
+    /// it back to [`pause`], which refuses a write whose segment has moved on
+    /// — see that method for the race, which is otherwise unguardable.
+    ///
+    /// Not serialized, for the reason `concurrency` is not: it says which
+    /// execution of the run a caller is looking at, not how far it has got.
+    ///
+    /// [`resume`]: CatalogRunRepository::resume
+    /// [`pause`]: CatalogRunRepository::pause
+    #[serde(skip)]
+    pub segment: i64,
 }
 
 /// Run records repository port (UC-42). Unit-testable against an in-memory
@@ -269,9 +285,34 @@ pub trait CatalogRunRepository: Send + Sync {
     /// sitting there resumable. The signal's own no-downgrade guard
     /// (`RunCell::raise`) cannot cover this: by then the cell is gone.
     ///
+    /// `expected_segment` is the second half of that guard, and the half a
+    /// status check cannot supply. `Some(n)` additionally requires the row to
+    /// still be on segment `n` — what a *walk* passes, being the segment it
+    /// captured when it began. `None` waives it, which is what the control
+    /// path passes: a caller acting on the current row means the run as it is
+    /// now, whichever segment that is.
+    ///
+    /// Without it the `running` check is satisfiable by the wrong run. The
+    /// walk drops its cell, and *both* a pause and a resume land in the gap
+    /// before `record_halt` — the pause finds no live cell and writes the row
+    /// itself, a client polls, sees `paused`, and resumes, so a new segment
+    /// spawns. The old walk's pause then arrives at a row reading `running`
+    /// and applies. The result is a row that says `paused`, with a
+    /// `paused_at`, while a segment is actively walking it: `overlay_live_
+    /// state` shows a paused run whose `processed` climbs, a launch-time
+    /// resume offer lists it, and accepting spawns a *second* concurrent
+    /// segment under one run id. `RunCell::raise` cannot help — the cell is
+    /// gone — and neither can `status`, which is `running` either way. The
+    /// segment is what tells the two apart.
+    ///
     /// Callers must not ignore the `false`. See `record_halt`, which logs it,
     /// and `RunControlHandler`, which reports it.
-    async fn pause(&self, id: Uuid, paused_at: DateTime<Utc>) -> Result<bool, DomainError>;
+    async fn pause(
+        &self,
+        id: Uuid,
+        paused_at: DateTime<Utc>,
+        expected_segment: Option<i64>,
+    ) -> Result<bool, DomainError>;
 
     /// Close a run's record as `cancelled` — the owner abandoned it.
     ///
@@ -361,6 +402,14 @@ pub trait CatalogRunRepository: Send + Sync {
     /// landed after someone else's cancel would revive a run its owner had
     /// just abandoned. The new width rides along inside that guard: a refused
     /// resume must not re-pace the run it failed to revive.
+    ///
+    /// Also inside it, and for the same reason: `segment` is incremented. The
+    /// run is going back to work as a new execution, and that number is what
+    /// lets the *previous* one's late writes be told apart from this one's —
+    /// see [`pause`]. A refused resume must not bump it, or it would invalidate
+    /// a live walk's pause without ever having started a walk of its own.
+    ///
+    /// [`pause`]: CatalogRunRepository::pause
     async fn resume(
         &self,
         id: Uuid,
@@ -447,7 +496,7 @@ macro_rules! run_columns {
     () => {
         "kind, status, root, started_at, finished_at, scanned, indexed, \
          skipped, already_cataloged, refreshed, marked_missing, unchanged, failed, error, \
-         phase, total, processed, paused_at, paused_millis, concurrency"
+         phase, total, processed, paused_at, paused_millis, concurrency, segment"
     };
 }
 
@@ -547,6 +596,7 @@ fn row_to_run(id: Uuid, row: &SqliteRow) -> Result<CatalogRun, DomainError> {
         concurrency: row
             .try_get::<Option<i64>, _>("concurrency")?
             .map(|concurrency| concurrency as u32),
+        segment: row.try_get("segment")?,
     })
 }
 
@@ -781,7 +831,12 @@ impl CatalogRunRepository for SqliteCatalogRunRepository {
         Ok(())
     }
 
-    async fn pause(&self, id: Uuid, paused_at: DateTime<Utc>) -> Result<bool, DomainError> {
+    async fn pause(
+        &self,
+        id: Uuid,
+        paused_at: DateTime<Utc>,
+        expected_segment: Option<i64>,
+    ) -> Result<bool, DomainError> {
         // No `phase = NULL` here, unlike every other transition below and
         // above: a paused run is not terminal, so its phase is not a
         // contradiction but the very thing that says where it stopped.
@@ -793,13 +848,25 @@ impl CatalogRunRepository for SqliteCatalogRunRepository {
         // walk was between closing its cell and recording itself — leaving
         // `paused` beside a `finished_at` the pause never wrote, and a run the
         // owner abandoned looking resumable.
+        //
+        // `AND (? IS NULL OR segment = ?)` is the other half, and the half
+        // `status` cannot express: `running` is also what the row reads when
+        // somebody paused *and resumed* it inside that same window, and a
+        // walk's late pause landing on the resumed segment stops nothing and
+        // misreports everything. See the trait doc. The bound `NULL` waives
+        // it for the control path, whose subject is the row as it stands. Two
+        // binds of one value rather than a numbered parameter: sqlx counts
+        // positional `?`s, and mixing the two forms is how that goes wrong.
         let result = sqlx::query(
-            "UPDATE catalog_runs SET status = ?, paused_at = ? WHERE id = ? AND status = ?",
+            "UPDATE catalog_runs SET status = ?, paused_at = ? \
+             WHERE id = ? AND status = ? AND (? IS NULL OR segment = ?)",
         )
         .bind(RunStatus::Paused.as_str())
         .bind(paused_at.to_rfc3339())
         .bind(id.to_string())
         .bind(RunStatus::Running.as_str())
+        .bind(expected_segment)
+        .bind(expected_segment)
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected() > 0)
@@ -857,9 +924,16 @@ impl CatalogRunRepository for SqliteCatalogRunRepository {
         // pre-column run's `NULL` alone, while a bound width overwrites it.
         // Expressing "keep" as a no-op inside the one guarded UPDATE is what
         // keeps a refused resume from re-pacing a run it did not revive.
+        //
+        // `segment = segment + 1` rides in the same statement for the same
+        // reason, and it is what makes the walk about to be spawned
+        // distinguishable from the one that just stopped: the previous
+        // segment's late `pause` is matched out by it. A refused resume must
+        // not bump it either — that would invalidate a live walk's pause
+        // without starting a walk to replace it.
         let result = sqlx::query(
             "UPDATE catalog_runs SET status = ?, paused_at = NULL, paused_millis = ?, \
-             processed = 0, total = NULL, phase = ?, \
+             processed = 0, total = NULL, phase = ?, segment = segment + 1, \
              concurrency = COALESCE(?, concurrency) WHERE id = ? AND status = ?",
         )
         .bind(RunStatus::Running.as_str())

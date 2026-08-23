@@ -93,7 +93,7 @@ impl ControlHarness {
                 .await
                 .expect("fail"),
             RunStatus::Paused => {
-                assert!(runs.pause(run_id, t(2)).await.expect("pause"));
+                assert!(runs.pause(run_id, t(2), None).await.expect("pause"));
             }
             RunStatus::Cancelled => {
                 assert!(runs.cancel(run_id, None, t(2)).await.expect("cancel"));
@@ -371,7 +371,7 @@ async fn given_a_cancelled_run_when_a_pause_write_lands_afterwards_then_the_fake
     .expect("start");
     runs.cancel(run_id, None, t(2)).await.expect("cancel");
 
-    let applied = runs.pause(run_id, t(3)).await.expect("pause");
+    let applied = runs.pause(run_id, t(3), None).await.expect("pause");
 
     assert!(!applied, "a pause must not apply to a run already closed");
     let run = runs.get_recorded(run_id).expect("run");
@@ -452,7 +452,7 @@ async fn paused_run(
     )
     .await
     .expect("record progress");
-    assert!(runs.pause(run_id, paused_at).await.expect("pause"));
+    assert!(runs.pause(run_id, paused_at, None).await.expect("pause"));
     let control = RunControlHandler::new(
         FakeAuth::Allowing,
         runs.clone(),
@@ -515,7 +515,7 @@ async fn paused_run_at_width(
     runs.start(run_id, RunKind::Index, Some("D:/music"), t(1), width)
         .await
         .expect("start");
-    assert!(runs.pause(run_id, t(2)).await.expect("pause"));
+    assert!(runs.pause(run_id, t(2), None).await.expect("pause"));
     let control = RunControlHandler::new(
         FakeAuth::Allowing,
         runs.clone(),
@@ -686,7 +686,10 @@ async fn given_a_run_paused_twice_when_resumed_again_then_both_pauses_are_banked
         .resume(run_id, TOKEN, None)
         .await
         .expect("first resume");
-    assert!(runs.pause(run_id, at(2, 0)).await.expect("second pause"));
+    assert!(runs
+        .pause(run_id, at(2, 0), None)
+        .await
+        .expect("second pause"));
     let control = RunControlHandler::new(
         FakeAuth::Allowing,
         runs.clone(),

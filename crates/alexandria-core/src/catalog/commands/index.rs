@@ -381,22 +381,38 @@ where
         // a correctness regression caused by a performance knob. The default
         // is still the right fallback for either case, but only one of them
         // is silent.
-        let concurrency = match self.runs.get(run_id).await {
-            Ok(Some(run)) => run
-                .concurrency
-                .map(|c| c.max(1) as usize)
-                .unwrap_or(self.concurrency),
-            Ok(None) => self.concurrency,
-            Err(err) => {
-                tracing::warn!(
-                    %run_id,
-                    error = %err,
-                    "could not read the run's configured concurrency; falling back to \
-                     indexing.concurrency"
-                );
-                self.concurrency
-            }
-        };
+        //
+        // Retried on a busy database like every other call this handler makes
+        // on the run repository. The fallback above still catches a failure —
+        // but a resumed low-priority run degrading to the default width
+        // because one `SELECT` met `SQLITE_BUSY` is a real regression, and
+        // being the single unretried call on this port is the kind of
+        // inconsistency that gets copied into the next one.
+        //
+        // The same read yields the run's segment, which `record_halt` needs
+        // at the bottom of this function — see `CatalogRunRepository::pause`
+        // for what a late pause with no segment to match cannot tell apart.
+        // `None`, for a row that is absent or unreadable, waives that check
+        // rather than inventing a segment for the write to match against.
+        let (concurrency, segment) =
+            match retry_on_busy(BUSY_ATTEMPTS, || self.runs.get(run_id)).await {
+                Ok(Some(run)) => (
+                    run.concurrency
+                        .map(|c| c.max(1) as usize)
+                        .unwrap_or(self.concurrency),
+                    Some(run.segment),
+                ),
+                Ok(None) => (self.concurrency, None),
+                Err(err) => {
+                    tracing::warn!(
+                        %run_id,
+                        error = %err,
+                        "could not read the run's configured concurrency; falling back to \
+                         indexing.concurrency"
+                    );
+                    (self.concurrency, None)
+                }
+            };
         // FR-FC-28: the run becomes observable here. A fresh cell reads as
         // `Discovering` with no total, which is exactly where the walk below
         // starts, and the guard closes the run again at every exit — a
@@ -454,7 +470,15 @@ where
                 already_cataloged: 0,
                 failed: 0,
             };
-            record_halt(&self.runs, run_id, signal, counts, self.clock.now()).await;
+            record_halt(
+                &self.runs,
+                run_id,
+                signal,
+                counts,
+                self.clock.now(),
+                segment,
+            )
+            .await;
             tracing::info!(%run_id, scanned, ?signal, "indexing stopped during discovery");
             return Ok(IndexOutcome {
                 run_id,
@@ -624,7 +648,7 @@ where
                 already_cataloged,
                 failed,
             };
-            record_halt(&self.runs, run_id, signal, counts, ended_at).await;
+            record_halt(&self.runs, run_id, signal, counts, ended_at, segment).await;
         }
         Ok(IndexOutcome {
             run_id,
