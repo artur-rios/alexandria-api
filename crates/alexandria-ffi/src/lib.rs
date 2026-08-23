@@ -93,6 +93,15 @@ fn authenticated(services: &Services, token: &str) -> bool {
 
 /// Result of starting an index run. `run_id` is a NUL-terminated UUID string
 /// on success (empty on failure).
+///
+/// Shared with `alexandria_index_resume` (UC-42), which reuses this same
+/// struct shape for a call that is not starting anything new. That reuse
+/// changes what `status` means: from `alexandria_index_start` and
+/// `alexandria_index_refresh_start` it is one of the `INDEX_ERR_*`
+/// constants, where `4` is `INDEX_ERR_OTHER`; from `alexandria_index_resume`
+/// it is one of the `RUN_ERR_*` constants, where `4` is `RUN_ERR_NOT_FOUND`
+/// instead. Check which function returned the value before reading `status`
+/// against either family.
 #[repr(C)]
 #[derive(Debug)]
 pub struct IndexStartResult {
@@ -236,9 +245,9 @@ fn load_settings() -> Settings {
 /// the background on the FFI runtime; read results via the accessor functions.
 ///
 /// `priority` is `"low"` or `"normal"` (case-sensitive, matching the HTTP
-/// body's spelling exactly — FR-FC-24), read with [`parse_priority`]. NULL or
-/// any other string is treated as `"normal"`: a client that cannot spell the
-/// value gets the safe default rather than a rejected call.
+/// body's spelling exactly — FR-FC-24). NULL or any other string is treated
+/// as `"normal"`: a client that cannot spell the value gets the safe default
+/// rather than a rejected call.
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
 pub extern "C" fn alexandria_index_start(

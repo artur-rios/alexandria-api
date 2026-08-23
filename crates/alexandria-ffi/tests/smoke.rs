@@ -56,6 +56,7 @@ const STATUS_RUN_INVALID_INPUT: i32 = alexandria_ffi::RUN_ERR_INVALID_INPUT;
 const STATUS_RUN_UNAUTHORIZED: i32 = alexandria_ffi::RUN_ERR_UNAUTHORIZED;
 const STATUS_RUN_NOT_FOUND: i32 = alexandria_ffi::RUN_ERR_NOT_FOUND;
 const STATUS_RUN_INVALID_STATE: i32 = alexandria_ffi::RUN_ERR_INVALID_STATE;
+const STATUS_RUN_OTHER: i32 = alexandria_ffi::RUN_ERR_OTHER;
 
 const STATUS_OK: i32 = alexandria_ffi::INDEX_OK;
 const STATUS_INVALID_INPUT: i32 = alexandria_ffi::INDEX_ERR_INVALID_INPUT;
@@ -1577,6 +1578,12 @@ fn wait_for_run_cell_live(run_id: &str, token: &CString) {
         if std::time::Instant::now() > deadline {
             panic!("run {run_id}'s cell never went live");
         }
+        // Same interval `wait_for_run_terminal_or_paused` sleeps: without it
+        // this loop calls `run_status` (a `block_on` against the very
+        // runtime the walk it is waiting on is running on) as fast as the
+        // thread can manage, burning a core and contending with the walk
+        // instead of just waiting on it.
+        std::thread::sleep(std::time::Duration::from_millis(25));
     }
 }
 
@@ -1743,15 +1750,28 @@ fn given_a_running_run_when_resumed_over_ffi_then_invalid_state() {
     let _g = serial();
     let (_db_dir, _db_path) = init_temp_db();
     let lib = tempdir().unwrap();
-    std::fs::write(lib.path().join("song.mp3"), b"audio").unwrap();
+    // A single file finishes near-instantly and this test would then be
+    // exercising "resuming a *complete* run", not "resuming a *running*
+    // one" — both return `InvalidState`, so a single-file library would not
+    // be a false pass, but it also would not reliably cover what the name
+    // promises. `write_library` + `wait_for_run_cell_live` (the same pair
+    // the pause/cancel tests above use) is what actually pins the run down
+    // while it is still `running`.
+    write_library(lib.path(), 500);
 
     let root = c(lib.path().to_str().unwrap());
     let token = c(TEST_TOKEN);
     let started = alexandria_index_start(root.as_ptr(), token.as_ptr(), std::ptr::null());
     assert_eq!(started.status, STATUS_OK);
     let run_id = run_id_string(&started);
+    wait_for_run_cell_live(&run_id, &token);
 
     let run_id_c = c(&run_id);
+    assert_eq!(
+        run_status(&run_id, &token)["status"],
+        "running",
+        "sanity: the run is still running at the moment resume is called"
+    );
     let resumed = alexandria_index_resume(run_id_c.as_ptr(), token.as_ptr());
     assert_eq!(
         resumed.status, STATUS_RUN_INVALID_STATE,
@@ -1796,6 +1816,71 @@ fn given_a_running_run_when_cancelled_over_ffi_then_terminal_and_a_second_cancel
     // Terminal: a second cancel finds nothing left to abandon.
     let second = alexandria_index_cancel(run_id_c.as_ptr(), token.as_ptr());
     assert_eq!(second, STATUS_RUN_INVALID_STATE);
+}
+
+#[test]
+fn given_a_paused_run_when_cancelled_over_ffi_then_terminal() {
+    // `cancel`'s doc comment advertises a `paused` run as the other legal
+    // transition (abandoning one is the whole reason to cancel rather than
+    // resume it) — pause has its own coverage above; this is cancel's.
+    let _g = serial();
+    let (_db_dir, _db_path) = init_temp_db();
+    let lib = tempdir().unwrap();
+    write_library(lib.path(), 500);
+
+    let root = c(lib.path().to_str().unwrap());
+    let token = c(TEST_TOKEN);
+    let started = alexandria_index_start(root.as_ptr(), token.as_ptr(), std::ptr::null());
+    assert_eq!(started.status, STATUS_OK);
+    let run_id = run_id_string(&started);
+    wait_for_run_cell_live(&run_id, &token);
+
+    let run_id_c = c(&run_id);
+    assert_eq!(
+        alexandria_index_pause(run_id_c.as_ptr(), token.as_ptr()),
+        STATUS_RUN_OK
+    );
+    assert_eq!(
+        wait_for_run_terminal_or_paused(&run_id, &token)["status"],
+        "paused"
+    );
+
+    let cancel_status = alexandria_index_cancel(run_id_c.as_ptr(), token.as_ptr());
+    assert_eq!(
+        cancel_status, STATUS_RUN_OK,
+        "a paused run must still be cancellable"
+    );
+    assert_eq!(run_status(&run_id, &token)["status"], "cancelled");
+}
+
+#[test]
+fn given_ffi_cancel_missing_run_then_not_found() {
+    let _g = serial();
+    let (_db_dir, _db_path) = init_temp_db();
+    let token = c(TEST_TOKEN);
+    let run_id = c("11111111-1111-1111-1111-111111111111");
+    let status = alexandria_index_cancel(run_id.as_ptr(), token.as_ptr());
+    assert_eq!(status, STATUS_RUN_NOT_FOUND);
+}
+
+#[test]
+fn given_ffi_cancel_malformed_run_id_then_invalid_input() {
+    let _g = serial();
+    let (_db_dir, _db_path) = init_temp_db();
+    let token = c(TEST_TOKEN);
+    let run_id = c("not-a-uuid");
+    let status = alexandria_index_cancel(run_id.as_ptr(), token.as_ptr());
+    assert_eq!(status, STATUS_RUN_INVALID_INPUT);
+}
+
+#[test]
+fn given_ffi_cancel_no_token_then_unauthorized() {
+    let _g = serial();
+    let (_db_dir, _db_path) = init_temp_db();
+    let empty = c("");
+    let run_id = c("11111111-1111-1111-1111-111111111111");
+    let status = alexandria_index_cancel(run_id.as_ptr(), empty.as_ptr());
+    assert_eq!(status, STATUS_RUN_UNAUTHORIZED);
 }
 
 #[test]
@@ -1945,4 +2030,111 @@ fn given_low_priority_when_refresh_started_over_ffi_then_low_concurrency() {
     assert_eq!(refreshed.status, STATUS_OK);
     let run_id = run_id_string(&refreshed);
     assert_eq!(run_concurrency(&db_path, &run_id), Some(1));
+}
+
+#[test]
+fn given_a_paused_refresh_run_when_resumed_over_ffi_then_it_finishes() {
+    // Every other resume test in this file starts an *index* run, so the
+    // `RunKind::Refresh` branch of `alexandria_index_resume` — which spawns
+    // `refresh_handler.execute(run_id)` with no root, a different call shape
+    // than the index branch — had no coverage at all. This is that coverage.
+    let _g = serial();
+    let (_db_dir, _db_path) = init_temp_db();
+    let lib = tempdir().unwrap();
+    write_library(lib.path(), 500);
+
+    let root = c(lib.path().to_str().unwrap());
+    let token = c(TEST_TOKEN);
+    let started = alexandria_index_start(root.as_ptr(), token.as_ptr(), std::ptr::null());
+    assert_eq!(started.status, STATUS_OK);
+    wait_for_files(500);
+
+    // The refresh walk re-reads every one of the 500 cataloged files, which
+    // is what gives it enough real wall-clock time for `wait_for_run_cell_live`
+    // to reliably catch it before it finishes.
+    let refreshed = alexandria_index_refresh_start(token.as_ptr(), std::ptr::null());
+    assert_eq!(refreshed.status, STATUS_OK);
+    let run_id = run_id_string(&refreshed);
+    wait_for_run_cell_live(&run_id, &token);
+
+    let run_id_c = c(&run_id);
+    assert_eq!(
+        alexandria_index_pause(run_id_c.as_ptr(), token.as_ptr()),
+        STATUS_RUN_OK
+    );
+    assert_eq!(
+        wait_for_run_terminal_or_paused(&run_id, &token)["status"],
+        "paused"
+    );
+
+    let resumed = alexandria_index_resume(run_id_c.as_ptr(), token.as_ptr());
+    assert_eq!(
+        resumed.status, STATUS_RUN_OK,
+        "expected RUN_OK resuming a paused refresh run"
+    );
+    assert_eq!(
+        run_id_string(&resumed),
+        run_id,
+        "resume must hand back the same run id, not mint a fresh one"
+    );
+
+    let body = wait_for_run_terminal_or_paused(&run_id, &token);
+    assert_eq!(body["status"], "complete");
+}
+
+#[test]
+fn given_a_paused_index_run_with_no_stored_root_when_resumed_then_error() {
+    // The other half of the hard part: `RunControlHandler::resume` hands
+    // back `RunResumed { root: run.root, kind: run.kind, .. }` straight from
+    // the row, and `RunKind::Index` is only ever supposed to have `Some`
+    // root — `IndexHandler::start` requires one to start at all. But nothing
+    // in the type system stops the row from drifting (a hand-edited
+    // database, a migration bug), so `alexandria_index_resume` has to treat
+    // `Index` + `root: None` as a real, refused case rather than an
+    // unreachable one. This drives that branch directly, the same
+    // `with_db` idiom `run_concurrency` above already uses to reach columns
+    // the FFI surface does not expose an accessor for.
+    let _g = serial();
+    let (_db_dir, db_path) = init_temp_db();
+    let lib = tempdir().unwrap();
+    write_library(lib.path(), 500);
+
+    let root = c(lib.path().to_str().unwrap());
+    let token = c(TEST_TOKEN);
+    let started = alexandria_index_start(root.as_ptr(), token.as_ptr(), std::ptr::null());
+    assert_eq!(started.status, STATUS_OK);
+    let run_id = run_id_string(&started);
+    wait_for_run_cell_live(&run_id, &token);
+
+    let run_id_c = c(&run_id);
+    assert_eq!(
+        alexandria_index_pause(run_id_c.as_ptr(), token.as_ptr()),
+        STATUS_RUN_OK
+    );
+    assert_eq!(
+        wait_for_run_terminal_or_paused(&run_id, &token)["status"],
+        "paused"
+    );
+
+    // Corrupt the stored row directly: a paused index run with no root,
+    // which `start` itself could never have produced.
+    let run_id_for_sql = run_id.clone();
+    with_db(&db_path, move |pool| async move {
+        sqlx::query("UPDATE catalog_runs SET root = NULL WHERE id = ?")
+            .bind(run_id_for_sql)
+            .execute(&pool)
+            .await
+            .expect("clear root");
+    });
+
+    let resumed = alexandria_index_resume(run_id_c.as_ptr(), token.as_ptr());
+    assert_eq!(
+        resumed.status, STATUS_RUN_OTHER,
+        "an index run with no stored root must fail loudly, not silently do nothing"
+    );
+    assert_eq!(
+        run_id_string(&resumed),
+        "",
+        "a refused resume must not carry a run id back"
+    );
 }
