@@ -32,7 +32,20 @@ pub fn app(settings: Settings, services: Arc<Services>) -> Router {
         .route("/v1/settings", get(routes::settings::get))
         .route("/v1/index", post(routes::index::index))
         .route("/v1/index/refresh", post(routes::refresh::refresh))
+        .route("/v1/index/runs", get(routes::runs::active_runs))
         .route("/v1/index/runs/{run_id}", get(routes::runs::run_status))
+        .route(
+            "/v1/index/runs/{run_id}/pause",
+            post(routes::runs::pause_run),
+        )
+        .route(
+            "/v1/index/runs/{run_id}/resume",
+            post(routes::runs::resume_run),
+        )
+        .route(
+            "/v1/index/runs/{run_id}/cancel",
+            post(routes::runs::cancel_run),
+        )
         .route(
             "/v1/files/{uuid}/metadata",
             patch(routes::edit_metadata::edit_metadata),

@@ -4057,7 +4057,7 @@ pub extern "C" fn alexandria_index_resume(
 /// overlays a single run (UC-42 / FR-FC-28). `token` is the bearer auth
 /// token. On success `json` is a NUL-terminated JSON array of `CatalogRun`
 /// bodies, newest first — byte-for-byte the same shape the HTTP
-/// `GET /v1/index/runs/active` route (Task 12) returns (FR-FC-24 / NFR-09).
+/// `GET /v1/index/runs?status=active` route (Task 12) returns (FR-FC-24 / NFR-09).
 /// The caller must free `json` with `alexandria_free_string`.
 ///
 /// A caller with nothing outstanding gets `RUN_OK` and an empty JSON array,

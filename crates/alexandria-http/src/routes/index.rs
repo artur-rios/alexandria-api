@@ -9,12 +9,17 @@ use alexandria_core::catalog::runs::RunPriority;
 
 use crate::middleware::auth::invalid_input;
 use crate::middleware::error::ApiError;
-use crate::routes::bearer_token;
+use crate::routes::{bearer_token, deserialize_priority};
 use crate::AppState;
 
 #[derive(Debug, Deserialize)]
 pub struct IndexBody {
     pub root: String,
+    /// How hard this run should push (FR-FC-08). `"low"` or `"normal"`,
+    /// matching `RunPriority`'s wire spelling exactly (FR-FC-24). Absent or
+    /// unrecognised both mean `Normal` — see `deserialize_priority`.
+    #[serde(default, deserialize_with = "deserialize_priority")]
+    pub priority: RunPriority,
 }
 
 /// `POST /v1/index` — start an asynchronous indexing scan of a root path
@@ -34,10 +39,7 @@ pub async fn index(
     let Json(body) = body.map_err(|err| invalid_input(format!("invalid index body: {err}")))?;
     let request = IndexRequest {
         root: body.root.clone(),
-        // The HTTP body carries no priority yet — that is a later task's
-        // wire change. Every run started from this surface today is
-        // `Normal`, matching the behaviour before run priority existed.
-        priority: RunPriority::Normal,
+        priority: body.priority,
     };
 
     let started = state

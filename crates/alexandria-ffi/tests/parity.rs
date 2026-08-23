@@ -28,13 +28,15 @@ use alexandria_ffi::{
     alexandria_file_get_by_uuid, alexandria_file_playback_source, alexandria_file_purge,
     alexandria_file_purge_on_disk, alexandria_file_read_content, alexandria_file_rename,
     alexandria_file_restore, alexandria_file_soft_delete, alexandria_file_thumbnail,
-    alexandria_files_list, alexandria_free_string, alexandria_index_count_files,
-    alexandria_index_files_json, alexandria_index_init, alexandria_index_refresh_start,
-    alexandria_index_run_status_json, alexandria_index_start, alexandria_reading_list_add_item,
-    alexandria_reading_list_create, alexandria_reading_list_delete,
-    alexandria_reading_list_remove_item, alexandria_reading_list_update_progress,
-    alexandria_reading_lists_list, alexandria_settings_json, alexandria_watchlist_add_video,
-    alexandria_watchlist_create, alexandria_watchlist_delete, alexandria_watchlist_remove_video,
+    alexandria_files_list, alexandria_free_string, alexandria_index_cancel,
+    alexandria_index_count_files, alexandria_index_files_json, alexandria_index_init,
+    alexandria_index_pause, alexandria_index_refresh_start, alexandria_index_resume,
+    alexandria_index_run_status_json, alexandria_index_runs_active_json, alexandria_index_start,
+    alexandria_reading_list_add_item, alexandria_reading_list_create,
+    alexandria_reading_list_delete, alexandria_reading_list_remove_item,
+    alexandria_reading_list_update_progress, alexandria_reading_lists_list,
+    alexandria_settings_json, alexandria_watchlist_add_video, alexandria_watchlist_create,
+    alexandria_watchlist_delete, alexandria_watchlist_remove_video,
     alexandria_watchlist_update_progress, alexandria_watchlists_list, IndexStartResult,
 };
 use alexandria_http::app;
@@ -11588,4 +11590,746 @@ async fn given_the_same_settings_when_read_via_http_and_ffi_then_bodies_identica
 
     assert_eq!(http_denied, axum::http::StatusCode::UNAUTHORIZED);
     assert_eq!(ffi_denied, alexandria_ffi::SETTINGS_ERR_UNAUTHORIZED);
+}
+
+// ---------------------------------------------------------------------------
+// UC-42 run control parity (Task 12, carried over from Task 11): pause,
+// resume, cancel, the active-runs listing, and the `priority` wire spelling,
+// compared FFI accessor against HTTP route.
+//
+// Every test below runs two *independent* legs — its own temp library, its
+// own temp SQLite database, its own `Services` instance for the HTTP leg and
+// its own `alexandria_index_init` for the FFI leg — and compares what each
+// surface reports about the run *it* drove, never a raw SQL read standing in
+// for one side. That independence is the point: an earlier task found that
+// the pre-Task-12 parity tests had been passing on a coincidence, because
+// both legs went through code sharing the same bug and therefore agreed
+// while both were wrong. Routing every assertion here through the real
+// `RunControlHandler`-backed accessor on each side (the HTTP route handlers,
+// `alexandria_index_pause`/`_resume`/`_cancel`/`_runs_active_json`) is what
+// makes a divergence between the two surfaces actually detectable.
+// ---------------------------------------------------------------------------
+
+/// A library with enough files that a walk has a real chance of still being
+/// `running` (or, failing that, landing in `RunControlHandler::control`'s
+/// documented "no live cell yet" window) the instant a pause/cancel/resume
+/// call follows `start`/`alexandria_index_start` immediately. Mirrors
+/// `alexandria-ffi/tests/smoke.rs`'s `write_library`.
+fn write_library(dir: &std::path::Path, count: usize) {
+    for i in 0..count {
+        std::fs::write(dir.join(format!("track-{i}.mp3")), b"audio bytes").unwrap();
+    }
+}
+
+async fn start_http_run(
+    services: &std::sync::Arc<alexandria_core::services::Services>,
+    root: &str,
+    token: &str,
+) -> String {
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/index")
+        .header("authorization", &format!("Bearer {token}"))
+        .header("content-type", "application/json")
+        .body(Body::from(json!({ "root": root }).to_string()))
+        .unwrap();
+    let response = app(Settings::default(), services.clone())
+        .oneshot(request)
+        .await
+        .expect("http start");
+    assert_eq!(response.status(), axum::http::StatusCode::ACCEPTED);
+    let body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    body["runId"].as_str().unwrap().to_string()
+}
+
+async fn http_control(
+    services: &std::sync::Arc<alexandria_core::services::Services>,
+    verb: &str,
+    run_id: &str,
+    token: &str,
+) -> axum::response::Response {
+    let request = Request::builder()
+        .method("POST")
+        .uri(format!("/v1/index/runs/{run_id}/{verb}"))
+        .header("authorization", &format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+    app(Settings::default(), services.clone())
+        .oneshot(request)
+        .await
+        .expect("http control")
+}
+
+/// Poll `GET /v1/index/runs/{runId}` until its progress cell has published at
+/// least one flush (`phase` non-null) while the run is still `running`. The
+/// HTTP counterpart of `alexandria-ffi/tests/smoke.rs`'s
+/// `wait_for_run_cell_live`.
+async fn wait_for_http_run_cell_live(
+    services: &std::sync::Arc<alexandria_core::services::Services>,
+    run_id: &str,
+    token: &str,
+) {
+    let dl = std::time::Instant::now() + ASYNC_RUN_DEADLINE;
+    loop {
+        let request = Request::builder()
+            .method("GET")
+            .uri(format!("/v1/index/runs/{run_id}"))
+            .header("authorization", &format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        let response = app(Settings::default(), services.clone())
+            .oneshot(request)
+            .await
+            .expect("run status oneshot");
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        if !body["phase"].is_null() {
+            return;
+        }
+        if body["status"] != "running" {
+            panic!("http run {run_id} left running before its cell ever went live");
+        }
+        if std::time::Instant::now() > dl {
+            panic!("http run {run_id}'s cell never went live");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+}
+
+/// The FFI counterpart of [`wait_for_http_run_cell_live`], polling
+/// `alexandria_index_run_status_json` instead of the HTTP route.
+fn wait_for_ffi_run_cell_live(run_id: &str, token: &CString) {
+    let run_id_c = CString::new(run_id).unwrap();
+    let dl = std::time::Instant::now() + ASYNC_RUN_DEADLINE;
+    loop {
+        let result = alexandria_index_run_status_json(run_id_c.as_ptr(), token.as_ptr());
+        assert_eq!(
+            result.status,
+            alexandria_ffi::RUN_OK,
+            "ffi run status failed"
+        );
+        assert!(!result.json.is_null());
+        // SAFETY: `json` is a NUL-terminated string owned by this call.
+        let body = unsafe { CStr::from_ptr(result.json) }
+            .to_str()
+            .unwrap()
+            .to_string();
+        // SAFETY: pointer came from this library and is freed exactly once.
+        unsafe {
+            alexandria_free_string(result.json);
+        }
+        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+        if !value["phase"].is_null() {
+            return;
+        }
+        if value["status"] != "running" {
+            panic!("ffi run {run_id} left running before its cell ever went live");
+        }
+        if std::time::Instant::now() > dl {
+            panic!("ffi run {run_id}'s cell never went live");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+}
+
+/// Read a single run's status via `alexandria_index_run_status_json`.
+fn ffi_run_status(run_id: &str, token: &CString) -> serde_json::Value {
+    let run_id_c = CString::new(run_id).unwrap();
+    let result = alexandria_index_run_status_json(run_id_c.as_ptr(), token.as_ptr());
+    assert_eq!(
+        result.status,
+        alexandria_ffi::RUN_OK,
+        "ffi run status failed"
+    );
+    assert!(!result.json.is_null());
+    let body = unsafe { CStr::from_ptr(result.json) }
+        .to_str()
+        .unwrap()
+        .to_string();
+    unsafe {
+        alexandria_free_string(result.json);
+    }
+    serde_json::from_str(&body).unwrap()
+}
+
+/// UC-42 parity — pause a running run through each surface independently and
+/// assert both report the same terminal shape: `status: "paused"`, with
+/// `processed` and `activeMillis` present as numbers (proof that the walk's
+/// progress, not just its state, carried over). Compares
+/// `RunControlHandler::pause` reached via `POST …/pause` against the same
+/// handler reached via `alexandria_index_pause` — never a raw `catalog_runs`
+/// read standing in for either.
+#[tokio::test]
+async fn given_a_running_run_when_paused_via_http_and_ffi_then_both_report_paused_with_progress() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+
+    // ---- HTTP leg ----
+    let http_dir = tempdir().unwrap();
+    let http_db = db_path(&http_dir, "http.sqlite");
+    let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    seed_session(&http_pool, TEST_TOKEN).await;
+    let http_services =
+        std::sync::Arc::new(build_services(&local_settings(), http_pool.clone()).await);
+
+    let http_lib = tempdir().unwrap();
+    write_library(http_lib.path(), 500);
+    let http_run_id = start_http_run(
+        &http_services,
+        http_lib.path().to_str().unwrap(),
+        TEST_TOKEN,
+    )
+    .await;
+    wait_for_http_run_cell_live(&http_services, &http_run_id, TEST_TOKEN).await;
+
+    let pause_response = http_control(&http_services, "pause", &http_run_id, TEST_TOKEN).await;
+    assert_eq!(pause_response.status(), axum::http::StatusCode::OK);
+
+    let http_body = wait_for_http_run_terminal(&http_services, &http_run_id, TEST_TOKEN).await;
+    assert_eq!(http_body["status"], "paused");
+    assert!(http_body["processed"].is_number(), "processed: {http_body}");
+    assert!(
+        http_body["activeMillis"].is_number(),
+        "activeMillis: {http_body}"
+    );
+
+    // ---- FFI leg (off the tokio thread: FFI block_on its own runtime) ----
+    let ffi_dir = tempdir().unwrap();
+    let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
+    let ffi_lib = tempdir().unwrap();
+    write_library(ffi_lib.path(), 500);
+    let ffi_lib_path = ffi_lib.path().to_str().unwrap().to_string();
+
+    let ffi_body = tokio::task::spawn_blocking(move || -> serde_json::Value {
+        let cdb = CString::new(ffi_db).unwrap();
+        assert_eq!(
+            alexandria_index_init(cdb.as_ptr()),
+            alexandria_ffi::INDEX_OK
+        );
+
+        let root = CString::new(ffi_lib_path).unwrap();
+        let token = CString::new(TEST_TOKEN).unwrap();
+        let started = alexandria_index_start(root.as_ptr(), token.as_ptr(), std::ptr::null());
+        assert_eq!(started.status, alexandria_ffi::INDEX_OK, "ffi start failed");
+        let run_id = run_id_string(&started);
+
+        wait_for_ffi_run_cell_live(&run_id, &token);
+        let run_id_c = CString::new(run_id.clone()).unwrap();
+        assert_eq!(
+            alexandria_index_pause(run_id_c.as_ptr(), token.as_ptr()),
+            alexandria_ffi::RUN_OK,
+            "ffi pause failed"
+        );
+
+        wait_for_ffi_run_terminal(&run_id, &token);
+        ffi_run_status(&run_id, &token)
+    })
+    .await
+    .unwrap();
+
+    // ---- compare (two independent legs, same shape) ----
+    assert_eq!(ffi_body["status"], "paused");
+    assert!(ffi_body["processed"].is_number(), "processed: {ffi_body}");
+    assert!(
+        ffi_body["activeMillis"].is_number(),
+        "activeMillis: {ffi_body}"
+    );
+    assert_eq!(
+        http_body["status"].as_str(),
+        ffi_body["status"].as_str(),
+        "HTTP and FFI must agree on what a paused run's status field spells"
+    );
+}
+
+/// UC-42 parity — pause, resume, and confirm completion through each surface
+/// independently. Both must hand back the *same run id* they were given
+/// (resume continues a run, it does not mint one), and both runs must finish
+/// after the resume walks the (already-cataloged) library over again.
+#[tokio::test]
+async fn given_a_paused_run_when_resumed_via_http_and_ffi_then_both_answer_with_the_same_run_id_and_finish(
+) {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+
+    // ---- HTTP leg ----
+    let http_dir = tempdir().unwrap();
+    let http_db = db_path(&http_dir, "http.sqlite");
+    let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    seed_session(&http_pool, TEST_TOKEN).await;
+    let http_services =
+        std::sync::Arc::new(build_services(&local_settings(), http_pool.clone()).await);
+
+    let http_lib = tempdir().unwrap();
+    write_library(http_lib.path(), 500);
+    let http_run_id = start_http_run(
+        &http_services,
+        http_lib.path().to_str().unwrap(),
+        TEST_TOKEN,
+    )
+    .await;
+    wait_for_http_run_cell_live(&http_services, &http_run_id, TEST_TOKEN).await;
+
+    assert_eq!(
+        http_control(&http_services, "pause", &http_run_id, TEST_TOKEN)
+            .await
+            .status(),
+        axum::http::StatusCode::OK
+    );
+    assert_eq!(
+        wait_for_http_run_terminal(&http_services, &http_run_id, TEST_TOKEN).await["status"],
+        "paused"
+    );
+
+    let resume_response = http_control(&http_services, "resume", &http_run_id, TEST_TOKEN).await;
+    assert_eq!(resume_response.status(), axum::http::StatusCode::ACCEPTED);
+    let resume_body: serde_json::Value = serde_json::from_slice(
+        &to_bytes(resume_response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        resume_body["runId"], http_run_id,
+        "http resume must hand back the same run id, not mint a fresh one"
+    );
+
+    let http_final = wait_for_http_run_terminal(&http_services, &http_run_id, TEST_TOKEN).await;
+    assert_eq!(http_final["status"], "complete");
+
+    // ---- FFI leg ----
+    let ffi_dir = tempdir().unwrap();
+    let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
+    let ffi_lib = tempdir().unwrap();
+    write_library(ffi_lib.path(), 500);
+    let ffi_lib_path = ffi_lib.path().to_str().unwrap().to_string();
+
+    let (ffi_started_id, ffi_resumed_id, ffi_final_status) =
+        tokio::task::spawn_blocking(move || -> (String, String, String) {
+            let cdb = CString::new(ffi_db).unwrap();
+            assert_eq!(
+                alexandria_index_init(cdb.as_ptr()),
+                alexandria_ffi::INDEX_OK
+            );
+
+            let root = CString::new(ffi_lib_path).unwrap();
+            let token = CString::new(TEST_TOKEN).unwrap();
+            let started = alexandria_index_start(root.as_ptr(), token.as_ptr(), std::ptr::null());
+            assert_eq!(started.status, alexandria_ffi::INDEX_OK, "ffi start failed");
+            let run_id = run_id_string(&started);
+
+            wait_for_ffi_run_cell_live(&run_id, &token);
+            let run_id_c = CString::new(run_id.clone()).unwrap();
+            assert_eq!(
+                alexandria_index_pause(run_id_c.as_ptr(), token.as_ptr()),
+                alexandria_ffi::RUN_OK
+            );
+            wait_for_ffi_run_terminal(&run_id, &token);
+
+            let resumed = alexandria_index_resume(run_id_c.as_ptr(), token.as_ptr());
+            assert_eq!(resumed.status, alexandria_ffi::RUN_OK, "ffi resume failed");
+            let resumed_id = run_id_string(&resumed);
+
+            wait_for_ffi_run_terminal(&run_id, &token);
+            let final_status = ffi_run_status(&run_id, &token)["status"]
+                .as_str()
+                .unwrap()
+                .to_string();
+
+            (run_id, resumed_id, final_status)
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        ffi_resumed_id, ffi_started_id,
+        "ffi resume must hand back the same run id, not mint a fresh one"
+    );
+    assert_eq!(ffi_final_status, "complete");
+
+    // ---- compare (two independent legs, same shape) ----
+    assert_eq!(http_final["status"].as_str().unwrap(), ffi_final_status);
+}
+
+/// UC-42 parity — cancel a running run through each surface independently:
+/// both must answer success once, land the run in `cancelled`, and refuse a
+/// second cancel as an illegal transition on that terminal status.
+#[tokio::test]
+async fn given_a_running_run_when_cancelled_via_http_and_ffi_then_both_report_cancelled_and_refuse_a_second_cancel(
+) {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+
+    // ---- HTTP leg ----
+    let http_dir = tempdir().unwrap();
+    let http_db = db_path(&http_dir, "http.sqlite");
+    let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    seed_session(&http_pool, TEST_TOKEN).await;
+    let http_services =
+        std::sync::Arc::new(build_services(&local_settings(), http_pool.clone()).await);
+
+    let http_lib = tempdir().unwrap();
+    write_library(http_lib.path(), 500);
+    let http_run_id = start_http_run(
+        &http_services,
+        http_lib.path().to_str().unwrap(),
+        TEST_TOKEN,
+    )
+    .await;
+    wait_for_http_run_cell_live(&http_services, &http_run_id, TEST_TOKEN).await;
+
+    assert_eq!(
+        http_control(&http_services, "cancel", &http_run_id, TEST_TOKEN)
+            .await
+            .status(),
+        axum::http::StatusCode::OK
+    );
+    let http_body = wait_for_http_run_terminal(&http_services, &http_run_id, TEST_TOKEN).await;
+    assert_eq!(http_body["status"], "cancelled");
+    assert_eq!(
+        http_control(&http_services, "cancel", &http_run_id, TEST_TOKEN)
+            .await
+            .status(),
+        axum::http::StatusCode::CONFLICT,
+        "a second cancel must be refused, not accepted"
+    );
+
+    // ---- FFI leg ----
+    let ffi_dir = tempdir().unwrap();
+    let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
+    let ffi_lib = tempdir().unwrap();
+    write_library(ffi_lib.path(), 500);
+    let ffi_lib_path = ffi_lib.path().to_str().unwrap().to_string();
+
+    let (ffi_status, second_cancel_status) =
+        tokio::task::spawn_blocking(move || -> (String, i32) {
+            let cdb = CString::new(ffi_db).unwrap();
+            assert_eq!(
+                alexandria_index_init(cdb.as_ptr()),
+                alexandria_ffi::INDEX_OK
+            );
+
+            let root = CString::new(ffi_lib_path).unwrap();
+            let token = CString::new(TEST_TOKEN).unwrap();
+            let started = alexandria_index_start(root.as_ptr(), token.as_ptr(), std::ptr::null());
+            assert_eq!(started.status, alexandria_ffi::INDEX_OK, "ffi start failed");
+            let run_id = run_id_string(&started);
+
+            wait_for_ffi_run_cell_live(&run_id, &token);
+            let run_id_c = CString::new(run_id.clone()).unwrap();
+            assert_eq!(
+                alexandria_index_cancel(run_id_c.as_ptr(), token.as_ptr()),
+                alexandria_ffi::RUN_OK
+            );
+            wait_for_ffi_run_terminal(&run_id, &token);
+            let status = ffi_run_status(&run_id, &token)["status"]
+                .as_str()
+                .unwrap()
+                .to_string();
+
+            let second = alexandria_index_cancel(run_id_c.as_ptr(), token.as_ptr());
+            (status, second)
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(ffi_status, "cancelled");
+    assert_eq!(
+        second_cancel_status,
+        alexandria_ffi::RUN_ERR_INVALID_STATE,
+        "a second cancel must be refused, not accepted"
+    );
+
+    // ---- compare (two independent legs, same shape) ----
+    assert_eq!(http_body["status"].as_str().unwrap(), ffi_status);
+}
+
+/// UC-42 parity — one running and one paused run, listed as "active" through
+/// each surface independently: both must report those two runs' statuses.
+///
+/// The listing itself is process-wide, not scoped to this test — both
+/// `GET /v1/index/runs?status=active` and `alexandria_index_runs_active_json`
+/// answer with every outstanding run their surface's database holds. On the
+/// HTTP leg that database is this test's own fresh temp file, so nothing
+/// else can land in it. On the FFI leg it is `alexandria_index_init`'s
+/// process-global services slot — every parity test in this binary runs
+/// serialized behind `SERIAL`, but a walk a *previous* test spawned onto the
+/// FFI runtime is not guaranteed to have dropped its last reference the
+/// instant that test's assertions returned, so a stray row can still be
+/// mid-write when this test's `alexandria_index_init` repoints the slot at a
+/// fresh database. Filtering the listing down to the two run ids this test
+/// itself minted — on both surfaces — is what makes the assertion robust to
+/// that, rather than asserting on the full array and hoping nothing else is
+/// ever outstanding when it runs.
+///
+/// The `paused` run is set up *first*; the `running` run is started *last*,
+/// immediately before each surface's query. A small fixture library finishes
+/// in milliseconds with no real hashing to do, so a `running` run created
+/// first and then left alone while a second run is built, paused, and waited
+/// on can legitimately finish before the listing is ever read — that is the
+/// walk actually completing, not a bug, and the fix is to shrink the window
+/// between "confirmed running" and "listed."
+#[tokio::test]
+async fn given_a_running_and_a_paused_run_when_active_runs_listed_via_http_and_ffi_then_both_report_exactly_those_two(
+) {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+
+    // ---- HTTP leg ----
+    let http_dir = tempdir().unwrap();
+    let http_db = db_path(&http_dir, "http.sqlite");
+    let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    seed_session(&http_pool, TEST_TOKEN).await;
+    let http_services =
+        std::sync::Arc::new(build_services(&local_settings(), http_pool.clone()).await);
+
+    let paused_lib = tempdir().unwrap();
+    write_library(paused_lib.path(), 500);
+    let paused_id = start_http_run(
+        &http_services,
+        paused_lib.path().to_str().unwrap(),
+        TEST_TOKEN,
+    )
+    .await;
+    wait_for_http_run_cell_live(&http_services, &paused_id, TEST_TOKEN).await;
+    assert_eq!(
+        http_control(&http_services, "pause", &paused_id, TEST_TOKEN)
+            .await
+            .status(),
+        axum::http::StatusCode::OK
+    );
+    assert_eq!(
+        wait_for_http_run_terminal(&http_services, &paused_id, TEST_TOKEN).await["status"],
+        "paused"
+    );
+
+    let running_lib = tempdir().unwrap();
+    write_library(running_lib.path(), 500);
+    let running_id = start_http_run(
+        &http_services,
+        running_lib.path().to_str().unwrap(),
+        TEST_TOKEN,
+    )
+    .await;
+    wait_for_http_run_cell_live(&http_services, &running_id, TEST_TOKEN).await;
+
+    let request = Request::builder()
+        .method("GET")
+        .uri("/v1/index/runs?status=active")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
+        .body(Body::empty())
+        .unwrap();
+    let response = app(Settings::default(), http_services.clone())
+        .oneshot(request)
+        .await
+        .expect("http active runs");
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let http_runs: serde_json::Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    // Filtered to the two ids this test minted — the listing is process-wide
+    // (see the doc comment above), so any sibling test's outstanding run
+    // would otherwise be counted too.
+    let mut http_statuses: Vec<String> = http_runs
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|r| {
+            let id = r["runId"].as_str().unwrap();
+            id == running_id || id == paused_id
+        })
+        .map(|r| r["status"].as_str().unwrap().to_string())
+        .collect();
+    http_statuses.sort();
+
+    // ---- FFI leg ----
+    let ffi_dir = tempdir().unwrap();
+    let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
+    let paused_lib_ffi = tempdir().unwrap();
+    write_library(paused_lib_ffi.path(), 500);
+    let paused_lib_ffi_path = paused_lib_ffi.path().to_str().unwrap().to_string();
+    let running_lib_ffi = tempdir().unwrap();
+    write_library(running_lib_ffi.path(), 500);
+    let running_lib_ffi_path = running_lib_ffi.path().to_str().unwrap().to_string();
+
+    let mut ffi_statuses = tokio::task::spawn_blocking(move || -> Vec<String> {
+        let cdb = CString::new(ffi_db).unwrap();
+        assert_eq!(
+            alexandria_index_init(cdb.as_ptr()),
+            alexandria_ffi::INDEX_OK
+        );
+        let token = CString::new(TEST_TOKEN).unwrap();
+
+        let paused_root = CString::new(paused_lib_ffi_path).unwrap();
+        let paused_started =
+            alexandria_index_start(paused_root.as_ptr(), token.as_ptr(), std::ptr::null());
+        assert_eq!(paused_started.status, alexandria_ffi::INDEX_OK);
+        let paused_run_id = run_id_string(&paused_started);
+        wait_for_ffi_run_cell_live(&paused_run_id, &token);
+        let paused_run_id_c = CString::new(paused_run_id.clone()).unwrap();
+        assert_eq!(
+            alexandria_index_pause(paused_run_id_c.as_ptr(), token.as_ptr()),
+            alexandria_ffi::RUN_OK
+        );
+        // `wait_for_ffi_run_terminal` waits for the run to leave `running`,
+        // not specifically for a terminal status — `paused` stops the poll
+        // just as `complete`/`failed`/`cancelled` would. The name is
+        // inherited from the completion-waiting tests earlier in this file;
+        // here, as in the pause/resume tests above, it is used for exactly
+        // the same "has the pause landed yet" purpose.
+        wait_for_ffi_run_terminal(&paused_run_id, &token);
+
+        let running_root = CString::new(running_lib_ffi_path).unwrap();
+        let running_started =
+            alexandria_index_start(running_root.as_ptr(), token.as_ptr(), std::ptr::null());
+        assert_eq!(running_started.status, alexandria_ffi::INDEX_OK);
+        let running_run_id = run_id_string(&running_started);
+        wait_for_ffi_run_cell_live(&running_run_id, &token);
+
+        let result = alexandria_index_runs_active_json(token.as_ptr());
+        assert_eq!(
+            result.status,
+            alexandria_ffi::RUN_OK,
+            "ffi active runs failed"
+        );
+        assert!(!result.json.is_null());
+        let body = unsafe { CStr::from_ptr(result.json) }
+            .to_str()
+            .unwrap()
+            .to_string();
+        unsafe {
+            alexandria_free_string(result.json);
+        }
+        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+        // Filtered to the two ids this test minted — see the doc comment on
+        // this test for why the raw listing is not asserted on directly.
+        value
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|r| {
+                let id = r["runId"].as_str().unwrap();
+                id == running_run_id || id == paused_run_id
+            })
+            .map(|r| r["status"].as_str().unwrap().to_string())
+            .collect()
+    })
+    .await
+    .unwrap();
+    ffi_statuses.sort();
+
+    // ---- compare (two independent legs, same shape) ----
+    assert_eq!(
+        http_statuses,
+        vec!["paused".to_string(), "running".to_string()],
+        "http active-runs listing (filtered to this test's two runs): {http_runs}"
+    );
+    assert_eq!(
+        ffi_statuses,
+        vec!["paused".to_string(), "running".to_string()],
+        "ffi active-runs listing (filtered to this test's two runs) must match the http one"
+    );
+    assert_eq!(http_statuses, ffi_statuses);
+}
+
+/// UC-42 / FR-FC-08 parity — the entire reason `priority` is a wire *string*
+/// rather than an int (Task 11's design note) is so both surfaces can be
+/// proven to accept the exact same spelling. Start a run with `"low"`
+/// through each surface independently and read back the concurrency each one
+/// resolved it to (not serialized on the run body —
+/// `CatalogRun::concurrency` is `#[serde(skip)]` — so this is the only place
+/// that spelling is observable). Both must land on
+/// `indexing.low_priority_concurrency` (1 by default), proving `"low"` means
+/// the same thing whether it arrived as a JSON string or a C string.
+#[tokio::test]
+async fn given_low_priority_when_started_via_http_and_ffi_then_both_spell_it_the_same_way() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+
+    // ---- HTTP leg ----
+    let http_dir = tempdir().unwrap();
+    let http_db = db_path(&http_dir, "http.sqlite");
+    let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    seed_session(&http_pool, TEST_TOKEN).await;
+    let http_services =
+        std::sync::Arc::new(build_services(&local_settings(), http_pool.clone()).await);
+
+    let http_lib = tempdir().unwrap();
+    std::fs::write(http_lib.path().join("song.mp3"), b"audio bytes").unwrap();
+
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/index")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({ "root": http_lib.path().to_str().unwrap(), "priority": "low" }).to_string(),
+        ))
+        .unwrap();
+    let response = app(Settings::default(), http_services.clone())
+        .oneshot(request)
+        .await
+        .expect("http start");
+    assert_eq!(response.status(), axum::http::StatusCode::ACCEPTED);
+    let http_run_id: serde_json::Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let http_run_id = http_run_id["runId"].as_str().unwrap().to_string();
+
+    let (http_concurrency,): (Option<i64>,) =
+        sqlx::query_as("SELECT concurrency FROM catalog_runs WHERE id = ?")
+            .bind(&http_run_id)
+            .fetch_one(&http_pool)
+            .await
+            .expect("http run row");
+
+    // ---- FFI leg ----
+    let ffi_dir = tempdir().unwrap();
+    let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
+    let ffi_lib = tempdir().unwrap();
+    std::fs::write(ffi_lib.path().join("song.mp3"), b"audio bytes").unwrap();
+    let ffi_lib_path = ffi_lib.path().to_str().unwrap().to_string();
+    let ffi_db_for_check = ffi_db.clone();
+
+    let ffi_run_id = tokio::task::spawn_blocking(move || -> String {
+        let cdb = CString::new(ffi_db).unwrap();
+        assert_eq!(
+            alexandria_index_init(cdb.as_ptr()),
+            alexandria_ffi::INDEX_OK
+        );
+
+        let root = CString::new(ffi_lib_path).unwrap();
+        let token = CString::new(TEST_TOKEN).unwrap();
+        let priority = CString::new("low").unwrap();
+        let started = alexandria_index_start(root.as_ptr(), token.as_ptr(), priority.as_ptr());
+        assert_eq!(started.status, alexandria_ffi::INDEX_OK, "ffi start failed");
+        run_id_string(&started)
+    })
+    .await
+    .unwrap();
+
+    // Re-open the ffi database from the main tokio runtime — the writer
+    // above ran on `alexandria_ffi`'s own runtime (`spawn_blocking`), but
+    // the row is already committed by the time `alexandria_index_start`
+    // returns (`start()` writes it before spawning the walk).
+    let ffi_pool = migrate_database(&ffi_db_for_check)
+        .await
+        .expect("re-open ffi db");
+    let (ffi_concurrency,): (Option<i64>,) =
+        sqlx::query_as("SELECT concurrency FROM catalog_runs WHERE id = ?")
+            .bind(&ffi_run_id)
+            .fetch_one(&ffi_pool)
+            .await
+            .expect("ffi run row");
+
+    // ---- compare (two independent legs, same spelling) ----
+    assert_eq!(
+        http_concurrency,
+        Some(1),
+        "http \"low\" must resolve to indexing.low_priority_concurrency"
+    );
+    assert_eq!(
+        ffi_concurrency,
+        Some(1),
+        "ffi \"low\" must resolve to indexing.low_priority_concurrency"
+    );
+    assert_eq!(
+        http_concurrency, ffi_concurrency,
+        "HTTP and FFI must resolve the literal string \"low\" identically"
+    );
 }
