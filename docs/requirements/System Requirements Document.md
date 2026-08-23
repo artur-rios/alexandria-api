@@ -416,7 +416,7 @@ kept indefinitely.
 | root | text | nullable | The indexed root, for an index run only; `NULL` for a refresh, which takes no root. |
 | startedAt | timestamp | required | When the run started. |
 | finishedAt | timestamp | nullable | When the run reached a terminal status; `NULL` while `running` or `paused`. |
-| phase | text | nullable | `discovering` or `processing` while the run is in flight; `NULL` once it is terminal, and `NULL` for a run that never published one. |
+| phase | text | nullable | `discovering` or `processing` while a walk is executing the run, and kept across an owner's pause so a client can see where the walk stopped. `NULL` once the run is terminal — `complete` beside `processing` would say two contradictory things — `NULL` for a run paused by startup reconciliation, whose process is gone so it is in no phase until it resumes, and `NULL` for a run that never published one. |
 | total | integer | nullable | How many entries the current segment has to get through; `NULL` until discovery has counted them. |
 | processed | integer | nullable | How many entries the current segment has finished with, of any outcome. |
 | pausedAt | timestamp | nullable | When the current pause began; `NULL` unless the run is `paused`. |
