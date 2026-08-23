@@ -1562,6 +1562,22 @@ fn wait_for_run_terminal_or_paused(run_id: &str, token: &CString) -> serde_json:
 /// test asserting `processed` is a number wants to race against. Waiting
 /// here first is what makes the difference deterministic instead of a coin
 /// flip on how fast the executor schedules the spawned task.
+///
+/// This function's own panic message ("... left running before its cell
+/// ever went live; `write_library` needs more files to give the walk time")
+/// names the fix for a fixture that is too small, but a caller sizing that
+/// fixture has to know too small *for what*: an index walk and a refresh
+/// walk do not cost the same per file. An index walk reads and classifies
+/// each file and — for a type with a metadata reader — parses its tag
+/// header; a refresh walk of already-cataloged paths is stat-only, no byte
+/// read and no tag parsing at all (Task 4). Refresh is therefore
+/// substantially faster per file than index, and a `write_library` count
+/// tuned to keep an *index* walk observably `running` (the tests below that
+/// call this against an index run) is not automatically large enough to do
+/// the same for a *refresh* walk — a refresh-side caller of this function
+/// needs its own, larger fixture. `given_a_paused_refresh_run_when_resumed_
+/// over_ffi_then_it_finishes` is that case; see its own comment for the
+/// count.
 fn wait_for_run_cell_live(run_id: &str, token: &CString) {
     let deadline = std::time::Instant::now() + ASYNC_RUN_DEADLINE;
     loop {
@@ -2041,17 +2057,29 @@ fn given_a_paused_refresh_run_when_resumed_over_ffi_then_it_finishes() {
     let _g = serial();
     let (_db_dir, _db_path) = init_temp_db();
     let lib = tempdir().unwrap();
-    write_library(lib.path(), 500);
+    // 5,000, not the 500 every index-side `wait_for_run_cell_live` caller in
+    // this file uses. A refresh walk over already-cataloged paths is
+    // stat-only — no byte read, no tag parsing (see `wait_for_run_cell_live`'s
+    // doc comment) — so it burns through a library many times faster per
+    // file than the index walk that cataloged it in the first place. 500
+    // was enough margin for an index walk under a live loop's overhead; it
+    // was not enough for a refresh walk under CPU contention from the rest
+    // of the suite (observed: this exact test flaking under
+    // `cargo test --workspace` while passing in isolation, the panic firing
+    // from this function precisely because the walk had already finished).
+    // 5,000 is deliberately generous — the margin has to hold up on a
+    // loaded machine, not just the median run.
+    write_library(lib.path(), 5000);
 
     let root = c(lib.path().to_str().unwrap());
     let token = c(TEST_TOKEN);
     let started = alexandria_index_start(root.as_ptr(), token.as_ptr(), std::ptr::null());
     assert_eq!(started.status, STATUS_OK);
-    wait_for_files(500);
+    wait_for_files(5000);
 
-    // The refresh walk re-reads every one of the 500 cataloged files, which
-    // is what gives it enough real wall-clock time for `wait_for_run_cell_live`
-    // to reliably catch it before it finishes.
+    // The refresh walk re-reads every one of the 5,000 cataloged files,
+    // which is what gives it enough real wall-clock time for
+    // `wait_for_run_cell_live` to reliably catch it before it finishes.
     let refreshed = alexandria_index_refresh_start(token.as_ptr(), std::ptr::null());
     assert_eq!(refreshed.status, STATUS_OK);
     let run_id = run_id_string(&refreshed);
