@@ -24,8 +24,9 @@ pub struct RefreshStarted {
 pub struct RefreshOutcome {
     #[serde(rename = "runId")]
     pub run_id: Uuid,
-    /// Records whose hash changed (or that returned to disk while marked
-    /// missing) and were refreshed.
+    /// Records whose stat changed (or that returned to disk while marked
+    /// missing) and were refreshed. Stat, not hash — Task 4 replaced the
+    /// SHA-256 comparison with a size/mtime one (FR-FC-10).
     pub refreshed: usize,
     /// Cataloged paths whose on-disk file is gone (UC-02 AF-01 / FR-FC-11).
     pub marked_missing: usize,
@@ -57,7 +58,8 @@ pub struct RefreshOutcome {
 ///
 /// Like `IndexHandler`, `execute` processes up to `concurrency` cataloged
 /// paths at a time, where `concurrency` is the width the run's own
-/// `RunPriority` resolved to at `start` — `indexing.concurrency` /
+/// `RunPriority` resolved to at `start`, or at the `resume` that last re-paced
+/// it (`RunControlHandler::resume`) — `indexing.concurrency` /
 /// `indexing.low_priority_concurrency`, the same two settings `IndexHandler`
 /// uses (a re-index is the same one-stat-per-file workload as an index, so
 /// splitting the knobs per command would only invite them to disagree), read
@@ -396,7 +398,7 @@ where
     /// SQLite's single writer while a client reads throughout, and a writer
     /// that waits out its whole `busy_timeout` is answered `SQLITE_BUSY`. Left
     /// unretried, that transient contention becomes a `failed` count — a
-    /// re-index silently leaving a stale hash or an unmarked missing file
+    /// re-index silently leaving a stale size/mtime or an unmarked missing file
     /// behind, which is worse here than at first index, since nothing else
     /// will revisit that row until the next run.
     async fn refresh_one(

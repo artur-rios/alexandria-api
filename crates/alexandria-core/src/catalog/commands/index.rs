@@ -57,8 +57,8 @@ pub struct IndexOutcome {
 /// `start` authenticates the caller, validates the root path — it must exist,
 /// and it must sit inside the configured `filesystem.root` when one is set
 /// (FR-FC-26) — and returns a fresh run id immediately. The heavy `execute`
-/// walk hashes and persists each supported file, skipping already-cataloged
-/// paths. `start` and `execute` are separated so the HTTP/FFI layer can spawn
+/// walk stats, classifies, and persists each supported file, skipping
+/// already-cataloged paths — no file bytes are read (FR-FC-09/FR-FC-10). `start` and `execute` are separated so the HTTP/FFI layer can spawn
 /// `execute` in the background (FR-FC-08) while `start` returns `202` right
 /// away.
 ///
@@ -67,13 +67,18 @@ pub struct IndexOutcome {
 /// `start` (`indexing.concurrency` default 4 for `Normal`,
 /// `indexing.low_priority_concurrency` default 1 for `Low` — FR-FC-08) and is
 /// read back from the run's stored `concurrency` column rather than from a
-/// field, so a resumed run reuses the width it was started with. The
-/// per-file work is dominated by hashing the bytes, which `StdFilesystem`
-/// runs on Tokio's blocking pool, so the concurrency buys real parallelism
-/// rather than interleaved waiting — that is what NFR-02's throughput target
-/// rests on. It is bounded rather than unlimited because an unbounded fan-out
-/// over a large library would queue one blocking task per file and starve
-/// every other user of the blocking pool. Note that the *database* half of
+/// field, so a resumed run walks at whatever width the run currently carries
+/// — the one it was started with, or the one a resume re-paced it to
+/// (`RunControlHandler::resume`). The per-file work is a stat plus, for a
+/// supported extension, a tag-header read — never a full-file hash
+/// (FR-FC-09/FR-FC-10) — and `StdFilesystem` runs both on Tokio's blocking
+/// pool, so the concurrency still buys real parallelism rather than
+/// interleaved waiting. NFR-02's throughput target rests on the per-file cost
+/// being size-independent, which is what dropping the hash bought; the
+/// concurrency is what keeps the syscalls from serializing. It is bounded
+/// rather than unlimited because an unbounded fan-out over a large library
+/// would queue one blocking task per file and starve every other user of the
+/// blocking pool. Note that the *database* half of
 /// each file's work still serializes: SQLite admits one writer at a time, and
 /// the pool caps connections at 8, so raising `concurrency` past that only
 /// lengthens the queue in front of the writer.
@@ -338,8 +343,8 @@ where
         Ok(IndexStarted { run_id })
     }
 
-    /// Walk, classify, hash, and persist. Skips unsupported extensions and
-    /// paths already cataloged (AF-03). Completion is logged at `info`.
+    /// Walk, classify, stat, and persist — no bytes hashed (FR-FC-09). Skips
+    /// unsupported extensions and paths already cataloged (AF-03). Completion is logged at `info`.
     ///
     /// Up to `concurrency` entries are in flight at once. The order files are
     /// processed in is therefore unspecified — the outcome counts are not,
@@ -668,11 +673,11 @@ where
             indexed_at: now,
         };
         // Only this one write is retried, and only on a transient busy. The
-        // directory walk and the hash above are not: they have already
-        // succeeded, and re-reading the bytes to answer database contention
-        // would multiply the expensive half of the work. A file that is still
-        // busy after the bound falls through exactly as before — counted in
-        // `failed`, logged, run continues.
+        // directory walk and the stat above are not: they have already
+        // succeeded, and re-walking the filesystem to answer database
+        // contention would repeat work that is already done. A file that is
+        // still busy after the bound falls through exactly as before —
+        // counted in `failed`, logged, run continues.
         let file = retry_on_busy(BUSY_ATTEMPTS, || {
             let new_file = new_file.clone();
             async { self.repo.insert_file(new_file).await }
