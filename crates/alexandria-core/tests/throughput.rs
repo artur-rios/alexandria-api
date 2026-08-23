@@ -462,6 +462,76 @@ async fn measure(format: Format, count: usize, concurrency: u32) -> (f64, f64) {
     )
 }
 
+/// Index a freshly generated library of `count` text files, each `bytes`
+/// long, against a fresh database, and return the measured files/sec.
+///
+/// Fixture generation is excluded from the timed window on purpose — see the
+/// size test below, whose whole point is a 1.6 GB fixture tree, for why
+/// writing the files must not be allowed to dominate the number this
+/// produces.
+async fn measure_rate(count: usize, bytes: usize) -> f64 {
+    let lib = tempfile::tempdir().expect("tempdir");
+    let dbdir = tempfile::tempdir().expect("tempdir");
+    generate_library(lib.path(), count, bytes);
+
+    let (handler, _repo) = build(&dbdir.path().join("bench.sqlite"), 4).await;
+
+    let started = Instant::now();
+    let outcome = handler
+        .execute(lib.path().to_str().expect("utf-8 lib path"), Uuid::new_v4())
+        .await
+        .expect("index run");
+    let elapsed = started.elapsed();
+
+    assert_eq!(
+        outcome.indexed,
+        count,
+        "every fixture file is cataloged: {}",
+        outcome_counters(&outcome)
+    );
+    assert_eq!(
+        outcome.failed,
+        0,
+        "no file failed to index: {}",
+        outcome_counters(&outcome)
+    );
+
+    count as f64 / elapsed.as_secs_f64()
+}
+
+/// NFR-02 restated: the indexing rate is independent of the library's size.
+///
+/// The other cases in this file use small text files, which is why they could
+/// not have caught the regression this test exists to prevent — a per-file
+/// cost proportional to the file's bytes is invisible to a size-free fixture.
+/// A library of 200 × 8 MB files is 1.6 GB; if indexing reads the bytes, this
+/// takes seconds to minutes, and if it only stats them, it takes about as
+/// long as the same count of empty files.
+///
+/// The floor is a factor of four, not a tight bound: change detection now
+/// keys off `(size_bytes, mtime)` rather than a content hash, so nothing in
+/// the scan path should read a byte of file content at all, and the two rates
+/// should be nearly identical. But a personal machine's timing noise —
+/// scheduler jitter, a page cache that is warm for one tempdir and cold for
+/// the other — is real, and this test only needs to catch a regression that
+/// shows up as orders of magnitude, not one that shows up as a few percent.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "throughput floor; see the module docs"]
+async fn given_large_files_when_indexed_then_the_rate_matches_the_small_file_rate() {
+    install_tracing();
+    let small = measure_rate(200, 0).await;
+    let large = measure_rate(200, 8 * 1024 * 1024).await;
+
+    println!("\nNFR-02 size independence\n  small files: {small:.0} files/sec\n  large files (8 MiB each): {large:.0} files/sec\n");
+
+    assert!(
+        large > small / 4.0,
+        "indexing rate collapsed on large files ({large:.0} vs {small:.0} files/sec): \
+         something is reading file bytes during a scan instead of relying on \
+         (size, mtime) change detection"
+    );
+}
+
 /// NFR-02, first half — the indexing rate.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "measures machine throughput; run explicitly with --ignored --nocapture"]
