@@ -1,4 +1,4 @@
-use axum::extract::rejection::PathRejection;
+use axum::extract::rejection::{PathRejection, QueryRejection};
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
@@ -239,8 +239,14 @@ fn parse_status(status: Option<&str>) -> Result<(), ApiError> {
 pub async fn active_runs(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Query(params): Query<RunListParams>,
+    params: Result<Query<RunListParams>, QueryRejection>,
 ) -> Result<Json<Vec<CatalogRun>>, ApiError> {
+    // `Result<Query<..>, QueryRejection>` rather than the bare extractor, so
+    // a malformed query string becomes this surface's `400` + `{"error": …}`
+    // envelope rather than axum's bare-text rejection — the same reason
+    // `run_status` and the control routes above take their path segment as
+    // `Result<Path<Uuid>, PathRejection>`.
+    let Query(params) = params.map_err(|_| invalid_input("malformed query string"))?;
     parse_status(params.status.as_deref())?;
     let token = bearer_token(&headers);
 

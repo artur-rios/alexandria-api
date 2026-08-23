@@ -11621,6 +11621,25 @@ fn write_library(dir: &std::path::Path, count: usize) {
     }
 }
 
+/// The sorted key set of a JSON object, or an empty vector for anything
+/// else. Used to compare *shape* between the two surfaces' run bodies —
+/// run ids, timestamps, and progress counters legitimately differ between
+/// two independently-executed runs, but which fields are present must not:
+/// FR-FC-24 is body parity, and comparing one field's value (e.g. `status`)
+/// proves transition parity, not body parity — a surface that silently
+/// dropped or renamed `alreadyCataloged`, `pausedAt`, `activeMillis`, or
+/// `phase` would still pass a `status`-only comparison.
+fn sorted_keys(value: &serde_json::Value) -> Vec<String> {
+    match value.as_object() {
+        Some(obj) => {
+            let mut keys: Vec<String> = obj.keys().cloned().collect();
+            keys.sort();
+            keys
+        }
+        None => Vec::new(),
+    }
+}
+
 async fn start_http_run(
     services: &std::sync::Arc<alexandria_core::services::Services>,
     root: &str,
@@ -11841,6 +11860,19 @@ async fn given_a_running_run_when_paused_via_http_and_ffi_then_both_report_pause
         ffi_body["status"].as_str(),
         "HTTP and FFI must agree on what a paused run's status field spells"
     );
+    // Body parity (FR-FC-24), not just transition parity: run ids and exact
+    // progress numbers legitimately differ between the two independently
+    // executed runs, but the *set of fields* a paused run carries —
+    // `alreadyCataloged`, `pausedAt`, `activeMillis`, `phase`, etc — must
+    // not. A surface that silently dropped or renamed one of those would
+    // still pass every assertion above; this is the one that would catch it.
+    assert_eq!(
+        sorted_keys(&http_body),
+        sorted_keys(&ffi_body),
+        "HTTP and FFI paused-run bodies must carry the same fields:
+http: {http_body}
+ffi: {ffi_body}"
+    );
 }
 
 /// UC-42 parity — pause, resume, and confirm completion through each surface
@@ -11904,8 +11936,8 @@ async fn given_a_paused_run_when_resumed_via_http_and_ffi_then_both_answer_with_
     write_library(ffi_lib.path(), 500);
     let ffi_lib_path = ffi_lib.path().to_str().unwrap().to_string();
 
-    let (ffi_started_id, ffi_resumed_id, ffi_final_status) =
-        tokio::task::spawn_blocking(move || -> (String, String, String) {
+    let (ffi_started_id, ffi_resumed_id, ffi_final) =
+        tokio::task::spawn_blocking(move || -> (String, String, serde_json::Value) {
             let cdb = CString::new(ffi_db).unwrap();
             assert_eq!(
                 alexandria_index_init(cdb.as_ptr()),
@@ -11931,12 +11963,9 @@ async fn given_a_paused_run_when_resumed_via_http_and_ffi_then_both_answer_with_
             let resumed_id = run_id_string(&resumed);
 
             wait_for_ffi_run_terminal(&run_id, &token);
-            let final_status = ffi_run_status(&run_id, &token)["status"]
-                .as_str()
-                .unwrap()
-                .to_string();
+            let final_body = ffi_run_status(&run_id, &token);
 
-            (run_id, resumed_id, final_status)
+            (run_id, resumed_id, final_body)
         })
         .await
         .unwrap();
@@ -11945,10 +11974,22 @@ async fn given_a_paused_run_when_resumed_via_http_and_ffi_then_both_answer_with_
         ffi_resumed_id, ffi_started_id,
         "ffi resume must hand back the same run id, not mint a fresh one"
     );
-    assert_eq!(ffi_final_status, "complete");
+    assert_eq!(ffi_final["status"], "complete");
 
     // ---- compare (two independent legs, same shape) ----
-    assert_eq!(http_final["status"].as_str().unwrap(), ffi_final_status);
+    assert_eq!(
+        http_final["status"].as_str().unwrap(),
+        ffi_final["status"].as_str().unwrap()
+    );
+    // Body parity (FR-FC-24): the completed run's field set, not just its
+    // status, must match across surfaces.
+    assert_eq!(
+        sorted_keys(&http_final),
+        sorted_keys(&ffi_final),
+        "HTTP and FFI completed-run bodies must carry the same fields:
+http: {http_final}
+ffi: {ffi_final}"
+    );
 }
 
 /// UC-42 parity — cancel a running run through each surface independently:
@@ -12000,8 +12041,8 @@ async fn given_a_running_run_when_cancelled_via_http_and_ffi_then_both_report_ca
     write_library(ffi_lib.path(), 500);
     let ffi_lib_path = ffi_lib.path().to_str().unwrap().to_string();
 
-    let (ffi_status, second_cancel_status) =
-        tokio::task::spawn_blocking(move || -> (String, i32) {
+    let (ffi_body, second_cancel_status) =
+        tokio::task::spawn_blocking(move || -> (serde_json::Value, i32) {
             let cdb = CString::new(ffi_db).unwrap();
             assert_eq!(
                 alexandria_index_init(cdb.as_ptr()),
@@ -12021,18 +12062,15 @@ async fn given_a_running_run_when_cancelled_via_http_and_ffi_then_both_report_ca
                 alexandria_ffi::RUN_OK
             );
             wait_for_ffi_run_terminal(&run_id, &token);
-            let status = ffi_run_status(&run_id, &token)["status"]
-                .as_str()
-                .unwrap()
-                .to_string();
+            let body = ffi_run_status(&run_id, &token);
 
             let second = alexandria_index_cancel(run_id_c.as_ptr(), token.as_ptr());
-            (status, second)
+            (body, second)
         })
         .await
         .unwrap();
 
-    assert_eq!(ffi_status, "cancelled");
+    assert_eq!(ffi_body["status"], "cancelled");
     assert_eq!(
         second_cancel_status,
         alexandria_ffi::RUN_ERR_INVALID_STATE,
@@ -12040,11 +12078,50 @@ async fn given_a_running_run_when_cancelled_via_http_and_ffi_then_both_report_ca
     );
 
     // ---- compare (two independent legs, same shape) ----
-    assert_eq!(http_body["status"].as_str().unwrap(), ffi_status);
+    assert_eq!(
+        http_body["status"].as_str().unwrap(),
+        ffi_body["status"].as_str().unwrap()
+    );
+    // Body parity (FR-FC-24): the cancelled run's field set, not just its
+    // status, must match across surfaces.
+    assert_eq!(
+        sorted_keys(&http_body),
+        sorted_keys(&ffi_body),
+        "HTTP and FFI cancelled-run bodies must carry the same fields:
+http: {http_body}
+ffi: {ffi_body}"
+    );
 }
 
-/// UC-42 parity — one running and one paused run, listed as "active" through
-/// each surface independently: both must report those two runs' statuses.
+/// UC-42 parity — two paused runs, listed as "active" through each surface
+/// independently: both must report those two runs' ids and statuses, and
+/// one paused entry's field set must match across surfaces.
+///
+/// Deliberately two `paused` runs rather than a `running` one and a `paused`
+/// one. `paused` is a stable state nothing spontaneously leaves — a `running`
+/// run backed by a small fixture library can legitimately finish (walk out
+/// of `running` into `complete`) in the time it takes this test's own setup
+/// and query to run, and did: under full-suite load, where every test binary
+/// competes for CPU, the earlier `running`+`paused` version of this test
+/// intermittently found the `running` run already `complete` by the time the
+/// listing was read, dropping it from the response and failing the
+/// assertion — not an HTTP/FFI disagreement (the failure reproduced with the
+/// FFI test binary run alone too, once put under equivalent load), just a
+/// race this test had no business depending on. Two paused runs remove that
+/// dependency entirely: once `wait_for_..._run_terminal` confirms `paused`,
+/// nothing under any load can move either run again without an explicit
+/// resume/cancel this test never issues.
+///
+/// *Which* statuses qualify as "active" is proven elsewhere, not here: the
+/// core's own tests (Task 10) cover `Running` and `Paused` both being
+/// returned and all three terminal statuses excluded against real SQLite,
+/// and `run_control_api.rs`'s
+/// `given_runs_in_every_state_when_active_ones_are_requested_then_only_those_come_back`
+/// re-proves that boundary at the HTTP layer with a real `running` run
+/// (single-surface, so it has no cross-surface race to inherit). This test's
+/// job is narrower and does not need a `running` run to do it: prove the two
+/// *surfaces* agree — same ids, same field sets — which two paused runs
+/// prove exactly as well as a running-plus-paused pair, without the flake.
 ///
 /// The listing itself is process-wide, not scoped to this test — both
 /// `GET /v1/index/runs?status=active` and `alexandria_index_runs_active_json`
@@ -12060,16 +12137,8 @@ async fn given_a_running_run_when_cancelled_via_http_and_ffi_then_both_report_ca
 /// itself minted — on both surfaces — is what makes the assertion robust to
 /// that, rather than asserting on the full array and hoping nothing else is
 /// ever outstanding when it runs.
-///
-/// The `paused` run is set up *first*; the `running` run is started *last*,
-/// immediately before each surface's query. A small fixture library finishes
-/// in milliseconds with no real hashing to do, so a `running` run created
-/// first and then left alone while a second run is built, paused, and waited
-/// on can legitimately finish before the listing is ever read — that is the
-/// walk actually completing, not a bug, and the fix is to shrink the window
-/// between "confirmed running" and "listed."
 #[tokio::test]
-async fn given_a_running_and_a_paused_run_when_active_runs_listed_via_http_and_ffi_then_both_report_exactly_those_two(
+async fn given_two_paused_runs_when_active_runs_listed_via_http_and_ffi_then_both_report_exactly_those_two(
 ) {
     let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
@@ -12081,35 +12150,45 @@ async fn given_a_running_and_a_paused_run_when_active_runs_listed_via_http_and_f
     let http_services =
         std::sync::Arc::new(build_services(&local_settings(), http_pool.clone()).await);
 
-    let paused_lib = tempdir().unwrap();
-    write_library(paused_lib.path(), 500);
-    let paused_id = start_http_run(
+    let first_lib = tempdir().unwrap();
+    write_library(first_lib.path(), 500);
+    let first_id = start_http_run(
         &http_services,
-        paused_lib.path().to_str().unwrap(),
+        first_lib.path().to_str().unwrap(),
         TEST_TOKEN,
     )
     .await;
-    wait_for_http_run_cell_live(&http_services, &paused_id, TEST_TOKEN).await;
+    wait_for_http_run_cell_live(&http_services, &first_id, TEST_TOKEN).await;
     assert_eq!(
-        http_control(&http_services, "pause", &paused_id, TEST_TOKEN)
+        http_control(&http_services, "pause", &first_id, TEST_TOKEN)
             .await
             .status(),
         axum::http::StatusCode::OK
     );
     assert_eq!(
-        wait_for_http_run_terminal(&http_services, &paused_id, TEST_TOKEN).await["status"],
+        wait_for_http_run_terminal(&http_services, &first_id, TEST_TOKEN).await["status"],
         "paused"
     );
 
-    let running_lib = tempdir().unwrap();
-    write_library(running_lib.path(), 500);
-    let running_id = start_http_run(
+    let second_lib = tempdir().unwrap();
+    write_library(second_lib.path(), 500);
+    let second_id = start_http_run(
         &http_services,
-        running_lib.path().to_str().unwrap(),
+        second_lib.path().to_str().unwrap(),
         TEST_TOKEN,
     )
     .await;
-    wait_for_http_run_cell_live(&http_services, &running_id, TEST_TOKEN).await;
+    wait_for_http_run_cell_live(&http_services, &second_id, TEST_TOKEN).await;
+    assert_eq!(
+        http_control(&http_services, "pause", &second_id, TEST_TOKEN)
+            .await
+            .status(),
+        axum::http::StatusCode::OK
+    );
+    assert_eq!(
+        wait_for_http_run_terminal(&http_services, &second_id, TEST_TOKEN).await["status"],
+        "paused"
+    );
 
     let request = Request::builder()
         .method("GET")
@@ -12127,106 +12206,154 @@ async fn given_a_running_and_a_paused_run_when_active_runs_listed_via_http_and_f
     // Filtered to the two ids this test minted — the listing is process-wide
     // (see the doc comment above), so any sibling test's outstanding run
     // would otherwise be counted too.
-    let mut http_statuses: Vec<String> = http_runs
+    let http_mine: Vec<serde_json::Value> = http_runs
         .as_array()
         .unwrap()
         .iter()
         .filter(|r| {
             let id = r["runId"].as_str().unwrap();
-            id == running_id || id == paused_id
+            id == first_id || id == second_id
         })
+        .cloned()
+        .collect();
+    let mut http_ids: Vec<String> = http_mine
+        .iter()
+        .map(|r| r["runId"].as_str().unwrap().to_string())
+        .collect();
+    http_ids.sort();
+    let http_statuses: Vec<String> = http_mine
+        .iter()
         .map(|r| r["status"].as_str().unwrap().to_string())
         .collect();
-    http_statuses.sort();
+    let http_entry = http_mine
+        .first()
+        .expect("http listing has an entry")
+        .clone();
 
     // ---- FFI leg ----
     let ffi_dir = tempdir().unwrap();
     let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
-    let paused_lib_ffi = tempdir().unwrap();
-    write_library(paused_lib_ffi.path(), 500);
-    let paused_lib_ffi_path = paused_lib_ffi.path().to_str().unwrap().to_string();
-    let running_lib_ffi = tempdir().unwrap();
-    write_library(running_lib_ffi.path(), 500);
-    let running_lib_ffi_path = running_lib_ffi.path().to_str().unwrap().to_string();
+    let first_lib_ffi = tempdir().unwrap();
+    write_library(first_lib_ffi.path(), 500);
+    let first_lib_ffi_path = first_lib_ffi.path().to_str().unwrap().to_string();
+    let second_lib_ffi = tempdir().unwrap();
+    write_library(second_lib_ffi.path(), 500);
+    let second_lib_ffi_path = second_lib_ffi.path().to_str().unwrap().to_string();
 
-    let mut ffi_statuses = tokio::task::spawn_blocking(move || -> Vec<String> {
-        let cdb = CString::new(ffi_db).unwrap();
-        assert_eq!(
-            alexandria_index_init(cdb.as_ptr()),
-            alexandria_ffi::INDEX_OK
-        );
-        let token = CString::new(TEST_TOKEN).unwrap();
+    let (mut ffi_ids, ffi_statuses, ffi_entry) =
+        tokio::task::spawn_blocking(move || -> (Vec<String>, Vec<String>, serde_json::Value) {
+            let cdb = CString::new(ffi_db).unwrap();
+            assert_eq!(
+                alexandria_index_init(cdb.as_ptr()),
+                alexandria_ffi::INDEX_OK
+            );
+            let token = CString::new(TEST_TOKEN).unwrap();
 
-        let paused_root = CString::new(paused_lib_ffi_path).unwrap();
-        let paused_started =
-            alexandria_index_start(paused_root.as_ptr(), token.as_ptr(), std::ptr::null());
-        assert_eq!(paused_started.status, alexandria_ffi::INDEX_OK);
-        let paused_run_id = run_id_string(&paused_started);
-        wait_for_ffi_run_cell_live(&paused_run_id, &token);
-        let paused_run_id_c = CString::new(paused_run_id.clone()).unwrap();
-        assert_eq!(
-            alexandria_index_pause(paused_run_id_c.as_ptr(), token.as_ptr()),
-            alexandria_ffi::RUN_OK
-        );
-        // `wait_for_ffi_run_terminal` waits for the run to leave `running`,
-        // not specifically for a terminal status — `paused` stops the poll
-        // just as `complete`/`failed`/`cancelled` would. The name is
-        // inherited from the completion-waiting tests earlier in this file;
-        // here, as in the pause/resume tests above, it is used for exactly
-        // the same "has the pause landed yet" purpose.
-        wait_for_ffi_run_terminal(&paused_run_id, &token);
+            let first_root = CString::new(first_lib_ffi_path).unwrap();
+            let first_started =
+                alexandria_index_start(first_root.as_ptr(), token.as_ptr(), std::ptr::null());
+            assert_eq!(first_started.status, alexandria_ffi::INDEX_OK);
+            let first_run_id = run_id_string(&first_started);
+            wait_for_ffi_run_cell_live(&first_run_id, &token);
+            let first_run_id_c = CString::new(first_run_id.clone()).unwrap();
+            assert_eq!(
+                alexandria_index_pause(first_run_id_c.as_ptr(), token.as_ptr()),
+                alexandria_ffi::RUN_OK
+            );
+            // `wait_for_ffi_run_terminal` waits for the run to leave
+            // `running`, not specifically for a terminal status — `paused`
+            // stops the poll just as `complete`/`failed`/`cancelled` would.
+            // The name is inherited from the completion-waiting tests
+            // earlier in this file; here, as in the pause/resume tests
+            // above, it is used for exactly the same "has the pause landed
+            // yet" purpose.
+            wait_for_ffi_run_terminal(&first_run_id, &token);
 
-        let running_root = CString::new(running_lib_ffi_path).unwrap();
-        let running_started =
-            alexandria_index_start(running_root.as_ptr(), token.as_ptr(), std::ptr::null());
-        assert_eq!(running_started.status, alexandria_ffi::INDEX_OK);
-        let running_run_id = run_id_string(&running_started);
-        wait_for_ffi_run_cell_live(&running_run_id, &token);
+            let second_root = CString::new(second_lib_ffi_path).unwrap();
+            let second_started =
+                alexandria_index_start(second_root.as_ptr(), token.as_ptr(), std::ptr::null());
+            assert_eq!(second_started.status, alexandria_ffi::INDEX_OK);
+            let second_run_id = run_id_string(&second_started);
+            wait_for_ffi_run_cell_live(&second_run_id, &token);
+            let second_run_id_c = CString::new(second_run_id.clone()).unwrap();
+            assert_eq!(
+                alexandria_index_pause(second_run_id_c.as_ptr(), token.as_ptr()),
+                alexandria_ffi::RUN_OK
+            );
+            wait_for_ffi_run_terminal(&second_run_id, &token);
 
-        let result = alexandria_index_runs_active_json(token.as_ptr());
-        assert_eq!(
-            result.status,
-            alexandria_ffi::RUN_OK,
-            "ffi active runs failed"
-        );
-        assert!(!result.json.is_null());
-        let body = unsafe { CStr::from_ptr(result.json) }
-            .to_str()
-            .unwrap()
-            .to_string();
-        unsafe {
-            alexandria_free_string(result.json);
-        }
-        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
-        // Filtered to the two ids this test minted — see the doc comment on
-        // this test for why the raw listing is not asserted on directly.
-        value
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter(|r| {
-                let id = r["runId"].as_str().unwrap();
-                id == running_run_id || id == paused_run_id
-            })
-            .map(|r| r["status"].as_str().unwrap().to_string())
-            .collect()
-    })
-    .await
-    .unwrap();
-    ffi_statuses.sort();
+            let result = alexandria_index_runs_active_json(token.as_ptr());
+            assert_eq!(
+                result.status,
+                alexandria_ffi::RUN_OK,
+                "ffi active runs failed"
+            );
+            assert!(!result.json.is_null());
+            let body = unsafe { CStr::from_ptr(result.json) }
+                .to_str()
+                .unwrap()
+                .to_string();
+            unsafe {
+                alexandria_free_string(result.json);
+            }
+            let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+            // Filtered to the two ids this test minted — see the doc
+            // comment on this test for why the raw listing is not asserted
+            // on directly.
+            let mine: Vec<serde_json::Value> = value
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|r| {
+                    let id = r["runId"].as_str().unwrap();
+                    id == first_run_id || id == second_run_id
+                })
+                .cloned()
+                .collect();
+            let mut ids: Vec<String> = mine
+                .iter()
+                .map(|r| r["runId"].as_str().unwrap().to_string())
+                .collect();
+            ids.sort();
+            let statuses: Vec<String> = mine
+                .iter()
+                .map(|r| r["status"].as_str().unwrap().to_string())
+                .collect();
+            let entry = mine.first().expect("ffi listing has an entry").clone();
+
+            (ids, statuses, entry)
+        })
+        .await
+        .unwrap();
+    ffi_ids.sort();
 
     // ---- compare (two independent legs, same shape) ----
     assert_eq!(
-        http_statuses,
-        vec!["paused".to_string(), "running".to_string()],
-        "http active-runs listing (filtered to this test's two runs): {http_runs}"
+        http_ids.len(),
+        2,
+        "http listing must contain exactly the two runs this test minted: {http_runs}"
     );
     assert_eq!(
-        ffi_statuses,
-        vec!["paused".to_string(), "running".to_string()],
-        "ffi active-runs listing (filtered to this test's two runs) must match the http one"
+        ffi_ids.len(),
+        2,
+        "ffi listing must contain exactly the two runs this test minted"
     );
-    assert_eq!(http_statuses, ffi_statuses);
+    assert!(
+        http_statuses.iter().all(|s| s == "paused"),
+        "every entry in a two-paused-runs listing must read paused: {http_statuses:?}"
+    );
+    assert!(
+        ffi_statuses.iter().all(|s| s == "paused"),
+        "every entry in a two-paused-runs listing must read paused: {ffi_statuses:?}"
+    );
+    // Body parity (FR-FC-24): one paused entry's field set must match across
+    // surfaces — proof this is a listing of full run bodies, not just a
+    // listing of statuses.
+    assert_eq!(
+        sorted_keys(&http_entry),
+        sorted_keys(&ffi_entry),
+        "HTTP and FFI active-runs entries must carry the same fields:\nhttp: {http_entry}\nffi: {ffi_entry}"
+    );
 }
 
 /// UC-42 / FR-FC-08 parity — the entire reason `priority` is a wire *string*

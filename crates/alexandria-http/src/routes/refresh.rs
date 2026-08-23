@@ -1,3 +1,4 @@
+use axum::extract::rejection::JsonRejection;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
@@ -11,9 +12,8 @@ use crate::routes::{bearer_token, deserialize_priority};
 use crate::AppState;
 
 /// The optional body `POST /v1/index/refresh` accepts. Every field has a
-/// default, so the whole body is optional too — see `refresh`'s
-/// `Option<Json<..>>` parameter, which is what makes a request with no body
-/// at all (every caller before Task 12) keep working unchanged.
+/// default, so the whole body is optional too — see `refresh`'s doc comment
+/// for how an absent or unreadable body reaches that default.
 #[derive(Debug, Default, Deserialize)]
 pub struct RefreshBody {
     /// How hard this run should push (FR-FC-08). Same wire spelling and the
@@ -27,21 +27,26 @@ pub struct RefreshBody {
 /// Refresh touches every cataloged path, so the only thing a body can carry
 /// is `priority` — and that is optional, so the body itself is optional.
 ///
-/// `Option<Json<RefreshBody>>` rather than `Result<Json<RefreshBody>, _>`:
-/// axum turns *any* extraction failure (no body, no `content-type`, or
-/// malformed JSON) into `None` rather than a rejection. That is deliberate
-/// here — this body's only field is a value this route already treats
-/// leniently (see `deserialize_priority`), so an absent or garbled body
-/// falling back to the default is consistent with an absent or garbled
-/// *field inside* a present body doing the same, rather than one being a
-/// silent default and the other a `400`.
+/// Taken as `Result<Json<RefreshBody>, JsonRejection>`, with *every*
+/// rejection folded into `RefreshBody::default()` — not
+/// `Option<Json<RefreshBody>>`. `Option<..>`'s `OptionalFromRequest` impl
+/// for `Json` (axum 0.8) only resolves to `None` when the `content-type`
+/// header is absent entirely; a JSON content-type with an empty body, a
+/// non-JSON content-type, or malformed JSON are all real extraction
+/// failures under that impl, which `Option` would have surfaced as this
+/// surface's usual `400`/`415` — breaking any caller whose HTTP library
+/// attaches a JSON content-type by default, a shape that worked before this
+/// task (`refresh` took no body extractor at all). Folding every rejection
+/// into the default here, explicitly, is what actually delivers "an absent
+/// or garbled body behaves like an absent or garbled `priority` field" — the
+/// leniency `deserialize_priority` already gives a *present* body's field.
 ///
 /// Returns `202` with a run id immediately; the refresh runs on a spawned
 /// task (FR-FC-08).
 pub async fn refresh(
     State(state): State<AppState>,
     headers: HeaderMap,
-    body: Option<Json<RefreshBody>>,
+    body: Result<Json<RefreshBody>, JsonRejection>,
 ) -> Result<(StatusCode, Json<RefreshStarted>), ApiError> {
     let token = bearer_token(&headers);
     let priority = body.map(|Json(b)| b.priority).unwrap_or_default();

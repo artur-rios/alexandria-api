@@ -52,6 +52,21 @@ fn refresh_request(body: Option<Value>) -> Request<Body> {
     builder.body(body).unwrap()
 }
 
+/// Like `refresh_request`, but lets a test send a request axum's `Json`
+/// extractor would reject outright — an empty body with a JSON
+/// content-type, or a body that is not valid JSON at all — rather than the
+/// "no body, no content-type" shape `refresh_request(None)` sends.
+fn refresh_request_raw(content_type: Option<&str>, raw_body: &str) -> Request<Body> {
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri("/v1/index/refresh")
+        .header("authorization", format!("Bearer {TEST_TOKEN}"));
+    if let Some(content_type) = content_type {
+        builder = builder.header("content-type", content_type);
+    }
+    builder.body(Body::from(raw_body.to_string())).unwrap()
+}
+
 fn control_request(verb: &str, run_id: &str, token: Option<&str>) -> Request<Body> {
     let mut builder = Request::builder()
         .method("POST")
@@ -500,6 +515,31 @@ async fn given_an_unrecognised_status_when_runs_listed_then_400() {
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
 
+/// A query string axum's `Query` extractor itself cannot parse (duplicate
+/// keys into a scalar field) must land in this surface's `{"error": …}`
+/// envelope too, not axum's bare-text rejection — the same reason the path
+/// segment and the JSON body on this router are taken as `Result<_,
+/// _Rejection>` rather than the bare extractor.
+#[tokio::test]
+async fn given_a_malformed_query_string_when_runs_listed_then_400_with_error_envelope() {
+    let test = test_app().await;
+    let router = app(Settings::default(), test.services);
+
+    let response = router
+        .oneshot(runs_request(
+            Some("status=active&status=low"),
+            Some(TEST_TOKEN),
+        ))
+        .await
+        .expect("runs");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(response).await;
+    assert!(
+        body.get("error").is_some(),
+        "must be this surface's error envelope, not axum's bare-text rejection: {body:?}"
+    );
+}
+
 #[tokio::test]
 async fn given_no_token_when_runs_listed_then_401() {
     let test = test_app().await;
@@ -600,6 +640,54 @@ async fn given_no_body_when_refresh_started_then_still_202_at_normal_priority() 
 
     let response = router
         .oneshot(refresh_request(None))
+        .await
+        .expect("refresh");
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let run_id = body_json(response).await["runId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let concurrency = run_concurrency(&test.pool, &run_id).await;
+    assert_eq!(concurrency, Some(4));
+}
+
+/// Regression: a JSON content-type with a genuinely empty body is a shape
+/// `Option<Json<..>>` on axum 0.8 does NOT collapse to `None` for (only a
+/// wholly *absent* `content-type` does) — it is a real `Json` extraction
+/// failure. Falling back to the default priority here has to come from
+/// folding the rejection, not from the extractor quietly resolving to
+/// `None`.
+#[tokio::test]
+async fn given_empty_body_with_json_content_type_when_refresh_started_then_still_202_at_normal_priority(
+) {
+    let test = test_app().await;
+    let router = app(Settings::default(), test.services.clone());
+
+    let response = router
+        .oneshot(refresh_request_raw(Some("application/json"), ""))
+        .await
+        .expect("refresh");
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let run_id = body_json(response).await["runId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let concurrency = run_concurrency(&test.pool, &run_id).await;
+    assert_eq!(concurrency, Some(4));
+}
+
+/// Regression: malformed JSON is also a real `Json` extraction failure, not
+/// a missing-content-type one — same fold-into-default requirement as the
+/// empty-body case above.
+#[tokio::test]
+async fn given_malformed_json_body_when_refresh_started_then_still_202_at_normal_priority() {
+    let test = test_app().await;
+    let router = app(Settings::default(), test.services.clone());
+
+    let response = router
+        .oneshot(refresh_request_raw(Some("application/json"), "{not json"))
         .await
         .expect("refresh");
     assert_eq!(response.status(), StatusCode::ACCEPTED);
