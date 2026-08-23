@@ -1219,3 +1219,105 @@ async fn given_a_failed_run_when_a_cancel_with_a_tally_lands_afterwards_then_it_
     assert!(run.counts.is_none());
     assert_eq!(run.finished_at, Some(t(2)));
 }
+
+// ---------------- list_active (Task 10) ----------------
+
+#[tokio::test]
+async fn given_rows_inserted_out_of_order_when_active_runs_are_listed_then_they_come_back_newest_first(
+) {
+    // Pins the query's own `ORDER BY started_at DESC` against real SQL,
+    // rather than trusting insertion order — SQLite makes no ordering
+    // promise without one, and inserting out of order is what would expose a
+    // query that quietly relied on it anyway.
+    let (repo, _dir) = repo().await;
+    let middle = Uuid::new_v4();
+    repo.start(middle, RunKind::Index, Some("/library"), t(5), 4)
+        .await
+        .expect("start middle");
+    let newest = Uuid::new_v4();
+    repo.start(newest, RunKind::Refresh, None, t(9), 4)
+        .await
+        .expect("start newest");
+    let oldest = Uuid::new_v4();
+    repo.start(oldest, RunKind::Index, Some("/library"), t(1), 4)
+        .await
+        .expect("start oldest");
+
+    let active = repo.list_active().await.expect("list_active");
+
+    let ids: Vec<_> = active.iter().map(|run| run.id).collect();
+    assert_eq!(ids, vec![newest, middle, oldest]);
+}
+
+#[tokio::test]
+async fn given_runs_in_every_terminal_status_when_active_runs_are_listed_then_none_are_returned() {
+    // `complete`, `failed`, and `cancelled` must all be excluded — not just
+    // whichever one a smaller test happened to cover.
+    let (repo, _dir) = repo().await;
+
+    let complete = Uuid::new_v4();
+    repo.start(complete, RunKind::Index, Some("/library"), t(1), 4)
+        .await
+        .expect("start");
+    repo.finish(
+        complete,
+        RunCounts::Index {
+            scanned: 1,
+            indexed: 1,
+            skipped: 0,
+            already_cataloged: 0,
+            failed: 0,
+        },
+        t(2),
+    )
+    .await
+    .expect("finish");
+
+    let failed = Uuid::new_v4();
+    repo.start(failed, RunKind::Index, Some("/library"), t(1), 4)
+        .await
+        .expect("start");
+    repo.fail(failed, "root unreadable", t(2))
+        .await
+        .expect("fail");
+
+    let cancelled = Uuid::new_v4();
+    repo.start(cancelled, RunKind::Index, Some("/library"), t(1), 4)
+        .await
+        .expect("start");
+    assert!(repo.cancel(cancelled, None, t(2)).await.expect("cancel"));
+
+    let active = repo.list_active().await.expect("list_active");
+
+    assert!(active.is_empty());
+}
+
+#[tokio::test]
+async fn given_a_running_and_a_paused_run_when_active_runs_are_listed_then_both_are_returned() {
+    let (repo, _dir) = repo().await;
+    let running = Uuid::new_v4();
+    repo.start(running, RunKind::Index, Some("/library"), t(1), 4)
+        .await
+        .expect("start running");
+    let paused = Uuid::new_v4();
+    repo.start(paused, RunKind::Refresh, None, t(2), 4)
+        .await
+        .expect("start paused");
+    assert!(repo.pause(paused, t(3)).await.expect("pause"));
+
+    let active = repo.list_active().await.expect("list_active");
+
+    let ids: Vec<_> = active.iter().map(|run| run.id).collect();
+    assert_eq!(ids.len(), 2);
+    assert!(ids.contains(&running) && ids.contains(&paused));
+}
+
+#[tokio::test]
+async fn given_no_runs_when_active_runs_are_listed_then_an_empty_list_is_returned_not_an_error() {
+    // An idle library — the common case — must not be an error.
+    let (repo, _dir) = repo().await;
+
+    let active = repo.list_active().await.expect("must not error");
+
+    assert!(active.is_empty());
+}

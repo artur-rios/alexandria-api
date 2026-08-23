@@ -37,6 +37,7 @@ use crate::catalog::commands::soft_delete::SoftDeleteFileHandler;
 use crate::catalog::document_tags::PdfEpubMetadataReader;
 use crate::catalog::fs::StdFilesystem;
 use crate::catalog::image_tags::ExifImageMetadataReader;
+use crate::catalog::queries::active_runs::GetActiveRunsHandler;
 use crate::catalog::queries::browse::BrowseFilesHandler;
 use crate::catalog::queries::read_content::ReadTextFileContentHandler;
 use crate::catalog::queries::run_status::GetRunStatusHandler;
@@ -125,6 +126,9 @@ pub type DefaultReadTextFileContentHandler =
 
 pub type DefaultGetRunStatusHandler =
     GetRunStatusHandler<RuntimeAuthService, SqliteCatalogRunRepository, SystemClock>;
+
+pub type DefaultGetActiveRunsHandler =
+    GetActiveRunsHandler<RuntimeAuthService, SqliteCatalogRunRepository, SystemClock>;
 
 pub type DefaultRunControlHandler =
     RunControlHandler<RuntimeAuthService, SqliteCatalogRunRepository, SystemClock>;
@@ -293,6 +297,7 @@ pub struct Services {
     pub browse_files_handler: Arc<DefaultBrowseFilesHandler>,
     pub read_text_file_content_handler: Arc<DefaultReadTextFileContentHandler>,
     pub get_run_status_handler: Arc<DefaultGetRunStatusHandler>,
+    pub get_active_runs_handler: Arc<DefaultGetActiveRunsHandler>,
     pub run_control_handler: Arc<DefaultRunControlHandler>,
     pub edit_text_file_content_handler: Arc<DefaultEditTextFileContentHandler>,
     pub playback_source_handler: Arc<DefaultPlaybackSourceHandler>,
@@ -480,6 +485,15 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         fs,
     ));
     let get_run_status_handler = Arc::new(GetRunStatusHandler::new(
+        auth.clone(),
+        run_repo.clone(),
+        clock,
+        run_registry.clone(),
+    ));
+    // Same repository and registry as the single-run query above: a client
+    // listing outstanding runs wants the same live-overlaid numbers a
+    // single-run read gives, not a second, differently-sourced answer.
+    let get_active_runs_handler = Arc::new(GetActiveRunsHandler::new(
         auth.clone(),
         run_repo.clone(),
         clock,
@@ -691,6 +705,7 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         browse_files_handler,
         read_text_file_content_handler,
         get_run_status_handler,
+        get_active_runs_handler,
         run_control_handler,
         edit_text_file_content_handler,
         playback_source_handler,

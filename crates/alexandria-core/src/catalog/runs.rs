@@ -1,6 +1,6 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use sqlx::sqlite::SqlitePool;
+use sqlx::sqlite::{SqlitePool, SqliteRow};
 use sqlx::Row;
 use uuid::Uuid;
 
@@ -360,6 +360,23 @@ pub trait CatalogRunRepository: Send + Sync {
     /// One run's record, or `None` for an unknown id (UC-42 AF-01).
     async fn get(&self, id: Uuid) -> Result<Option<CatalogRun>, DomainError>;
 
+    /// Every run whose status is `running` or `paused` — the two non-terminal
+    /// statuses (see [`RunStatus`]) — newest first.
+    ///
+    /// This is what answers "is anything indexing right now" and "what can be
+    /// resumed" across the whole catalog in one call, rather than the caller
+    /// having to remember every run id it ever started and poll [`get`] on
+    /// each — see `GetActiveRunsHandler`. An idle library has none: that is
+    /// an empty list, not an error.
+    ///
+    /// Newest first because that is the order either question wants an
+    /// answer read in: a resume offer leads with the run most likely to still
+    /// matter to the owner, and an activity indicator built from the first
+    /// entry wants the freshest one.
+    ///
+    /// [`get`]: CatalogRunRepository::get
+    async fn list_active(&self) -> Result<Vec<CatalogRun>, DomainError>;
+
     /// Pause every run still `running`, returning how many were reconciled
     /// (FR-FC-29).
     ///
@@ -397,6 +414,120 @@ fn parse_time(raw: &str, column: &str) -> Result<DateTime<Utc>, DomainError> {
     DateTime::parse_from_rfc3339(raw)
         .map(|t| t.with_timezone(&Utc))
         .map_err(|err| DomainError::internal(format!("corrupt catalog_runs.{column}: {err}")))
+}
+
+/// Every `catalog_runs` column [`row_to_run`] needs, other than `id` — `get`
+/// already has the id it queried by and has no reason to ask the row for it
+/// back, while `list_active` has no id to bind against and must select it.
+/// A macro rather than a `const &str`: `sqlx::query` requires a `&'static
+/// str` it can statically audit for injection, which rules out building the
+/// two queries below with `format!` — this expands inline at compile time
+/// instead, so the column list is still written once.
+macro_rules! run_columns {
+    () => {
+        "kind, status, root, started_at, finished_at, scanned, indexed, \
+         skipped, already_cataloged, refreshed, marked_missing, unchanged, failed, error, \
+         phase, total, processed, paused_at, paused_millis, concurrency"
+    };
+}
+
+/// `get`'s query: one row by id, or none.
+const GET_RUN_QUERY: &str = concat!("SELECT ", run_columns!(), " FROM catalog_runs WHERE id = ?");
+
+/// `list_active`'s query (see [`CatalogRunRepository::list_active`]):
+/// `running` and `paused` are the two non-terminal statuses, and
+/// `ORDER BY started_at DESC` is explicit rather than left to whatever order
+/// SQLite happens to return rows in — it makes no promise without one.
+const LIST_ACTIVE_RUNS_QUERY: &str = concat!(
+    "SELECT id, ",
+    run_columns!(),
+    " FROM catalog_runs WHERE status IN ('running', 'paused') ORDER BY started_at DESC"
+);
+
+/// Map one `catalog_runs` row into a [`CatalogRun`], given the id the row was
+/// found by (`get`) or read out of (`list_active`). Shared so the two query
+/// paths cannot drift on how a row's columns become a run.
+fn row_to_run(id: Uuid, row: &SqliteRow) -> Result<CatalogRun, DomainError> {
+    let kind = RunKind::parse(&row.try_get::<String, _>("kind")?)?;
+    let status = RunStatus::parse(&row.try_get::<String, _>("status")?)?;
+    let started_at = parse_time(&row.try_get::<String, _>("started_at")?, "started_at")?;
+    let finished_at = row
+        .try_get::<Option<String>, _>("finished_at")?
+        .map(|raw| parse_time(&raw, "finished_at"))
+        .transpose()?;
+
+    // Counts exist only once a walk has finished. Presence of the first
+    // column of the kind's set decides — `finish` writes them together.
+    // The reverse narrowing: these columns hold file counts a single walk
+    // produced, so a stored value large enough to overflow `usize` on a
+    // 32-bit target is not reachable, and the cast is not checked.
+    let counts = match kind {
+        RunKind::Index => row
+            .try_get::<Option<i64>, _>("scanned")?
+            .map(|scanned| -> Result<RunCounts, DomainError> {
+                Ok(RunCounts::Index {
+                    scanned: scanned as usize,
+                    indexed: row.try_get::<i64, _>("indexed")? as usize,
+                    skipped: row.try_get::<i64, _>("skipped")? as usize,
+                    already_cataloged: row.try_get::<i64, _>("already_cataloged")? as usize,
+                    failed: row.try_get::<i64, _>("failed")? as usize,
+                })
+            })
+            .transpose()?,
+        RunKind::Refresh => row
+            .try_get::<Option<i64>, _>("refreshed")?
+            .map(|refreshed| -> Result<RunCounts, DomainError> {
+                Ok(RunCounts::Refresh {
+                    refreshed: refreshed as usize,
+                    marked_missing: row.try_get::<i64, _>("marked_missing")? as usize,
+                    unchanged: row.try_get::<i64, _>("unchanged")? as usize,
+                    failed: row.try_get::<i64, _>("failed")? as usize,
+                })
+            })
+            .transpose()?,
+    };
+
+    // The last flushed progress (FR-FC-28). A stored `phase` that parses
+    // to nothing is dropped rather than failing the read: progress is a
+    // display field, and refusing to answer at all would be a worse
+    // outcome than answering without it.
+    let phase = row
+        .try_get::<Option<String>, _>("phase")?
+        .as_deref()
+        .and_then(RunPhase::parse);
+    let paused_at = row
+        .try_get::<Option<String>, _>("paused_at")?
+        .map(|raw| parse_time(&raw, "paused_at"))
+        .transpose()?;
+
+    Ok(CatalogRun {
+        id,
+        kind,
+        status,
+        root: row.try_get("root")?,
+        started_at,
+        finished_at,
+        counts,
+        error: row.try_get("error")?,
+        phase,
+        total: row
+            .try_get::<Option<i64>, _>("total")?
+            .map(|total| total as usize),
+        processed: row
+            .try_get::<Option<i64>, _>("processed")?
+            .map(|processed| processed as usize),
+        // Derived by `GetRunStatusHandler` / `GetActiveRunsHandler`, which
+        // hold the clock — a repository has no business asking what time it
+        // is.
+        active_millis: 0,
+        paused_at,
+        paused_millis: row.try_get("paused_millis")?,
+        // The reverse narrowing of `start`'s: a concurrency wider than
+        // `u32` was never written, so the cast cannot lose anything.
+        concurrency: row
+            .try_get::<Option<i64>, _>("concurrency")?
+            .map(|concurrency| concurrency as u32),
+    })
 }
 
 /// Reject a `finish()` call whose `RunCounts` variant does not match the
@@ -723,98 +854,37 @@ impl CatalogRunRepository for SqliteCatalogRunRepository {
     }
 
     async fn get(&self, id: Uuid) -> Result<Option<CatalogRun>, DomainError> {
-        let row = sqlx::query(
-            "SELECT kind, status, root, started_at, finished_at, scanned, indexed, \
-             skipped, already_cataloged, refreshed, marked_missing, unchanged, failed, error, \
-             phase, total, processed, paused_at, paused_millis, concurrency \
-             FROM catalog_runs WHERE id = ?",
-        )
-        .bind(id.to_string())
-        .fetch_optional(&self.pool)
-        .await?;
+        let row = sqlx::query(GET_RUN_QUERY)
+            .bind(id.to_string())
+            .fetch_optional(&self.pool)
+            .await?;
 
         let Some(row) = row else {
             return Ok(None);
         };
 
-        let kind = RunKind::parse(&row.try_get::<String, _>("kind")?)?;
-        let status = RunStatus::parse(&row.try_get::<String, _>("status")?)?;
-        let started_at = parse_time(&row.try_get::<String, _>("started_at")?, "started_at")?;
-        let finished_at = row
-            .try_get::<Option<String>, _>("finished_at")?
-            .map(|raw| parse_time(&raw, "finished_at"))
-            .transpose()?;
+        Ok(Some(row_to_run(id, &row)?))
+    }
 
-        // Counts exist only once a walk has finished. Presence of the first
-        // column of the kind's set decides — `finish` writes them together.
-        // The reverse narrowing: these columns hold file counts a single walk
-        // produced, so a stored value large enough to overflow `usize` on a
-        // 32-bit target is not reachable, and the cast is not checked.
-        let counts = match kind {
-            RunKind::Index => row
-                .try_get::<Option<i64>, _>("scanned")?
-                .map(|scanned| -> Result<RunCounts, DomainError> {
-                    Ok(RunCounts::Index {
-                        scanned: scanned as usize,
-                        indexed: row.try_get::<i64, _>("indexed")? as usize,
-                        skipped: row.try_get::<i64, _>("skipped")? as usize,
-                        already_cataloged: row.try_get::<i64, _>("already_cataloged")? as usize,
-                        failed: row.try_get::<i64, _>("failed")? as usize,
-                    })
-                })
-                .transpose()?,
-            RunKind::Refresh => row
-                .try_get::<Option<i64>, _>("refreshed")?
-                .map(|refreshed| -> Result<RunCounts, DomainError> {
-                    Ok(RunCounts::Refresh {
-                        refreshed: refreshed as usize,
-                        marked_missing: row.try_get::<i64, _>("marked_missing")? as usize,
-                        unchanged: row.try_get::<i64, _>("unchanged")? as usize,
-                        failed: row.try_get::<i64, _>("failed")? as usize,
-                    })
-                })
-                .transpose()?,
-        };
+    async fn list_active(&self) -> Result<Vec<CatalogRun>, DomainError> {
+        // `started_at DESC` is explicit rather than relied upon from
+        // insertion order — SQLite makes no ordering promise without an
+        // ORDER BY, and `catalog_runs` has no autoincrement rowid ordering a
+        // caller could accidentally lean on either (the primary key is the
+        // run's own UUID).
+        let rows = sqlx::query(LIST_ACTIVE_RUNS_QUERY)
+            .fetch_all(&self.pool)
+            .await?;
 
-        // The last flushed progress (FR-FC-28). A stored `phase` that parses
-        // to nothing is dropped rather than failing the read: progress is a
-        // display field, and refusing to answer at all would be a worse
-        // outcome than answering without it.
-        let phase = row
-            .try_get::<Option<String>, _>("phase")?
-            .as_deref()
-            .and_then(RunPhase::parse);
-        let paused_at = row
-            .try_get::<Option<String>, _>("paused_at")?
-            .map(|raw| parse_time(&raw, "paused_at"))
-            .transpose()?;
-
-        Ok(Some(CatalogRun {
-            id,
-            kind,
-            status,
-            root: row.try_get("root")?,
-            started_at,
-            finished_at,
-            counts,
-            error: row.try_get("error")?,
-            phase,
-            total: row
-                .try_get::<Option<i64>, _>("total")?
-                .map(|total| total as usize),
-            processed: row
-                .try_get::<Option<i64>, _>("processed")?
-                .map(|processed| processed as usize),
-            // Derived by `GetRunStatusHandler`, which holds the clock.
-            active_millis: 0,
-            paused_at,
-            paused_millis: row.try_get("paused_millis")?,
-            // The reverse narrowing of `start`'s: a concurrency wider than
-            // `u32` was never written, so the cast cannot lose anything.
-            concurrency: row
-                .try_get::<Option<i64>, _>("concurrency")?
-                .map(|concurrency| concurrency as u32),
-        }))
+        rows.iter()
+            .map(|row| {
+                let raw_id = row.try_get::<String, _>("id")?;
+                let id = Uuid::parse_str(&raw_id).map_err(|err| {
+                    DomainError::internal(format!("corrupt catalog_runs.id {raw_id:?}: {err}"))
+                })?;
+                row_to_run(id, row)
+            })
+            .collect()
     }
 
     async fn pause_running(&self, now: DateTime<Utc>) -> Result<u64, DomainError> {

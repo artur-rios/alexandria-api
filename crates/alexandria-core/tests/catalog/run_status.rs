@@ -7,6 +7,7 @@ use chrono::{TimeZone, Utc};
 use uuid::Uuid;
 
 use alexandria_core::catalog::clock::FixedClock;
+use alexandria_core::catalog::queries::active_runs::GetActiveRunsHandler;
 use alexandria_core::catalog::queries::run_status::GetRunStatusHandler;
 use alexandria_core::catalog::run_registry::{RunPhase, RunProgress, RunRegistry};
 use alexandria_core::catalog::runs::{CatalogRunRepository, RunCounts, RunKind, RunStatus};
@@ -421,4 +422,178 @@ async fn given_a_run_cancelled_while_paused_when_read_then_its_clock_is_frozen()
         10 * 60 * 1000,
         "twenty minutes elapsed to the cancel, of which the last ten were paused"
     );
+}
+
+// ---------------- GetActiveRunsHandler (Task 10) ----------------
+
+/// The handler under test plus the repository and registry a test needs to
+/// seed runs into. Mirrors `run_control.rs`'s `ControlHarness`.
+struct ActiveRunsHarness {
+    handler: GetActiveRunsHandler<FakeAuth, FakeCatalogRunRepository, FixedClock>,
+    runs: FakeCatalogRunRepository,
+    registry: RunRegistry,
+}
+
+impl ActiveRunsHarness {
+    async fn new() -> Self {
+        let runs = FakeCatalogRunRepository::new();
+        let registry = RunRegistry::new();
+        Self {
+            handler: GetActiveRunsHandler::new(
+                FakeAuth::Allowing,
+                runs.clone(),
+                FixedClock(t(9)),
+                registry.clone(),
+            ),
+            runs,
+            registry,
+        }
+    }
+
+    /// Start a run and, unless it is `Running`, drive it into `status`
+    /// through the repository's own transitions — the same reasoning as
+    /// `ControlHarness::with_run`: seeding through the real transitions keeps
+    /// the fake and the adapter from drifting on what each status leaves
+    /// behind.
+    async fn a_run(&self, status: RunStatus) -> Uuid {
+        let id = Uuid::new_v4();
+        self.runs
+            .start(id, RunKind::Index, Some("/library"), t(1), 4)
+            .await
+            .unwrap();
+        match status {
+            RunStatus::Running => {}
+            RunStatus::Paused => {
+                assert!(self.runs.pause(id, t(2)).await.unwrap());
+            }
+            RunStatus::Complete => self
+                .runs
+                .finish(
+                    id,
+                    RunCounts::Index {
+                        scanned: 1,
+                        indexed: 1,
+                        skipped: 0,
+                        already_cataloged: 0,
+                        failed: 0,
+                    },
+                    t(2),
+                )
+                .await
+                .unwrap(),
+            RunStatus::Failed => self.runs.fail(id, "root unreadable", t(2)).await.unwrap(),
+            RunStatus::Cancelled => {
+                assert!(self.runs.cancel(id, None, t(2)).await.unwrap());
+            }
+        }
+        id
+    }
+}
+
+#[tokio::test]
+async fn given_runs_in_every_state_when_active_ones_are_listed_then_only_running_and_paused_are_returned(
+) {
+    let harness = ActiveRunsHarness::new().await;
+    let running = harness.a_run(RunStatus::Running).await;
+    let paused = harness.a_run(RunStatus::Paused).await;
+    harness.a_run(RunStatus::Complete).await;
+    harness.a_run(RunStatus::Failed).await;
+    harness.a_run(RunStatus::Cancelled).await;
+
+    let active = harness.handler.list("token").await.unwrap();
+
+    let ids: Vec<_> = active.iter().map(|r| r.id).collect();
+    assert_eq!(ids.len(), 2);
+    assert!(ids.contains(&running) && ids.contains(&paused));
+}
+
+#[tokio::test]
+async fn given_no_outstanding_runs_when_listed_then_an_empty_list_is_returned_not_an_error() {
+    // An idle library is the normal case, not an error condition.
+    let harness = ActiveRunsHarness::new().await;
+    harness.a_run(RunStatus::Complete).await;
+
+    let active = harness.handler.list("token").await.expect("must not error");
+
+    assert!(active.is_empty());
+}
+
+#[tokio::test]
+async fn given_an_unauthenticated_caller_when_active_runs_are_listed_then_unauthorized() {
+    let runs = FakeCatalogRunRepository::new();
+    let handler = GetActiveRunsHandler::new(
+        FakeAuth::Denying,
+        runs,
+        FixedClock(t(9)),
+        RunRegistry::new(),
+    );
+
+    let err = handler
+        .list("")
+        .await
+        .expect_err("must reject an unauthenticated caller");
+
+    assert!(matches!(err, DomainError::Unauthorized), "got {err:?}");
+}
+
+#[tokio::test]
+async fn given_a_live_run_in_the_list_when_read_then_it_reports_live_progress_not_the_last_flush() {
+    // The same overlay `GetRunStatusHandler` performs: a client listing
+    // outstanding runs wants current numbers, not the last flush. The
+    // persisted row deliberately carries a *stale* tally so a pass proves the
+    // overlay read the cell rather than the row.
+    let harness = ActiveRunsHarness::new().await;
+    let id = harness.a_run(RunStatus::Running).await;
+    harness
+        .runs
+        .record_progress(
+            id,
+            &RunProgress {
+                phase: RunPhase::Processing,
+                total: Some(12_264),
+                processed: 4_000,
+            },
+        )
+        .await
+        .unwrap();
+
+    let cell = harness.registry.open(id);
+    cell.set_phase(RunPhase::Processing);
+    cell.set_total(12_264);
+    for _ in 0..8_412 {
+        cell.advance();
+    }
+
+    let active = harness.handler.list("token").await.unwrap();
+
+    let run = active.iter().find(|r| r.id == id).expect("run in list");
+    assert_eq!(run.phase, Some(RunPhase::Processing));
+    assert_eq!(run.total, Some(12_264));
+    assert_eq!(
+        run.processed,
+        Some(8_412),
+        "the live cell must win over the last flush"
+    );
+}
+
+#[tokio::test]
+async fn given_active_runs_when_listed_then_they_come_back_newest_first() {
+    let harness = ActiveRunsHarness::new().await;
+    let older = Uuid::new_v4();
+    harness
+        .runs
+        .start(older, RunKind::Index, Some("/library"), t(1), 4)
+        .await
+        .unwrap();
+    let newer = Uuid::new_v4();
+    harness
+        .runs
+        .start(newer, RunKind::Index, Some("/library"), t(5), 4)
+        .await
+        .unwrap();
+
+    let active = harness.handler.list("token").await.unwrap();
+
+    let ids: Vec<_> = active.iter().map(|r| r.id).collect();
+    assert_eq!(ids, vec![newer, older], "newest started run first");
 }

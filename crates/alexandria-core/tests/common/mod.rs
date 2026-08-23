@@ -2565,6 +2565,22 @@ impl CatalogRunRepository for FakeCatalogRunRepository {
         }
         Ok(reconciled)
     }
+
+    async fn list_active(&self) -> Result<Vec<CatalogRun>, DomainError> {
+        let mut active: Vec<CatalogRun> = self
+            .runs
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|run| matches!(run.status, RunStatus::Running | RunStatus::Paused))
+            .cloned()
+            .collect();
+        // Mirrors the SQLite adapter's explicit `ORDER BY started_at DESC` —
+        // a `HashMap`'s iteration order carries no promise at all, so a test
+        // against this fake would be exercising nothing without a sort here.
+        active.sort_by_key(|run| std::cmp::Reverse(run.started_at));
+        Ok(active)
+    }
 }
 
 /// A `CatalogRepository` whose `list_all` always fails (UC-42 / FR-FC-27).
@@ -2894,6 +2910,12 @@ impl CatalogRunRepository for FailingCatalogRunRepository {
 
     async fn pause_running(&self, _now: DateTime<Utc>) -> Result<u64, DomainError> {
         Ok(0)
+    }
+
+    async fn list_active(&self) -> Result<Vec<CatalogRun>, DomainError> {
+        // Not exercised by any current test against this double — every
+        // variant's test drives a single walk directly rather than listing.
+        Ok(Vec::new())
     }
 }
 
