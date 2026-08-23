@@ -87,6 +87,12 @@ root = ""
 # only lengthens the queue. 0 is treated as 1 (sequential).
 concurrency = 4
 
+# How many files a run started at low priority processes at a time. Low
+# priority is for a large scan the owner wants running while they keep
+# browsing and playing back, so the default is the narrowest useful width.
+# 0 is treated as 1 (sequential), exactly as `concurrency` is.
+low_priority_concurrency = 1
+
 [deletion]
 # Soft-delete retention window in days. After this many days have elapsed, a
 # soft-deleted record becomes eligible for hard purge (default 30, see NFR-10).

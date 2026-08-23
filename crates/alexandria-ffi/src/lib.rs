@@ -9,6 +9,7 @@ use tokio::runtime::{Builder, Runtime};
 use alexandria_core::auth::windows_identity::{verify_owner, ProcessWindowsIdentity};
 use alexandria_core::auth::AuthService;
 use alexandria_core::catalog::commands::index::IndexRequest;
+use alexandria_core::catalog::runs::RunPriority;
 use alexandria_core::config::AuthMode;
 use alexandria_core::config::Settings;
 use alexandria_core::errors::{error_body, DomainError};
@@ -238,7 +239,17 @@ pub extern "C" fn alexandria_index_start(
     let started = rt.block_on(async {
         services
             .index_handler
-            .start(IndexRequest { root: root.clone() }, &token)
+            .start(
+                // No FFI argument carries a priority yet — that is a later
+                // task's wire change. Every run started from this surface
+                // today is `Normal`, matching the behaviour before run
+                // priority existed.
+                IndexRequest {
+                    root: root.clone(),
+                    priority: RunPriority::Normal,
+                },
+                &token,
+            )
             .await
     });
 
@@ -281,7 +292,14 @@ pub extern "C" fn alexandria_index_refresh_start(token: *const c_char) -> IndexS
     let token = cstr_lossy(token).unwrap_or_default();
     let rt = runtime();
 
-    let started = rt.block_on(async { services.refresh_handler.start(&token).await });
+    // No FFI argument carries a priority yet — see the same note on
+    // `alexandria_index_start` above.
+    let started = rt.block_on(async {
+        services
+            .refresh_handler
+            .start(RunPriority::Normal, &token)
+            .await
+    });
 
     match started {
         Ok(s) => {

@@ -11,7 +11,7 @@
 #![allow(dead_code)]
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
@@ -2311,6 +2311,17 @@ impl FakeCatalogRunRepository {
         }
     }
 
+    /// Erase a run's stored width, simulating one started before run priority
+    /// existed — `start` always records a width now, so a test about the
+    /// legacy fallback (`RunControlHandler::resume`'s
+    /// `unwrap_or(default_concurrency)`) has to unset it explicitly rather
+    /// than rely on `start` ever leaving it `None`.
+    pub fn clear_concurrency(&self, id: Uuid) {
+        if let Some(run) = self.runs.lock().unwrap().get_mut(&id) {
+            run.concurrency = None;
+        }
+    }
+
     /// Cancel `id` the next time it is read, after the read has answered.
     ///
     /// Simulates the one window the pause guard exists for: a control call
@@ -2348,6 +2359,7 @@ impl CatalogRunRepository for FakeCatalogRunRepository {
         kind: RunKind,
         root: Option<&str>,
         started_at: DateTime<Utc>,
+        concurrency: u32,
     ) -> Result<(), DomainError> {
         self.runs.lock().unwrap().insert(
             id,
@@ -2366,9 +2378,9 @@ impl CatalogRunRepository for FakeCatalogRunRepository {
                 active_millis: 0,
                 paused_at: None,
                 paused_millis: 0,
-                // Written by run priority (a later task); until then every
-                // run resumes at the handler's configured width.
-                concurrency: None,
+                // Mirrors the SQLite adapter: the width the caller's
+                // `RunPriority` resolved to, so a resume can reuse it.
+                concurrency: Some(concurrency),
             },
         );
         Ok(())
@@ -2759,8 +2771,8 @@ impl Filesystem for FailingListFilesystem {
     }
 }
 
-/// A `CatalogRunRepository` that fails one lifecycle write on purpose (UC-42
-/// / FR-FC-27).
+/// A `CatalogRunRepository` that fails one lifecycle operation on purpose
+/// (UC-42 / FR-FC-27).
 ///
 /// `FinishFails` pins the "a bookkeeping failure must not sink a successful
 /// walk" behavior: `execute()` retries the write and, once retries are
@@ -2771,13 +2783,32 @@ impl Filesystem for FailingListFilesystem {
 /// a failure to open the run record must propagate, because a caller must
 /// never receive a run id it can never query.
 ///
-/// Each variant implements only the method its test exercises; the rest are
-/// `unimplemented!()`.
+/// `GetFails` pins run priority's own version of the same "a bookkeeping
+/// failure must not sink a successful walk" ruling: `execute` now opens with
+/// a `get` to read the width the run was started at (Task 9), and a
+/// transient failure of that read is exactly the kind of thing that must not
+/// abort a walk that could perfectly well proceed at the configured default
+/// -- only the *pacing* depends on the answer, not the work.
+///
+/// Each variant implements only the methods its test exercises with a
+/// meaningful failure; the rest answer a harmless success/empty value rather
+/// than panicking, because `execute`'s own shape has changed under this
+/// double before (this file) and will again -- a method that happens to go
+/// unread by every *current* test is not a promise it stays that way, and a
+/// double that panics on first contact with a new caller is a worse failure
+/// mode than one that quietly hands back a plausible answer no test happens
+/// to check.
 #[derive(Debug, Clone, Copy, Default)]
+// The shared `Fails` postfix is the point, not an accident: each variant
+// names the one operation this double fails, and `FinishFails`/`StartFails`/
+// `GetFails` read at every call site (`FailingCatalogRunRepository::GetFails`)
+// far better than a shared prefix or a de-suffixed form would.
+#[allow(clippy::enum_variant_names)]
 pub enum FailingCatalogRunRepository {
     #[default]
     FinishFails,
     StartFails,
+    GetFails,
 }
 
 impl CatalogRunRepository for FailingCatalogRunRepository {
@@ -2787,10 +2818,14 @@ impl CatalogRunRepository for FailingCatalogRunRepository {
         _kind: RunKind,
         _root: Option<&str>,
         _started_at: DateTime<Utc>,
+        _concurrency: u32,
     ) -> Result<(), DomainError> {
         match self {
             Self::StartFails => Err(DomainError::Disk("run store unavailable".into())),
-            Self::FinishFails => unimplemented!("not exercised by the finish-always-fails test"),
+            // Neither `FinishFails`' nor `GetFails`' test calls `start` at
+            // all -- both hand `execute` a bare `Uuid::new_v4()` instead, so
+            // there is nothing for a real answer here to be checked against.
+            Self::FinishFails | Self::GetFails => Ok(()),
         }
     }
 
@@ -2802,7 +2837,10 @@ impl CatalogRunRepository for FailingCatalogRunRepository {
     ) -> Result<(), DomainError> {
         match self {
             Self::FinishFails => Err(DomainError::Disk("run store unavailable".into())),
-            Self::StartFails => unimplemented!("start already failed; finish is never reached"),
+            // `StartFails`' test never reaches `finish` (start already
+            // failed). `GetFails`' test needs this write to succeed -- the
+            // walk itself is fine, only its `get` at the top is not.
+            Self::StartFails | Self::GetFails => Ok(()),
         }
     }
 
@@ -2812,18 +2850,18 @@ impl CatalogRunRepository for FailingCatalogRunRepository {
         _error: &str,
         _finished_at: DateTime<Utc>,
     ) -> Result<(), DomainError> {
-        unimplemented!("not exercised by either failing-repository test")
+        Ok(())
     }
 
     async fn record_progress(&self, _id: Uuid, _progress: &RunProgress) -> Result<(), DomainError> {
         // A flush is best-effort, so failing one here would not change what
-        // either failing-repository test observes; succeeding keeps their
-        // subject the write they are actually about.
+        // any of these tests observe; succeeding keeps their subject the one
+        // write each is actually about.
         Ok(())
     }
 
     async fn pause(&self, _id: Uuid, _paused_at: DateTime<Utc>) -> Result<bool, DomainError> {
-        unimplemented!("not exercised by either failing-repository test")
+        Ok(false)
     }
 
     async fn cancel(
@@ -2832,19 +2870,30 @@ impl CatalogRunRepository for FailingCatalogRunRepository {
         _counts: Option<RunCounts>,
         _cancelled_at: DateTime<Utc>,
     ) -> Result<bool, DomainError> {
-        unimplemented!("not exercised by either failing-repository test")
+        Ok(false)
     }
 
     async fn resume(&self, _id: Uuid, _paused_millis: i64) -> Result<bool, DomainError> {
-        unimplemented!("not exercised by either failing-repository test")
+        Ok(false)
     }
 
     async fn get(&self, _id: Uuid) -> Result<Option<CatalogRun>, DomainError> {
-        unimplemented!("not exercised by either failing-repository test")
+        match self {
+            // The one failure this double exists to pin: `execute`'s
+            // concurrency lookup must survive this and fall back to the
+            // configured default rather than aborting the walk.
+            Self::GetFails => Err(DomainError::Disk("run store unavailable".into())),
+            // `FinishFails`' and `StartFails`' tests never actually call
+            // `start`, so there is truthfully no row to answer with --
+            // `Ok(None)` matches that, and exercises the same "unknown run"
+            // fallback `execute` takes in production for a run this
+            // repository has never heard of.
+            Self::FinishFails | Self::StartFails => Ok(None),
+        }
     }
 
     async fn pause_running(&self, _now: DateTime<Utc>) -> Result<u64, DomainError> {
-        unimplemented!("not exercised by either failing-repository test")
+        Ok(0)
     }
 }
 
@@ -2975,6 +3024,51 @@ impl AudioMetadataReader for InterruptingAudioMetadataReader {
         if !self.fired.swap(true, Ordering::Relaxed) {
             (self.interrupt)().await;
         }
+        None
+    }
+}
+
+/// Proves how wide `IndexHandler::execute`'s `buffer_unordered` actually ran
+/// by watching how many `read` calls are in flight at once, rather than
+/// asserting on the outcome tally — which is identical at every width (see
+/// `given_any_concurrency_when_execute_then_same_counts_and_same_catalog`)
+/// and so cannot tell one concurrency from another.
+///
+/// `current` tracks calls in flight right now; `max_seen` is the high-water
+/// mark, which is what a test reads. The `yield_now` between the increment
+/// and the decrement is load-bearing: without it, a `FakeCatalogRepository`
+/// lookup that never actually awaits would let `buffer_unordered` drive one
+/// future all the way to completion before the next is ever polled, and every
+/// width would look sequential. Yielding once forces the executor to poll
+/// every future it has already started before any of them finishes, so
+/// `max_seen` reports how many were genuinely started together.
+#[derive(Debug, Default, Clone)]
+pub struct ConcurrencyTrackingAudioMetadataReader {
+    // Arc-wrapped, not plain fields: the test needs a handle that outlives
+    // the handler's own copy to read `max_seen` afterward, mirroring how
+    // `FakeCatalogRepository` shares its state — a cheap `Clone` of a shared
+    // count, not two independent counters.
+    current: Arc<AtomicUsize>,
+    max_seen: Arc<AtomicUsize>,
+}
+
+impl ConcurrencyTrackingAudioMetadataReader {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The most `read` calls this reader ever saw in flight at once.
+    pub fn max_seen(&self) -> usize {
+        self.max_seen.load(Ordering::SeqCst)
+    }
+}
+
+impl AudioMetadataReader for ConcurrencyTrackingAudioMetadataReader {
+    async fn read(&self, _path: &str) -> Option<AudioTags> {
+        let now_in_flight = self.current.fetch_add(1, Ordering::SeqCst) + 1;
+        self.max_seen.fetch_max(now_in_flight, Ordering::SeqCst);
+        tokio::task::yield_now().await;
+        self.current.fetch_sub(1, Ordering::SeqCst);
         None
     }
 }

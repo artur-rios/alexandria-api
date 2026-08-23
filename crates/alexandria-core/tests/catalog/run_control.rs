@@ -23,9 +23,11 @@ use crate::common::{FakeAuth, FakeCatalogRunRepository};
 
 const TOKEN: &str = "owner-token";
 
-/// What the handler resumes a run at when the row itself records no width.
-/// Every run predates the `concurrency` column being written, so this is the
-/// value every resume in this file returns.
+/// What the handler resumes a run at when the row itself records no width —
+/// `RunControlHandler`'s configured fallback. Also the width these tests seed
+/// `start` with, since none of them (other than the one that explicitly
+/// clears it via `FakeCatalogRunRepository::clear_concurrency`) cares whether
+/// the row's own value or the fallback answered.
 const DEFAULT_CONCURRENCY: u32 = 4;
 
 fn t(hour: u32) -> chrono::DateTime<Utc> {
@@ -53,9 +55,15 @@ impl ControlHarness {
     async fn with_run(status: RunStatus) -> Self {
         let runs = FakeCatalogRunRepository::new();
         let run_id = Uuid::new_v4();
-        runs.start(run_id, RunKind::Index, Some("/library"), t(1))
-            .await
-            .expect("start");
+        runs.start(
+            run_id,
+            RunKind::Index,
+            Some("/library"),
+            t(1),
+            DEFAULT_CONCURRENCY,
+        )
+        .await
+        .expect("start");
         match status {
             RunStatus::Running => {}
             RunStatus::Complete => runs
@@ -341,9 +349,15 @@ async fn given_a_cancelled_run_when_a_pause_write_lands_afterwards_then_the_fake
     // exists for would be invisible here.
     let runs = FakeCatalogRunRepository::new();
     let run_id = Uuid::new_v4();
-    runs.start(run_id, RunKind::Index, Some("/library"), t(1))
-        .await
-        .expect("start");
+    runs.start(
+        run_id,
+        RunKind::Index,
+        Some("/library"),
+        t(1),
+        DEFAULT_CONCURRENCY,
+    )
+    .await
+    .expect("start");
     runs.cancel(run_id, None, t(2)).await.expect("cancel");
 
     let applied = runs.pause(run_id, t(3)).await.expect("pause");
@@ -404,9 +418,19 @@ async fn paused_run(
 ) {
     let runs = FakeCatalogRunRepository::new();
     let run_id = Uuid::new_v4();
-    runs.start(run_id, RunKind::Index, Some("D:/music"), t(1))
-        .await
-        .expect("start");
+    runs.start(
+        run_id,
+        RunKind::Index,
+        Some("D:/music"),
+        t(1),
+        DEFAULT_CONCURRENCY,
+    )
+    .await
+    .expect("start");
+    // Simulates a run started before run priority existed — `start` always
+    // writes a width now, so the "resumes at the configured default" test
+    // below has to unset it explicitly to still exercise that fallback.
+    runs.clear_concurrency(run_id);
     runs.record_progress(
         run_id,
         &RunProgress {
@@ -610,9 +634,15 @@ async fn given_a_cancelled_run_when_a_walks_cancel_lands_afterwards_then_the_fak
     // cancelled run's counts where the real one keeps them.
     let runs = FakeCatalogRunRepository::new();
     let run_id = Uuid::new_v4();
-    runs.start(run_id, RunKind::Index, Some("/library"), t(1))
-        .await
-        .expect("start");
+    runs.start(
+        run_id,
+        RunKind::Index,
+        Some("/library"),
+        t(1),
+        DEFAULT_CONCURRENCY,
+    )
+    .await
+    .expect("start");
     assert!(runs
         .cancel(run_id, None, t(2))
         .await

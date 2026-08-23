@@ -5,6 +5,7 @@ use axum::Json;
 use serde::Deserialize;
 
 use alexandria_core::catalog::commands::index::{IndexRequest, IndexStarted};
+use alexandria_core::catalog::runs::RunPriority;
 
 use crate::middleware::auth::invalid_input;
 use crate::middleware::error::ApiError;
@@ -33,6 +34,10 @@ pub async fn index(
     let Json(body) = body.map_err(|err| invalid_input(format!("invalid index body: {err}")))?;
     let request = IndexRequest {
         root: body.root.clone(),
+        // The HTTP body carries no priority yet — that is a later task's
+        // wire change. Every run started from this surface today is
+        // `Normal`, matching the behaviour before run priority existed.
+        priority: RunPriority::Normal,
     };
 
     let started = state

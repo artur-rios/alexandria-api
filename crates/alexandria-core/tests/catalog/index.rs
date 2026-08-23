@@ -15,16 +15,18 @@ use alexandria_core::catalog::image_tags::{ImageMetadataReader, ImageTags};
 use alexandria_core::catalog::model::{FileType, FormatKind, SubtypeMetadata};
 use alexandria_core::catalog::repos::CatalogRepository;
 use alexandria_core::catalog::run_registry::{RunPhase, RunRegistry};
-use alexandria_core::catalog::runs::{CatalogRunRepository, RunCounts, RunKind, RunStatus};
+use alexandria_core::catalog::runs::{
+    CatalogRunRepository, RunCounts, RunKind, RunPriority, RunStatus,
+};
 use alexandria_core::catalog::video_tags::{VideoDuration, VideoMetadataReader, VideoTags};
 use alexandria_core::errors::DomainError;
 
 use crate::common::{
-    existing_file, fixed_clock, interrupt, now, FailingCatalogRunRepository, FailingListFilesystem,
-    FakeAudioMetadataReader, FakeAuth, FakeCatalogRepository, FakeCatalogRunRepository,
-    FakeComicMetadataReader, FakeDocumentMetadataReader, FakeFilesystem, FakeImageMetadataReader,
-    FakeVideoMetadataReader, Interrupt, InterruptingAudioMetadataReader, InterruptingFilesystem,
-    Seam, SteppingClock,
+    existing_file, fixed_clock, interrupt, now, ConcurrencyTrackingAudioMetadataReader,
+    FailingCatalogRunRepository, FailingListFilesystem, FakeAudioMetadataReader, FakeAuth,
+    FakeCatalogRepository, FakeCatalogRunRepository, FakeComicMetadataReader,
+    FakeDocumentMetadataReader, FakeFilesystem, FakeImageMetadataReader, FakeVideoMetadataReader,
+    Interrupt, InterruptingAudioMetadataReader, InterruptingFilesystem, Seam, SteppingClock,
 };
 
 const ROOT: &str = "/library";
@@ -35,6 +37,11 @@ const TOKEN: &str = "bearer-token";
 /// exercising the concurrent path is what keeps that true. Tests that assert
 /// on a *single* entry are unaffected either way.
 const TEST_CONCURRENCY: u32 = 4;
+
+/// The low-priority width these unit tests build handlers with. Deliberately
+/// distinct from [`TEST_CONCURRENCY`], so a test that observes which one was
+/// actually used cannot pass by accident.
+const TEST_LOW_PRIORITY_CONCURRENCY: u32 = 1;
 
 #[allow(clippy::too_many_arguments)]
 fn handler<A, R, F, C, M, N, O, P, Q, RR>(
@@ -117,6 +124,7 @@ where
         video_tags,
         comic_tags,
         TEST_CONCURRENCY,
+        TEST_LOW_PRIORITY_CONCURRENCY,
         library_root,
         runs,
         // Progress goes somewhere no test reads. The tests that do read it
@@ -164,6 +172,7 @@ where
         video_tags,
         comic_tags,
         TEST_CONCURRENCY,
+        TEST_LOW_PRIORITY_CONCURRENCY,
         String::new(),
         runs,
         registry,
@@ -201,6 +210,7 @@ async fn given_valid_root_and_authenticated_when_start_then_returns_run_id() {
         .start(
             IndexRequest {
                 root: ROOT.to_string(),
+                priority: RunPriority::Normal,
             },
             TOKEN,
         )
@@ -231,6 +241,7 @@ async fn given_missing_root_when_start_then_invalid_input() {
         .start(
             IndexRequest {
                 root: "/nope".to_string(),
+                priority: RunPriority::Normal,
             },
             TOKEN,
         )
@@ -266,6 +277,7 @@ async fn given_unauthenticated_when_start_then_unauthorized() {
         .start(
             IndexRequest {
                 root: ROOT.to_string(),
+                priority: RunPriority::Normal,
             },
             "",
         )
@@ -389,7 +401,13 @@ async fn given_a_file_on_disk_when_indexed_then_its_size_and_mtime_are_recorded(
     );
 
     let IndexStarted { run_id } = handler
-        .start(IndexRequest { root: ROOT.into() }, TOKEN)
+        .start(
+            IndexRequest {
+                root: ROOT.into(),
+                priority: RunPriority::Normal,
+            },
+            TOKEN,
+        )
         .await
         .unwrap();
     handler.execute(ROOT, run_id).await.unwrap();
@@ -427,7 +445,13 @@ async fn given_a_file_when_indexed_then_no_content_hash_is_computed() {
     );
 
     let IndexStarted { run_id } = handler
-        .start(IndexRequest { root: ROOT.into() }, TOKEN)
+        .start(
+            IndexRequest {
+                root: ROOT.into(),
+                priority: RunPriority::Normal,
+            },
+            TOKEN,
+        )
         .await
         .unwrap();
     handler.execute(ROOT, run_id).await.unwrap();
@@ -487,6 +511,7 @@ async fn given_any_concurrency_when_execute_then_same_counts_and_same_catalog() 
             FakeVideoMetadataReader::new(),
             FakeComicMetadataReader::new(),
             concurrency,
+            TEST_LOW_PRIORITY_CONCURRENCY,
             String::new(),
             FakeCatalogRunRepository::new(),
             RunRegistry::new(),
@@ -534,6 +559,7 @@ async fn given_zero_concurrency_when_execute_then_runs_sequentially_rather_than_
         FakeVideoMetadataReader::new(),
         FakeComicMetadataReader::new(),
         0,
+        TEST_LOW_PRIORITY_CONCURRENCY,
         String::new(),
         FakeCatalogRunRepository::new(),
         RunRegistry::new(),
@@ -543,6 +569,50 @@ async fn given_zero_concurrency_when_execute_then_runs_sequentially_rather_than_
         .execute(ROOT, Uuid::new_v4())
         .await
         .expect("execute");
+
+    assert_eq!(outcome.indexed, 2);
+}
+
+/// Requirement D: zero is exactly as meaningless for the `Low` width as it is
+/// for the `Normal` one, and gets the same clamp. A run started at `Low`
+/// against a misconfigured `indexing.low_priority_concurrency = 0` must still
+/// make progress rather than hang on a stream buffered zero deep.
+#[tokio::test]
+async fn given_zero_low_priority_concurrency_when_a_low_priority_run_executes_then_runs_sequentially_rather_than_hanging(
+) {
+    let fs = FakeFilesystem::builder()
+        .with_file(ROOT, "/library/a.mp3", "a.mp3", "h-a")
+        .with_file(ROOT, "/library/b.mp3", "b.mp3", "h-b")
+        .build();
+    let runs = FakeCatalogRunRepository::new();
+    let handler = IndexHandler::new(
+        FakeAuth::Allowing,
+        FakeCatalogRepository::new(),
+        fs,
+        fixed_clock(now()),
+        FakeAudioMetadataReader::new(),
+        FakeImageMetadataReader::new(),
+        FakeDocumentMetadataReader::new(),
+        FakeVideoMetadataReader::new(),
+        FakeComicMetadataReader::new(),
+        TEST_CONCURRENCY,
+        0,
+        String::new(),
+        runs,
+        RunRegistry::new(),
+    );
+
+    let IndexStarted { run_id } = handler
+        .start(
+            IndexRequest {
+                root: ROOT.into(),
+                priority: RunPriority::Low,
+            },
+            TOKEN,
+        )
+        .await
+        .unwrap();
+    let outcome = handler.execute(ROOT, run_id).await.expect("execute");
 
     assert_eq!(outcome.indexed, 2);
 }
@@ -1797,6 +1867,7 @@ async fn start_bounded_with_runs(
         .start(
             IndexRequest {
                 root: requested.to_string(),
+                priority: RunPriority::Normal,
             },
             TOKEN,
         )
@@ -1925,7 +1996,15 @@ async fn given_empty_configured_library_root_when_start_then_any_root_accepted()
     );
 
     // Act
-    let started = handler.start(IndexRequest { root: requested }, TOKEN).await;
+    let started = handler
+        .start(
+            IndexRequest {
+                root: requested,
+                priority: RunPriority::Normal,
+            },
+            TOKEN,
+        )
+        .await;
 
     // Assert
     assert_ne!(started.expect("start").run_id, Uuid::nil());
@@ -1956,7 +2035,15 @@ async fn given_unresolvable_configured_library_root_when_start_then_invalid_inpu
     );
 
     // Act
-    let result = handler.start(IndexRequest { root: requested }, TOKEN).await;
+    let result = handler
+        .start(
+            IndexRequest {
+                root: requested,
+                priority: RunPriority::Normal,
+            },
+            TOKEN,
+        )
+        .await;
 
     // Assert
     assert!(matches!(result, Err(DomainError::InvalidInput(_))));
@@ -1985,6 +2072,7 @@ async fn given_a_started_index_when_started_then_the_run_is_recorded_running() {
         .start(
             IndexRequest {
                 root: ROOT.to_string(),
+                priority: RunPriority::Normal,
             },
             TOKEN,
         )
@@ -1995,6 +2083,81 @@ async fn given_a_started_index_when_started_then_the_run_is_recorded_running() {
     assert_eq!(recorded.kind, RunKind::Index);
     assert_eq!(recorded.status, RunStatus::Running);
     assert_eq!(recorded.root, Some(ROOT.to_string()));
+}
+
+/// The write side of run priority (FR-FC-08 / Task 9): a run started at `Low`
+/// records the low-priority width, not the normal one, on its own row. This
+/// is what makes `CatalogRunRepository::start`'s `concurrency` column
+/// something other than always-NULL.
+#[tokio::test]
+async fn given_a_low_priority_index_when_started_then_the_run_records_the_low_concurrency() {
+    let runs = FakeCatalogRunRepository::new();
+    let fs = FakeFilesystem::builder().with_root(ROOT).build();
+    let handler = handler(
+        FakeAuth::Allowing,
+        FakeCatalogRepository::new(),
+        fs,
+        fixed_clock(now()),
+        FakeAudioMetadataReader::new(),
+        FakeImageMetadataReader::new(),
+        FakeDocumentMetadataReader::new(),
+        FakeVideoMetadataReader::new(),
+        FakeComicMetadataReader::new(),
+        runs.clone(),
+    );
+
+    let IndexStarted { run_id } = handler
+        .start(
+            IndexRequest {
+                root: ROOT.into(),
+                priority: RunPriority::Low,
+            },
+            TOKEN,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        runs.get_recorded(run_id).unwrap().concurrency,
+        Some(TEST_LOW_PRIORITY_CONCURRENCY)
+    );
+}
+
+/// The `Normal` counterpart of the test above — pinned so a regression that
+/// swapped the two `match` arms in `IndexHandler::concurrency_for` would be
+/// caught by *some* test even if it happened to leave `Low` looking right.
+#[tokio::test]
+async fn given_a_normal_priority_index_when_started_then_the_run_records_the_normal_concurrency() {
+    let runs = FakeCatalogRunRepository::new();
+    let fs = FakeFilesystem::builder().with_root(ROOT).build();
+    let handler = handler(
+        FakeAuth::Allowing,
+        FakeCatalogRepository::new(),
+        fs,
+        fixed_clock(now()),
+        FakeAudioMetadataReader::new(),
+        FakeImageMetadataReader::new(),
+        FakeDocumentMetadataReader::new(),
+        FakeVideoMetadataReader::new(),
+        FakeComicMetadataReader::new(),
+        runs.clone(),
+    );
+
+    let IndexStarted { run_id } = handler
+        .start(
+            IndexRequest {
+                root: ROOT.into(),
+                priority: RunPriority::Normal,
+            },
+            TOKEN,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        runs.get_recorded(run_id).unwrap().concurrency,
+        Some(TEST_CONCURRENCY)
+    );
 }
 
 #[tokio::test]
@@ -2024,6 +2187,7 @@ async fn given_an_index_that_walks_when_executed_then_the_run_is_recorded_comple
         .start(
             IndexRequest {
                 root: ROOT.to_string(),
+                priority: RunPriority::Normal,
             },
             TOKEN,
         )
@@ -2071,6 +2235,7 @@ async fn given_a_root_that_cannot_be_listed_when_executed_then_the_run_is_record
         .start(
             IndexRequest {
                 root: ROOT.to_string(),
+                priority: RunPriority::Normal,
             },
             TOKEN,
         )
@@ -2123,6 +2288,7 @@ async fn given_files_that_individually_fail_when_executed_then_the_run_is_comple
         .start(
             IndexRequest {
                 root: ROOT.to_string(),
+                priority: RunPriority::Normal,
             },
             TOKEN,
         )
@@ -2181,6 +2347,46 @@ async fn given_run_completion_cannot_be_recorded_when_executed_then_the_outcome_
     assert_eq!(outcome.failed, 0);
 }
 
+/// Requirement A's sharp edge: `execute` now opens with a `get` to read the
+/// run's stored concurrency (Task 9), so a transient failure of that one read
+/// must not be allowed to sink a walk that could perfectly well run at the
+/// configured default — that would be a correctness regression caused by a
+/// performance knob. `IndexHandler::execute` shares this path with
+/// `RefreshHandler::execute`
+/// (`given_the_run_lookup_fails_when_executed_then_the_walk_still_completes_at_the_default_concurrency`
+/// in `refresh.rs`); both get a direct test for the same reason the
+/// finish-fails case above does.
+#[tokio::test]
+async fn given_the_run_lookup_fails_when_executed_then_the_walk_still_completes_at_the_default_concurrency(
+) {
+    let fs = FakeFilesystem::builder()
+        .with_file(ROOT, "/library/a.mp3", "a.mp3", "h-a")
+        .with_file(ROOT, "/library/b.md", "b.md", "h-b")
+        .build();
+    let handler = handler(
+        FakeAuth::Allowing,
+        FakeCatalogRepository::new(),
+        fs,
+        fixed_clock(now()),
+        FakeAudioMetadataReader::new(),
+        FakeImageMetadataReader::new(),
+        FakeDocumentMetadataReader::new(),
+        FakeVideoMetadataReader::new(),
+        FakeComicMetadataReader::new(),
+        FailingCatalogRunRepository::GetFails,
+    );
+
+    let outcome = handler
+        .execute(ROOT, Uuid::new_v4())
+        .await
+        .expect("a failed concurrency lookup must not fail the walk");
+
+    assert_eq!(outcome.scanned, 2);
+    assert_eq!(outcome.indexed, 2);
+    assert_eq!(outcome.skipped, 0);
+    assert_eq!(outcome.failed, 0);
+}
+
 #[tokio::test]
 async fn given_a_cataloged_file_and_an_unsupported_one_when_indexed_then_the_two_are_counted_apart()
 {
@@ -2205,13 +2411,25 @@ async fn given_a_cataloged_file_and_an_unsupported_one_when_indexed_then_the_two
     // Index once so song.txt is already cataloged, then again over the same
     // root — which is exactly what resume does.
     let IndexStarted { run_id } = handler
-        .start(IndexRequest { root: ROOT.into() }, TOKEN)
+        .start(
+            IndexRequest {
+                root: ROOT.into(),
+                priority: RunPriority::Normal,
+            },
+            TOKEN,
+        )
         .await
         .unwrap();
     handler.execute(ROOT, run_id).await.unwrap();
 
     let IndexStarted { run_id } = handler
-        .start(IndexRequest { root: ROOT.into() }, TOKEN)
+        .start(
+            IndexRequest {
+                root: ROOT.into(),
+                priority: RunPriority::Normal,
+            },
+            TOKEN,
+        )
         .await
         .unwrap();
     let outcome = handler.execute(ROOT, run_id).await.unwrap();
@@ -2251,7 +2469,7 @@ async fn given_a_completed_index_when_execute_then_the_final_progress_is_flushed
         registry.clone(),
     );
     let run_id = Uuid::new_v4();
-    runs.start(run_id, RunKind::Index, Some(ROOT), now())
+    runs.start(run_id, RunKind::Index, Some(ROOT), now(), TEST_CONCURRENCY)
         .await
         .unwrap();
 
@@ -2300,7 +2518,7 @@ async fn given_a_progress_flush_that_fails_when_execute_then_the_run_still_compl
         runs.clone(),
     );
     let run_id = Uuid::new_v4();
-    runs.start(run_id, RunKind::Index, Some(ROOT), now())
+    runs.start(run_id, RunKind::Index, Some(ROOT), now(), TEST_CONCURRENCY)
         .await
         .unwrap();
 
@@ -2338,7 +2556,7 @@ async fn given_a_run_that_cannot_list_its_root_when_execute_then_the_cell_is_clo
         registry.clone(),
     );
     let run_id = Uuid::new_v4();
-    runs.start(run_id, RunKind::Index, Some(ROOT), now())
+    runs.start(run_id, RunKind::Index, Some(ROOT), now(), TEST_CONCURRENCY)
         .await
         .unwrap();
 
@@ -2385,7 +2603,7 @@ async fn given_a_walk_longer_than_the_flush_interval_when_execute_then_intermedi
         runs.clone(),
     );
     let run_id = Uuid::new_v4();
-    runs.start(run_id, RunKind::Index, Some(ROOT), now())
+    runs.start(run_id, RunKind::Index, Some(ROOT), now(), TEST_CONCURRENCY)
         .await
         .unwrap();
 
@@ -2496,7 +2714,7 @@ async fn given_an_index_walk_in_flight_when_paused_then_it_stops_with_entries_un
     let registry = RunRegistry::new();
     let catalog = FakeCatalogRepository::new();
     let run_id = Uuid::new_v4();
-    runs.start(run_id, RunKind::Index, Some(ROOT), now())
+    runs.start(run_id, RunKind::Index, Some(ROOT), now(), TEST_CONCURRENCY)
         .await
         .unwrap();
     let pause_mid_walk = control_interrupt(
@@ -2576,7 +2794,7 @@ async fn given_an_index_walk_in_flight_when_cancelled_then_it_stops_and_is_termi
     let runs = FakeCatalogRunRepository::new();
     let registry = RunRegistry::new();
     let run_id = Uuid::new_v4();
-    runs.start(run_id, RunKind::Index, Some(ROOT), now())
+    runs.start(run_id, RunKind::Index, Some(ROOT), now(), TEST_CONCURRENCY)
         .await
         .unwrap();
     let cancel_mid_walk = control_interrupt(
@@ -2642,7 +2860,7 @@ async fn given_a_run_paused_during_discovery_when_execute_then_no_entry_is_proce
     let registry = RunRegistry::new();
     let catalog = FakeCatalogRepository::new();
     let run_id = Uuid::new_v4();
-    runs.start(run_id, RunKind::Index, Some(ROOT), now())
+    runs.start(run_id, RunKind::Index, Some(ROOT), now(), TEST_CONCURRENCY)
         .await
         .unwrap();
     let pause_during_discovery = control_interrupt(
@@ -2702,7 +2920,7 @@ async fn given_a_paused_index_run_when_resumed_then_it_re_walks_and_finishes_the
     let registry = RunRegistry::new();
     let catalog = FakeCatalogRepository::new();
     let run_id = Uuid::new_v4();
-    runs.start(run_id, RunKind::Index, Some(ROOT), now())
+    runs.start(run_id, RunKind::Index, Some(ROOT), now(), TEST_CONCURRENCY)
         .await
         .unwrap();
     let pause_mid_walk = control_interrupt(
@@ -2811,5 +3029,80 @@ async fn given_a_paused_index_run_when_resumed_then_it_re_walks_and_finishes_the
         }),
         "the recorded tally describes the segment that finished, which is what \
          decision 9 of the design says it should"
+    );
+}
+
+/// The test the column exists for: a resumed run's second segment walks at
+/// the width it was *started* with, not at whatever `IndexHandler` itself was
+/// built with. `resumed_at_concurrency` (2) is deliberately distinct from
+/// both [`TEST_CONCURRENCY`] (4, what the second segment's handler is built
+/// with) and [`TEST_LOW_PRIORITY_CONCURRENCY`] (1), so the assertion below
+/// cannot pass by any width coinciding with another by accident.
+///
+/// Unlike the outcome tallies (`given_any_concurrency_when_execute_...`),
+/// which are identical at every width and so cannot distinguish "used the
+/// stored value" from "used the field", this reads the actual number of
+/// `read` calls a `ConcurrencyTrackingAudioMetadataReader` ever saw in
+/// flight together — the one observable that does depend on which width
+/// `buffer_unordered` was actually built with.
+#[tokio::test]
+async fn given_a_resumed_run_when_executed_then_it_walks_at_the_width_it_was_started_at() {
+    const RESUMED_AT_CONCURRENCY: u32 = 2;
+
+    let runs = FakeCatalogRunRepository::new();
+    let registry = RunRegistry::new();
+    let catalog = FakeCatalogRepository::new();
+    let run_id = Uuid::new_v4();
+    // Started directly against the repository at a width distinct from the
+    // second segment's handler field, standing in for a run `IndexHandler`
+    // itself started at `RunPriority::Low` some time before this process —
+    // `start`'s own write is covered separately by
+    // `given_a_low_priority_index_when_started_then_the_run_records_the_low_concurrency`.
+    runs.start(
+        run_id,
+        RunKind::Index,
+        Some(ROOT),
+        now(),
+        RESUMED_AT_CONCURRENCY,
+    )
+    .await
+    .unwrap();
+    assert!(runs.pause(run_id, now()).await.expect("pause"));
+
+    let resumed = control_handler(runs.clone(), registry.clone())
+        .resume(run_id, TOKEN)
+        .await
+        .expect("resume");
+    assert_eq!(
+        resumed.concurrency, RESUMED_AT_CONCURRENCY,
+        "sanity check: the row's own width, not the control handler's fallback"
+    );
+
+    let probe = ConcurrencyTrackingAudioMetadataReader::new();
+    let second_segment = handler_with_registry(
+        FakeAuth::Allowing,
+        catalog,
+        audio_library(),
+        fixed_clock(now()),
+        probe.clone(),
+        FakeImageMetadataReader::new(),
+        FakeDocumentMetadataReader::new(),
+        FakeVideoMetadataReader::new(),
+        FakeComicMetadataReader::new(),
+        runs.clone(),
+        registry,
+    );
+
+    second_segment
+        .execute(ROOT, run_id)
+        .await
+        .expect("second segment");
+
+    assert_eq!(
+        probe.max_seen() as u32,
+        RESUMED_AT_CONCURRENCY,
+        "the walk must run at the width the run was started at ({RESUMED_AT_CONCURRENCY}), \
+         not at the handler's own configured concurrency ({TEST_CONCURRENCY}) — that is what \
+         proves execute() reads the stored column rather than falling back to its field"
     );
 }

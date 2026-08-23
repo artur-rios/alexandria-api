@@ -399,8 +399,11 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
     let video_tags = FfmpegVideoMetadataReader;
     let comic_tags = CbzComicMetadataReader;
     // UC-01 and UC-02 are the same hash-every-file workload, so both walks
-    // take the same `indexing.concurrency` bound.
+    // take the same `indexing.concurrency` bound, and the same
+    // `indexing.low_priority_concurrency` bound for a `RunPriority::Low` run
+    // (FR-FC-08).
     let indexing_concurrency = settings.indexing.concurrency;
+    let indexing_low_priority_concurrency = settings.indexing.low_priority_concurrency;
     // FR-FC-26: `filesystem.root` bounds which trees UC-01 will index. It is
     // logged here, once per process, because this is the single startup path
     // both transports go through — the HTTP binary and `alexandria_index_init`
@@ -434,6 +437,7 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         video_tags,
         comic_tags,
         indexing_concurrency,
+        indexing_low_priority_concurrency,
         settings.filesystem.root.clone(),
         run_repo.clone(),
         run_registry.clone(),
@@ -444,6 +448,7 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         fs,
         clock,
         indexing_concurrency,
+        indexing_low_priority_concurrency,
         run_repo.clone(),
         run_registry.clone(),
     ));

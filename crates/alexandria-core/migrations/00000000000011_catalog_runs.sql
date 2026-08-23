@@ -24,10 +24,12 @@
 --
 -- `concurrency` records how many entries the run was processing at a time, so
 -- a resumed run continues at the width it was started with rather than at
--- whatever the configuration happens to say later. Nothing writes it yet —
--- pause/resume does. It is declared here rather than in a later migration
--- because this baseline file is amended in place, never stacked, so the
--- table's shape is settled in one edit.
+-- whatever the configuration happens to say later. Written by `start()` from
+-- the caller's chosen run priority (`RunPriority`, FR-FC-08); NULL only for a
+-- run started before run priority existed, and a resume of one of those falls
+-- back to the configured default. It is declared here rather than in a later
+-- migration because this baseline file is amended in place, never stacked, so
+-- the table's shape is settled in one edit.
 CREATE TABLE IF NOT EXISTS catalog_runs (
     id              TEXT PRIMARY KEY,
     kind            TEXT    NOT NULL,

@@ -412,6 +412,9 @@ async fn build(
         FfmpegVideoMetadataReader,
         CbzComicMetadataReader,
         concurrency,
+        // Low-priority width is not exercised by these throughput
+        // benchmarks — every call here builds and runs a `Normal` handler.
+        1,
         String::new(),
         run_repo,
         RunRegistry::new(),

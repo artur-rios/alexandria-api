@@ -282,16 +282,29 @@ pub struct IndexingSettings {
     /// buy nothing. Zero is clamped to 1 (sequential) by the handlers.
     #[serde(default = "default_indexing_concurrency")]
     pub concurrency: u32,
+    /// How many files a `Low`-priority run (`RunPriority::Low`, FR-FC-08)
+    /// processes at a time. A large scan started at low priority is meant to
+    /// stay out of the way of browsing and playback rather than to finish
+    /// fast, so the default is the narrowest useful width — sequential is 1,
+    /// not 0, for the reason `concurrency` itself is never let land there.
+    /// Zero is clamped to 1 by the handlers, exactly as `concurrency` is.
+    #[serde(default = "default_indexing_low_priority_concurrency")]
+    pub low_priority_concurrency: u32,
 }
 
 fn default_indexing_concurrency() -> u32 {
     4
 }
 
+fn default_indexing_low_priority_concurrency() -> u32 {
+    1
+}
+
 impl Default for IndexingSettings {
     fn default() -> Self {
         Self {
             concurrency: default_indexing_concurrency(),
+            low_priority_concurrency: default_indexing_low_priority_concurrency(),
         }
     }
 }
@@ -461,6 +474,11 @@ impl Settings {
         if let Ok(concurrency) = env::var("ALEXANDRIA_INDEXING_CONCURRENCY") {
             if let Ok(parsed) = concurrency.parse::<u32>() {
                 self.indexing.concurrency = parsed;
+            }
+        }
+        if let Ok(concurrency) = env::var("ALEXANDRIA_INDEXING_LOW_PRIORITY_CONCURRENCY") {
+            if let Ok(parsed) = concurrency.parse::<u32>() {
+                self.indexing.low_priority_concurrency = parsed;
             }
         }
         if let Ok(days) = env::var("ALEXANDRIA_DELETION_RETENTION_DAYS") {

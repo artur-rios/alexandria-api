@@ -1,11 +1,33 @@
 use chrono::{DateTime, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sqlx::sqlite::SqlitePool;
 use sqlx::Row;
 use uuid::Uuid;
 
 use crate::catalog::run_registry::{RunPhase, RunProgress};
 use crate::errors::DomainError;
+
+/// How hard a run should push (FR-FC-08). Semantic rather than a raw thread
+/// count on purpose: a client starting a big scan should not have to invent a
+/// number that happens to be "small," it should be able to say what it wants
+/// — keep this out of the way of browsing and playback — and let the server
+/// decide what number that means today. `Low` maps to
+/// `indexing.low_priority_concurrency` (default 1), `Normal` to the existing
+/// `indexing.concurrency` (default 4); which config key a priority means is
+/// the handlers' business, not this type's.
+///
+/// Chosen once, at `start`, and stored on the run's `concurrency` column
+/// (`CatalogRun::concurrency`) — not a live slider. `buffer_unordered` fixes
+/// its width when the stream is built, so changing your mind mid-run costs a
+/// pause and a resume, and a resumed run reuses the width it was started
+/// with rather than picking a fresh one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum RunPriority {
+    #[default]
+    Normal,
+    Low,
+}
 
 /// Which command produced a run (FR-FC-27). The two share a lifecycle but not
 /// their tallies, which is why `RunCounts` is per-kind.
@@ -163,11 +185,15 @@ pub struct CatalogRun {
     /// continues at the width it was started with rather than at whatever the
     /// configuration happens to say later.
     ///
-    /// `None` for every run so far — nothing writes the column until run
-    /// priority exists, and a resume then falls back to the configured
-    /// default. Not serialized, for the reason `paused_millis` is not: the
-    /// run body is what a client draws a progress bar from, and this is an
-    /// input to how the run is spawned, not a fact about its progress.
+    /// Written by `start`, from the `RunPriority` the caller chose (`Normal`
+    /// maps to `indexing.concurrency`, `Low` to
+    /// `indexing.low_priority_concurrency`) — see `RunPriority`. `None` only
+    /// for a run started before run priority existed; a resume of one of
+    /// those falls back to the configured default (`RunControlHandler`'s
+    /// `default_concurrency`). Not serialized, for the reason `paused_millis`
+    /// is not: the run body is what a client draws a progress bar from, and
+    /// this is an input to how the run is spawned, not a fact about its
+    /// progress.
     #[serde(skip)]
     pub concurrency: Option<u32>,
 }
@@ -179,12 +205,17 @@ pub trait CatalogRunRepository: Send + Sync {
     /// Open a run's record as `running` (FR-FC-27). Called by `start()`
     /// before it returns the id it minted, so a started run is always a
     /// recorded run.
+    ///
+    /// `concurrency` is the width the caller's `RunPriority` resolved to —
+    /// see `CatalogRun::concurrency` — recorded here so a resume can reuse it
+    /// instead of falling back to whatever the configuration says later.
     async fn start(
         &self,
         id: Uuid,
         kind: RunKind,
         root: Option<&str>,
         started_at: DateTime<Utc>,
+        concurrency: u32,
     ) -> Result<(), DomainError>;
 
     /// Close a run's record as `complete` with its tally. Per-file failures
@@ -548,16 +579,20 @@ impl CatalogRunRepository for SqliteCatalogRunRepository {
         kind: RunKind,
         root: Option<&str>,
         started_at: DateTime<Utc>,
+        concurrency: u32,
     ) -> Result<(), DomainError> {
         sqlx::query(
-            "INSERT INTO catalog_runs (id, kind, status, root, started_at) \
-             VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO catalog_runs (id, kind, status, root, started_at, concurrency) \
+             VALUES (?, ?, ?, ?, ?, ?)",
         )
         .bind(id.to_string())
         .bind(kind.as_str())
         .bind(RunStatus::Running.as_str())
         .bind(root)
         .bind(started_at.to_rfc3339())
+        // Narrowed to i64 for the column; the reverse narrowing happens in
+        // `get`, which is safe for the reason documented there.
+        .bind(concurrency as i64)
         .execute(&self.pool)
         .await?;
         Ok(())

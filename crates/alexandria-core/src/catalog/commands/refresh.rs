@@ -10,7 +10,7 @@ use crate::catalog::fs::Filesystem;
 use crate::catalog::model::File;
 use crate::catalog::repos::CatalogRepository;
 use crate::catalog::run_registry::{RunCell, RunPhase, RunRegistry, RunSignal};
-use crate::catalog::runs::{CatalogRunRepository, RunCounts, RunKind};
+use crate::catalog::runs::{CatalogRunRepository, RunCounts, RunKind, RunPriority};
 use crate::errors::DomainError;
 use crate::retry::{retry_on_busy, BUSY_ATTEMPTS};
 
@@ -56,9 +56,13 @@ pub struct RefreshOutcome {
 /// bytes to compute one.
 ///
 /// Like `IndexHandler`, `execute` processes up to `concurrency` cataloged
-/// paths at a time (`indexing.concurrency`, the same setting — a re-index is
-/// the same one-stat-per-file workload as an index, so splitting the two
-/// knobs would only invite them to disagree).
+/// paths at a time, where `concurrency` is the width the run's own
+/// `RunPriority` resolved to at `start` — `indexing.concurrency` /
+/// `indexing.low_priority_concurrency`, the same two settings `IndexHandler`
+/// uses (a re-index is the same one-stat-per-file workload as an index, so
+/// splitting the knobs per command would only invite them to disagree), read
+/// back from the run's stored `concurrency` column exactly as
+/// `IndexHandler::execute` does.
 ///
 /// Generic over collaborators so the decision logic is unit-tested against
 /// trait fakes with no real DB / filesystem / auth service (Testing Spec §6.2).
@@ -68,6 +72,10 @@ pub struct RefreshHandler<A, R, F, C, RR> {
     fs: F,
     clock: C,
     concurrency: usize,
+    /// The width a `RunPriority::Low` run refreshes at
+    /// (`indexing.low_priority_concurrency`). See `concurrency` for the
+    /// `Normal` counterpart and the zero clamp both share.
+    low_priority_concurrency: usize,
     runs: RR,
     /// Where `execute` publishes this run's live progress (FR-FC-28). Shared
     /// with `GetRunStatusHandler`, which reads it back.
@@ -83,13 +91,17 @@ where
     RR: CatalogRunRepository,
 {
     /// `concurrency` is how many cataloged paths `execute` refreshes at a
-    /// time; zero is clamped to 1, as in `IndexHandler::new`.
+    /// time for a `RunPriority::Normal` run; `low_priority_concurrency` is
+    /// the same for `RunPriority::Low`. Zero is clamped to 1 for either, as
+    /// in `IndexHandler::new`.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         auth: A,
         repo: R,
         fs: F,
         clock: C,
         concurrency: u32,
+        low_priority_concurrency: u32,
         runs: RR,
         registry: RunRegistry,
     ) -> Self {
@@ -99,8 +111,18 @@ where
             fs,
             clock,
             concurrency: concurrency.max(1) as usize,
+            low_priority_concurrency: low_priority_concurrency.max(1) as usize,
             runs,
             registry,
+        }
+    }
+
+    /// The width a run at `priority` should be walked at. See
+    /// `IndexHandler::concurrency_for`, which this mirrors.
+    fn concurrency_for(&self, priority: RunPriority) -> usize {
+        match priority {
+            RunPriority::Normal => self.concurrency,
+            RunPriority::Low => self.low_priority_concurrency,
         }
     }
 
@@ -112,12 +134,18 @@ where
     /// Unlike `finish`/`fail`, this write's failure is not swallowed after
     /// retrying: if the record cannot be opened at all, the caller must not
     /// receive a run id it can never query.
-    pub async fn start(&self, token: &str) -> Result<RefreshStarted, DomainError> {
+    pub async fn start(
+        &self,
+        priority: RunPriority,
+        token: &str,
+    ) -> Result<RefreshStarted, DomainError> {
         self.auth.authenticate(token).await?;
         let run_id = Uuid::new_v4();
         let started_at = self.clock.now();
+        let concurrency = self.concurrency_for(priority) as u32;
         retry_on_busy(BUSY_ATTEMPTS, || {
-            self.runs.start(run_id, RunKind::Refresh, None, started_at)
+            self.runs
+                .start(run_id, RunKind::Refresh, None, started_at, concurrency)
         })
         .await?;
         Ok(RefreshStarted { run_id })
@@ -136,6 +164,28 @@ where
     /// rest of the catalog. Only a failure to list the catalog at all aborts.
     pub async fn execute(&self, run_id: Uuid) -> Result<RefreshOutcome, DomainError> {
         let now = self.clock.now();
+        // Read from the run's own row, not a field — see
+        // `IndexHandler::execute`'s comment on the same read, which explains
+        // why (a resumed run reusing the width it was started with), what it
+        // costs (one extra SELECT per run), and why a failed read (unlike an
+        // absent row) is worth a `warn` — it must still fall back rather than
+        // abort a walk that could perfectly well run at the default width.
+        let concurrency = match self.runs.get(run_id).await {
+            Ok(Some(run)) => run
+                .concurrency
+                .map(|c| c.max(1) as usize)
+                .unwrap_or(self.concurrency),
+            Ok(None) => self.concurrency,
+            Err(err) => {
+                tracing::warn!(
+                    %run_id,
+                    error = %err,
+                    "could not read the run's configured concurrency; falling back to \
+                     indexing.concurrency"
+                );
+                self.concurrency
+            }
+        };
         // FR-FC-28: a refresh's discovery is `list_all` rather than a
         // filesystem walk, but it is the same shape — a phase with no
         // denominator, then a phase with one — so it gets the same treatment.
@@ -229,7 +279,7 @@ where
                     }
                 }
             })
-            .buffer_unordered(self.concurrency)
+            .buffer_unordered(concurrency)
             .fold(
                 RefreshTally::new(loop_started),
                 |mut tally, outcome| async move {

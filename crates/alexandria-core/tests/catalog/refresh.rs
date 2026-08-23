@@ -9,7 +9,9 @@ use alexandria_core::catalog::commands::run_control::RunControlHandler;
 use alexandria_core::catalog::fs::Filesystem;
 use alexandria_core::catalog::repos::CatalogRepository;
 use alexandria_core::catalog::run_registry::{RunPhase, RunRegistry};
-use alexandria_core::catalog::runs::{CatalogRunRepository, RunCounts, RunKind, RunStatus};
+use alexandria_core::catalog::runs::{
+    CatalogRunRepository, RunCounts, RunKind, RunPriority, RunStatus,
+};
 use alexandria_core::errors::DomainError;
 
 use crate::common::{
@@ -23,6 +25,10 @@ const TOKEN: &str = "bearer-token";
 /// Deliberately > 1 so these tests exercise the concurrent walk — the outcome
 /// tallies must not depend on how many paths are in flight.
 const TEST_CONCURRENCY: u32 = 4;
+
+/// The low-priority width these unit tests build handlers with. Deliberately
+/// distinct from [`TEST_CONCURRENCY`], mirroring `tests/catalog/index.rs`.
+const TEST_LOW_PRIORITY_CONCURRENCY: u32 = 1;
 
 fn refresh_handler<A, R, F, C, RR>(
     auth: A,
@@ -44,6 +50,7 @@ where
         fs,
         clock,
         TEST_CONCURRENCY,
+        TEST_LOW_PRIORITY_CONCURRENCY,
         runs,
         // Progress goes somewhere no test reads; the ones that do read it
         // build the handler with their own registry.
@@ -62,7 +69,10 @@ async fn given_authenticated_when_refresh_start_then_returns_run_id() {
         FakeCatalogRunRepository::new(),
     );
 
-    let started: RefreshStarted = handler.start(TOKEN).await.expect("start");
+    let started: RefreshStarted = handler
+        .start(RunPriority::Normal, TOKEN)
+        .await
+        .expect("start");
     assert_ne!(started.run_id, Uuid::nil());
 }
 
@@ -77,7 +87,7 @@ async fn given_unauthenticated_when_refresh_start_then_unauthorized() {
         FakeCatalogRunRepository::new(),
     );
 
-    let result = handler.start("").await;
+    let result = handler.start(RunPriority::Normal, "").await;
     assert!(matches!(result, Err(DomainError::Unauthorized)));
 }
 
@@ -419,6 +429,7 @@ async fn given_any_concurrency_when_execute_then_same_outcome_tallies() {
             fs,
             fixed_clock(now()),
             concurrency,
+            TEST_LOW_PRIORITY_CONCURRENCY,
             FakeCatalogRunRepository::new(),
             RunRegistry::new(),
         );
@@ -452,6 +463,7 @@ async fn given_zero_concurrency_when_execute_then_runs_sequentially_rather_than_
         fs,
         fixed_clock(now()),
         0,
+        TEST_LOW_PRIORITY_CONCURRENCY,
         FakeCatalogRunRepository::new(),
         RunRegistry::new(),
     );
@@ -554,7 +566,10 @@ async fn given_a_started_refresh_when_started_then_the_run_is_recorded_running()
         runs.clone(),
     );
 
-    let started = handler.start(TOKEN).await.expect("start");
+    let started = handler
+        .start(RunPriority::Normal, TOKEN)
+        .await
+        .expect("start");
 
     let recorded = runs.get_recorded(started.run_id).expect("run recorded");
     assert_eq!(recorded.kind, RunKind::Refresh);
@@ -586,7 +601,10 @@ async fn given_a_refresh_that_walks_when_executed_then_the_run_is_recorded_compl
         runs.clone(),
     );
 
-    let started = handler.start(TOKEN).await.expect("start");
+    let started = handler
+        .start(RunPriority::Normal, TOKEN)
+        .await
+        .expect("start");
     let outcome = handler.execute(started.run_id).await.expect("execute");
 
     let recorded = runs.get_recorded(started.run_id).expect("run recorded");
@@ -616,7 +634,10 @@ async fn given_a_catalog_that_cannot_be_listed_when_executed_then_the_run_is_rec
         runs.clone(),
     );
 
-    let started = handler.start(TOKEN).await.expect("start");
+    let started = handler
+        .start(RunPriority::Normal, TOKEN)
+        .await
+        .expect("start");
     let err = handler
         .execute(started.run_id)
         .await
@@ -669,6 +690,44 @@ async fn given_run_completion_cannot_be_recorded_when_executed_then_the_outcome_
     assert_eq!(outcome.failed, 0);
 }
 
+/// The `refresh.rs` half of requirement A's failure case — see
+/// `given_the_run_lookup_fails_when_executed_then_the_walk_still_completes_at_the_default_concurrency`
+/// in `index.rs` for the full reasoning. `execute` now opens with a `get` to
+/// read the run's stored concurrency (Task 9); a transient failure of that
+/// read must not sink an otherwise-successful walk.
+#[tokio::test]
+async fn given_the_run_lookup_fails_when_executed_then_the_walk_still_completes_at_the_default_concurrency(
+) {
+    let repo = FakeCatalogRepository::new();
+    repo.seed(a_cataloged_file_with_hash(
+        "/library/a.mp3",
+        4096,
+        Some(now()),
+        "old-hash",
+    ));
+    let fs = FakeFilesystem::builder()
+        .with_file("/lib", "/library/a.mp3", "a.mp3", "unused")
+        .with_stat("/library/a.mp3", 8192, Some(now()))
+        .build();
+    let handler = refresh_handler(
+        FakeAuth::Allowing,
+        repo,
+        fs,
+        fixed_clock(now()),
+        FailingCatalogRunRepository::GetFails,
+    );
+
+    let outcome = handler
+        .execute(Uuid::new_v4())
+        .await
+        .expect("a failed concurrency lookup must not fail the walk");
+
+    assert_eq!(outcome.refreshed, 1);
+    assert_eq!(outcome.marked_missing, 0);
+    assert_eq!(outcome.unchanged, 0);
+    assert_eq!(outcome.failed, 0);
+}
+
 #[tokio::test]
 async fn given_run_cannot_be_started_when_start_then_the_error_propagates() {
     // FR-FC-27: the opposite ruling from the finish/fail case above. A caller
@@ -684,7 +743,7 @@ async fn given_run_cannot_be_started_when_start_then_the_error_propagates() {
         FailingCatalogRunRepository::StartFails,
     );
 
-    let result = handler.start(TOKEN).await;
+    let result = handler.start(RunPriority::Normal, TOKEN).await;
 
     assert!(
         result.is_err(),
@@ -713,11 +772,12 @@ async fn given_a_completed_refresh_when_execute_then_the_final_progress_is_flush
         fs,
         fixed_clock(now()),
         TEST_CONCURRENCY,
+        TEST_LOW_PRIORITY_CONCURRENCY,
         runs.clone(),
         registry.clone(),
     );
     let run_id = Uuid::new_v4();
-    runs.start(run_id, RunKind::Refresh, None, now())
+    runs.start(run_id, RunKind::Refresh, None, now(), TEST_CONCURRENCY)
         .await
         .unwrap();
 
@@ -754,7 +814,7 @@ async fn given_a_progress_flush_that_fails_when_execute_then_the_refresh_still_c
         runs.clone(),
     );
     let run_id = Uuid::new_v4();
-    runs.start(run_id, RunKind::Refresh, None, now())
+    runs.start(run_id, RunKind::Refresh, None, now(), TEST_CONCURRENCY)
         .await
         .unwrap();
 
@@ -789,7 +849,7 @@ async fn given_a_refresh_walk_in_flight_when_paused_then_it_stops_with_paths_unp
     let runs = FakeCatalogRunRepository::new();
     let registry = RunRegistry::new();
     let run_id = Uuid::new_v4();
-    runs.start(run_id, RunKind::Refresh, None, now())
+    runs.start(run_id, RunKind::Refresh, None, now(), TEST_CONCURRENCY)
         .await
         .unwrap();
     let control = Arc::new(RunControlHandler::new(
@@ -813,6 +873,7 @@ async fn given_a_refresh_walk_in_flight_when_paused_then_it_stops_with_paths_unp
         ),
         fixed_clock(now()),
         TEST_CONCURRENCY,
+        TEST_LOW_PRIORITY_CONCURRENCY,
         runs.clone(),
         registry.clone(),
     );

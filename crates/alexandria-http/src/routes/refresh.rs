@@ -3,6 +3,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
 
 use alexandria_core::catalog::commands::refresh::RefreshStarted;
+use alexandria_core::catalog::runs::RunPriority;
 
 use crate::middleware::error::ApiError;
 use crate::routes::bearer_token;
@@ -17,10 +18,13 @@ pub async fn refresh(
 ) -> Result<(StatusCode, Json<RefreshStarted>), ApiError> {
     let token = bearer_token(&headers);
 
+    // No body carries a priority yet — that is a later task's wire change.
+    // Every run started from this surface today is `Normal`, matching the
+    // behaviour before run priority existed.
     let started = state
         .services
         .refresh_handler
-        .start(&token)
+        .start(RunPriority::Normal, &token)
         .await
         .map_err(ApiError)?;
 

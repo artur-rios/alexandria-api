@@ -24,7 +24,7 @@ use alexandria_core::catalog::fs::StdFilesystem;
 use alexandria_core::catalog::model::{FileType, NewFile};
 use alexandria_core::catalog::repos::{CatalogRepository, SqliteCatalogRepository};
 use alexandria_core::catalog::run_registry::RunRegistry;
-use alexandria_core::catalog::runs::SqliteCatalogRunRepository;
+use alexandria_core::catalog::runs::{RunPriority, SqliteCatalogRunRepository};
 use alexandria_core::migrate::run_migrations;
 use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
 use uuid::Uuid;
@@ -97,10 +97,14 @@ async fn given_a_just_edited_text_file_when_refreshed_then_it_is_unchanged_and_i
         StdFilesystem,
         SystemClock,
         1,
+        1,
         runs,
         RunRegistry::new(),
     );
-    let started = refresher.start(TOKEN).await.expect("start");
+    let started = refresher
+        .start(RunPriority::Normal, TOKEN)
+        .await
+        .expect("start");
     let outcome = refresher.execute(started.run_id).await.expect("execute");
 
     // Assert: the edit's own post-write stat already matches what re-index

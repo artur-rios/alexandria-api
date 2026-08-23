@@ -15,7 +15,7 @@ use crate::catalog::image_tags::ImageMetadataReader;
 use crate::catalog::model::{FileType, NewFile};
 use crate::catalog::repos::CatalogRepository;
 use crate::catalog::run_registry::{RunCell, RunPhase, RunRegistry, RunSignal};
-use crate::catalog::runs::{CatalogRunRepository, RunCounts, RunKind};
+use crate::catalog::runs::{CatalogRunRepository, RunCounts, RunKind, RunPriority};
 use crate::catalog::video_tags::VideoMetadataReader;
 use crate::errors::DomainError;
 use crate::retry::{retry_on_busy, BUSY_ATTEMPTS};
@@ -23,6 +23,8 @@ use crate::retry::{retry_on_busy, BUSY_ATTEMPTS};
 #[derive(Debug, Clone)]
 pub struct IndexRequest {
     pub root: String,
+    /// How hard this run should push (FR-FC-08). See `RunPriority`.
+    pub priority: RunPriority,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -60,17 +62,21 @@ pub struct IndexOutcome {
 /// `execute` in the background (FR-FC-08) while `start` returns `202` right
 /// away.
 ///
-/// `execute` processes up to `concurrency` files at a time (configurable via
-/// `indexing.concurrency`, default 4). The per-file work is dominated by
-/// hashing the bytes, which `StdFilesystem` runs on Tokio's blocking pool, so
-/// the concurrency buys real parallelism rather than interleaved waiting —
-/// that is what NFR-02's throughput target rests on. It is bounded rather
-/// than unlimited because an unbounded fan-out over a large library would
-/// queue one blocking task per file and starve every other user of the
-/// blocking pool. Note that the *database* half of each file's work still
-/// serializes: SQLite admits one writer at a time, and the pool caps
-/// connections at 8, so raising `concurrency` past that only lengthens the
-/// queue in front of the writer.
+/// `execute` processes up to `concurrency` files at a time, where
+/// `concurrency` is the width the run's own `RunPriority` resolved to at
+/// `start` (`indexing.concurrency` default 4 for `Normal`,
+/// `indexing.low_priority_concurrency` default 1 for `Low` — FR-FC-08) and is
+/// read back from the run's stored `concurrency` column rather than from a
+/// field, so a resumed run reuses the width it was started with. The
+/// per-file work is dominated by hashing the bytes, which `StdFilesystem`
+/// runs on Tokio's blocking pool, so the concurrency buys real parallelism
+/// rather than interleaved waiting — that is what NFR-02's throughput target
+/// rests on. It is bounded rather than unlimited because an unbounded fan-out
+/// over a large library would queue one blocking task per file and starve
+/// every other user of the blocking pool. Note that the *database* half of
+/// each file's work still serializes: SQLite admits one writer at a time, and
+/// the pool caps connections at 8, so raising `concurrency` past that only
+/// lengthens the queue in front of the writer.
 ///
 /// Generic over its collaborators so the same decision logic is unit-tested
 /// against trait fakes (no real DB, filesystem, or auth service in unit
@@ -87,6 +93,10 @@ pub struct IndexHandler<A, R, F, C, M, N, O, P, Q, RR> {
     video_tags: P,
     comic_tags: Q,
     concurrency: usize,
+    /// The width a `RunPriority::Low` run processes at
+    /// (`indexing.low_priority_concurrency`). See `concurrency` for the
+    /// `Normal` counterpart and the zero clamp both share.
+    low_priority_concurrency: usize,
     /// The configured library root (`filesystem.root`) every requested index
     /// root must sit inside (FR-FC-26). `None` when the key is unset, which
     /// leaves indexing unconstrained — the historical behaviour.
@@ -183,10 +193,13 @@ where
     Q: ComicMetadataReader,
     RR: CatalogRunRepository,
 {
-    /// `concurrency` is how many files `execute` processes at a time
-    /// (`indexing.concurrency`). Zero is meaningless — a stream buffered zero
-    /// deep makes no progress — so it is clamped to 1, which is the
-    /// sequential behaviour a caller asking for "no concurrency" means.
+    /// `concurrency` is how many files `execute` processes at a time for a
+    /// `RunPriority::Normal` run (`indexing.concurrency`);
+    /// `low_priority_concurrency` is the same for `RunPriority::Low`
+    /// (`indexing.low_priority_concurrency`). Zero is meaningless for either —
+    /// a stream buffered zero deep makes no progress — so both are clamped to
+    /// 1, which is the sequential behaviour a caller asking for "no
+    /// concurrency" means.
     ///
     /// `library_root` is the configured `filesystem.root` (FR-FC-26). An
     /// empty string means the key is unset, and indexing stays unconstrained
@@ -205,6 +218,7 @@ where
         video_tags: P,
         comic_tags: Q,
         concurrency: u32,
+        low_priority_concurrency: u32,
         library_root: String,
         runs: RR,
         registry: RunRegistry,
@@ -228,9 +242,21 @@ where
             video_tags,
             comic_tags,
             concurrency: concurrency.max(1) as usize,
+            low_priority_concurrency: low_priority_concurrency.max(1) as usize,
             library_root,
             runs,
             registry,
+        }
+    }
+
+    /// The width a run at `priority` should be walked at — `Normal` maps to
+    /// `concurrency`, `Low` to `low_priority_concurrency`. See `RunPriority`
+    /// for why this is a match on a semantic enum rather than a number the
+    /// caller supplies directly.
+    fn concurrency_for(&self, priority: RunPriority) -> usize {
+        match priority {
+            RunPriority::Normal => self.concurrency,
+            RunPriority::Low => self.low_priority_concurrency,
         }
     }
 
@@ -298,9 +324,15 @@ where
         self.check_root_within_library(&request.root)?;
         let run_id = Uuid::new_v4();
         let started_at = self.clock.now();
+        let concurrency = self.concurrency_for(request.priority) as u32;
         retry_on_busy(BUSY_ATTEMPTS, || {
-            self.runs
-                .start(run_id, RunKind::Index, Some(&request.root), started_at)
+            self.runs.start(
+                run_id,
+                RunKind::Index,
+                Some(&request.root),
+                started_at,
+                concurrency,
+            )
         })
         .await?;
         Ok(IndexStarted { run_id })
@@ -323,6 +355,43 @@ where
     /// rest of the library. Only a failure to list the root at all aborts.
     pub async fn execute(&self, root: &str, run_id: Uuid) -> Result<IndexOutcome, DomainError> {
         let now = self.clock.now();
+        // Read from the run's own row rather than carried in as a parameter
+        // or held in a field: `IndexHandler` is long-lived (built once at
+        // startup) and `execute` is called for both a fresh run and a
+        // resumed one, so the field it was built with cannot tell the two
+        // apart. This is what makes `given_a_resumed_run_when_executed_...`
+        // true — a resumed run reuses the width `start` wrote rather than
+        // whatever `self.concurrency` happens to be today. The cost is one
+        // extra SELECT per run (not per file), which is negligible next to a
+        // walk that takes minutes.
+        //
+        // Three outcomes, not two: a run with no stored width — one started
+        // before run priority existed, or one `execute` is asked to run
+        // without ever having called `start` (as several unit tests do) —
+        // falls back to the configured `Normal` width with no fuss, mirroring
+        // `RunControlHandler::resume`'s own fallback. A *failed* read is
+        // different and gets a `warn`: pacing is not the walk's job to
+        // guarantee, so a transient store error here must not abort a scan
+        // that could perfectly well run at the default width — that would be
+        // a correctness regression caused by a performance knob. The default
+        // is still the right fallback for either case, but only one of them
+        // is silent.
+        let concurrency = match self.runs.get(run_id).await {
+            Ok(Some(run)) => run
+                .concurrency
+                .map(|c| c.max(1) as usize)
+                .unwrap_or(self.concurrency),
+            Ok(None) => self.concurrency,
+            Err(err) => {
+                tracing::warn!(
+                    %run_id,
+                    error = %err,
+                    "could not read the run's configured concurrency; falling back to \
+                     indexing.concurrency"
+                );
+                self.concurrency
+            }
+        };
         // FR-FC-28: the run becomes observable here. A fresh cell reads as
         // `Discovering` with no total, which is exactly where the walk below
         // starts, and the guard closes the run again at every exit — a
@@ -429,7 +498,7 @@ where
                     }
                 }
             })
-            .buffer_unordered(self.concurrency)
+            .buffer_unordered(concurrency)
             .fold(
                 IndexTally::new(loop_started),
                 |mut tally, outcome| async move {
