@@ -3,7 +3,7 @@ use uuid::Uuid;
 use crate::auth::AuthService;
 use crate::catalog::clock::Clock;
 use crate::catalog::run_registry::{RunRegistry, RunSignal};
-use crate::catalog::runs::{CatalogRunRepository, RunKind, RunStatus};
+use crate::catalog::runs::{CatalogRunRepository, RunKind, RunPriority, RunStatus};
 use crate::errors::DomainError;
 use crate::retry::{retry_on_busy, BUSY_ATTEMPTS};
 
@@ -33,11 +33,18 @@ pub struct RunControlHandler<A, RR, C> {
     runs: RR,
     clock: C,
     registry: RunRegistry,
-    /// The width to resume a run at when its own row records none
-    /// (`indexing.concurrency`). A run started before the priority column was
-    /// ever written has no stored width, and resuming it at the configured
-    /// default is the only answer available that is not invented.
+    /// The width a `RunPriority::Normal` run is walked at
+    /// (`indexing.concurrency`), and the width to resume a run at when its own
+    /// row records none. A run started before the priority column was ever
+    /// written has no stored width, and resuming it at the configured default
+    /// is the only answer available that is not invented.
     default_concurrency: u32,
+    /// The width a `RunPriority::Low` run is walked at
+    /// (`indexing.low_priority_concurrency`). Held here for the same reason
+    /// `IndexHandler` holds it: resume may now be handed a priority, and
+    /// resolving one into a width is a question only the configuration can
+    /// answer.
+    low_priority_concurrency: u32,
 }
 
 /// What a caller needs to put a resumed run back to work (UC-42).
@@ -98,19 +105,39 @@ where
     RR: CatalogRunRepository,
     C: Clock,
 {
+    /// `default_concurrency` is `indexing.concurrency` and
+    /// `low_priority_concurrency` is `indexing.low_priority_concurrency` —
+    /// the same two numbers `IndexHandler::new` takes, and clamped the same
+    /// way, because a run resumed at a priority must land on exactly the
+    /// width a run *started* at that priority would have (FR-FC-08). Zero is
+    /// meaningless for either: a walk that processes no files at a time is
+    /// not a slower walk, it is no walk.
     pub fn new(
         auth: A,
         runs: RR,
         clock: C,
         registry: RunRegistry,
         default_concurrency: u32,
+        low_priority_concurrency: u32,
     ) -> Self {
         Self {
             auth,
             runs,
             clock,
             registry,
-            default_concurrency,
+            default_concurrency: default_concurrency.max(1),
+            low_priority_concurrency: low_priority_concurrency.max(1),
+        }
+    }
+
+    /// The width a run at `priority` should be walked at — the same mapping
+    /// `IndexHandler::concurrency_for` makes, and deliberately duplicated
+    /// rather than shared: this handler must not depend on `IndexHandler`,
+    /// which it would otherwise have to for the refresh case too.
+    fn concurrency_for(&self, priority: RunPriority) -> u32 {
+        match priority {
+            RunPriority::Normal => self.default_concurrency,
+            RunPriority::Low => self.low_priority_concurrency,
         }
     }
 
@@ -139,7 +166,23 @@ where
     /// a header read (FR-FC-09/FR-FC-10), so everything an earlier segment
     /// cataloged falls out as `AlreadyCataloged` in seconds, which leaves no
     /// checkpoint to keep honest and no drift to correct.
-    pub async fn resume(&self, run_id: Uuid, token: &str) -> Result<RunResumed, DomainError> {
+    ///
+    /// `priority` is how a run is re-paced (FR-FC-08 / FR-FC-33). Decision 11
+    /// rejected a live throttle slider — `buffer_unordered` fixes its width
+    /// when the stream is built — on the promise that pausing and resuming
+    /// would do the job instead; this parameter is that promise. `Some`
+    /// resolves to a width and *overwrites the run's stored `concurrency`*
+    /// before the caller spawns anything, which is what actually re-paces it:
+    /// `execute` reads the width off the row (decision 9), so the row is the
+    /// only place a new one can be put. `None` keeps the run's own width —
+    /// not `Normal`, which would silently speed up every low-priority run
+    /// resumed by a caller that predates this parameter.
+    pub async fn resume(
+        &self,
+        run_id: Uuid,
+        token: &str,
+        priority: Option<RunPriority>,
+    ) -> Result<RunResumed, DomainError> {
         // Ahead of the lookup, for the reason `control` does it: a caller
         // with a bad token must learn neither that the run exists nor what
         // state it is in.
@@ -165,8 +208,17 @@ where
             .unwrap_or(0);
         let paused_millis = run.paused_millis + this_pause;
 
-        let applied =
-            retry_on_busy(BUSY_ATTEMPTS, || self.runs.resume(run_id, paused_millis)).await?;
+        // The requested width, resolved before the write and handed to it, so
+        // the row carries the new number the moment it goes back to
+        // `running`. `execute` reads the width off that row (decision 9), and
+        // the caller spawns it the instant this returns — so anything later
+        // than this write would be a race the resumed segment could lose.
+        // `None` binds through as "leave the column alone".
+        let requested = priority.map(|priority| self.concurrency_for(priority));
+        let applied = retry_on_busy(BUSY_ATTEMPTS, || {
+            self.runs.resume(run_id, paused_millis, requested)
+        })
+        .await?;
         if !applied {
             // The run stopped being `paused` between the lookup above and
             // this write — in practice a cancel that landed in between.
@@ -180,9 +232,16 @@ where
             run_id,
             root: run.root,
             kind: run.kind,
-            // A run whose row records no width — every run, until run
-            // priority writes the column — resumes at the configured one.
-            concurrency: run.concurrency.unwrap_or(self.default_concurrency),
+            // The width just written, if this resume named one. Failing that,
+            // the row's own — and failing *that*, the configured default, for
+            // a run started before run priority ever wrote the column. Note
+            // this is the value the *caller* is told, not the one `execute`
+            // uses: `execute` reads the row. Reporting it anyway keeps
+            // `RunResumed` honest about what the run is now paced at, and is
+            // what the tests can observe without a walk.
+            concurrency: requested
+                .or(run.concurrency)
+                .unwrap_or(self.default_concurrency),
         })
     }
 

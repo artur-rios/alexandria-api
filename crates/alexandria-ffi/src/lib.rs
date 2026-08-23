@@ -170,6 +170,28 @@ fn parse_priority(raw: Option<String>) -> RunPriority {
     }
 }
 
+/// Parse a wire priority string for `alexandria_index_resume`, where the
+/// answer is three-valued rather than two.
+///
+/// `"low"` and `"normal"` are requests to re-pace the run; **anything else —
+/// NULL, an unrecognised word, malformed UTF-8 — is `None`, meaning keep the
+/// width the run already has.** That is the difference from
+/// [`parse_priority`], and it is deliberate rather than an inconsistency:
+/// starting a run must produce *some* width, so an unreadable priority there
+/// has to fall to a default, but a run being resumed already has one. Folding
+/// NULL into `Normal` here would silently speed every low-priority run back
+/// up the moment a caller written before this parameter existed passed the
+/// NULL it has always passed. Same lenient rule as `parse_priority` about
+/// *how* an unreadable value is treated — quietly, never as a rejected call —
+/// and the same rule the HTTP body uses (FR-FC-24).
+fn parse_resume_priority(raw: Option<String>) -> Option<RunPriority> {
+    match raw.as_deref() {
+        Some("low") => Some(RunPriority::Low),
+        Some("normal") => Some(RunPriority::Normal),
+        _ => None,
+    }
+}
+
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
 pub extern "C" fn alexandria_version() -> *const c_char {
@@ -3973,6 +3995,14 @@ pub extern "C" fn alexandria_index_cancel(run_id: *const c_char, token: *const c
 /// silently doing nothing: a caller told `RUN_OK` for a run that never
 /// actually resumes would have no way to notice.
 ///
+/// `priority` re-paces the run (FR-FC-08 / FR-FC-33): `"low"` or `"normal"`,
+/// the same case-sensitive spelling `alexandria_index_start` accepts. Unlike
+/// there, NULL or an unrecognised string does **not** mean `"normal"` — it
+/// means *keep the width this run already has*, which is what every caller
+/// written before this parameter existed was asking for. Passing NULL is
+/// therefore the backward-compatible call, and `"normal"` is a real request
+/// to speed a low-priority run back up. See `parse_resume_priority`.
+///
 /// Returns `RUN_ERR_NOT_FOUND` for an id naming no run (AF-01),
 /// `RUN_ERR_UNAUTHORIZED` for an unauthenticated caller (AF-02),
 /// `RUN_ERR_INVALID_INPUT` when `run_id` is not a uuid, and
@@ -3982,6 +4012,7 @@ pub extern "C" fn alexandria_index_cancel(run_id: *const c_char, token: *const c
 pub extern "C" fn alexandria_index_resume(
     run_id: *const c_char,
     token: *const c_char,
+    priority: *const c_char,
 ) -> IndexStartResult {
     let services = match services_slot().lock().unwrap().clone() {
         Some(s) => s,
@@ -4003,12 +4034,18 @@ pub extern "C" fn alexandria_index_resume(
         return IndexStartResult::err(RUN_ERR_INVALID_INPUT);
     };
 
+    let priority = parse_resume_priority(cstr_lossy(priority));
+
     let rt = runtime();
-    let resumed =
-        match rt.block_on(async { services.run_control_handler.resume(run_id, &token).await }) {
-            Ok(resumed) => resumed,
-            Err(err) => return IndexStartResult::err(map_run_err_code(err)),
-        };
+    let resumed = match rt.block_on(async {
+        services
+            .run_control_handler
+            .resume(run_id, &token, priority)
+            .await
+    }) {
+        Ok(resumed) => resumed,
+        Err(err) => return IndexStartResult::err(map_run_err_code(err)),
+    };
 
     match resumed.kind {
         RunKind::Index => {
@@ -4150,6 +4187,48 @@ mod tests {
         // two surfaces at parity (FR-FC-24) rather than accepting a wider
         // set FFI understands and HTTP does not.
         assert_eq!(parse_priority(Some("Low".to_string())), RunPriority::Normal);
+    }
+
+    // `parse_resume_priority` is the three-valued twin: `"low"`/`"normal"`
+    // are requests, everything else means "keep the run's width".
+
+    #[test]
+    fn given_low_when_resume_priority_parsed_then_low() {
+        assert_eq!(
+            parse_resume_priority(Some("low".to_string())),
+            Some(RunPriority::Low)
+        );
+    }
+
+    #[test]
+    fn given_normal_when_resume_priority_parsed_then_normal() {
+        // Not the same as absent — this is a request to widen a throttled
+        // run back out.
+        assert_eq!(
+            parse_resume_priority(Some("normal".to_string())),
+            Some(RunPriority::Normal)
+        );
+    }
+
+    #[test]
+    fn given_none_when_resume_priority_parsed_then_keep_the_current_width() {
+        // The backward-compatible call: every embedder written before
+        // `alexandria_index_resume` took a `priority` passes NULL, and a run
+        // they throttled down must stay throttled down.
+        assert_eq!(parse_resume_priority(None), None);
+    }
+
+    #[test]
+    fn given_garbage_string_when_resume_priority_parsed_then_keep_the_current_width() {
+        assert_eq!(parse_resume_priority(Some("URGENT!!1".to_string())), None);
+    }
+
+    #[test]
+    fn given_uppercase_low_when_resume_priority_parsed_then_keep_the_current_width() {
+        // Case-sensitive for the reason `parse_priority` is, but falling
+        // back to "keep" rather than to `Normal`: the run already has a
+        // width, so there is a better answer available than a default.
+        assert_eq!(parse_resume_priority(Some("Low".to_string())), None);
     }
 
     #[test]

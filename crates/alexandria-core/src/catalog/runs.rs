@@ -16,11 +16,13 @@ use crate::errors::DomainError;
 /// `indexing.concurrency` (default 4); which config key a priority means is
 /// the handlers' business, not this type's.
 ///
-/// Chosen once, at `start`, and stored on the run's `concurrency` column
-/// (`CatalogRun::concurrency`) — not a live slider. `buffer_unordered` fixes
-/// its width when the stream is built, so changing your mind mid-run costs a
-/// pause and a resume, and a resumed run reuses the width it was started
-/// with rather than picking a fresh one.
+/// Chosen at `start` *or at `resume`*, and stored on the run's `concurrency`
+/// column (`CatalogRun::concurrency`) — not a live slider. `buffer_unordered`
+/// fixes its width when the stream is built, so changing your mind mid-run
+/// costs a pause and a resume: `RunControlHandler::resume` takes an optional
+/// priority, and the run walks its next segment at whatever that resolves to.
+/// A resume that names none reuses the width the run already had, which is
+/// what every caller predating this option asks for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum RunPriority {
@@ -181,15 +183,18 @@ pub struct CatalogRun {
     /// client holding `activeMillis` has no use for it.
     #[serde(skip)]
     pub paused_millis: i64,
-    /// How many entries at a time the run was started with, so a resumed run
-    /// continues at the width it was started with rather than at whatever the
-    /// configuration happens to say later.
+    /// How many entries at a time the run is being walked, so a resumed run
+    /// continues at its own width rather than at whatever the configuration
+    /// happens to say later.
     ///
     /// Written by `start`, from the `RunPriority` the caller chose (`Normal`
     /// maps to `indexing.concurrency`, `Low` to
-    /// `indexing.low_priority_concurrency`) — see `RunPriority`. `None` only
-    /// for a run started before run priority existed; a resume of one of
-    /// those falls back to the configured default (`RunControlHandler`'s
+    /// `indexing.low_priority_concurrency`) — see `RunPriority` — and
+    /// rewritten by `resume` when that caller names a priority of its own,
+    /// which is how a run is re-paced without losing its tally or its record.
+    /// `None` only for a run started before run priority existed; a resume of
+    /// one of those that names no priority falls back to the configured
+    /// default (`RunControlHandler`'s
     /// `default_concurrency`). Not serialized, for the reason `paused_millis`
     /// is not: the run body is what a client draws a progress bar from, and
     /// this is an input to how the run is spawned, not a fact about its
@@ -342,11 +347,26 @@ pub trait CatalogRunRepository: Send + Sync {
     /// does not for `active_millis`. The caller adds the pause that is ending
     /// to whatever was already banked and passes the sum.
     ///
+    /// `concurrency` re-paces the run: `Some(width)` overwrites the stored
+    /// column so the segment about to be spawned walks at the new width;
+    /// `None` leaves whatever is there alone, which is what a resume that
+    /// named no priority means. It is written *here*, in the same statement
+    /// as the status change, rather than by a separate call: `execute` reads
+    /// the width back off this row (decision 9), so a resume that flipped the
+    /// status first and the width second would leave a window in which the
+    /// spawned segment could read the old number.
+    ///
     /// **Conditional on the run still being `paused`**, and `Ok(false)` when
     /// it was not — the same guard `pause` and `cancel` carry. A resume that
     /// landed after someone else's cancel would revive a run its owner had
-    /// just abandoned.
-    async fn resume(&self, id: Uuid, paused_millis: i64) -> Result<bool, DomainError>;
+    /// just abandoned. The new width rides along inside that guard: a refused
+    /// resume must not re-pace the run it failed to revive.
+    async fn resume(
+        &self,
+        id: Uuid,
+        paused_millis: i64,
+        concurrency: Option<u32>,
+    ) -> Result<bool, DomainError>;
 
     /// Flush a run's live progress into its record (FR-FC-28).
     ///
@@ -817,7 +837,12 @@ impl CatalogRunRepository for SqliteCatalogRunRepository {
             .await
     }
 
-    async fn resume(&self, id: Uuid, paused_millis: i64) -> Result<bool, DomainError> {
+    async fn resume(
+        &self,
+        id: Uuid,
+        paused_millis: i64,
+        concurrency: Option<u32>,
+    ) -> Result<bool, DomainError> {
         // One statement, so a resume either happens completely or not at all:
         // a row left `running` with a stale `paused_at` would go on banking
         // the same pause on every subsequent resume.
@@ -825,13 +850,24 @@ impl CatalogRunRepository for SqliteCatalogRunRepository {
         // `processed = 0, total = NULL, phase = 'discovering'` puts the run
         // back where every run starts. See the trait doc — those counters
         // describe a segment, not a position, and resume re-walks.
+        //
+        // `concurrency = COALESCE(?, concurrency)` is how the new width joins
+        // that same statement: a bound `NULL` — a resume that named no
+        // priority — leaves the column exactly as it was, including leaving a
+        // pre-column run's `NULL` alone, while a bound width overwrites it.
+        // Expressing "keep" as a no-op inside the one guarded UPDATE is what
+        // keeps a refused resume from re-pacing a run it did not revive.
         let result = sqlx::query(
             "UPDATE catalog_runs SET status = ?, paused_at = NULL, paused_millis = ?, \
-             processed = 0, total = NULL, phase = ? WHERE id = ? AND status = ?",
+             processed = 0, total = NULL, phase = ?, \
+             concurrency = COALESCE(?, concurrency) WHERE id = ? AND status = ?",
         )
         .bind(RunStatus::Running.as_str())
         .bind(paused_millis)
         .bind(RunPhase::Discovering.as_str())
+        // The same widening `start` does — SQLite has no unsigned integer, and
+        // a width is never large enough for the cast to lose anything.
+        .bind(concurrency.map(|concurrency| concurrency as i64))
         .bind(id.to_string())
         .bind(RunStatus::Paused.as_str())
         .execute(&self.pool)

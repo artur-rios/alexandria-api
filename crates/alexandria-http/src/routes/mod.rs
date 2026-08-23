@@ -63,3 +63,41 @@ where
         _ => RunPriority::Normal,
     })
 }
+
+/// Lenient `priority` field deserializer for
+/// `POST /v1/index/runs/{runId}/resume` (Task 15), where the answer is
+/// three-valued rather than two: `"low"` and `"normal"` are requests to
+/// re-pace the run, and **anything else — the key absent, an explicit
+/// `null`, an unrecognised word, a value that is not a string — is `None`,
+/// meaning keep the width the run already has.**
+///
+/// That is the one place this deliberately differs from
+/// [`deserialize_priority`]. Starting a run must produce *some* width, so an
+/// unreadable priority there falls to `Normal`; a run being resumed already
+/// has a width, so falling to `Normal` would silently speed every
+/// low-priority run back up the moment a client written before this field
+/// existed sent the bodiless resume it has always sent. Combined with
+/// `#[serde(default)]` on the field and `resume_run`'s folding of every
+/// `JsonRejection` into `ResumeBody::default()`, "absent" means the same
+/// thing at every level: no body, no field, or an unreadable field.
+///
+/// Mirrors `alexandria-ffi::parse_resume_priority` byte for byte (FR-FC-24).
+pub(crate) fn deserialize_optional_priority<'de, D>(
+    deserializer: D,
+) -> Result<Option<RunPriority>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    // `serde_json::Value` for the reason `deserialize_priority` uses it: a
+    // non-string value must fall back rather than bubble up as a type
+    // mismatch, so both surfaces answer the same question the same lenient
+    // way. `Value` also absorbs an explicit `null` — `Option<String>` would
+    // have reached the same answer by a different route, and one rule is
+    // easier to keep true than two.
+    let raw = serde_json::Value::deserialize(deserializer)?;
+    Ok(match raw.as_str() {
+        Some("low") => Some(RunPriority::Low),
+        Some("normal") => Some(RunPriority::Normal),
+        _ => None,
+    })
+}

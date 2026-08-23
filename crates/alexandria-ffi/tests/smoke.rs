@@ -1743,7 +1743,7 @@ fn given_a_paused_run_when_resumed_over_ffi_then_same_run_id_and_it_finishes() {
         "paused"
     );
 
-    let resumed = alexandria_index_resume(run_id_c.as_ptr(), token.as_ptr());
+    let resumed = alexandria_index_resume(run_id_c.as_ptr(), token.as_ptr(), std::ptr::null());
     assert_eq!(
         resumed.status, STATUS_RUN_OK,
         "expected RUN_OK resuming a paused run"
@@ -1788,7 +1788,7 @@ fn given_a_running_run_when_resumed_over_ffi_then_invalid_state() {
         "running",
         "sanity: the run is still running at the moment resume is called"
     );
-    let resumed = alexandria_index_resume(run_id_c.as_ptr(), token.as_ptr());
+    let resumed = alexandria_index_resume(run_id_c.as_ptr(), token.as_ptr(), std::ptr::null());
     assert_eq!(
         resumed.status, STATUS_RUN_INVALID_STATE,
         "resuming a run that is not paused must be refused"
@@ -1801,7 +1801,7 @@ fn given_ffi_resume_missing_run_then_not_found() {
     let (_db_dir, _db_path) = init_temp_db();
     let token = c(TEST_TOKEN);
     let run_id = c("11111111-1111-1111-1111-111111111111");
-    let resumed = alexandria_index_resume(run_id.as_ptr(), token.as_ptr());
+    let resumed = alexandria_index_resume(run_id.as_ptr(), token.as_ptr(), std::ptr::null());
     assert_eq!(resumed.status, STATUS_RUN_NOT_FOUND);
 }
 
@@ -2095,7 +2095,7 @@ fn given_a_paused_refresh_run_when_resumed_over_ffi_then_it_finishes() {
         "paused"
     );
 
-    let resumed = alexandria_index_resume(run_id_c.as_ptr(), token.as_ptr());
+    let resumed = alexandria_index_resume(run_id_c.as_ptr(), token.as_ptr(), std::ptr::null());
     assert_eq!(
         resumed.status, STATUS_RUN_OK,
         "expected RUN_OK resuming a paused refresh run"
@@ -2155,7 +2155,7 @@ fn given_a_paused_index_run_with_no_stored_root_when_resumed_then_error() {
             .expect("clear root");
     });
 
-    let resumed = alexandria_index_resume(run_id_c.as_ptr(), token.as_ptr());
+    let resumed = alexandria_index_resume(run_id_c.as_ptr(), token.as_ptr(), std::ptr::null());
     assert_eq!(
         resumed.status, STATUS_RUN_OTHER,
         "an index run with no stored root must fail loudly, not silently do nothing"

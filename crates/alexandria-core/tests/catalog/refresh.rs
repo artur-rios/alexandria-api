@@ -883,6 +883,7 @@ async fn given_a_refresh_walk_in_flight_when_paused_then_it_stops_with_paths_unp
         fixed_clock(now()),
         registry.clone(),
         TEST_CONCURRENCY,
+        TEST_LOW_PRIORITY_CONCURRENCY,
     ));
     let pause_mid_walk = interrupt(move || {
         let control = Arc::clone(&control);

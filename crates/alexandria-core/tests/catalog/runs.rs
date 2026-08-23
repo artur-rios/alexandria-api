@@ -960,7 +960,7 @@ async fn given_a_paused_run_with_progress_when_resumed_then_the_segment_counters
     .expect("record progress");
     assert!(repo.pause(id, t(2)).await.expect("pause"));
 
-    let applied = repo.resume(id, 90_000).await.expect("resume");
+    let applied = repo.resume(id, 90_000, None).await.expect("resume");
 
     assert!(applied, "a paused run accepts a resume");
     let run = repo.get(id).await.expect("get").expect("run exists");
@@ -978,6 +978,59 @@ async fn given_a_paused_run_with_progress_when_resumed_then_the_segment_counters
         "a resumed run starts where every run starts"
     );
     assert!(run.finished_at.is_none());
+    assert_eq!(
+        run.concurrency,
+        Some(4),
+        "a resume that names no width leaves the stored one alone"
+    );
+}
+
+/// The adapter half of Task 15: `concurrency = COALESCE(?, concurrency)`.
+/// Both branches are checked against the real SQLite statement, because
+/// COALESCE is exactly the sort of expression that reads correct and binds
+/// backwards.
+#[tokio::test]
+async fn given_a_paused_run_when_resumed_with_a_width_then_the_stored_concurrency_is_replaced() {
+    let (repo, _dir) = repo().await;
+    let id = Uuid::new_v4();
+    repo.start(id, RunKind::Index, Some("/library"), t(1), 4)
+        .await
+        .expect("start");
+    assert!(repo.pause(id, t(2)).await.expect("pause"));
+
+    assert!(repo.resume(id, 0, Some(1)).await.expect("resume"));
+
+    assert_eq!(
+        repo.get(id).await.unwrap().unwrap().concurrency,
+        Some(1),
+        "the new width is what `execute` will read back"
+    );
+}
+
+/// A run predating the `concurrency` column has none, and a resume that names
+/// no priority must not invent one — `COALESCE(NULL, NULL)` is still NULL, and
+/// `RunControlHandler` is the layer that decides what an absent width falls
+/// back to.
+#[tokio::test]
+async fn given_a_run_with_no_stored_width_when_resumed_without_one_then_it_stays_absent() {
+    let (repo, pool, _dir) = repo_with_pool().await;
+    let id = Uuid::new_v4();
+    repo.start(id, RunKind::Index, Some("/library"), t(1), 4)
+        .await
+        .expect("start");
+    // Seeded directly, the way `repo_with_pool` exists to allow: `start`
+    // always writes a width now, so a run predating the column can only be
+    // produced by clearing it.
+    sqlx::query("UPDATE catalog_runs SET concurrency = NULL WHERE id = ?")
+        .bind(id.to_string())
+        .execute(&pool)
+        .await
+        .expect("clear concurrency");
+    assert!(repo.pause(id, t(2)).await.expect("pause"));
+
+    assert!(repo.resume(id, 0, None).await.expect("resume"));
+
+    assert_eq!(repo.get(id).await.unwrap().unwrap().concurrency, None);
 }
 
 #[tokio::test]
@@ -997,11 +1050,11 @@ async fn given_a_run_that_is_not_paused_when_resumed_then_the_write_is_refused()
     repo.cancel(cancelled, None, t(2)).await.expect("cancel");
 
     assert!(
-        !repo.resume(running, 0).await.expect("resume"),
+        !repo.resume(running, 0, None).await.expect("resume"),
         "a running run is already running"
     );
     assert!(
-        !repo.resume(cancelled, 0).await.expect("resume"),
+        !repo.resume(cancelled, 0, None).await.expect("resume"),
         "a cancelled run must not be revived"
     );
     let run = repo.get(cancelled).await.unwrap().unwrap();
@@ -1016,7 +1069,7 @@ async fn given_a_run_that_is_not_paused_when_resumed_then_the_write_is_refused()
 #[tokio::test]
 async fn given_an_unknown_run_when_resumed_then_the_write_is_refused() {
     let (repo, _dir) = repo().await;
-    assert!(!repo.resume(Uuid::new_v4(), 0).await.expect("resume"));
+    assert!(!repo.resume(Uuid::new_v4(), 0, None).await.expect("resume"));
 }
 
 #[tokio::test]

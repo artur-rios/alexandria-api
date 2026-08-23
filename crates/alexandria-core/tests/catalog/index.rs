@@ -2676,12 +2676,25 @@ fn control_handler(
     runs: FakeCatalogRunRepository,
     registry: RunRegistry,
 ) -> Arc<RunControlHandler<FakeAuth, FakeCatalogRunRepository, FixedClock>> {
+    control_handler_with_low_width(runs, registry, TEST_LOW_PRIORITY_CONCURRENCY)
+}
+
+/// [`control_handler`] with `indexing.low_priority_concurrency` set to
+/// something of the test's choosing — what a test needs when it resumes at
+/// `RunPriority::Low` and wants the resulting width to be a number nothing
+/// else in this file could have produced.
+fn control_handler_with_low_width(
+    runs: FakeCatalogRunRepository,
+    registry: RunRegistry,
+    low_priority_concurrency: u32,
+) -> Arc<RunControlHandler<FakeAuth, FakeCatalogRunRepository, FixedClock>> {
     Arc::new(RunControlHandler::new(
         FakeAuth::Allowing,
         runs,
         fixed_clock(now()),
         registry,
         TEST_CONCURRENCY,
+        low_priority_concurrency,
     ))
 }
 
@@ -2956,7 +2969,7 @@ async fn given_a_paused_index_run_when_resumed_then_it_re_walks_and_finishes_the
     );
 
     let resumed = control_handler(runs.clone(), registry.clone())
-        .resume(run_id, TOKEN)
+        .resume(run_id, TOKEN, None)
         .await
         .expect("resume");
     assert_eq!(resumed.run_id, run_id);
@@ -3070,7 +3083,7 @@ async fn given_a_resumed_run_when_executed_then_it_walks_at_the_width_it_was_sta
     assert!(runs.pause(run_id, now()).await.expect("pause"));
 
     let resumed = control_handler(runs.clone(), registry.clone())
-        .resume(run_id, TOKEN)
+        .resume(run_id, TOKEN, None)
         .await
         .expect("resume");
     assert_eq!(
@@ -3104,5 +3117,98 @@ async fn given_a_resumed_run_when_executed_then_it_walks_at_the_width_it_was_sta
         "the walk must run at the width the run was started at ({RESUMED_AT_CONCURRENCY}), \
          not at the handler's own configured concurrency ({TEST_CONCURRENCY}) — that is what \
          proves execute() reads the stored column rather than falling back to its field"
+    );
+}
+
+/// Task 15's whole point, end to end: a run started at one width, paused, and
+/// resumed at `RunPriority::Low` must have its next segment *actually walked*
+/// at the low width. Decision 11 refused a live throttle slider on the
+/// promise that a pause and a resume would do the job instead; this is the
+/// test that the promise is kept.
+///
+/// Four distinct widths are in play, deliberately, so no assertion here can
+/// pass by coincidence:
+///
+/// * `STARTED_AT_CONCURRENCY` (2) — the width the run was started at, and
+///   what the row would still say if the resume failed to persist the new
+///   one;
+/// * `RESUMED_AT_LOW_CONCURRENCY` (3) — what `Low` resolves to for the
+///   control handler this test builds, and the only correct answer;
+/// * [`TEST_CONCURRENCY`] (4) — the second segment's handler field, and what
+///   `execute` would fall back to if the width were persisted but not read;
+/// * [`TEST_LOW_PRIORITY_CONCURRENCY`] (1) — the file's usual low width,
+///   excluded so that "resumed at low" cannot be confused with "some other
+///   test's low".
+///
+/// The observable is the same one Task 9's test uses — the greatest number
+/// of `read` calls a `ConcurrencyTrackingAudioMetadataReader` ever saw in
+/// flight together — because the outcome tallies are identical at every
+/// width and so cannot distinguish one from another.
+#[tokio::test]
+async fn given_a_paused_run_when_resumed_at_low_priority_then_it_walks_at_the_new_width() {
+    const STARTED_AT_CONCURRENCY: u32 = 2;
+    const RESUMED_AT_LOW_CONCURRENCY: u32 = 3;
+
+    let runs = FakeCatalogRunRepository::new();
+    let registry = RunRegistry::new();
+    let catalog = FakeCatalogRepository::new();
+    let run_id = Uuid::new_v4();
+    runs.start(
+        run_id,
+        RunKind::Index,
+        Some(ROOT),
+        now(),
+        STARTED_AT_CONCURRENCY,
+    )
+    .await
+    .unwrap();
+    assert!(runs.pause(run_id, now()).await.expect("pause"));
+
+    let resumed =
+        control_handler_with_low_width(runs.clone(), registry.clone(), RESUMED_AT_LOW_CONCURRENCY)
+            .resume(run_id, TOKEN, Some(RunPriority::Low))
+            .await
+            .expect("resume");
+
+    assert_eq!(
+        resumed.concurrency, RESUMED_AT_LOW_CONCURRENCY,
+        "sanity check: the caller is told the new width, not the old one"
+    );
+    assert_eq!(
+        runs.get_recorded(run_id).expect("run").concurrency,
+        Some(RESUMED_AT_LOW_CONCURRENCY),
+        "sanity check: and the row records it — persisting it is the only way \
+         `execute` can ever see it"
+    );
+
+    let probe = ConcurrencyTrackingAudioMetadataReader::new();
+    let second_segment = handler_with_registry(
+        FakeAuth::Allowing,
+        catalog,
+        audio_library(),
+        fixed_clock(now()),
+        probe.clone(),
+        FakeImageMetadataReader::new(),
+        FakeDocumentMetadataReader::new(),
+        FakeVideoMetadataReader::new(),
+        FakeComicMetadataReader::new(),
+        runs.clone(),
+        registry,
+    );
+
+    second_segment
+        .execute(ROOT, run_id)
+        .await
+        .expect("second segment");
+
+    assert_eq!(
+        probe.max_seen() as u32,
+        RESUMED_AT_LOW_CONCURRENCY,
+        "the resumed segment must walk at the width the resume asked for \
+         ({RESUMED_AT_LOW_CONCURRENCY}) — not at the width the run was started at \
+         ({STARTED_AT_CONCURRENCY}), which is what would show if the new width were \
+         answered but never persisted, and not at the handler's own configured \
+         concurrency ({TEST_CONCURRENCY}), which is what would show if it were \
+         persisted but never read"
     );
 }

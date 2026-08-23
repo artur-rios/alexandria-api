@@ -1579,7 +1579,8 @@ have only one of.
 1. The owner asks to resume a run, naming its id.
 2. The system confirms the caller is authenticated as the owner and that the run is `paused`.
 3. The system adds the length of the pause that is ending to the time the run has spent paused, so that pause never counts as work (FR-FC-28), and records the run `running` again under the **same id** — a resume continues a run, it does not start a new one.
-4. The system walks again at the priority the run was started with (FR-FC-31), from the root for an index run or across every cataloged path for a re-index. There is no cursor: the run rediscovers its total and counts from zero, and everything an earlier segment already cataloged falls out as `alreadyCataloged` in seconds.
+4. The owner may name a priority for the resumed segment (FR-FC-33). Naming one re-paces the run and is remembered, so it holds across a further pause; naming none keeps the priority the run already has, which is what an owner who only wants their run back is asking for. This is the whole answer to changing your mind about throttling mid-run: the priority is fixed while a segment walks, and a pause and a resume is what changes it (FR-FC-31).
+5. The system walks again at that priority, from the root for an index run or across every cataloged path for a re-index. There is no cursor: the run rediscovers its total and counts from zero, and everything an earlier segment already cataloged falls out as `alreadyCataloged` in seconds.
 
 **Main Flow — cancel** (FR-FC-34)
 
@@ -1595,7 +1596,7 @@ have only one of.
 | AF-01 | No run exists with that id | The system responds with a not-found error. |
 | AF-02 | The caller is not authenticated | The system denies with an unauthorized error. |
 | AF-03 | A pause is asked of a run that is not `running` — it is already `paused`, or it is `complete`, `failed`, or `cancelled` | The system refuses with a conflict rather than silently accepting. A pause that appeared to succeed against a finished run would leave the owner waiting for a resume prompt that never comes. |
-| AF-04 | A resume is asked of a run that is not `paused` — it is already `running`, or it is terminal | The system refuses with a conflict. A run that is already running has nothing to resume, and a terminal one has no run left at all; re-doing a completed scan is a fresh UC-01, not a resume. |
+| AF-04 | A resume is asked of a run that is not `paused` — it is already `running`, or it is terminal | The system refuses with a conflict, and leaves the run's stored priority alone even if the resume named one. A run that is already running has nothing to resume, and a terminal one has no run left at all; re-doing a completed scan is a fresh UC-01, not a resume. |
 | AF-05 | A cancel is asked of a run that is already terminal | The system refuses with a conflict: there is nothing left to abandon, and a run that closed itself is not one a later cancel may rewrite. |
 | AF-06 | The application was restarted while the run was executing | Startup recorded the run `paused` (FR-FC-29), so it appears in the outstanding runs (UC-42) with the last progress it published, and this use case's resume flow applies to it unchanged. Nothing resumed by itself while the application was starting — the owner is offered the run, and resuming it is their act. |
 | AF-07 | The pause or cancel arrives while the run is still discovering its entries | The system honours it at the end of discovery, before any file is touched. The tree walk is a single uninterruptible call, and it takes seconds. |

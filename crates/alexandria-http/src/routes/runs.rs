@@ -1,4 +1,4 @@
-use axum::extract::rejection::{PathRejection, QueryRejection};
+use axum::extract::rejection::{JsonRejection, PathRejection, QueryRejection};
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
@@ -6,11 +6,11 @@ use serde::Deserialize;
 use uuid::Uuid;
 
 use alexandria_core::catalog::commands::index::IndexStarted;
-use alexandria_core::catalog::runs::{CatalogRun, RunKind};
+use alexandria_core::catalog::runs::{CatalogRun, RunKind, RunPriority};
 
 use crate::middleware::auth::invalid_input;
 use crate::middleware::error::ApiError;
-use crate::routes::bearer_token;
+use crate::routes::{bearer_token, deserialize_optional_priority};
 use crate::AppState;
 
 /// `GET /v1/index/runs/{runId}` — report an index or re-index run's status and
@@ -100,6 +100,19 @@ pub async fn cancel_run(
     Ok(StatusCode::OK)
 }
 
+/// The optional body `POST /v1/index/runs/{runId}/resume` accepts. Its one
+/// field is optional too, so the whole body is — see `resume_run` for how an
+/// absent or unreadable body reaches the default.
+#[derive(Debug, Default, Deserialize)]
+pub struct ResumeBody {
+    /// Re-pace the run (FR-FC-08 / FR-FC-33). `"low"` or `"normal"`, the same
+    /// wire spelling `IndexBody::priority` accepts — but *three*-valued here:
+    /// absent, `null`, or unrecognised is `None`, meaning keep the width the
+    /// run already has. See `deserialize_optional_priority`.
+    #[serde(default, deserialize_with = "deserialize_optional_priority")]
+    pub priority: Option<RunPriority>,
+}
+
 /// `POST /v1/index/runs/{runId}/resume` — put a paused run back to work
 /// (UC-42 / FR-FC-28). Answers `202` with the *same* run id it was given —
 /// matching how `POST /v1/index` and `POST /v1/index/refresh` answer a fresh
@@ -124,19 +137,31 @@ pub async fn cancel_run(
 /// Returns `202` with `{"runId": …}` on success, `400` (the path segment is
 /// not a uuid), `401` (unauthenticated, AF-02), `404` (no run with that id,
 /// AF-01), or `409` (the run is not currently `paused`).
+///
+/// The body is taken as `Result<Json<ResumeBody>, JsonRejection>`, with
+/// *every* rejection folded into `ResumeBody::default()` — the same shape
+/// `refresh.rs` uses, and for the same reason. `Option<Json<ResumeBody>>`
+/// would not do: axum 0.8's `OptionalFromRequest` impl for `Json` resolves to
+/// `None` only when the `content-type` header is absent entirely, so a JSON
+/// content-type with an empty body — exactly what a client that always
+/// attaches one sends to a route that never took a body before — would come
+/// back as a `400`. This route answered every bodiless resume before Task 15
+/// and must go on answering them.
 pub async fn resume_run(
     State(state): State<AppState>,
     headers: HeaderMap,
     run_id: Result<Path<Uuid>, PathRejection>,
+    body: Result<Json<ResumeBody>, JsonRejection>,
 ) -> Result<(StatusCode, Json<IndexStarted>), ApiError> {
     let token = bearer_token(&headers);
 
     let Path(run_id) = run_id.map_err(|_| invalid_input("path segment is not a valid UUID"))?;
+    let priority = body.map(|Json(b)| b.priority).unwrap_or_default();
 
     let resumed = state
         .services
         .run_control_handler
-        .resume(run_id, &token)
+        .resume(run_id, &token, priority)
         .await
         .map_err(ApiError)?;
 

@@ -11958,7 +11958,8 @@ async fn given_a_paused_run_when_resumed_via_http_and_ffi_then_both_answer_with_
             );
             wait_for_ffi_run_terminal(&run_id, &token);
 
-            let resumed = alexandria_index_resume(run_id_c.as_ptr(), token.as_ptr());
+            let resumed =
+                alexandria_index_resume(run_id_c.as_ptr(), token.as_ptr(), std::ptr::null());
             assert_eq!(resumed.status, alexandria_ffi::RUN_OK, "ffi resume failed");
             let resumed_id = run_id_string(&resumed);
 
@@ -11989,6 +11990,155 @@ async fn given_a_paused_run_when_resumed_via_http_and_ffi_then_both_answer_with_
         "HTTP and FFI completed-run bodies must carry the same fields:
 http: {http_final}
 ffi: {ffi_final}"
+    );
+}
+
+/// UC-42 / FR-FC-08 / FR-FC-33 parity (Task 15) — resume a paused run at a
+/// *different* priority through each surface independently, and confirm both
+/// re-paced their own run to the same width.
+///
+/// Two fully independent legs, as everything in this section is: each drives
+/// its own run, over its own library, in its own database, through its own
+/// surface's real resume entry point — the HTTP route with a
+/// `{"priority": "low"}` body, and `alexandria_index_resume` with the C
+/// string `"low"`. Neither leg is asserted against the other's state.
+///
+/// The observable is the run's stored `concurrency`, read from each leg's own
+/// database, because there is no accessor that exposes it:
+/// `CatalogRun::concurrency` is `#[serde(skip)]` on the run body, so the
+/// column is the only place a resolved priority can be seen. That is the same
+/// reason `given_low_priority_when_started_via_http_and_ffi_then_both_spell_it_the_same_way`
+/// reads it directly.
+///
+/// Both runs start at `indexing.concurrency` (4) and must come back at
+/// `indexing.low_priority_concurrency` (1), so a surface that ignored the
+/// priority, or that could not spell it, fails here rather than agreeing with
+/// the other surface while both are wrong.
+#[tokio::test]
+async fn given_a_paused_run_when_resumed_at_low_priority_via_http_and_ffi_then_both_re_pace_it_the_same_way(
+) {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+
+    // ---- HTTP leg ----
+    let http_dir = tempdir().unwrap();
+    let http_db = db_path(&http_dir, "http.sqlite");
+    let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    seed_session(&http_pool, TEST_TOKEN).await;
+    let http_services =
+        std::sync::Arc::new(build_services(&local_settings(), http_pool.clone()).await);
+
+    let http_lib = tempdir().unwrap();
+    write_library(http_lib.path(), 500);
+    let http_run_id = start_http_run(
+        &http_services,
+        http_lib.path().to_str().unwrap(),
+        TEST_TOKEN,
+    )
+    .await;
+    wait_for_http_run_cell_live(&http_services, &http_run_id, TEST_TOKEN).await;
+    assert_eq!(
+        http_control(&http_services, "pause", &http_run_id, TEST_TOKEN)
+            .await
+            .status(),
+        axum::http::StatusCode::OK
+    );
+    assert_eq!(
+        wait_for_http_run_terminal(&http_services, &http_run_id, TEST_TOKEN).await["status"],
+        "paused"
+    );
+
+    let request = Request::builder()
+        .method("POST")
+        .uri(format!("/v1/index/runs/{http_run_id}/resume"))
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
+        .header("content-type", "application/json")
+        .body(Body::from(json!({ "priority": "low" }).to_string()))
+        .unwrap();
+    let response = app(Settings::default(), http_services.clone())
+        .oneshot(request)
+        .await
+        .expect("http resume");
+    assert_eq!(response.status(), axum::http::StatusCode::ACCEPTED);
+
+    let (http_concurrency,): (Option<i64>,) =
+        sqlx::query_as("SELECT concurrency FROM catalog_runs WHERE id = ?")
+            .bind(&http_run_id)
+            .fetch_one(&http_pool)
+            .await
+            .expect("http run row");
+
+    // ---- FFI leg ----
+    let ffi_dir = tempdir().unwrap();
+    let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
+    let ffi_lib = tempdir().unwrap();
+    write_library(ffi_lib.path(), 500);
+    let ffi_lib_path = ffi_lib.path().to_str().unwrap().to_string();
+    let ffi_db_for_check = ffi_db.clone();
+
+    let ffi_run_id = tokio::task::spawn_blocking(move || -> String {
+        let cdb = CString::new(ffi_db).unwrap();
+        assert_eq!(
+            alexandria_index_init(cdb.as_ptr()),
+            alexandria_ffi::INDEX_OK
+        );
+
+        let root = CString::new(ffi_lib_path).unwrap();
+        let token = CString::new(TEST_TOKEN).unwrap();
+        let started = alexandria_index_start(root.as_ptr(), token.as_ptr(), std::ptr::null());
+        assert_eq!(started.status, alexandria_ffi::INDEX_OK, "ffi start failed");
+        let run_id = run_id_string(&started);
+
+        wait_for_ffi_run_cell_live(&run_id, &token);
+        let run_id_c = CString::new(run_id.clone()).unwrap();
+        assert_eq!(
+            alexandria_index_pause(run_id_c.as_ptr(), token.as_ptr()),
+            alexandria_ffi::RUN_OK
+        );
+        wait_for_ffi_run_terminal(&run_id, &token);
+
+        let priority = CString::new("low").unwrap();
+        let resumed = alexandria_index_resume(run_id_c.as_ptr(), token.as_ptr(), priority.as_ptr());
+        assert_eq!(resumed.status, alexandria_ffi::RUN_OK, "ffi resume failed");
+        assert_eq!(
+            run_id_string(&resumed),
+            run_id,
+            "a re-paced resume still continues the same run"
+        );
+
+        // Let the resumed walk finish before the database is re-opened from
+        // the other runtime, so nothing is mid-write underneath the read.
+        wait_for_ffi_run_terminal(&run_id, &token);
+        run_id
+    })
+    .await
+    .unwrap();
+
+    let ffi_pool = migrate_database(&ffi_db_for_check)
+        .await
+        .expect("re-open ffi db");
+    let (ffi_concurrency,): (Option<i64>,) =
+        sqlx::query_as("SELECT concurrency FROM catalog_runs WHERE id = ?")
+            .bind(&ffi_run_id)
+            .fetch_one(&ffi_pool)
+            .await
+            .expect("ffi run row");
+
+    // ---- compare (two independent legs, same spelling, same effect) ----
+    assert_eq!(
+        http_concurrency,
+        Some(1),
+        "http resume with \"low\" must re-pace the run to \
+         indexing.low_priority_concurrency, not leave it at indexing.concurrency (4)"
+    );
+    assert_eq!(
+        ffi_concurrency,
+        Some(1),
+        "ffi resume with \"low\" must re-pace the run to \
+         indexing.low_priority_concurrency, not leave it at indexing.concurrency (4)"
+    );
+    assert_eq!(
+        http_concurrency, ffi_concurrency,
+        "HTTP and FFI must resolve a resume-time \"low\" identically"
     );
 }
 

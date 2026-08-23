@@ -77,6 +77,28 @@ fn control_request(verb: &str, run_id: &str, token: Option<&str>) -> Request<Bod
     builder.body(Body::empty()).unwrap()
 }
 
+/// Like [`control_request`], but with a body — including bodies axum's
+/// `Json` extractor rejects outright, so the resume route's folding of every
+/// `JsonRejection` into the default is exercised rather than assumed.
+/// `content_type` is kept separate from `raw_body` for the reason
+/// `refresh_request_raw` keeps them apart: on axum 0.8 it is the presence of
+/// that header, not the body, that decides which failures are reachable.
+fn control_request_raw(
+    verb: &str,
+    run_id: &str,
+    content_type: Option<&str>,
+    raw_body: &str,
+) -> Request<Body> {
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri(format!("/v1/index/runs/{run_id}/{verb}"))
+        .header("authorization", format!("Bearer {TEST_TOKEN}"));
+    if let Some(content_type) = content_type {
+        builder = builder.header("content-type", content_type);
+    }
+    builder.body(Body::from(raw_body.to_string())).unwrap()
+}
+
 fn runs_request(query: Option<&str>, token: Option<&str>) -> Request<Body> {
     let uri = match query {
         Some(q) => format!("/v1/index/runs?{q}"),
@@ -157,6 +179,196 @@ async fn start_index(router: &axum::Router, root: &str) -> String {
         .as_str()
         .expect("runId")
         .to_string()
+}
+
+/// Start an index run at `priority` over `lib` and drive it to `paused`,
+/// returning its id — the fixture every resume test below needs. Factored
+/// out of `given_a_paused_run_when_resumed_then_202_same_run_id_and_it_finishes`
+/// unchanged, including the 500-file library: that is what gives an *index*
+/// walk (which parses tags per file, unlike a refresh) time to still be
+/// running when the pause lands, and `wait_for_run_cell_live` panics with a
+/// pointed message rather than flaking if it ever stops being enough.
+async fn paused_index_run(
+    router: &axum::Router,
+    services: &std::sync::Arc<alexandria_core::services::Services>,
+    lib: &tempfile::TempDir,
+    priority: Option<&str>,
+) -> String {
+    let response = router
+        .clone()
+        .oneshot(index_request(lib.path().to_str().unwrap(), priority))
+        .await
+        .expect("index");
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let run_id = body_json(response).await["runId"]
+        .as_str()
+        .expect("runId")
+        .to_string();
+
+    wait_for_run_cell_live(router, &run_id).await;
+    let pause_response = router
+        .clone()
+        .oneshot(control_request("pause", &run_id, Some(TEST_TOKEN)))
+        .await
+        .expect("pause");
+    assert_eq!(pause_response.status(), StatusCode::OK);
+    assert_eq!(
+        wait_for_run_terminal(services, &run_id, TEST_TOKEN)
+            .await
+            .get("status")
+            .unwrap(),
+        "paused"
+    );
+    run_id
+}
+
+/// The user-facing goal of Task 15 over HTTP: a scan started at normal speed,
+/// paused, and resumed `"low"` so the app is usable again — without losing the
+/// run. The stored `concurrency` is the only place the resolved priority is
+/// observable (`CatalogRun::concurrency` is `#[serde(skip)]`), and it is what
+/// `execute` reads to pace the resumed walk.
+#[tokio::test]
+async fn given_a_paused_run_when_resumed_with_low_priority_then_the_run_is_repaced_low() {
+    let test = test_app().await;
+    let router = app(Settings::default(), test.services.clone());
+    let lib = tempfile::tempdir().unwrap();
+    write_library(&lib, 500);
+    let run_id = paused_index_run(&router, &test.services, &lib, None).await;
+    assert_eq!(
+        run_concurrency(&test.pool, &run_id).await,
+        Some(4),
+        "sanity: it started at indexing.concurrency"
+    );
+
+    let response = router
+        .clone()
+        .oneshot(control_request_raw(
+            "resume",
+            &run_id,
+            Some("application/json"),
+            &serde_json::json!({ "priority": "low" }).to_string(),
+        ))
+        .await
+        .expect("resume");
+
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    assert_eq!(
+        run_concurrency(&test.pool, &run_id).await,
+        Some(1),
+        "\"low\" must re-pace the run to indexing.low_priority_concurrency"
+    );
+    assert_eq!(
+        wait_for_run_terminal(&test.services, &run_id, TEST_TOKEN).await["status"],
+        "complete",
+        "and the re-paced run still finishes under the same id"
+    );
+}
+
+/// The other direction: `"normal"` is a real request to widen a throttled run
+/// back out, which is exactly what distinguishes it from sending nothing.
+#[tokio::test]
+async fn given_a_low_priority_paused_run_when_resumed_with_normal_priority_then_it_is_widened() {
+    let test = test_app().await;
+    let router = app(Settings::default(), test.services.clone());
+    let lib = tempfile::tempdir().unwrap();
+    write_library(&lib, 500);
+    let run_id = paused_index_run(&router, &test.services, &lib, Some("low")).await;
+    assert_eq!(run_concurrency(&test.pool, &run_id).await, Some(1));
+
+    let response = router
+        .clone()
+        .oneshot(control_request_raw(
+            "resume",
+            &run_id,
+            Some("application/json"),
+            &serde_json::json!({ "priority": "normal" }).to_string(),
+        ))
+        .await
+        .expect("resume");
+
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    assert_eq!(
+        run_concurrency(&test.pool, &run_id).await,
+        Some(4),
+        "\"normal\" must widen the run to indexing.concurrency"
+    );
+}
+
+/// Regression, and the reason absent is not spelled `normal`: every caller
+/// before Task 15 posted no body at all to this route, and a run they had
+/// throttled down must come back throttled down. Sending nothing is not a
+/// request to speed up.
+///
+/// Three bodiless shapes at once, because on axum 0.8 they fail three
+/// different ways and only one of them is what `Option<Json<..>>` collapses:
+/// no content-type at all, a JSON content-type with an empty body, and a
+/// JSON content-type with a body that is not JSON. All three must reach the
+/// same default.
+#[tokio::test]
+async fn given_no_readable_body_when_a_low_priority_run_is_resumed_then_it_keeps_its_low_width() {
+    for (content_type, raw_body) in [
+        (None, ""),
+        (Some("application/json"), ""),
+        (Some("application/json"), "{not json"),
+    ] {
+        let test = test_app().await;
+        let router = app(Settings::default(), test.services.clone());
+        let lib = tempfile::tempdir().unwrap();
+        write_library(&lib, 500);
+        let run_id = paused_index_run(&router, &test.services, &lib, Some("low")).await;
+
+        let response = router
+            .clone()
+            .oneshot(control_request_raw(
+                "resume",
+                &run_id,
+                content_type,
+                raw_body,
+            ))
+            .await
+            .expect("resume");
+
+        assert_eq!(
+            response.status(),
+            StatusCode::ACCEPTED,
+            "a resume with content-type {content_type:?} and body {raw_body:?} must \
+             still be accepted"
+        );
+        assert_eq!(
+            run_concurrency(&test.pool, &run_id).await,
+            Some(1),
+            "and must leave the run at the width it already had, not widen it to \
+             indexing.concurrency"
+        );
+    }
+}
+
+/// An unrecognised priority is treated like an absent one — quietly, never as
+/// a rejected call — the same leniency both start bodies already give
+/// (FR-FC-24). "Keep the current width" is the fallback here rather than
+/// `normal`, because the run already has a width to keep.
+#[tokio::test]
+async fn given_an_unrecognised_priority_when_a_low_priority_run_is_resumed_then_it_keeps_its_width()
+{
+    let test = test_app().await;
+    let router = app(Settings::default(), test.services.clone());
+    let lib = tempfile::tempdir().unwrap();
+    write_library(&lib, 500);
+    let run_id = paused_index_run(&router, &test.services, &lib, Some("low")).await;
+
+    let response = router
+        .clone()
+        .oneshot(control_request_raw(
+            "resume",
+            &run_id,
+            Some("application/json"),
+            &serde_json::json!({ "priority": "URGENT!!1" }).to_string(),
+        ))
+        .await
+        .expect("resume");
+
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    assert_eq!(run_concurrency(&test.pool, &run_id).await, Some(1));
 }
 
 #[tokio::test]

@@ -193,15 +193,31 @@ separately in `alexandria-ui`.
     A refresh resumes as safely as an index. It iterates cataloged paths and is
     idempotent, and after decision 1 re-running it is cheap.
 
-11. **Throttling is a priority chosen at run start, not a live slider.**
+11. **Throttling is a priority chosen per segment, not a live slider.**
     `buffer_unordered(n)` fixes its width when the stream is built, so a live
     knob means replacing it with a semaphore whose permits grow and shrink —
     the most invasive change available here and the likeliest to introduce a
-    subtle concurrency bug. Instead, starting or resuming a run takes
+    subtle concurrency bug. Instead, starting a run takes
     `priority: Normal | Low`, mapping to `indexing.concurrency` (default 4) and
-    a new `indexing.low_priority_concurrency` (default 1). The choice is stored
-    on the run, so resume defaults to it. Changing your mind mid-run means
-    pausing and resuming, which decision 9 made nearly free.
+    a new `indexing.low_priority_concurrency` (default 1), and the choice is
+    stored on the run.
+
+    Resume takes an **optional** priority of its own. `Some` resolves to a
+    width and overwrites the run's stored `concurrency` *before* the caller
+    spawns the next segment — which is what actually re-paces it, since
+    `execute` reads the width off the row (decision 9) and there is
+    deliberately no second path to that number. `None` keeps the run's own
+    width; it does not mean `Normal`. That distinction is the whole of the
+    backward compatibility story: every caller written before the option
+    sends nothing, and a run they throttled down must stay throttled down.
+    On the wire both surfaces spell it the same lowercase `"normal"` /
+    `"low"`, and absent, NULL, or unrecognised all mean "keep" rather than
+    being rejected.
+
+    So changing your mind mid-run means pausing and resuming — which decision
+    9 made nearly free, and which keeps the run's id, its record, and
+    everything it has already cataloged. Cancelling and starting over is not
+    the answer, and would not have been an acceptable one.
 
     A semantic priority rather than a raw thread count: the client should not
     have to invent a number.
@@ -234,7 +250,7 @@ separately in `alexandria-ui`.
 | `paused_at` | when the current pause began |
 | `paused_millis` | accumulated paused time across segments |
 | `already_cataloged` | decision 4's new counter |
-| `concurrency` | the priority the run was started or resumed with |
+| `concurrency` | the width the run was started at, or last resumed at |
 
 `status` gains `paused` and `cancelled`, and loses `interrupted`.
 
@@ -260,7 +276,7 @@ FFI (`crates/alexandria-ffi/src/lib.rs`, header regenerated):
 | Call | Shape |
 | --- | --- |
 | `alexandria_index_pause` | `(run_id, token) -> c_int` |
-| `alexandria_index_resume` | `(run_id, token) -> IndexStartResult` |
+| `alexandria_index_resume` | `(run_id, token, priority) -> IndexStartResult` |
 | `alexandria_index_cancel` | `(run_id, token) -> c_int` |
 | `alexandria_index_runs_active_json` | `(token) -> RunJsonResult` |
 | `alexandria_index_start` | gains `priority` (breaking) |
@@ -273,7 +289,8 @@ HTTP, at parity per FR-FC-24:
 - `POST /v1/index/runs/{runId}/resume`
 - `POST /v1/index/runs/{runId}/cancel`
 - `GET /v1/index/runs?status=active`
-- `priority` accepted on `POST /v1/index` and `POST /v1/index/refresh`
+- `priority` accepted on `POST /v1/index` and `POST /v1/index/refresh`, and
+  optionally in the body of `POST /v1/index/runs/{runId}/resume`
 
 The two breaking FFI signatures are acceptable because both repositories move
 together and `ffigen` regenerates the Dart bindings from the header.

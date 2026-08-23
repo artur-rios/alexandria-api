@@ -507,10 +507,12 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         run_repo.clone(),
         clock,
         run_registry,
-        // What a resumed run whose row records no width goes back to — the
-        // same `indexing.concurrency` both walks are built with, so a resume
-        // cannot end up wider or narrower than a start.
+        // The same two widths both walks are built with, so a run resumed at
+        // a priority lands on exactly the width a run *started* at that
+        // priority would have — and a resumed run whose row records no width
+        // goes back to the configured `indexing.concurrency`.
         indexing_concurrency,
+        indexing_low_priority_concurrency,
     ));
     let edit_text_file_content_handler = Arc::new(EditTextFileContentHandler::new(
         auth.clone(),

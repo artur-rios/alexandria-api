@@ -2495,7 +2495,12 @@ impl CatalogRunRepository for FakeCatalogRunRepository {
         Ok(false)
     }
 
-    async fn resume(&self, id: Uuid, paused_millis: i64) -> Result<bool, DomainError> {
+    async fn resume(
+        &self,
+        id: Uuid,
+        paused_millis: i64,
+        concurrency: Option<u32>,
+    ) -> Result<bool, DomainError> {
         let mut runs = self.runs.lock().unwrap();
         let Some(run) = runs.get_mut(&id) else {
             return Ok(false);
@@ -2505,6 +2510,13 @@ impl CatalogRunRepository for FakeCatalogRunRepository {
         // else just cancelled would revive it.
         if run.status != RunStatus::Paused {
             return Ok(false);
+        }
+        // Mirrors the adapter's `concurrency = COALESCE(?, concurrency)`, and
+        // inside the same guard: `None` keeps the stored width (including a
+        // pre-column run's absent one), `Some` re-paces the run, and a refused
+        // resume does neither.
+        if let Some(concurrency) = concurrency {
+            run.concurrency = Some(concurrency);
         }
         run.status = RunStatus::Running;
         run.paused_at = None;
@@ -2889,7 +2901,12 @@ impl CatalogRunRepository for FailingCatalogRunRepository {
         Ok(false)
     }
 
-    async fn resume(&self, _id: Uuid, _paused_millis: i64) -> Result<bool, DomainError> {
+    async fn resume(
+        &self,
+        _id: Uuid,
+        _paused_millis: i64,
+        _concurrency: Option<u32>,
+    ) -> Result<bool, DomainError> {
         Ok(false)
     }
 
