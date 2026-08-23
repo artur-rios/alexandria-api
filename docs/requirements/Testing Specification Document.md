@@ -205,9 +205,10 @@ floor is a statement about a machine, so asserting 500 files/sec inside
 `cargo test --workspace` would make the suite report on the runner rather than
 on the code.
 
-`alexandria-core/tests/throughput.rs` measures both halves of NFR-02 — the
-indexing rate, and that reads keep being served while a run is in flight
-(NFR-01's p95 during load). Its tests are `#[ignore]`d and run on request:
+`alexandria-core/tests/throughput.rs` measures each of NFR-02's three claims —
+the indexing rate, that the rate is independent of the library's total size,
+and that reads keep being served while a run is in flight (NFR-01's p95 during
+load). Its tests are `#[ignore]`d and run on request:
 
 ```bash
 cargo test --release -p alexandria-core --test throughput -- --ignored --nocapture
@@ -224,13 +225,39 @@ rather than the product. Two assertion modes:
 | `ALEXANDRIA_NFR_STRICT=1` | the requirement itself (≥ 500 files/sec, p95 < 200 ms) | verifying NFR-02 on "a personal machine", which is what the requirement scopes it to |
 
 Fixture size is tunable via `ALEXANDRIA_BENCH_FILES`,
-`ALEXANDRIA_BENCH_FILE_BYTES`, and `ALEXANDRIA_BENCH_CONCURRENCY`.
+`ALEXANDRIA_BENCH_FILE_BYTES`, `ALEXANDRIA_BENCH_MEDIA_FILES`, and
+`ALEXANDRIA_BENCH_CONCURRENCY`. The size-independence case fixes its own
+counts and sizes and reads none of them: a knob that could shrink its fixture
+back to a size-free one would defeat the only thing it measures.
 
 **What the NFR-02 number covers.** Its fixture is plain text files, so it
-measures the walk → classify → hash → persist pipeline (FR-FC-01..09) and
+measures the walk → classify → stat → persist pipeline (FR-FC-01..09) and
 nothing else. Extraction is excluded there deliberately: folding ffmpeg's probe
 speed into a figure labelled "Alexandria's indexing rate" would make the number
 say less, not more.
+
+**Size independence (NFR-02).** A separate case indexes 200 files of 8 MiB
+each — a 1.6 GB fixture tree — and asserts the resulting rate against the rate
+for the same *count* of empty files, with a floor of a quarter. If anything in
+the scan path reads a file's bytes, the large-file rate collapses by orders of
+magnitude; if it only stats them (FR-FC-09, FR-FC-10), the two rates are nearly
+identical. The floor is deliberately loose rather than tight, because the
+regression it guards against shows up as orders of magnitude and a personal
+machine's timing noise — scheduler jitter, a page cache warm for one temporary
+directory and cold for the other — is real. Fixture generation sits outside the
+timed window, or writing 1.6 GB would dominate the figure it is supposed to
+produce.
+
+This case exists because **the rest of the suite could not have caught the
+regression it guards against.** Every other fixture in the file is a small text
+file, and the throughput case's default is 2,000 files of 4 KB — 8 MB in total.
+A per-file cost proportional to the file's bytes is arithmetically invisible at
+that size: the whole fixture tree hashes in the time a single real video would.
+The suite was measuring a rate that was genuinely 500+ files/sec on its own
+fixtures while a 418 GB library took tens of minutes, and no assertion anywhere
+was wrong. Only a fixture whose bytes actually cost something can tell the two
+apart, which is the whole reason this case carries a fixture two orders of
+magnitude larger than any other in the file.
 
 **Extraction cost (FR-FC-25)** is measured separately, by the third test in the
 same file. It generates a real fixture per metadata-carrying subtype — an
@@ -241,10 +268,13 @@ format's rate as a percentage of the text baseline.
 Those rows are **floors, not forecasts.** Each fixture is the smallest valid
 file of its format, so a row isolates the fixed per-file cost — open the
 container, find the metadata, parse it — with almost no payload to scale over.
-Real media is orders of magnitude larger, and two costs grow with size:
-hashing reads every byte, and ffmpeg may seek a long way to find its best video
-stream. Read a row as "extraction costs at least this much per file, before
-file size enters into it".
+Real media is orders of magnitude larger, and extraction is the one part of
+indexing whose cost still grows with a file's size: ffmpeg may seek a long way
+to find its best video stream, and a container's metadata is not always at its
+front. Nothing else in the pipeline reads file bytes any more (FR-FC-09), which
+is why the size-independence case above passes while these rows still shift
+with real media. Read a row as "extraction costs at least this much per file,
+before file size enters into it".
 
 The test discards one warm-up round before the row it reports as the baseline.
 Every row builds its own database and fixture tree, but the first row also

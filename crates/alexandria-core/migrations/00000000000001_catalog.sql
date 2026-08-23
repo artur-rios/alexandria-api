@@ -1,10 +1,21 @@
+-- The catalog baseline: every media table the rest of the schema hangs off.
+--
+-- Pre-release baseline: amended in place, never stacked — this file has been
+-- edited after it shipped (`size_bytes` and `mtime` joined `files` when change
+-- detection stopped hashing whole files, FR-FC-09). sqlx checksums a
+-- migration's file content, so any edit here — a comment included — makes an
+-- existing database fail startup with `DomainError::Migration`. That is the
+-- accepted trade while the project is pre-release (Operations & Infrastructure
+-- Document §2.5): an existing database is deleted and rebuilt, not migrated.
 CREATE TABLE IF NOT EXISTS files (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     uuid          TEXT    NOT NULL UNIQUE,
     path          TEXT    NOT NULL UNIQUE,
     name          TEXT    NOT NULL,
     type          TEXT    NOT NULL CHECK (type IN ('audio', 'video', 'html', 'text', 'document', 'comic', 'image')),
-    content_hash  TEXT    NOT NULL,
+    content_hash  TEXT,
+    size_bytes    INTEGER,
+    mtime         TEXT,
     state         TEXT    NOT NULL DEFAULT 'active' CHECK (state IN ('active', 'deleted')),
     deleted_at    TEXT,
     indexed_at    TEXT    NOT NULL,

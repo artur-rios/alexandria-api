@@ -68,7 +68,18 @@ pub struct NewFile {
     pub path: String,
     pub name: String,
     pub file_type: FileType,
-    pub content_hash: String,
+    /// SHA-256 of the file's bytes, lowercase hex. Indexing never reads
+    /// file bytes (FR-FC-09), so this is `None` for most files — the only
+    /// writer is UC-33's text-content edit, which recomputes it from the
+    /// bytes it just wrote and verified (FR-TX-03). `None` is the normal,
+    /// expected state for a file nothing has ever edited, not a gap to be
+    /// filled in.
+    pub content_hash: Option<String>,
+    /// The file's size in bytes at index time. With `mtime`, this is what
+    /// re-index compares to decide whether a file changed (FR-FC-10).
+    pub size_bytes: Option<i64>,
+    /// The file's on-disk modification time at index time.
+    pub mtime: Option<DateTime<Utc>>,
     pub indexed_at: DateTime<Utc>,
 }
 
@@ -299,7 +310,18 @@ pub struct File {
     pub path: String,
     pub name: String,
     pub file_type: FileType,
-    pub content_hash: String,
+    /// SHA-256 of the file's bytes, lowercase hex. Indexing never reads
+    /// file bytes (FR-FC-09), so this is `None` for most files — the only
+    /// writer is UC-33's text-content edit, which recomputes it from the
+    /// bytes it just wrote and verified (FR-TX-03). `None` is the normal,
+    /// expected state for a file nothing has ever edited, not a gap to be
+    /// filled in.
+    pub content_hash: Option<String>,
+    /// The file's size in bytes at index time. With `mtime`, this is what
+    /// re-index compares to decide whether a file changed (FR-FC-10).
+    pub size_bytes: Option<i64>,
+    /// The file's on-disk modification time at index time.
+    pub mtime: Option<DateTime<Utc>>,
     pub state: FileState,
     pub deleted_at: Option<DateTime<Utc>>,
     pub indexed_at: DateTime<Utc>,

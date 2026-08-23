@@ -110,13 +110,15 @@ alexandria-api/
 | IR-05 | Database migrations shall run at startup before the server begins serving requests. |
 | IR-06 | The solution shall generate a C header for the FFI surface (via cbindgen) as part of the build, for the Flutter front-end to consume. |
 
-### 2.5 Migrations are append-only
+### 2.5 Migrations are append-only — with one pre-release exception
 
 sqlx records a checksum of every applied migration's **file content** and
 refuses to run against a database whose stored checksum no longer matches,
 failing with `VersionMismatch`. Editing a migration that has already run —
 including changing only a comment — therefore breaks every existing database,
-not just schema-relevant edits.
+not just schema-relevant edits. IR-05 runs migrations before the server
+serves, so such a database does not degrade: it fails startup outright, with
+`DomainError::Migration`.
 
 The rule: once a migration has been applied anywhere it must be treated as
 frozen; corrections go in a new migration. A database that has drifted (because
@@ -128,6 +130,36 @@ file and letting it rebuild:
 -- inspect what the database believes it applied
 SELECT version, description, checksum FROM _sqlx_migrations ORDER BY version;
 ```
+
+#### The pre-release exception
+
+Until the first packaged release described in §7 Build & Delivery, the
+**baseline migrations may be amended in place** rather than corrected by a new
+one. A baseline migration is one that establishes a table's shape rather than
+changing it, and each says so in its own header comment
+(`00000000000001_catalog.sql`, `00000000000011_catalog_runs.sql`). Anything
+that is not a baseline is frozen by the rule above from the moment it merges.
+
+Two facts make this the cheaper answer for now, and both expire:
+
+* The only deployment is the single-user desktop bundle of §6, and packaging
+  it is still deferred (§7). There is no installed base to migrate — the
+  databases in existence are development ones and the maintainer's own.
+* A settled table read in one file beats the same table reconstructed from a
+  chain of `ALTER TABLE`s, and the indexing schema was still moving:
+  `size_bytes`/`mtime` replaced hash-based change detection, and the run
+  record grew progress, pause, priority, and segment columns.
+
+What the exception costs, stated plainly: **an existing database is deleted
+and rebuilt, not migrated.** A user who upgrades across an amendment gets
+`DomainError::Migration` at startup and must delete the database file, losing
+their catalog and re-indexing. That is acceptable only because the catalog is
+derived from files on disk and can be rebuilt by re-running the index. Every
+amendment must therefore be announced as a breaking change in the README's
+[Upgrading](../../README.md#upgrading) section.
+
+This exception ends at the first packaged release. From then on the rule above
+is unconditional and the baselines are frozen like everything else.
 
 ---
 
@@ -154,10 +186,11 @@ keys — a key not listed here does not exist, and only the keys showing an
 | `http.port` | config / `ALEXANDRIA_HTTP_PORT` | default `8080`. |
 | `database.path` | config / `ALEXANDRIA_DATABASE_PATH` | SQLite file path; bundled beside the desktop app's data dir. |
 | `filesystem.root` | config / `ALEXANDRIA_FILESYSTEM_ROOT` | the library root, in two roles. The health check probes it for reachability (IR-03 / UC-37), and it **bounds indexing**: UC-01 rejects a requested root that is neither it nor a descendant of it (FR-FC-26). Empty — the default — turns both roles off: the probe reports the filesystem unreachable, and indexing is unconstrained, so UC-01 will catalog any absolute path a caller supplies. Startup logs a warning while it is unset. UC-02 takes no root and is unaffected either way. |
-| `indexing.concurrency` | config / `ALEXANDRIA_INDEXING_CONCURRENCY` | how many files the UC-01 index and UC-02 re-index walks process at a time; default `4`, `0` is treated as `1`. Hashing runs on the blocking pool, so this is real parallelism; the DB half still serializes behind SQLite's single writer and the 8-connection pool. |
+| `indexing.concurrency` | config / `ALEXANDRIA_INDEXING_CONCURRENCY` | how many files a `normal`-priority UC-01 index or UC-02 re-index walk processes at a time (FR-FC-08, FR-FC-31); default `4`, `0` is treated as `1`. The filesystem half runs on the blocking pool, so this is real parallelism; the DB half still serializes behind SQLite's single writer and the 8-connection pool, so values far above that buy nothing. |
+| `indexing.low_priority_concurrency` | config / `ALEXANDRIA_INDEXING_LOW_PRIORITY_CONCURRENCY` | the same width for a run started — or resumed (FR-FC-33) — at `low` priority (FR-FC-31); default `1`, `0` is treated as `1`. A low-priority scan is meant to stay out of the way of browsing and playback rather than to finish fast, which is why the default is sequential. |
 | `deletion.retention_days` | config / `ALEXANDRIA_DELETION_RETENTION_DAYS` | soft-delete retention window; default `30` (NFR-10). |
 | `logging.level` | config / `ALEXANDRIA_LOG_LEVEL` | `error` / `warn` / `info` / `debug` / `trace`; default `info`. |
-| `playback.thumbnail_cache_dir` | config / `ALEXANDRIA_PLAYBACK_THUMBNAIL_CACHE_DIR` | directory holding thumbnails generated by UC-40, created on first use; default `thumbnails`. Entries are keyed by content hash, so a re-index invalidates a changed file's thumbnail for free; nothing evicts old entries. |
+| `playback.thumbnail_cache_dir` | config / `ALEXANDRIA_PLAYBACK_THUMBNAIL_CACHE_DIR` | directory holding thumbnails generated by UC-40, created on first use; default `thumbnails`. Entries are keyed by the file's UUID, its recorded modification time, and the target dimension (UC-40), so a re-index that picks up a new modification time invalidates that file's thumbnail for free; nothing evicts old entries. |
 
 **Secrets:** local-login credentials live only in the SQLite credential row
 (never in config or env), and the password is held there only as a one-way
@@ -224,9 +257,11 @@ Logging uses structured, span-aware logs via `tracing` / `tracing-subscriber`
 | Span fields | `use_case`, `request_id`, `file_uuid`, `operation` on relevant spans |
 | Never logged | plaintext passwords, password hashes, JWT contents, full credential values, file contents |
 
-A log line is emitted for indexing progress (files indexed, hashes computed) and
-for every catalog write at `info`; validation and auth denials are `warn`; disk
-and integrity failures are `error`.
+A log line is emitted for indexing progress (files indexed, skipped, already
+cataloged, failed) and for every catalog write at `info`; validation and auth
+denials are `warn`; disk and integrity failures are `error`. Startup logs how
+many runs it found still marked `running` and recorded `paused` for resume
+(FR-FC-29), so an operator can see that a previous process stopped mid-scan.
 
 ---
 

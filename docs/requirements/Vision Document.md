@@ -111,7 +111,7 @@ database instead.
 
 | ID | Feature | Description |
 | --- | --- | --- |
-| **F-01** | File indexing | Scan a directory tree, create type-aware catalog records for supported file types, compute content hashes, and run indexing asynchronously without blocking reads. |
+| **F-01** | File indexing | Scan a directory tree and create type-aware catalog records for supported file types, recording each file's path, size, and modification time without reading its contents. Runs asynchronously without blocking reads, report their progress while they go, and can be started at a chosen priority, paused, resumed — optionally at a new priority — and cancelled. |
 | **F-02** | Catalog browsing and metadata editing | List, query, view, and edit the metadata of any supported file type; edit comic-book, video, audio, document, and image metadata; browse by type and collection. |
 | **F-03** | Renaming and lifecycle management | Rename files (which renames them on disk), soft-delete records with restore, hard-purge records, and explicitly purge a file on disk. |
 | **F-04** | Text file content editing | Read Markdown and text file content and write edited content back to the file on disk. |
@@ -150,8 +150,8 @@ erDiagram
 Each entity carries an internal primary key plus a public UUID (see
 [System Requirements Document](System%20Requirements%20Document.md) §4.0). The
 owner is a single implicit principal — no entity carries a per-user foreign key.
-A File is referenced by its on-disk path and a content hash; the bytes are never
-stored.
+A File is referenced by its on-disk path, size, and modification time; the bytes
+are never stored, and are never read to identify the file.
 
 ---
 
@@ -170,7 +170,7 @@ Alexandria has exactly one kind of actor, so no role hierarchy diagram applies.
 
 - The platform is **Rust**, with `#![deny(unsafe_code)]` applied project-wide; concrete versions are pinned in the [Technology Stack Document](Technology%20Stack%20Document.md).
 - The relational store is **SQLite**, embedded and bundled with the desktop app; additional databases may be introduced later but SQLite is the starting point (see [Technology Stack Document](Technology%20Stack%20Document.md) §4).
-- The API stores **metadata and a path/content-hash reference only** — never file bytes.
+- The API stores **metadata and a reference to the file on disk only** — its path, size, and modification time — never file bytes.
 - The API performs **no complex media editing** — no audio or video re-encoding, no image manipulation.
 - **Exactly one auth mode** is active at runtime, selected by startup configuration; JWTs are never issued by Alexandria.
 - Deletion is **two-phase**: soft delete (restorable) then hard purge after a configurable retention window; on-disk files are removed only by an explicit purge-on-disk operation.

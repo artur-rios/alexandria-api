@@ -19,12 +19,34 @@ pub trait CatalogRepository: Send + Sync {
     async fn insert_file(&self, new_file: NewFile) -> Result<File, DomainError>;
     /// Every cataloged record (UC-02 re-index iterates these).
     async fn list_all(&self) -> Result<Vec<File>, DomainError>;
-    /// Refresh a file's content hash + `indexed_at` and clear the missing marker
-    /// (the on-disk file returned / is present). `state`/`deleted_at` untouched.
+    /// Refresh a file's content hash, size, and mtime + `indexed_at`, and
+    /// clear the missing marker. **UC-33's writer only**
+    /// (`EditTextFileContentHandler`) — a text edit changes the file's bytes,
+    /// size, *and* mtime all at once. Recording only the hash and not the new
+    /// size/mtime would leave the row's stats stale, so the very next
+    /// re-index would see a stat mismatch, treat the file as changed, and
+    /// null out the hash this call just verified and stored (see
+    /// `refresh_stat` below, which is what re-index calls). `state` /
+    /// `deleted_at` untouched.
     async fn refresh_hash(
         &self,
         path: &str,
         content_hash: &str,
+        size_bytes: i64,
+        mtime: Option<DateTime<Utc>>,
+        indexed_at: DateTime<Utc>,
+    ) -> Result<(), DomainError>;
+    /// Refresh a file's size and mtime + `indexed_at`, clear its (now stale)
+    /// `content_hash`, and clear the missing marker. **UC-02's writer only**
+    /// (`RefreshHandler`) — re-index compares stat, not bytes (Task 4 /
+    /// FR-FC-10), so it never has a fresh hash to record; the recorded one
+    /// described bytes that changed, so it is nulled rather than left to be
+    /// served as current. `state` / `deleted_at` untouched.
+    async fn refresh_stat(
+        &self,
+        path: &str,
+        size_bytes: i64,
+        mtime: Option<DateTime<Utc>>,
         indexed_at: DateTime<Utc>,
     ) -> Result<(), DomainError>;
     /// Mark a cataloged path's disk file as gone (UC-02 AF-01). Sets
@@ -261,17 +283,20 @@ fn parse_type_str(s: &str) -> Result<FileType, DomainError> {
 
 /// A `files` row as selected by every catalog read, in column order:
 /// uuid, path, name, type, content_hash, state, deleted_at, indexed_at,
-/// missing_at. Named so the four read paths share one shape and `parse_file_row`
-/// has a single source of truth for it.
+/// missing_at, size_bytes, mtime. Named so the four read paths share one
+/// shape and `parse_file_row` has a single source of truth for it.
+/// `content_hash` is nullable (Task 3): `None` means "not computed yet".
 type FileRow = (
-    String,
-    String,
     String,
     String,
     String,
     String,
     Option<String>,
     String,
+    Option<String>,
+    String,
+    Option<String>,
+    Option<i64>,
     Option<String>,
 );
 
@@ -294,7 +319,7 @@ impl CatalogRepository for SqliteCatalogRepository {
     async fn find_by_path(&self, path: &str) -> Result<Option<File>, DomainError> {
         let row: Option<FileRow> = sqlx::query_as(
             "SELECT uuid, path, name, type, content_hash, state, deleted_at, indexed_at, \
-             missing_at FROM files WHERE path = ?",
+             missing_at, size_bytes, mtime FROM files WHERE path = ?",
         )
         .bind(path)
         .fetch_optional(&self.pool)
@@ -305,7 +330,7 @@ impl CatalogRepository for SqliteCatalogRepository {
     async fn find_by_uuid(&self, uuid: Uuid) -> Result<Option<File>, DomainError> {
         let row: Option<FileRow> = sqlx::query_as(
             "SELECT uuid, path, name, type, content_hash, state, deleted_at, indexed_at, \
-             missing_at FROM files WHERE uuid = ?",
+             missing_at, size_bytes, mtime FROM files WHERE uuid = ?",
         )
         .bind(uuid.to_string())
         .fetch_optional(&self.pool)
@@ -318,14 +343,17 @@ impl CatalogRepository for SqliteCatalogRepository {
 
         sqlx::query(
             "INSERT INTO files \
-             (uuid, path, name, type, content_hash, state, deleted_at, indexed_at, missing_at) \
-             VALUES (?, ?, ?, ?, ?, 'active', NULL, ?, NULL)",
+             (uuid, path, name, type, content_hash, size_bytes, mtime, state, deleted_at, \
+             indexed_at, missing_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, 'active', NULL, ?, NULL)",
         )
         .bind(new_file.uuid.to_string())
         .bind(&new_file.path)
         .bind(&new_file.name)
         .bind(new_file.file_type.as_str())
-        .bind(&new_file.content_hash)
+        .bind(new_file.content_hash.as_deref())
+        .bind(new_file.size_bytes)
+        .bind(new_file.mtime.map(|t| t.to_rfc3339()))
         .bind(new_file.indexed_at.to_rfc3339())
         .execute(&mut *tx)
         .await?;
@@ -347,6 +375,8 @@ impl CatalogRepository for SqliteCatalogRepository {
             name: new_file.name,
             file_type: new_file.file_type,
             content_hash: new_file.content_hash,
+            size_bytes: new_file.size_bytes,
+            mtime: new_file.mtime,
             state: FileState::Active,
             deleted_at: None,
             indexed_at: new_file.indexed_at,
@@ -357,7 +387,7 @@ impl CatalogRepository for SqliteCatalogRepository {
     async fn list_all(&self) -> Result<Vec<File>, DomainError> {
         let rows: Vec<FileRow> = sqlx::query_as(
             "SELECT uuid, path, name, type, content_hash, state, deleted_at, indexed_at, \
-             missing_at FROM files ORDER BY path",
+             missing_at, size_bytes, mtime FROM files ORDER BY path",
         )
         .fetch_all(&self.pool)
         .await?;
@@ -368,13 +398,37 @@ impl CatalogRepository for SqliteCatalogRepository {
         &self,
         path: &str,
         content_hash: &str,
+        size_bytes: i64,
+        mtime: Option<DateTime<Utc>>,
         indexed_at: DateTime<Utc>,
     ) -> Result<(), DomainError> {
         sqlx::query(
-            "UPDATE files SET content_hash = ?, indexed_at = ?, missing_at = NULL \
-             WHERE path = ?",
+            "UPDATE files SET content_hash = ?, size_bytes = ?, mtime = ?, \
+             indexed_at = ?, missing_at = NULL WHERE path = ?",
         )
         .bind(content_hash)
+        .bind(size_bytes)
+        .bind(mtime.map(|t| t.to_rfc3339()))
+        .bind(indexed_at.to_rfc3339())
+        .bind(path)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn refresh_stat(
+        &self,
+        path: &str,
+        size_bytes: i64,
+        mtime: Option<DateTime<Utc>>,
+        indexed_at: DateTime<Utc>,
+    ) -> Result<(), DomainError> {
+        sqlx::query(
+            "UPDATE files SET size_bytes = ?, mtime = ?, content_hash = NULL, \
+             indexed_at = ?, missing_at = NULL WHERE path = ?",
+        )
+        .bind(size_bytes)
+        .bind(mtime.map(|t| t.to_rfc3339()))
         .bind(indexed_at.to_rfc3339())
         .bind(path)
         .execute(&self.pool)
@@ -530,7 +584,7 @@ impl CatalogRepository for SqliteCatalogRepository {
         // injection surface; `?` placeholders bind the type discriminator and
         // the collection uuid.
         let base = "SELECT uuid, path, name, type, content_hash, state, deleted_at, \
-                    indexed_at, missing_at FROM files";
+                    indexed_at, missing_at, size_bytes, mtime FROM files";
         let mut sql = String::from(base);
         let mut conj = " WHERE ";
         if file_type.is_some() {
@@ -1173,8 +1227,10 @@ impl CatalogRepository for SqliteCatalogRepository {
 /// unknown `type` — means the row is corrupt. Returning an error surfaces that
 /// as a `500`; silently substituting the nil UUID or `text` would hand the
 /// caller a plausible-looking record that does not correspond to reality.
-/// Nullable columns (`deleted_at`, `missing_at`) are absent-or-valid: a NULL is
-/// legitimately `None`, but a present-and-unparseable value is corruption.
+/// Nullable columns (`deleted_at`, `missing_at`, `content_hash`) are
+/// absent-or-valid: a NULL is legitimately `None`, but a present-and-
+/// unparseable value is corruption (`content_hash` has no parse step, so
+/// there is nothing to fail — every non-NULL value is accepted as-is).
 fn parse_file_row(row: FileRow) -> Result<File, DomainError> {
     let (
         uuid_str,
@@ -1186,6 +1242,8 @@ fn parse_file_row(row: FileRow) -> Result<File, DomainError> {
         deleted_at_str,
         indexed_at_str,
         missing_at_str,
+        size_bytes,
+        mtime_str,
     ) = row;
 
     let uuid = Uuid::parse_str(&uuid_str).map_err(|_| {
@@ -1210,6 +1268,9 @@ fn parse_file_row(row: FileRow) -> Result<File, DomainError> {
     let missing_at = missing_at_str
         .map(|s| parse_timestamp(&s, "missing_at"))
         .transpose()?;
+    let mtime = mtime_str
+        .map(|s| parse_timestamp(&s, "mtime"))
+        .transpose()?;
 
     Ok(File {
         uuid,
@@ -1217,6 +1278,8 @@ fn parse_file_row(row: FileRow) -> Result<File, DomainError> {
         name,
         file_type,
         content_hash,
+        size_bytes,
+        mtime,
         state,
         deleted_at,
         indexed_at,

@@ -9,6 +9,7 @@ pub mod image_tags;
 pub mod model;
 pub mod queries;
 pub mod repos;
+pub mod run_registry;
 pub mod runs;
 pub mod video_tags;
 

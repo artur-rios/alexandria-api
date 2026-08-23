@@ -32,14 +32,17 @@ use crate::catalog::commands::purge_on_disk::PurgeFileOnDiskHandler;
 use crate::catalog::commands::refresh::RefreshHandler;
 use crate::catalog::commands::rename::RenameFileHandler;
 use crate::catalog::commands::restore::RestoreFileHandler;
+use crate::catalog::commands::run_control::RunControlHandler;
 use crate::catalog::commands::soft_delete::SoftDeleteFileHandler;
 use crate::catalog::document_tags::PdfEpubMetadataReader;
 use crate::catalog::fs::StdFilesystem;
 use crate::catalog::image_tags::ExifImageMetadataReader;
+use crate::catalog::queries::active_runs::GetActiveRunsHandler;
 use crate::catalog::queries::browse::BrowseFilesHandler;
 use crate::catalog::queries::read_content::ReadTextFileContentHandler;
 use crate::catalog::queries::run_status::GetRunStatusHandler;
 use crate::catalog::repos::SqliteCatalogRepository;
+use crate::catalog::run_registry::RunRegistry;
 use crate::catalog::runs::{CatalogRunRepository, SqliteCatalogRunRepository};
 use crate::catalog::video_tags::FfmpegVideoMetadataReader;
 use crate::collections::commands::add_items::AddItemsToCollectionHandler;
@@ -122,7 +125,13 @@ pub type DefaultReadTextFileContentHandler =
     ReadTextFileContentHandler<RuntimeAuthService, SqliteCatalogRepository, StdFilesystem>;
 
 pub type DefaultGetRunStatusHandler =
-    GetRunStatusHandler<RuntimeAuthService, SqliteCatalogRunRepository>;
+    GetRunStatusHandler<RuntimeAuthService, SqliteCatalogRunRepository, SystemClock>;
+
+pub type DefaultGetActiveRunsHandler =
+    GetActiveRunsHandler<RuntimeAuthService, SqliteCatalogRunRepository, SystemClock>;
+
+pub type DefaultRunControlHandler =
+    RunControlHandler<RuntimeAuthService, SqliteCatalogRunRepository, SystemClock>;
 
 pub type DefaultEditTextFileContentHandler = EditTextFileContentHandler<
     RuntimeAuthService,
@@ -288,6 +297,8 @@ pub struct Services {
     pub browse_files_handler: Arc<DefaultBrowseFilesHandler>,
     pub read_text_file_content_handler: Arc<DefaultReadTextFileContentHandler>,
     pub get_run_status_handler: Arc<DefaultGetRunStatusHandler>,
+    pub get_active_runs_handler: Arc<DefaultGetActiveRunsHandler>,
+    pub run_control_handler: Arc<DefaultRunControlHandler>,
     pub edit_text_file_content_handler: Arc<DefaultEditTextFileContentHandler>,
     pub playback_source_handler: Arc<DefaultPlaybackSourceHandler>,
     pub comic_page_handler: Arc<DefaultComicPageHandler>,
@@ -339,25 +350,32 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
     let retention_days = settings.deletion.retention_days;
     let repo = SqliteCatalogRepository::new(pool.clone());
     let run_repo = SqliteCatalogRunRepository::new(pool.clone());
+    // FR-FC-28: one registry, shared by the handlers that publish live run
+    // progress and the query that reads it back.
+    let run_registry = RunRegistry::new();
     let session_repo = SqliteSessionRepository::new(pool.clone());
     let credential_repo = SqliteLocalCredentialRepository::new(pool.clone());
     let recovery_code_repo = SqliteRecoveryCodeRepository::new(pool.clone());
     let fs = StdFilesystem;
     let clock = SystemClock;
     // FR-FC-29: any run still recorded as `running` belongs to a process that
-    // is gone — runs execute in-process and are never resumed. Reconcile them
-    // now, so a client polling one gets a terminal answer instead of waiting
-    // forever. A failure here must not stop startup: the catalog is still
+    // is gone — runs execute in-process, so nothing is walking it. Reconcile
+    // them into `paused`, so a client polling one gets a definite answer
+    // instead of waiting forever, and the owner is offered the run back
+    // rather than told it was lost. Nothing is started here: resuming is an
+    // explicit act. A failure must not stop startup — the catalog is still
     // fully usable, and the stale rows are reconciled on the next boot.
-    match run_repo.interrupt_running(clock.now()).await {
+    match run_repo.pause_running(clock.now()).await {
         Ok(0) => {}
         Ok(reconciled) => {
             tracing::info!(
                 reconciled,
-                "marked interrupted runs left by a previous process"
+                "paused runs left by a previous process; they can be resumed"
             )
         }
-        Err(err) => tracing::warn!(error = %err, "could not reconcile interrupted runs"),
+        Err(err) => {
+            tracing::warn!(error = %err, "could not reconcile runs left by a previous process")
+        }
     }
     // FR-AU-01/FR-AU-03: exactly one auth mode is active, selected once here
     // from startup configuration.
@@ -386,8 +404,11 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
     let video_tags = FfmpegVideoMetadataReader;
     let comic_tags = CbzComicMetadataReader;
     // UC-01 and UC-02 are the same hash-every-file workload, so both walks
-    // take the same `indexing.concurrency` bound.
+    // take the same `indexing.concurrency` bound, and the same
+    // `indexing.low_priority_concurrency` bound for a `RunPriority::Low` run
+    // (FR-FC-08).
     let indexing_concurrency = settings.indexing.concurrency;
+    let indexing_low_priority_concurrency = settings.indexing.low_priority_concurrency;
     // FR-FC-26: `filesystem.root` bounds which trees UC-01 will index. It is
     // logged here, once per process, because this is the single startup path
     // both transports go through — the HTTP binary and `alexandria_index_init`
@@ -421,8 +442,10 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         video_tags,
         comic_tags,
         indexing_concurrency,
+        indexing_low_priority_concurrency,
         settings.filesystem.root.clone(),
         run_repo.clone(),
+        run_registry.clone(),
     ));
     let refresh_handler = Arc::new(RefreshHandler::new(
         auth.clone(),
@@ -430,7 +453,9 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         fs,
         clock,
         indexing_concurrency,
+        indexing_low_priority_concurrency,
         run_repo.clone(),
+        run_registry.clone(),
     ));
     let edit_metadata_handler = Arc::new(EditMetadataHandler::new(auth.clone(), repo.clone()));
     let rename_file_handler = Arc::new(RenameFileHandler::new(auth.clone(), repo.clone(), fs));
@@ -459,7 +484,36 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         repo.clone(),
         fs,
     ));
-    let get_run_status_handler = Arc::new(GetRunStatusHandler::new(auth.clone(), run_repo.clone()));
+    let get_run_status_handler = Arc::new(GetRunStatusHandler::new(
+        auth.clone(),
+        run_repo.clone(),
+        clock,
+        run_registry.clone(),
+    ));
+    // Same repository and registry as the single-run query above: a client
+    // listing outstanding runs wants the same live-overlaid numbers a
+    // single-run read gives, not a second, differently-sourced answer.
+    let get_active_runs_handler = Arc::new(GetActiveRunsHandler::new(
+        auth.clone(),
+        run_repo.clone(),
+        clock,
+        run_registry.clone(),
+    ));
+    // The same registry the two walks publish into: pausing a run means
+    // writing a signal into the very cell its own loop is reading, so a
+    // second registry here would signal nothing at all.
+    let run_control_handler = Arc::new(RunControlHandler::new(
+        auth.clone(),
+        run_repo.clone(),
+        clock,
+        run_registry,
+        // The same two widths both walks are built with, so a run resumed at
+        // a priority lands on exactly the width a run *started* at that
+        // priority would have — and a resumed run whose row records no width
+        // goes back to the configured `indexing.concurrency`.
+        indexing_concurrency,
+        indexing_low_priority_concurrency,
+    ));
     let edit_text_file_content_handler = Arc::new(EditTextFileContentHandler::new(
         auth.clone(),
         repo.clone(),
@@ -653,6 +707,8 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         browse_files_handler,
         read_text_file_content_handler,
         get_run_status_handler,
+        get_active_runs_handler,
+        run_control_handler,
         edit_text_file_content_handler,
         playback_source_handler,
         comic_page_handler,

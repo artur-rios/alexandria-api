@@ -77,6 +77,8 @@ async fn given_text_file_when_content_edited_then_200_and_disk_and_hash_updated(
     wait_for_files(&test.pool, 1).await;
     let rows_before = file_rows_with_uuid(&test.pool).await;
     let uuid = rows_before[0].0.clone();
+    // `None`: indexing never reads file bytes (FR-FC-09), so nothing computed
+    // a hash. UC-33's edit is what writes the first one.
     let hash_before = rows_before[0].4.clone();
 
     let response = router
@@ -87,13 +89,14 @@ async fn given_text_file_when_content_edited_then_200_and_disk_and_hash_updated(
     assert_eq!(response.status(), StatusCode::OK);
     let body = body_json(response).await;
     assert_eq!(body["uuid"], uuid);
-    assert_ne!(body["contentHash"], hash_before);
+    let hash_after = body["contentHash"].as_str().map(str::to_string);
+    assert_ne!(hash_after, hash_before);
 
     let on_disk = std::fs::read_to_string(&path).expect("read back");
     assert_eq!(on_disk, "new content");
 
     let rows_after = file_rows_with_uuid(&test.pool).await;
-    assert_eq!(rows_after[0].4, body["contentHash"].as_str().unwrap());
+    assert_eq!(rows_after[0].4.as_deref(), body["contentHash"].as_str());
 }
 
 // ---------------- AF-01: invalid input (wrong file type) ----------------

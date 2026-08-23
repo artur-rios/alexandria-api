@@ -1,0 +1,593 @@
+//! Live progress for in-flight runs (UC-42 / FR-FC-28).
+//!
+//! A run in flight used to have status `running` and nothing else: counts were
+//! written once, at the end, by `runs.finish`. A client could not draw a
+//! progress bar because the core published no number to draw one from.
+//!
+//! Progress lives here, in a per-run cell of atomics, rather than in the
+//! database: the processing loop touches it once per file, and a row update
+//! per file would put a SQLite write in front of every entry — the exact cost
+//! FR-FC-08 keeps off the indexing path. The cell is flushed into
+//! `catalog_runs` periodically instead (see the handlers), which is what lets
+//! a run that stopped still report its last known tally.
+
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+
+use serde::Serialize;
+use uuid::Uuid;
+
+/// Which half of a run is executing (FR-FC-28).
+///
+/// `Discovering` is enumeration — a filesystem walk for an index, a
+/// `list_all` for a refresh — during which the denominator is not yet known.
+/// `Processing` is the per-entry loop, where both numbers are meaningful.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RunPhase {
+    Discovering,
+    Processing,
+}
+
+impl RunPhase {
+    /// The stored form. Kept as text, like `kind` and `status`, so a row is
+    /// readable without a lookup table.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RunPhase::Discovering => "discovering",
+            RunPhase::Processing => "processing",
+        }
+    }
+
+    /// `None` for an unrecognized value. The caller decides whether that is
+    /// an error; for a display-only field, "unknown" is not worth failing a
+    /// read over.
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "discovering" => Some(RunPhase::Discovering),
+            "processing" => Some(RunPhase::Processing),
+            _ => None,
+        }
+    }
+
+    /// The `AtomicU8` encoding. Private to this module — the discriminants
+    /// are an implementation detail of [`RunCell`], not a stored format.
+    fn as_code(self) -> u8 {
+        match self {
+            RunPhase::Discovering => 0,
+            RunPhase::Processing => 1,
+        }
+    }
+
+    fn from_code(code: u8) -> Self {
+        match code {
+            1 => RunPhase::Processing,
+            // A cell is born `Discovering` and only ever set to a value
+            // `as_code` produced, so this arm is unreachable in practice.
+            // Defaulting beats panicking in a display path.
+            _ => RunPhase::Discovering,
+        }
+    }
+}
+
+/// What a run has been told to do, if anything.
+///
+/// One signal serves both verbs because the run reads them identically: stop
+/// taking new entries. What differs is only what is *recorded* afterwards —
+/// a pause the run can be resumed from, or a terminal cancel — and that
+/// decision belongs to the handler writing the row, not to the loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunSignal {
+    None,
+    Pause,
+    Cancel,
+}
+
+impl RunSignal {
+    /// The `AtomicU8` encoding. Private, like [`RunPhase::as_code`] — these
+    /// discriminants are an implementation detail of [`RunCell`].
+    ///
+    /// The values are ordered by severity, which [`RunCell::raise`] relies
+    /// on: `None` < `Pause` < `Cancel`.
+    fn as_code(self) -> u8 {
+        match self {
+            RunSignal::None => 0,
+            RunSignal::Pause => 1,
+            RunSignal::Cancel => 2,
+        }
+    }
+
+    fn from_code(code: u8) -> Self {
+        match code {
+            1 => RunSignal::Pause,
+            2 => RunSignal::Cancel,
+            // A cell is born `None` and only ever set to a value `as_code`
+            // produced, so this arm is unreachable in practice.
+            _ => RunSignal::None,
+        }
+    }
+}
+
+/// One read of a [`RunCell`]. `total` is `None` while discovery is still
+/// counting — see [`TOTAL_UNKNOWN`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RunProgress {
+    pub phase: RunPhase,
+    pub total: Option<usize>,
+    pub processed: usize,
+}
+
+/// The sentinel [`RunCell::total`] holds until discovery reports a real count.
+///
+/// A sentinel rather than an `Option` because the field has to be an atomic —
+/// there is no `AtomicOption<usize>`, and wrapping the whole cell in a mutex
+/// to make one nullable field expressible would put a lock on the per-file
+/// path. `usize::MAX` is safe as the "unknown" marker: it means a library of
+/// exactly `usize::MAX` files would report an unknown total, which is not a
+/// reachable library.
+const TOTAL_UNKNOWN: usize = usize::MAX;
+
+/// The live progress of one run: a phase, a denominator, and a counter.
+///
+/// Every field is `Ordering::Relaxed`. These counters are read for display,
+/// and a reader that sees `processed` one increment behind — or sees the new
+/// `total` a moment before the phase that goes with it — has read a progress
+/// bar that is momentarily stale, not a wrong answer. Nothing branches on
+/// them, and no other state is published through them, so there is nothing
+/// for an `Acquire`/`Release` pair to order. Paying for a fence on every
+/// indexed file to make a progress bar a few microseconds fresher is not a
+/// trade worth making.
+#[derive(Debug)]
+pub struct RunCell {
+    processed: AtomicUsize,
+    total: AtomicUsize,
+    phase: AtomicU8,
+    /// What the run has been told to do, raised by `RunControlHandler` and
+    /// read by the processing loop before each entry.
+    ///
+    /// `Relaxed` like the rest, and for the same reason: nothing else is
+    /// published through it. A reader that sees the signal one poll late has
+    /// halted one entry later than it might have — a stat and a header read,
+    /// microseconds — and the atomic itself still guarantees the write
+    /// arrives. There is no other state whose visibility has to be ordered
+    /// against it, so an `Acquire`/`Release` pair would buy nothing.
+    signal: AtomicU8,
+}
+
+impl RunCell {
+    fn new() -> Self {
+        Self {
+            processed: AtomicUsize::new(0),
+            total: AtomicUsize::new(TOTAL_UNKNOWN),
+            phase: AtomicU8::new(RunPhase::Discovering.as_code()),
+            signal: AtomicU8::new(RunSignal::None.as_code()),
+        }
+    }
+
+    /// Tell the run to stop.
+    ///
+    /// Never downgrades: a signal already raised stays at least as severe as
+    /// it was. Without that, a `pause` racing a `cancel` could turn the
+    /// cancel into a pause — the control handler reads the run's *row* to
+    /// decide whether a transition is legal, and the row still says `running`
+    /// for the moment between a cancel being raised and the loop writing it.
+    /// A cancel that quietly became a pause would leave a run the owner asked
+    /// to abandon sitting there resumable.
+    pub fn raise(&self, signal: RunSignal) {
+        self.signal.fetch_max(signal.as_code(), Ordering::Relaxed);
+    }
+
+    /// What the run has been told to do. `RunSignal::None` is the overwhelming
+    /// case — this is read once per entry.
+    pub fn signal(&self) -> RunSignal {
+        RunSignal::from_code(self.signal.load(Ordering::Relaxed))
+    }
+
+    pub fn set_phase(&self, phase: RunPhase) {
+        self.phase.store(phase.as_code(), Ordering::Relaxed);
+    }
+
+    /// Publish the denominator once discovery has counted it.
+    pub fn set_total(&self, total: usize) {
+        self.total.store(total, Ordering::Relaxed);
+    }
+
+    /// One more entry finished. Called once per entry regardless of that
+    /// entry's outcome — an entry that was skipped or failed is still an
+    /// entry the run is done with, and a progress bar that stalled on the
+    /// unreadable files would misreport how far along the run is.
+    pub fn advance(&self) {
+        self.processed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn snapshot(&self) -> RunProgress {
+        let total = self.total.load(Ordering::Relaxed);
+        RunProgress {
+            phase: RunPhase::from_code(self.phase.load(Ordering::Relaxed)),
+            total: (total != TOTAL_UNKNOWN).then_some(total),
+            processed: self.processed.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// The live cells of every run currently executing in this process.
+///
+/// Cloning shares the same map: the indexing handlers write cells into it and
+/// the status query reads them out, and they are separate handlers holding
+/// separate clones of one registry.
+///
+/// The mutex is taken only to open, find, or close a run — three times per
+/// run plus once per status query — never on the per-file path, which touches
+/// the `Arc<RunCell>` it already holds.
+#[derive(Debug, Clone, Default)]
+pub struct RunRegistry {
+    cells: Arc<Mutex<HashMap<Uuid, Arc<RunCell>>>>,
+}
+
+impl RunRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register `run_id` as live and hand back a guard over its cell.
+    /// Re-opening an id replaces its cell, so a run always starts from zero.
+    ///
+    /// The guard is what closes the run: see [`RunCellGuard`]. A caller that
+    /// wants the cell gone at a specific point — before a terminal write, so
+    /// no reader can overlay live progress on a finished row — drops the
+    /// guard there rather than calling [`RunRegistry::close`] directly.
+    pub fn open(&self, run_id: Uuid) -> RunCellGuard {
+        let cell = Arc::new(RunCell::new());
+        self.lock().insert(run_id, Arc::clone(&cell));
+        RunCellGuard {
+            registry: self.clone(),
+            run_id,
+            cell,
+        }
+    }
+
+    /// The live cell for `run_id`, or `None` when no run by that id is
+    /// executing here — which is the signal to fall back to the persisted
+    /// row.
+    pub fn get(&self, run_id: Uuid) -> Option<Arc<RunCell>> {
+        self.lock().get(&run_id).map(Arc::clone)
+    }
+
+    /// Drop `run_id`'s cell, whoever it belongs to.
+    ///
+    /// Test-only, and deliberately: this is the by-id close whose use in
+    /// `RunCellGuard`'s `Drop` let a stale guard evict a live segment's cell
+    /// once run ids started being reused by resume. Production code closes a
+    /// run by dropping its guard, which goes through
+    /// [`RunRegistry::close_if_owned`]. Leaving this `pub` for the whole
+    /// crate is the one way that hazard comes back.
+    ///
+    /// It survives for the one test that covers a handler closing explicitly
+    /// and then dropping its guard at end of scope — the double close that is
+    /// the normal path, not an edge case.
+    #[cfg(test)]
+    pub fn close(&self, run_id: Uuid) {
+        self.lock().remove(&run_id);
+    }
+
+    /// Drop `run_id`'s cell only if the registered cell is `cell` itself.
+    ///
+    /// What [`RunCellGuard`]'s `Drop` uses, and the reason it does not simply
+    /// call [`RunRegistry::close`]. Run ids are reused: resume re-runs
+    /// `execute` under the *same* id, so a paused segment's guard and the
+    /// resumed segment's guard can exist at the same time if the first task
+    /// was aborted without being awaited. Closing by id alone would let the
+    /// stale guard evict the live segment's cell on its way out, and that run
+    /// would then report no live progress for the rest of its life — a
+    /// silent, permanent loss with nothing in the logs.
+    ///
+    /// Identity is `Arc::ptr_eq` rather than a generation counter because it
+    /// answers the question directly and needs no second piece of state to
+    /// keep in step. It cannot be fooled by an address reused after a free:
+    /// the guard holds a strong reference to its own cell for as long as it
+    /// exists, so that allocation cannot have been handed out again.
+    fn close_if_owned(&self, run_id: Uuid, cell: &Arc<RunCell>) {
+        let mut cells = self.lock();
+        if cells
+            .get(&run_id)
+            .is_some_and(|registered| Arc::ptr_eq(registered, cell))
+        {
+            cells.remove(&run_id);
+        }
+    }
+
+    /// A poisoned lock is recovered from rather than propagated: the map is a
+    /// plain `HashMap` with no invariant a panic mid-insert could have left
+    /// broken, and refusing every future progress read because one unrelated
+    /// thread panicked would turn a display concern into an outage.
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<Uuid, Arc<RunCell>>> {
+        self.cells.lock().unwrap_or_else(|err| err.into_inner())
+    }
+}
+
+/// A live run's cell, which closes the run when it goes out of scope.
+///
+/// `execute` has several exits — the discovery failure, the normal end, and
+/// any panic or task abort in between — and a cell left in the registry
+/// outlives its run: a status query would keep reading it and reporting a
+/// dead run as live progress forever. Tying the removal to a scope makes that
+/// unreachable by construction instead of dependent on every exit remembering
+/// to call [`RunRegistry::close`].
+///
+/// Derefs to the cell, so a holder calls `advance()` / `set_total()` /
+/// `snapshot()` on it directly.
+#[derive(Debug)]
+pub struct RunCellGuard {
+    registry: RunRegistry,
+    run_id: Uuid,
+    cell: Arc<RunCell>,
+}
+
+impl RunCellGuard {
+    /// The cell itself — the same `Arc` [`RunRegistry::get`] hands out.
+    pub fn cell(&self) -> &Arc<RunCell> {
+        &self.cell
+    }
+}
+
+impl std::ops::Deref for RunCellGuard {
+    type Target = RunCell;
+
+    fn deref(&self) -> &RunCell {
+        &self.cell
+    }
+}
+
+impl Drop for RunCellGuard {
+    fn drop(&mut self) {
+        // Only if this guard still owns the registered cell: a stale guard
+        // for a run id that has since been reopened must not evict the live
+        // segment's cell. See [`RunRegistry::close_if_owned`].
+        self.registry.close_if_owned(self.run_id, &self.cell);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn given_a_fresh_cell_when_snapshotted_then_it_is_discovering_with_no_total() {
+        let registry = RunRegistry::new();
+        let cell = registry.open(Uuid::new_v4());
+
+        let progress = cell.snapshot();
+
+        assert_eq!(progress.phase, RunPhase::Discovering);
+        assert_eq!(progress.total, None, "discovery has not counted yet");
+        assert_eq!(progress.processed, 0);
+    }
+
+    #[test]
+    fn given_a_counted_run_when_advanced_then_the_snapshot_reports_both_numbers() {
+        let registry = RunRegistry::new();
+        let cell = registry.open(Uuid::new_v4());
+        cell.set_phase(RunPhase::Processing);
+        cell.set_total(12_264);
+        for _ in 0..8_412 {
+            cell.advance();
+        }
+
+        let progress = cell.snapshot();
+
+        assert_eq!(progress.phase, RunPhase::Processing);
+        assert_eq!(progress.total, Some(12_264));
+        assert_eq!(progress.processed, 8_412);
+    }
+
+    #[test]
+    fn given_an_open_run_when_fetched_then_the_same_cell_is_returned() {
+        let registry = RunRegistry::new();
+        let run_id = Uuid::new_v4();
+        let guard = registry.open(run_id);
+        guard.advance();
+
+        let fetched = registry.get(run_id).expect("an open run has a cell");
+
+        assert_eq!(fetched.snapshot().processed, 1);
+        assert!(
+            Arc::ptr_eq(guard.cell(), &fetched),
+            "get must hand out the writer's own cell, not a copy"
+        );
+    }
+
+    #[test]
+    fn given_an_open_run_when_its_guard_is_dropped_then_the_cell_is_gone() {
+        // The guard is the only thing a run has to get right: every exit,
+        // including a panic, closes through this.
+        let registry = RunRegistry::new();
+        let run_id = Uuid::new_v4();
+
+        drop(registry.open(run_id));
+
+        assert!(registry.get(run_id).is_none());
+    }
+
+    #[test]
+    fn given_a_closed_run_when_its_guard_drops_later_then_nothing_breaks() {
+        // A handler closes explicitly before its terminal write and the guard
+        // then drops at end of scope, so the double close is the normal path,
+        // not an edge case.
+        let registry = RunRegistry::new();
+        let run_id = Uuid::new_v4();
+        let guard = registry.open(run_id);
+
+        registry.close(run_id);
+        assert!(registry.get(run_id).is_none());
+        drop(guard);
+
+        assert!(registry.get(run_id).is_none());
+    }
+
+    #[test]
+    fn given_a_run_reopened_after_closing_when_read_then_it_starts_from_zero() {
+        let registry = RunRegistry::new();
+        let run_id = Uuid::new_v4();
+        let first = registry.open(run_id);
+        first.advance();
+        drop(first);
+
+        let second = registry.open(run_id);
+
+        assert_eq!(second.snapshot().processed, 0);
+    }
+
+    #[test]
+    fn given_a_reopened_run_when_the_stale_guard_drops_then_the_live_cell_survives() {
+        // Resume re-runs `execute` under the *same* run id, so two guards for
+        // one id can exist at once: the paused segment's, if its task was
+        // aborted without being awaited, and the resumed segment's. A `Drop`
+        // that closed by id alone would let the stale one evict the live
+        // one's cell, and that run would then report no live progress for the
+        // rest of its life.
+        let registry = RunRegistry::new();
+        let run_id = Uuid::new_v4();
+        let stale = registry.open(run_id);
+        let live = registry.open(run_id);
+        live.advance();
+
+        drop(stale);
+
+        let cell = registry
+            .get(run_id)
+            .expect("the live run must keep its cell");
+        assert!(
+            Arc::ptr_eq(live.cell(), &cell),
+            "the surviving cell must be the live guard's own, not the stale one's"
+        );
+        assert_eq!(cell.snapshot().processed, 1, "and its progress is intact");
+    }
+
+    #[test]
+    fn given_a_reopened_run_when_the_live_guard_drops_then_the_cell_is_gone() {
+        // The other half of the ownership check: the guard that *does* own the
+        // registered cell still closes it, so a reopened run is not left
+        // leaking a cell once its own segment ends.
+        let registry = RunRegistry::new();
+        let run_id = Uuid::new_v4();
+        let stale = registry.open(run_id);
+        let live = registry.open(run_id);
+
+        drop(live);
+
+        assert!(registry.get(run_id).is_none());
+        drop(stale);
+        assert!(registry.get(run_id).is_none());
+    }
+
+    #[test]
+    fn given_two_runs_when_one_advances_then_the_other_is_untouched() {
+        let registry = RunRegistry::new();
+        let (first, second) = (Uuid::new_v4(), Uuid::new_v4());
+        let first_cell = registry.open(first);
+        let _second_cell = registry.open(second);
+
+        first_cell.advance();
+
+        assert_eq!(registry.get(first).unwrap().snapshot().processed, 1);
+        assert_eq!(registry.get(second).unwrap().snapshot().processed, 0);
+    }
+
+    #[test]
+    fn given_a_registry_clone_when_a_run_opens_then_the_clone_sees_it() {
+        // The handlers hold separate clones of one registry: the indexer
+        // writes cells and the status query reads them.
+        let writer = RunRegistry::new();
+        let reader = writer.clone();
+        let run_id = Uuid::new_v4();
+
+        let _guard = writer.open(run_id);
+        writer.get(run_id).unwrap().advance();
+
+        assert_eq!(reader.get(run_id).unwrap().snapshot().processed, 1);
+    }
+
+    #[test]
+    fn given_a_fresh_cell_when_its_signal_is_read_then_the_run_is_told_nothing() {
+        let registry = RunRegistry::new();
+        let cell = registry.open(Uuid::new_v4());
+
+        assert_eq!(cell.signal(), RunSignal::None);
+    }
+
+    #[test]
+    fn given_a_live_run_when_a_signal_is_raised_then_every_holder_of_the_cell_sees_it() {
+        // The control handler raises through `get`; the processing loop reads
+        // through the guard it already holds. Both must be the same cell.
+        let registry = RunRegistry::new();
+        let run_id = Uuid::new_v4();
+        let guard = registry.open(run_id);
+
+        registry.get(run_id).unwrap().raise(RunSignal::Pause);
+
+        assert_eq!(guard.signal(), RunSignal::Pause);
+    }
+
+    #[test]
+    fn given_a_cancelled_run_when_pause_is_raised_then_the_cancel_stands() {
+        // A pause arriving behind a cancel must not downgrade it: the run was
+        // told to be abandoned, and turning that into a resumable pause would
+        // leave behind exactly the run the owner asked to be rid of.
+        let registry = RunRegistry::new();
+        let cell = registry.open(Uuid::new_v4());
+        cell.raise(RunSignal::Cancel);
+
+        cell.raise(RunSignal::Pause);
+
+        assert_eq!(cell.signal(), RunSignal::Cancel);
+    }
+
+    #[test]
+    fn given_a_paused_run_when_cancel_is_raised_then_it_escalates() {
+        // The other direction does apply: a run paused and then cancelled in
+        // the same drain must end up cancelled.
+        let registry = RunRegistry::new();
+        let cell = registry.open(Uuid::new_v4());
+        cell.raise(RunSignal::Pause);
+
+        cell.raise(RunSignal::Cancel);
+
+        assert_eq!(cell.signal(), RunSignal::Cancel);
+    }
+
+    #[test]
+    fn given_a_signalled_run_when_reopened_then_the_new_run_is_told_nothing() {
+        // Resume reopens the same id (Task 8). It must not inherit the signal
+        // that stopped the previous segment.
+        let registry = RunRegistry::new();
+        let run_id = Uuid::new_v4();
+        let first = registry.open(run_id);
+        first.raise(RunSignal::Cancel);
+        drop(first);
+
+        let second = registry.open(run_id);
+
+        assert_eq!(second.signal(), RunSignal::None);
+    }
+
+    #[test]
+    fn given_two_runs_when_one_is_signalled_then_the_other_keeps_going() {
+        let registry = RunRegistry::new();
+        let (first, second) = (Uuid::new_v4(), Uuid::new_v4());
+        let first_cell = registry.open(first);
+        let second_cell = registry.open(second);
+
+        first_cell.raise(RunSignal::Cancel);
+
+        assert_eq!(second_cell.signal(), RunSignal::None);
+    }
+
+    #[test]
+    fn given_a_phase_when_round_tripped_through_its_stored_form_then_it_is_unchanged() {
+        for phase in [RunPhase::Discovering, RunPhase::Processing] {
+            assert_eq!(RunPhase::parse(phase.as_str()), Some(phase));
+        }
+        assert_eq!(RunPhase::parse("nonsense"), None);
+    }
+}

@@ -1,6 +1,7 @@
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
 
 use crate::errors::DomainError;
@@ -31,11 +32,28 @@ where
     }
 }
 
-/// A discovered file ready to be classified and hashed.
+/// A discovered file ready to be classified and recorded.
+///
+/// `size_bytes` and `modified_at` come from the directory entry's own
+/// metadata, which `walkdir` has already fetched during the walk — reading
+/// them here costs nothing and is what lets the indexer decide whether a file
+/// changed without opening it.
 #[derive(Debug, Clone)]
 pub struct FileEntry {
     pub path: String,
     pub name: String,
+    pub size_bytes: i64,
+    /// `None` when the platform or filesystem could not report a modification
+    /// time. Change detection falls back to size alone for such a file.
+    pub modified_at: Option<DateTime<Utc>>,
+}
+
+/// One file's change signal (FR-FC-10). `None` from `stat` means the file is
+/// not there at all, which is UC-02 AF-01's "marked missing".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileStat {
+    pub size_bytes: i64,
+    pub modified_at: Option<DateTime<Utc>>,
 }
 
 /// Filesystem port — the indexer's view of the on-disk store. The real
@@ -47,6 +65,13 @@ pub trait Filesystem: Send + Sync {
     async fn path_exists(&self, root: &str) -> bool;
     async fn list_files(&self, root: &str) -> Result<Vec<FileEntry>, DomainError>;
     async fn content_hash(&self, path: &str) -> Result<String, DomainError>;
+    /// The file's size and modification time, or `None` when it is gone
+    /// (UC-02 AF-01). One `stat` syscall — this is what replaced reading and
+    /// hashing every byte to answer "did this change?" (Task 4). Also used
+    /// by UC-33's post-write refresh (`EditTextFileContentHandler`) to record
+    /// the new size/mtime alongside the hash it just verified, so the very
+    /// next re-index sees them match and does not clobber a hash it stored.
+    async fn stat(&self, path: &str) -> Result<Option<FileStat>, DomainError>;
     /// Rename `from` to `to` on disk (UC-05 / FR-FC-19). Atomic on a single
     /// volume; fails with `Disk` when the source is missing, the parent
     /// directory is not writable, or the target already exists (the latter is
@@ -150,9 +175,17 @@ impl StdFilesystem {
             if name.is_empty() {
                 continue;
             }
+            let metadata = entry.metadata().ok();
+            let size_bytes = metadata.as_ref().map(|m| m.len() as i64).unwrap_or(0);
+            let modified_at = metadata
+                .as_ref()
+                .and_then(|m| m.modified().ok())
+                .map(DateTime::<Utc>::from);
             entries.push(FileEntry {
                 path: path.to_string_lossy().into_owned(),
                 name,
+                size_bytes,
+                modified_at,
             });
         }
         entries
@@ -191,6 +224,19 @@ impl Filesystem for StdFilesystem {
     async fn content_hash(&self, path: &str) -> Result<String, DomainError> {
         let path = path.to_string();
         blocking(move || hash_file_blocking(&path)).await
+    }
+
+    async fn stat(&self, path: &str) -> Result<Option<FileStat>, DomainError> {
+        let path = path.to_string();
+        blocking(move || match std::fs::metadata(&path) {
+            Ok(metadata) => Ok(Some(FileStat {
+                size_bytes: metadata.len() as i64,
+                modified_at: metadata.modified().ok().map(DateTime::<Utc>::from),
+            })),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(err) => Err(DomainError::disk(format!("stat {path:?}: {err}"))),
+        })
+        .await
     }
 
     async fn rename(&self, from: &str, to: &str) -> Result<(), DomainError> {
@@ -232,10 +278,15 @@ impl Filesystem for StdFilesystem {
 }
 
 impl FileEntry {
+    /// Builds an entry with no stat — what a filesystem that could not
+    /// report size or modification time would give. Test fakes that need a
+    /// real stat call `Filesystem::list_files` after seeding one instead.
     pub fn new(path: impl Into<String>, name: impl Into<String>) -> Self {
         Self {
             path: path.into(),
             name: name.into(),
+            size_bytes: 0,
+            modified_at: None,
         }
     }
 }

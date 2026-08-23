@@ -11,6 +11,7 @@
 #![allow(dead_code)]
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
@@ -24,15 +25,16 @@ use alexandria_core::auth::{AuthService, Principal};
 use alexandria_core::bookmarks::model::{Bookmark, BookmarkState, NewBookmark};
 use alexandria_core::bookmarks::repos::BookmarkRepository;
 use alexandria_core::catalog::audio_tags::{AudioMetadataReader, AudioTags};
-use alexandria_core::catalog::clock::FixedClock;
+use alexandria_core::catalog::clock::{Clock, FixedClock};
 use alexandria_core::catalog::comic_tags::{ComicMetadataReader, ComicTags};
 use alexandria_core::catalog::document_tags::{DocumentMetadataReader, DocumentTags};
-use alexandria_core::catalog::fs::{FileEntry, Filesystem};
+use alexandria_core::catalog::fs::{FileEntry, FileStat, Filesystem};
 use alexandria_core::catalog::image_tags::{ImageMetadataReader, ImageTags};
 use alexandria_core::catalog::model::{
     File, FileState, FileType, NewFile, StateFilter, SubtypeMetadata,
 };
 use alexandria_core::catalog::repos::CatalogRepository;
+use alexandria_core::catalog::run_registry::{RunPhase, RunProgress};
 use alexandria_core::catalog::runs::{
     CatalogRun, CatalogRunRepository, RunCounts, RunKind, RunStatus,
 };
@@ -84,9 +86,10 @@ impl AuthService for FakeAuth {
 pub struct FakeCatalogRepository {
     files: Arc<Mutex<HashMap<String, File>>>,
     metadata: Arc<Mutex<HashMap<Uuid, SubtypeMetadata>>>,
-    /// Paths whose `insert_file` / `refresh_hash` / `mark_missing` must fail,
-    /// simulating a per-file repository error mid-run (UC-01 / UC-02: the run
-    /// counts the failure and continues rather than aborting).
+    /// Paths whose `insert_file` / `refresh_hash` / `refresh_stat` /
+    /// `mark_missing` must fail, simulating a per-file repository error
+    /// mid-run (UC-01 / UC-02: the run counts the failure and continues
+    /// rather than aborting).
     failing_paths: Arc<Mutex<std::collections::HashSet<String>>>,
     /// UUIDs whose `rename_file` must fail with a Database error, simulating
     /// the post-rename catalog-failure branch of UC-05.
@@ -258,6 +261,8 @@ impl CatalogRepository for FakeCatalogRepository {
             name: new_file.name,
             file_type: new_file.file_type,
             content_hash: new_file.content_hash,
+            size_bytes: new_file.size_bytes,
+            mtime: new_file.mtime,
             state: alexandria_core::catalog::model::FileState::Active,
             deleted_at: None,
             indexed_at: new_file.indexed_at,
@@ -280,6 +285,8 @@ impl CatalogRepository for FakeCatalogRepository {
         &self,
         path: &str,
         content_hash: &str,
+        size_bytes: i64,
+        mtime: Option<chrono::DateTime<chrono::Utc>>,
         indexed_at: chrono::DateTime<chrono::Utc>,
     ) -> Result<(), DomainError> {
         if self.fails(path) {
@@ -287,7 +294,30 @@ impl CatalogRepository for FakeCatalogRepository {
         }
         let mut files = self.files.lock().unwrap();
         if let Some(file) = files.get_mut(path) {
-            file.content_hash = content_hash.to_string();
+            file.content_hash = Some(content_hash.to_string());
+            file.size_bytes = Some(size_bytes);
+            file.mtime = mtime;
+            file.indexed_at = indexed_at;
+            file.missing_at = None;
+        }
+        Ok(())
+    }
+
+    async fn refresh_stat(
+        &self,
+        path: &str,
+        size_bytes: i64,
+        mtime: Option<chrono::DateTime<chrono::Utc>>,
+        indexed_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), DomainError> {
+        if self.fails(path) {
+            return Err(DomainError::internal("fake refresh failure"));
+        }
+        let mut files = self.files.lock().unwrap();
+        if let Some(file) = files.get_mut(path) {
+            file.content_hash = None;
+            file.size_bytes = Some(size_bytes);
+            file.mtime = mtime;
             file.indexed_at = indexed_at;
             file.missing_at = None;
         }
@@ -772,6 +802,11 @@ pub struct FakeFilesystem {
     roots: std::collections::HashSet<String>,
     entries_by_root: HashMap<String, Vec<FileEntry>>,
     hash_by_path: HashMap<String, String>,
+    /// Stat override seeded by `with_stat`, keyed by path: `(size_bytes,
+    /// modified_at)`. Applied by `list_files` on top of the `FileEntry` a
+    /// `with_file`/`with_unreadable_file` call already pushed, since those
+    /// builder methods run before the stat for the same path is known.
+    stat_by_path: HashMap<String, (i64, Option<DateTime<Utc>>)>,
     /// Paths that exist and are listed but cannot be read (locked / permission
     /// denied). `content_hash` fails for these, simulating the single bad file
     /// that must not abort a whole index or refresh run.
@@ -809,6 +844,10 @@ struct FakeFsState {
     /// `read_file` and `content_hash` prefer this over the builder-seeded
     /// `content_by_path`/`hash_by_path` once a write has happened.
     written: HashMap<String, String>,
+    /// Count of `content_hash` calls so far (Task 3 / Task 4). Indexing must
+    /// never reach this port at all — `IndexHandler::index_entry` no longer
+    /// hashes bytes — so a test can assert it stayed at zero.
+    hash_calls: std::sync::atomic::AtomicUsize,
 }
 
 impl FakeFilesystem {
@@ -895,6 +934,16 @@ impl FakeFilesystem {
     pub fn remove_count(&self) -> usize {
         self.state.lock().unwrap().removed.len()
     }
+
+    /// Count of `content_hash` calls so far. Indexing must never reach the
+    /// hash port at all (Task 3); refresh stops reaching it too (Task 4).
+    pub fn hash_calls(&self) -> usize {
+        self.state
+            .lock()
+            .unwrap()
+            .hash_calls
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
 }
 
 #[derive(Debug, Default)]
@@ -944,6 +993,21 @@ impl FakeFilesystemBuilder {
         self
     }
 
+    /// Seed the stat a `FileEntry` carries out of the walk. Without this an
+    /// entry reports zero bytes and no modification time — what a filesystem
+    /// that could not answer would give.
+    pub fn with_stat(
+        mut self,
+        path: &str,
+        size_bytes: i64,
+        modified_at: Option<DateTime<Utc>>,
+    ) -> Self {
+        self.fs
+            .stat_by_path
+            .insert(path.to_string(), (size_bytes, modified_at));
+        self
+    }
+
     pub fn build(self) -> FakeFilesystem {
         self.fs
     }
@@ -971,10 +1035,28 @@ impl Filesystem for FakeFilesystem {
     }
 
     async fn list_files(&self, root: &str) -> Result<Vec<FileEntry>, DomainError> {
-        Ok(self.entries_by_root.get(root).cloned().unwrap_or_default())
+        Ok(self
+            .entries_by_root
+            .get(root)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|mut entry| {
+                if let Some((size_bytes, modified_at)) = self.stat_by_path.get(&entry.path) {
+                    entry.size_bytes = *size_bytes;
+                    entry.modified_at = *modified_at;
+                }
+                entry
+            })
+            .collect())
     }
 
     async fn content_hash(&self, path: &str) -> Result<String, DomainError> {
+        self.state
+            .lock()
+            .unwrap()
+            .hash_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if self.unreadable.contains(path) {
             return Err(DomainError::internal(format!("failed to read {path}")));
         }
@@ -986,6 +1068,42 @@ impl Filesystem for FakeFilesystem {
             .get(path)
             .cloned()
             .unwrap_or_else(|| format!("hash-of-{path}")))
+    }
+
+    async fn stat(&self, path: &str) -> Result<Option<FileStat>, DomainError> {
+        // Mirrors `path_exists`, plus a path `write_file` has stored bytes
+        // for — a file UC-33 just wrote is "present" even though it was
+        // never registered as a root, a hashed file, or a disk-only entry.
+        // Without this, `EditTextFileContentHandler`'s post-write `stat`
+        // call (Task 4 correction) would see the file it just wrote as gone.
+        let state = self.state.lock().unwrap();
+        let moved_from = state.renames.iter().any(|(f, _)| f == path)
+            && !state.renames.iter().any(|(_, t)| t == path);
+        let moved_to = state.renames.iter().any(|(_, t)| t == path);
+        let disk = state.disk_paths.contains(path);
+        let removed = state.removed.iter().any(|p| p == path);
+        let written = state.written.contains_key(path);
+        drop(state);
+        let exists = !removed
+            && (self.roots.contains(path)
+                || self.hash_by_path.contains_key(path)
+                || self.unreadable.contains(path)
+                || disk
+                || written
+                || (moved_to && !moved_from));
+        if !exists {
+            return Ok(None);
+        }
+        if let Some((size_bytes, modified_at)) = self.stat_by_path.get(path) {
+            return Ok(Some(FileStat {
+                size_bytes: *size_bytes,
+                modified_at: *modified_at,
+            }));
+        }
+        Ok(Some(FileStat {
+            size_bytes: 0,
+            modified_at: None,
+        }))
     }
 
     async fn rename(&self, from: &str, to: &str) -> Result<(), DomainError> {
@@ -1047,6 +1165,44 @@ impl Filesystem for FakeFilesystem {
     }
 }
 
+/// A clock that moves forward a fixed amount on every read.
+///
+/// `FixedClock` cannot exercise anything that measures an elapsed interval —
+/// every subtraction against it is zero — which makes it blind to the
+/// two-second progress flush in `IndexHandler::execute`'s processing loop.
+/// This advances by `step` per `now()` call, and the loop reads the clock
+/// once per entry, so a walk of N entries covers N steps of simulated time
+/// and crosses the interval deterministically, with no real waiting and no
+/// dependence on how fast the machine runs.
+///
+/// Reads are counted with `SeqCst` rather than `Relaxed`: unlike the display
+/// counters in `RunRegistry`, the *value* this returns is derived from the
+/// count, and a test asserting on flush timing needs each concurrent reader
+/// to see a distinct, monotonically increasing instant.
+#[derive(Debug, Clone)]
+pub struct SteppingClock {
+    start: DateTime<Utc>,
+    step: chrono::Duration,
+    reads: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl SteppingClock {
+    pub fn new(start: DateTime<Utc>, step_seconds: i64) -> Self {
+        Self {
+            start,
+            step: chrono::Duration::seconds(step_seconds),
+            reads: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }
+    }
+}
+
+impl Clock for SteppingClock {
+    fn now(&self) -> DateTime<Utc> {
+        let reads = self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.start + self.step * (reads as i32)
+    }
+}
+
 /// Fixed clock wrapper for tests.
 pub fn fixed_clock(now: DateTime<Utc>) -> FixedClock {
     FixedClock(now)
@@ -1065,7 +1221,9 @@ pub fn existing_file(path: &str, file_type: FileType) -> File {
         path: path.to_string(),
         name: "seedy".to_string(),
         file_type,
-        content_hash: "preexisting".to_string(),
+        content_hash: Some("preexisting".to_string()),
+        size_bytes: None,
+        mtime: None,
         state: alexandria_core::catalog::model::FileState::Active,
         deleted_at: None,
         indexed_at: now(),
@@ -1099,7 +1257,9 @@ pub fn deleted_file_at(
         path: path.to_string(),
         name: name.to_string(),
         file_type,
-        content_hash: "preexisting".to_string(),
+        content_hash: Some("preexisting".to_string()),
+        size_bytes: None,
+        mtime: None,
         state: alexandria_core::catalog::model::FileState::Deleted,
         deleted_at: Some(deleted_at),
         indexed_at: deleted_at,
@@ -1115,7 +1275,9 @@ pub fn existing_file_with_hash(path: &str, name: &str, file_type: FileType, hash
         path: path.to_string(),
         name: name.to_string(),
         file_type,
-        content_hash: hash.to_string(),
+        content_hash: Some(hash.to_string()),
+        size_bytes: None,
+        mtime: None,
         state: alexandria_core::catalog::model::FileState::Active,
         deleted_at: None,
         indexed_at: earlier(),
@@ -1132,11 +1294,67 @@ pub fn existing_missing_file(path: &str, name: &str, file_type: FileType, hash: 
         path: path.to_string(),
         name: name.to_string(),
         file_type,
-        content_hash: hash.to_string(),
+        content_hash: Some(hash.to_string()),
+        size_bytes: None,
+        mtime: None,
         state: alexandria_core::catalog::model::FileState::Active,
         deleted_at: None,
         indexed_at: earlier(),
         missing_at: Some(earlier()),
+    }
+}
+
+/// A cataloged file with a known size/mtime and no content hash — what a
+/// normally-indexed file looks like after Task 3 (indexing never hashes).
+/// `existing_file_with_hash`/`existing_missing_file` above carry
+/// `size_bytes: None, mtime: None`, which can never compare equal to a real
+/// on-disk stat; UC-02 refresh's stat-comparison tests (Task 4) need a
+/// fixture whose stats are explicit and controllable instead.
+#[allow(dead_code)]
+pub fn a_cataloged_file(path: &str, size_bytes: i64, mtime: Option<DateTime<Utc>>) -> File {
+    File {
+        uuid: Uuid::new_v4(),
+        path: path.to_string(),
+        name: path.rsplit('/').next().unwrap_or(path).to_string(),
+        file_type: FileType::Audio,
+        content_hash: None,
+        size_bytes: Some(size_bytes),
+        mtime,
+        state: FileState::Active,
+        deleted_at: None,
+        indexed_at: earlier(),
+        missing_at: None,
+    }
+}
+
+/// As [`a_cataloged_file`], but with a stored content hash — as if UC-33 had
+/// edited it, or to pin that a refresh must null out a now-stale one.
+#[allow(dead_code)]
+pub fn a_cataloged_file_with_hash(
+    path: &str,
+    size_bytes: i64,
+    mtime: Option<DateTime<Utc>>,
+    hash: &str,
+) -> File {
+    File {
+        content_hash: Some(hash.to_string()),
+        ..a_cataloged_file(path, size_bytes, mtime)
+    }
+}
+
+/// As [`a_cataloged_file_with_hash`], but already marked missing (the
+/// on-disk file was gone at a prior re-index) — used to test the "file came
+/// back" path of UC-02 with explicit, controllable stats.
+#[allow(dead_code)]
+pub fn a_cataloged_missing_file(
+    path: &str,
+    size_bytes: i64,
+    mtime: Option<DateTime<Utc>>,
+    hash: &str,
+) -> File {
+    File {
+        missing_at: Some(earlier()),
+        ..a_cataloged_file_with_hash(path, size_bytes, mtime, hash)
     }
 }
 
@@ -2029,16 +2247,138 @@ impl ComicMetadataReader for FakeComicMetadataReader {
     }
 }
 
+/// The statuses a tally-less cancel may be written from, mirroring the SQLite
+/// adapter's own guard. Without it the fake would be more permissive than the
+/// real repository, and a late cancel overwriting a completed run would be
+/// invisible in every handler test.
+const CANCELLABLE_FROM: [RunStatus; 2] = [RunStatus::Running, RunStatus::Paused];
+
+/// The wider set a cancel carrying a tally may be written from, mirroring the
+/// adapter again: a walk landing behind a control call that already cancelled
+/// the row fills in the counts that call had none of, rather than dropping
+/// them.
+const TALLY_CANCELLABLE_FROM: [RunStatus; 3] =
+    [RunStatus::Running, RunStatus::Paused, RunStatus::Cancelled];
+
 /// In-memory `CatalogRunRepository` (UC-42). Lets the index/refresh handler
 /// tests assert the run lifecycle without a database.
 #[derive(Debug, Default, Clone)]
 pub struct FakeCatalogRunRepository {
     runs: Arc<Mutex<HashMap<Uuid, CatalogRun>>>,
+    /// When set, every `record_progress` fails. A progress flush is
+    /// best-effort (FR-FC-28), so this is what proves a run survives one.
+    progress_fails: Arc<AtomicBool>,
+    /// Armed by `cancel_after_next_get` / `complete_after_next_get`: the run
+    /// to close once, and the status to close it into, right after the next
+    /// `get` has answered.
+    close_after_get: Arc<Mutex<Option<(Uuid, RunStatus)>>>,
+    /// Every flush the handler attempted, in order, failed ones included.
+    /// The row only ever holds the newest, so this is the only way a test can
+    /// see that an *intermediate* flush happened at all — which is what the
+    /// two-second interval exists to produce.
+    progress_history: Arc<Mutex<Vec<RunProgress>>>,
+    /// Armed by `pause_and_resume_before_next_halt`: the run to put through a
+    /// pause and a resume once, immediately before the next `pause` or
+    /// `cancel` write is evaluated.
+    resume_before_halt: Arc<Mutex<Option<Uuid>>>,
 }
 
 impl FakeCatalogRunRepository {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A repository whose progress flushes always fail — everything else
+    /// works, so a run against it exercises exactly the flush failure.
+    pub fn with_failing_progress() -> Self {
+        let repo = Self::default();
+        repo.progress_fails.store(true, Ordering::Relaxed);
+        repo
+    }
+
+    /// How many times a flush was attempted, failing ones included.
+    pub fn progress_calls(&self) -> usize {
+        self.progress_history.lock().unwrap().len()
+    }
+
+    /// Every attempted flush, in order.
+    pub fn progress_history(&self) -> Vec<RunProgress> {
+        self.progress_history.lock().unwrap().clone()
+    }
+
+    /// Bank a paused stretch directly, without going through the pause and
+    /// resume that would produce it — so a test about `active_millis`'s
+    /// arithmetic states the one number it is about and nothing else.
+    pub fn set_paused_millis(&self, id: Uuid, paused_millis: i64) {
+        if let Some(run) = self.runs.lock().unwrap().get_mut(&id) {
+            run.paused_millis = paused_millis;
+        }
+    }
+
+    /// Erase a run's stored width, simulating one started before run priority
+    /// existed — `start` always records a width now, so a test about the
+    /// legacy fallback (`RunControlHandler::resume`'s
+    /// `unwrap_or(default_concurrency)`) has to unset it explicitly rather
+    /// than rely on `start` ever leaving it `None`.
+    pub fn clear_concurrency(&self, id: Uuid) {
+        if let Some(run) = self.runs.lock().unwrap().get_mut(&id) {
+            run.concurrency = None;
+        }
+    }
+
+    /// Cancel `id` the next time it is read, after the read has answered.
+    ///
+    /// Simulates the one window the pause guard exists for: a control call
+    /// reads a `running` run, and the row is closed by someone else before
+    /// that call's own write lands. Nothing else can produce that ordering
+    /// against an in-memory fake, and asserting it by closing the run *before*
+    /// the call would prove something different — the state machine's
+    /// rejection rather than the write's.
+    pub fn cancel_after_next_get(&self, id: Uuid) {
+        *self.close_after_get.lock().unwrap() = Some((id, RunStatus::Cancelled));
+    }
+
+    /// Complete `id` the next time it is read, after the read has answered.
+    ///
+    /// The cancel guard's own window: a control call reads a `running` run,
+    /// and the walk it is aiming at finishes before that call's write lands.
+    pub fn complete_after_next_get(&self, id: Uuid) {
+        *self.close_after_get.lock().unwrap() = Some((id, RunStatus::Complete));
+    }
+
+    /// Pause and resume `id` the next time a halt is written — `pause` or
+    /// `cancel` — in between that write being asked for and being evaluated.
+    ///
+    /// Simulates the one window the segment guard exists for: a walk drops
+    /// its run cell, a control-path pause finds no live cell and writes
+    /// `paused` itself, a client sees that and resumes, and only then does
+    /// the walk's own `record_halt` land — against a row that is `running`
+    /// again, because a different segment is now walking it. Both halt verbs
+    /// meet it, and a late `cancel` is the worse of the two: it is terminal.
+    ///
+    /// Nothing else can produce that ordering against an in-memory fake, and
+    /// arming it on `get` (as the close-during-lookup races do) would prove
+    /// something different: the gap this one is about opens *after* the
+    /// walk's last read of the row.
+    pub fn pause_and_resume_before_next_halt(&self, id: Uuid) {
+        *self.resume_before_halt.lock().unwrap() = Some(id);
+    }
+
+    /// Apply an armed [`pause_and_resume_before_next_halt`], if it names `id`.
+    ///
+    /// The net effect of a control-path pause followed by a resume, applied
+    /// as one step rather than by re-entering those two methods, whose lock
+    /// the caller already holds: the row is `running` again, on a new
+    /// segment, with no pause time left on it.
+    fn apply_armed_resume(&self, runs: &mut HashMap<Uuid, CatalogRun>, id: Uuid) {
+        if self.resume_before_halt.lock().unwrap().take() != Some(id) {
+            return;
+        }
+        if let Some(run) = runs.get_mut(&id) {
+            run.status = RunStatus::Running;
+            run.paused_at = None;
+            run.segment += 1;
+        }
     }
 
     /// The recorded run for `id`, for assertions.
@@ -2058,6 +2398,7 @@ impl CatalogRunRepository for FakeCatalogRunRepository {
         kind: RunKind,
         root: Option<&str>,
         started_at: DateTime<Utc>,
+        concurrency: u32,
     ) -> Result<(), DomainError> {
         self.runs.lock().unwrap().insert(
             id,
@@ -2070,6 +2411,18 @@ impl CatalogRunRepository for FakeCatalogRunRepository {
                 finished_at: None,
                 counts: None,
                 error: None,
+                phase: None,
+                total: None,
+                processed: None,
+                active_millis: 0,
+                paused_at: None,
+                paused_millis: 0,
+                // Mirrors the SQLite adapter: the width the caller's
+                // `RunPriority` resolved to, so a resume can reuse it.
+                concurrency: Some(concurrency),
+                // The first execution of the run, as the column's default
+                // says. `resume` counts from here.
+                segment: 0,
             },
         );
         Ok(())
@@ -2100,6 +2453,9 @@ impl CatalogRunRepository for FakeCatalogRunRepository {
             run.status = RunStatus::Complete;
             run.counts = Some(counts);
             run.finished_at = Some(finished_at);
+            // Mirrors the SQLite adapter: a terminal run has no phase, so a
+            // client is never told `complete` and `processing` at once.
+            run.phase = None;
         }
         Ok(())
     }
@@ -2115,25 +2471,206 @@ impl CatalogRunRepository for FakeCatalogRunRepository {
             run.status = RunStatus::Failed;
             run.error = Some(error.to_string());
             run.finished_at = Some(finished_at);
+            run.phase = None;
+        }
+        Ok(())
+    }
+
+    async fn pause(
+        &self,
+        id: Uuid,
+        paused_at: DateTime<Utc>,
+        expected_segment: Option<i64>,
+    ) -> Result<bool, DomainError> {
+        let mut runs = self.runs.lock().unwrap();
+        self.apply_armed_resume(&mut runs, id);
+        let Some(run) = runs.get_mut(&id) else {
+            return Ok(false);
+        };
+        // Mirrors the SQLite adapter's `AND status = 'running'`. Without it
+        // the fake would be more permissive than the real repository, and the
+        // handler tests would pass against a guard that does not exist.
+        if run.status != RunStatus::Running {
+            return Ok(false);
+        }
+        // Mirrors the adapter's `AND (? IS NULL OR segment = ?)`, for the same
+        // reason: a walk's late pause must not land on the segment that
+        // replaced it, and `running` is what the row reads either way.
+        if expected_segment.is_some_and(|expected| expected != run.segment) {
+            return Ok(false);
+        }
+        run.status = RunStatus::Paused;
+        run.paused_at = Some(paused_at);
+        // Also mirrors the adapter: pause is the one non-terminal transition,
+        // so unlike `finish` / `fail` / `cancel` it leaves `phase` describing
+        // where the run actually stopped, and writes no `finished_at`.
+        Ok(true)
+    }
+
+    async fn cancel(
+        &self,
+        id: Uuid,
+        counts: Option<RunCounts>,
+        cancelled_at: DateTime<Utc>,
+        expected_segment: Option<i64>,
+    ) -> Result<bool, DomainError> {
+        let mut runs = self.runs.lock().unwrap();
+        self.apply_armed_resume(&mut runs, id);
+        if let Some(run) = runs.get_mut(&id) {
+            // Every guard is answered before anything is written, so a
+            // refused cancel leaves the row exactly as it found it — the
+            // adapter gets that for free from doing it in one UPDATE, and the
+            // fake has to be written for it.
+            let accepted = if let Some(counts) = counts {
+                // Mirrors the adapter's shared `close_with_counts` guard.
+                let matches = matches!(
+                    (run.kind, &counts),
+                    (RunKind::Index, RunCounts::Index { .. })
+                        | (RunKind::Refresh, RunCounts::Refresh { .. })
+                );
+                if !matches {
+                    return Err(DomainError::internal(format!(
+                        "counts kind mismatch: run is {:?} but counts are {:?}",
+                        run.kind, counts
+                    )));
+                }
+                // Mirrors the adapter: the kind check is answered before
+                // the state guard, so a mismatched tally is an error rather
+                // than a silent refusal whatever state the row is in.
+                if !TALLY_CANCELLABLE_FROM.contains(&run.status) {
+                    return Ok(false);
+                }
+                Some(counts)
+            } else {
+                if !CANCELLABLE_FROM.contains(&run.status) {
+                    return Ok(false);
+                }
+                None
+            };
+            // Mirrors the `segment_guard!()` both adapter `cancel` statements
+            // carry: a walk's late cancel must not land on the segment that
+            // replaced it, and `running` is what the row reads either way. A
+            // control call binds `None` and is unaffected — including the
+            // control-cancel-then-walk-backfill path, since cancelling does
+            // not move the segment.
+            if expected_segment.is_some_and(|expected| expected != run.segment) {
+                return Ok(false);
+            }
+            if let Some(counts) = accepted {
+                // A cancelled run is never resumed, so its partial tally is
+                // final and is kept for the record.
+                run.counts = Some(counts);
+            }
+            run.status = RunStatus::Cancelled;
+            run.finished_at = Some(cancelled_at);
+            // Terminal, so the phase clears exactly as `finish`'s does.
+            run.phase = None;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    async fn resume(
+        &self,
+        id: Uuid,
+        paused_millis: i64,
+        concurrency: Option<u32>,
+    ) -> Result<bool, DomainError> {
+        let mut runs = self.runs.lock().unwrap();
+        let Some(run) = runs.get_mut(&id) else {
+            return Ok(false);
+        };
+        // Mirrors the adapter's `AND status = 'paused'`: resume is the one
+        // edge back into `running`, and a resume landing on a run someone
+        // else just cancelled would revive it.
+        if run.status != RunStatus::Paused {
+            return Ok(false);
+        }
+        // Mirrors the adapter's `concurrency = COALESCE(?, concurrency)`, and
+        // inside the same guard: `None` keeps the stored width (including a
+        // pre-column run's absent one), `Some` re-paces the run, and a refused
+        // resume does neither.
+        if let Some(concurrency) = concurrency {
+            run.concurrency = Some(concurrency);
+        }
+        run.status = RunStatus::Running;
+        run.paused_at = None;
+        run.paused_millis = paused_millis;
+        // Mirrors the adapter's `segment = segment + 1`, inside the same
+        // guard: the run goes back to work as a new execution, and this is
+        // what lets the previous one's late `pause` be told apart from it.
+        run.segment += 1;
+        // The segment counters restart: resume re-walks, so `processed` is a
+        // fresh count and `total` is rediscovered.
+        run.processed = Some(0);
+        run.total = None;
+        run.phase = Some(RunPhase::Discovering);
+        Ok(true)
+    }
+
+    async fn record_progress(&self, id: Uuid, progress: &RunProgress) -> Result<(), DomainError> {
+        self.progress_history.lock().unwrap().push(*progress);
+        if self.progress_fails.load(Ordering::Relaxed) {
+            return Err(DomainError::Disk("run store unavailable".into()));
+        }
+        if let Some(run) = self.runs.lock().unwrap().get_mut(&id) {
+            run.phase = Some(progress.phase);
+            run.total = progress.total;
+            run.processed = Some(progress.processed);
         }
         Ok(())
     }
 
     async fn get(&self, id: Uuid) -> Result<Option<CatalogRun>, DomainError> {
-        Ok(self.runs.lock().unwrap().get(&id).cloned())
+        let answer = self.runs.lock().unwrap().get(&id).cloned();
+        // The read answers first, then the row moves on — which is exactly the
+        // interleaving a control call meets when someone else closes the run
+        // between its lookup and its write. One-shot, so a later `get` in the
+        // same test sees the closed row rather than re-closing it.
+        let armed = self.close_after_get.lock().unwrap().take();
+        if let Some((armed_id, status)) = armed {
+            if armed_id == id {
+                if let Some(run) = self.runs.lock().unwrap().get_mut(&id) {
+                    run.status = status;
+                    run.finished_at = Some(run.started_at);
+                    run.phase = None;
+                }
+            }
+        }
+        Ok(answer)
     }
 
-    async fn interrupt_running(&self, now: DateTime<Utc>) -> Result<u64, DomainError> {
+    async fn pause_running(&self, now: DateTime<Utc>) -> Result<u64, DomainError> {
         let mut runs = self.runs.lock().unwrap();
         let mut reconciled = 0;
         for run in runs.values_mut() {
             if run.status == RunStatus::Running {
-                run.status = RunStatus::Interrupted;
-                run.finished_at = Some(now);
+                run.status = RunStatus::Paused;
+                run.paused_at = Some(now);
+                // No `finished_at`: the run is offered for resume, not
+                // closed. `phase` clears because a run whose process is gone
+                // is not in one until it resumes.
+                run.phase = None;
                 reconciled += 1;
             }
         }
         Ok(reconciled)
+    }
+
+    async fn list_active(&self) -> Result<Vec<CatalogRun>, DomainError> {
+        let mut active: Vec<CatalogRun> = self
+            .runs
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|run| matches!(run.status, RunStatus::Running | RunStatus::Paused))
+            .cloned()
+            .collect();
+        // Mirrors the SQLite adapter's explicit `ORDER BY started_at DESC` —
+        // a `HashMap`'s iteration order carries no promise at all, so a test
+        // against this fake would be exercising nothing without a sort here.
+        active.sort_by_key(|run| std::cmp::Reverse(run.started_at));
+        Ok(active)
     }
 }
 
@@ -2166,6 +2703,18 @@ impl CatalogRepository for FailingCatalogRepository {
         &self,
         _path: &str,
         _content_hash: &str,
+        _size_bytes: i64,
+        _mtime: Option<DateTime<Utc>>,
+        _indexed_at: DateTime<Utc>,
+    ) -> Result<(), DomainError> {
+        unimplemented!("not reached by the run-fails-to-list path")
+    }
+
+    async fn refresh_stat(
+        &self,
+        _path: &str,
+        _size_bytes: i64,
+        _mtime: Option<DateTime<Utc>>,
         _indexed_at: DateTime<Utc>,
     ) -> Result<(), DomainError> {
         unimplemented!("not reached by the run-fails-to-list path")
@@ -2308,6 +2857,10 @@ impl Filesystem for FailingListFilesystem {
         unimplemented!("not reached by the run-fails-to-list path")
     }
 
+    async fn stat(&self, _path: &str) -> Result<Option<FileStat>, DomainError> {
+        unimplemented!("not reached by the run-fails-to-list path")
+    }
+
     async fn rename(&self, _from: &str, _to: &str) -> Result<(), DomainError> {
         unimplemented!("not reached by the run-fails-to-list path")
     }
@@ -2325,8 +2878,8 @@ impl Filesystem for FailingListFilesystem {
     }
 }
 
-/// A `CatalogRunRepository` that fails one lifecycle write on purpose (UC-42
-/// / FR-FC-27).
+/// A `CatalogRunRepository` that fails one lifecycle operation on purpose
+/// (UC-42 / FR-FC-27).
 ///
 /// `FinishFails` pins the "a bookkeeping failure must not sink a successful
 /// walk" behavior: `execute()` retries the write and, once retries are
@@ -2337,13 +2890,38 @@ impl Filesystem for FailingListFilesystem {
 /// a failure to open the run record must propagate, because a caller must
 /// never receive a run id it can never query.
 ///
-/// Each variant implements only the method its test exercises; the rest are
-/// `unimplemented!()`.
+/// `GetFails` pins run priority's own version of the same "a bookkeeping
+/// failure must not sink a successful walk" ruling: `execute` now opens with
+/// a `get` to read the width the run was started at (Task 9), and a
+/// transient failure of that read is exactly the kind of thing that must not
+/// abort a walk that could perfectly well proceed at the configured default
+/// -- only the *pacing* depends on the answer, not the work.
+///
+/// Each variant implements only the methods its test exercises with a
+/// meaningful failure; the rest answer a harmless *refusal* -- `Ok(false)`,
+/// `0` -- rather than panicking, because `execute`'s own shape has changed
+/// under this double before (this file) and will again: a method that happens
+/// to go unread by every *current* test is not a promise it stays that way,
+/// and a double that panics on first contact with a new caller is a worse
+/// failure mode than one that visibly declines to do anything.
+///
+/// That reasoning turns on the answer reading as a refusal. `list_active` has
+/// no such answer -- `Ok(vec![])` is what a *working* repository says about an
+/// idle catalog, so a future test written to prove this double's error
+/// propagates through a listing would pass having never seen an error at all.
+/// It panics instead, the way `FailingCatalogRepository`'s unreachable methods
+/// do, and whoever needs it next gives it a failure worth asserting on.
 #[derive(Debug, Clone, Copy, Default)]
+// The shared `Fails` postfix is the point, not an accident: each variant
+// names the one operation this double fails, and `FinishFails`/`StartFails`/
+// `GetFails` read at every call site (`FailingCatalogRunRepository::GetFails`)
+// far better than a shared prefix or a de-suffixed form would.
+#[allow(clippy::enum_variant_names)]
 pub enum FailingCatalogRunRepository {
     #[default]
     FinishFails,
     StartFails,
+    GetFails,
 }
 
 impl CatalogRunRepository for FailingCatalogRunRepository {
@@ -2353,10 +2931,14 @@ impl CatalogRunRepository for FailingCatalogRunRepository {
         _kind: RunKind,
         _root: Option<&str>,
         _started_at: DateTime<Utc>,
+        _concurrency: u32,
     ) -> Result<(), DomainError> {
         match self {
             Self::StartFails => Err(DomainError::Disk("run store unavailable".into())),
-            Self::FinishFails => unimplemented!("not exercised by the finish-always-fails test"),
+            // Neither `FinishFails`' nor `GetFails`' test calls `start` at
+            // all -- both hand `execute` a bare `Uuid::new_v4()` instead, so
+            // there is nothing for a real answer here to be checked against.
+            Self::FinishFails | Self::GetFails => Ok(()),
         }
     }
 
@@ -2368,7 +2950,10 @@ impl CatalogRunRepository for FailingCatalogRunRepository {
     ) -> Result<(), DomainError> {
         match self {
             Self::FinishFails => Err(DomainError::Disk("run store unavailable".into())),
-            Self::StartFails => unimplemented!("start already failed; finish is never reached"),
+            // `StartFails`' test never reaches `finish` (start already
+            // failed). `GetFails`' test needs this write to succeed -- the
+            // walk itself is fine, only its `get` at the top is not.
+            Self::StartFails | Self::GetFails => Ok(()),
         }
     }
 
@@ -2378,15 +2963,246 @@ impl CatalogRunRepository for FailingCatalogRunRepository {
         _error: &str,
         _finished_at: DateTime<Utc>,
     ) -> Result<(), DomainError> {
-        unimplemented!("not exercised by either failing-repository test")
+        Ok(())
+    }
+
+    async fn record_progress(&self, _id: Uuid, _progress: &RunProgress) -> Result<(), DomainError> {
+        // A flush is best-effort, so failing one here would not change what
+        // any of these tests observe; succeeding keeps their subject the one
+        // write each is actually about.
+        Ok(())
+    }
+
+    async fn pause(
+        &self,
+        _id: Uuid,
+        _paused_at: DateTime<Utc>,
+        _expected_segment: Option<i64>,
+    ) -> Result<bool, DomainError> {
+        Ok(false)
+    }
+
+    async fn cancel(
+        &self,
+        _id: Uuid,
+        _counts: Option<RunCounts>,
+        _cancelled_at: DateTime<Utc>,
+        _expected_segment: Option<i64>,
+    ) -> Result<bool, DomainError> {
+        Ok(false)
+    }
+
+    async fn resume(
+        &self,
+        _id: Uuid,
+        _paused_millis: i64,
+        _concurrency: Option<u32>,
+    ) -> Result<bool, DomainError> {
+        Ok(false)
     }
 
     async fn get(&self, _id: Uuid) -> Result<Option<CatalogRun>, DomainError> {
-        unimplemented!("not exercised by either failing-repository test")
+        match self {
+            // The one failure this double exists to pin: `execute`'s
+            // concurrency lookup must survive this and fall back to the
+            // configured default rather than aborting the walk.
+            Self::GetFails => Err(DomainError::Disk("run store unavailable".into())),
+            // `FinishFails`' and `StartFails`' tests never actually call
+            // `start`, so there is truthfully no row to answer with --
+            // `Ok(None)` matches that, and exercises the same "unknown run"
+            // fallback `execute` takes in production for a run this
+            // repository has never heard of.
+            Self::FinishFails | Self::StartFails => Ok(None),
+        }
     }
 
-    async fn interrupt_running(&self, _now: DateTime<Utc>) -> Result<u64, DomainError> {
-        unimplemented!("not exercised by either failing-repository test")
+    async fn pause_running(&self, _now: DateTime<Utc>) -> Result<u64, DomainError> {
+        Ok(0)
+    }
+
+    async fn list_active(&self) -> Result<Vec<CatalogRun>, DomainError> {
+        // Not reached by any variant's test: each drives a single walk
+        // directly rather than listing. Panics rather than answering
+        // `Ok(vec![])` — see the type doc: an empty list is what success
+        // looks like here, so a failure-injection double handing one back
+        // would let the next error-propagation test pass vacuously.
+        unimplemented!("not reached by the single-walk paths this double exists for")
+    }
+}
+
+/// An async action a collaborator runs from *inside* a walk that is already
+/// under way.
+///
+/// The interesting question about pause is not what it does to a run that has
+/// already stopped — it is whether it stops one mid-flight, leaving entries
+/// unprocessed. There is no seam between "the walk started" and "the walk
+/// ended" other than the collaborators the per-entry work calls, so the
+/// doubles below take one of these and run it once, on their first call.
+///
+/// Boxed rather than a generic parameter because the future has to outlive
+/// the call that made it, and a `Fn() -> impl Future` field cannot say that.
+pub type Interrupt = Arc<dyn Fn() -> futures_util::future::BoxFuture<'static, ()> + Send + Sync>;
+
+/// Wrap an async closure into an [`Interrupt`].
+pub fn interrupt<F, Fut>(action: F) -> Interrupt
+where
+    F: Fn() -> Fut + Send + Sync + 'static,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    Arc::new(move || Box::pin(action()))
+}
+
+/// Which call an [`InterruptingFilesystem`] fires its action on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Seam {
+    /// `list_files`, before it answers — the run is still discovering, and
+    /// has not processed a single entry.
+    Discovery,
+    /// The first per-path `stat` — the run is inside its processing loop,
+    /// which is where `RefreshHandler::refresh_one` starts each path.
+    FirstStat,
+}
+
+/// Runs an [`Interrupt`] once, at the chosen [`Seam`], then delegates every
+/// call to the [`FakeFilesystem`] it wraps.
+pub struct InterruptingFilesystem {
+    inner: FakeFilesystem,
+    seam: Seam,
+    interrupt: Interrupt,
+    fired: AtomicBool,
+}
+
+impl InterruptingFilesystem {
+    pub fn new(inner: FakeFilesystem, seam: Seam, interrupt: Interrupt) -> Self {
+        Self {
+            inner,
+            seam,
+            interrupt,
+            fired: AtomicBool::new(false),
+        }
+    }
+
+    /// Run the action unless it has already run. `swap` rather than a
+    /// load-then-store so two entries in flight at once cannot both fire it.
+    async fn fire_once(&self) {
+        if !self.fired.swap(true, Ordering::Relaxed) {
+            (self.interrupt)().await;
+        }
+    }
+}
+
+impl Filesystem for InterruptingFilesystem {
+    async fn path_exists(&self, root: &str) -> bool {
+        self.inner.path_exists(root).await
+    }
+
+    async fn list_files(&self, root: &str) -> Result<Vec<FileEntry>, DomainError> {
+        if self.seam == Seam::Discovery {
+            self.fire_once().await;
+        }
+        self.inner.list_files(root).await
+    }
+
+    async fn content_hash(&self, path: &str) -> Result<String, DomainError> {
+        self.inner.content_hash(path).await
+    }
+
+    async fn stat(&self, path: &str) -> Result<Option<FileStat>, DomainError> {
+        if self.seam == Seam::FirstStat {
+            self.fire_once().await;
+        }
+        self.inner.stat(path).await
+    }
+
+    async fn rename(&self, from: &str, to: &str) -> Result<(), DomainError> {
+        self.inner.rename(from, to).await
+    }
+
+    async fn remove_file(&self, path: &str) -> Result<bool, DomainError> {
+        self.inner.remove_file(path).await
+    }
+
+    async fn read_file(&self, path: &str) -> Result<String, DomainError> {
+        self.inner.read_file(path).await
+    }
+
+    async fn write_file(&self, path: &str, content: &str) -> Result<(), DomainError> {
+        self.inner.write_file(path, content).await
+    }
+}
+
+/// Runs an [`Interrupt`] the first time it is asked to read audio tags, then
+/// answers `None` like an unseeded [`FakeAudioMetadataReader`] would.
+///
+/// This is the index walk's counterpart to [`InterruptingFilesystem`]:
+/// indexing does not stat per entry, and `CatalogRepository` is far too wide
+/// to wrap, but every audio entry reaches the tag reader inside `index_entry`
+/// — so a walk of `.mp3` files has its seam here.
+pub struct InterruptingAudioMetadataReader {
+    interrupt: Interrupt,
+    fired: AtomicBool,
+}
+
+impl InterruptingAudioMetadataReader {
+    pub fn new(interrupt: Interrupt) -> Self {
+        Self {
+            interrupt,
+            fired: AtomicBool::new(false),
+        }
+    }
+}
+
+impl AudioMetadataReader for InterruptingAudioMetadataReader {
+    async fn read(&self, _path: &str) -> Option<AudioTags> {
+        if !self.fired.swap(true, Ordering::Relaxed) {
+            (self.interrupt)().await;
+        }
+        None
+    }
+}
+
+/// Proves how wide `IndexHandler::execute`'s `buffer_unordered` actually ran
+/// by watching how many `read` calls are in flight at once, rather than
+/// asserting on the outcome tally — which is identical at every width (see
+/// `given_any_concurrency_when_execute_then_same_counts_and_same_catalog`)
+/// and so cannot tell one concurrency from another.
+///
+/// `current` tracks calls in flight right now; `max_seen` is the high-water
+/// mark, which is what a test reads. The `yield_now` between the increment
+/// and the decrement is load-bearing: without it, a `FakeCatalogRepository`
+/// lookup that never actually awaits would let `buffer_unordered` drive one
+/// future all the way to completion before the next is ever polled, and every
+/// width would look sequential. Yielding once forces the executor to poll
+/// every future it has already started before any of them finishes, so
+/// `max_seen` reports how many were genuinely started together.
+#[derive(Debug, Default, Clone)]
+pub struct ConcurrencyTrackingAudioMetadataReader {
+    // Arc-wrapped, not plain fields: the test needs a handle that outlives
+    // the handler's own copy to read `max_seen` afterward, mirroring how
+    // `FakeCatalogRepository` shares its state — a cheap `Clone` of a shared
+    // count, not two independent counters.
+    current: Arc<AtomicUsize>,
+    max_seen: Arc<AtomicUsize>,
+}
+
+impl ConcurrencyTrackingAudioMetadataReader {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The most `read` calls this reader ever saw in flight at once.
+    pub fn max_seen(&self) -> usize {
+        self.max_seen.load(Ordering::SeqCst)
+    }
+}
+
+impl AudioMetadataReader for ConcurrencyTrackingAudioMetadataReader {
+    async fn read(&self, _path: &str) -> Option<AudioTags> {
+        let now_in_flight = self.current.fetch_add(1, Ordering::SeqCst) + 1;
+        self.max_seen.fetch_max(now_in_flight, Ordering::SeqCst);
+        tokio::task::yield_now().await;
+        self.current.fetch_sub(1, Ordering::SeqCst);
+        None
     }
 }
 

@@ -109,6 +109,32 @@ fn given_no_indexing_section_when_parsed_then_default_concurrency() {
     assert_eq!(settings.indexing.concurrency, 4);
 }
 
+/// Mirrors `given_no_indexing_section_when_parsed_then_default_concurrency`
+/// for the `Low`-priority width (run priority, FR-FC-08): an owner who never
+/// sets the key still gets the narrowest useful default rather than an error.
+#[test]
+fn given_no_configured_low_priority_concurrency_when_loaded_then_it_defaults_to_one() {
+    let settings = Settings::default();
+    assert_eq!(settings.indexing.low_priority_concurrency, 1);
+}
+
+/// Same shape as `given_configured_indexing_concurrency`: a set key lands
+/// verbatim.
+#[test]
+fn given_configured_low_priority_concurrency_when_parsed_then_kept_verbatim() {
+    let settings: Settings = toml::from_str("[indexing]\nlow_priority_concurrency = 2\n").unwrap();
+    assert_eq!(settings.indexing.low_priority_concurrency, 2);
+}
+
+/// Zero is as meaningless here as it is for `concurrency` — see
+/// `given_zero_indexing_concurrency_when_parsed_then_kept_verbatim_for_the_handler_to_clamp`.
+/// The config layer stores whatever it is given; the handlers clamp it.
+#[test]
+fn given_zero_low_priority_concurrency_when_parsed_then_kept_verbatim_for_the_handler_to_clamp() {
+    let settings: Settings = toml::from_str("[indexing]\nlow_priority_concurrency = 0\n").unwrap();
+    assert_eq!(settings.indexing.low_priority_concurrency, 0);
+}
+
 /// `config.toml.example` is the documented full key list (README §Running), so
 /// it has to parse into `Settings` and its values have to land in real fields.
 /// Unknown keys are ignored by design (the example file says so), so a key the
@@ -126,6 +152,7 @@ fn given_shipped_example_config_when_parsed_then_values_land_in_settings() {
     assert_eq!(settings.http.port, 8080);
     assert_eq!(settings.database.path, "alexandria.sqlite");
     assert_eq!(settings.indexing.concurrency, 4);
+    assert_eq!(settings.indexing.low_priority_concurrency, 1);
     assert_eq!(settings.deletion.retention_days, 30);
     assert_eq!(settings.logging.level.as_str(), "info");
 }

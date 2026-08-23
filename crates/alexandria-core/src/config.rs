@@ -275,23 +275,37 @@ impl Default for DatabaseSettings {
 #[derive(Debug, Clone, Deserialize)]
 pub struct IndexingSettings {
     /// How many files UC-01's index walk and UC-02's re-index walk process at
-    /// a time. The per-file cost is dominated by hashing the bytes, which runs
-    /// on Tokio's blocking pool, so this is a real parallelism knob — but the
-    /// database half of each file's work still serializes behind SQLite's
+    /// a time. The per-file cost is a stat plus, for a supported extension, a
+    /// tag-header read — no file bytes are hashed (FR-FC-09/FR-FC-10) — and
+    /// both run on Tokio's blocking pool, so this is a real parallelism knob.
+    /// The database half of each file's work still serializes behind SQLite's
     /// single writer and the pool's 8 connections, so values far above that
     /// buy nothing. Zero is clamped to 1 (sequential) by the handlers.
     #[serde(default = "default_indexing_concurrency")]
     pub concurrency: u32,
+    /// How many files a `Low`-priority run (`RunPriority::Low`, FR-FC-08)
+    /// processes at a time. A large scan started at low priority is meant to
+    /// stay out of the way of browsing and playback rather than to finish
+    /// fast, so the default is the narrowest useful width — sequential is 1,
+    /// not 0, for the reason `concurrency` itself is never let land there.
+    /// Zero is clamped to 1 by the handlers, exactly as `concurrency` is.
+    #[serde(default = "default_indexing_low_priority_concurrency")]
+    pub low_priority_concurrency: u32,
 }
 
 fn default_indexing_concurrency() -> u32 {
     4
 }
 
+fn default_indexing_low_priority_concurrency() -> u32 {
+    1
+}
+
 impl Default for IndexingSettings {
     fn default() -> Self {
         Self {
             concurrency: default_indexing_concurrency(),
+            low_priority_concurrency: default_indexing_low_priority_concurrency(),
         }
     }
 }
@@ -348,10 +362,13 @@ pub struct PlaybackSettings {
     /// Directory holding generated thumbnails (UC-40), created on first
     /// use. Relative by default, matching `database.path`.
     ///
-    /// Cache entries are keyed by content hash, so a re-index that changes
-    /// a file's bytes invalidates its thumbnail for free. There is no
-    /// eviction policy: inventing one before anyone has a full cache would
-    /// be guessing.
+    /// Cache entries are keyed by uuid and mtime (see
+    /// `playback::thumbnail`), so a file that changes on disk invalidates its
+    /// thumbnail for free. Not by content hash, which is what this said until
+    /// indexing stopped computing one (FR-FC-09): keying on a hash would make
+    /// the first thumbnail of a multi-gigabyte video pay to read the whole
+    /// file. There is no eviction policy: inventing one before anyone has a
+    /// full cache would be guessing.
     #[serde(default = "default_thumbnail_cache_dir")]
     pub thumbnail_cache_dir: String,
 }
@@ -461,6 +478,11 @@ impl Settings {
         if let Ok(concurrency) = env::var("ALEXANDRIA_INDEXING_CONCURRENCY") {
             if let Ok(parsed) = concurrency.parse::<u32>() {
                 self.indexing.concurrency = parsed;
+            }
+        }
+        if let Ok(concurrency) = env::var("ALEXANDRIA_INDEXING_LOW_PRIORITY_CONCURRENCY") {
+            if let Ok(parsed) = concurrency.parse::<u32>() {
+                self.indexing.low_priority_concurrency = parsed;
             }
         }
         if let Ok(days) = env::var("ALEXANDRIA_DELETION_RETENTION_DAYS") {

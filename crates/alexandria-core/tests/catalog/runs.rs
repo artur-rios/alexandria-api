@@ -5,18 +5,31 @@
 use chrono::{TimeZone, Utc};
 use uuid::Uuid;
 
+use alexandria_core::catalog::run_registry::{RunPhase, RunProgress};
 use alexandria_core::catalog::runs::{
     CatalogRunRepository, RunCounts, RunKind, RunStatus, SqliteCatalogRunRepository,
 };
 use alexandria_core::migrate::migrate_database;
 
 async fn repo() -> (SqliteCatalogRunRepository, tempfile::TempDir) {
+    let (repo, _pool, dir) = repo_with_pool().await;
+    (repo, dir)
+}
+
+/// As [`repo`], but keeping the pool as well - for seeding a pause directly
+/// rather than through the transition that produces it, so the read path is
+/// covered on its own.
+async fn repo_with_pool() -> (
+    SqliteCatalogRunRepository,
+    sqlx::sqlite::SqlitePool,
+    tempfile::TempDir,
+) {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("alexandria.sqlite");
     let pool = migrate_database(path.to_str().expect("path"))
         .await
         .expect("migrate");
-    (SqliteCatalogRunRepository::new(pool), dir)
+    (SqliteCatalogRunRepository::new(pool.clone()), pool, dir)
 }
 
 fn t(hour: u32) -> chrono::DateTime<Utc> {
@@ -28,7 +41,7 @@ async fn given_a_started_run_when_read_then_it_is_running_with_no_counts() {
     let (repo, _dir) = repo().await;
     let id = Uuid::new_v4();
 
-    repo.start(id, RunKind::Index, Some("/library"), t(1))
+    repo.start(id, RunKind::Index, Some("/library"), t(1), 4)
         .await
         .expect("start");
 
@@ -41,22 +54,46 @@ async fn given_a_started_run_when_read_then_it_is_running_with_no_counts() {
     assert!(run.finished_at.is_none(), "a running run has not finished");
     assert!(run.counts.is_none(), "no tally exists until the walk ends");
     assert!(run.error.is_none());
+    assert_eq!(
+        run.concurrency,
+        Some(4),
+        "start persists the width it was called with, against the real column"
+    );
+}
+
+/// The real-SQL counterpart of the handler-level
+/// `given_a_low_priority_index_when_started_then_the_run_records_the_low_concurrency`
+/// (`tests/catalog/index.rs`): `start`'s `concurrency` INSERT and `get`'s
+/// `concurrency` SELECT round-trip through an actual `catalog_runs` row, not
+/// just the in-memory fake.
+#[tokio::test]
+async fn given_a_run_started_at_a_given_width_when_read_then_the_width_round_trips() {
+    let (repo, _dir) = repo().await;
+    let id = Uuid::new_v4();
+
+    repo.start(id, RunKind::Index, Some("/library"), t(1), 1)
+        .await
+        .expect("start");
+
+    let run = repo.get(id).await.expect("get").expect("run exists");
+    assert_eq!(run.concurrency, Some(1));
 }
 
 #[tokio::test]
 async fn given_a_running_index_run_when_finished_then_it_is_complete_with_its_counts() {
     let (repo, _dir) = repo().await;
     let id = Uuid::new_v4();
-    repo.start(id, RunKind::Index, Some("/library"), t(1))
+    repo.start(id, RunKind::Index, Some("/library"), t(1), 4)
         .await
         .expect("start");
 
     repo.finish(
         id,
         RunCounts::Index {
-            scanned: 10,
+            scanned: 13,
             indexed: 7,
             skipped: 2,
+            already_cataloged: 3,
             failed: 1,
         },
         t(2),
@@ -70,9 +107,10 @@ async fn given_a_running_index_run_when_finished_then_it_is_complete_with_its_co
     assert_eq!(
         run.counts,
         Some(RunCounts::Index {
-            scanned: 10,
+            scanned: 13,
             indexed: 7,
             skipped: 2,
+            already_cataloged: 3,
             failed: 1
         })
     );
@@ -85,7 +123,7 @@ async fn given_a_run_with_per_file_failures_when_finished_then_it_is_complete_no
     // `failed` counts them; the run still completed its walk.
     let (repo, _dir) = repo().await;
     let id = Uuid::new_v4();
-    repo.start(id, RunKind::Refresh, None, t(1))
+    repo.start(id, RunKind::Refresh, None, t(1), 4)
         .await
         .expect("start");
 
@@ -114,7 +152,7 @@ async fn given_a_run_with_per_file_failures_when_finished_then_it_is_complete_no
 async fn given_a_running_refresh_run_when_failed_then_it_carries_the_error() {
     let (repo, _dir) = repo().await;
     let id = Uuid::new_v4();
-    repo.start(id, RunKind::Refresh, None, t(1))
+    repo.start(id, RunKind::Refresh, None, t(1), 4)
         .await
         .expect("start");
 
@@ -137,7 +175,7 @@ async fn given_a_refresh_run_when_started_then_it_has_no_root() {
     // A refresh touches every cataloged path and takes no root.
     let (repo, _dir) = repo().await;
     let id = Uuid::new_v4();
-    repo.start(id, RunKind::Refresh, None, t(1))
+    repo.start(id, RunKind::Refresh, None, t(1), 4)
         .await
         .expect("start");
 
@@ -154,19 +192,21 @@ async fn given_an_unknown_id_when_read_then_none() {
 }
 
 #[tokio::test]
-async fn given_running_and_terminal_runs_when_reconciled_then_only_running_becomes_interrupted() {
-    // FR-FC-29: runs execute in-process and are never resumed, so a row still
-    // `running` at startup provably has no task behind it. Terminal rows must
-    // be left exactly as they are.
+async fn given_running_and_terminal_runs_when_reconciled_then_only_running_becomes_paused() {
+    // FR-FC-29: a row still `running` at startup provably has no task behind
+    // it, because runs execute in-process. It becomes `paused` rather than
+    // terminal, so closing the application mid-scan leaves work to resume
+    // rather than work to redo. Terminal rows must be left exactly as they
+    // are.
     let (repo, _dir) = repo().await;
     let running = Uuid::new_v4();
     let completed = Uuid::new_v4();
     let failed = Uuid::new_v4();
 
-    repo.start(running, RunKind::Index, Some("/library"), t(1))
+    repo.start(running, RunKind::Index, Some("/library"), t(1), 4)
         .await
         .expect("start running");
-    repo.start(completed, RunKind::Refresh, None, t(1))
+    repo.start(completed, RunKind::Refresh, None, t(1), 4)
         .await
         .expect("start completed");
     repo.finish(
@@ -181,19 +221,23 @@ async fn given_running_and_terminal_runs_when_reconciled_then_only_running_becom
     )
     .await
     .expect("finish");
-    repo.start(failed, RunKind::Refresh, None, t(1))
+    repo.start(failed, RunKind::Refresh, None, t(1), 4)
         .await
         .expect("start failed");
     repo.fail(failed, "catalog unreadable", t(2))
         .await
         .expect("fail");
 
-    let reconciled = repo.interrupt_running(t(3)).await.expect("interrupt");
+    let reconciled = repo.pause_running(t(3)).await.expect("pause running");
 
     assert_eq!(reconciled, 1, "only the running row is reconciled");
     let run = repo.get(running).await.unwrap().unwrap();
-    assert_eq!(run.status, RunStatus::Interrupted);
-    assert_eq!(run.finished_at, Some(t(3)));
+    assert_eq!(run.status, RunStatus::Paused);
+    assert_eq!(run.paused_at, Some(t(3)));
+    assert!(
+        run.finished_at.is_none(),
+        "a run offered for resume has not finished"
+    );
     assert_eq!(
         repo.get(completed).await.unwrap().unwrap().status,
         RunStatus::Complete
@@ -207,14 +251,14 @@ async fn given_running_and_terminal_runs_when_reconciled_then_only_running_becom
 #[tokio::test]
 async fn given_no_running_runs_when_reconciled_then_nothing_changes() {
     let (repo, _dir) = repo().await;
-    assert_eq!(repo.interrupt_running(t(3)).await.expect("interrupt"), 0);
+    assert_eq!(repo.pause_running(t(3)).await.expect("pause running"), 0);
 }
 
 #[tokio::test]
-async fn given_a_run_left_running_when_services_are_built_then_it_is_interrupted() {
+async fn given_a_run_still_marked_running_at_startup_when_reconciled_then_it_is_paused_not_lost() {
     // FR-FC-29 end to end: a run recorded as running by a previous process is
-    // reconciled at startup, so a client polling it gets a terminal answer
-    // instead of waiting on a run that cannot finish.
+    // reconciled at startup into a run the owner is *offered*, not a loss they
+    // are informed of. Nothing starts by itself — resuming is an explicit act.
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("alexandria.sqlite");
     let pool = migrate_database(path.to_str().expect("path"))
@@ -223,7 +267,7 @@ async fn given_a_run_left_running_when_services_are_built_then_it_is_interrupted
 
     let repo = SqliteCatalogRunRepository::new(pool.clone());
     let id = Uuid::new_v4();
-    repo.start(id, RunKind::Refresh, None, t(1))
+    repo.start(id, RunKind::Refresh, None, t(1), 4)
         .await
         .expect("start");
 
@@ -231,7 +275,11 @@ async fn given_a_run_left_running_when_services_are_built_then_it_is_interrupted
         alexandria_core::services::build_services(&Default::default(), pool.clone()).await;
 
     let run = repo.get(id).await.expect("get").expect("run exists");
-    assert_eq!(run.status, RunStatus::Interrupted);
+    assert_eq!(run.status, RunStatus::Paused);
+    assert!(
+        run.finished_at.is_none(),
+        "the run is resumable, so it carries no finish time"
+    );
 }
 
 #[tokio::test]
@@ -241,7 +289,7 @@ async fn given_an_index_run_when_finished_with_refresh_counts_then_error_and_row
     // `get` would otherwise report as a `Complete` run with no counts.
     let (repo, _dir) = repo().await;
     let id = Uuid::new_v4();
-    repo.start(id, RunKind::Index, Some("/library"), t(1))
+    repo.start(id, RunKind::Index, Some("/library"), t(1), 4)
         .await
         .expect("start");
 
@@ -269,7 +317,7 @@ async fn given_an_index_run_when_finished_with_refresh_counts_then_error_and_row
 async fn given_a_refresh_run_when_finished_with_index_counts_then_error_and_row_untouched() {
     let (repo, _dir) = repo().await;
     let id = Uuid::new_v4();
-    repo.start(id, RunKind::Refresh, None, t(1))
+    repo.start(id, RunKind::Refresh, None, t(1), 4)
         .await
         .expect("start");
 
@@ -280,6 +328,7 @@ async fn given_a_refresh_run_when_finished_with_index_counts_then_error_and_row_
                 scanned: 1,
                 indexed: 1,
                 skipped: 0,
+                already_cataloged: 0,
                 failed: 0,
             },
             t(2),
@@ -297,7 +346,7 @@ async fn given_a_refresh_run_when_finished_with_index_counts_then_error_and_row_
 async fn given_a_running_index_run_when_serialized_then_only_running_fields_present() {
     let (repo, _dir) = repo().await;
     let id = Uuid::new_v4();
-    repo.start(id, RunKind::Index, Some("/library"), t(1))
+    repo.start(id, RunKind::Index, Some("/library"), t(1), 4)
         .await
         .expect("start");
     let run = repo.get(id).await.expect("get").expect("run exists");
@@ -322,6 +371,7 @@ async fn given_a_running_index_run_when_serialized_then_only_running_fields_pres
     assert!(value.get("scanned").is_none());
     assert!(value.get("indexed").is_none());
     assert!(value.get("skipped").is_none());
+    assert!(value.get("alreadyCataloged").is_none());
     assert!(value.get("failed").is_none());
     assert!(value.get("error").is_none());
 }
@@ -330,7 +380,7 @@ async fn given_a_running_index_run_when_serialized_then_only_running_fields_pres
 async fn given_a_completed_refresh_run_when_serialized_then_counts_are_flattened_top_level() {
     let (repo, _dir) = repo().await;
     let id = Uuid::new_v4();
-    repo.start(id, RunKind::Refresh, None, t(1))
+    repo.start(id, RunKind::Refresh, None, t(1), 4)
         .await
         .expect("start");
     repo.finish(
@@ -357,6 +407,7 @@ async fn given_a_completed_refresh_run_when_serialized_then_counts_are_flattened
     assert!(value.get("scanned").is_none());
     assert!(value.get("indexed").is_none());
     assert!(value.get("skipped").is_none());
+    assert!(value.get("alreadyCataloged").is_none());
     assert!(value.get("root").is_none(), "a refresh has no root");
     assert!(value.get("error").is_none());
 }
@@ -366,15 +417,16 @@ async fn given_a_completed_index_run_when_serialized_then_counts_and_root_are_fl
 {
     let (repo, _dir) = repo().await;
     let id = Uuid::new_v4();
-    repo.start(id, RunKind::Index, Some("/library"), t(1))
+    repo.start(id, RunKind::Index, Some("/library"), t(1), 4)
         .await
         .expect("start");
     repo.finish(
         id,
         RunCounts::Index {
-            scanned: 10,
+            scanned: 13,
             indexed: 7,
             skipped: 2,
+            already_cataloged: 3,
             failed: 1,
         },
         t(2),
@@ -386,9 +438,13 @@ async fn given_a_completed_index_run_when_serialized_then_counts_and_root_are_fl
     let value = serde_json::to_value(&run).expect("serialize");
 
     assert_eq!(value.get("root").and_then(|v| v.as_str()), Some("/library"));
-    assert_eq!(value.get("scanned").and_then(|v| v.as_u64()), Some(10));
+    assert_eq!(value.get("scanned").and_then(|v| v.as_u64()), Some(13));
     assert_eq!(value.get("indexed").and_then(|v| v.as_u64()), Some(7));
     assert_eq!(value.get("skipped").and_then(|v| v.as_u64()), Some(2));
+    assert_eq!(
+        value.get("alreadyCataloged").and_then(|v| v.as_u64()),
+        Some(3)
+    );
     assert_eq!(value.get("failed").and_then(|v| v.as_u64()), Some(1));
     assert!(value.get("finishedAt").is_some());
     // Refresh-only count keys must be absent, not sent as null.
@@ -402,7 +458,7 @@ async fn given_a_completed_index_run_when_serialized_then_counts_and_root_are_fl
 async fn given_a_failed_run_when_serialized_then_error_present_and_no_counts() {
     let (repo, _dir) = repo().await;
     let id = Uuid::new_v4();
-    repo.start(id, RunKind::Refresh, None, t(1))
+    repo.start(id, RunKind::Refresh, None, t(1), 4)
         .await
         .expect("start");
     repo.fail(id, "catalog unreadable", t(2))
@@ -424,8 +480,1038 @@ async fn given_a_failed_run_when_serialized_then_error_present_and_no_counts() {
     assert!(value.get("scanned").is_none());
     assert!(value.get("indexed").is_none());
     assert!(value.get("skipped").is_none());
+    assert!(value.get("alreadyCataloged").is_none());
     assert!(
         value.get("failed").is_none(),
         "no failed-count key on a run with no tally"
     );
+}
+
+#[tokio::test]
+async fn given_a_running_run_when_progress_is_recorded_then_it_reads_back_from_the_row() {
+    // FR-FC-28: the flush is the only durable record of how far a run got, so
+    // its own UPDATE and the `get` that reads it have to round-trip against
+    // real SQL, not just against the in-memory fake.
+    let (repo, _dir) = repo().await;
+    let id = Uuid::new_v4();
+    repo.start(id, RunKind::Index, Some("/library"), t(1), 4)
+        .await
+        .expect("start");
+
+    repo.record_progress(
+        id,
+        &RunProgress {
+            phase: RunPhase::Processing,
+            total: Some(12_264),
+            processed: 8_412,
+        },
+    )
+    .await
+    .expect("record progress");
+
+    let run = repo.get(id).await.expect("get").expect("run exists");
+    assert_eq!(run.phase, Some(RunPhase::Processing));
+    assert_eq!(run.total, Some(12_264));
+    assert_eq!(run.processed, Some(8_412));
+    assert_eq!(
+        run.status,
+        RunStatus::Running,
+        "a flush is not a transition"
+    );
+    assert_eq!(
+        run.paused_millis, 0,
+        "a run that was never paused needs no special case"
+    );
+    assert!(run.paused_at.is_none());
+}
+
+#[tokio::test]
+async fn given_a_run_still_discovering_when_progress_is_recorded_then_the_total_is_null() {
+    // Discovery has no denominator yet: the sentinel must reach the row as
+    // NULL and read back as `None`, not as some large number.
+    let (repo, _dir) = repo().await;
+    let id = Uuid::new_v4();
+    repo.start(id, RunKind::Index, Some("/library"), t(1), 4)
+        .await
+        .expect("start");
+
+    repo.record_progress(
+        id,
+        &RunProgress {
+            phase: RunPhase::Discovering,
+            total: None,
+            processed: 0,
+        },
+    )
+    .await
+    .expect("record progress");
+
+    let run = repo.get(id).await.expect("get").expect("run exists");
+    assert_eq!(run.phase, Some(RunPhase::Discovering));
+    assert_eq!(run.total, None);
+    assert_eq!(run.processed, Some(0));
+}
+
+#[tokio::test]
+async fn given_a_run_with_progress_when_finished_then_the_phase_clears_and_the_tally_stays() {
+    // A terminal run has no phase: `status = complete` beside
+    // `phase = processing` would tell a client two contradictory things. The
+    // numbers are still true, so they stay.
+    let (repo, _dir) = repo().await;
+    let id = Uuid::new_v4();
+    repo.start(id, RunKind::Index, Some("/library"), t(1), 4)
+        .await
+        .expect("start");
+    repo.record_progress(
+        id,
+        &RunProgress {
+            phase: RunPhase::Processing,
+            total: Some(13),
+            processed: 13,
+        },
+    )
+    .await
+    .expect("record progress");
+
+    repo.finish(
+        id,
+        RunCounts::Index {
+            scanned: 13,
+            indexed: 7,
+            skipped: 2,
+            already_cataloged: 3,
+            failed: 1,
+        },
+        t(2),
+    )
+    .await
+    .expect("finish");
+
+    let run = repo.get(id).await.expect("get").expect("run exists");
+    assert_eq!(run.status, RunStatus::Complete);
+    assert_eq!(run.phase, None, "a terminal run publishes no phase");
+    assert_eq!(run.total, Some(13));
+    assert_eq!(run.processed, Some(13));
+    let value = serde_json::to_value(&run).expect("serialize");
+    assert!(
+        value.get("phase").is_none(),
+        "an absent phase is omitted, not sent as null"
+    );
+}
+
+#[tokio::test]
+async fn given_a_run_with_progress_when_it_fails_then_the_phase_clears() {
+    let (repo, _dir) = repo().await;
+    let id = Uuid::new_v4();
+    repo.start(id, RunKind::Refresh, None, t(1), 4)
+        .await
+        .expect("start");
+    repo.record_progress(
+        id,
+        &RunProgress {
+            phase: RunPhase::Processing,
+            total: Some(4),
+            processed: 1,
+        },
+    )
+    .await
+    .expect("record progress");
+
+    repo.fail(id, "catalog unreadable", t(2))
+        .await
+        .expect("fail");
+
+    let run = repo.get(id).await.expect("get").expect("run exists");
+    assert_eq!(run.status, RunStatus::Failed);
+    assert_eq!(run.phase, None);
+    assert_eq!(
+        run.processed,
+        Some(1),
+        "how far a failed run got is still worth reporting"
+    );
+}
+
+#[tokio::test]
+async fn given_a_run_reconciled_at_startup_when_read_then_it_publishes_no_phase() {
+    // A run paused by startup reconciliation is not *in* a phase: its process
+    // is gone, and it will not be in one again until it is resumed. That is
+    // the one thing separating it from a run an owner paused, whose phase says
+    // where its still-live walk stopped.
+    let (repo, _dir) = repo().await;
+    let id = Uuid::new_v4();
+    repo.start(id, RunKind::Index, Some("/library"), t(1), 4)
+        .await
+        .expect("start");
+    repo.record_progress(
+        id,
+        &RunProgress {
+            phase: RunPhase::Processing,
+            total: Some(9),
+            processed: 5,
+        },
+    )
+    .await
+    .expect("record progress");
+
+    repo.pause_running(t(2)).await.expect("pause running");
+
+    let run = repo.get(id).await.expect("get").expect("run exists");
+    assert_eq!(run.status, RunStatus::Paused);
+    assert_eq!(run.paused_at, Some(t(2)));
+    assert_eq!(run.phase, None);
+    assert_eq!(
+        run.processed,
+        Some(5),
+        "the last flush is what the lost segment has to show for itself"
+    );
+}
+
+#[tokio::test]
+async fn given_a_running_run_with_progress_when_paused_then_it_keeps_its_phase_and_stamps_paused_at(
+) {
+    // Pause is the one non-terminal transition, so it is the one that keeps
+    // its phase: a client reading `paused` beside `processing` learns the run
+    // stopped mid-walk rather than mid-discovery, which is exactly what it
+    // needs to know before resuming.
+    let (repo, _dir) = repo().await;
+    let id = Uuid::new_v4();
+    repo.start(id, RunKind::Index, Some("/library"), t(1), 4)
+        .await
+        .expect("start");
+    repo.record_progress(
+        id,
+        &RunProgress {
+            phase: RunPhase::Processing,
+            total: Some(9),
+            processed: 4,
+        },
+    )
+    .await
+    .expect("record progress");
+
+    let applied = repo.pause(id, t(2), None).await.expect("pause");
+
+    assert!(applied, "a running run accepts a pause");
+    let run = repo.get(id).await.expect("get").expect("run exists");
+    assert_eq!(run.status, RunStatus::Paused);
+    assert_eq!(run.paused_at, Some(t(2)));
+    assert_eq!(
+        run.phase,
+        Some(RunPhase::Processing),
+        "a paused run is not terminal, so its phase still describes where it stopped"
+    );
+    assert_eq!(run.processed, Some(4), "the tally survives the pause");
+    assert!(
+        run.finished_at.is_none(),
+        "a paused run has not finished — it can still be resumed"
+    );
+    let value = serde_json::to_value(&run).expect("serialize");
+    assert_eq!(value.get("status").and_then(|v| v.as_str()), Some("paused"));
+    assert!(value.get("pausedAt").is_some());
+}
+
+#[tokio::test]
+async fn given_a_run_with_progress_when_cancelled_then_it_is_terminal_and_clears_its_phase() {
+    // Cancel is terminal, so it clears the phase for the same reason `finish`
+    // and `fail` do: `status = cancelled` beside `phase = processing` would
+    // tell a client two contradictory things.
+    let (repo, _dir) = repo().await;
+    let id = Uuid::new_v4();
+    repo.start(id, RunKind::Refresh, None, t(1), 4)
+        .await
+        .expect("start");
+    repo.record_progress(
+        id,
+        &RunProgress {
+            phase: RunPhase::Processing,
+            total: Some(9),
+            processed: 4,
+        },
+    )
+    .await
+    .expect("record progress");
+
+    repo.cancel(id, None, t(2), None).await.expect("cancel");
+
+    let run = repo.get(id).await.expect("get").expect("run exists");
+    assert_eq!(run.status, RunStatus::Cancelled);
+    assert_eq!(run.finished_at, Some(t(2)));
+    assert_eq!(run.phase, None, "a terminal run publishes no phase");
+    assert_eq!(
+        run.processed,
+        Some(4),
+        "how far a cancelled run got is still worth reporting"
+    );
+    let value = serde_json::to_value(&run).expect("serialize");
+    assert_eq!(
+        value.get("status").and_then(|v| v.as_str()),
+        Some("cancelled")
+    );
+}
+
+#[tokio::test]
+async fn given_a_paused_run_when_startup_reconciles_then_it_is_left_paused() {
+    // FR-FC-29 reconciles `running` rows, and a paused run must not be one of
+    // them: it stopped deliberately, and its row is what a later resume has
+    // to work from.
+    let (repo, _dir) = repo().await;
+    let id = Uuid::new_v4();
+    repo.start(id, RunKind::Index, Some("/library"), t(1), 4)
+        .await
+        .expect("start");
+    assert!(repo.pause(id, t(2), None).await.expect("pause"));
+
+    let reconciled = repo.pause_running(t(3)).await.expect("pause running");
+
+    assert_eq!(reconciled, 0, "a paused run is not a running one");
+    let run = repo.get(id).await.expect("get").expect("run exists");
+    assert_eq!(run.status, RunStatus::Paused);
+    assert_eq!(run.paused_at, Some(t(2)));
+}
+
+#[tokio::test]
+async fn given_a_row_with_pause_columns_set_when_read_then_they_come_back_off_the_row() {
+    // `paused_at` / `paused_millis` are read by real SQL here and written by
+    // the pause/resume command in a later task. Seeded directly so the read
+    // path - including the RFC 3339 parse of `paused_at` - is covered now
+    // rather than resting on a test-only fake setter.
+    let (repo, pool, _dir) = repo_with_pool().await;
+    let id = Uuid::new_v4();
+    repo.start(id, RunKind::Index, Some("/library"), t(1), 4)
+        .await
+        .expect("start");
+
+    sqlx::query("UPDATE catalog_runs SET paused_at = ?, paused_millis = ? WHERE id = ?")
+        .bind(t(2).to_rfc3339())
+        .bind(90_000_i64)
+        .bind(id.to_string())
+        .execute(&pool)
+        .await
+        .expect("seed the pause columns");
+
+    let run = repo.get(id).await.expect("get").expect("run exists");
+    assert_eq!(run.paused_at, Some(t(2)));
+    assert_eq!(run.paused_millis, 90_000);
+    let value = serde_json::to_value(&run).expect("serialize");
+    assert!(
+        value.get("pausedMillis").is_none(),
+        "pausedMillis is the input activeMillis is derived from, not a client field"
+    );
+}
+
+#[tokio::test]
+async fn given_a_cancelled_run_when_a_pause_write_lands_afterwards_then_the_cancel_stands() {
+    // The window the `AND status = 'running'` guard exists for. A walk closes
+    // its cell *before* its own terminal write; a cancel arriving in that gap
+    // finds no live cell and writes the row directly, and the walk's own
+    // `pause` then lands second. Unguarded, that pause would leave `paused`
+    // beside the `finished_at` the cancel stamped, and a run the owner asked
+    // to abandon would look resumable.
+    let (repo, _dir) = repo().await;
+    let id = Uuid::new_v4();
+    repo.start(id, RunKind::Index, Some("/library"), t(1), 4)
+        .await
+        .expect("start");
+    repo.cancel(id, None, t(2), None).await.expect("cancel");
+
+    let applied = repo.pause(id, t(3), None).await.expect("pause");
+
+    assert!(!applied, "a pause must not apply to a run already closed");
+    let run = repo.get(id).await.expect("get").expect("run exists");
+    assert_eq!(run.status, RunStatus::Cancelled, "the cancel stands");
+    assert_eq!(run.finished_at, Some(t(2)));
+    assert!(
+        run.paused_at.is_none(),
+        "the refused pause must not have stamped a pause time either"
+    );
+}
+
+#[tokio::test]
+async fn given_a_resumed_run_when_the_previous_segments_pause_lands_then_it_is_refused() {
+    // The window `AND (? IS NULL OR segment = ?)` exists for, and the one the
+    // status guard above cannot cover: *both* a pause and a resume land while
+    // the walk is between dropping its cell and recording itself, so the row
+    // reads `running` again — a different segment. The old walk's pause would
+    // otherwise apply, leaving `paused` on a run a live segment is walking.
+    let (repo, _dir) = repo().await;
+    let id = Uuid::new_v4();
+    repo.start(id, RunKind::Index, Some("/library"), t(1), 4)
+        .await
+        .expect("start");
+    let segment = repo
+        .get(id)
+        .await
+        .expect("get")
+        .expect("run exists")
+        .segment;
+    // The gap: someone pauses the run the walk had already stopped, a client
+    // sees `paused`, and resumes — spawning the segment now walking it.
+    assert!(repo.pause(id, t(2), None).await.expect("pause"));
+    assert!(repo.resume(id, 0, None).await.expect("resume"));
+
+    let applied = repo.pause(id, t(3), Some(segment)).await.expect("pause");
+
+    assert!(
+        !applied,
+        "a segment that has already stopped must not pause the one that replaced it"
+    );
+    let run = repo.get(id).await.expect("get").expect("run exists");
+    assert_eq!(
+        run.status,
+        RunStatus::Running,
+        "the resumed segment is still walking"
+    );
+    assert!(run.paused_at.is_none());
+    assert_eq!(run.segment, segment + 1, "resume opened a new segment");
+}
+
+#[tokio::test]
+async fn given_a_resumed_run_when_the_previous_segments_cancel_lands_then_it_is_refused() {
+    // The pause race's terminal twin, and the worse of the two: an old
+    // segment's cancel landing on a resumed row marks the run `cancelled`
+    // while the new segment walks on against it, and only that segment's
+    // unconditional `finish` — minutes later — contradicts it.
+    // `TALLY_CANCELLABLE_FROM` admits `running`, so the status guard alone
+    // lets it through.
+    let (repo, _dir) = repo().await;
+    let id = Uuid::new_v4();
+    repo.start(id, RunKind::Index, Some("/library"), t(1), 4)
+        .await
+        .expect("start");
+    let segment = repo
+        .get(id)
+        .await
+        .expect("get")
+        .expect("run exists")
+        .segment;
+    assert!(repo.pause(id, t(2), None).await.expect("pause"));
+    assert!(repo.resume(id, 0, None).await.expect("resume"));
+
+    let applied = repo
+        .cancel(
+            id,
+            Some(RunCounts::Index {
+                scanned: 13,
+                indexed: 4,
+                skipped: 1,
+                already_cataloged: 0,
+                failed: 1,
+            }),
+            t(3),
+            Some(segment),
+        )
+        .await
+        .expect("walk cancel");
+
+    assert!(
+        !applied,
+        "a segment that has already stopped must not cancel the one that replaced it"
+    );
+    let run = repo.get(id).await.expect("get").expect("run exists");
+    assert_eq!(
+        run.status,
+        RunStatus::Running,
+        "the resumed segment is still walking"
+    );
+    assert!(run.finished_at.is_none());
+    assert!(
+        run.counts.is_none(),
+        "nor may it write the stopped segment's tally over a run still working"
+    );
+}
+
+#[tokio::test]
+async fn given_a_running_run_when_its_own_segments_pause_lands_then_it_applies() {
+    // The legal path the guard must not cost anything: a walk pausing the
+    // segment it is actually executing. The only difference from the test
+    // above is that nobody resumed in between.
+    let (repo, _dir) = repo().await;
+    let id = Uuid::new_v4();
+    repo.start(id, RunKind::Refresh, None, t(1), 4)
+        .await
+        .expect("start");
+    let segment = repo
+        .get(id)
+        .await
+        .expect("get")
+        .expect("run exists")
+        .segment;
+
+    let applied = repo.pause(id, t(2), Some(segment)).await.expect("pause");
+
+    assert!(applied);
+    let run = repo.get(id).await.expect("get").expect("run exists");
+    assert_eq!(run.status, RunStatus::Paused);
+    assert_eq!(run.paused_at, Some(t(2)));
+}
+
+#[tokio::test]
+async fn given_a_completed_run_when_a_pause_write_lands_afterwards_then_it_is_refused() {
+    // The same guard seen from the ordinary direction: a walk that finished
+    // between a control call's lookup and its write.
+    let (repo, _dir) = repo().await;
+    let id = Uuid::new_v4();
+    repo.start(id, RunKind::Refresh, None, t(1), 4)
+        .await
+        .expect("start");
+    repo.finish(
+        id,
+        RunCounts::Refresh {
+            refreshed: 1,
+            marked_missing: 0,
+            unchanged: 0,
+            failed: 0,
+        },
+        t(2),
+    )
+    .await
+    .expect("finish");
+
+    let applied = repo.pause(id, t(3), None).await.expect("pause");
+
+    assert!(!applied);
+    assert_eq!(
+        repo.get(id).await.unwrap().unwrap().status,
+        RunStatus::Complete
+    );
+}
+
+#[tokio::test]
+async fn given_a_cancelled_run_with_a_tally_when_read_then_the_counts_are_kept() {
+    // A cancelled run is never resumed, so the tally it reached is final —
+    // and a client deserves the same four numbers a completed run gives it,
+    // not just `processed` from the last flush.
+    let (repo, _dir) = repo().await;
+    let id = Uuid::new_v4();
+    repo.start(id, RunKind::Index, Some("/library"), t(1), 4)
+        .await
+        .expect("start");
+
+    repo.cancel(
+        id,
+        Some(RunCounts::Index {
+            scanned: 13,
+            indexed: 4,
+            skipped: 1,
+            already_cataloged: 0,
+            failed: 1,
+        }),
+        t(2),
+        None,
+    )
+    .await
+    .expect("cancel");
+
+    let run = repo.get(id).await.expect("get").expect("run exists");
+    assert_eq!(run.status, RunStatus::Cancelled);
+    assert_eq!(
+        run.counts,
+        Some(RunCounts::Index {
+            scanned: 13,
+            indexed: 4,
+            skipped: 1,
+            already_cataloged: 0,
+            failed: 1
+        })
+    );
+    assert_eq!(run.phase, None, "still terminal, so still no phase");
+    let value = serde_json::to_value(&run).expect("serialize");
+    assert_eq!(value.get("scanned").and_then(|v| v.as_u64()), Some(13));
+    assert_eq!(value.get("indexed").and_then(|v| v.as_u64()), Some(4));
+    assert!(
+        value.get("scanned").and_then(|v| v.as_u64())
+            > value.get("indexed").and_then(|v| v.as_u64()),
+        "a cancelled run's scanned exceeds what it processed — that is the point"
+    );
+}
+
+#[tokio::test]
+async fn given_an_index_run_when_cancelled_with_refresh_counts_then_error_and_row_untouched() {
+    // Cancel keeps a tally now, so it inherits `finish`'s kind guard: writing
+    // the wrong variant would leave the row's real columns NULL.
+    let (repo, _dir) = repo().await;
+    let id = Uuid::new_v4();
+    repo.start(id, RunKind::Index, Some("/library"), t(1), 4)
+        .await
+        .expect("start");
+
+    let result = repo
+        .cancel(
+            id,
+            Some(RunCounts::Refresh {
+                refreshed: 1,
+                marked_missing: 0,
+                unchanged: 0,
+                failed: 0,
+            }),
+            t(2),
+            None,
+        )
+        .await;
+
+    assert!(result.is_err(), "mismatched counts kind must be rejected");
+    let run = repo.get(id).await.expect("get").expect("run exists");
+    assert_eq!(run.status, RunStatus::Running, "the row is left untouched");
+    assert!(run.counts.is_none());
+    assert!(run.finished_at.is_none());
+}
+
+#[tokio::test]
+async fn given_a_paused_run_with_progress_when_resumed_then_the_segment_counters_reset() {
+    // Resume re-walks from the start; it does not seek to an offset.
+    // `processed` is a count of what one segment folded, never a position in
+    // the walk, so a resumed segment that inherited it would report a run
+    // further along than it is. Clearing `total` and returning to
+    // `discovering` says the same about the denominator: the resumed segment
+    // counts it again for itself.
+    let (repo, _dir) = repo().await;
+    let id = Uuid::new_v4();
+    repo.start(id, RunKind::Index, Some("/library"), t(1), 4)
+        .await
+        .expect("start");
+    repo.record_progress(
+        id,
+        &RunProgress {
+            phase: RunPhase::Processing,
+            total: Some(12_264),
+            processed: 8_412,
+        },
+    )
+    .await
+    .expect("record progress");
+    assert!(repo.pause(id, t(2), None).await.expect("pause"));
+
+    let applied = repo.resume(id, 90_000, None).await.expect("resume");
+
+    assert!(applied, "a paused run accepts a resume");
+    let run = repo.get(id).await.expect("get").expect("run exists");
+    assert_eq!(run.status, RunStatus::Running);
+    assert_eq!(run.paused_at, None, "the run is no longer paused");
+    assert_eq!(
+        run.paused_millis, 90_000,
+        "the banked total is what was set"
+    );
+    assert_eq!(run.processed, Some(0), "the segment's counter restarts");
+    assert_eq!(run.total, None, "the denominator is rediscovered");
+    assert_eq!(
+        run.phase,
+        Some(RunPhase::Discovering),
+        "a resumed run starts where every run starts"
+    );
+    assert!(run.finished_at.is_none());
+    assert_eq!(
+        run.concurrency,
+        Some(4),
+        "a resume that names no width leaves the stored one alone"
+    );
+}
+
+/// The adapter half of Task 15: `concurrency = COALESCE(?, concurrency)`.
+/// Both branches are checked against the real SQLite statement, because
+/// COALESCE is exactly the sort of expression that reads correct and binds
+/// backwards.
+#[tokio::test]
+async fn given_a_paused_run_when_resumed_with_a_width_then_the_stored_concurrency_is_replaced() {
+    let (repo, _dir) = repo().await;
+    let id = Uuid::new_v4();
+    repo.start(id, RunKind::Index, Some("/library"), t(1), 4)
+        .await
+        .expect("start");
+    assert!(repo.pause(id, t(2), None).await.expect("pause"));
+
+    assert!(repo.resume(id, 0, Some(1)).await.expect("resume"));
+
+    assert_eq!(
+        repo.get(id).await.unwrap().unwrap().concurrency,
+        Some(1),
+        "the new width is what `execute` will read back"
+    );
+}
+
+/// A run predating the `concurrency` column has none, and a resume that names
+/// no priority must not invent one — `COALESCE(NULL, NULL)` is still NULL, and
+/// `RunControlHandler` is the layer that decides what an absent width falls
+/// back to.
+#[tokio::test]
+async fn given_a_run_with_no_stored_width_when_resumed_without_one_then_it_stays_absent() {
+    let (repo, pool, _dir) = repo_with_pool().await;
+    let id = Uuid::new_v4();
+    repo.start(id, RunKind::Index, Some("/library"), t(1), 4)
+        .await
+        .expect("start");
+    // Seeded directly, the way `repo_with_pool` exists to allow: `start`
+    // always writes a width now, so a run predating the column can only be
+    // produced by clearing it.
+    sqlx::query("UPDATE catalog_runs SET concurrency = NULL WHERE id = ?")
+        .bind(id.to_string())
+        .execute(&pool)
+        .await
+        .expect("clear concurrency");
+    assert!(repo.pause(id, t(2), None).await.expect("pause"));
+
+    assert!(repo.resume(id, 0, None).await.expect("resume"));
+
+    assert_eq!(repo.get(id).await.unwrap().unwrap().concurrency, None);
+}
+
+#[tokio::test]
+async fn given_a_run_that_is_not_paused_when_resumed_then_the_write_is_refused() {
+    // The same shape of guard `pause` and `cancel` carry: the row must still
+    // be in the state the caller decided from. A resume landing on a cancelled
+    // run would revive a run its owner abandoned.
+    let (repo, _dir) = repo().await;
+    let running = Uuid::new_v4();
+    repo.start(running, RunKind::Index, Some("/library"), t(1), 4)
+        .await
+        .expect("start");
+    let cancelled = Uuid::new_v4();
+    repo.start(cancelled, RunKind::Index, Some("/library"), t(1), 4)
+        .await
+        .expect("start");
+    repo.cancel(cancelled, None, t(2), None)
+        .await
+        .expect("cancel");
+
+    assert!(
+        !repo.resume(running, 0, None).await.expect("resume"),
+        "a running run is already running"
+    );
+    assert!(
+        !repo.resume(cancelled, 0, None).await.expect("resume"),
+        "a cancelled run must not be revived"
+    );
+    let run = repo.get(cancelled).await.unwrap().unwrap();
+    assert_eq!(run.status, RunStatus::Cancelled);
+    assert_eq!(
+        run.finished_at,
+        Some(t(2)),
+        "and the refused write left its finish time alone"
+    );
+}
+
+#[tokio::test]
+async fn given_an_unknown_run_when_resumed_then_the_write_is_refused() {
+    let (repo, _dir) = repo().await;
+    assert!(!repo.resume(Uuid::new_v4(), 0, None).await.expect("resume"));
+}
+
+#[tokio::test]
+async fn given_a_completed_run_when_a_cancel_write_lands_afterwards_then_the_completion_stands() {
+    // The cancel-side mirror of the pause guard. A control call reads
+    // `running`, the walk then writes `finish`, and the cancel lands last --
+    // rewriting a run that completed all of its work into a `cancelled` one
+    // with a fresh `finished_at`, and telling the caller it succeeded. The row
+    // stays internally coherent, which is exactly why nothing else catches it.
+    let (repo, _dir) = repo().await;
+    let id = Uuid::new_v4();
+    repo.start(id, RunKind::Index, Some("/library"), t(1), 4)
+        .await
+        .expect("start");
+    repo.finish(
+        id,
+        RunCounts::Index {
+            scanned: 13,
+            indexed: 13,
+            skipped: 0,
+            already_cataloged: 0,
+            failed: 0,
+        },
+        t(2),
+    )
+    .await
+    .expect("finish");
+
+    let applied = repo.cancel(id, None, t(3), None).await.expect("cancel");
+
+    assert!(!applied, "a cancel must not apply to a run already closed");
+    let run = repo.get(id).await.expect("get").expect("run exists");
+    assert_eq!(run.status, RunStatus::Complete, "the completion stands");
+    assert_eq!(
+        run.finished_at,
+        Some(t(2)),
+        "and it keeps the finish time the walk stamped"
+    );
+}
+
+#[tokio::test]
+async fn given_a_completed_run_when_a_cancel_with_a_tally_lands_afterwards_then_it_is_refused() {
+    // The same guard on the other `cancel` branch -- the one a walk takes,
+    // which carries its partial tally through `close_with_counts`. Without it
+    // the guard would hold for the control handler and leak for the walk.
+    let (repo, _dir) = repo().await;
+    let id = Uuid::new_v4();
+    repo.start(id, RunKind::Index, Some("/library"), t(1), 4)
+        .await
+        .expect("start");
+    repo.finish(
+        id,
+        RunCounts::Index {
+            scanned: 13,
+            indexed: 13,
+            skipped: 0,
+            already_cataloged: 0,
+            failed: 0,
+        },
+        t(2),
+    )
+    .await
+    .expect("finish");
+
+    let applied = repo
+        .cancel(
+            id,
+            Some(RunCounts::Index {
+                scanned: 13,
+                indexed: 4,
+                skipped: 0,
+                already_cataloged: 0,
+                failed: 0,
+            }),
+            t(3),
+            None,
+        )
+        .await
+        .expect("cancel");
+
+    assert!(!applied);
+    let run = repo.get(id).await.expect("get").expect("run exists");
+    assert_eq!(run.status, RunStatus::Complete);
+    assert_eq!(
+        run.counts,
+        Some(RunCounts::Index {
+            scanned: 13,
+            indexed: 13,
+            skipped: 0,
+            already_cataloged: 0,
+            failed: 0
+        }),
+        "the completed tally must not be overwritten by the partial one"
+    );
+}
+
+#[tokio::test]
+async fn given_a_paused_run_when_cancelled_then_the_write_applies() {
+    // Why the cancel guard is a set rather than a single value: abandoning a
+    // paused run is the whole point of cancelling one, and a guard bound to
+    // `running` alone would make a paused run impossible to be rid of.
+    let (repo, _dir) = repo().await;
+    let id = Uuid::new_v4();
+    repo.start(id, RunKind::Index, Some("/library"), t(1), 4)
+        .await
+        .expect("start");
+    assert!(repo.pause(id, t(2), None).await.expect("pause"));
+
+    let applied = repo.cancel(id, None, t(3), None).await.expect("cancel");
+
+    assert!(applied);
+    let run = repo.get(id).await.expect("get").expect("run exists");
+    assert_eq!(run.status, RunStatus::Cancelled);
+    assert_eq!(run.finished_at, Some(t(3)));
+}
+
+#[tokio::test]
+async fn given_a_cancelled_run_when_the_walks_own_cancel_lands_afterwards_then_its_tally_is_kept() {
+    // The half of the cancel guard that must *not* refuse. A control call
+    // that finds no live cell writes `cancelled` with no tally, because it
+    // holds none; the walk it stopped then reaches its own `record_halt`
+    // carrying the four numbers it actually computed. Refusing that second
+    // write would leave the row cancelled with `counts` NULL forever, and the
+    // design asks a cancel to keep its tally for the record. The status does
+    // not change and only the finish time moves, to when the walk really
+    // stopped.
+    let (repo, _dir) = repo().await;
+    let id = Uuid::new_v4();
+    repo.start(id, RunKind::Index, Some("/library"), t(1), 4)
+        .await
+        .expect("start");
+    // What the walk captured when it began, and what it names below. The
+    // point is that the control cancel does not move it — only a resume does,
+    // and none happens here — so the walk's write still matches.
+    let segment = repo
+        .get(id)
+        .await
+        .expect("get")
+        .expect("run exists")
+        .segment;
+    assert!(repo
+        .cancel(id, None, t(2), None)
+        .await
+        .expect("control cancel"));
+    assert!(
+        repo.get(id).await.unwrap().unwrap().counts.is_none(),
+        "the control call had no tally to write"
+    );
+
+    let applied = repo
+        .cancel(
+            id,
+            Some(RunCounts::Index {
+                scanned: 13,
+                indexed: 4,
+                skipped: 1,
+                already_cataloged: 0,
+                failed: 1,
+            }),
+            t(3),
+            Some(segment),
+        )
+        .await
+        .expect("walk cancel");
+
+    assert!(
+        applied,
+        "the walk fills in the tally the control call had none of"
+    );
+    let run = repo.get(id).await.expect("get").expect("run exists");
+    assert_eq!(run.status, RunStatus::Cancelled, "still cancelled");
+    assert_eq!(
+        run.counts,
+        Some(RunCounts::Index {
+            scanned: 13,
+            indexed: 4,
+            skipped: 1,
+            already_cataloged: 0,
+            failed: 1
+        })
+    );
+    assert_eq!(run.finished_at, Some(t(3)));
+}
+
+#[tokio::test]
+async fn given_a_failed_run_when_a_cancel_with_a_tally_lands_afterwards_then_it_is_refused() {
+    // The wider set for the walk's branch admits `cancelled` and nothing
+    // else: a run that closed itself is still not one a cancel may rewrite.
+    let (repo, _dir) = repo().await;
+    let id = Uuid::new_v4();
+    repo.start(id, RunKind::Index, Some("/library"), t(1), 4)
+        .await
+        .expect("start");
+    repo.fail(id, "root unreadable", t(2)).await.expect("fail");
+
+    let applied = repo
+        .cancel(
+            id,
+            Some(RunCounts::Index {
+                scanned: 13,
+                indexed: 4,
+                skipped: 0,
+                already_cataloged: 0,
+                failed: 0,
+            }),
+            t(3),
+            None,
+        )
+        .await
+        .expect("cancel");
+
+    assert!(!applied);
+    let run = repo.get(id).await.expect("get").expect("run exists");
+    assert_eq!(run.status, RunStatus::Failed);
+    assert!(run.counts.is_none());
+    assert_eq!(run.finished_at, Some(t(2)));
+}
+
+// ---------------- list_active (Task 10) ----------------
+
+#[tokio::test]
+async fn given_rows_inserted_out_of_order_when_active_runs_are_listed_then_they_come_back_newest_first(
+) {
+    // Pins the query's own `ORDER BY started_at DESC` against real SQL,
+    // rather than trusting insertion order — SQLite makes no ordering
+    // promise without one, and inserting out of order is what would expose a
+    // query that quietly relied on it anyway.
+    let (repo, _dir) = repo().await;
+    let middle = Uuid::new_v4();
+    repo.start(middle, RunKind::Index, Some("/library"), t(5), 4)
+        .await
+        .expect("start middle");
+    let newest = Uuid::new_v4();
+    repo.start(newest, RunKind::Refresh, None, t(9), 4)
+        .await
+        .expect("start newest");
+    let oldest = Uuid::new_v4();
+    repo.start(oldest, RunKind::Index, Some("/library"), t(1), 4)
+        .await
+        .expect("start oldest");
+
+    let active = repo.list_active().await.expect("list_active");
+
+    let ids: Vec<_> = active.iter().map(|run| run.id).collect();
+    assert_eq!(ids, vec![newest, middle, oldest]);
+}
+
+#[tokio::test]
+async fn given_runs_in_every_terminal_status_when_active_runs_are_listed_then_none_are_returned() {
+    // `complete`, `failed`, and `cancelled` must all be excluded — not just
+    // whichever one a smaller test happened to cover.
+    let (repo, _dir) = repo().await;
+
+    let complete = Uuid::new_v4();
+    repo.start(complete, RunKind::Index, Some("/library"), t(1), 4)
+        .await
+        .expect("start");
+    repo.finish(
+        complete,
+        RunCounts::Index {
+            scanned: 1,
+            indexed: 1,
+            skipped: 0,
+            already_cataloged: 0,
+            failed: 0,
+        },
+        t(2),
+    )
+    .await
+    .expect("finish");
+
+    let failed = Uuid::new_v4();
+    repo.start(failed, RunKind::Index, Some("/library"), t(1), 4)
+        .await
+        .expect("start");
+    repo.fail(failed, "root unreadable", t(2))
+        .await
+        .expect("fail");
+
+    let cancelled = Uuid::new_v4();
+    repo.start(cancelled, RunKind::Index, Some("/library"), t(1), 4)
+        .await
+        .expect("start");
+    assert!(repo
+        .cancel(cancelled, None, t(2), None)
+        .await
+        .expect("cancel"));
+
+    let active = repo.list_active().await.expect("list_active");
+
+    assert!(active.is_empty());
+}
+
+#[tokio::test]
+async fn given_a_running_and_a_paused_run_when_active_runs_are_listed_then_both_are_returned() {
+    let (repo, _dir) = repo().await;
+    let running = Uuid::new_v4();
+    repo.start(running, RunKind::Index, Some("/library"), t(1), 4)
+        .await
+        .expect("start running");
+    let paused = Uuid::new_v4();
+    repo.start(paused, RunKind::Refresh, None, t(2), 4)
+        .await
+        .expect("start paused");
+    assert!(repo.pause(paused, t(3), None).await.expect("pause"));
+
+    let active = repo.list_active().await.expect("list_active");
+
+    let ids: Vec<_> = active.iter().map(|run| run.id).collect();
+    assert_eq!(ids.len(), 2);
+    assert!(ids.contains(&running) && ids.contains(&paused));
+}
+
+#[tokio::test]
+async fn given_no_runs_when_active_runs_are_listed_then_an_empty_list_is_returned_not_an_error() {
+    // An idle library — the common case — must not be an error.
+    let (repo, _dir) = repo().await;
+
+    let active = repo.list_active().await.expect("must not error");
+
+    assert!(active.is_empty());
 }

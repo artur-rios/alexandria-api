@@ -86,6 +86,18 @@ impl CatalogRepository for FakeRepo {
         &self,
         _path: &str,
         _content_hash: &str,
+        _size_bytes: i64,
+        _mtime: Option<DateTime<Utc>>,
+        _indexed_at: DateTime<Utc>,
+    ) -> Result<(), DomainError> {
+        unimplemented!()
+    }
+
+    async fn refresh_stat(
+        &self,
+        _path: &str,
+        _size_bytes: i64,
+        _mtime: Option<DateTime<Utc>>,
         _indexed_at: DateTime<Utc>,
     ) -> Result<(), DomainError> {
         unimplemented!()
@@ -206,11 +218,13 @@ impl CatalogRepository for FakeRepo {
     }
 }
 
-/// A canned `File`. `content_hash` is always `"abc"` — the thumbnail
-/// module's cache-key tests are written against that exact value, so it is
-/// not a parameter here; `path`, `file_type`, `state`, and `missing_at` are,
-/// because different tests across the four modules genuinely need different
-/// values for those.
+/// A canned `File`. `uuid` is always `Uuid::nil()` and `mtime` starts `None`
+/// — the thumbnail module's cache-key tests are written against that exact
+/// pair, and a test that needs a non-default `mtime` sets `File.mtime`
+/// directly on the returned value, since it is a public field. `path`,
+/// `file_type`, `state`, and `missing_at` are parameters here, because
+/// different tests across the four modules genuinely need different values
+/// for those.
 pub(crate) fn a_file(
     path: &str,
     file_type: FileType,
@@ -225,7 +239,9 @@ pub(crate) fn a_file(
             .map_or(path, |(_, name)| name)
             .to_string(),
         file_type,
-        content_hash: "abc".to_string(),
+        content_hash: Some("abc".to_string()),
+        size_bytes: None,
+        mtime: None,
         state,
         deleted_at: None,
         indexed_at: Utc::now(),

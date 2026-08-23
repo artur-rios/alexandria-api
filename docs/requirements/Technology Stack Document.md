@@ -59,15 +59,15 @@ choices instead of restating them, so that:
 | **windows-sys** | latest stable at implementation time | alexandria-core (auth) | reading the process token needs the Win32 bindings; this is the thinnest available — raw FFI declarations with no wrapper layer — and it is declared under `[target.'cfg(windows)'.dependencies]`, so it enters the graph only on Windows targets and no other platform's build is affected |
 | **toml** | latest stable at implementation time | all crates | `config.toml` parsing with env-var overrides |
 | **cbindgen** | latest stable at implementation time | alexandria-ffi (build) | generates the C header consumed by Flutter FFI |
-| **ring** or **sha2** | latest stable at implementation time | alexandria-core | content hashing for indexed files (SHA-256) |
+| **sha2** | latest stable at implementation time | alexandria-core | SHA-256 of the bytes a text edit wrote back (FR-TX-03). Not on the scan path: indexing and re-index compute no hash (FR-FC-09, FR-FC-10). |
 | **walkdir** | latest stable at implementation time | alexandria-core | recursive tree walk performed by the indexer (UC-01) |
 | **futures-util** | latest stable at implementation time | alexandria-core | `buffer_unordered`, the bounded-concurrency combinator the index and re-index walks are built on (FR-FC-08) |
 
-Blocking filesystem work — the tree walk, hashing, and every metadata parse in
-§3.1 — is dispatched to Tokio's blocking pool via `spawn_blocking` rather than
-run on a runtime worker. That is both what keeps reads answerable during a scan
-(FR-FC-08) and what makes `indexing.concurrency` buy real parallelism instead of
-interleaved waiting.
+Blocking filesystem work — the tree walk, each entry's `stat`, and every
+metadata parse in §3.1 — is dispatched to Tokio's blocking pool via
+`spawn_blocking` rather than run on a runtime worker. That is both what keeps
+reads answerable during a scan (FR-FC-08) and what makes the concurrency bound
+buy real parallelism instead of interleaved waiting.
 
 Input validation is **hand-written** per command handler (a `validate_*`
 function beside the handler it guards, unit-tested against its own table of
@@ -109,8 +109,9 @@ never fails the file's indexing.
 | Migrations | **sqlx migrate**; migrations live in `alexandria-core/migrations` and run at startup. |
 | Same engine in tests | yes — every environment including tests uses an on-disk or in-memory SQLite database; see the [Testing Specification Document](Testing%20Specification%20Document.md). |
 
-The API stores **only metadata and a path/content-hash reference**, never file
-bytes. Markdown and text file content is edited in place on disk.
+The API stores **only metadata and a reference to the file on disk** — its
+path, size, and modification time — never file bytes. Markdown and text file
+content is edited in place on disk.
 
 ---
 
@@ -140,7 +141,7 @@ unit tests substitute in-memory fakes (see the
 | Error / result model | typed domain errors via **thiserror**; **anyhow** at crate boundaries; `Result<T, E>` everywhere | latest stable at implementation time | commands/queries return `Result<T, DomainError>`; the HTTP layer maps `DomainError` to status codes |
 | API documentation | System Requirements Document §5 + rustdoc on each route | — | the endpoint table is the contract; the FFI surface mirrors the same operations. No generated OpenAPI spec (see §3). |
 | Configuration | **toml** + env overrides | latest stable at implementation time | `config.toml` read at startup; the `ALEXANDRIA_*` env namespace overrides keys |
-| Content hashing | **sha2** (SHA-256) | latest stable at implementation time | per-file content hash stored at index time, refreshed on re-index |
+| Content hashing | **sha2** (SHA-256) | latest stable at implementation time | verifying and recording the bytes a text edit wrote back (FR-TX-03); indexing and re-index detect change from size and modification time instead (FR-FC-09, FR-FC-10) |
 
 ---
 
