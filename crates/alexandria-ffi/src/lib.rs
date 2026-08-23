@@ -9,7 +9,7 @@ use tokio::runtime::{Builder, Runtime};
 use alexandria_core::auth::windows_identity::{verify_owner, ProcessWindowsIdentity};
 use alexandria_core::auth::AuthService;
 use alexandria_core::catalog::commands::index::IndexRequest;
-use alexandria_core::catalog::runs::RunPriority;
+use alexandria_core::catalog::runs::{RunKind, RunPriority};
 use alexandria_core::config::AuthMode;
 use alexandria_core::config::Settings;
 use alexandria_core::errors::{error_body, DomainError};
@@ -146,6 +146,21 @@ fn cstr_lossy(ptr: *const c_char) -> Option<String> {
     Some(s)
 }
 
+/// Parse a wire priority string into a [`RunPriority`].
+///
+/// `"low"` maps to `RunPriority::Low`; anything else — NULL, `"normal"`, an
+/// unrecognised word, or malformed UTF-8 lossily decoded to garbage — maps to
+/// `RunPriority::Normal`. A client that cannot spell the value gets the safe
+/// default rather than a rejected call; the same lenient rule the HTTP body
+/// (Task 12) uses, so the two surfaces agree on what an unreadable priority
+/// means as well as on the words they both accept (FR-FC-24).
+fn parse_priority(raw: Option<String>) -> RunPriority {
+    match raw.as_deref() {
+        Some("low") => RunPriority::Low,
+        _ => RunPriority::Normal,
+    }
+}
+
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
 pub extern "C" fn alexandria_version() -> *const c_char {
@@ -219,11 +234,17 @@ fn load_settings() -> Settings {
 /// Start an asynchronous index scan of `root`. Returns a `IndexStartResult`
 /// with a `run_id` and `status` (parity with HTTP 202 body). The scan runs in
 /// the background on the FFI runtime; read results via the accessor functions.
+///
+/// `priority` is `"low"` or `"normal"` (case-sensitive, matching the HTTP
+/// body's spelling exactly — FR-FC-24), read with [`parse_priority`]. NULL or
+/// any other string is treated as `"normal"`: a client that cannot spell the
+/// value gets the safe default rather than a rejected call.
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
 pub extern "C" fn alexandria_index_start(
     root: *const c_char,
     token: *const c_char,
+    priority: *const c_char,
 ) -> IndexStartResult {
     let services = match services_slot().lock().unwrap().clone() {
         Some(s) => s,
@@ -234,19 +255,16 @@ pub extern "C" fn alexandria_index_start(
         None => return IndexStartResult::err(INDEX_ERR_INVALID_INPUT),
     };
     let token = cstr_lossy(token).unwrap_or_default();
+    let priority = parse_priority(cstr_lossy(priority));
     let rt = runtime();
 
     let started = rt.block_on(async {
         services
             .index_handler
             .start(
-                // No FFI argument carries a priority yet — that is a later
-                // task's wire change. Every run started from this surface
-                // today is `Normal`, matching the behaviour before run
-                // priority existed.
                 IndexRequest {
                     root: root.clone(),
-                    priority: RunPriority::Normal,
+                    priority,
                 },
                 &token,
             )
@@ -282,24 +300,25 @@ pub extern "C" fn alexandria_index_start(
 /// returns a `IndexStartResult` with a `run_id` and `status` (parity with the
 /// HTTP `POST /v1/index/refresh` 202 body). The refresh runs in the background
 /// on the FFI runtime; read results via the accessor functions.
+///
+/// `priority` is parsed exactly as `alexandria_index_start`'s is — see that
+/// function's doc comment for the accepted spellings and the NULL/garbage
+/// fallback.
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
-pub extern "C" fn alexandria_index_refresh_start(token: *const c_char) -> IndexStartResult {
+pub extern "C" fn alexandria_index_refresh_start(
+    token: *const c_char,
+    priority: *const c_char,
+) -> IndexStartResult {
     let services = match services_slot().lock().unwrap().clone() {
         Some(s) => s,
         None => return IndexStartResult::err(INDEX_ERR_NOT_INITIALIZED),
     };
     let token = cstr_lossy(token).unwrap_or_default();
+    let priority = parse_priority(cstr_lossy(priority));
     let rt = runtime();
 
-    // No FFI argument carries a priority yet — see the same note on
-    // `alexandria_index_start` above.
-    let started = rt.block_on(async {
-        services
-            .refresh_handler
-            .start(RunPriority::Normal, &token)
-            .await
-    });
+    let started = rt.block_on(async { services.refresh_handler.start(priority, &token).await });
 
     match started {
         Ok(s) => {
@@ -3736,6 +3755,14 @@ pub const RUN_ERR_INVALID_INPUT: c_int = 1;
 pub const RUN_ERR_UNAUTHORIZED: c_int = 2;
 pub const RUN_ERR_NOT_INITIALIZED: c_int = 3;
 pub const RUN_ERR_NOT_FOUND: c_int = 4;
+/// The run exists but is not in a state the requested verb permits — pausing
+/// a run that is not `running`, or resuming one that is not `paused`
+/// (`DomainError::InvalidState`, UC-42 Task 11). Distinct from
+/// `RUN_ERR_OTHER` for the same reason `FILE_ERR_INVALID_STATE` and
+/// `COLLECTION_ERR_INVALID_STATE` are distinct from their own catch-alls: a
+/// caller retrying a transient failure and a caller that asked for an
+/// impossible transition need different responses.
+pub const RUN_ERR_INVALID_STATE: c_int = 5;
 pub const RUN_ERR_OTHER: c_int = 9;
 
 /// Result of `alexandria_index_run_status_json` (UC-42). On success `status`
@@ -3768,13 +3795,25 @@ impl RunJsonResult {
     }
 }
 
-fn map_run_err(err: DomainError) -> RunJsonResult {
+/// Map a `DomainError` from a run-control or run-query handler to a
+/// `RUN_ERR_*` code. The one mapping every FFI export in this section shares,
+/// including `alexandria_index_resume`'s `IndexStartResult::status`, which is
+/// `c_int`-typed exactly like every other code here despite the struct's name
+/// (see the corrections to Task 11 — this surface's errors are `RUN_ERR_*`,
+/// not `INDEX_ERR_*`, because resume is part of run control, not of starting
+/// a fresh run).
+fn map_run_err_code(err: DomainError) -> c_int {
     match err {
-        DomainError::NotFound => RunJsonResult::err(RUN_ERR_NOT_FOUND),
-        DomainError::Unauthorized => RunJsonResult::err(RUN_ERR_UNAUTHORIZED),
-        DomainError::InvalidInput(_) => RunJsonResult::err(RUN_ERR_INVALID_INPUT),
-        _ => RunJsonResult::err(RUN_ERR_OTHER),
+        DomainError::NotFound => RUN_ERR_NOT_FOUND,
+        DomainError::Unauthorized => RUN_ERR_UNAUTHORIZED,
+        DomainError::InvalidInput(_) => RUN_ERR_INVALID_INPUT,
+        DomainError::InvalidState => RUN_ERR_INVALID_STATE,
+        _ => RUN_ERR_OTHER,
     }
+}
+
+fn map_run_err(err: DomainError) -> RunJsonResult {
+    RunJsonResult::err(map_run_err_code(err))
 }
 
 /// Report an index or re-index run's status and outcome (UC-42 / FR-FC-28).
@@ -3823,6 +3862,225 @@ pub extern "C" fn alexandria_index_run_status_json(
     }
 }
 
+/// Pause a running index or re-index run where it stands, leaving it
+/// resumable (UC-42 / FR-FC-28). `run_id` is the id `alexandria_index_start`
+/// or `alexandria_index_refresh_start` returned; `token` is the bearer auth
+/// token. Calls the same `RunControlHandler::pause` the HTTP route (Task 12)
+/// calls.
+///
+/// Returns `RUN_ERR_NOT_FOUND` for an id naming no run (AF-01),
+/// `RUN_ERR_UNAUTHORIZED` for an unauthenticated caller (AF-02),
+/// `RUN_ERR_INVALID_INPUT` when `run_id` is not a uuid, and
+/// `RUN_ERR_INVALID_STATE` when the run is not currently `running` — pausing
+/// an already-paused or already-finished run is refused rather than silently
+/// accepted.
+#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
+#[no_mangle]
+pub extern "C" fn alexandria_index_pause(run_id: *const c_char, token: *const c_char) -> c_int {
+    let services = match services_slot().lock().unwrap().clone() {
+        Some(s) => s,
+        None => return RUN_ERR_NOT_INITIALIZED,
+    };
+
+    // Deny before touching the payload — an unauthenticated caller must
+    // not learn whether its run id would have parsed.
+    let token = cstr_lossy(token).unwrap_or_default();
+    if !authenticated(&services, &token) {
+        return RUN_ERR_UNAUTHORIZED;
+    }
+
+    let raw = match cstr_lossy(run_id) {
+        Some(s) => s,
+        None => return RUN_ERR_INVALID_INPUT,
+    };
+    let Ok(run_id) = uuid::Uuid::parse_str(raw.trim()) else {
+        return RUN_ERR_INVALID_INPUT;
+    };
+
+    match runtime().block_on(async { services.run_control_handler.pause(run_id, &token).await }) {
+        Ok(()) => RUN_OK,
+        Err(err) => map_run_err_code(err),
+    }
+}
+
+/// Abandon a running or paused index or re-index run (UC-42 / FR-FC-28).
+/// Terminal — a cancelled run is never resumed. `run_id` is the id
+/// `alexandria_index_start` or `alexandria_index_refresh_start` returned;
+/// `token` is the bearer auth token. Calls the same
+/// `RunControlHandler::cancel` the HTTP route (Task 12) calls.
+///
+/// Returns `RUN_ERR_NOT_FOUND` for an id naming no run (AF-01),
+/// `RUN_ERR_UNAUTHORIZED` for an unauthenticated caller (AF-02),
+/// `RUN_ERR_INVALID_INPUT` when `run_id` is not a uuid, and
+/// `RUN_ERR_INVALID_STATE` when the run is already terminal (`complete`,
+/// `failed`, or already `cancelled`) — there is nothing left to abandon.
+#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
+#[no_mangle]
+pub extern "C" fn alexandria_index_cancel(run_id: *const c_char, token: *const c_char) -> c_int {
+    let services = match services_slot().lock().unwrap().clone() {
+        Some(s) => s,
+        None => return RUN_ERR_NOT_INITIALIZED,
+    };
+
+    // Deny before touching the payload — an unauthenticated caller must
+    // not learn whether its run id would have parsed.
+    let token = cstr_lossy(token).unwrap_or_default();
+    if !authenticated(&services, &token) {
+        return RUN_ERR_UNAUTHORIZED;
+    }
+
+    let raw = match cstr_lossy(run_id) {
+        Some(s) => s,
+        None => return RUN_ERR_INVALID_INPUT,
+    };
+    let Ok(run_id) = uuid::Uuid::parse_str(raw.trim()) else {
+        return RUN_ERR_INVALID_INPUT;
+    };
+
+    match runtime().block_on(async { services.run_control_handler.cancel(run_id, &token).await }) {
+        Ok(()) => RUN_OK,
+        Err(err) => map_run_err_code(err),
+    }
+}
+
+/// Put a paused index or re-index run back to work (UC-42 / FR-FC-28).
+/// `run_id` is the id `alexandria_index_start` or `alexandria_index_refresh_start`
+/// returned; `token` is the bearer auth token. Returns the *same* `run_id` on
+/// success — a resume does not mint a fresh run, it continues the one it was
+/// given — wrapped in the same `IndexStartResult` `alexandria_index_start`
+/// returns (parity of shape, not of meaning: `status` here is a `RUN_ERR_*`
+/// code, because resume is part of run control, not of starting a fresh run).
+///
+/// `RunControlHandler::resume` only records the state transition; it does not
+/// walk anything. Spawning the walk is this function's job, exactly as
+/// `alexandria_index_start` spawns its own — the handler is kept free of the
+/// runtime so `execute` is always spawned by whichever transport owns one.
+/// Which handler gets spawned depends on `RunResumed::kind`: an index run
+/// resumes into `index_handler.execute(&root, run_id)`, a refresh into
+/// `refresh_handler.execute(run_id)` (a refresh carries no root — it touches
+/// everything cataloged). A resumed index run whose stored `root` is somehow
+/// absent — it should never be, every row `RunKind::Index` writes carries one
+/// — is refused with `RUN_ERR_OTHER` and logged at `error`, rather than
+/// silently doing nothing: a caller told `RUN_OK` for a run that never
+/// actually resumes would have no way to notice.
+///
+/// Returns `RUN_ERR_NOT_FOUND` for an id naming no run (AF-01),
+/// `RUN_ERR_UNAUTHORIZED` for an unauthenticated caller (AF-02),
+/// `RUN_ERR_INVALID_INPUT` when `run_id` is not a uuid, and
+/// `RUN_ERR_INVALID_STATE` when the run is not currently `paused`.
+#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
+#[no_mangle]
+pub extern "C" fn alexandria_index_resume(
+    run_id: *const c_char,
+    token: *const c_char,
+) -> IndexStartResult {
+    let services = match services_slot().lock().unwrap().clone() {
+        Some(s) => s,
+        None => return IndexStartResult::err(RUN_ERR_NOT_INITIALIZED),
+    };
+
+    // Deny before touching the payload — an unauthenticated caller must
+    // not learn whether its run id would have parsed.
+    let token = cstr_lossy(token).unwrap_or_default();
+    if !authenticated(&services, &token) {
+        return IndexStartResult::err(RUN_ERR_UNAUTHORIZED);
+    }
+
+    let raw = match cstr_lossy(run_id) {
+        Some(s) => s,
+        None => return IndexStartResult::err(RUN_ERR_INVALID_INPUT),
+    };
+    let Ok(run_id) = uuid::Uuid::parse_str(raw.trim()) else {
+        return IndexStartResult::err(RUN_ERR_INVALID_INPUT);
+    };
+
+    let rt = runtime();
+    let resumed =
+        match rt.block_on(async { services.run_control_handler.resume(run_id, &token).await }) {
+            Ok(resumed) => resumed,
+            Err(err) => return IndexStartResult::err(map_run_err_code(err)),
+        };
+
+    match resumed.kind {
+        RunKind::Index => {
+            let root = match resumed.root {
+                Some(root) => root,
+                None => {
+                    // Every row `RunKind::Index` writes carries a root
+                    // (`start` requires one); reaching this means the stored
+                    // row and its kind have drifted apart. Fail loudly rather
+                    // than resume nothing and tell the caller it worked.
+                    tracing::error!(
+                        run_id = %resumed.run_id,
+                        "resumed index run has no stored root; refusing to spawn"
+                    );
+                    return IndexStartResult::err(RUN_ERR_OTHER);
+                }
+            };
+            let handler = services.index_handler.clone();
+            let spawned_run_id = resumed.run_id;
+            rt.spawn(async move {
+                // Same shape as `alexandria_index_start`'s own spawn: an
+                // `Err` here means the run could not resume at all;
+                // `execute` has already written its own terminal row on that
+                // path (UC-42), so the failure is recorded, not lost.
+                if let Err(err) = handler.execute(&root, spawned_run_id).await {
+                    tracing::error!(run_id = %spawned_run_id, error = %err, "resumed index run aborted");
+                }
+            });
+        }
+        RunKind::Refresh => {
+            let handler = services.refresh_handler.clone();
+            let spawned_run_id = resumed.run_id;
+            rt.spawn(async move {
+                if let Err(err) = handler.execute(spawned_run_id).await {
+                    tracing::error!(run_id = %spawned_run_id, error = %err, "resumed re-index run aborted");
+                }
+            });
+        }
+    }
+
+    IndexStartResult::ok(&resumed.run_id.to_string())
+}
+
+/// Every outstanding (`running` or `paused`) index and re-index run at once,
+/// each with live progress overlaid exactly as `alexandria_index_run_status_json`
+/// overlays a single run (UC-42 / FR-FC-28). `token` is the bearer auth
+/// token. On success `json` is a NUL-terminated JSON array of `CatalogRun`
+/// bodies, newest first — byte-for-byte the same shape the HTTP
+/// `GET /v1/index/runs/active` route (Task 12) returns (FR-FC-24 / NFR-09).
+/// The caller must free `json` with `alexandria_free_string`.
+///
+/// A caller with nothing outstanding gets `RUN_OK` and an empty JSON array,
+/// not an error — an idle library is the normal case, not a failure.
+///
+/// Returns `RUN_ERR_UNAUTHORIZED` for an unauthenticated caller (AF-02).
+#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
+#[no_mangle]
+pub extern "C" fn alexandria_index_runs_active_json(token: *const c_char) -> RunJsonResult {
+    let services = match services_slot().lock().unwrap().clone() {
+        Some(s) => s,
+        None => return RunJsonResult::err(RUN_ERR_NOT_INITIALIZED),
+    };
+
+    // Deny before touching the payload, same as every other run-control call
+    // in this section.
+    let token = cstr_lossy(token).unwrap_or_default();
+    if !authenticated(&services, &token) {
+        return RunJsonResult::err(RUN_ERR_UNAUTHORIZED);
+    }
+
+    let result = runtime().block_on(async { services.get_active_runs_handler.list(&token).await });
+
+    match result {
+        Ok(runs) => {
+            let json = serde_json::to_string(&runs).unwrap_or_default();
+            RunJsonResult::ok(json)
+        }
+        Err(err) => map_run_err(err),
+    }
+}
+
 /// Free a string previously returned by an FFI accessor.
 ///
 /// # Safety
@@ -3839,5 +4097,78 @@ pub unsafe extern "C" fn alexandria_free_string(ptr: *mut c_char) {
         unsafe {
             let _ = CString::from_raw(ptr);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // `parse_priority` and `map_run_err_code` are pure logic with no
+    // filesystem or database behind them, so they are unit-tested here
+    // rather than through an FFI call in `tests/`.
+
+    #[test]
+    fn given_low_when_priority_parsed_then_low() {
+        assert_eq!(parse_priority(Some("low".to_string())), RunPriority::Low);
+    }
+
+    #[test]
+    fn given_normal_when_priority_parsed_then_normal() {
+        assert_eq!(
+            parse_priority(Some("normal".to_string())),
+            RunPriority::Normal
+        );
+    }
+
+    #[test]
+    fn given_none_when_priority_parsed_then_normal() {
+        assert_eq!(parse_priority(None), RunPriority::Normal);
+    }
+
+    #[test]
+    fn given_garbage_string_when_priority_parsed_then_normal() {
+        assert_eq!(
+            parse_priority(Some("URGENT!!1".to_string())),
+            RunPriority::Normal
+        );
+    }
+
+    #[test]
+    fn given_uppercase_low_when_priority_parsed_then_normal() {
+        // Case-sensitive on purpose — the HTTP body Task 12 adds spells it
+        // lowercase, and matching that spelling exactly is what keeps the
+        // two surfaces at parity (FR-FC-24) rather than accepting a wider
+        // set FFI understands and HTTP does not.
+        assert_eq!(parse_priority(Some("Low".to_string())), RunPriority::Normal);
+    }
+
+    #[test]
+    fn given_invalid_state_when_run_err_mapped_then_run_err_invalid_state() {
+        assert_eq!(
+            map_run_err_code(DomainError::InvalidState),
+            RUN_ERR_INVALID_STATE
+        );
+    }
+
+    #[test]
+    fn given_not_found_when_run_err_mapped_then_run_err_not_found() {
+        assert_eq!(map_run_err_code(DomainError::NotFound), RUN_ERR_NOT_FOUND);
+    }
+
+    #[test]
+    fn given_unauthorized_when_run_err_mapped_then_run_err_unauthorized() {
+        assert_eq!(
+            map_run_err_code(DomainError::Unauthorized),
+            RUN_ERR_UNAUTHORIZED
+        );
+    }
+
+    #[test]
+    fn given_invalid_input_when_run_err_mapped_then_run_err_invalid_input() {
+        assert_eq!(
+            map_run_err_code(DomainError::InvalidInput("bad".into())),
+            RUN_ERR_INVALID_INPUT
+        );
     }
 }

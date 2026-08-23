@@ -233,7 +233,7 @@ async fn given_same_lib_when_indexed_via_http_and_ffi_then_files_rows_identical(
 
         let root = CString::new(lib_for_ffi).unwrap();
         let token = CString::new(TEST_TOKEN).unwrap();
-        let result = alexandria_index_start(root.as_ptr(), token.as_ptr());
+        let result = alexandria_index_start(root.as_ptr(), token.as_ptr(), std::ptr::null());
         assert_eq!(result.status, alexandria_ffi::INDEX_OK, "ffi start failed");
         assert!(!run_id_string(&result).is_empty());
 
@@ -384,7 +384,7 @@ async fn given_same_lib_when_refreshed_via_http_and_ffi_then_rows_and_missing_ma
 
             let root = CString::new(ffi_lib_path.clone()).unwrap();
             let token = CString::new(TEST_TOKEN).unwrap();
-            let started = alexandria_index_start(root.as_ptr(), token.as_ptr());
+            let started = alexandria_index_start(root.as_ptr(), token.as_ptr(), std::ptr::null());
             assert_eq!(started.status, alexandria_ffi::INDEX_OK);
             wait_for_ffi_files(2);
 
@@ -392,7 +392,7 @@ async fn given_same_lib_when_refreshed_via_http_and_ffi_then_rows_and_missing_ma
             std::fs::write(ffi_lib.path().join("a.mp3"), b"audio-v2-CHANGED").unwrap();
             std::fs::remove_file(ffi_lib.path().join("b.md")).unwrap();
 
-            let refresh = alexandria_index_refresh_start(token.as_ptr());
+            let refresh = alexandria_index_refresh_start(token.as_ptr(), std::ptr::null());
             assert_eq!(refresh.status, alexandria_ffi::INDEX_OK);
             let ffi_run_id = run_id_string(&refresh);
 
@@ -543,7 +543,7 @@ async fn given_a_freshly_indexed_file_when_hash_read_via_http_and_ffi_then_both_
 
         let root = CString::new(ffi_lib_path).unwrap();
         let token = CString::new(TEST_TOKEN).unwrap();
-        let started = alexandria_index_start(root.as_ptr(), token.as_ptr());
+        let started = alexandria_index_start(root.as_ptr(), token.as_ptr(), std::ptr::null());
         assert_eq!(started.status, alexandria_ffi::INDEX_OK, "ffi start failed");
 
         let dl = std::time::Instant::now() + ASYNC_RUN_DEADLINE;
@@ -814,7 +814,7 @@ async fn given_same_audio_file_when_metadata_edited_via_http_and_ffi_then_respon
 
             let root = CString::new(ffi_lib_path).unwrap();
             let token = CString::new(TEST_TOKEN).unwrap();
-            let started = alexandria_index_start(root.as_ptr(), token.as_ptr());
+            let started = alexandria_index_start(root.as_ptr(), token.as_ptr(), std::ptr::null());
             assert_eq!(started.status, alexandria_ffi::INDEX_OK);
             wait_for_ffi_files(1);
 
@@ -1090,7 +1090,7 @@ async fn given_same_lib_when_files_listed_via_http_and_ffi_then_arrays_identical
 
             let root = CString::new(ffi_lib_path).unwrap();
             let token = CString::new(TEST_TOKEN).unwrap();
-            let started = alexandria_index_start(root.as_ptr(), token.as_ptr());
+            let started = alexandria_index_start(root.as_ptr(), token.as_ptr(), std::ptr::null());
             assert_eq!(started.status, alexandria_ffi::INDEX_OK);
             wait_for_ffi_files(3);
 
@@ -1253,7 +1253,7 @@ async fn given_same_file_when_fetched_via_http_and_ffi_then_file_view_bodies_ide
 
         let root = CString::new(ffi_lib_path).unwrap();
         let token = CString::new(TEST_TOKEN).unwrap();
-        let started = alexandria_index_start(root.as_ptr(), token.as_ptr());
+        let started = alexandria_index_start(root.as_ptr(), token.as_ptr(), std::ptr::null());
         assert_eq!(started.status, alexandria_ffi::INDEX_OK);
         wait_for_ffi_files(1);
 
@@ -1468,7 +1468,7 @@ async fn given_unknown_filter_values_when_listed_via_http_and_ffi_then_both_reje
 
             let root = CString::new(ffi_lib_path).unwrap();
             let token = CString::new(TEST_TOKEN).unwrap();
-            let started = alexandria_index_start(root.as_ptr(), token.as_ptr());
+            let started = alexandria_index_start(root.as_ptr(), token.as_ptr(), std::ptr::null());
             assert_eq!(started.status, alexandria_ffi::INDEX_OK);
             wait_for_ffi_files(1);
 
@@ -1729,7 +1729,7 @@ async fn given_same_file_when_renamed_via_http_and_ffi_then_file_bodies_and_disk
 
             let root = CString::new(ffi_lib_path).unwrap();
             let token = CString::new(TEST_TOKEN).unwrap();
-            let started = alexandria_index_start(root.as_ptr(), token.as_ptr());
+            let started = alexandria_index_start(root.as_ptr(), token.as_ptr(), std::ptr::null());
             assert_eq!(started.status, alexandria_ffi::INDEX_OK);
             wait_for_ffi_files(1);
 
@@ -1977,7 +1977,7 @@ async fn given_same_file_when_soft_deleted_via_http_and_ffi_then_file_bodies_ide
 
             let root = CString::new(ffi_lib_path).unwrap();
             let token = CString::new(TEST_TOKEN).unwrap();
-            let started = alexandria_index_start(root.as_ptr(), token.as_ptr());
+            let started = alexandria_index_start(root.as_ptr(), token.as_ptr(), std::ptr::null());
             assert_eq!(started.status, alexandria_ffi::INDEX_OK);
             wait_for_ffi_files(1);
 
@@ -2252,7 +2252,7 @@ async fn given_soft_deleted_file_when_restored_via_http_and_ffi_then_file_bodies
 
             let root = CString::new(ffi_lib_path).unwrap();
             let token = CString::new(TEST_TOKEN).unwrap();
-            let started = alexandria_index_start(root.as_ptr(), token.as_ptr());
+            let started = alexandria_index_start(root.as_ptr(), token.as_ptr(), std::ptr::null());
             assert_eq!(started.status, alexandria_ffi::INDEX_OK);
             wait_for_ffi_files(1);
 
@@ -2536,7 +2536,7 @@ async fn given_purgeable_file_when_purged_via_http_and_ffi_then_file_bodies_iden
 
             let root = CString::new(ffi_lib_path).unwrap();
             let token = CString::new(TEST_TOKEN).unwrap();
-            let started = alexandria_index_start(root.as_ptr(), token.as_ptr());
+            let started = alexandria_index_start(root.as_ptr(), token.as_ptr(), std::ptr::null());
             assert_eq!(started.status, alexandria_ffi::INDEX_OK);
             wait_for_ffi_files(1);
 
@@ -2838,7 +2838,7 @@ async fn given_active_file_when_purged_on_disk_via_http_and_ffi_then_file_bodies
 
             let root = CString::new(ffi_lib_path).unwrap();
             let token = CString::new(TEST_TOKEN).unwrap();
-            let started = alexandria_index_start(root.as_ptr(), token.as_ptr());
+            let started = alexandria_index_start(root.as_ptr(), token.as_ptr(), std::ptr::null());
             assert_eq!(started.status, alexandria_ffi::INDEX_OK);
             wait_for_ffi_files(1);
 
@@ -3156,7 +3156,7 @@ async fn given_missing_disk_file_when_purged_on_disk_via_http_and_ffi_then_both_
 
             let root = CString::new(ffi_lib_path).unwrap();
             let token = CString::new(TEST_TOKEN).unwrap();
-            let started = alexandria_index_start(root.as_ptr(), token.as_ptr());
+            let started = alexandria_index_start(root.as_ptr(), token.as_ptr(), std::ptr::null());
             assert_eq!(started.status, alexandria_ffi::INDEX_OK);
             wait_for_ffi_files(1);
 
@@ -3445,7 +3445,7 @@ async fn given_active_file_when_purged_via_http_and_ffi_then_both_invalid_state(
 
         let root = CString::new(ffi_lib_path).unwrap();
         let token = CString::new(TEST_TOKEN).unwrap();
-        let started = alexandria_index_start(root.as_ptr(), token.as_ptr());
+        let started = alexandria_index_start(root.as_ptr(), token.as_ptr(), std::ptr::null());
         assert_eq!(started.status, alexandria_ffi::INDEX_OK);
         wait_for_ffi_files(1);
 
@@ -9336,7 +9336,7 @@ async fn given_tagged_audio_file_when_indexed_via_http_and_ffi_then_extracted_me
 
         let root = CString::new(ffi_lib_path).unwrap();
         let token = CString::new(TEST_TOKEN).unwrap();
-        let started = alexandria_index_start(root.as_ptr(), token.as_ptr());
+        let started = alexandria_index_start(root.as_ptr(), token.as_ptr(), std::ptr::null());
         assert_eq!(started.status, alexandria_ffi::INDEX_OK);
 
         let dl = std::time::Instant::now() + ASYNC_RUN_DEADLINE;
@@ -9568,7 +9568,7 @@ async fn given_tagged_image_file_when_indexed_via_http_and_ffi_then_extracted_me
 
         let root = CString::new(ffi_lib_path).unwrap();
         let token = CString::new(TEST_TOKEN).unwrap();
-        let started = alexandria_index_start(root.as_ptr(), token.as_ptr());
+        let started = alexandria_index_start(root.as_ptr(), token.as_ptr(), std::ptr::null());
         assert_eq!(started.status, alexandria_ffi::INDEX_OK);
 
         // Poll the FFI leg's own sqlite file directly for both extraction
@@ -9782,7 +9782,7 @@ async fn given_tagged_pdf_file_when_indexed_via_http_and_ffi_then_extracted_meta
 
         let root = CString::new(ffi_lib_path).unwrap();
         let token = CString::new(TEST_TOKEN).unwrap();
-        let started = alexandria_index_start(root.as_ptr(), token.as_ptr());
+        let started = alexandria_index_start(root.as_ptr(), token.as_ptr(), std::ptr::null());
         assert_eq!(started.status, alexandria_ffi::INDEX_OK);
 
         // Poll the FFI leg's own sqlite file directly for all three
@@ -9999,7 +9999,7 @@ async fn given_tagged_mp4_file_when_indexed_via_http_and_ffi_then_extracted_meta
 
         let root = CString::new(ffi_lib_path).unwrap();
         let token = CString::new(TEST_TOKEN).unwrap();
-        let started = alexandria_index_start(root.as_ptr(), token.as_ptr());
+        let started = alexandria_index_start(root.as_ptr(), token.as_ptr(), std::ptr::null());
         assert_eq!(started.status, alexandria_ffi::INDEX_OK);
 
         // Poll the FFI leg's own sqlite file directly for all three
@@ -10211,7 +10211,7 @@ async fn given_tagged_cbz_file_when_indexed_via_http_and_ffi_then_extracted_meta
 
         let root = CString::new(ffi_lib_path).unwrap();
         let token = CString::new(TEST_TOKEN).unwrap();
-        let started = alexandria_index_start(root.as_ptr(), token.as_ptr());
+        let started = alexandria_index_start(root.as_ptr(), token.as_ptr(), std::ptr::null());
         assert_eq!(started.status, alexandria_ffi::INDEX_OK);
 
         // Poll the FFI leg's own sqlite file directly for all four
@@ -11045,7 +11045,7 @@ async fn given_a_completed_refresh_when_status_read_via_http_and_ffi_then_bodies
             );
 
             let token = CString::new(TEST_TOKEN).unwrap();
-            let started = alexandria_index_refresh_start(token.as_ptr());
+            let started = alexandria_index_refresh_start(token.as_ptr(), std::ptr::null());
             assert_eq!(started.status, alexandria_ffi::INDEX_OK);
             let run_id = run_id_string(&started);
             assert!(!run_id.is_empty());
