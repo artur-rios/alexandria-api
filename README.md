@@ -489,6 +489,40 @@ TTL local mode uses. This mode proves the process was launched by that
 account, not who is calling it — keep `http.bind_addr` on loopback, since
 startup only warns, and does not fail, when it is not.
 
+### Upgrading
+
+**Alexandria is pre-release, and an upgrade can require you to delete your
+database.** Until the first packaged release, the two baseline migrations
+(`00000000000001_catalog.sql` and `00000000000011_catalog_runs.sql`) are
+amended in place rather than corrected by a new migration — see
+[Operations & Infrastructure Document §2.5](docs/requirements/Operations%20&%20Infrastructure%20Document.md).
+sqlx checksums a migration's file content, so an amended baseline no longer
+matches what your database recorded, and migrations run before the server
+serves (IR-05). The upgrade therefore fails at startup rather than misbehaving
+later:
+
+```
+database migration error: migration 1 was previously applied but has been modified
+```
+
+The fix is to delete the database file and let it rebuild:
+
+```bash
+rm "${ALEXANDRIA_DATABASE_PATH:-alexandria.sqlite}"
+```
+
+Then start the server and re-run `POST /v1/index` against your library. The
+catalog is derived from the files on disk, so re-indexing restores it — but
+anything the catalog holds that is *not* derived from disk is lost: edited
+metadata, collections, bookmarks, watchlists, reading lists, watch and reading
+progress, and local-auth accounts. Export or note whatever you need first.
+
+#### Breaking changes so far
+
+| Change | Effect |
+| --- | --- |
+| `size_bytes`/`mtime` change detection replaced full-file hashing (FR-FC-09), and the run record gained progress, pause, priority, and segment columns (UC-42) | Both baselines amended. Delete the database and re-index. |
+
 ### Health check
 
 ```bash
