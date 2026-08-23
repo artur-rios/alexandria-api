@@ -29,7 +29,10 @@ health, configuration, deployment) are specified in the
 | --- | --- |
 | **File** | An indexed on-disk resource. One of seven subtypes: AudioFile, VideoFile, HtmlPage, TextFile, Document, ComicBook, Image. |
 | **Path** | The absolute on-disk location of a File. Unique across the catalog. |
-| **Content hash** | SHA-256 hash of a File's bytes, computed at index time and refreshed on re-index. |
+| **Content hash** | SHA-256 hash of a File's bytes. Informational, and usually absent: indexing and re-index never compute one (FR-FC-09, FR-FC-10). The only thing that writes it is the post-write verification of a text edit (FR-TX-03). |
+| **Stat pair** | A File's `sizeBytes` and `mtime`, both taken from the directory entry during the walk. Together they are the change signal a re-index compares (FR-FC-10). |
+| **Run** | One index or re-index execution, recorded and addressable by a run id (FR-FC-27). Non-terminal statuses are `running` and `paused`; terminal ones are `complete`, `failed`, and `cancelled`. |
+| **Run priority** | How hard a run pushes: `normal` or `low`, chosen when the run is started (FR-FC-31) and reused when it is resumed. |
 | **State** | A File or Bookmark lifecycle state: `active`, `deleted` (soft), or purged. |
 | **mediaKind** | VideoFile discriminator: `movie` or `series`. |
 | **formatKind** | Document discriminator: `book` or `ebook`. |
@@ -78,16 +81,16 @@ graph LR
 
 | ID | Requirement |
 | --- | --- |
-| FR-FC-01 | The system shall index audio files from a specified root path, creating a File record with path, name, type, and content hash, plus an AudioFile subtype record. Its metadata fields are prefilled from the file's embedded tags at first index (FR-FC-25) and are editable by the owner via FR-FC-14. |
+| FR-FC-01 | The system shall index audio files from a specified root path, creating a File record with path, name, type, size, and modification time (FR-FC-09), plus an AudioFile subtype record. Its metadata fields are prefilled from the file's embedded tags at first index (FR-FC-25) and are editable by the owner via FR-FC-14. |
 | FR-FC-02 | The system shall index video files as VideoFiles. Title, year, resolution and duration are prefilled from the container at first index (FR-FC-25), but `mediaKind` (movie/series) is owner-supplied via FR-FC-15: nothing in a video file distinguishes a movie from an episode, so indexing does not infer it. |
 | FR-FC-03 | The system shall index saved HTML pages. |
 | FR-FC-04 | The system shall index Markdown and plain-text files as TextFiles. |
 | FR-FC-05 | The system shall index PDF and e-book files as Documents. Title, author and page count are prefilled from the file's own metadata at first index, and `formatKind` is set from the format itself — `book` for PDF, `ebook` for EPUB (FR-FC-25). Both remain editable by the owner via FR-FC-16. |
 | FR-FC-06 | The system shall index comic-book files (CBR/CBZ) as ComicBooks. Title, series and issue metadata are prefilled from the archive's `ComicInfo.xml` when it has one (FR-FC-25) and are editable by the owner via FR-FC-17. A `.pdf` indexes as a Document (FR-FC-05): file extension alone cannot distinguish a comic PDF from a book PDF. |
 | FR-FC-07 | The system shall index image files. |
-| FR-FC-08 | The system shall run indexing asynchronously and shall not block read/query operations while indexing is in progress. Filesystem work (directory walks, hashing, metadata parsing) shall run off the async runtime's worker threads, and the index and re-index walks shall process a bounded number of files concurrently (`indexing.concurrency`, default 4) rather than one at a time. |
-| FR-FC-09 | The system shall compute a SHA-256 content hash for each indexed file and store it on the File record. |
-| FR-FC-10 | The system shall, on re-index, detect a content-hash change for an existing path and refresh that File's stored hash and `indexedAt`. |
+| FR-FC-08 | The system shall run indexing asynchronously and shall not block read/query operations while indexing is in progress. Filesystem work (directory walks, file stats, metadata parsing) shall run off the async runtime's worker threads, and the index and re-index walks shall process a bounded number of files concurrently rather than one at a time. That bound is the run's priority (FR-FC-31) resolved against configuration: `indexing.concurrency` (default 4) for `normal`, `indexing.low_priority_concurrency` (default 1) for `low`. |
+| FR-FC-09 | The system shall record, for each indexed file, its path, name, type, size in bytes, and last-modification time, all taken from the directory entry. Indexing shall not read the contents of the file for the purpose of identifying or fingerprinting it, and shall leave the File's content hash unset. Metadata extraction (FR-FC-25) reads only as much of a file as its own format demands, which is why the cost of a scan is set by the number of files in the library rather than by their total size (NFR-02). |
+| FR-FC-10 | The system shall, on re-index, compare each cataloged path's recorded size and modification time against the file now on disk, and shall treat a difference in either as a change. For a changed file the system shall store the new size and modification time, update `indexedAt`, and clear the File's stored content hash, so that a hash cannot outlive the bytes it described. Re-index shall read no file contents and shall compute no hash. A file whose size and modification time are both unchanged is recorded unchanged. |
 | FR-FC-11 | The system shall, on re-index, detect a path that no longer exists on disk and set the File's `missingAt` marker without deleting the record or changing its `state`. |
 | FR-FC-12 | The system shall list and query files filtered by type and lifecycle state. Filtering by containing collection is delivered with Collections (FR-CO-07), since no collection exists before then. |
 | FR-FC-13 | The system shall return a single file's metadata by its public UUID. |
@@ -104,10 +107,15 @@ graph LR
 | FR-FC-24 | The system shall expose every catalog operation via both the HTTP/REST-JSON surface and the FFI surface with identical results. FR-MP-06 defines the single exception: byte transfer, where the FFI surface returns a playback descriptor instead of a stream. |
 | FR-FC-25 | The system shall, at first index only, prefill a file's subtype metadata from the metadata embedded in the file itself (audio tags, image EXIF, document and comic metadata, video container metadata). Extraction is best-effort: a failure leaves the fields empty and never fails the file's indexing, and re-index (FR-FC-10) never re-runs it, so an owner's edit (FR-FC-14..18) is never overwritten. |
 | FR-FC-26 | The system shall reject an index request (FR-FC-01) whose root path is not the configured `filesystem.root` or a descendant of it, comparing the two paths after resolving each to its canonical form so that traversal segments, trailing separators, and symbolic links cannot escape the bound. When `filesystem.root` is unset, indexing is unconstrained and any readable root is accepted — the constraint is opt-in by configuration. Re-index (FR-FC-10, FR-FC-11) takes no root and is unaffected. |
-| FR-FC-27 | The system shall record every index and re-index run: its id, kind, start time, terminal status, finish time, and the outcome counts for its kind. A run whose walk completes shall be recorded `complete` even when individual files failed — those are counted in the run's `failed` tally, and one file's failure shall not abandon the rest of the walk. A run that could not proceed at all shall be recorded `failed` with the underlying error. |
-| FR-FC-28 | The system shall expose a run's recorded status and outcome to an authenticated caller, given the run id returned when the run was started, over both the HTTP and FFI surfaces. |
-| FR-FC-29 | The system shall, at startup, mark every run still recorded as running as interrupted; runs execute in-process and are never resumed. |
+| FR-FC-27 | The system shall record every index and re-index run: its id, kind, start time, status, finish time once it has one, and the outcome counts for its kind. A run's status shall be one of `running`, `paused`, `complete`, `failed`, or `cancelled`; `running` and `paused` are the non-terminal ones. Its counts shall be `scanned`, `indexed`, `skipped` (classified out), `alreadyCataloged` (a path the catalog already held), and `failed` for an index run, and `refreshed`, `markedMissing`, `unchanged`, and `failed` for a re-index. `skipped` and `alreadyCataloged` are counted apart so that a resumed run's tally describes what it actually did rather than reporting every entry an earlier segment cataloged as a skip. A run whose walk completes shall be recorded `complete` even when individual files failed — those are counted in the run's `failed` tally, and one file's failure shall not abandon the rest of the walk. A run that could not proceed at all shall be recorded `failed` with the underlying error. |
+| FR-FC-28 | The system shall expose a run's recorded status and outcome to an authenticated caller, given the run id returned when the run was started, over both the HTTP and FFI surfaces. While the run is in flight the answer shall also carry its live progress: `phase` (`discovering` while the entries are still being counted, `processing` once they are, and absent once the run is terminal), `total` (absent until discovery has finished counting), `processed` (entries the current segment has finished with), `activeMillis` (elapsed time with paused stretches subtracted), and `pausedAt` for a run that is paused right now. A run this process is no longer executing shall still report the last progress it published, so a run paused across a restart can still say how far it got. The system shall not report a remaining-time estimate: `processed`, `total`, and `activeMillis` are the inputs a client cannot derive for itself, and smoothing an estimate over them is a presentation decision. |
+| FR-FC-29 | The system shall, at startup, record every run still marked `running` as `paused` and offer it for resume (FR-FC-33); runs execute in-process, so such a run provably has no task behind it. Nothing shall resume by itself — resuming is an explicit act by the owner. |
 | FR-FC-30 | The system shall report the configuration a client needs to render the catalog correctly, beginning with the soft-delete retention window it enforces on every restore and purge. |
+| FR-FC-31 | The system shall accept a priority — `normal` or `low` — when an index or re-index run is started, treating an absent or unrecognised value as `normal` on both surfaces rather than rejecting the call, and shall resolve it to the concurrency bound FR-FC-08 applies. The priority shall be stored on the run and reused when the run is resumed, so a resumed run continues at the width it was started with rather than at whatever configuration happens to say later. It is fixed for the life of the run: resume takes no priority of its own, so an owner who wants a different one cancels the run (FR-FC-34) and starts a fresh one, which is cheap because everything already cataloged falls straight through as `alreadyCataloged`. |
+| FR-FC-32 | The system shall pause a `running` index or re-index run on the owner's request, leaving it recorded `paused` with the point it reached and with no finish time, so that it can be resumed later. A pause requested against a run in any other status shall be refused as a conflict rather than silently accepted. |
+| FR-FC-33 | The system shall resume a `paused` index or re-index run on the owner's request, recording it `running` again and continuing it under the same run id, with the time it spent paused excluded from its `activeMillis`. A resumed index run re-walks its root and a resumed re-index re-visits every cataloged path; entries an earlier segment already cataloged are counted in `alreadyCataloged`. A resume requested against a run in any other status shall be refused as a conflict. |
+| FR-FC-34 | The system shall cancel a `running` or `paused` index or re-index run on the owner's request, recording it `cancelled` with a finish time and with the progress it last published. Where a walk was executing, the partial tally it had reached is kept as well; a run no process is executing has none to offer, and is recorded without counts rather than with invented ones. `cancelled` is terminal: a cancelled run shall never be resumed. A cancel requested against an already-terminal run shall be refused as a conflict. |
+| FR-FC-35 | The system shall report every outstanding run — every run whose status is `running` or `paused` — to an authenticated caller in one call, newest first, each carrying the same body FR-FC-28 defines. A caller with nothing outstanding shall receive an empty list rather than an error. This is what lets a client show whether anything is indexing and offer a resume at launch without having to remember every run id it ever started. |
 
 ### 3.2 Collections (CO)
 
@@ -250,7 +258,9 @@ erDiagram
 | path | text | required, unique | Absolute on-disk path. |
 | name | text | required | Editable file name. |
 | type | enum | required; one of `audio`, `video`, `html`, `text`, `document`, `comic`, `image` | Subtype discriminator. |
-| contentHash | text | required | SHA-256 of the file bytes. |
+| contentHash | text | nullable | SHA-256 of the file bytes, when one is known. `NULL` is the normal state: indexing and re-index never compute one (FR-FC-09, FR-FC-10), and a re-index clears it on a changed file. The only writer is the post-write verification of a text edit (FR-TX-03). Informational — nothing reads it back as a decision input. |
+| sizeBytes | integer | nullable | The file's size on disk at the last index or re-index; half of the change signal (FR-FC-10). |
+| mtime | timestamp | nullable | The file's last-modification time on disk at the last index or re-index; the other half of the change signal (FR-FC-10), and part of the thumbnail cache key (FR-MP-05). |
 | state | enum | required; one of `active`, `deleted` | Lifecycle state. |
 | deletedAt | timestamp | nullable | Set when soft-deleted; drives the retention window. |
 | indexedAt | timestamp | required | Last index/re-index time. |
@@ -392,30 +402,48 @@ presents. External mode creates no sessions — each request carries its own JWT
 
 ### 4.11 CatalogRun Fields
 
-Records each index and re-index run (UC-01, UC-02), queried by run id (UC-42,
-FR-FC-27). A row is written `running` when the run starts and closed to a
-terminal `status` when it ends; rows are kept indefinitely.
+Records each index and re-index run (UC-01, UC-02), queried by run id or as
+part of the outstanding set (UC-42, FR-FC-27, FR-FC-35), and controlled by
+UC-48. A row is written `running` when the run starts, updated as the run
+publishes progress, and closed to a terminal `status` when it ends; rows are
+kept indefinitely.
 
 | Field | Type | Constraints | Description |
 | --- | --- | --- | --- |
 | id | UUID | PK | The run id returned when the run was started. |
 | kind | text | required | `index` or `refresh`. |
-| status | text | required | `running`, `complete`, `failed`, or `interrupted`. |
+| status | text | required | `running`, `paused`, `complete`, `failed`, or `cancelled` (FR-FC-27). |
 | root | text | nullable | The indexed root, for an index run only; `NULL` for a refresh, which takes no root. |
 | startedAt | timestamp | required | When the run started. |
-| finishedAt | timestamp | nullable | When the run reached a terminal status; `NULL` while `running`. |
-| scanned | integer | nullable | Index only: files scanned. |
+| finishedAt | timestamp | nullable | When the run reached a terminal status; `NULL` while `running` or `paused`. |
+| phase | text | nullable | `discovering` or `processing` while the run is in flight; `NULL` once it is terminal, and `NULL` for a run that never published one. |
+| total | integer | nullable | How many entries the current segment has to get through; `NULL` until discovery has counted them. |
+| processed | integer | nullable | How many entries the current segment has finished with, of any outcome. |
+| pausedAt | timestamp | nullable | When the current pause began; `NULL` unless the run is `paused`. |
+| pausedMillis | integer | required | Time the run has spent paused, accumulated across segments. Internal: it is the input `activeMillis` is derived from, and is not itself reported. |
+| concurrency | integer | nullable | The width the run's priority (FR-FC-31) resolved to, so a resume reuses it. Internal; `NULL` only for a run started before priority existed, which resumes at the configured default. |
+| scanned | integer | nullable | Index only: entries scanned. |
 | indexed | integer | nullable | Index only: files newly indexed. |
-| skipped | integer | nullable | Index only: files skipped. |
+| skipped | integer | nullable | Index only: entries classified out (an unsupported extension). |
+| alreadyCataloged | integer | nullable | Index only: entries whose path the catalog already held. |
 | refreshed | integer | nullable | Refresh only: records refreshed. |
 | markedMissing | integer | nullable | Refresh only: records marked missing. |
 | unchanged | integer | nullable | Refresh only: records unchanged. |
 | failed | integer | nullable | Both kinds: files that failed individually without abandoning the run. |
 | error | text | nullable | The underlying error; set only when `status` is `failed`. |
 
-Every count field and `finishedAt` are `NULL` while the run is `running`. A run
-is `interrupted` at startup if it was still recorded `running`, since runs
-execute in-process and are never resumed (FR-FC-29).
+`activeMillis` (FR-FC-28) is not a column: it is elapsed time — to `finishedAt`,
+or to now for a run still going — less `pausedMillis`, computed when the run is
+read.
+
+Every count field and `finishedAt` are `NULL` while the run is `running` or
+`paused`; `processed` and `total` are what a client draws a progress bar from
+until then. A run still recorded `running` at startup is recorded `paused`, not
+lost, and is offered for resume (FR-FC-29) — which is why there is no
+`interrupted` status. A `paused` run keeps its `processed` and `total` from its
+last flush, so it can still say how far it got across a restart; resuming it
+resets them, because the resumed segment rediscovers its own total and counts
+from zero (FR-FC-33).
 
 ---
 
@@ -429,10 +457,22 @@ endpoint requires authentication from the active mode (see §7).
 
 | Method | Path | Description | Requirement |
 | --- | --- | --- | --- |
-| POST | /v1/index | Start an asynchronous indexing scan of a root path. | FR-FC-01..08 |
-| POST | /v1/index/refresh | Re-index existing records (refresh hashes/metadata). | FR-FC-10, FR-FC-11 |
+| POST | /v1/index | Start an asynchronous indexing scan of a root path, optionally at a `priority` of `normal` or `low`. | FR-FC-01..09, FR-FC-31 |
+| POST | /v1/index/refresh | Re-index existing records (compare size and mtime, mark missing), optionally at a `priority`. | FR-FC-10, FR-FC-11, FR-FC-31 |
 | GET | /v1/settings | Report the client-relevant configuration, beginning with the retention window. | FR-FC-30 |
-| GET | /v1/index/runs/{runId} | Report an index or re-index run's status and outcome. | FR-FC-27, FR-FC-28 |
+| GET | /v1/index/runs/{runId} | Report an index or re-index run's status, progress, and outcome. | FR-FC-27, FR-FC-28 |
+| GET | /v1/index/runs?status=active | List every outstanding (`running` or `paused`) run, newest first. | FR-FC-35 |
+| POST | /v1/index/runs/{runId}/pause | Pause a running run, leaving it resumable. | FR-FC-32 |
+| POST | /v1/index/runs/{runId}/resume | Resume a paused run under the same run id. | FR-FC-33 |
+| POST | /v1/index/runs/{runId}/cancel | Abandon a running or paused run. Terminal. | FR-FC-34 |
+
+`status` on the runs listing is optional and defaults to `active`, the only
+value it accepts; any other value is rejected as invalid input rather than
+quietly answered with the active set. The three control operations answer a
+conflict when the run is not in a status that permits the verb (FR-FC-32 …
+FR-FC-34) and a not-found for an id naming no run; over FFI they report the
+same two outcomes as distinct result codes. Resume answers with the run id it
+was given — a resume continues a run, it does not mint a new one.
 
 ### 5.2 Files
 
@@ -570,7 +610,7 @@ returns a playback descriptor instead of bytes (FR-MP-06).
 | ID | Category | Requirement |
 | --- | --- | --- |
 | NFR-01 | Performance | The system shall answer catalog read queries with p95 latency under 200 ms for a library of tens of thousands of files. |
-| NFR-02 | Performance | The system shall index at least 500 files per second on a personal machine without blocking read/query operations. |
+| NFR-02 | Performance | The system shall index at least 500 files per second on a personal machine, independent of the total size of the library, without blocking read/query operations. The rate is per **file**, not per byte: a library of large files shall index at substantially the same rate as a library of the same number of small ones, because nothing in the scan path reads a file's contents to identify it (FR-FC-09, FR-FC-10). |
 | NFR-03 | Maintainability | The core library shall be organized by Command/Query (CQRS-style) handlers depending on repository traits, following SOLID principles. |
 | NFR-04 | Maintainability | The core library shall contain no `unsafe` code; `#![deny(unsafe_code)]` is enforced workspace-wide. |
 | NFR-05 | Security | The system shall never store plaintext passwords and shall never log credentials or tokens. |
@@ -586,7 +626,7 @@ returns a playback descriptor instead of bytes (FR-MP-06).
 
 | Operation | Owner (authenticated) | Unauthenticated |
 | --- | --- | --- |
-| Index files / re-index | ✅ | ❌ |
+| Index files / re-index; query, pause, resume, or cancel a run | ✅ | ❌ |
 | Browse and view file metadata | ✅ | ❌ |
 | Edit file metadata / rename / content | ✅ | ❌ |
 | Soft-delete / restore / hard-purge / purge-on-disk | ✅ | ❌ |
@@ -653,7 +693,7 @@ The feature identifiers are the milestones the
 | Feature | Requirements |
 | --- | --- |
 | F-00 Foundation and operations | IR-01 through IR-06 (Operations & Infrastructure Document §2) |
-| F-01 File indexing | FR-FC-01 through FR-FC-11, FR-FC-25 through FR-FC-29 |
+| F-01 File indexing | FR-FC-01 through FR-FC-11, FR-FC-25 through FR-FC-29, FR-FC-31 through FR-FC-35 |
 | F-02 Catalog browsing and metadata editing | FR-FC-12 through FR-FC-18 |
 | F-03 Renaming and lifecycle management | FR-FC-19 through FR-FC-23 |
 | F-04 Text file content editing | FR-TX-01 through FR-TX-03 |
@@ -673,14 +713,14 @@ ships, which is why each one lands on both surfaces at once.
 | Business Rule | Realized by |
 | --- | --- |
 | BR-01 single owner | FR-AU-07, NFR-06 (all operations require owner auth) |
-| BR-02 metadata + path/hash only | FR-FC-09, FR-FC-23, FR-TX-02 (writes to disk, not stored) |
+| BR-02 metadata + path reference only, never file bytes | FR-FC-09, FR-FC-23, FR-TX-02 (writes to disk, not stored). The reference is the path plus the stat pair; the content hash the rule was originally written around is now informational and usually absent (FR-FC-09, FR-FC-10). |
 | BR-03 text edits write back to disk | FR-TX-02 |
 | BR-04 no complex media editing | NFR-08 |
 | BR-05 watchlists only videos | FR-WL-03 |
 | BR-06 per-episode series tracking | FR-WL-05 |
 | BR-07 dual transport parity | FR-FC-24, FR-AU-08, NFR-09 |
 | BR-08 pluggable auth, external + local + Windows | FR-AU-01, FR-AU-02, FR-AU-04, FR-AU-06, FR-AU-20 |
-| BR-09 async non-blocking indexing | FR-FC-08, NFR-02 |
+| BR-09 async non-blocking indexing | FR-FC-08, FR-FC-28, FR-FC-31, FR-FC-32, FR-FC-33, FR-FC-34, FR-FC-35, NFR-02 (a run the owner cannot see, throttle, or stop is only half non-blocking) |
 | BR-10 two-phase deletion | FR-FC-20, FR-FC-21, FR-FC-22, NFR-07, NFR-10 |
 | BR-11 hard purge no disk touch; separate purge-on-disk | FR-FC-22, FR-FC-23 |
 | BR-12 delete collection preserves items | FR-CO-04 |

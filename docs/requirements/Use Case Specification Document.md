@@ -108,18 +108,20 @@ graph LR
 | **Actors** | Owner, Local Filesystem |
 | **Description** | Scan a root directory and create type-aware catalog records for every supported file type. |
 | **Preconditions** | The caller is authenticated as the owner; the root path is supplied, and it sits inside the configured `filesystem.root` when one is configured (FR-FC-26). |
-| **Postconditions** | A File record exists for each supported file found, each with a content hash and a subtype record prefilled with whatever metadata could be extracted from the file itself; indexing runs without blocking reads. |
-| **Requirements** | FR-FC-01, FR-FC-02, FR-FC-03, FR-FC-04, FR-FC-05, FR-FC-06, FR-FC-07, FR-FC-08, FR-FC-09, FR-FC-24, FR-FC-25, FR-FC-26 |
+| **Postconditions** | A File record exists for each supported file found, each carrying that file's path, name, type, size, and modification time, plus a subtype record prefilled with whatever metadata could be extracted from the file itself; indexing runs without blocking reads. |
+| **Requirements** | FR-FC-01, FR-FC-02, FR-FC-03, FR-FC-04, FR-FC-05, FR-FC-06, FR-FC-07, FR-FC-08, FR-FC-09, FR-FC-24, FR-FC-25, FR-FC-26, FR-FC-27, FR-FC-31 |
 
 **Main Flow**
 
-1. The owner requests indexing with a root path.
-2. The system starts an asynchronous scan and returns immediately.
-3. The system walks the tree, classifies each supported file **by extension**, and creates a File record (with a row in the matching subtype table) carrying path, name, type, and the computed SHA-256 content hash. Files are processed **several at a time**, up to the configured `indexing.concurrency`; the order is therefore unspecified, but every scanned entry contributes exactly one outcome to the run's counts.
-4. For the subtypes that carry embedded metadata — audio, image, document, video, and comic — the system reads the file's own metadata and prefills the subtype row with it (FR-FC-25). Extraction is **best-effort**: an unreadable or metadata-less file simply leaves the fields empty, and the owner can set or correct any of them afterwards via UC-04. Extraction runs **only here, at first index** — UC-02 never re-reads it, so an owner's UC-04 edit is never overwritten by a later run.
-5. The system records the `indexedAt` timestamp and logs the run's outcome (scanned, indexed, skipped, failed).
+1. The owner requests indexing with a root path, and optionally a **priority** — `normal` or `low` (FR-FC-31). An absent or unrecognised priority means `normal`.
+2. The system starts an asynchronous scan and returns immediately with the run's id.
+3. The system walks the tree to discover its entries. While it is counting them the run reports phase `discovering` and no total; once the count is known the total is fixed and the phase becomes `processing` (FR-FC-28).
+4. The system classifies each supported file **by extension** and creates a File record (with a row in the matching subtype table) carrying path, name, type, and the size and modification time taken from the directory entry. **Nothing reads the file's contents to identify it**, and no content hash is computed: size and modification time are the change signal a later re-index compares (UC-02), and the File's content hash is left unset (FR-FC-09). Files are processed **several at a time**, up to the width the run's priority resolved to (`indexing.concurrency` for `normal`, `indexing.low_priority_concurrency` for `low`); the order is therefore unspecified, but every scanned entry contributes exactly one outcome to the run's counts.
+5. For the subtypes that carry embedded metadata — audio, image, document, video, and comic — the system reads the file's own metadata and prefills the subtype row with it (FR-FC-25). Extraction is **best-effort**: an unreadable or metadata-less file simply leaves the fields empty, and the owner can set or correct any of them afterwards via UC-04. Extraction runs **only here, at first index** — UC-02 never re-reads it, so an owner's UC-04 edit is never overwritten by a later run.
+6. The system records the `indexedAt` timestamp and logs the run's outcome (scanned, indexed, skipped, alreadyCataloged, failed).
 
-The `runId` returned in step 2 is opaque: completion is reported to the log only, and there is no query to retrieve a run's outcome.
+The `runId` returned in step 2 is how the owner follows the run: UC-42 reports
+its status and live progress, and UC-48 pauses, resumes, or cancels it.
 
 **Alternative Flows**
 
@@ -127,9 +129,10 @@ The `runId` returned in step 2 is opaque: completion is reported to the log only
 | --- | --- | --- |
 | AF-01 | The root path does not exist on disk | The system rejects the request with an invalid-input error. |
 | AF-02 | The caller is not authenticated | The system denies with an unauthorized error. |
-| AF-03 | A file path is already cataloged | The system skips creation (no duplicate path); a refresh is handled by UC-02. |
+| AF-03 | A file path is already cataloged | The system creates no duplicate and counts the entry in `alreadyCataloged`, kept apart from `skipped` (an unsupported extension) so that a resumed run's tally stays honest (FR-FC-27); a refresh is handled by UC-02. |
+| AF-08 | The owner pauses or cancels the run while it is in flight (UC-48) | The entries already in flight finish, and the run records itself `paused` or `cancelled` where it stood. Because per-file work is a stat rather than a read of the whole file, that window drains in milliseconds. |
 | AF-04 | A single file cannot be read or persisted | The system counts it as failed, logs a warning naming the path, and continues the run; the remaining files are still indexed. |
-| AF-05 | A file's embedded metadata cannot be parsed, or writing the extracted values fails | The system logs a warning naming the path and leaves the subtype fields empty. The file is still indexed successfully — this is **not** counted as a failure (step 4 is best-effort). |
+| AF-05 | A file's embedded metadata cannot be parsed, or writing the extracted values fails | The system logs a warning naming the path and leaves the subtype fields empty. The file is still indexed successfully — this is **not** counted as a failure (step 5 is best-effort). |
 | AF-06 | `filesystem.root` is configured and the requested root is neither it nor a descendant of it (FR-FC-26) | The system rejects the request with an invalid-input error saying the root is outside the configured library root. Both paths are canonicalized before the comparison, so `..` segments, trailing separators, symbolic links, and a sibling whose name merely shares a prefix with the library root are all judged on where they actually resolve to. The message does not disclose the configured root's location. Where `filesystem.root` is unset the check does not run at all and any readable root is accepted. |
 | AF-07 | `filesystem.root` is configured but cannot be resolved on disk | The system rejects the request with a distinct invalid-input error saying the server's configured library root could not be resolved (not the AF-06 "outside the library root" message, which would misleadingly blame the caller) and logs an error naming the key and the unresolvable value. A bound that silently vanished when its configuration went bad would be worse than none, because the operator would still believe it were there. |
 
@@ -142,17 +145,17 @@ The `runId` returned in step 2 is opaque: completion is reported to the log only
 | **ID** | UC-02 |
 | **Name** | Re-index and refresh the catalog |
 | **Actors** | Owner, Local Filesystem |
-| **Description** | Re-scan indexed paths and refresh metadata and content hashes. |
+| **Description** | Re-visit every cataloged path, detect the ones that changed on disk, and mark the ones that are gone. |
 | **Preconditions** | The caller is authenticated; at least one indexing run has occurred. |
-| **Postconditions** | Changed files have refreshed content hashes and `indexedAt`; missing-on-disk files carry a `missingAt` marker but are not deleted. |
-| **Requirements** | FR-FC-08, FR-FC-10, FR-FC-11, FR-FC-24 |
+| **Postconditions** | Changed files carry their new size, modification time, and `indexedAt`, and no stale content hash; missing-on-disk files carry a `missingAt` marker but are not deleted. |
+| **Requirements** | FR-FC-08, FR-FC-10, FR-FC-11, FR-FC-24, FR-FC-27, FR-FC-31 |
 
 **Main Flow**
 
-1. The owner requests a re-index.
-2. The system re-reads each cataloged path's bytes asynchronously, several paths at a time (the same `indexing.concurrency` bound UC-01 uses — a re-index is the same hash-every-file workload). The order paths are visited in is unspecified; each path's outcome depends only on its own row and its own bytes.
-3. For each path whose content hash changed, the system refreshes the hash and updates `indexedAt`. Subtype metadata is **not** refreshed: extraction happens once, at first index (UC-01 step 4), so a re-index can never overwrite what the owner set via UC-04.
-4. For each path that no longer exists on disk, the system sets the File's `missingAt` marker without deleting the record. `state` is untouched: `missingAt` is orthogonal to the soft-delete lifecycle owned by UC-06/UC-07, so a file may be `active` and missing at the same time. A file that returns to disk has its marker cleared.
+1. The owner requests a re-index, and optionally a **priority** — `normal` or `low` (FR-FC-31), exactly as UC-01 accepts one. A re-index takes no root: it visits everything the catalog already holds, and discovering *new* files is UC-01's job.
+2. The system stats each cataloged path asynchronously, several paths at a time (the same priority-resolved bound UC-01 uses). The order paths are visited in is unspecified; each path's outcome depends only on its own row and its own entry on disk. **No file's contents are read**: one stat per path is the whole of the per-file work, which is why a re-index costs the same on a library of films as on a library of notes.
+3. For each path whose size or modification time differs from what the record holds, the system treats the file as changed: it stores the new size and modification time, updates `indexedAt`, and clears the record's content hash, so a hash cannot outlive the bytes it described (FR-FC-10). A path whose size and modification time both match is recorded unchanged. Subtype metadata is **not** refreshed: extraction happens once, at first index (UC-01 step 5), so a re-index can never overwrite what the owner set via UC-04.
+4. For each path that no longer exists on disk, the system sets the File's `missingAt` marker without deleting the record. `state` is untouched: `missingAt` is orthogonal to the soft-delete lifecycle owned by UC-06/UC-07, so a file may be `active` and missing at the same time. A file that returns to disk has its marker cleared and is recorded as refreshed.
 
 **Alternative Flows**
 
@@ -161,6 +164,14 @@ The `runId` returned in step 2 is opaque: completion is reported to the log only
 | AF-01 | A path on disk was deleted since indexing | The system sets `missingAt` (per main flow step 4); the record is neither deleted nor moved to the `deleted` state. (Explicit deletion is UC-06.) |
 | AF-02 | The caller is not authenticated | The system denies with an unauthorized error. |
 | AF-03 | A single cataloged path cannot be read or written | The system counts it as failed, logs a warning naming the path, and continues the run; the remaining paths are still refreshed. |
+| AF-04 | The owner pauses or cancels the run while it is in flight (UC-48) | As UC-01 AF-08. A resumed re-index re-visits every cataloged path from the start; that is safe because the comparison is idempotent and each path costs one stat. |
+
+> Size and modification time have one blind spot, and it is accepted knowingly:
+> a file edited in place to exactly the same byte length with its modification
+> time preserved reads as unchanged. Producing that takes deliberate effort,
+> and re-indexing it after touching the file is the escape hatch. What it buys
+> is that a re-index no longer reads the library's every byte — the difference
+> between a scan measured in minutes and one measured in seconds.
 
 ---
 
@@ -1223,16 +1234,16 @@ UC-36's externally issued JWT.
 | **ID** | UC-40 |
 | **Name** | Get a file thumbnail |
 | **Actors** | Owner, Local Filesystem |
-| **Description** | Return a downscaled JPEG thumbnail for a video, image, or comic File, cached on disk keyed by content hash. |
+| **Description** | Return a downscaled JPEG thumbnail for a video, image, or comic File, cached on disk keyed by the file's UUID, modification time, and target dimension. |
 | **Preconditions** | The caller is authenticated; the target file is `active`, present on disk, and of type video, image, or comic. |
-| **Postconditions** | The caller receives the thumbnail's bytes; on a cache miss, the generated thumbnail is written to the disk cache under a key derived from the file's content hash. |
+| **Postconditions** | The caller receives the thumbnail's bytes; on a cache miss, the generated thumbnail is written to the disk cache under that key. |
 | **Requirements** | FR-MP-05, FR-MP-06 |
 
 **Main Flow**
 
 1. The owner requests a thumbnail for a File UUID.
 2. The system verifies the file's type is video, image, or comic.
-3. The system looks up the thumbnail cache by a key derived from the file's content hash; on a hit, it returns the cached bytes without rendering anything.
+3. The system looks up the thumbnail cache by a key derived from the file's UUID, its recorded modification time, and the target dimension; on a hit, it returns the cached bytes without rendering anything. The UUID is unique and stable, and folding in the modification time is what invalidates the entry when the file changes — the same job the content hash used to do, without the whole-file read that keying on a hash would now force at browse time (FR-FC-09).
 4. On a cache miss, the system produces a source image — a video keyframe, the decoded image, or the comic's first page — and downscales it to fit within 320 pixels on its longest side, preserving aspect ratio and never enlarging a source that is already smaller, then encodes it as JPEG.
 5. The system writes the encoded bytes to the cache and returns them.
 
@@ -1307,18 +1318,36 @@ UC-34 or UC-44 completes the job.
 | **ID** | UC-42 |
 | **Name** | Query an index or refresh run |
 | **Actors** | Owner |
-| **Description** | Report the status and outcome of an index (UC-01) or re-index (UC-02) run, given the run id returned when it was started. |
-| **Preconditions** | The caller is authenticated; a run was started and its id retained. |
+| **Description** | Report the status, live progress, and outcome of an index (UC-01) or re-index (UC-02) run — either one run by its id, or every outstanding run at once. |
+| **Preconditions** | The caller is authenticated; for the single-run form, a run was started and its id retained. |
 | **Postconditions** | None — this is a query. The catalog is unchanged. |
-| **Requirements** | FR-FC-24, FR-FC-27, FR-FC-28, FR-FC-29 |
+| **Requirements** | FR-FC-24, FR-FC-27, FR-FC-28, FR-FC-29, FR-FC-35 |
 
 **Main Flow**
 
 1. The caller submits a run id.
 2. The system confirms the caller is authenticated as the owner.
-3. The system reads the run record for that id.
+3. The system reads the run record for that id and overlays the progress the
+   run is publishing right now, when a run by that id is executing in this
+   process.
 4. The system returns the run's kind, status, start time, finish time when it
-   has one, and the outcome counts for its kind.
+   has one, the outcome counts for its kind once it has them, and — while the
+   run is in flight — its phase, total, processed count, active milliseconds,
+   and the instant it was paused if it is paused (FR-FC-28).
+
+**Alternate Main Flow — every outstanding run** (FR-FC-35)
+
+1. The caller asks for the outstanding runs, naming no id.
+2. The system confirms the caller is authenticated as the owner.
+3. The system returns every run whose status is `running` or `paused`, newest
+   first, each as the same body the single-run form returns. Nothing
+   outstanding is an empty list, not an error.
+
+This is the form a client uses to answer "is anything indexing?" and "is there
+anything to resume?" without having had to remember every run id it ever
+started — the two questions a background-activity indicator and a
+resume-at-launch prompt ask, and neither can be answered honestly from one
+client's own memory.
 
 **Alternative Flows**
 
@@ -1326,15 +1355,28 @@ UC-34 or UC-44 completes the job.
 | --- | --- | --- |
 | AF-01 | No run exists with that id | The system responds with a not-found error. |
 | AF-02 | The caller is not authenticated | The system denies with an unauthorized error. |
-| AF-03 | The run is still executing | The system returns it with status `running`; the count fields are absent, since no tally exists until the walk finishes. |
+| AF-03 | The run is still executing | The system returns it with status `running` and its live progress; the outcome counts are absent, since no tally exists until the walk finishes. |
 | AF-04 | The run could not proceed at all (the catalog was unreadable, or the root could not be walked) | The system returns it with status `failed` and the underlying error message. |
-| AF-05 | The run was executing when the process stopped | The system returns it with status `interrupted` — no task is executing it and it will not resume. |
+| AF-05 | The run was executing when the process stopped | The system returns it with status `paused` and the last progress it published, so the owner is shown how far it got and can resume it (UC-48, FR-FC-29). |
+| AF-06 | The run was abandoned by its owner | The system returns it with status `cancelled`, its finish time, the progress it last published, and the partial tally it reached where a walk was executing to produce one. It is terminal and will not resume. |
+| AF-07 | The listing is asked for a status other than the outstanding one | The system rejects with an invalid-input error rather than answering with the outstanding set: a caller who named a status almost certainly wanted that status, and no query here can list terminal runs. |
 
 A run whose walk completed with per-file failures is `complete`, not `failed`:
 those are counted in its `failed` tally and the walk deliberately continues past
 them. `failed` is reserved for a run that could not proceed at all. The
 distinction already exists inside `execute()` — one unreadable file must not
 abandon the rest of the catalog — and this surfaces it.
+
+A run publishes its progress into memory as it goes and flushes it to its
+record periodically, so a query against a live run is exact rather than up to a
+flush stale, and a query against a run this process is no longer executing
+still answers from the last flush. That is what lets a run paused across a
+restart say "8,412 of 12,264" at the next launch.
+
+The system reports no estimated time remaining. `processed`, `total`, and
+`activeMillis` are the three inputs a client cannot derive for itself;
+smoothing them into an estimate depends on how often that client polls, which
+makes it a presentation decision rather than a catalog one.
 
 ---
 
@@ -1513,12 +1555,78 @@ have only one of.
 
 ---
 
+### UC-48: Pause, resume, or cancel an index run
+
+| Field | Value |
+| --- | --- |
+| **ID** | UC-48 |
+| **Name** | Pause, resume, or cancel an index run |
+| **Actors** | Owner, Local Filesystem |
+| **Description** | Stop an index (UC-01) or re-index (UC-02) run where it stands and pick it up again later, or abandon it outright. |
+| **Preconditions** | The caller is authenticated as the owner; a run exists with the submitted id. |
+| **Postconditions** | The run is recorded `paused` (resumable, with no finish time), `running` again under the same id, or `cancelled` (terminal, with a finish time and the tally it reached). The catalog holds whatever the run had already written; nothing is rolled back. |
+| **Requirements** | FR-FC-24, FR-FC-27, FR-FC-29, FR-FC-31, FR-FC-32, FR-FC-33, FR-FC-34 |
+
+**Main Flow — pause** (FR-FC-32)
+
+1. The owner asks to pause a run, naming its id.
+2. The system confirms the caller is authenticated as the owner and that the run is `running`.
+3. The system signals the run to stop. Entries already in flight finish; nothing further is started. Because per-file work is a stat and, at most, a metadata read rather than a read of the whole file (UC-01 step 4), that window drains in milliseconds however large the library's files are.
+4. The system records the run `paused`, with the instant the pause began and no finish time, keeping the phase and the progress it had reached.
+
+**Main Flow — resume** (FR-FC-33)
+
+1. The owner asks to resume a run, naming its id.
+2. The system confirms the caller is authenticated as the owner and that the run is `paused`.
+3. The system adds the length of the pause that is ending to the time the run has spent paused, so that pause never counts as work (FR-FC-28), and records the run `running` again under the **same id** — a resume continues a run, it does not start a new one.
+4. The system walks again at the priority the run was started with (FR-FC-31), from the root for an index run or across every cataloged path for a re-index. There is no cursor: the run rediscovers its total and counts from zero, and everything an earlier segment already cataloged falls out as `alreadyCataloged` in seconds.
+
+**Main Flow — cancel** (FR-FC-34)
+
+1. The owner asks to cancel a run, naming its id.
+2. The system confirms the caller is authenticated as the owner and that the run is `running` or `paused`.
+3. The system stops the run as a pause does, then records it `cancelled` with a finish time and with the progress it last published. A run a walk was executing also keeps the partial tally that walk had reached; a `paused` run, which no process is executing, is recorded without counts rather than with invented ones.
+4. The run is terminal. It will not resume, and cancelling it again is refused.
+
+**Alternative Flows**
+
+| ID | Condition | Outcome |
+| --- | --- | --- |
+| AF-01 | No run exists with that id | The system responds with a not-found error. |
+| AF-02 | The caller is not authenticated | The system denies with an unauthorized error. |
+| AF-03 | A pause is asked of a run that is not `running` — it is already `paused`, or it is `complete`, `failed`, or `cancelled` | The system refuses with a conflict rather than silently accepting. A pause that appeared to succeed against a finished run would leave the owner waiting for a resume prompt that never comes. |
+| AF-04 | A resume is asked of a run that is not `paused` — it is already `running`, or it is terminal | The system refuses with a conflict. A run that is already running has nothing to resume, and a terminal one has no run left at all; re-doing a completed scan is a fresh UC-01, not a resume. |
+| AF-05 | A cancel is asked of a run that is already terminal | The system refuses with a conflict: there is nothing left to abandon, and a run that closed itself is not one a later cancel may rewrite. |
+| AF-06 | The application was restarted while the run was executing | Startup recorded the run `paused` (FR-FC-29), so it appears in the outstanding runs (UC-42) with the last progress it published, and this use case's resume flow applies to it unchanged. Nothing resumed by itself while the application was starting — the owner is offered the run, and resuming it is their act. |
+| AF-07 | The pause or cancel arrives while the run is still discovering its entries | The system honours it at the end of discovery, before any file is touched. The tree walk is a single uninterruptible call, and it takes seconds. |
+| AF-08 | The run being resumed is an index run whose recorded root is missing | The system refuses with an internal error and logs it, rather than reporting a resume that would never walk anything. Every index run records its root, so this should not occur. |
+
+> Pause and cancel are the same mechanism aimed at different intentions.
+> Pause is "I will come back to this"; cancel is "I started this on the wrong
+> folder". Keeping them apart is why a paused run keeps no finish time and a
+> cancelled one gets both a finish time and its partial tally.
+
+> A resumed run's tally describes its **last segment**, not the whole history:
+> a run paused at 8,000 of 12,264 and resumed finishes reporting `scanned
+> 12,264, indexed 4,264, alreadyCataloged 8,000`. "How much is in the library"
+> is `indexed + alreadyCataloged`, which lands on the right number — and it is
+> exactly why FR-FC-27 keeps `alreadyCataloged` apart from `skipped`.
+
+> A run's priority cannot be changed part-way through. The concurrency bound
+> is fixed when the walk is built, and a resume reuses the width the run was
+> started with rather than taking a new one (FR-FC-31). An owner who picked
+> the wrong priority cancels the run and starts a fresh one at the other
+> priority; that is nearly free, because everything the abandoned run had
+> cataloged falls straight through the new one as `alreadyCataloged`.
+
+---
+
 ## 3. Use Case — Requirements Traceability
 
 | Use Case | Requirements |
 | --- | --- |
-| UC-01: Index library files | FR-FC-01, FR-FC-02, FR-FC-03, FR-FC-04, FR-FC-05, FR-FC-06, FR-FC-07, FR-FC-08, FR-FC-09, FR-FC-24, FR-FC-25, FR-FC-26 |
-| UC-02: Re-index and refresh the catalog | FR-FC-08, FR-FC-10, FR-FC-11, FR-FC-24 |
+| UC-01: Index library files | FR-FC-01, FR-FC-02, FR-FC-03, FR-FC-04, FR-FC-05, FR-FC-06, FR-FC-07, FR-FC-08, FR-FC-09, FR-FC-24, FR-FC-25, FR-FC-26, FR-FC-27, FR-FC-31 |
+| UC-02: Re-index and refresh the catalog | FR-FC-08, FR-FC-10, FR-FC-11, FR-FC-24, FR-FC-27, FR-FC-31 |
 | UC-03: Browse and view file metadata | FR-FC-12, FR-FC-13, FR-FC-24 |
 | UC-04: Edit file metadata | FR-FC-14, FR-FC-15, FR-FC-16, FR-FC-17, FR-FC-18, FR-FC-24 |
 | UC-05: Rename a file | FR-FC-19, FR-FC-24 |
@@ -1557,19 +1665,20 @@ have only one of.
 | UC-39: Read a comic book page | FR-MP-03, FR-MP-04, FR-MP-06 |
 | UC-40: Get a file thumbnail | FR-MP-05, FR-MP-06 |
 | UC-41: Register the local account | FR-AU-05, FR-AU-06, FR-AU-08, FR-AU-09, FR-AU-10, FR-AU-11, FR-AU-13, FR-AU-19 |
-| UC-42: Query an index or refresh run | FR-FC-24, FR-FC-27, FR-FC-28, FR-FC-29 |
+| UC-42: Query an index or refresh run | FR-FC-24, FR-FC-27, FR-FC-28, FR-FC-29, FR-FC-35 |
 | UC-43: Redeem a recovery code | FR-AU-11, FR-AU-14, FR-AU-15, FR-AU-16 |
 | UC-44: Regenerate recovery codes | FR-AU-17, FR-AU-19 |
 | UC-45: Log in with the Windows account | FR-AU-20, FR-AU-22 |
 | UC-46: Browse collections | FR-CO-08, FR-FC-24 |
 | UC-47: Report the retention window | FR-FC-30, FR-FC-24 |
+| UC-48: Pause, resume, or cancel an index run | FR-FC-24, FR-FC-27, FR-FC-29, FR-FC-31, FR-FC-32, FR-FC-33, FR-FC-34 |
 
 Every functional requirement in [System Requirements Document](System%20Requirements%20Document.md)
 §3 appears in at least one row above except FR-AU-12, FR-AU-18, FR-AU-21,
 FR-AU-23, and FR-AU-24, which are cross-cutting (the error envelope shape, the
 account query, the Windows startup account check, the Windows-mode refusal of
 local-mode operations, and the loopback-bind warning, respectively) rather
-than tied to one use case: FR-FC-01..29, FR-CO-01..07, FR-BM-01..06,
+than tied to one use case: FR-FC-01..35, FR-CO-01..07, FR-BM-01..06,
 FR-WL-01..08, FR-RL-01..08, FR-TX-01..03, FR-AU-01..11, FR-AU-13..17,
 FR-AU-19, FR-AU-20, FR-AU-22, FR-MP-01..06.
 UC-37 (Health check) is specified in the
@@ -1615,3 +1724,24 @@ stateDiagram-v2
     Read --> [*] : item removed / reading list deleted
     Pending --> [*] : item removed / reading list deleted
 ```
+
+### 4.4 Index Run Lifecycle
+
+```mermaid
+stateDiagram-v2
+    [*] --> running : UC-01 / UC-02 started
+    running --> paused : UC-48 pause, or startup reconciliation (FR-FC-29)
+    paused --> running : UC-48 resume
+    running --> complete : walk finished
+    running --> failed : could not proceed at all
+    running --> cancelled : UC-48 cancel
+    paused --> cancelled : UC-48 cancel
+    complete --> [*]
+    failed --> [*]
+    cancelled --> [*]
+```
+
+`running` and `paused` are the two non-terminal statuses, and are exactly what
+UC-42's outstanding-runs listing returns (FR-FC-35). A control verb aimed at a
+status the diagram gives it no edge from is refused as a conflict (UC-48 AF-03
+… AF-05) rather than silently ignored.
