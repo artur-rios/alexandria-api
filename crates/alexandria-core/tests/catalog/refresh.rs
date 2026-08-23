@@ -76,6 +76,31 @@ async fn given_authenticated_when_refresh_start_then_returns_run_id() {
     assert_ne!(started.run_id, Uuid::nil());
 }
 
+/// Closes a gap Task 9's review found: every other test in this file starts
+/// at `RunPriority::Normal`, so a swapped `match` in
+/// `RefreshHandler::concurrency_for`'s `Low` arm would ship undetected. Mirror
+/// of `index.rs`'s
+/// `given_a_low_priority_index_when_started_then_the_run_records_the_low_concurrency`.
+#[tokio::test]
+async fn given_a_low_priority_refresh_when_started_then_the_run_records_the_low_concurrency() {
+    let runs = FakeCatalogRunRepository::new();
+    let fs = FakeFilesystem::builder().build();
+    let handler = refresh_handler(
+        FakeAuth::Allowing,
+        FakeCatalogRepository::new(),
+        fs,
+        fixed_clock(now()),
+        runs.clone(),
+    );
+
+    let started: RefreshStarted = handler.start(RunPriority::Low, TOKEN).await.expect("start");
+
+    assert_eq!(
+        runs.get_recorded(started.run_id).unwrap().concurrency,
+        Some(TEST_LOW_PRIORITY_CONCURRENCY)
+    );
+}
+
 #[tokio::test]
 async fn given_unauthenticated_when_refresh_start_then_unauthorized() {
     let fs = FakeFilesystem::builder().build();
