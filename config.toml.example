@@ -1,10 +1,8 @@
 # Alexandria example configuration.
 # Copy this file to config.toml and adjust as needed. Most keys can also be set
-# through an environment variable named ALEXANDRIA_<SECTION>_<KEY> (e.g.
-# ALEXANDRIA_HTTP_PORT, ALEXANDRIA_AUTH_MODE). Two keys depart from that:
-# `auth.local_db` has no override at all, and `logging.level` is read from
-# ALEXANDRIA_LOG_LEVEL rather than ALEXANDRIA_LOGGING_LEVEL. Unknown keys are
-# ignored. This file lists every key the
+# through an environment variable named ALEXANDRIA_<SECTION>_<KEY> — e.g.
+# ALEXANDRIA_HTTP_PORT, ALEXANDRIA_AUTH_MODE, ALEXANDRIA_LOGGING_LEVEL. Every
+# key below follows that rule, with no exceptions. Unknown keys are ignored. This file lists every key the
 # server reads — see the Operations & Infrastructure Document §4 for the
 # authoritative table.
 
@@ -37,11 +35,6 @@ heimdall_scope_id = ""
 # from a default install.
 heimdall_issuer = ""
 heimdall_audience = ""
-
-# Local mode only: indicates local-login credentials are managed in the SQLite
-# database. Set credentials once via the local credential setup operation (UC-35)
-# before callers can authenticate. Ignored when mode = "external".
-local_db = false
 
 # Local mode only: how long the session created by a successful local login
 # (UC-34) stays valid. Callers present that session id on subsequent requests.

@@ -63,15 +63,38 @@ broken if it were true, since content hashes are no longer computed at all.
 
 **Fixed** — the comment now describes the real key and why it is that key.
 
-### A-03 — `logging.level` breaks the documented environment-variable rule · **fixed**
+### A-03 — The environment-variable rule had two exceptions, and both were removable · **fixed**
 
 `config.toml.example` stated the override pattern is `ALEXANDRIA_<SECTION>_<KEY>`
-with `auth.local_db` as the only exception. `logging.level` is in fact read from
-`ALEXANDRIA_LOG_LEVEL`, not `ALEXANDRIA_LOGGING_LEVEL`.
+with `auth.local_db` as the only exception. There were in fact two, and neither
+needed to exist:
 
-**Fixed** as documentation rather than as code. Renaming the variable would break
-every existing deployment that sets it, to buy consistency in a rule that can
-simply name its two exceptions instead. Both are now named.
+- **`logging.level`** was read from `ALEXANDRIA_LOG_LEVEL`, not
+  `ALEXANDRIA_LOGGING_LEVEL`.
+- **`auth.local_db`** had no override at all — because it is a **dead key**. It
+  is declared, defaulted, documented as meaning "local-login credentials are
+  managed in the SQLite database", and read by nothing. No production code
+  branches on it; what actually selects local credentials is `auth.mode`. The
+  only thing referencing it outside its own declaration was a test asserting it
+  parses.
+
+**Fixed** in code, not in prose. `ALEXANDRIA_LOG_LEVEL` is renamed to
+`ALEXANDRIA_LOGGING_LEVEL`, and `auth.local_db` is deleted — from the settings
+struct, its default, the example file, the Operations document's configuration
+table, and the test.
+
+The rule now has **no exceptions**, which is a rule worth having; two documented
+departures is a rule nobody can apply without looking it up.
+
+Removing the key is safe on both counts that matter: unknown keys are ignored,
+so an existing `config.toml` still carrying `local_db = false` parses exactly as
+before, and nothing read the value, so no behavior changes. Documenting a
+configuration key as meaningful when nothing consumes it is itself the class of
+defect this review is about.
+
+Done on the basis that the project is pre-release with no deployment to break;
+the earlier draft of this file recommended the documentation-only fix for that
+reason.
 
 ### A-04 — Run-control operations cited the wrong requirement and use case · **fixed**
 
@@ -172,4 +195,3 @@ Recorded so a later reader knows these were checked rather than skipped.
   `FR-AU-12`, and several `NFR`/`IR` identifiers are never cited in source.**
   Annotation coverage is not a correctness property, and adding citations
   mechanically would be churn without a reader. Listed here so the gap is known.
-- **The `logging.level` environment variable was not renamed.** See A-03.

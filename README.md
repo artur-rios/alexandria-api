@@ -438,11 +438,20 @@ The workspace enforces `#![deny(unsafe_code)]` in every crate.
 
 ## Running
 
-Configuration is read from `config.toml` at startup, with any key overridable
-through an `ALEXANDRIA_*` environment variable. See [`config.toml.example`](config.toml.example)
-for the full list (auth mode and session TTL, HTTP bind address, SQLite path,
-filesystem root — which both feeds the health probe and bounds what indexing
-may reach — indexing concurrency, soft-delete retention, log level).
+Configuration is read from `config.toml` at startup, with every key overridable
+through an environment variable named `ALEXANDRIA_<SECTION>_<KEY>` —
+`ALEXANDRIA_HTTP_PORT`, `ALEXANDRIA_AUTH_MODE`, `ALEXANDRIA_LOGGING_LEVEL`. The
+rule has no exceptions. See [`config.toml.example`](config.toml.example) for the
+full list (auth mode and session TTL, HTTP bind address, SQLite path, filesystem
+root — which both feeds the health probe and bounds what indexing may reach —
+indexing concurrency, soft-delete retention, log level).
+
+> Two configuration changes landed together while the project is pre-release,
+> and both fail quietly rather than loudly. The log level's override is now
+> `ALEXANDRIA_LOGGING_LEVEL`; `ALEXANDRIA_LOG_LEVEL` is no longer read, so a
+> shell profile still exporting it leaves the level at its default. And
+> `auth.local_db` is gone — nothing ever read it — so a `config.toml` still
+> carrying it parses fine, because unknown keys are ignored.
 
 ```bash
 # 1. Create a local config from the example

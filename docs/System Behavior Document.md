@@ -124,14 +124,12 @@ sequenceDiagram
 ### 3.1 Configuration
 
 Read once from `config.toml`, then overridden per key from the environment. The
-naming rule is `ALEXANDRIA_<SECTION>_<KEY>`, with two departures:
+naming rule is `ALEXANDRIA_<SECTION>_<KEY>` — `ALEXANDRIA_HTTP_PORT`,
+`ALEXANDRIA_AUTH_MODE`, `ALEXANDRIA_LOGGING_LEVEL` — and every key follows it,
+with no exceptions.
 
-| Key | Override |
-| --- | --- |
-| `auth.local_db` | none — file only |
-| `logging.level` | `ALEXANDRIA_LOG_LEVEL`, **not** `ALEXANDRIA_LOGGING_LEVEL` |
-
-Unknown keys are ignored. Every key is listed in
+Unknown keys are ignored, so a stale key left in a config file is inert rather
+than fatal. Every key is listed in
 [`config.toml.example`](../config.toml.example).
 
 ### 3.2 Migrations
