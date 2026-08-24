@@ -21,7 +21,7 @@ alexandria-core = { path = "crates/alexandria-core" }
 anyhow = "1"
 argon2 = { version = "0.5", features = ["std"] }
 axum = "0.8"
-base64 = "0.22"
+base64 = "0.23"
 cbindgen = "0.29"
 chrono = { version = "0.4", features = ["serde"] }
 epub = "2"
@@ -39,11 +39,17 @@ futures-util = { version = "0.3", default-features = false, features = ["std", "
 # vector, `image` is a raster crate, and rasterizing it would mean a new
 # dependency. `ThumbnailHandler` rejects SVG explicitly instead.
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif", "bmp", "tiff"] }
-jsonwebtoken = "9"
-kamadak-exif = "0.5"
-lofty = "0.22"
-lopdf = "0.34"
-quick-xml = "0.37"
+# 11 no longer picks a crypto backend for you: it panics at the first
+# verification unless exactly one of `rust_crypto` and `aws_lc_rs` is
+# enabled. `rust_crypto` is the one that fits here — it is pure Rust, where
+# `aws_lc_rs` builds C and would make this the project's second system
+# dependency after ffmpeg. HS256 is all Alexandria verifies, so `hmac` and
+# `sha2` out of that feature are what actually get used.
+jsonwebtoken = { version = "11", features = ["rust_crypto"] }
+kamadak-exif = "0.6"
+lofty = "0.25"
+lopdf = "0.44"
+quick-xml = "0.42"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -62,7 +68,7 @@ walkdir = "2"
 # (UC-45). The thinnest binding available — raw FFI declarations, no wrapper
 # layer — and it enters the graph only on Windows targets.
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Threading"] }
-zip = "2"
+zip = "8"
 
 # dev-only
 little_exif = "0.6"

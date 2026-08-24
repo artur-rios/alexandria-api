@@ -126,10 +126,22 @@ fn parse_comic_info(xml: &str) -> (Option<String>, Option<String>, Option<i64>) 
     loop {
         match reader.read_event() {
             Ok(Event::Start(e)) => {
-                current_tag = String::from_utf8_lossy(e.name().as_ref()).into_owned();
+                // quick-xml 0.42 decodes names to `str` on the way out, so
+                // there are no longer bytes here to convert lossily.
+                current_tag = e.name().as_ref().to_owned();
             }
             Ok(Event::Text(e)) => {
-                let text = e.unescape().unwrap_or_default().into_owned();
+                // 0.42 also split what `BytesText::unescape` used to do in one
+                // step: the event carries the decoded content with line
+                // endings normalised, and resolving `&amp;` and friends is now
+                // the free function in `quick_xml::escape`. An unresolvable
+                // entity still collapses that field to nothing, exactly as
+                // `unwrap_or_default` did before — every field here is
+                // best-effort.
+                let content = e.xml10_content();
+                let text = quick_xml::escape::unescape(content.as_ref())
+                    .unwrap_or_default()
+                    .into_owned();
                 let text = text.trim();
                 if text.is_empty() {
                     continue;

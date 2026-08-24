@@ -9254,7 +9254,9 @@ fn write_test_tags(path: &std::path::Path) {
     tag.set_artist("Parity Artist".to_string());
     tag.set_album("Parity Album".to_string());
     tag.set_genre("Parity Genre".to_string());
-    tag.set_year(2015);
+    // ID3v2 maps no dedicated `Year` item, so this is where lofty's own
+    // `set_year` put it before 0.25 removed that method.
+    tag.insert_text(lofty::tag::ItemKey::RecordingDate, "2015".to_string());
     tag.set_track(2);
     tag.save_to_path(path, WriteOptions::default())
         .expect("save tag");

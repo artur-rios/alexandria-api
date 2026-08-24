@@ -254,7 +254,9 @@ fn write_audio_tags(path: &std::path::Path, i: usize) {
     tag.set_artist(format!("Artist {i}"));
     tag.set_album(format!("Album {i}"));
     tag.set_genre("Bench".to_string());
-    tag.set_year(2020);
+    // ID3v2 maps no dedicated `Year` item, so this is where lofty's own
+    // `set_year` put it before 0.25 removed that method.
+    tag.insert_text(lofty::tag::ItemKey::RecordingDate, "2020".to_string());
     tag.set_track(u32::try_from(i % 100).unwrap_or(0));
     tag.save_to_path(path, WriteOptions::default())
         .expect("save id3 tag");

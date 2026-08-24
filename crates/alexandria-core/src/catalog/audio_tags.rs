@@ -14,6 +14,33 @@ pub struct AudioTags {
     pub track: Option<i64>,
 }
 
+/// The year `lofty::tag::Accessor::year()` used to return.
+///
+/// lofty 0.25 dropped that convenience: "year" is ambiguous between a
+/// dedicated `Year` item, which few formats map, and the year part of a
+/// `RecordingDate`, which most of them do. Reimplemented here rather than
+/// replaced with a single key read, so the catalog records exactly what it
+/// has always recorded — prefer `Year`, fall back to `RecordingDate`, and
+/// take the first four leading ASCII digits of whichever answered.
+///
+/// That last rule is what makes `1983` and `1983-04-01` both read as 1983,
+/// tolerates leading whitespace, and makes anything with fewer than four
+/// leading digits read as nothing at all rather than as a truncated year.
+fn year_of(tag: &lofty::tag::Tag) -> Option<u32> {
+    let raw = tag
+        .get_string(lofty::tag::ItemKey::Year)
+        .or_else(|| tag.get_string(lofty::tag::ItemKey::RecordingDate))?;
+    let (digits, year) = raw
+        .chars()
+        .skip_while(|c| c.is_whitespace())
+        .take_while(char::is_ascii_digit)
+        .take(4)
+        .fold((0usize, 0u32), |(digits, year), c| {
+            (digits + 1, year * 10 + c.to_digit(10).expect("ascii digit"))
+        });
+    (digits == 4).then_some(year)
+}
+
 impl AudioTags {
     /// `None` when every field is `None` — nothing worth writing, so the
     /// caller skips the `update_metadata` call entirely.
@@ -92,7 +119,7 @@ impl LoftyAudioMetadataReader {
                 .album()
                 .map(|s| s.to_string())
                 .filter(|s| !s.trim().is_empty()),
-            year: tag.year().map(i64::from),
+            year: year_of(tag).map(i64::from),
             genre: tag
                 .genre()
                 .map(|s| s.to_string())
@@ -186,7 +213,10 @@ mod tests {
         tag.set_artist("Test Artist".to_string());
         tag.set_album("Test Album".to_string());
         tag.set_genre("Test Genre".to_string());
-        tag.set_year(2020);
+        // What `set_year` did for an ID3v2 tag: that format maps no dedicated
+        // `Year` item, so the year goes to `RecordingDate`, which is where
+        // `year_of` falls back to reading it.
+        tag.insert_text(lofty::tag::ItemKey::RecordingDate, "2020".to_string());
         tag.set_track(7);
         tag.save_to_path(path, WriteOptions::default())
             .expect("save tag");
@@ -236,7 +266,10 @@ mod tests {
         tag.set_artist("   ".to_string());
         tag.set_album(String::new());
         tag.set_genre(String::new());
-        tag.set_year(2021);
+        // What `set_year` did for an ID3v2 tag: that format maps no dedicated
+        // `Year` item, so the year goes to `RecordingDate`, which is where
+        // `year_of` falls back to reading it.
+        tag.insert_text(lofty::tag::ItemKey::RecordingDate, "2021".to_string());
         tag.save_to_path(path, WriteOptions::default())
             .expect("save tag");
     }
