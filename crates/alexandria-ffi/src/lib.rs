@@ -94,7 +94,7 @@ fn authenticated(services: &Services, token: &str) -> bool {
 /// Result of starting an index run. `run_id` is a NUL-terminated UUID string
 /// on success (empty on failure).
 ///
-/// Shared with `alexandria_index_resume` (UC-42), which reuses this same
+/// Shared with `alexandria_index_resume` (UC-48), which reuses this same
 /// struct shape for a call that is not starting anything new. That reuse
 /// changes what `status` means: from `alexandria_index_start` and
 /// `alexandria_index_refresh_start` it is one of the `INDEX_ERR_*`
@@ -310,7 +310,7 @@ pub extern "C" fn alexandria_index_start(
                 // Per-file failures are counted inside `execute`; an `Err`
                 // here means the run could not start at all. `execute` has
                 // already written the `failed` run record on its own error
-                // path (UC-42), so the failure is recorded, not lost. This
+                // path (UC-48), so the failure is recorded, not lost. This
                 // log line is for the operator.
                 if let Err(err) = handler.execute(&root, run_id).await {
                     tracing::error!(%run_id, error = %err, "index run aborted");
@@ -359,7 +359,7 @@ pub extern "C" fn alexandria_index_refresh_start(
                 // Per-file failures are counted inside `execute`; an `Err`
                 // here means the run could not start at all. `execute` has
                 // already written the `failed` run record on its own error
-                // path (UC-42), so the failure is recorded, not lost. This
+                // path (UC-48), so the failure is recorded, not lost. This
                 // log line is for the operator.
                 if let Err(err) = handler.execute(run_id).await {
                     tracing::error!(%run_id, error = %err, "re-index run aborted");
@@ -3777,7 +3777,7 @@ pub extern "C" fn alexandria_settings_json(token: *const c_char) -> SettingsJson
     }
 }
 
-/// FFI status codes returned by run-status operations (UC-42 / FR-FC-28).
+/// FFI status codes returned by run-status operations (UC-42, UC-48 / FR-FC-28, FR-FC-32 … FR-FC-35).
 /// Deliberately separate from `INDEX_*`, `FILE_*`, `COLLECTION_*`, `PLAYBACK_*`,
 /// and `AUTH_*` — per the convention established above — so this surface can
 /// grow independently; `RUN_OK == INDEX_OK == 0` by convention.
@@ -3788,7 +3788,7 @@ pub const RUN_ERR_NOT_INITIALIZED: c_int = 3;
 pub const RUN_ERR_NOT_FOUND: c_int = 4;
 /// The run exists but is not in a state the requested verb permits — pausing
 /// a run that is not `running`, or resuming one that is not `paused`
-/// (`DomainError::InvalidState`, UC-42 Task 11). Distinct from
+/// (`DomainError::InvalidState`, UC-48). Distinct from
 /// `RUN_ERR_OTHER` for the same reason `FILE_ERR_INVALID_STATE` and
 /// `COLLECTION_ERR_INVALID_STATE` are distinct from their own catch-alls: a
 /// caller retrying a transient failure and a caller that asked for an
@@ -3894,7 +3894,7 @@ pub extern "C" fn alexandria_index_run_status_json(
 }
 
 /// Pause a running index or re-index run where it stands, leaving it
-/// resumable (UC-42 / FR-FC-28). `run_id` is the id `alexandria_index_start`
+/// resumable (UC-48 / FR-FC-32). `run_id` is the id `alexandria_index_start`
 /// or `alexandria_index_refresh_start` returned; `token` is the bearer auth
 /// token. Calls the same `RunControlHandler::pause` the HTTP route (Task 12)
 /// calls.
@@ -3934,7 +3934,7 @@ pub extern "C" fn alexandria_index_pause(run_id: *const c_char, token: *const c_
     }
 }
 
-/// Abandon a running or paused index or re-index run (UC-42 / FR-FC-28).
+/// Abandon a running or paused index or re-index run (UC-48 / FR-FC-34).
 /// Terminal — a cancelled run is never resumed. `run_id` is the id
 /// `alexandria_index_start` or `alexandria_index_refresh_start` returned;
 /// `token` is the bearer auth token. Calls the same
@@ -3974,7 +3974,7 @@ pub extern "C" fn alexandria_index_cancel(run_id: *const c_char, token: *const c
     }
 }
 
-/// Put a paused index or re-index run back to work (UC-42 / FR-FC-28).
+/// Put a paused index or re-index run back to work (UC-48 / FR-FC-33).
 /// `run_id` is the id `alexandria_index_start` or `alexandria_index_refresh_start`
 /// returned; `token` is the bearer auth token. Returns the *same* `run_id` on
 /// success — a resume does not mint a fresh run, it continues the one it was
@@ -4069,7 +4069,7 @@ pub extern "C" fn alexandria_index_resume(
                 // Same shape as `alexandria_index_start`'s own spawn: an
                 // `Err` here means the run could not resume at all;
                 // `execute` has already written its own terminal row on that
-                // path (UC-42), so the failure is recorded, not lost.
+                // path (UC-48), so the failure is recorded, not lost.
                 if let Err(err) = handler.execute(&root, spawned_run_id).await {
                     tracing::error!(run_id = %spawned_run_id, error = %err, "resumed index run aborted");
                 }
@@ -4091,7 +4091,7 @@ pub extern "C" fn alexandria_index_resume(
 
 /// Every outstanding (`running` or `paused`) index and re-index run at once,
 /// each with live progress overlaid exactly as `alexandria_index_run_status_json`
-/// overlays a single run (UC-42 / FR-FC-28). `token` is the bearer auth
+/// overlays a single run (UC-42 / FR-FC-35). `token` is the bearer auth
 /// token. On success `json` is a NUL-terminated JSON array of `CatalogRun`
 /// bodies, newest first — byte-for-byte the same shape the HTTP
 /// `GET /v1/index/runs?status=active` route (Task 12) returns (FR-FC-24 / NFR-09).

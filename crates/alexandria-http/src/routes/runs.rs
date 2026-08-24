@@ -46,7 +46,7 @@ pub async fn run_status(
 }
 
 /// `POST /v1/index/runs/{runId}/pause` — stop a running run where it stands,
-/// leaving it resumable (UC-42 / FR-FC-28). Calls the same
+/// leaving it resumable (UC-48 / FR-FC-32). Calls the same
 /// `RunControlHandler::pause` `alexandria_index_pause` (FFI, Task 11) calls.
 ///
 /// Returns `200` on success, `400` (the path segment is not a uuid), `401`
@@ -73,7 +73,7 @@ pub async fn pause_run(
 }
 
 /// `POST /v1/index/runs/{runId}/cancel` — abandon a running or paused run
-/// (UC-42 / FR-FC-28). Terminal — a cancelled run is never resumed. Calls the
+/// (UC-48 / FR-FC-34). Terminal — a cancelled run is never resumed. Calls the
 /// same `RunControlHandler::cancel` `alexandria_index_cancel` (FFI, Task 11)
 /// calls.
 ///
@@ -114,7 +114,7 @@ pub struct ResumeBody {
 }
 
 /// `POST /v1/index/runs/{runId}/resume` — put a paused run back to work
-/// (UC-42 / FR-FC-28). Answers `202` with the *same* run id it was given —
+/// (UC-48 / FR-FC-33). Answers `202` with the *same* run id it was given —
 /// matching how `POST /v1/index` and `POST /v1/index/refresh` answer a fresh
 /// start, because a resume does not mint a new run, it continues the one it
 /// was given (the same parity `alexandria_index_resume`, FFI Task 11,
@@ -189,7 +189,7 @@ pub async fn resume_run(
             tokio::spawn(async move {
                 // Same shape as `index()`'s own spawn: an `Err` here means
                 // the run could not resume at all; `execute` has already
-                // written its own terminal row on that path (UC-42), so the
+                // written its own terminal row on that path (UC-48), so the
                 // failure is recorded, not lost.
                 if let Err(err) = handler.execute(&root, spawned_run_id).await {
                     tracing::error!(run_id = %spawned_run_id, error = %err, "resumed index run aborted");
@@ -215,7 +215,7 @@ pub async fn resume_run(
     ))
 }
 
-/// Query-string parameters for `GET /v1/index/runs` (UC-42 / FR-FC-28).
+/// Query-string parameters for `GET /v1/index/runs` (UC-42 / FR-FC-35).
 #[derive(Debug, Default, Deserialize)]
 pub struct RunListParams {
     #[serde(default)]
@@ -251,7 +251,7 @@ fn parse_status(status: Option<&str>) -> Result<(), ApiError> {
 /// `GET /v1/index/runs?status=active` — every outstanding (`running` or
 /// `paused`) index and re-index run at once, newest first, each with live
 /// progress overlaid exactly as `GET /v1/index/runs/{runId}` overlays a
-/// single run (UC-42 / FR-FC-28). Calls the same
+/// single run (UC-42 / FR-FC-35). Calls the same
 /// `GetActiveRunsHandler::list` `alexandria_index_runs_active_json` (FFI,
 /// Task 11) calls — byte-for-byte the same body shape on both surfaces
 /// (FR-FC-24 / NFR-09).

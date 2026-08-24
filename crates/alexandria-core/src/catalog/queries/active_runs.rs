@@ -5,7 +5,7 @@ use crate::catalog::run_registry::RunRegistry;
 use crate::catalog::runs::{CatalogRun, CatalogRunRepository};
 use crate::errors::DomainError;
 
-/// UC-42 — Query every outstanding run at once (FR-FC-28).
+/// UC-42 — Query every outstanding run at once (FR-FC-35).
 ///
 /// `GetRunStatusHandler` answers "what became of *this* run," which is fine
 /// when a caller already holds a run id. Two things the front end needs
