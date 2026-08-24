@@ -59,7 +59,9 @@ already on disk, without re-encoding, duplicating, or relocating the files.
   manipulation. The API manages metadata, names, organization, and (for text)
   content; it does not transform media.
 - No duplicating or relocating source files — files stay on disk where they are.
-  The API stores metadata plus a path/content-hash reference, never the bytes.
+  The API stores metadata plus a path, never the bytes. Change detection is the
+  size and modification time the directory entry already carries (FR-FC-09,
+  FR-FC-10); a content hash is recorded only where a text edit computes one.
 - No automatic removal of files from disk. Deletion of a catalog record never
   touches the on-disk file unless the user runs a separate, explicit purge.
 - No self-issued authentication for the external mode. When external auth is

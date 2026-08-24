@@ -8,7 +8,7 @@ relocating them. The domain logic lives in a reusable Rust core library exposed
 over both an HTTP/REST-JSON API and a Flutter FFI surface, so any client in any
 language can drive it and the Flutter desktop front-end can call it in-process.
 
-> Single-user. Metadata + path/content-hash only. No complex media editing.
+> Single-user. Metadata + path only, never the bytes. No complex media editing.
 > Two-phase soft/hard deletion. Pluggable auth (external JWT, local encrypted
 > login, **or** the Windows account the server process runs as).
 
@@ -24,7 +24,7 @@ its open/closed state, so the tables stay in sync with the board automatically.
 | Milestone | Scope | Progress |
 | --- | --- | :---: |
 | [F-00 Foundation & operations](https://github.com/artur-rios/alexandria-api/milestone/1) | Scaffold, config, migrations, health, settings | 3 / 3 |
-| [F-01 File indexing](https://github.com/artur-rios/alexandria-api/milestone/2) | UC-01 … UC-02, UC-42 | 2 / 3 |
+| [F-01 File indexing](https://github.com/artur-rios/alexandria-api/milestone/2) | UC-01 … UC-02, UC-42, UC-48 | 3 / 3 |
 | [F-02 Catalog browsing & metadata editing](https://github.com/artur-rios/alexandria-api/milestone/3) | UC-03 … UC-04 | 2 / 2 |
 | [F-03 Renaming & lifecycle management](https://github.com/artur-rios/alexandria-api/milestone/4) | UC-05 … UC-09 | 5 / 5 |
 | [F-04 Text file content editing](https://github.com/artur-rios/alexandria-api/milestone/5) | UC-32 … UC-33 | 2 / 2 |
@@ -32,9 +32,9 @@ its open/closed state, so the tables stay in sync with the board automatically.
 | [F-06 Bookmarks](https://github.com/artur-rios/alexandria-api/milestone/7) | UC-15 … UC-19 | 5 / 5 |
 | [F-07 Watchlists](https://github.com/artur-rios/alexandria-api/milestone/8) | UC-20 … UC-25 | 6 / 6 |
 | [F-08 Reading lists](https://github.com/artur-rios/alexandria-api/milestone/9) | UC-26 … UC-31 | 6 / 6 |
-| [F-09 Pluggable authentication](https://github.com/artur-rios/alexandria-api/milestone/10) | UC-34 … UC-36, UC-41 | 3 / 4 |
+| [F-09 Pluggable authentication](https://github.com/artur-rios/alexandria-api/milestone/10) | UC-34 … UC-36, UC-41 | 4 / 4 |
 | [F-10 Media playback](https://github.com/artur-rios/alexandria-api/milestone/11) | UC-38 … UC-40 | 3 / 3 |
-| **Total** | | **43 / 45** |
+| **Total** | | **45 / 45** |
 
 ### F-00 — Foundation & operations
 
@@ -48,14 +48,16 @@ Workspace scaffold, configuration, migrations, logging, and the health surface.
 
 ### F-01 — File indexing
 
-Discover on-disk files, classify them by type, hash their bytes, and keep the
-catalog current.
+Discover on-disk files, classify them by type, record the stat pair every
+directory entry already carries, and keep the catalog current — with each run
+observable, pausable, resumable, and cancellable while it walks.
 
 | Issue | Use case | Status | Title | Requirements |
 | --- | --- | :---: | --- | --- |
 | [#2](https://github.com/artur-rios/alexandria-api/issues/2) | UC-01 | &#9745; | Index library files | FR-FC-01 … FR-FC-09, FR-FC-24 |
 | [#3](https://github.com/artur-rios/alexandria-api/issues/3) | UC-02 | &#9745; | Re-index and refresh the catalog | FR-FC-08, FR-FC-10, FR-FC-11, FR-FC-24 |
-| [#99](https://github.com/artur-rios/alexandria-api/issues/99) | UC-42 | &#9744; | Query an index or refresh run | FR-FC-24, FR-FC-27, FR-FC-28, FR-FC-29 |
+| [#99](https://github.com/artur-rios/alexandria-api/issues/99) | UC-42 | &#9745; | Query an index or refresh run | FR-FC-24, FR-FC-27, FR-FC-28, FR-FC-29, FR-FC-35 |
+| — | UC-48 | &#9745; | Pause, resume, or cancel an index run | FR-FC-24, FR-FC-27, FR-FC-29, FR-FC-31 … FR-FC-34 |
 
 ### F-02 — Catalog browsing & metadata editing
 
@@ -148,7 +150,7 @@ Windows account the server process runs as.
 | [#35](https://github.com/artur-rios/alexandria-api/issues/35) | UC-34 | &#9745; | Local login | FR-AU-01, FR-AU-04, FR-AU-07, FR-AU-08 |
 | [#36](https://github.com/artur-rios/alexandria-api/issues/36) | UC-35 | &#9745; | Set or change local login credentials | FR-AU-05, FR-AU-06, FR-AU-07, FR-AU-08, FR-AU-11 |
 | [#37](https://github.com/artur-rios/alexandria-api/issues/37) | UC-36 | &#9745; | Authenticate via Heimdall JWT | FR-AU-01, FR-AU-02, FR-AU-03, FR-AU-07, FR-AU-08 |
-| [#96](https://github.com/artur-rios/alexandria-api/issues/96) | UC-41 | &#9744; | Register the local account | FR-AU-10, FR-AU-11, FR-AU-13, FR-AU-19 |
+| [#96](https://github.com/artur-rios/alexandria-api/issues/96) | UC-41 | &#9745; | Register the local account | FR-AU-10, FR-AU-11, FR-AU-13, FR-AU-19 |
 | — | UC-43 | &#9745; | Redeem a recovery code | FR-AU-11, FR-AU-14, FR-AU-15, FR-AU-16 |
 | — | UC-44 | &#9745; | Regenerate recovery codes | FR-AU-17, FR-AU-19 |
 | — | UC-45 | &#9745; | Log in with the Windows account | FR-AU-20, FR-AU-22 |
@@ -208,7 +210,8 @@ alexandria-api/
 ├── config.toml.example
 ├── docs/
 │   ├── initial/               # informal docs (Project Overview, Stack, Workflow, Business Rules)
-│   └── requirements/         # formal specs (Vision, SRD, Use Cases, …)
+│   ├── requirements/          # formal specs (Vision, SRD, Use Cases, …)
+│   └── System Behavior Document.md   # how the running system behaves, with diagrams
 ├── tools/
 └── README.md
 ```
@@ -435,11 +438,20 @@ The workspace enforces `#![deny(unsafe_code)]` in every crate.
 
 ## Running
 
-Configuration is read from `config.toml` at startup, with any key overridable
-through an `ALEXANDRIA_*` environment variable. See [`config.toml.example`](config.toml.example)
-for the full list (auth mode and session TTL, HTTP bind address, SQLite path,
-filesystem root — which both feeds the health probe and bounds what indexing
-may reach — indexing concurrency, soft-delete retention, log level).
+Configuration is read from `config.toml` at startup, with every key overridable
+through an environment variable named `ALEXANDRIA_<SECTION>_<KEY>` —
+`ALEXANDRIA_HTTP_PORT`, `ALEXANDRIA_AUTH_MODE`, `ALEXANDRIA_LOGGING_LEVEL`. The
+rule has no exceptions. See [`config.toml.example`](config.toml.example) for the
+full list (auth mode and session TTL, HTTP bind address, SQLite path, filesystem
+root — which both feeds the health probe and bounds what indexing may reach —
+indexing concurrency, soft-delete retention, log level).
+
+> Two configuration changes landed together while the project is pre-release,
+> and both fail quietly rather than loudly. The log level's override is now
+> `ALEXANDRIA_LOGGING_LEVEL`; `ALEXANDRIA_LOG_LEVEL` is no longer read, so a
+> shell profile still exporting it leaves the level at its default. And
+> `auth.local_db` is gone — nothing ever read it — so a `config.toml` still
+> carrying it parses fine, because unknown keys are ignored.
 
 ```bash
 # 1. Create a local config from the example
@@ -586,9 +598,16 @@ The full specification set lives under [`docs/`](docs/):
 
 - Informal: [`docs/initial/`](docs/initial/) — Project Overview, Technology Stack, Workflow, Business Rules.
 - Formal: [`docs/requirements/`](docs/requirements/) — Vision, System Requirements, Use Case Specification, Development Workflow, Testing Specification, Operations & Infrastructure, Technology Stack.
+- Behavior: [`docs/System Behavior Document.md`](docs/System%20Behavior%20Document.md) — how the running system actually behaves, with diagrams: startup, the request path, the indexing and run-control machinery, playback and byte streaming, the deletion lifecycle, and the three authentication modes.
 
-These are the source of truth the issues trace into. Reading order for a new
-contributor: `docs/initial/Project Overview.md` → `docs/requirements/Vision Document.md` → `docs/requirements/Use Case Specification Document.md`.
+The requirements documents say what the system *shall* do and are the source of
+truth the issues trace into; the behavior document says what it *does*. Where
+the two disagree, one of them is a bug.
+
+Reading order for a new contributor: `docs/initial/Project Overview.md` →
+`docs/requirements/Vision Document.md` →
+`docs/requirements/Use Case Specification Document.md` →
+`docs/System Behavior Document.md`.
 
 ## Legal details
 

@@ -27,8 +27,10 @@ SQLite as the embedded, primary database for catalog metadata, folder
 structure, bookmarks, watchlists, and deletion state. The design is open to
 additional databases later if a need arises; SQLite is the starting point.
 
-The API stores **only metadata and a path/content-hash reference**, never file
-bytes. Markdown and text file content is edited in place on disk.
+The API stores **only metadata and a path**, never file bytes. Indexing reads no
+bytes to identify a file: size and modification time are the change signal
+(FR-FC-09, FR-FC-10). Markdown and text file content is edited in place on
+disk, and that write is the one thing that records a content hash (FR-TX-03).
 
 ## Data Access
 

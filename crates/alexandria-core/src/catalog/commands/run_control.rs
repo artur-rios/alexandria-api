@@ -7,7 +7,7 @@ use crate::catalog::runs::{CatalogRunRepository, RunKind, RunPriority, RunStatus
 use crate::errors::DomainError;
 use crate::retry::{retry_on_busy, BUSY_ATTEMPTS};
 
-/// Pause or cancel an index or re-index run in flight (UC-42).
+/// Pause or cancel an index or re-index run in flight (UC-48).
 ///
 /// A run answers immediately with an id and then walks a library for minutes
 /// (FR-FC-08). Until now the only way to stop one was to stop the process.
@@ -47,7 +47,7 @@ pub struct RunControlHandler<A, RR, C> {
     low_priority_concurrency: u32,
 }
 
-/// What a caller needs to put a resumed run back to work (UC-42).
+/// What a caller needs to put a resumed run back to work (UC-48).
 ///
 /// `resume` records the state change and hands this back rather than spawning
 /// anything, mirroring how `start` and `execute` are already separated: the

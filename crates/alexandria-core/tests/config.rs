@@ -56,7 +56,6 @@ fn given_example_config_when_parsed_then_defaults_and_overrides_match_spec() {
     let toml = r#"
 [auth]
 mode = "local"
-local_db = true
 session_ttl_hours = 12
 
 [http]
@@ -81,7 +80,6 @@ level = "debug"
     let settings: Settings = toml::from_str(toml).unwrap();
 
     assert_eq!(settings.auth.mode, AuthMode::Local);
-    assert!(settings.auth.local_db);
     assert_eq!(settings.auth.session_ttl_hours, 12);
     assert_eq!(settings.http.bind_addr, "127.0.0.1");
     assert_eq!(settings.http.port, 9090);

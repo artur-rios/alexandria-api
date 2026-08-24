@@ -120,8 +120,6 @@ pub struct AuthSettings {
     /// for the same reason as `heimdall_issuer`.
     #[serde(default)]
     pub heimdall_audience: String,
-    #[serde(default)]
-    pub local_db: bool,
     /// How long a session created by local login (UC-34) stays valid.
     #[serde(default = "default_session_ttl_hours")]
     pub session_ttl_hours: u32,
@@ -152,7 +150,6 @@ impl Default for AuthSettings {
             heimdall_scope_id: String::new(),
             heimdall_issuer: String::new(),
             heimdall_audience: String::new(),
-            local_db: false,
             session_ttl_hours: default_session_ttl_hours(),
             windows_owner_sid: String::new(),
         }
@@ -490,7 +487,7 @@ impl Settings {
                 self.deletion.retention_days = parsed;
             }
         }
-        if let Ok(level) = env::var("ALEXANDRIA_LOG_LEVEL") {
+        if let Ok(level) = env::var("ALEXANDRIA_LOGGING_LEVEL") {
             if let Ok(parsed) = match_log_level(&level) {
                 self.logging.level = parsed;
             }
