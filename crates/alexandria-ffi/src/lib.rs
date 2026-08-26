@@ -489,10 +489,11 @@ pub extern "C" fn alexandria_file_edit_metadata(
 /// Result of `alexandria_files_list` and `alexandria_file_get_by_uuid` (UC-03).
 /// On success `status` is `FILE_OK` and `json` is a NUL-terminated JSON string
 /// — byte-for-byte the same shape HTTP returns from `GET /v1/files` (a JSON
-/// array of `File` records) or `GET /v1/files/{uuid}` (a `FileView` object),
-/// so the FFI and HTTP surfaces agree modulo key ordering (parity, FR-FC-24 /
-/// NFR-09). On failure `json` is NULL and `status` carries the mapped error
-/// code. The caller must free `json` with `alexandria_free_string`.
+/// array of `FileView` objects, issue #116) or `GET /v1/files/{uuid}` (a
+/// single `FileView` object), so the FFI and HTTP surfaces agree modulo key
+/// ordering (parity, FR-FC-24 / NFR-09). On failure `json` is NULL and
+/// `status` carries the mapped error code. The caller must free `json` with
+/// `alexandria_free_string`.
 #[repr(C)]
 #[derive(Debug)]
 pub struct FileJsonResult {
@@ -599,9 +600,11 @@ impl FilesListFilter {
 /// `json_filters` is a JSON string `{"type":"audio","state":"all"}` (empty
 /// string or NULL for defaults). The function deserializes it, calls the same
 /// `BrowseFilesHandler` the HTTP route uses, and on success serializes the
-/// returned `Vec<File>` back to a JSON array — so the FFI and HTTP surfaces
-/// agree byte-for-byte modulo key ordering (parity, FR-FC-24 / NFR-09).
-/// `token` is the bearer auth token.
+/// returned `Vec<FileView>` back to a JSON array — each element the same
+/// `{"file": …, "metadata": …, …}` shape `alexandria_file_get_by_uuid`
+/// answers for one file (issue #116) — so the FFI and HTTP surfaces agree
+/// byte-for-byte modulo key ordering (parity, FR-FC-24 / NFR-09). `token` is
+/// the bearer auth token.
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
 pub extern "C" fn alexandria_files_list(

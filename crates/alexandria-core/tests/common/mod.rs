@@ -31,7 +31,7 @@ use alexandria_core::catalog::document_tags::{DocumentMetadataReader, DocumentTa
 use alexandria_core::catalog::fs::{FileEntry, FileStat, Filesystem};
 use alexandria_core::catalog::image_tags::{ImageMetadataReader, ImageTags};
 use alexandria_core::catalog::model::{
-    File, FileState, FileType, NewFile, StateFilter, SubtypeMetadata,
+    File, FileState, FileType, FileView, NewFile, StateFilter, SubtypeMetadata,
 };
 use alexandria_core::catalog::repos::CatalogRepository;
 use alexandria_core::catalog::run_registry::{RunPhase, RunProgress};
@@ -382,6 +382,65 @@ impl CatalogRepository for FakeCatalogRepository {
             .collect();
         out.sort_by(|a, b| a.path.cmp(&b.path));
         Ok(out)
+    }
+
+    /// Assembles each `FileView` from the same in-memory maps
+    /// `get_by_uuid`'s per-field lookups would read for that file — the
+    /// fake has no queries to batch, so it just reuses `list_filtered`'s
+    /// selection and looks each file's own pieces up directly. The real
+    /// `SqliteCatalogRepository` batches these lookups per subtype table
+    /// (issue #116 §2); that claim is pinned by an integration test against
+    /// real SQLite, not by this fake, so this method only needs to answer
+    /// the right *shape*, not the right *query count*.
+    async fn list_filtered_view(
+        &self,
+        file_type: Option<FileType>,
+        state: StateFilter,
+        collection_uuid: Option<Uuid>,
+    ) -> Result<Vec<FileView>, DomainError> {
+        let files = self
+            .list_filtered(file_type, state, collection_uuid)
+            .await?;
+        let metadata = self.metadata.lock().unwrap();
+        let dimensions = self.dimensions.lock().unwrap();
+        let document_page_counts = self.document_page_counts.lock().unwrap();
+        let video_durations = self.video_durations.lock().unwrap();
+        let comic_page_counts = self.comic_page_counts.lock().unwrap();
+
+        Ok(files
+            .into_iter()
+            .map(|file| {
+                let uuid = file.uuid;
+                let (width, height) = match file.file_type {
+                    FileType::Image => dimensions
+                        .get(&uuid)
+                        .map(|(w, h)| (Some(*w), Some(*h)))
+                        .unwrap_or((None, None)),
+                    _ => (None, None),
+                };
+                let page_count = match file.file_type {
+                    FileType::Document => document_page_counts.get(&uuid).copied(),
+                    _ => None,
+                };
+                let duration_seconds = match file.file_type {
+                    FileType::Video => video_durations.get(&uuid).copied(),
+                    _ => None,
+                };
+                let comic_page_count = match file.file_type {
+                    FileType::Comic => comic_page_counts.get(&uuid).copied(),
+                    _ => None,
+                };
+                FileView {
+                    metadata: metadata.get(&uuid).cloned(),
+                    file,
+                    width,
+                    height,
+                    page_count,
+                    duration_seconds,
+                    comic_page_count,
+                }
+            })
+            .collect())
     }
 
     async fn find_metadata_by_uuid(
@@ -2742,6 +2801,15 @@ impl CatalogRepository for FailingCatalogRepository {
         _state: StateFilter,
         _collection_uuid: Option<Uuid>,
     ) -> Result<Vec<File>, DomainError> {
+        unimplemented!("not reached by the run-fails-to-list path")
+    }
+
+    async fn list_filtered_view(
+        &self,
+        _file_type: Option<FileType>,
+        _state: StateFilter,
+        _collection_uuid: Option<Uuid>,
+    ) -> Result<Vec<FileView>, DomainError> {
         unimplemented!("not reached by the run-fails-to-list path")
     }
 

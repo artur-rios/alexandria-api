@@ -14,7 +14,9 @@ use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
 use crate::auth::{AuthService, Principal};
-use crate::catalog::model::{File, FileState, FileType, NewFile, StateFilter, SubtypeMetadata};
+use crate::catalog::model::{
+    File, FileState, FileType, FileView, NewFile, StateFilter, SubtypeMetadata,
+};
 use crate::catalog::repos::CatalogRepository;
 use crate::config::AuthMode;
 use crate::errors::DomainError;
@@ -125,6 +127,15 @@ impl CatalogRepository for FakeRepo {
         _state: StateFilter,
         _collection_uuid: Option<Uuid>,
     ) -> Result<Vec<File>, DomainError> {
+        unimplemented!()
+    }
+
+    async fn list_filtered_view(
+        &self,
+        _file_type: Option<FileType>,
+        _state: StateFilter,
+        _collection_uuid: Option<Uuid>,
+    ) -> Result<Vec<FileView>, DomainError> {
         unimplemented!()
     }
 

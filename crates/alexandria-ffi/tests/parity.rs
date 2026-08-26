@@ -525,8 +525,8 @@ async fn given_a_freshly_indexed_file_when_hash_read_via_http_and_ffi_then_both_
         .as_array()
         .unwrap()
         .iter()
-        .find(|f| f["name"] == "song.mp3")
-        .expect("song.mp3 in http listing")["contentHash"]
+        .find(|f| f["file"]["name"] == "song.mp3")
+        .expect("song.mp3 in http listing")["file"]["contentHash"]
         .clone();
 
     // ---- FFI leg: the real alexandria_index_files_json accessor ----
@@ -1000,16 +1000,19 @@ async fn given_same_lib_when_files_listed_via_http_and_ffi_then_arrays_identical
 
     let norm = |v: serde_json::Value| -> Vec<(String, String, String)> {
         // (name, fileType, state) sorted by name — uuid/path/indexedAt are
-        // per-database and excluded from the parity comparison.
+        // per-database and excluded from the parity comparison. issue #116:
+        // the array now holds `FileView` objects (`{"file": …, "metadata":
+        // …}`), so the three fields live under `f["file"]`, not at the
+        // top level.
         let mut arr: Vec<(String, String, String)> = v
             .as_array()
             .unwrap()
             .iter()
             .map(|f| {
                 (
-                    f["name"].as_str().unwrap().to_string(),
-                    f["fileType"].as_str().unwrap().to_string(),
-                    f["state"].as_str().unwrap().to_string(),
+                    f["file"]["name"].as_str().unwrap().to_string(),
+                    f["file"]["fileType"].as_str().unwrap().to_string(),
+                    f["file"]["state"].as_str().unwrap().to_string(),
                 )
             })
             .collect();

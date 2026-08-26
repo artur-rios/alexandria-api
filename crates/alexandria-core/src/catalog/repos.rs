@@ -1,11 +1,26 @@
+use std::collections::HashMap;
+
 use chrono::{DateTime, Utc};
 use sqlx::sqlite::SqlitePool;
 use uuid::Uuid;
 
 use crate::catalog::model::{
-    File, FileState, FileType, FormatKind, MediaKind, NewFile, StateFilter, SubtypeMetadata,
+    File, FileState, FileType, FileView, FormatKind, MediaKind, NewFile, StateFilter,
+    SubtypeMetadata,
 };
 use crate::errors::{DomainError, WRITE_TX};
+
+/// The largest number of `?` placeholders one batched `WHERE file_id IN
+/// (…)` query binds (issue #116 §2). SQLite's compiled-in bound-parameter
+/// ceiling (`SQLITE_MAX_VARIABLE_NUMBER`) is 999 on the conservative
+/// builds still common in the wild and 32766 on builds compiled with
+/// SQLite's newer default; this crate does not control how the SQLite this
+/// binary links against was compiled, so `list_filtered_view` assumes the
+/// lower, older limit rather than the host's actual one. A batch is chunked
+/// at this size regardless of how many ids a listing produces, so the
+/// query count for one subtype stays a fixed handful of chunks rather than
+/// growing with the number of files.
+const MAX_SQLITE_PARAMS: usize = 900;
 
 /// Catalog repository port. The indexer depends on this trait so its decision
 /// logic (skip duplicates, insert) is unit-tested against an in-memory fake
@@ -79,6 +94,31 @@ pub trait CatalogRepository: Send + Sync {
         state: StateFilter,
         collection_uuid: Option<Uuid>,
     ) -> Result<Vec<File>, DomainError>;
+
+    /// List files filtered exactly as `list_filtered`, but answering the
+    /// full `FileView` record each row would carry from `get_by_uuid` —
+    /// the file, its subtype metadata, and the extracted scalars (issue
+    /// #116 / FR-FC-12).
+    ///
+    /// The obvious implementation calls the single-file assembly once per
+    /// row, moving the client's old N+1 into the core rather than removing
+    /// it. This does not: it runs the filtered query once, then issues one
+    /// further query per subtype table the result actually contains (never
+    /// per file), each pulling every matching row at once via `WHERE
+    /// file_id IN (…)` — chunked at `MAX_SQLITE_PARAMS` so a library larger
+    /// than SQLite's bound-parameter ceiling still succeeds instead of
+    /// failing the query — and stitches the rows back onto their files in
+    /// memory. A listing filtered to one type costs two queries (the files
+    /// query plus one subtype batch) whatever its size, or more only when
+    /// chunking splits that one batch across several `IN` lists; a mixed
+    /// listing costs one query per subtype present, bounded by the five
+    /// subtypes that carry `SubtypeMetadata` (Text/Html never register).
+    async fn list_filtered_view(
+        &self,
+        file_type: Option<FileType>,
+        state: StateFilter,
+        collection_uuid: Option<Uuid>,
+    ) -> Result<Vec<FileView>, DomainError>;
 
     /// Read the stored subtype metadata for the file identified by `uuid`
     /// (UC-03 single-file view / FR-FC-13). Returns `Ok(None)` when the file
@@ -261,6 +301,220 @@ impl SqliteCatalogRepository {
             FileType::Image => "DELETE FROM images WHERE file_id = ?",
         }
     }
+
+    /// Build a `column IN (?, ?, …)` placeholder list sized to `chunk`. Used
+    /// by the `batch_*` helpers below so each chunk of ids gets exactly as
+    /// many placeholders as it has elements — never more, which would bind
+    /// past the values given, and never fewer, which would drop ids.
+    fn in_placeholders(chunk: &[i64]) -> String {
+        std::iter::repeat_n("?", chunk.len())
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    /// Batch-fetch audio metadata for every id in `ids`, chunked at
+    /// `MAX_SQLITE_PARAMS` (issue #116 §2). An id with every editable field
+    /// `NULL` — the indexer inserts an empty subtype row for every file, so
+    /// a row existing is not enough — is omitted from the map rather than
+    /// mapped to an empty `SubtypeMetadata`, matching `find_metadata_by_uuid`.
+    /// An id with no `audio_files` row at all (should not happen while the
+    /// indexer keeps the two in lockstep, but the caller does not rely on
+    /// that) is likewise simply absent.
+    async fn batch_audio(&self, ids: &[i64]) -> Result<HashMap<i64, SubtypeMetadata>, DomainError> {
+        let mut out = HashMap::new();
+        for chunk in ids.chunks(MAX_SQLITE_PARAMS) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let sql = format!(
+                "SELECT file_id, title, artist, album, year, genre, track FROM audio_files \
+                 WHERE file_id IN ({})",
+                Self::in_placeholders(chunk)
+            );
+            let mut query = sqlx::query_as::<_, AudioBatchRow>(sqlx::AssertSqlSafe(sql));
+            for id in chunk {
+                query = query.bind(id);
+            }
+            let rows = query.fetch_all(&self.pool).await?;
+            for (file_id, title, artist, album, year, genre, track) in rows {
+                let all_none = title.is_none()
+                    && artist.is_none()
+                    && album.is_none()
+                    && year.is_none()
+                    && genre.is_none()
+                    && track.is_none();
+                if !all_none {
+                    out.insert(
+                        file_id,
+                        SubtypeMetadata::Audio {
+                            title,
+                            artist,
+                            album,
+                            year,
+                            genre,
+                            track,
+                        },
+                    );
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Batch-fetch video metadata and duration for every id in `ids`,
+    /// chunked at `MAX_SQLITE_PARAMS`. See `batch_audio` for the
+    /// all-`NULL`-means-absent rule; here it governs only the `metadata`
+    /// half of the pair — `duration_seconds` is reported as read, `NULL`
+    /// or not, exactly as `find_video_duration` does.
+    #[allow(clippy::type_complexity)]
+    async fn batch_video(
+        &self,
+        ids: &[i64],
+    ) -> Result<HashMap<i64, (Option<SubtypeMetadata>, Option<f64>)>, DomainError> {
+        let mut out = HashMap::new();
+        for chunk in ids.chunks(MAX_SQLITE_PARAMS) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let sql = format!(
+                "SELECT file_id, title, year, resolution, media_kind, duration_seconds \
+                 FROM video_files WHERE file_id IN ({})",
+                Self::in_placeholders(chunk)
+            );
+            let mut query = sqlx::query_as::<_, VideoBatchRow>(sqlx::AssertSqlSafe(sql));
+            for id in chunk {
+                query = query.bind(id);
+            }
+            let rows = query.fetch_all(&self.pool).await?;
+            for (file_id, title, year, resolution, media_kind, duration_seconds) in rows {
+                let all_none = title.is_none()
+                    && year.is_none()
+                    && resolution.is_none()
+                    && media_kind.is_none();
+                let metadata = (!all_none).then_some(SubtypeMetadata::Video {
+                    title,
+                    year,
+                    resolution,
+                    media_kind: media_kind.and_then(|m| MediaKind::parse(&m)),
+                });
+                out.insert(file_id, (metadata, duration_seconds));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Batch-fetch document metadata and page count for every id in `ids`,
+    /// chunked at `MAX_SQLITE_PARAMS`. See `batch_video` for the pairing
+    /// rule.
+    #[allow(clippy::type_complexity)]
+    async fn batch_document(
+        &self,
+        ids: &[i64],
+    ) -> Result<HashMap<i64, (Option<SubtypeMetadata>, Option<i64>)>, DomainError> {
+        let mut out = HashMap::new();
+        for chunk in ids.chunks(MAX_SQLITE_PARAMS) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let sql = format!(
+                "SELECT file_id, title, author, year, format_kind, page_count FROM documents \
+                 WHERE file_id IN ({})",
+                Self::in_placeholders(chunk)
+            );
+            let mut query = sqlx::query_as::<_, DocumentBatchRow>(sqlx::AssertSqlSafe(sql));
+            for id in chunk {
+                query = query.bind(id);
+            }
+            let rows = query.fetch_all(&self.pool).await?;
+            for (file_id, title, author, year, format_kind, page_count) in rows {
+                let all_none =
+                    title.is_none() && author.is_none() && year.is_none() && format_kind.is_none();
+                let metadata = (!all_none).then_some(SubtypeMetadata::Document {
+                    title,
+                    author,
+                    year,
+                    format_kind: format_kind.and_then(|f| FormatKind::parse(&f)),
+                });
+                out.insert(file_id, (metadata, page_count));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Batch-fetch comic metadata and page count for every id in `ids`,
+    /// chunked at `MAX_SQLITE_PARAMS`. See `batch_video` for the pairing
+    /// rule.
+    #[allow(clippy::type_complexity)]
+    async fn batch_comic(
+        &self,
+        ids: &[i64],
+    ) -> Result<HashMap<i64, (Option<SubtypeMetadata>, Option<i64>)>, DomainError> {
+        let mut out = HashMap::new();
+        for chunk in ids.chunks(MAX_SQLITE_PARAMS) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let sql = format!(
+                "SELECT file_id, title, series, issue_number, page_count FROM comic_books \
+                 WHERE file_id IN ({})",
+                Self::in_placeholders(chunk)
+            );
+            let mut query = sqlx::query_as::<_, ComicBatchRow>(sqlx::AssertSqlSafe(sql));
+            for id in chunk {
+                query = query.bind(id);
+            }
+            let rows = query.fetch_all(&self.pool).await?;
+            for (file_id, title, series, issue_number, page_count) in rows {
+                let all_none = title.is_none() && series.is_none() && issue_number.is_none();
+                let metadata = (!all_none).then_some(SubtypeMetadata::Comic {
+                    title,
+                    series,
+                    issue_number,
+                });
+                out.insert(file_id, (metadata, page_count));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Batch-fetch image metadata and pixel dimensions for every id in
+    /// `ids`, chunked at `MAX_SQLITE_PARAMS`. See `batch_video` for the
+    /// pairing rule; unlike the scalar pairs above, a dimension is only
+    /// reported when *both* `width` and `height` are set, matching
+    /// `find_image_dimensions`.
+    #[allow(clippy::type_complexity)]
+    async fn batch_image(
+        &self,
+        ids: &[i64],
+    ) -> Result<HashMap<i64, (Option<SubtypeMetadata>, Option<i64>, Option<i64>)>, DomainError>
+    {
+        let mut out = HashMap::new();
+        for chunk in ids.chunks(MAX_SQLITE_PARAMS) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let sql = format!(
+                "SELECT file_id, title, caption, width, height FROM images \
+                 WHERE file_id IN ({})",
+                Self::in_placeholders(chunk)
+            );
+            let mut query = sqlx::query_as::<_, ImageBatchRow>(sqlx::AssertSqlSafe(sql));
+            for id in chunk {
+                query = query.bind(id);
+            }
+            let rows = query.fetch_all(&self.pool).await?;
+            for (file_id, title, caption, width, height) in rows {
+                let all_none = title.is_none() && caption.is_none();
+                let metadata = (!all_none).then_some(SubtypeMetadata::Image { title, caption });
+                let (width, height) = match (width, height) {
+                    (Some(w), Some(h)) => (Some(w), Some(h)),
+                    _ => (None, None),
+                };
+                out.insert(file_id, (metadata, width, height));
+            }
+        }
+        Ok(out)
+    }
 }
 
 /// Parse the stored `type` discriminator. A value outside the enum means the
@@ -314,6 +568,73 @@ type VideoRow = (Option<String>, Option<i64>, Option<String>, Option<String>);
 type DocumentRow = (Option<String>, Option<String>, Option<i64>, Option<String>);
 type ComicRow = (Option<String>, Option<String>, Option<i64>);
 type ImageRow = (Option<String>, Option<String>);
+
+/// A `files` row as selected by `list_filtered_view`, in column order: the
+/// internal `id` (the subtype tables' join key, absent from `FileRow`),
+/// then every `FileRow` column. `list_filtered_view` needs the internal id
+/// to batch the subtype queries; the public `File` it builds from the rest
+/// never carries it.
+type FileRowWithId = (
+    i64,
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+    String,
+    Option<String>,
+    String,
+    Option<String>,
+    Option<i64>,
+    Option<String>,
+);
+
+/// The editable columns of each subtype row plus the type's own extracted
+/// scalar (see `FileView`'s field docs), as selected in one batched query by
+/// `list_filtered_view`'s per-type helpers — `find_metadata_by_uuid` and the
+/// `find_*` scalar getters fetch these two pieces separately because
+/// `get_by_uuid` only needs them for a single already-known file, but a
+/// batch fetching many rows at once has no reason to pay for a second
+/// query when both live in the same subtype table.
+type AudioBatchRow = (
+    i64,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<i64>,
+    Option<String>,
+    Option<i64>,
+);
+type VideoBatchRow = (
+    i64,
+    Option<String>,
+    Option<i64>,
+    Option<String>,
+    Option<String>,
+    Option<f64>,
+);
+type DocumentBatchRow = (
+    i64,
+    Option<String>,
+    Option<String>,
+    Option<i64>,
+    Option<String>,
+    Option<i64>,
+);
+type ComicBatchRow = (
+    i64,
+    Option<String>,
+    Option<String>,
+    Option<i64>,
+    Option<i64>,
+);
+type ImageBatchRow = (
+    i64,
+    Option<String>,
+    Option<String>,
+    Option<i64>,
+    Option<i64>,
+);
 
 impl CatalogRepository for SqliteCatalogRepository {
     async fn find_by_path(&self, path: &str) -> Result<Option<File>, DomainError> {
@@ -628,6 +949,180 @@ impl CatalogRepository for SqliteCatalogRepository {
 
         let rows = query.fetch_all(&self.pool).await?;
         rows.into_iter().map(parse_file_row).collect()
+    }
+
+    async fn list_filtered_view(
+        &self,
+        file_type: Option<FileType>,
+        state: StateFilter,
+        collection_uuid: Option<Uuid>,
+    ) -> Result<Vec<FileView>, DomainError> {
+        // Identical filter-building to `list_filtered`, with `id` selected
+        // alongside the public columns — the subtype batches below key on
+        // it, not on `uuid` (see `find_metadata_by_uuid`'s doc comment).
+        let base = "SELECT id, uuid, path, name, type, content_hash, state, deleted_at, \
+                    indexed_at, missing_at, size_bytes, mtime FROM files";
+        let mut sql = String::from(base);
+        let mut conj = " WHERE ";
+        if file_type.is_some() {
+            sql.push_str(conj);
+            sql.push_str("type = ?");
+            conj = " AND ";
+        }
+        match state {
+            StateFilter::Active => {
+                sql.push_str(conj);
+                sql.push_str("state = 'active'");
+                conj = " AND ";
+            }
+            StateFilter::Deleted => {
+                sql.push_str(conj);
+                sql.push_str("state = 'deleted'");
+                conj = " AND ";
+            }
+            StateFilter::All => {}
+        }
+        if collection_uuid.is_some() {
+            sql.push_str(conj);
+            sql.push_str("collection_id = (SELECT id FROM collections WHERE uuid = ?)");
+        }
+        sql.push_str(" ORDER BY path");
+
+        // See `list_filtered`'s matching comment: `sql` is assembled only
+        // from string literals chosen by the enum/Option parameters above.
+        let query = sqlx::query_as::<_, FileRowWithId>(sqlx::AssertSqlSafe(sql));
+        let query = match file_type {
+            Some(t) => query.bind(t.as_str()),
+            None => query,
+        };
+        let query = match collection_uuid {
+            Some(u) => query.bind(u.to_string()),
+            None => query,
+        };
+
+        // Query 1: the files themselves.
+        let rows = query.fetch_all(&self.pool).await?;
+        let files: Vec<(i64, File)> = rows
+            .into_iter()
+            .map(|row| {
+                let id = row.0;
+                let file_row: FileRow = (
+                    row.1, row.2, row.3, row.4, row.5, row.6, row.7, row.8, row.9, row.10, row.11,
+                );
+                parse_file_row(file_row).map(|file| (id, file))
+            })
+            .collect::<Result<_, _>>()?;
+
+        // Group the internal ids by subtype, so each subtype table the
+        // result actually contains is queried exactly once (chunking
+        // aside) rather than once per file (issue #116 §2).
+        let mut audio_ids = Vec::new();
+        let mut video_ids = Vec::new();
+        let mut document_ids = Vec::new();
+        let mut comic_ids = Vec::new();
+        let mut image_ids = Vec::new();
+        for (id, file) in &files {
+            match file.file_type {
+                FileType::Audio => audio_ids.push(*id),
+                FileType::Video => video_ids.push(*id),
+                FileType::Document => document_ids.push(*id),
+                FileType::Comic => comic_ids.push(*id),
+                FileType::Image => image_ids.push(*id),
+                // Text and Html carry no SubtypeMetadata variant and no
+                // extracted scalar — nothing to batch (UC-04).
+                FileType::Text | FileType::Html => {}
+            }
+        }
+
+        // Queries 2..N: one batch per subtype present, each chunked at
+        // `MAX_SQLITE_PARAMS`. A listing of a single type touches exactly
+        // one of these five branches.
+        let audio = self.batch_audio(&audio_ids).await?;
+        let video = self.batch_video(&video_ids).await?;
+        let document = self.batch_document(&document_ids).await?;
+        let comic = self.batch_comic(&comic_ids).await?;
+        let image = self.batch_image(&image_ids).await?;
+
+        // Stitch each file to its own batch's row in memory. A missing
+        // entry (subtype row never written, or — for Text/Html — no batch
+        // ran at all) means every `FileView` field beyond `file` stays
+        // `None`, matching `get_by_uuid`'s "absent, not failing" contract.
+        let views = files
+            .into_iter()
+            .map(|(id, file)| match file.file_type {
+                FileType::Audio => FileView {
+                    file,
+                    metadata: audio.get(&id).cloned(),
+                    width: None,
+                    height: None,
+                    page_count: None,
+                    duration_seconds: None,
+                    comic_page_count: None,
+                },
+                FileType::Video => {
+                    let (metadata, duration_seconds) =
+                        video.get(&id).cloned().unwrap_or((None, None));
+                    FileView {
+                        file,
+                        metadata,
+                        width: None,
+                        height: None,
+                        page_count: None,
+                        duration_seconds,
+                        comic_page_count: None,
+                    }
+                }
+                FileType::Document => {
+                    let (metadata, page_count) = document.get(&id).cloned().unwrap_or((None, None));
+                    FileView {
+                        file,
+                        metadata,
+                        width: None,
+                        height: None,
+                        page_count,
+                        duration_seconds: None,
+                        comic_page_count: None,
+                    }
+                }
+                FileType::Comic => {
+                    let (metadata, comic_page_count) =
+                        comic.get(&id).cloned().unwrap_or((None, None));
+                    FileView {
+                        file,
+                        metadata,
+                        width: None,
+                        height: None,
+                        page_count: None,
+                        duration_seconds: None,
+                        comic_page_count,
+                    }
+                }
+                FileType::Image => {
+                    let (metadata, width, height) =
+                        image.get(&id).cloned().unwrap_or((None, None, None));
+                    FileView {
+                        file,
+                        metadata,
+                        width,
+                        height,
+                        page_count: None,
+                        duration_seconds: None,
+                        comic_page_count: None,
+                    }
+                }
+                FileType::Text | FileType::Html => FileView {
+                    file,
+                    metadata: None,
+                    width: None,
+                    height: None,
+                    page_count: None,
+                    duration_seconds: None,
+                    comic_page_count: None,
+                },
+            })
+            .collect();
+
+        Ok(views)
     }
 
     async fn find_metadata_by_uuid(

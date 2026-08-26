@@ -1,7 +1,7 @@
 use uuid::Uuid;
 
 use crate::auth::AuthService;
-use crate::catalog::model::{File, FileType, FileView, StateFilter};
+use crate::catalog::model::{FileType, FileView, StateFilter};
 use crate::catalog::repos::CatalogRepository;
 use crate::errors::DomainError;
 
@@ -48,11 +48,16 @@ impl FileFilter {
 /// Browse and view file metadata (UC-03 / FR-FC-12, FR-FC-13).
 ///
 /// `list` authenticates the caller (AF-02), applies the filter, and returns
-/// the matching files. The default state filter is `Active` — soft-deleted
-/// records are excluded unless the owner explicitly requests them (main-flow
-/// step 2). `get_by_uuid` authenticates the caller, looks up a single file by
-/// its public UUID (AF-01 when absent), and returns the file plus its stored
-/// subtype metadata when the subtype has one.
+/// the matching files as `FileView` records — the same shape `get_by_uuid`
+/// answers for one file (issue #116), assembled by the repository's batched
+/// `list_filtered_view` rather than one `get_by_uuid`-equivalent call per
+/// row (`BrowseFilesHandler` itself does no per-row fan-out; see that
+/// method's doc comment for the batching). The default state filter is
+/// `Active` — soft-deleted records are excluded unless the owner explicitly
+/// requests them (main-flow step 2). `get_by_uuid` authenticates the caller,
+/// looks up a single file by its public UUID (AF-01 when absent), and
+/// returns the file plus its stored subtype metadata when the subtype has
+/// one.
 ///
 /// Generic over the auth service and catalog repository so the same decision
 /// logic is unit-tested against trait fakes (no real DB or auth service in
@@ -73,13 +78,19 @@ where
         Self { auth, repo }
     }
 
-    /// List files matching `filter`. The default filter excludes
-    /// soft-deleted records (UC-03 main-flow step 2).
-    pub async fn list(&self, filter: FileFilter, token: &str) -> Result<Vec<File>, DomainError> {
+    /// List files matching `filter`, each answered as the full `FileView`
+    /// record `get_by_uuid` would answer for it (issue #116 / FR-FC-12).
+    /// The default filter excludes soft-deleted records (UC-03 main-flow
+    /// step 2).
+    pub async fn list(
+        &self,
+        filter: FileFilter,
+        token: &str,
+    ) -> Result<Vec<FileView>, DomainError> {
         // AF-02: the caller must be authenticated.
         self.auth.authenticate(token).await?;
         self.repo
-            .list_filtered(filter.file_type, filter.state, filter.collection_uuid)
+            .list_filtered_view(filter.file_type, filter.state, filter.collection_uuid)
             .await
     }
 

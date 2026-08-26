@@ -562,7 +562,7 @@ async fn given_indexed_files_when_get_files_then_200_array_excluding_deleted_by_
     let arr = body.as_array().expect("array");
     assert_eq!(arr.len(), 2);
     // Ordered by path; both are active.
-    assert!(arr.iter().all(|f| f["state"] == "active"));
+    assert!(arr.iter().all(|f| f["file"]["state"] == "active"));
 }
 
 #[tokio::test]
@@ -580,7 +580,7 @@ async fn given_indexed_files_when_get_files_with_type_filter_then_only_matching_
         serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
     let arr = body.as_array().expect("array");
     assert_eq!(arr.len(), 1);
-    assert_eq!(arr[0]["fileType"], "audio");
+    assert_eq!(arr[0]["file"]["fileType"], "audio");
 }
 
 #[tokio::test]
@@ -651,7 +651,7 @@ async fn given_indexed_files_when_get_files_with_collection_filter_then_only_lin
         serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
     let arr = body.as_array().expect("array");
     assert_eq!(arr.len(), 1);
-    assert_eq!(arr[0]["uuid"], a_uuid);
+    assert_eq!(arr[0]["file"]["uuid"], a_uuid);
 }
 
 #[tokio::test]
@@ -772,8 +772,8 @@ async fn given_deleted_file_when_get_files_state_deleted_then_only_deleted_retur
         serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
     let arr = body.as_array().unwrap();
     assert_eq!(arr.len(), 1);
-    assert_eq!(arr[0]["state"], "deleted");
-    assert_eq!(arr[0]["name"], "a.mp3");
+    assert_eq!(arr[0]["file"]["state"], "deleted");
+    assert_eq!(arr[0]["file"]["name"], "a.mp3");
 }
 
 #[tokio::test]
@@ -796,6 +796,61 @@ async fn given_deleted_file_when_get_files_state_all_then_both_returned() {
     let body: Value =
         serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
     assert_eq!(body.as_array().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn given_indexed_audio_file_with_metadata_when_get_files_then_array_element_carries_it() {
+    // issue #116 / FR-FC-12: `GET /v1/files` answers the same `FileView`
+    // shape `GET /v1/files/{uuid}` answers for one file — each element of
+    // the array carries the file's stored subtype metadata, not just the
+    // bare `File` record.
+    let lib = tempdir().unwrap();
+    let test = test_app().await;
+    index_library(&lib, &test.pool, &[("song.mp3", b"x")]).await;
+    let uuid = uuid_for_name(&test.pool, "song.mp3").await;
+    sqlx::query(
+        "UPDATE audio_files SET title='T', artist='A', album=NULL, year=2001, genre=NULL, \
+         track=NULL FROM files WHERE audio_files.file_id = files.id AND files.uuid = ?",
+    )
+    .bind(&uuid)
+    .execute(&test.pool)
+    .await
+    .expect("audio metadata");
+
+    let response = app(Settings::default(), test.services)
+        .oneshot(get_files("/v1/files"))
+        .await
+        .expect("list one-shot");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let arr = body.as_array().expect("array");
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["file"]["uuid"], uuid);
+    assert_eq!(arr[0]["metadata"]["type"], "audio");
+    assert_eq!(arr[0]["metadata"]["title"], "T");
+    assert_eq!(arr[0]["metadata"]["artist"], "A");
+}
+
+#[tokio::test]
+async fn given_indexed_text_file_when_get_files_then_array_element_metadata_is_null() {
+    // Text has no editable SubtypeMetadata variant (UC-04); the listing
+    // must reflect that as `null`, the same as GET /v1/files/{uuid} does,
+    // rather than omitting the key or failing.
+    let lib = tempdir().unwrap();
+    let test = test_app().await;
+    index_library(&lib, &test.pool, &[("notes.md", b"# h")]).await;
+
+    let response = app(Settings::default(), test.services)
+        .oneshot(get_files("/v1/files"))
+        .await
+        .expect("list one-shot");
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let arr = body.as_array().expect("array");
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["file"]["fileType"], "text");
+    assert!(arr[0]["metadata"].is_null());
 }
 
 #[tokio::test]

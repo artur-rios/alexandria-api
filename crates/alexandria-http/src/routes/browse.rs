@@ -5,7 +5,7 @@ use axum::Json;
 use serde::Deserialize;
 use uuid::Uuid;
 
-use alexandria_core::catalog::model::{File, FileType, FileView, StateFilter};
+use alexandria_core::catalog::model::{FileType, FileView, StateFilter};
 use alexandria_core::catalog::queries::browse::FileFilter;
 
 use crate::middleware::auth::invalid_input;
@@ -47,14 +47,17 @@ fn parse_state(s: Option<&str>) -> Result<StateFilter, ApiError> {
 }
 
 /// `GET /v1/files` — list/query files by type and lifecycle state (UC-03 /
-/// FR-FC-12). Returns `200` with a JSON array of `File` records. Soft-deleted
-/// records are excluded by default unless `state=deleted` or `state=all` is
-/// requested. The collection filter is deferred until Collections land.
+/// FR-FC-12). Returns `200` with a JSON array of `FileView` records — the
+/// same shape `GET /v1/files/{uuid}` returns for one file (issue #116): the
+/// `File`, its `SubtypeMetadata`, and the extracted scalars, assembled by
+/// `BrowseFilesHandler::list` via the repository's batched query rather than
+/// one detail lookup per row. Soft-deleted records are excluded by default
+/// unless `state=deleted` or `state=all` is requested.
 pub async fn list_files(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(params): Query<FileListParams>,
-) -> Result<Json<Vec<File>>, ApiError> {
+) -> Result<Json<Vec<FileView>>, ApiError> {
     let token = bearer_token(&headers);
 
     let mut filter = FileFilter::new().with_state(parse_state(params.state.as_deref())?);
