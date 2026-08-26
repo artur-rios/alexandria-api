@@ -1254,7 +1254,7 @@ UC-36's externally issued JWT.
 | AF-01 | The file's type has no thumbnail (text, HTML page, or document), or is an audio File with no embedded picture | The system rejects with an invalid-input error. |
 | AF-02 | The file UUID does not exist | The system responds with a not-found error. |
 | AF-03 | The file is soft-deleted | The system rejects with an invalid-state error (restore via UC-07 first). |
-| AF-04 | The file is marked missing on disk, or its bytes cannot be read or decoded | The system responds with a disk-error. |
+| AF-04 | The file is marked missing on disk, or its bytes cannot be read or decoded — for audio, this includes a file that cannot be opened or parsed as audio at all (missing at request time despite being marked present, corrupt, or an unsupported format such as `.wma`), told apart from AF-01's "parsed fine, but carries no picture" | The system responds with a disk-error. |
 | AF-05 | The caller is not authenticated | The system denies with an unauthorized error. |
 
 ---

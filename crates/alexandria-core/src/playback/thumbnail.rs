@@ -6,7 +6,7 @@ use serde::Serialize;
 use uuid::Uuid;
 
 use crate::auth::AuthService;
-use crate::catalog::audio_tags::CoverArtReader;
+use crate::catalog::audio_tags::{CoverArtRead, CoverArtReader};
 use crate::catalog::model::FileType;
 use crate::catalog::repos::CatalogRepository;
 use crate::errors::DomainError;
@@ -163,17 +163,34 @@ where
                 // cached by the same uuid-and-mtime key every other arm
                 // uses.
                 //
-                // A file that embeds no picture at all — or one `lofty`
-                // cannot parse — is `InvalidInput` in the same shape the
-                // SVG and `.cbr` rejections above use: "not supported for
-                // this file", which a caller can act on, rather than a
-                // decoder error it cannot.
-                let picture = self.cover.read(&file.path).await.ok_or_else(|| {
-                    DomainError::InvalidInput(format!("file {uuid} has no embedded cover art"))
-                })?;
-                self.renderer
-                    .from_image_bytes(&picture, THUMBNAIL_MAX_DIM)
-                    .await?
+                // `CoverArtRead` tells apart the two ways this can come back
+                // empty (see its own doc comment): a file that parsed fine
+                // but simply has no picture is `InvalidInput`, the same
+                // shape the SVG and `.cbr` rejections above use — "not
+                // supported for this file", which a caller can act on. A
+                // file that could not be read or parsed as audio at all is
+                // `Disk`, the same classification a video that will not
+                // decode already gets — the file itself is the problem, and
+                // telling an owner whose file has gone missing that it "has
+                // no cover art" would point them at the wrong one (issue
+                // #117 review).
+                match self.cover.read(&file.path).await {
+                    CoverArtRead::Found(picture) => {
+                        self.renderer
+                            .from_image_bytes(&picture, THUMBNAIL_MAX_DIM)
+                            .await?
+                    }
+                    CoverArtRead::NoPicture => {
+                        return Err(DomainError::InvalidInput(format!(
+                            "file {uuid} has no embedded cover art"
+                        )))
+                    }
+                    CoverArtRead::Unreadable => {
+                        return Err(DomainError::disk(format!(
+                            "file {uuid} could not be read as audio"
+                        )))
+                    }
+                }
             }
             _ => {
                 return Err(DomainError::InvalidInput(format!(
@@ -489,14 +506,14 @@ mod tests {
         }
     }
 
-    /// Cover-art fake: hands back a fixed answer and records every path it
-    /// was asked to read, so a test can assert both what the handler did
-    /// with the result *and* whether the reader was consulted at all — the
-    /// auth/state/type guards that run earlier must short-circuit before
-    /// this is ever reached.
+    /// Cover-art fake: hands back a fixed [`CoverArtRead`] and records every
+    /// path it was asked to read, so a test can assert both what the
+    /// handler did with the result *and* whether the reader was consulted
+    /// at all — the auth/state/type guards that run earlier must
+    /// short-circuit before this is ever reached.
     #[derive(Clone)]
     struct FakeCoverArt {
-        picture: Option<Vec<u8>>,
+        outcome: CoverArtRead,
         calls: Arc<Mutex<Vec<String>>>,
     }
 
@@ -505,23 +522,32 @@ mod tests {
         /// in this module, which never expects `cover` to be consulted.
         fn none() -> Self {
             Self {
-                picture: None,
+                outcome: CoverArtRead::NoPicture,
                 calls: Arc::new(Mutex::new(Vec::new())),
             }
         }
 
         fn with_picture(picture: Vec<u8>) -> Self {
             Self {
-                picture: Some(picture),
+                outcome: CoverArtRead::Found(picture),
+                calls: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        /// The file could not be read or parsed as audio at all — distinct
+        /// from `none()`'s "parsed fine, no picture" (issue #117 review).
+        fn unreadable() -> Self {
+            Self {
+                outcome: CoverArtRead::Unreadable,
                 calls: Arc::new(Mutex::new(Vec::new())),
             }
         }
     }
 
     impl CoverArtReader for FakeCoverArt {
-        async fn read(&self, path: &str) -> Option<Vec<u8>> {
+        async fn read(&self, path: &str) -> CoverArtRead {
             self.calls.lock().unwrap().push(path.to_string());
-            self.picture.clone()
+            self.outcome.clone()
         }
     }
 
@@ -1009,9 +1035,7 @@ mod tests {
 
     #[tokio::test]
     async fn given_audio_with_no_cover_art_when_thumbnailed_then_invalid_input() {
-        // Arrange — the reader found no embedded picture (or could not parse
-        // the file at all; the handler cannot tell them apart, and does not
-        // need to).
+        // Arrange — the reader parsed the file fine but found no picture.
         let repo = FakeRepo::with_file(a_file(
             "/lib/song.mp3",
             FileType::Audio,
@@ -1034,6 +1058,37 @@ mod tests {
 
         // Assert
         assert!(matches!(result, Err(DomainError::InvalidInput(_))));
+    }
+
+    #[tokio::test]
+    async fn given_unreadable_audio_when_thumbnailed_then_disk_error() {
+        // Arrange — the reader could not open or parse the file at all
+        // (missing, corrupt, or an unsupported format). This must be told
+        // apart from "no cover art": an owner whose file has actually gone
+        // missing should not be told the problem is a missing picture
+        // (issue #117 review).
+        let repo = FakeRepo::with_file(a_file(
+            "/lib/song.mp3",
+            FileType::Audio,
+            FileState::Active,
+            None,
+        ));
+        let handler = ThumbnailHandler::new(
+            FakeAuth { good: "t" },
+            repo,
+            FakeArchive,
+            FakeRenderer {
+                calls: Arc::new(Mutex::new(Vec::new())),
+            },
+            FakeCache::new(Arc::new(Mutex::new(Vec::new()))),
+            FakeCoverArt::unreadable(),
+        );
+
+        // Act
+        let result = handler.thumbnail(Uuid::nil(), "t").await;
+
+        // Assert
+        assert!(matches!(result, Err(DomainError::Disk(_))));
     }
 
     #[tokio::test]

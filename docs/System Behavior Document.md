@@ -808,9 +808,18 @@ than letting them re-sniff the bytes.
 CBZ, or a page out of range is a `400`.
 
 **`GET /v1/files/{uuid}/thumbnail`** returns a downscaled JPEG for a video, image,
-or comic (`FR-MP-05`). A type with no thumbnail is a `400`. SVG is rejected
-explicitly: it is vector, the raster decoder cannot read it, and rasterizing it
-would mean a new dependency.
+comic, or audio File (`FR-MP-05`). A type with no thumbnail is a `400`. SVG is
+rejected explicitly: it is vector, the raster decoder cannot read it, and
+rasterizing it would mean a new dependency.
+
+For audio, the thumbnail is the picture the file's own tag calls the front
+cover (or, failing that, whichever picture the tag lists first). An audio File
+that parses fine but carries no picture at all is a `400`, the same "not
+supported for this file" shape SVG and non-CBZ comics get. An audio File that
+cannot be read or parsed as audio at all — missing on disk, corrupt, or a
+format `lofty` does not support (`.wma`) — is a `500` disk error instead: it is
+told apart from "no picture" deliberately, so an owner is never pointed at the
+wrong problem.
 
 The thumbnail cache is keyed on **uuid and mtime**, not on a content hash —
 hashing a multi-gigabyte video to decide whether its thumbnail is stale would

@@ -344,9 +344,11 @@ async fn given_audio_with_cover_art_when_thumbnailed_then_jpeg_returned() {
         "image/jpeg"
     );
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-    // `ImageThumbnailRenderer::encode` returns a source already inside the
-    // box untouched — the 4x4 fixture never needs downscaling — so the
-    // response decodes to a valid JPEG rather than to any particular size.
+    // `ImageThumbnailRenderer::encode` re-encodes every source through its
+    // own `JpegEncoder`, never enlarging one already inside the box — the
+    // 4x4 fixture never needs downscaling, but the bytes are still a fresh
+    // re-encode, not the original picture bytes untouched. So the assertion
+    // is "decodes to a valid JPEG," not "matches the source byte for byte."
     image::load_from_memory(&body).expect("valid jpeg");
 }
 
@@ -371,12 +373,19 @@ async fn given_audio_with_no_cover_art_when_thumbnailed_then_bad_request() {
 }
 
 #[tokio::test]
-async fn given_audio_thumbnail_requested_twice_then_second_call_is_cached() {
-    // Arrange — the same caching behaviour every other thumbnailable type
-    // gets (Testing Specification's own audio-thumbnail requirement).
+async fn given_audio_thumbnail_requested_twice_then_second_call_reads_from_cache() {
+    // Arrange — same shape as the image cache test above, but proved the
+    // hard way rather than by name alone: rendering is deterministic, so
+    // two calls returning equal bytes does not by itself show the cache was
+    // *consulted* (Testing Specification section 3's unit/integration split
+    // still lets a cache-miss path produce the identical bytes). Deleting
+    // the source file between the two requests removes that ambiguity — a
+    // second call that still succeeds with the first call's exact bytes can
+    // only have come from the cache, since `LoftyCoverArtReader` can no
+    // longer read anything from the now-missing file.
     let lib = tempdir().unwrap();
     let cover = common::jpeg_bytes_for("cached-cover");
-    write_audio_with_cover_art(&lib, "song.wav", &cover);
+    let track = write_audio_with_cover_art(&lib, "song.wav", &cover);
     let cache_dir = tempdir().unwrap();
     let (_test, router, uuid) = index_one(&lib, cache_dir.path()).await;
 
@@ -386,19 +395,29 @@ async fn given_audio_thumbnail_requested_twice_then_second_call_is_cached() {
         .oneshot(thumbnail_request(&uuid))
         .await
         .expect("one-shot");
+    assert_eq!(first_response.status(), StatusCode::OK);
     let first = to_bytes(first_response.into_body(), usize::MAX)
         .await
         .unwrap();
     let cached_files_after_first = common::count_dir_entries(cache_dir.path());
+
+    std::fs::remove_file(&track).expect("remove source audio file");
+
     let second_response = router
         .oneshot(thumbnail_request(&uuid))
         .await
         .expect("one-shot");
+
+    // Assert — a cache miss here would surface as a disk error (the source
+    // file is gone), not a repeat of the first call's bytes.
+    assert_eq!(
+        second_response.status(),
+        StatusCode::OK,
+        "a cache hit must not need the now-deleted source file"
+    );
     let second = to_bytes(second_response.into_body(), usize::MAX)
         .await
         .unwrap();
-
-    // Assert
     assert_eq!(first, second);
     assert_eq!(cached_files_after_first, 1);
 }
