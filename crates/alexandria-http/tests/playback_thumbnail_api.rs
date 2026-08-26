@@ -18,7 +18,10 @@ use axum::http::{Request, StatusCode};
 use tempfile::tempdir;
 use tower::ServiceExt;
 
-use crate::common::{file_rows_with_uuid, test_app_with_settings, wait_for_files};
+use crate::common::{
+    file_rows_with_uuid, test_app_with_settings, wait_for_files, write_audio_with_cover_art,
+    write_audio_without_cover_art,
+};
 
 fn settings_with_cache_dir(cache_dir: &std::path::Path) -> Settings {
     let mut settings = Settings::default();
@@ -285,7 +288,7 @@ async fn given_cbr_comic_when_thumbnailed_then_bad_request() {
 
 #[tokio::test]
 async fn given_document_when_thumbnailed_then_bad_request() {
-    // Arrange — FR-MP-05 covers video, image, and comic only.
+    // Arrange — FR-MP-05 covers video, image, comic, and audio only.
     let lib = tempdir().unwrap();
     common::write_file(&lib, "book.pdf", b"%PDF-1.4");
     let cache_dir = tempdir().unwrap();
@@ -310,4 +313,111 @@ async fn given_document_when_thumbnailed_then_bad_request() {
 
     // Assert
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+/// UC-40's fourth arm, issue #117: an audio file's thumbnail is the picture
+/// embedded in its own tag. A genuine tagged WAV, built at test time with
+/// `lofty` — the same crate that reads it back inside `ThumbnailHandler` —
+/// rather than a committed binary fixture nobody in the repository could
+/// otherwise read or regenerate.
+#[tokio::test]
+async fn given_audio_with_cover_art_when_thumbnailed_then_jpeg_returned() {
+    // Arrange — the embedded picture is itself a real, decodable JPEG, so
+    // the assertion below can decode the response the same way the SVG and
+    // format tests above decode theirs.
+    let lib = tempdir().unwrap();
+    let cover = common::jpeg_bytes_for("cover");
+    write_audio_with_cover_art(&lib, "song.wav", &cover);
+    let cache_dir = tempdir().unwrap();
+    let (_test, router, uuid) = index_one(&lib, cache_dir.path()).await;
+
+    // Act
+    let response = router
+        .oneshot(thumbnail_request(&uuid))
+        .await
+        .expect("one-shot");
+
+    // Assert
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get("content-type").unwrap(),
+        "image/jpeg"
+    );
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    // `ImageThumbnailRenderer::encode` re-encodes every source through its
+    // own `JpegEncoder`, never enlarging one already inside the box — the
+    // 4x4 fixture never needs downscaling, but the bytes are still a fresh
+    // re-encode, not the original picture bytes untouched. So the assertion
+    // is "decodes to a valid JPEG," not "matches the source byte for byte."
+    image::load_from_memory(&body).expect("valid jpeg");
+}
+
+#[tokio::test]
+async fn given_audio_with_no_cover_art_when_thumbnailed_then_bad_request() {
+    // Arrange — a genuinely untagged file, not merely one `lofty` fails to
+    // parse: this proves "the tag carries no picture" is refused the same
+    // way "the file has no tag at all" is.
+    let lib = tempdir().unwrap();
+    write_audio_without_cover_art(&lib, "no_cover.wav");
+    let cache_dir = tempdir().unwrap();
+    let (_test, router, uuid) = index_one(&lib, cache_dir.path()).await;
+
+    // Act
+    let response = router
+        .oneshot(thumbnail_request(&uuid))
+        .await
+        .expect("one-shot");
+
+    // Assert
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn given_audio_thumbnail_requested_twice_then_second_call_reads_from_cache() {
+    // Arrange — same shape as the image cache test above, but proved the
+    // hard way rather than by name alone: rendering is deterministic, so
+    // two calls returning equal bytes does not by itself show the cache was
+    // *consulted* (Testing Specification section 3's unit/integration split
+    // still lets a cache-miss path produce the identical bytes). Deleting
+    // the source file between the two requests removes that ambiguity — a
+    // second call that still succeeds with the first call's exact bytes can
+    // only have come from the cache, since `LoftyCoverArtReader` can no
+    // longer read anything from the now-missing file.
+    let lib = tempdir().unwrap();
+    let cover = common::jpeg_bytes_for("cached-cover");
+    let track = write_audio_with_cover_art(&lib, "song.wav", &cover);
+    let cache_dir = tempdir().unwrap();
+    let (_test, router, uuid) = index_one(&lib, cache_dir.path()).await;
+
+    // Act
+    let first_response = router
+        .clone()
+        .oneshot(thumbnail_request(&uuid))
+        .await
+        .expect("one-shot");
+    assert_eq!(first_response.status(), StatusCode::OK);
+    let first = to_bytes(first_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let cached_files_after_first = common::count_dir_entries(cache_dir.path());
+
+    std::fs::remove_file(&track).expect("remove source audio file");
+
+    let second_response = router
+        .oneshot(thumbnail_request(&uuid))
+        .await
+        .expect("one-shot");
+
+    // Assert — a cache miss here would surface as a disk error (the source
+    // file is gone), not a repeat of the first call's bytes.
+    assert_eq!(
+        second_response.status(),
+        StatusCode::OK,
+        "a cache hit must not need the now-deleted source file"
+    );
+    let second = to_bytes(second_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(first, second);
+    assert_eq!(cached_files_after_first, 1);
 }

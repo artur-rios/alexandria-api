@@ -10664,6 +10664,126 @@ async fn given_same_image_when_thumbnailed_then_bytes_identical_across_surfaces(
     assert_eq!(std::fs::read_dir(ffi_cache.path()).unwrap().count(), 1);
 }
 
+/// Write a real, front-cover-typed JPEG picture onto an ID3v2 tag and save
+/// it to `path`. Mirrors `write_test_tags` above; a separate helper because
+/// that one writes the six textual tag fields and nothing else.
+fn write_cover_art(path: &std::path::Path, jpeg: &[u8]) {
+    use lofty::config::WriteOptions;
+    use lofty::picture::{MimeType, Picture, PictureType};
+    use lofty::tag::{Tag, TagExt, TagType};
+
+    let mut tag = Tag::new(TagType::Id3v2);
+    let picture = Picture::unchecked(jpeg.to_vec())
+        .pic_type(PictureType::CoverFront)
+        .mime_type(MimeType::Jpeg)
+        .build();
+    tag.push_picture(picture);
+    tag.save_to_path(path, WriteOptions::default())
+        .expect("save cover art tag");
+}
+
+/// UC-40 parity, issue #117 - thumbnail the same tagged audio file over both
+/// transports and assert the JPEG bytes are identical, HTTP raw against FFI
+/// base64 (Testing Specification section 7.3, FR-MP-05, FR-MP-06, NFR-09).
+/// Shares its shape with the image thumbnail parity test above; the only
+/// difference is the fixture and the file's catalog type, which is seeded
+/// directly (`seed_file_at_path`) rather than produced by indexing, the same
+/// shortcut the audio-tag-extraction parity test above it takes.
+#[tokio::test]
+async fn given_same_audio_file_when_thumbnailed_then_bytes_identical_across_surfaces() {
+    // Arrange — each leg gets its own cache directory: the default is the
+    // relative path "thumbnails", which would land in the repository.
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+
+    let cover = jpeg_bytes_for("audio-cover");
+
+    let http_lib = tempdir().unwrap();
+    let http_track = http_lib.path().join("song.wav");
+    write_minimal_wav(&http_track);
+    write_cover_art(&http_track, &cover);
+    let http_track = http_track.to_str().unwrap().to_string();
+
+    let ffi_lib = tempdir().unwrap();
+    let ffi_track = ffi_lib.path().join("song.wav");
+    write_minimal_wav(&ffi_track);
+    write_cover_art(&ffi_track, &cover);
+    let ffi_track = ffi_track.to_str().unwrap().to_string();
+
+    let http_cache = tempdir().unwrap();
+    let http_dir = tempdir().unwrap();
+    let http_pool = migrate_database(&db_path(&http_dir, "http.sqlite"))
+        .await
+        .expect("http migrate");
+    seed_session(&http_pool, TEST_TOKEN).await;
+    let settings = playback_settings(&http_cache);
+    let http_services = std::sync::Arc::new(build_services(&settings, http_pool.clone()).await);
+    let http_uuid = seed_file_at_path(&http_pool, "audio", &http_track).await;
+
+    let ffi_cache = tempdir().unwrap();
+    let _thumbnail_cache_guard = ThumbnailCacheGuard::new(&ffi_cache);
+    let ffi_dir = tempdir().unwrap();
+    let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
+    let ffi_pool = migrate_database(&ffi_db).await.expect("ffi migrate");
+    let ffi_uuid = seed_file_at_path(&ffi_pool, "audio", &ffi_track).await;
+    ffi_pool.close().await;
+
+    // Act
+    let req = Request::builder()
+        .method("GET")
+        .uri(format!("/v1/files/{http_uuid}/thumbnail"))
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = app(settings.clone(), http_services)
+        .oneshot(req)
+        .await
+        .expect("http thumbnail");
+    assert_eq!(resp.status(), axum::http::StatusCode::OK);
+    let http_content_type = header_string(&resp, "content-type");
+    let http_body = to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap()
+        .to_vec();
+
+    let ffi_thumb: serde_json::Value = tokio::task::spawn_blocking(move || -> serde_json::Value {
+        let cdb = CString::new(ffi_db).unwrap();
+        assert_eq!(
+            alexandria_index_init(cdb.as_ptr()),
+            alexandria_ffi::INDEX_OK
+        );
+
+        let token = CString::new(TEST_TOKEN).unwrap();
+        let uuid_c = CString::new(ffi_uuid).unwrap();
+        let r = alexandria_file_thumbnail(uuid_c.as_ptr(), token.as_ptr());
+        assert_eq!(r.status, alexandria_ffi::PLAYBACK_OK, "ffi thumbnail");
+        assert!(!r.json.is_null());
+        let s = unsafe { CStr::from_ptr(r.json) }
+            .to_string_lossy()
+            .into_owned();
+        unsafe {
+            alexandria_free_string(r.json);
+        }
+        serde_json::from_str(&s).unwrap()
+    })
+    .await
+    .unwrap();
+
+    // Assert — both surfaces read the same embedded picture through the
+    // same `LoftyCoverArtReader`, so the JPEG bytes must agree exactly.
+    use base64::Engine;
+    let ffi_bytes = base64::engine::general_purpose::STANDARD
+        .decode(ffi_thumb["bytesBase64"].as_str().expect("bytesBase64"))
+        .expect("decode base64");
+    assert_eq!(ffi_bytes, http_body, "audio thumbnail bytes identical");
+    assert_eq!(ffi_thumb["mimeType"], http_content_type);
+    assert_eq!(ffi_thumb["mimeType"], "image/jpeg");
+    // The re-encoded thumbnail decodes back to the same 4x4 pixels the
+    // embedded cover was built from — the downscale-and-encode pipeline ran
+    // on the actual extracted picture, not on some other source.
+    let decoded = image::load_from_memory(&http_body).expect("valid jpeg");
+    assert_eq!((decoded.width(), decoded.height()), (4, 4));
+}
+
 /// Playback error parity - every row of F-10's error table decides the same
 /// way on both surfaces (Testing Specification section 7.3, FR-MP-06,
 /// NFR-09).

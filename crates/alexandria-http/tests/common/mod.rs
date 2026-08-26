@@ -304,6 +304,72 @@ pub fn write_mp4(
     path
 }
 
+/// Write a minimal valid single-channel 8-bit PCM WAV file — just enough of
+/// a real RIFF/WAVE container for `lofty` to recognize the format and accept
+/// a written tag. Mirrors the helper of the same name in `alexandria-core`'s
+/// `audio_tags` unit tests; duplicated rather than shared because that one
+/// is `#[cfg(test)]`-private to its own crate.
+fn write_minimal_wav(path: &std::path::Path) {
+    let sample_data: [u8; 8] = [0x80; 8];
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"RIFF");
+    bytes.extend_from_slice(&(36u32 + sample_data.len() as u32).to_le_bytes());
+    bytes.extend_from_slice(b"WAVE");
+    bytes.extend_from_slice(b"fmt ");
+    bytes.extend_from_slice(&16u32.to_le_bytes()); // fmt chunk size
+    bytes.extend_from_slice(&1u16.to_le_bytes()); // PCM
+    bytes.extend_from_slice(&1u16.to_le_bytes()); // mono
+    bytes.extend_from_slice(&8000u32.to_le_bytes()); // sample rate
+    bytes.extend_from_slice(&8000u32.to_le_bytes()); // byte rate
+    bytes.extend_from_slice(&1u16.to_le_bytes()); // block align
+    bytes.extend_from_slice(&8u16.to_le_bytes()); // bits per sample
+    bytes.extend_from_slice(b"data");
+    bytes.extend_from_slice(&(sample_data.len() as u32).to_le_bytes());
+    bytes.extend_from_slice(&sample_data);
+    std::fs::write(path, bytes).expect("write wav");
+}
+
+/// Write a real WAV audio file at `dir/name` carrying one embedded
+/// front-cover picture (`jpeg` bytes, straight from the caller — real JPEG
+/// bytes recommended, but `lofty::picture::Picture::unchecked` does not
+/// itself require it) in an ID3v2 tag. The extension the caller passes
+/// decides `FileType::Audio` classification the same way it does for any
+/// other library file — WAV rather than MP3 because it needs no encoder,
+/// only a fixed byte layout, matching `alexandria-core`'s own audio
+/// fixtures.
+pub fn write_audio_with_cover_art(
+    dir: &tempfile::TempDir,
+    name: &str,
+    jpeg: &[u8],
+) -> std::path::PathBuf {
+    use lofty::config::WriteOptions;
+    use lofty::picture::{MimeType, Picture, PictureType};
+    use lofty::tag::{Tag, TagExt, TagType};
+
+    let path = dir.path().join(name);
+    write_minimal_wav(&path);
+
+    let mut tag = Tag::new(TagType::Id3v2);
+    let picture = Picture::unchecked(jpeg.to_vec())
+        .pic_type(PictureType::CoverFront)
+        .mime_type(MimeType::Jpeg)
+        .build();
+    tag.push_picture(picture);
+    tag.save_to_path(&path, WriteOptions::default())
+        .expect("save cover art tag");
+
+    path
+}
+
+/// Write a real WAV audio file at `dir/name` with no embedded tag at all —
+/// the "genuinely no cover art" fixture, as distinct from one `lofty` fails
+/// to parse.
+pub fn write_audio_without_cover_art(dir: &tempfile::TempDir, name: &str) -> std::path::PathBuf {
+    let path = dir.path().join(name);
+    write_minimal_wav(&path);
+    path
+}
+
 /// Count entries in a directory, treating a missing directory as zero — the
 /// thumbnail cache directory does not exist until the first thumbnail is
 /// written.
