@@ -92,7 +92,7 @@ graph LR
 | FR-FC-09 | The system shall record, for each indexed file, its path, name, type, size in bytes, and last-modification time, all taken from the directory entry. Indexing shall not read the contents of the file for the purpose of identifying or fingerprinting it, and shall leave the File's content hash unset. Metadata extraction (FR-FC-25) reads only as much of a file as its own format demands, which is why the cost of a scan is set by the number of files in the library rather than by their total size (NFR-02). |
 | FR-FC-10 | The system shall, on re-index, compare each cataloged path's recorded size and modification time against the file now on disk, and shall treat a difference in either as a change. For a changed file the system shall store the new size and modification time, update `indexedAt`, and clear the File's stored content hash, so that a hash cannot outlive the bytes it described. Re-index shall read no file contents and shall compute no hash. A file whose size and modification time are both unchanged is recorded unchanged. |
 | FR-FC-11 | The system shall, on re-index, detect a path that no longer exists on disk and set the File's `missingAt` marker without deleting the record or changing its `state`. |
-| FR-FC-12 | The system shall list and query files filtered by type and lifecycle state. Filtering by containing collection is delivered with Collections (FR-CO-07), since no collection exists before then. |
+| FR-FC-12 | The system shall list and query files filtered by type and lifecycle state, answering each matching file as the same record its single-file lookup (FR-FC-13) would answer: the File plus its subtype metadata and extracted scalars. Filtering by containing collection is delivered with Collections (FR-CO-07), since no collection exists before then. |
 | FR-FC-13 | The system shall return a single file's metadata by its public UUID. |
 | FR-FC-14 | The system shall allow editing audio metadata (title, artist, album, year, genre, track). |
 | FR-FC-15 | The system shall allow editing video metadata (title, year, resolution; `mediaKind` movie/series). |
@@ -478,7 +478,7 @@ was given — a resume continues a run, it does not mint a new one.
 
 | Method | Path | Description | Requirement |
 | --- | --- | --- | --- |
-| GET | /v1/files | List/query files by type and state (collection filter ships with Collections). An unrecognised filter value is rejected as invalid input. | FR-FC-12 |
+| GET | /v1/files | List/query files by type and state (collection filter ships with Collections), each returned as the same record `GET /v1/files/{uuid}` answers for one file. An unrecognised filter value is rejected as invalid input. | FR-FC-12 |
 | GET | /v1/files/{uuid} | Get one file's metadata. | FR-FC-13 |
 | PATCH | /v1/files/{uuid}/metadata | Edit type-specific metadata. | FR-FC-14..18 |
 | POST | /v1/files/{uuid}/rename | Rename the file (and on-disk file). | FR-FC-19 |

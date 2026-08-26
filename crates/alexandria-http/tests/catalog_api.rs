@@ -562,7 +562,7 @@ async fn given_indexed_files_when_get_files_then_200_array_excluding_deleted_by_
     let arr = body.as_array().expect("array");
     assert_eq!(arr.len(), 2);
     // Ordered by path; both are active.
-    assert!(arr.iter().all(|f| f["state"] == "active"));
+    assert!(arr.iter().all(|f| f["file"]["state"] == "active"));
 }
 
 #[tokio::test]
@@ -580,7 +580,7 @@ async fn given_indexed_files_when_get_files_with_type_filter_then_only_matching_
         serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
     let arr = body.as_array().expect("array");
     assert_eq!(arr.len(), 1);
-    assert_eq!(arr[0]["fileType"], "audio");
+    assert_eq!(arr[0]["file"]["fileType"], "audio");
 }
 
 #[tokio::test]
@@ -651,7 +651,7 @@ async fn given_indexed_files_when_get_files_with_collection_filter_then_only_lin
         serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
     let arr = body.as_array().expect("array");
     assert_eq!(arr.len(), 1);
-    assert_eq!(arr[0]["uuid"], a_uuid);
+    assert_eq!(arr[0]["file"]["uuid"], a_uuid);
 }
 
 #[tokio::test]
@@ -772,8 +772,8 @@ async fn given_deleted_file_when_get_files_state_deleted_then_only_deleted_retur
         serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
     let arr = body.as_array().unwrap();
     assert_eq!(arr.len(), 1);
-    assert_eq!(arr[0]["state"], "deleted");
-    assert_eq!(arr[0]["name"], "a.mp3");
+    assert_eq!(arr[0]["file"]["state"], "deleted");
+    assert_eq!(arr[0]["file"]["name"], "a.mp3");
 }
 
 #[tokio::test]
@@ -796,6 +796,145 @@ async fn given_deleted_file_when_get_files_state_all_then_both_returned() {
     let body: Value =
         serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
     assert_eq!(body.as_array().unwrap().len(), 2);
+}
+
+/// issue #116 / FR-FC-12, code-review Finding 1: the five combined
+/// metadata+scalar batch `SELECT`s in `SqliteCatalogRepository::
+/// batch_{audio,video,document,comic,image}` are new code with hard-coded
+/// column names — `comic_books.page_count` even maps to a `FileView` field
+/// named `comicPageCount`, not `pageCount` (that name is document's) — and
+/// a wrong column name in any one of them is a 500 on every listing
+/// containing that type, caught by nothing until this test existed:
+/// `browse_batching.rs`'s SQLite integration tests only seed audio (plus
+/// one metadata-less video), the unit tests in `tests/catalog/browse.rs`
+/// go through a fake that serves scalars from in-memory maps rather than
+/// SQL, and the pre-existing single-type test here covered audio alone.
+/// This table drives all five metadata-bearing subtypes through the real
+/// batch queries, each asserting both the type's `metadata` and its own
+/// extracted-scalar field, so a wrong column name in any of the five
+/// fails here rather than in production.
+#[tokio::test]
+async fn given_each_metadata_bearing_type_when_get_files_then_element_carries_metadata_and_its_own_scalar(
+) {
+    struct Case {
+        file_name: &'static str,
+        update_sql: &'static str,
+        expected_type: &'static str,
+        assert_view: fn(&Value),
+    }
+
+    let cases = [
+        Case {
+            file_name: "song.mp3",
+            update_sql: "UPDATE audio_files SET title='Title', artist='Artist', album=NULL, \
+                          year=2001, genre=NULL, track=NULL \
+                          FROM files WHERE audio_files.file_id = files.id AND files.uuid = ?",
+            expected_type: "audio",
+            assert_view: |el| {
+                assert_eq!(el["metadata"]["type"], "audio");
+                assert_eq!(el["metadata"]["title"], "Title");
+                assert_eq!(el["metadata"]["artist"], "Artist");
+            },
+        },
+        Case {
+            file_name: "clip.mp4",
+            update_sql: "UPDATE video_files SET title='Clip', year=NULL, resolution='1080p', \
+                          media_kind='movie', duration_seconds=125.5 \
+                          FROM files WHERE video_files.file_id = files.id AND files.uuid = ?",
+            expected_type: "video",
+            assert_view: |el| {
+                assert_eq!(el["metadata"]["type"], "video");
+                assert_eq!(el["metadata"]["title"], "Clip");
+                assert_eq!(el["metadata"]["resolution"], "1080p");
+                assert_eq!(el["durationSeconds"], 125.5);
+            },
+        },
+        Case {
+            file_name: "book.pdf",
+            update_sql: "UPDATE documents SET title='Book', author='Author', year=NULL, \
+                          format_kind='book', page_count=42 \
+                          FROM files WHERE documents.file_id = files.id AND files.uuid = ?",
+            expected_type: "document",
+            assert_view: |el| {
+                assert_eq!(el["metadata"]["type"], "document");
+                assert_eq!(el["metadata"]["author"], "Author");
+                assert_eq!(el["pageCount"], 42);
+            },
+        },
+        Case {
+            file_name: "issue1.cbz",
+            update_sql: "UPDATE comic_books SET title='Issue', series='Series', \
+                          issue_number=1, page_count=24 \
+                          FROM files WHERE comic_books.file_id = files.id AND files.uuid = ?",
+            expected_type: "comic",
+            assert_view: |el| {
+                assert_eq!(el["metadata"]["type"], "comic");
+                assert_eq!(el["metadata"]["series"], "Series");
+                assert_eq!(el["comicPageCount"], 24);
+            },
+        },
+        Case {
+            file_name: "photo.jpg",
+            update_sql: "UPDATE images SET title='Photo', caption='Caption', width=800, \
+                          height=600 \
+                          FROM files WHERE images.file_id = files.id AND files.uuid = ?",
+            expected_type: "image",
+            assert_view: |el| {
+                assert_eq!(el["metadata"]["type"], "image");
+                assert_eq!(el["metadata"]["caption"], "Caption");
+                assert_eq!(el["width"], 800);
+                assert_eq!(el["height"], 600);
+            },
+        },
+    ];
+
+    for case in cases {
+        let lib = tempdir().unwrap();
+        let test = test_app().await;
+        index_library(&lib, &test.pool, &[(case.file_name, b"x")]).await;
+        let uuid = uuid_for_name(&test.pool, case.file_name).await;
+        sqlx::query(case.update_sql)
+            .bind(&uuid)
+            .execute(&test.pool)
+            .await
+            .unwrap_or_else(|e| panic!("{} metadata update: {e}", case.expected_type));
+
+        let response = app(Settings::default(), test.services)
+            .oneshot(get_files("/v1/files"))
+            .await
+            .expect("list one-shot");
+        assert_eq!(response.status(), StatusCode::OK, "{}", case.expected_type);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        let arr = body.as_array().expect("array");
+        assert_eq!(arr.len(), 1, "{}", case.expected_type);
+        let el = &arr[0];
+        assert_eq!(el["file"]["uuid"], uuid, "{}", case.expected_type);
+        assert_eq!(el["file"]["fileType"], case.expected_type);
+        (case.assert_view)(el);
+    }
+}
+
+#[tokio::test]
+async fn given_indexed_text_file_when_get_files_then_array_element_metadata_is_null() {
+    // Text has no editable SubtypeMetadata variant (UC-04); the listing
+    // must reflect that as `null`, the same as GET /v1/files/{uuid} does,
+    // rather than omitting the key or failing.
+    let lib = tempdir().unwrap();
+    let test = test_app().await;
+    index_library(&lib, &test.pool, &[("notes.md", b"# h")]).await;
+
+    let response = app(Settings::default(), test.services)
+        .oneshot(get_files("/v1/files"))
+        .await
+        .expect("list one-shot");
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let arr = body.as_array().expect("array");
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["file"]["fileType"], "text");
+    assert!(arr[0]["metadata"].is_null());
 }
 
 #[tokio::test]

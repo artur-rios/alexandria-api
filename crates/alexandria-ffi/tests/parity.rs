@@ -98,9 +98,12 @@ type AudioMetadataRow = (
     Option<i64>,
 );
 
-/// `(path, type, content_hash)` triples — the shape a `files` table is
-/// reduced to whenever the two legs' catalogs are compared.
-type FileTriples = Vec<(String, String, String)>;
+/// The shape a `GET /v1/files` / `alexandria_files_list` array is reduced
+/// to whenever the two legs' listings are compared: each `FileView`
+/// element as a `serde_json::Value`, stripped of its per-database fields
+/// (see `given_same_lib_when_files_listed_via_http_and_ffi_then_arrays_identical`'s
+/// `norm`).
+type FileViews = Vec<serde_json::Value>;
 
 /// `(path, name, type, content_hash, missing_at)` — `content_hash` and
 /// `missing_at` both nullable — the row shape UC-01/UC-02 parity tests
@@ -525,8 +528,8 @@ async fn given_a_freshly_indexed_file_when_hash_read_via_http_and_ffi_then_both_
         .as_array()
         .unwrap()
         .iter()
-        .find(|f| f["name"] == "song.mp3")
-        .expect("song.mp3 in http listing")["contentHash"]
+        .find(|f| f["file"]["name"] == "song.mp3")
+        .expect("song.mp3 in http listing")["file"]["contentHash"]
         .clone();
 
     // ---- FFI leg: the real alexandria_index_files_json accessor ----
@@ -948,10 +951,46 @@ async fn given_same_audio_file_when_metadata_edited_via_http_and_ffi_then_respon
     );
 }
 
+/// Strip the per-database fields (`uuid`/`path`/`indexedAt` differ between
+/// the two temp libraries and databases each leg indexes) from a listing's
+/// `FileView` elements and sort by name, so array order — both surfaces
+/// already order by path, but the two libs' paths differ — doesn't matter
+/// either. `mtime` is stripped too, for the same reason as `indexedAt`: it
+/// is the wall-clock time each leg's own `std::fs::write` happened to run
+/// at, not a value either transport derives — see the identical strip in
+/// `given_same_file_when_renamed_via_http_and_ffi_then_file_bodies_and_disk_state_identical`.
+/// Everything else, `metadata` and the extracted scalars included, is
+/// compared whole via `assert_eq!` rather than through a hand-picked tuple
+/// of fields: that stays correct automatically as `FileView` grows new
+/// fields, and it is the only way this test can actually exercise metadata
+/// parity (code-review Finding 2) rather than merely asserting two `null`s
+/// agree.
+fn norm(v: serde_json::Value) -> FileViews {
+    let mut arr: FileViews = v
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| {
+            let mut f = f.clone();
+            if let Some(file) = f.get_mut("file").and_then(|f| f.as_object_mut()) {
+                file.remove("uuid");
+                file.remove("path");
+                file.remove("indexedAt");
+                file.remove("mtime");
+            }
+            f
+        })
+        .collect();
+    arr.sort_by(|a, b| a["file"]["name"].as_str().cmp(&b["file"]["name"].as_str()));
+    arr
+}
+
 /// UC-03 parity — list files through both transports with identical filters
 /// and assert the returned JSON arrays agree (modulo the per-database values
-/// `uuid`, `path`, and `indexedAt`, which differ for each temp library)
-/// (Testing Specification §7.3, FR-FC-24).
+/// `uuid`, `path`, and `indexedAt`, which differ for each temp library),
+/// **including each element's `metadata` and extracted-scalar fields** —
+/// the whole point of issue #116 (Testing Specification §7.3, FR-FC-24,
+/// NFR-09).
 #[tokio::test]
 async fn given_same_lib_when_files_listed_via_http_and_ffi_then_arrays_identical() {
     let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
@@ -961,6 +1000,7 @@ async fn given_same_lib_when_files_listed_via_http_and_ffi_then_arrays_identical
     std::fs::write(http_lib.path().join("song.mp3"), b"audio").unwrap();
     std::fs::write(http_lib.path().join("notes.md"), b"# h").unwrap();
     std::fs::write(http_lib.path().join("clip.mkv"), b"video").unwrap();
+    std::fs::write(http_lib.path().join("photo.jpg"), b"image").unwrap();
 
     let http_dir = tempdir().unwrap();
     let http_db = db_path(&http_dir, "http.sqlite");
@@ -982,7 +1022,7 @@ async fn given_same_lib_when_files_listed_via_http_and_ffi_then_arrays_identical
         .oneshot(index_req)
         .await
         .expect("http index");
-    wait_for_http_files(&http_pool, 3).await;
+    wait_for_http_files(&http_pool, 4).await;
 
     // Soft-delete one record so we can exercise the default-excludes-deleted
     // behavior and the state=all filter on both surfaces.
@@ -998,26 +1038,37 @@ async fn given_same_lib_when_files_listed_via_http_and_ffi_then_arrays_identical
         .await
         .expect("soft-delete");
 
-    let norm = |v: serde_json::Value| -> Vec<(String, String, String)> {
-        // (name, fileType, state) sorted by name — uuid/path/indexedAt are
-        // per-database and excluded from the parity comparison.
-        let mut arr: Vec<(String, String, String)> = v
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|f| {
-                (
-                    f["name"].as_str().unwrap().to_string(),
-                    f["fileType"].as_str().unwrap().to_string(),
-                    f["state"].as_str().unwrap().to_string(),
-                )
-            })
-            .collect();
-        arr.sort();
-        arr
-    };
+    // Write real metadata to one audio and one image file on this leg — the
+    // way the UC-04 edit-metadata parity test does — so the comparison
+    // below actually exercises `metadata` and the extracted scalars rather
+    // than comparing two `null`s (code-review Finding 2: a vacuous parity
+    // assertion is worse than none, since it reads as coverage that isn't
+    // there).
+    sqlx::query(
+        "UPDATE audio_files SET title='Airbag', artist='Radiohead', album=NULL, year=1997, \
+         genre=NULL, track=NULL FROM files WHERE audio_files.file_id = files.id AND files.uuid = ?",
+    )
+    .bind(&del_uuid)
+    .execute(&http_pool)
+    .await
+    .expect("http audio metadata");
 
-    // Default filter (excludes deleted): HTTP returns notes.md + clip.mkv.
+    let (http_photo_uuid,): (String,) = sqlx::query_as("SELECT uuid FROM files WHERE name = ?")
+        .bind("photo.jpg")
+        .fetch_one(&http_pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE images SET title='Photo', caption='A photo', width=800, height=600 \
+         FROM files WHERE images.file_id = files.id AND files.uuid = ?",
+    )
+    .bind(&http_photo_uuid)
+    .execute(&http_pool)
+    .await
+    .expect("http image metadata");
+
+    // Default filter (excludes deleted): HTTP returns notes.md + clip.mkv +
+    // photo.jpg.
     let default_req = Request::builder()
         .method("GET")
         .uri("/v1/files")
@@ -1036,9 +1087,9 @@ async fn given_same_lib_when_files_listed_via_http_and_ffi_then_arrays_identical
     )
     .unwrap();
     let http_default_n = norm(http_default);
-    assert_eq!(http_default_n.len(), 2, "default excludes deleted (http)");
+    assert_eq!(http_default_n.len(), 3, "default excludes deleted (http)");
 
-    // state=all filter: HTTP returns all three.
+    // state=all filter: HTTP returns all four.
     let all_req = Request::builder()
         .method("GET")
         .uri("/v1/files?state=all")
@@ -1052,9 +1103,10 @@ async fn given_same_lib_when_files_listed_via_http_and_ffi_then_arrays_identical
     let http_all: serde_json::Value =
         serde_json::from_slice(&to_bytes(all_resp.into_body(), usize::MAX).await.unwrap()).unwrap();
     let http_all_n = norm(http_all);
-    assert_eq!(http_all_n.len(), 3, "state=all returns everything (http)");
+    assert_eq!(http_all_n.len(), 4, "state=all returns everything (http)");
 
-    // type=audio + state=all filter: HTTP returns only the soft-deleted song.
+    // type=audio + state=all filter: HTTP returns only the soft-deleted song
+    // — with its metadata, since the filter has nothing to do with it.
     let audio_req = Request::builder()
         .method("GET")
         .uri("/v1/files?type=audio&state=all")
@@ -1070,20 +1122,22 @@ async fn given_same_lib_when_files_listed_via_http_and_ffi_then_arrays_identical
             .unwrap();
     let http_audio_n = norm(http_audio);
     assert_eq!(http_audio_n.len(), 1);
-    assert_eq!(http_audio_n[0].0, "song.mp3");
-    assert_eq!(http_audio_n[0].2, "deleted");
+    assert_eq!(http_audio_n[0]["file"]["name"], "song.mp3");
+    assert_eq!(http_audio_n[0]["file"]["state"], "deleted");
+    assert_eq!(http_audio_n[0]["metadata"]["artist"], "Radiohead");
 
     // ---- FFI leg (own identical lib + db) ----
     let ffi_lib = tempdir().unwrap();
     std::fs::write(ffi_lib.path().join("song.mp3"), b"audio").unwrap();
     std::fs::write(ffi_lib.path().join("notes.md"), b"# h").unwrap();
     std::fs::write(ffi_lib.path().join("clip.mkv"), b"video").unwrap();
+    std::fs::write(ffi_lib.path().join("photo.jpg"), b"image").unwrap();
     let ffi_dir = tempdir().unwrap();
     let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
     let ffi_lib_path = ffi_lib.path().to_str().unwrap().to_string();
 
     let (ffi_default_n, ffi_all_n, ffi_audio_n) =
-        tokio::task::spawn_blocking(move || -> (FileTriples, FileTriples, FileTriples) {
+        tokio::task::spawn_blocking(move || -> (FileViews, FileViews, FileViews) {
             let cdb = CString::new(ffi_db).unwrap();
             assert_eq!(
                 alexandria_index_init(cdb.as_ptr()),
@@ -1094,14 +1148,15 @@ async fn given_same_lib_when_files_listed_via_http_and_ffi_then_arrays_identical
             let token = CString::new(TEST_TOKEN).unwrap();
             let started = alexandria_index_start(root.as_ptr(), token.as_ptr(), std::ptr::null());
             assert_eq!(started.status, alexandria_ffi::INDEX_OK);
-            wait_for_ffi_files(3);
+            wait_for_ffi_files(4);
 
-            // Soft-delete song.mp3 via a direct SQL update on the FFI db, so
+            // Soft-delete song.mp3 and write the same audio/image metadata
+            // as the HTTP leg, via a direct connection to the FFI db, so
             // the data state matches the HTTP leg exactly.
             let ffi_db_path = std::path::PathBuf::from(ffi_dir.path()).join("ffi.sqlite");
-            let ffi_uuid = std::thread::spawn({
+            std::thread::spawn({
                 let ffi_db_path = ffi_db_path.clone();
-                move || -> String {
+                move || {
                     let rt = tokio::runtime::Builder::new_current_thread()
                         .enable_all()
                         .build()
@@ -1119,19 +1174,29 @@ async fn given_same_lib_when_files_listed_via_http_and_ffi_then_arrays_identical
                             .execute(&pool)
                             .await
                             .unwrap();
-                        let (uuid,): (String,) =
-                            sqlx::query_as("SELECT uuid FROM files WHERE name=?")
-                                .bind("song.mp3")
-                                .fetch_one(&pool)
-                                .await
-                                .unwrap();
-                        uuid
+                        sqlx::query(
+                            "UPDATE audio_files SET title='Airbag', artist='Radiohead', \
+                             album=NULL, year=1997, genre=NULL, track=NULL \
+                             FROM files WHERE audio_files.file_id = files.id AND files.name = ?",
+                        )
+                        .bind("song.mp3")
+                        .execute(&pool)
+                        .await
+                        .unwrap();
+                        sqlx::query(
+                            "UPDATE images SET title='Photo', caption='A photo', width=800, \
+                             height=600 \
+                             FROM files WHERE images.file_id = files.id AND files.name = ?",
+                        )
+                        .bind("photo.jpg")
+                        .execute(&pool)
+                        .await
+                        .unwrap();
                     })
                 }
             })
             .join()
             .unwrap();
-            let _ = ffi_uuid; // not used by FFI list, but confirms the delete landed
 
             let ffi_list = |filters: &str| -> serde_json::Value {
                 let f = CString::new(filters).unwrap();
@@ -1158,6 +1223,10 @@ async fn given_same_lib_when_files_listed_via_http_and_ffi_then_arrays_identical
         .unwrap();
 
     // ---- compare ----
+    // Whole-element comparison: name, fileType, state, contentHash,
+    // deletedAt, missingAt, metadata (including its inner fields), and
+    // every extracted scalar all have to agree, not just the three fields
+    // the old tuple picked out.
     assert_eq!(
         http_default_n, ffi_default_n,
         "default list diverges across surfaces"

@@ -270,6 +270,11 @@ impl StateFilter {
 /// have no `SubtypeMetadata` variant, so `metadata` is `None` for them.
 /// Serialized as `{"file": …, "metadata": …}` over both the HTTP and FFI
 /// surfaces so the two stay at parity (FR-FC-24 / NFR-09).
+///
+/// Also the element type of UC-03's listing (FR-FC-12, issue #116): a
+/// listing answers each matching file as this same record rather than the
+/// bare `File`, so there is one shape for a file whether it arrived as one
+/// of many rows or as a single lookup.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FileView {
