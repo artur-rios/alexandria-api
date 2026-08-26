@@ -140,6 +140,110 @@ impl AudioMetadataReader for LoftyAudioMetadataReader {
     }
 }
 
+/// Read-only port over an audio file's embedded front-cover picture
+/// (issue #117). A sibling of [`AudioMetadataReader`] rather than an
+/// extension of it: the two are read at different times for different
+/// reasons — tags are extracted once, at first index, to prefill editable
+/// metadata (FR-FC-25); a cover picture is read fresh on every uncached
+/// thumbnail request (UC-40, FR-MP-05), because it is not a field an owner
+/// edits and there is nothing to prefill. Injected into `ThumbnailHandler`
+/// the way its other collaborators are, so "no picture", "wrong type", and
+/// the auth/state checks that run before it is even consulted stay
+/// unit-testable against a fake with no file I/O (Testing Specification
+/// §6.2); the real implementation is `lofty`-backed and wired in
+/// `services.rs`, beside [`LoftyAudioMetadataReader`].
+#[allow(async_fn_in_trait)]
+pub trait CoverArtReader: Send + Sync {
+    /// Best-effort read of the embedded front-cover picture's raw,
+    /// still-encoded bytes (JPEG or PNG, whatever the tag itself carries).
+    /// `None` covers "no picture embedded", "the tag has pictures but none
+    /// is usable", and "couldn't parse this file" alike — the caller never
+    /// needs to tell them apart; extraction failure is never a run failure
+    /// or a panic, only ever a "there is nothing to show" the caller maps to
+    /// `InvalidInput`.
+    async fn read(&self, path: &str) -> Option<Vec<u8>>;
+}
+
+/// Real cover-art reader backed by `lofty`, covering the same formats
+/// [`LoftyAudioMetadataReader`] does.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct LoftyCoverArtReader;
+
+impl LoftyCoverArtReader {
+    /// The synchronous probe. `read` runs it on the blocking pool — see
+    /// [`crate::catalog::read_blocking`].
+    fn parse(path: &str) -> Option<Vec<u8>> {
+        Self::parse_capped(path, crate::playback::MAX_PLAYBACK_READ_BYTES)
+    }
+
+    /// `parse`'s body, with the cap broken out as a parameter so a test can
+    /// drive the over-cap branch against a fixture of a few bytes rather
+    /// than allocating a picture past the real, 256 MiB
+    /// `MAX_PLAYBACK_READ_BYTES` — the same reason `playback::read_capped`
+    /// takes its cap as a parameter instead of reading the constant itself.
+    fn parse_capped(path: &str, cap: u64) -> Option<Vec<u8>> {
+        use lofty::file::TaggedFileExt;
+        use lofty::picture::PictureType;
+        use lofty::probe::Probe;
+
+        let tagged_file = match Probe::open(path).and_then(|probe| probe.read()) {
+            Ok(f) => f,
+            Err(err) => {
+                tracing::debug!(path, error = %err, "could not parse audio file for cover art");
+                return None;
+            }
+        };
+
+        let tag = tagged_file
+            .primary_tag()
+            .or_else(|| tagged_file.first_tag())?;
+
+        // The picture the tag itself calls the front cover is what a sleeve
+        // wants; where it carries pictures but names none of them the front
+        // cover (a lone icon or back-cover-only release), the first is a
+        // better answer than nothing — the design's own call, matching
+        // "cover art" loosely rather than refusing a file that clearly has
+        // some artwork embedded.
+        let pictures = tag.pictures();
+        let picture = pictures
+            .iter()
+            .find(|p| p.pic_type() == PictureType::CoverFront)
+            .or_else(|| pictures.first())?;
+
+        let data = picture.data();
+
+        // Nothing in ID3v2, Vorbis comments, or MP4 atoms bounds an embedded
+        // picture's size — that is a property of the container format, not
+        // of pictures. `Probe::open` reads the audio file sequentially
+        // rather than loading it whole, but the picture's own bytes are
+        // materialized in full once the tag is parsed, so an oversized one
+        // must be refused here rather than handed on: a file claiming a
+        // multi-gigabyte "cover" must not cost that much memory before
+        // `ImageThumbnailRenderer` ever gets a chance to reject it. Capped
+        // at the same `MAX_PLAYBACK_READ_BYTES` the image thumbnail arm
+        // bounds its own read by (in production; `parse_capped`'s caller
+        // decides which), so both arms share one ceiling for "how large a
+        // source image a thumbnail request will decode."
+        if data.len() as u64 > cap {
+            tracing::warn!(
+                path,
+                size = data.len(),
+                cap,
+                "embedded cover art exceeds the playback read cap; refusing"
+            );
+            return None;
+        }
+
+        Some(data.to_vec())
+    }
+}
+
+impl CoverArtReader for LoftyCoverArtReader {
+    async fn read(&self, path: &str) -> Option<Vec<u8>> {
+        crate::catalog::read_blocking(path, Self::parse).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -304,5 +408,168 @@ mod tests {
         let tags = reader.read("/no/such/file.wav").await;
 
         assert!(tags.is_none());
+    }
+
+    /// A tiny, real, decodable JPEG — deterministic per `seed` so a test can
+    /// recompute the exact bytes it expects back without threading them
+    /// through a second channel. Mirrors `jpeg_bytes_for` in the HTTP test
+    /// suite's `common` helpers, kept local here because this module has no
+    /// dependency on that crate.
+    fn jpeg_bytes_for(seed: u8) -> Vec<u8> {
+        let img = image::RgbImage::from_pixel(4, 4, image::Rgb([seed, 100, 200]));
+        let mut out = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new(&mut out)
+            .encode_image(&image::DynamicImage::ImageRgb8(img))
+            .expect("encode jpeg");
+        out
+    }
+
+    /// Write a fresh ID3v2 tag carrying one picture of `pic_type` onto
+    /// `path`, mirroring `write_test_tags`'s shape: a new in-memory `Tag`,
+    /// populated, then saved.
+    fn write_picture(path: &std::path::Path, pic_type: lofty::picture::PictureType, data: Vec<u8>) {
+        use lofty::config::WriteOptions;
+        use lofty::picture::{MimeType, Picture};
+        use lofty::tag::{Tag, TagExt, TagType};
+
+        let mut tag = Tag::new(TagType::Id3v2);
+        let picture = Picture::unchecked(data)
+            .pic_type(pic_type)
+            .mime_type(MimeType::Jpeg)
+            .build();
+        tag.push_picture(picture);
+        tag.save_to_path(path, WriteOptions::default())
+            .expect("save tag with picture");
+    }
+
+    #[tokio::test]
+    async fn given_front_cover_when_read_then_its_bytes_returned() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("cover.wav");
+        write_minimal_wav(&path);
+        let cover = jpeg_bytes_for(11);
+        write_picture(
+            &path,
+            lofty::picture::PictureType::CoverFront,
+            cover.clone(),
+        );
+
+        // Act
+        let reader = LoftyCoverArtReader;
+        let bytes = reader
+            .read(path.to_str().unwrap())
+            .await
+            .expect("picture extracted");
+
+        // Assert
+        assert_eq!(bytes, cover);
+    }
+
+    #[tokio::test]
+    async fn given_only_a_back_cover_when_read_then_it_is_returned_anyway() {
+        // Arrange — no `CoverFront` picture exists, but one picture does.
+        // The design calls the first picture a better answer than nothing
+        // when the tag names no front cover.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("back_only.wav");
+        write_minimal_wav(&path);
+        let back = jpeg_bytes_for(22);
+        write_picture(&path, lofty::picture::PictureType::CoverBack, back.clone());
+
+        // Act
+        let reader = LoftyCoverArtReader;
+        let bytes = reader
+            .read(path.to_str().unwrap())
+            .await
+            .expect("fallback picture extracted");
+
+        // Assert
+        assert_eq!(bytes, back);
+    }
+
+    #[tokio::test]
+    async fn given_untagged_wav_when_cover_read_then_none() {
+        // Arrange — no tag written at all.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("no_picture.wav");
+        write_minimal_wav(&path);
+
+        // Act
+        let reader = LoftyCoverArtReader;
+        let bytes = reader.read(path.to_str().unwrap()).await;
+
+        // Assert
+        assert!(bytes.is_none());
+    }
+
+    #[tokio::test]
+    async fn given_tag_with_no_pictures_when_read_then_none() {
+        // Arrange — a tag exists (title set) but carries no picture at all,
+        // proving "tag present, no picture" is told apart from "no tag".
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("titled_no_picture.wav");
+        write_minimal_wav(&path);
+        write_test_tags(&path);
+
+        // Act
+        let reader = LoftyCoverArtReader;
+        let bytes = reader.read(path.to_str().unwrap()).await;
+
+        // Assert
+        assert!(bytes.is_none());
+    }
+
+    #[tokio::test]
+    async fn given_missing_file_when_cover_read_then_none_not_panic() {
+        let reader = LoftyCoverArtReader;
+
+        let bytes = reader.read("/no/such/file.wav").await;
+
+        assert!(bytes.is_none());
+    }
+
+    #[tokio::test]
+    async fn given_picture_over_cap_when_parsed_then_none() {
+        // Arrange — a real 16-byte picture against an 8-byte cap. `cap` is a
+        // parameter to `parse_capped` precisely so this fixture stays tiny;
+        // the request path calls `parse`, which passes the real 256 MiB
+        // `MAX_PLAYBACK_READ_BYTES`. Reaching this branch at all proves the
+        // rejection runs before the bytes are cloned out to the caller.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("over_cap.wav");
+        write_minimal_wav(&path);
+        write_picture(
+            &path,
+            lofty::picture::PictureType::CoverFront,
+            vec![0xFFu8; 16],
+        );
+
+        // Act
+        let bytes = LoftyCoverArtReader::parse_capped(path.to_str().unwrap(), 8);
+
+        // Assert
+        assert!(bytes.is_none(), "a picture over cap must be refused");
+    }
+
+    #[tokio::test]
+    async fn given_picture_exactly_at_cap_when_parsed_then_returned() {
+        // Arrange — a picture the same size as the cap is legal; the extra
+        // byte `read_capped`'s sibling logic allows must not turn a
+        // right-at-the-line picture into a rejection.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("at_cap.wav");
+        write_minimal_wav(&path);
+        write_picture(
+            &path,
+            lofty::picture::PictureType::CoverFront,
+            vec![0xFFu8; 16],
+        );
+
+        // Act
+        let bytes = LoftyCoverArtReader::parse_capped(path.to_str().unwrap(), 16);
+
+        // Assert
+        assert_eq!(bytes, Some(vec![0xFFu8; 16]));
     }
 }

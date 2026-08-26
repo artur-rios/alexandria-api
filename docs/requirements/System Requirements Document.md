@@ -212,7 +212,7 @@ graph LR
 | FR-MP-02 | The system shall support HTTP byte-range requests over that stream, so a client can seek without transferring the whole file. |
 | FR-MP-03 | The system shall never re-encode, transcode, or otherwise modify the bytes it serves. |
 | FR-MP-04 | The system shall return a single page of a CBZ ComicBook as an image, addressed by 1-based page index. |
-| FR-MP-05 | The system shall return a downscaled thumbnail image for a video, image, or comic File. |
+| FR-MP-05 | The system shall return a downscaled thumbnail image for a video, image, comic, or audio File. For audio, the thumbnail is the front-cover picture embedded in the file's own tag; a file with no embedded picture returns no thumbnail. |
 | FR-MP-06 | The system shall expose playback operations via both the HTTP and FFI surfaces. Because the FFI surface cannot carry a byte stream, FR-MP-01 over FFI returns a **playback descriptor** — resolved absolute path, MIME type, and byte size — and parity for it is defined on that descriptor and on the authorization, state, and error decisions rather than on byte transfer. FR-MP-04 and FR-MP-05 return their bytes over both surfaces and are byte-exact across them. |
 
 ---
@@ -596,7 +596,7 @@ account is UC-41).
 | --- | --- | --- | --- |
 | GET | /v1/files/{uuid}/stream | Stream an `active` File's bytes from disk, honouring `Range`. | FR-MP-01, FR-MP-02, FR-MP-03 |
 | GET | /v1/files/{uuid}/pages/{page} | Return one page of a CBZ ComicBook, 1-based. | FR-MP-04 |
-| GET | /v1/files/{uuid}/thumbnail | Return a downscaled JPEG thumbnail (video, image, comic). | FR-MP-05 |
+| GET | /v1/files/{uuid}/thumbnail | Return a downscaled JPEG thumbnail (video, image, comic, audio). | FR-MP-05 |
 
 `/stream` is deliberately not `/content`: that path is UC-32's text-content
 read and UC-33's editor, which exchange a JSON document rather than a seekable

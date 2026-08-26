@@ -21,7 +21,7 @@ use crate::bookmarks::commands::purge::PurgeBookmarkHandler;
 use crate::bookmarks::commands::update::UpdateBookmarkHandler;
 use crate::bookmarks::queries::browse::BrowseBookmarksHandler;
 use crate::bookmarks::repos::SqliteBookmarkRepository;
-use crate::catalog::audio_tags::LoftyAudioMetadataReader;
+use crate::catalog::audio_tags::{LoftyAudioMetadataReader, LoftyCoverArtReader};
 use crate::catalog::clock::{Clock, SystemClock};
 use crate::catalog::comic_tags::CbzComicMetadataReader;
 use crate::catalog::commands::edit_content::EditTextFileContentHandler;
@@ -152,6 +152,7 @@ pub type DefaultThumbnailHandler = ThumbnailHandler<
     ZipComicArchive,
     ImageThumbnailRenderer,
     DiskThumbnailCache,
+    LoftyCoverArtReader,
 >;
 
 pub type DefaultCreateCollectionHandler =
@@ -536,6 +537,11 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         ZipComicArchive,
         ImageThumbnailRenderer,
         DiskThumbnailCache::new(settings.playback.thumbnail_cache_dir.clone()),
+        // Beside `audio_tags` (`LoftyAudioMetadataReader`), the reader it
+        // sits next to: both are lofty-backed reads of the same tagged
+        // file, at two different times for two different reasons (see
+        // `CoverArtReader`'s own doc comment).
+        LoftyCoverArtReader,
     ));
     let create_collection_handler = Arc::new(CreateCollectionHandler::new(
         auth.clone(),

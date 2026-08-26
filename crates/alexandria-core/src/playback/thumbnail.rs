@@ -6,6 +6,7 @@ use serde::Serialize;
 use uuid::Uuid;
 
 use crate::auth::AuthService;
+use crate::catalog::audio_tags::CoverArtReader;
 use crate::catalog::model::FileType;
 use crate::catalog::repos::CatalogRepository;
 use crate::errors::DomainError;
@@ -52,30 +53,34 @@ pub trait ThumbnailCache: Send + Sync {
     async fn put(&self, key: &str, bytes: &[u8]) -> Result<(), DomainError>;
 }
 
-/// UC-40 — return a downscaled thumbnail for a video, image, or comic.
-pub struct ThumbnailHandler<A, R, C, T, K> {
+/// UC-40 — return a downscaled thumbnail for a video, image, comic, or audio
+/// File.
+pub struct ThumbnailHandler<A, R, C, T, K, V> {
     auth: A,
     repo: R,
     archive: C,
     renderer: T,
     cache: K,
+    cover: V,
 }
 
-impl<A, R, C, T, K> ThumbnailHandler<A, R, C, T, K>
+impl<A, R, C, T, K, V> ThumbnailHandler<A, R, C, T, K, V>
 where
     A: AuthService,
     R: CatalogRepository,
     C: ComicArchive,
     T: ThumbnailRenderer,
     K: ThumbnailCache,
+    V: CoverArtReader,
 {
-    pub fn new(auth: A, repo: R, archive: C, renderer: T, cache: K) -> Self {
+    pub fn new(auth: A, repo: R, archive: C, renderer: T, cache: K, cover: V) -> Self {
         Self {
             auth,
             repo,
             archive,
             renderer,
             cache,
+            cover,
         }
     }
 
@@ -147,9 +152,32 @@ where
                     .from_image_bytes(&first.bytes, THUMBNAIL_MAX_DIM)
                     .await?
             }
+            FileType::Audio => {
+                // Read on demand, not at index time (issue #117's correction
+                // to its own issue body): indexing reads no file bytes to
+                // identify a file (FR-FC-09), and cover art is not a field
+                // an owner edits, so FR-FC-25's first-index prefill has
+                // nothing to prefill it into. Nothing is stored here either
+                // — a cache hit above would already have returned, so
+                // reaching this arm means the picture is decoded fresh and
+                // cached by the same uuid-and-mtime key every other arm
+                // uses.
+                //
+                // A file that embeds no picture at all — or one `lofty`
+                // cannot parse — is `InvalidInput` in the same shape the
+                // SVG and `.cbr` rejections above use: "not supported for
+                // this file", which a caller can act on, rather than a
+                // decoder error it cannot.
+                let picture = self.cover.read(&file.path).await.ok_or_else(|| {
+                    DomainError::InvalidInput(format!("file {uuid} has no embedded cover art"))
+                })?;
+                self.renderer
+                    .from_image_bytes(&picture, THUMBNAIL_MAX_DIM)
+                    .await?
+            }
             _ => {
                 return Err(DomainError::InvalidInput(format!(
-                    "file {uuid} has no thumbnail; thumbnails cover video, image, and comic"
+                    "file {uuid} has no thumbnail; thumbnails cover video, image, comic, and audio"
                 )))
             }
         };
@@ -461,6 +489,42 @@ mod tests {
         }
     }
 
+    /// Cover-art fake: hands back a fixed answer and records every path it
+    /// was asked to read, so a test can assert both what the handler did
+    /// with the result *and* whether the reader was consulted at all — the
+    /// auth/state/type guards that run earlier must short-circuit before
+    /// this is ever reached.
+    #[derive(Clone)]
+    struct FakeCoverArt {
+        picture: Option<Vec<u8>>,
+        calls: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl FakeCoverArt {
+        /// No embedded picture — the common case for every non-audio test
+        /// in this module, which never expects `cover` to be consulted.
+        fn none() -> Self {
+            Self {
+                picture: None,
+                calls: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn with_picture(picture: Vec<u8>) -> Self {
+            Self {
+                picture: Some(picture),
+                calls: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+    }
+
+    impl CoverArtReader for FakeCoverArt {
+        async fn read(&self, path: &str) -> Option<Vec<u8>> {
+            self.calls.lock().unwrap().push(path.to_string());
+            self.picture.clone()
+        }
+    }
+
     /// Renderer fake recording which path it was asked to take. The log is
     /// an `Arc` the test keeps its own clone of, so assertions read it
     /// directly instead of through a test-only accessor on the handler.
@@ -564,6 +628,7 @@ mod tests {
                 calls: Arc::clone(&calls),
             },
             FakeCache::new(Arc::clone(&entries)),
+            FakeCoverArt::none(),
         );
 
         // Act
@@ -609,6 +674,7 @@ mod tests {
                 calls: Arc::new(Mutex::new(Vec::new())),
             },
             cache.clone(),
+            FakeCoverArt::none(),
         );
 
         // Act — first request: nothing is cached yet.
@@ -628,6 +694,7 @@ mod tests {
                 calls: Arc::new(Mutex::new(Vec::new())),
             },
             cache.clone(),
+            FakeCoverArt::none(),
         );
         let second = handler_two
             .thumbnail(Uuid::nil(), "t")
@@ -661,6 +728,7 @@ mod tests {
                 calls: Arc::clone(&calls),
             },
             FakeCache::new(Arc::new(Mutex::new(Vec::new()))),
+            FakeCoverArt::none(),
         );
 
         // Act
@@ -703,6 +771,7 @@ mod tests {
                 calls: Arc::new(Mutex::new(Vec::new())),
             },
             FailingPutCache,
+            FakeCoverArt::none(),
         );
 
         // Act
@@ -734,6 +803,7 @@ mod tests {
                 calls: Arc::new(Mutex::new(Vec::new())),
             },
             FakeCache::new(Arc::new(Mutex::new(Vec::new()))),
+            FakeCoverArt::none(),
         );
 
         // Act
@@ -760,6 +830,7 @@ mod tests {
                 calls: Arc::clone(&calls),
             },
             FakeCache::new(Arc::new(Mutex::new(Vec::new()))),
+            FakeCoverArt::none(),
         );
         let pages = ComicPageHandler::new(
             FakeAuth { good: "t" },
@@ -805,6 +876,7 @@ mod tests {
                 calls: Arc::clone(&calls),
             },
             cache,
+            FakeCoverArt::none(),
         );
 
         // Act
@@ -817,8 +889,8 @@ mod tests {
 
     #[tokio::test]
     async fn given_unsupported_type_when_thumbnailed_then_invalid_input() {
-        // Arrange — FR-MP-05 covers video, image, and comic only. A PDF
-        // would need a rasterizer, which is out of scope.
+        // Arrange — FR-MP-05 covers video, image, comic, and audio only. A
+        // PDF would need a rasterizer, which is out of scope.
         let repo = FakeRepo::with_file(a_file(
             "/lib/book.pdf",
             FileType::Document,
@@ -833,6 +905,7 @@ mod tests {
                 calls: Arc::new(Mutex::new(Vec::new())),
             },
             FakeCache::new(Arc::new(Mutex::new(Vec::new()))),
+            FakeCoverArt::none(),
         );
 
         // Act
@@ -862,6 +935,7 @@ mod tests {
                 calls: Arc::clone(&calls),
             },
             FakeCache::new(Arc::new(Mutex::new(Vec::new()))),
+            FakeCoverArt::none(),
         );
 
         // Act
@@ -899,5 +973,178 @@ mod tests {
         // Assert
         let out = image::load_from_memory(&bytes).expect("valid jpeg");
         assert_eq!((out.width(), out.height()), (64, 64));
+    }
+
+    #[tokio::test]
+    async fn given_audio_with_cover_art_when_thumbnailed_then_picture_rendered() {
+        // Arrange — the reader answers with a fixed "picture"; the handler's
+        // job is just to hand it to the renderer and cache the result, the
+        // same as every other arm.
+        let repo = FakeRepo::with_file(a_file(
+            "/lib/song.mp3",
+            FileType::Audio,
+            FileState::Active,
+            None,
+        ));
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let handler = ThumbnailHandler::new(
+            FakeAuth { good: "t" },
+            repo,
+            FakeArchive,
+            FakeRenderer {
+                calls: Arc::clone(&calls),
+            },
+            FakeCache::new(Arc::new(Mutex::new(Vec::new()))),
+            FakeCoverArt::with_picture(b"sleeve".to_vec()),
+        );
+
+        // Act
+        let thumb = handler.thumbnail(Uuid::nil(), "t").await.expect("thumb");
+
+        // Assert
+        assert_eq!(thumb.bytes, b"JPEG".to_vec());
+        assert_eq!(thumb.mime_type, "image/jpeg");
+        assert_eq!(*calls.lock().unwrap(), vec!["image:sleeve".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn given_audio_with_no_cover_art_when_thumbnailed_then_invalid_input() {
+        // Arrange — the reader found no embedded picture (or could not parse
+        // the file at all; the handler cannot tell them apart, and does not
+        // need to).
+        let repo = FakeRepo::with_file(a_file(
+            "/lib/song.mp3",
+            FileType::Audio,
+            FileState::Active,
+            None,
+        ));
+        let handler = ThumbnailHandler::new(
+            FakeAuth { good: "t" },
+            repo,
+            FakeArchive,
+            FakeRenderer {
+                calls: Arc::new(Mutex::new(Vec::new())),
+            },
+            FakeCache::new(Arc::new(Mutex::new(Vec::new()))),
+            FakeCoverArt::none(),
+        );
+
+        // Act
+        let result = handler.thumbnail(Uuid::nil(), "t").await;
+
+        // Assert
+        assert!(matches!(result, Err(DomainError::InvalidInput(_))));
+    }
+
+    #[tokio::test]
+    async fn given_deleted_audio_file_when_thumbnailed_then_reader_not_consulted() {
+        // Arrange — `resolve_playable` must refuse a soft-deleted record
+        // before any of `FileType::Audio`'s own work runs, cover art
+        // included. A `FakeCoverArt` that recorded a call here would mean
+        // the guard ran too late.
+        let repo = FakeRepo::with_file(a_file(
+            "/lib/song.mp3",
+            FileType::Audio,
+            FileState::Deleted,
+            None,
+        ));
+        let cover = FakeCoverArt::with_picture(b"sleeve".to_vec());
+        let handler = ThumbnailHandler::new(
+            FakeAuth { good: "t" },
+            repo,
+            FakeArchive,
+            FakeRenderer {
+                calls: Arc::new(Mutex::new(Vec::new())),
+            },
+            FakeCache::new(Arc::new(Mutex::new(Vec::new()))),
+            cover.clone(),
+        );
+
+        // Act
+        let result = handler.thumbnail(Uuid::nil(), "t").await;
+
+        // Assert
+        assert!(matches!(result, Err(DomainError::InvalidState)));
+        assert!(cover.calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn given_unauthenticated_caller_when_audio_thumbnailed_then_reader_not_consulted() {
+        // Arrange — same shape as the deleted-file case, for the other guard
+        // `resolve_playable` runs first: authentication.
+        let repo = FakeRepo::with_file(a_file(
+            "/lib/song.mp3",
+            FileType::Audio,
+            FileState::Active,
+            None,
+        ));
+        let cover = FakeCoverArt::with_picture(b"sleeve".to_vec());
+        let handler = ThumbnailHandler::new(
+            FakeAuth { good: "t" },
+            repo,
+            FakeArchive,
+            FakeRenderer {
+                calls: Arc::new(Mutex::new(Vec::new())),
+            },
+            FakeCache::new(Arc::new(Mutex::new(Vec::new()))),
+            cover.clone(),
+        );
+
+        // Act
+        let result = handler.thumbnail(Uuid::nil(), "wrong-token").await;
+
+        // Assert
+        assert!(matches!(result, Err(DomainError::Unauthorized)));
+        assert!(cover.calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn given_audio_with_cover_art_when_thumbnailed_then_max_dim_matches_other_arms() {
+        // Arrange — `FakeRenderer::from_image_bytes` ignores the `max_dim`
+        // it is passed, so this asserts through a renderer that records it,
+        // rather than reusing `FakeRenderer`.
+        struct DimRecordingRenderer {
+            dims: Arc<Mutex<Vec<u32>>>,
+        }
+
+        impl ThumbnailRenderer for DimRecordingRenderer {
+            async fn from_image_bytes(
+                &self,
+                _bytes: &[u8],
+                max_dim: u32,
+            ) -> Result<Vec<u8>, DomainError> {
+                self.dims.lock().unwrap().push(max_dim);
+                Ok(b"JPEG".to_vec())
+            }
+
+            async fn from_video(&self, _path: &str, _max_dim: u32) -> Result<Vec<u8>, DomainError> {
+                unreachable!("audio thumbnails never call from_video")
+            }
+        }
+
+        let repo = FakeRepo::with_file(a_file(
+            "/lib/song.mp3",
+            FileType::Audio,
+            FileState::Active,
+            None,
+        ));
+        let dims = Arc::new(Mutex::new(Vec::new()));
+        let handler = ThumbnailHandler::new(
+            FakeAuth { good: "t" },
+            repo,
+            FakeArchive,
+            DimRecordingRenderer {
+                dims: Arc::clone(&dims),
+            },
+            FakeCache::new(Arc::new(Mutex::new(Vec::new()))),
+            FakeCoverArt::with_picture(b"sleeve".to_vec()),
+        );
+
+        // Act
+        handler.thumbnail(Uuid::nil(), "t").await.expect("thumb");
+
+        // Assert — the one size every other arm asks for (see
+        // `THUMBNAIL_MAX_DIM`'s own doc comment).
+        assert_eq!(*dims.lock().unwrap(), vec![THUMBNAIL_MAX_DIM]);
     }
 }

@@ -1234,24 +1234,24 @@ UC-36's externally issued JWT.
 | **ID** | UC-40 |
 | **Name** | Get a file thumbnail |
 | **Actors** | Owner, Local Filesystem |
-| **Description** | Return a downscaled JPEG thumbnail for a video, image, or comic File, cached on disk keyed by the file's UUID, modification time, and target dimension. |
-| **Preconditions** | The caller is authenticated; the target file is `active`, present on disk, and of type video, image, or comic. |
+| **Description** | Return a downscaled JPEG thumbnail for a video, image, comic, or audio File, cached on disk keyed by the file's UUID, modification time, and target dimension. For audio, the thumbnail is the front-cover picture embedded in the file's own tag. |
+| **Preconditions** | The caller is authenticated; the target file is `active`, present on disk, and of type video, image, comic, or audio. |
 | **Postconditions** | The caller receives the thumbnail's bytes; on a cache miss, the generated thumbnail is written to the disk cache under that key. |
 | **Requirements** | FR-MP-05, FR-MP-06 |
 
 **Main Flow**
 
 1. The owner requests a thumbnail for a File UUID.
-2. The system verifies the file's type is video, image, or comic.
+2. The system verifies the file's type is video, image, comic, or audio.
 3. The system looks up the thumbnail cache by a key derived from the file's UUID, its recorded modification time, and the target dimension; on a hit, it returns the cached bytes without rendering anything. The UUID is unique and stable, and folding in the modification time is what invalidates the entry when the file changes — the same job the content hash used to do, without the whole-file read that keying on a hash would now force at browse time (FR-FC-09).
-4. On a cache miss, the system produces a source image — a video keyframe, the decoded image, or the comic's first page — and downscales it to fit within 320 pixels on its longest side, preserving aspect ratio and never enlarging a source that is already smaller, then encodes it as JPEG.
+4. On a cache miss, the system produces a source image — a video keyframe, the decoded image, the comic's first page, or an audio file's embedded front-cover picture — and downscales it to fit within 320 pixels on its longest side, preserving aspect ratio and never enlarging a source that is already smaller, then encodes it as JPEG. An audio File with no embedded picture is rejected as AF-01 rather than produced; nothing is read or extracted from an audio File at index time for this purpose (FR-FC-09, FR-FC-25).
 5. The system writes the encoded bytes to the cache and returns them.
 
 **Alternative Flows**
 
 | ID | Condition | Outcome |
 | --- | --- | --- |
-| AF-01 | The file's type has no thumbnail (audio, text, HTML page, or document) | The system rejects with an invalid-input error. |
+| AF-01 | The file's type has no thumbnail (text, HTML page, or document), or is an audio File with no embedded picture | The system rejects with an invalid-input error. |
 | AF-02 | The file UUID does not exist | The system responds with a not-found error. |
 | AF-03 | The file is soft-deleted | The system rejects with an invalid-state error (restore via UC-07 first). |
 | AF-04 | The file is marked missing on disk, or its bytes cannot be read or decoded | The system responds with a disk-error. |

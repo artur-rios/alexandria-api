@@ -18,7 +18,10 @@ use axum::http::{Request, StatusCode};
 use tempfile::tempdir;
 use tower::ServiceExt;
 
-use crate::common::{file_rows_with_uuid, test_app_with_settings, wait_for_files};
+use crate::common::{
+    file_rows_with_uuid, test_app_with_settings, wait_for_files, write_audio_with_cover_art,
+    write_audio_without_cover_art,
+};
 
 fn settings_with_cache_dir(cache_dir: &std::path::Path) -> Settings {
     let mut settings = Settings::default();
@@ -285,7 +288,7 @@ async fn given_cbr_comic_when_thumbnailed_then_bad_request() {
 
 #[tokio::test]
 async fn given_document_when_thumbnailed_then_bad_request() {
-    // Arrange — FR-MP-05 covers video, image, and comic only.
+    // Arrange — FR-MP-05 covers video, image, comic, and audio only.
     let lib = tempdir().unwrap();
     common::write_file(&lib, "book.pdf", b"%PDF-1.4");
     let cache_dir = tempdir().unwrap();
@@ -310,4 +313,92 @@ async fn given_document_when_thumbnailed_then_bad_request() {
 
     // Assert
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+/// UC-40's fourth arm, issue #117: an audio file's thumbnail is the picture
+/// embedded in its own tag. A genuine tagged WAV, built at test time with
+/// `lofty` — the same crate that reads it back inside `ThumbnailHandler` —
+/// rather than a committed binary fixture nobody in the repository could
+/// otherwise read or regenerate.
+#[tokio::test]
+async fn given_audio_with_cover_art_when_thumbnailed_then_jpeg_returned() {
+    // Arrange — the embedded picture is itself a real, decodable JPEG, so
+    // the assertion below can decode the response the same way the SVG and
+    // format tests above decode theirs.
+    let lib = tempdir().unwrap();
+    let cover = common::jpeg_bytes_for("cover");
+    write_audio_with_cover_art(&lib, "song.wav", &cover);
+    let cache_dir = tempdir().unwrap();
+    let (_test, router, uuid) = index_one(&lib, cache_dir.path()).await;
+
+    // Act
+    let response = router
+        .oneshot(thumbnail_request(&uuid))
+        .await
+        .expect("one-shot");
+
+    // Assert
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get("content-type").unwrap(),
+        "image/jpeg"
+    );
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    // `ImageThumbnailRenderer::encode` returns a source already inside the
+    // box untouched — the 4x4 fixture never needs downscaling — so the
+    // response decodes to a valid JPEG rather than to any particular size.
+    image::load_from_memory(&body).expect("valid jpeg");
+}
+
+#[tokio::test]
+async fn given_audio_with_no_cover_art_when_thumbnailed_then_bad_request() {
+    // Arrange — a genuinely untagged file, not merely one `lofty` fails to
+    // parse: this proves "the tag carries no picture" is refused the same
+    // way "the file has no tag at all" is.
+    let lib = tempdir().unwrap();
+    write_audio_without_cover_art(&lib, "no_cover.wav");
+    let cache_dir = tempdir().unwrap();
+    let (_test, router, uuid) = index_one(&lib, cache_dir.path()).await;
+
+    // Act
+    let response = router
+        .oneshot(thumbnail_request(&uuid))
+        .await
+        .expect("one-shot");
+
+    // Assert
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn given_audio_thumbnail_requested_twice_then_second_call_is_cached() {
+    // Arrange — the same caching behaviour every other thumbnailable type
+    // gets (Testing Specification's own audio-thumbnail requirement).
+    let lib = tempdir().unwrap();
+    let cover = common::jpeg_bytes_for("cached-cover");
+    write_audio_with_cover_art(&lib, "song.wav", &cover);
+    let cache_dir = tempdir().unwrap();
+    let (_test, router, uuid) = index_one(&lib, cache_dir.path()).await;
+
+    // Act
+    let first_response = router
+        .clone()
+        .oneshot(thumbnail_request(&uuid))
+        .await
+        .expect("one-shot");
+    let first = to_bytes(first_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let cached_files_after_first = common::count_dir_entries(cache_dir.path());
+    let second_response = router
+        .oneshot(thumbnail_request(&uuid))
+        .await
+        .expect("one-shot");
+    let second = to_bytes(second_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+
+    // Assert
+    assert_eq!(first, second);
+    assert_eq!(cached_files_after_first, 1);
 }
