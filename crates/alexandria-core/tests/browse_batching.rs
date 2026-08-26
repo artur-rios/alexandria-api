@@ -38,6 +38,16 @@
 //! first attempt) never sees it — it silently counts zero. Only a
 //! subscriber installed as the process's global default is visible from
 //! every thread, worker threads included.
+//!
+//! **Accepted residual fragility, by design, not by oversight**: the
+//! `"sqlx::query"` target is sqlx's own internal implementation detail, not
+//! a public contract — a future sqlx upgrade could rename it. And
+//! `init_counter` swallows `set_global_default`'s error, so if some other
+//! dependency (or a future test) installs a global subscriber first, this
+//! file's counter silently stops counting. Both failure modes fail
+//! *closed*: a broken counter reads as "queries: 0" against the exact
+//! counts these tests assert (`assert_eq!`, not `<=`), which fails loudly
+//! rather than passing on a dead mechanism.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, Once};
@@ -151,13 +161,15 @@ async fn seed_audio_files(repo: &SqliteCatalogRepository, count: usize) {
     }
 }
 
-/// The design's headline claim: a listing filtered to one type costs two
-/// or three queries (the files query plus one batched subtype query, split
-/// across more than one `IN` chunk only once the id count crosses
-/// `MAX_SQLITE_PARAMS`) — whatever its size. This pins it at two sizes far
-/// apart; if a future change reintroduced a per-row `find_metadata_by_uuid`
-/// call, the 200-file run's count would grow in lockstep with the row
-/// count instead of staying flat, and this assertion would catch it.
+/// The design's headline claim: a listing filtered to one type, at or below
+/// `MAX_SQLITE_PARAMS` ids, costs exactly two queries — the files query
+/// plus one batched subtype query — whatever its size. This pins it at two
+/// sizes far apart; if a future change reintroduced a per-row
+/// `find_metadata_by_uuid` call, the 200-file run's count would grow in
+/// lockstep with the row count instead of staying flat, and this assertion
+/// would catch it. (Chunking past `MAX_SQLITE_PARAMS` is covered
+/// separately below, by
+/// `given_a_listing_past_the_chunk_boundary_when_listed_then_every_id_is_still_covered`.)
 #[tokio::test]
 async fn given_single_type_listing_when_listed_then_query_count_is_bounded_not_per_row() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
@@ -189,11 +201,12 @@ async fn given_single_type_listing_when_listed_then_query_count_is_bounded_not_p
         "a 40x larger single-type listing must not issue more queries — \
          the query count must not grow with the number of files"
     );
-    assert!(
-        small_queries <= 3,
-        "a single-type listing should cost the files query plus one \
-         batched subtype query, got {small_queries}"
+    assert_eq!(
+        small_queries, 2,
+        "a single-type listing under the chunk boundary should cost \
+         exactly the files query plus one batched subtype query"
     );
+    assert_eq!(large_queries, 2);
 
     // Every row still carries its own metadata — batching must not have
     // lost anything on the way to being cheap.
@@ -239,5 +252,49 @@ async fn given_mixed_type_listing_when_listed_then_query_count_scales_with_types
         queries, 3,
         "a listing spanning two subtypes should cost the files query plus \
          one batch per subtype present, got {queries}"
+    );
+}
+
+/// `MAX_SQLITE_PARAMS` (`repos.rs`) is 900 — chosen as a conservative
+/// assumption about SQLite's compiled-in bound-parameter ceiling, not
+/// measured against the actual limit this binary links against. Nothing
+/// else in this file proves that constant does what it claims: the
+/// largest listing above binds only 200 parameters, comfortably under it.
+/// If the linked SQLite were ever compiled with a lower ceiling, every
+/// single-type library above that size would fail at runtime with nothing
+/// catching it.
+///
+/// This seeds 901 audio files — one past the boundary — so the batch is
+/// forced to split into two `IN` chunks (900 + 1), and asserts three
+/// things at once: every one of the 901 ids is still covered (no id lost
+/// at the chunk seam), every row still carries its metadata (the second,
+/// one-id chunk is not silently dropped), and the query count is exactly
+/// 3 (files query + two subtype chunks) — proving the chunk arithmetic,
+/// not just asserting a size passed.
+#[tokio::test]
+async fn given_a_listing_past_the_chunk_boundary_when_listed_then_every_id_is_still_covered() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+
+    let pool = migrated_pool().await;
+    let repo = SqliteCatalogRepository::new(pool);
+    seed_audio_files(&repo, 901).await;
+
+    let (views, queries) =
+        count_queries(|| repo.list_filtered_view(Some(FileType::Audio), StateFilter::Active, None))
+            .await;
+    let views = views.expect("list 901");
+
+    assert_eq!(views.len(), 901, "every id must survive the chunk split");
+    assert!(
+        views
+            .iter()
+            .all(|v| matches!(v.metadata, Some(SubtypeMetadata::Audio { .. }))),
+        "every row, including those in the second one-id chunk, must \
+         still carry its metadata"
+    );
+    assert_eq!(
+        queries, 3,
+        "901 ids at a 900-id chunk size should cost the files query plus \
+         two subtype chunks (900 + 1), got {queries}"
     );
 }

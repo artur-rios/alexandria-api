@@ -302,6 +302,55 @@ impl SqliteCatalogRepository {
         }
     }
 
+    /// Build the ` WHERE …`/` ORDER BY path` suffix shared by
+    /// `list_filtered` and `list_filtered_view` — the two queries select
+    /// different columns (`list_filtered_view` also needs the internal
+    /// `id`, since the subtype batches key on it) but filter identically.
+    /// Appended straight after each query's own `SELECT … FROM files`
+    /// prefix. Kept as one function so the two queries cannot drift apart:
+    /// FR-CO-07's real collection filter, when it lands, edits this once
+    /// rather than two call sites that happen to agree today.
+    ///
+    /// `file_type` and `collection_uuid` only need to be checked for
+    /// presence here — the caller binds their actual values in the same
+    /// order this appends the placeholders (`type = ?` before the
+    /// collection subquery's `?`).
+    fn list_filter_where_clause(
+        file_type: Option<FileType>,
+        state: StateFilter,
+        collection_uuid: Option<Uuid>,
+    ) -> String {
+        // The filters are enumerated (not user strings), so there is no SQL
+        // injection surface here — every value below is still bound as a
+        // `?` parameter by the caller.
+        let mut sql = String::new();
+        let mut conj = " WHERE ";
+        if file_type.is_some() {
+            sql.push_str(conj);
+            sql.push_str("type = ?");
+            conj = " AND ";
+        }
+        match state {
+            StateFilter::Active => {
+                sql.push_str(conj);
+                sql.push_str("state = 'active'");
+                conj = " AND ";
+            }
+            StateFilter::Deleted => {
+                sql.push_str(conj);
+                sql.push_str("state = 'deleted'");
+                conj = " AND ";
+            }
+            StateFilter::All => {}
+        }
+        if collection_uuid.is_some() {
+            sql.push_str(conj);
+            sql.push_str("collection_id = (SELECT id FROM collections WHERE uuid = ?)");
+        }
+        sql.push_str(" ORDER BY path");
+        sql
+    }
+
     /// Build a `column IN (?, ?, …)` placeholder list sized to `chunk`. Used
     /// by the `batch_*` helpers below so each chunk of ids gets exactly as
     /// many placeholders as it has elements — never more, which would bind
@@ -323,9 +372,6 @@ impl SqliteCatalogRepository {
     async fn batch_audio(&self, ids: &[i64]) -> Result<HashMap<i64, SubtypeMetadata>, DomainError> {
         let mut out = HashMap::new();
         for chunk in ids.chunks(MAX_SQLITE_PARAMS) {
-            if chunk.is_empty() {
-                continue;
-            }
             let sql = format!(
                 "SELECT file_id, title, artist, album, year, genre, track FROM audio_files \
                  WHERE file_id IN ({})",
@@ -373,9 +419,6 @@ impl SqliteCatalogRepository {
     ) -> Result<HashMap<i64, (Option<SubtypeMetadata>, Option<f64>)>, DomainError> {
         let mut out = HashMap::new();
         for chunk in ids.chunks(MAX_SQLITE_PARAMS) {
-            if chunk.is_empty() {
-                continue;
-            }
             let sql = format!(
                 "SELECT file_id, title, year, resolution, media_kind, duration_seconds \
                  FROM video_files WHERE file_id IN ({})",
@@ -413,9 +456,6 @@ impl SqliteCatalogRepository {
     ) -> Result<HashMap<i64, (Option<SubtypeMetadata>, Option<i64>)>, DomainError> {
         let mut out = HashMap::new();
         for chunk in ids.chunks(MAX_SQLITE_PARAMS) {
-            if chunk.is_empty() {
-                continue;
-            }
             let sql = format!(
                 "SELECT file_id, title, author, year, format_kind, page_count FROM documents \
                  WHERE file_id IN ({})",
@@ -451,9 +491,6 @@ impl SqliteCatalogRepository {
     ) -> Result<HashMap<i64, (Option<SubtypeMetadata>, Option<i64>)>, DomainError> {
         let mut out = HashMap::new();
         for chunk in ids.chunks(MAX_SQLITE_PARAMS) {
-            if chunk.is_empty() {
-                continue;
-            }
             let sql = format!(
                 "SELECT file_id, title, series, issue_number, page_count FROM comic_books \
                  WHERE file_id IN ({})",
@@ -490,9 +527,6 @@ impl SqliteCatalogRepository {
     {
         let mut out = HashMap::new();
         for chunk in ids.chunks(MAX_SQLITE_PARAMS) {
-            if chunk.is_empty() {
-                continue;
-            }
             let sql = format!(
                 "SELECT file_id, title, caption, width, height FROM images \
                  WHERE file_id IN ({})",
@@ -900,37 +934,16 @@ impl CatalogRepository for SqliteCatalogRepository {
         state: StateFilter,
         collection_uuid: Option<Uuid>,
     ) -> Result<Vec<File>, DomainError> {
-        // Build the query dynamically based on which filters are active. The
-        // filters are enumerated (not user strings) so there is no SQL
-        // injection surface; `?` placeholders bind the type discriminator and
-        // the collection uuid.
+        // Build the query dynamically based on which filters are active —
+        // see `list_filter_where_clause`.
         let base = "SELECT uuid, path, name, type, content_hash, state, deleted_at, \
                     indexed_at, missing_at, size_bytes, mtime FROM files";
         let mut sql = String::from(base);
-        let mut conj = " WHERE ";
-        if file_type.is_some() {
-            sql.push_str(conj);
-            sql.push_str("type = ?");
-            conj = " AND ";
-        }
-        match state {
-            StateFilter::Active => {
-                sql.push_str(conj);
-                sql.push_str("state = 'active'");
-                conj = " AND ";
-            }
-            StateFilter::Deleted => {
-                sql.push_str(conj);
-                sql.push_str("state = 'deleted'");
-                conj = " AND ";
-            }
-            StateFilter::All => {}
-        }
-        if collection_uuid.is_some() {
-            sql.push_str(conj);
-            sql.push_str("collection_id = (SELECT id FROM collections WHERE uuid = ?)");
-        }
-        sql.push_str(" ORDER BY path");
+        sql.push_str(&Self::list_filter_where_clause(
+            file_type,
+            state,
+            collection_uuid,
+        ));
 
         // sqlx 0.9 refuses a runtime-built SQL string unless the caller asserts
         // it was audited. `sql` is assembled only from string literals chosen by
@@ -957,36 +970,18 @@ impl CatalogRepository for SqliteCatalogRepository {
         state: StateFilter,
         collection_uuid: Option<Uuid>,
     ) -> Result<Vec<FileView>, DomainError> {
-        // Identical filter-building to `list_filtered`, with `id` selected
-        // alongside the public columns — the subtype batches below key on
-        // it, not on `uuid` (see `find_metadata_by_uuid`'s doc comment).
+        // Same filter, built by the same helper `list_filtered` uses, with
+        // `id` selected alongside the public columns — the subtype batches
+        // below key on it, not on `uuid` (see `find_metadata_by_uuid`'s
+        // doc comment).
         let base = "SELECT id, uuid, path, name, type, content_hash, state, deleted_at, \
                     indexed_at, missing_at, size_bytes, mtime FROM files";
         let mut sql = String::from(base);
-        let mut conj = " WHERE ";
-        if file_type.is_some() {
-            sql.push_str(conj);
-            sql.push_str("type = ?");
-            conj = " AND ";
-        }
-        match state {
-            StateFilter::Active => {
-                sql.push_str(conj);
-                sql.push_str("state = 'active'");
-                conj = " AND ";
-            }
-            StateFilter::Deleted => {
-                sql.push_str(conj);
-                sql.push_str("state = 'deleted'");
-                conj = " AND ";
-            }
-            StateFilter::All => {}
-        }
-        if collection_uuid.is_some() {
-            sql.push_str(conj);
-            sql.push_str("collection_id = (SELECT id FROM collections WHERE uuid = ?)");
-        }
-        sql.push_str(" ORDER BY path");
+        sql.push_str(&Self::list_filter_where_clause(
+            file_type,
+            state,
+            collection_uuid,
+        ));
 
         // See `list_filtered`'s matching comment: `sql` is assembled only
         // from string literals chosen by the enum/Option parameters above.

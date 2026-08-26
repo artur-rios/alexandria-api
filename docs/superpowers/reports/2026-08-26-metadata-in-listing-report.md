@@ -260,3 +260,103 @@ list-parity and hash-parity tests).
   divergence between transports is structurally not possible here — but a
   reviewer preferring belt-and-braces might want an explicit assertion in
   the listing parity test too.
+
+## Code review response (post-initial-report)
+
+The two concerns noted above were exactly what the code review caught,
+plus six more findings. All eight were addressed:
+
+- **Finding 1 (Important)** — three of the five new batch statements
+  (document, comic, image) never executed in any test. Replaced the
+  single audio-only HTTP test with
+  `given_each_metadata_bearing_type_when_get_files_then_element_carries_metadata_and_its_own_scalar`
+  in `crates/alexandria-http/tests/catalog_api.rs`: a table over all five
+  metadata-bearing types, each writing real metadata + its own extracted
+  scalar directly via SQL, listing, and asserting both the `metadata`
+  sub-object and the type-specific scalar field (`durationSeconds`,
+  `pageCount`, `comicPageCount`, `width`/`height`) on the array element.
+- **Finding 2 (Important)** — the FFI list-parity test compared only
+  `(name, fileType, state)`, and its library never wrote metadata, so the
+  comparison was vacuous on the one field it added metadata for. Rewrote
+  `given_same_lib_when_files_listed_via_http_and_ffi_then_arrays_identical`
+  in `crates/alexandria-ffi/tests/parity.rs`: both legs now write real
+  audio and image metadata, and `norm` (promoted to a free function,
+  `FileTriples` renamed `FileViews`) returns whole `serde_json::Value`
+  elements — stripped of `file.uuid`/`file.path`/`file.indexedAt`/
+  `file.mtime`, sorted by `file.name` — compared with `assert_eq!` on the
+  full vectors. First pass forgot to strip `mtime` (the per-leg
+  `std::fs::write` wall-clock timestamp) and failed on that alone; fixed
+  and reran green.
+- **Finding 3 (Important)** — `MAX_SQLITE_PARAMS = 900` was asserted in a
+  doc comment but never exercised past 200 ids. Added
+  `given_a_listing_past_the_chunk_boundary_when_listed_then_every_id_is_still_covered`
+  to `crates/alexandria-core/tests/browse_batching.rs`: seeds 901 audio
+  files (one past the boundary), asserts all 901 views come back with
+  metadata intact and the query count is exactly 3 (files + two subtype
+  chunks of 900 and 1).
+- **Finding 4 (Important)** — `assert!(small_queries <= 3)` would pass on
+  a dead counter (0 queries). Changed to `assert_eq!(small_queries, 2)`
+  / `assert_eq!(large_queries, 2)` — the implementation lands on exactly
+  two, matching the design. Added an "Accepted residual fragility"
+  paragraph to the module doc recording the two known failure modes (the
+  `"sqlx::query"` target being sqlx-internal, and `init_counter` swallowing
+  a losing `set_global_default`) and why both fail closed rather than
+  silently passing.
+- **Finding 5 (Minor)** — removed the five unreachable
+  `if chunk.is_empty() { continue; }` guards (`slice::chunks` never yields
+  an empty chunk) from the `batch_*` helpers in `repos.rs`.
+- **Finding 6 (Minor)** — extracted `SqliteCatalogRepository::
+  list_filter_where_clause`, called by both `list_filtered` and
+  `list_filtered_view`, so the two filter-building sites (previously
+  verbatim duplicates) can no longer drift apart when FR-CO-07's real
+  collection filter lands.
+- **Finding 7 (Minor)** — `FileView`'s doc comment in `model.rs` now notes
+  it is also the listing element (FR-FC-12), not only the single-file
+  response (FR-FC-13).
+- **Finding 8 (Minor)** — trimmed FR-FC-12 back to stating behavior only
+  (the `FileView` shape); the batching mechanism (bounded queries, one per
+  subtype present, chunked for the bound-parameter ceiling) already lived
+  in the design document's §2 and needed no duplication there — it was
+  only the SRD that had drifted into mechanism.
+
+**Follow-up noted, no action taken (out of scope for FR-FC-12):**
+`crates/alexandria-core/src/collections/queries/list_items.rs:64` still
+returns bare `File` for a collection's items, so the client now sees two
+different shapes for "a list of files" — `GET /v1/files` answers
+`FileView`, `GET /v1/collections/{uuid}/items` answers `File`. Worth its
+own issue if collection item listings should carry metadata too.
+
+## Final verification (after all eight findings addressed)
+
+```
+cargo fmt --all
+```
+No output — nothing to reformat on the final pass.
+
+```
+cargo clippy --workspace --all-targets -- -D warnings
+```
+```
+    Checking alexandria-core v0.1.0 (D:\Repositories\alexandria-api\crates\alexandria-core)
+    Checking alexandria-http v0.1.0 (D:\Repositories\alexandria-api\crates\alexandria-http)
+    Checking alexandria-ffi v0.1.0 (D:\Repositories\alexandria-api\crates\alexandria-ffi)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 3.04s
+```
+Zero warnings.
+
+```
+cargo test --workspace --no-fail-fast
+```
+53 test binaries, all `test result: ok`, 0 failed, 0 errors. Notably:
+`alexandria-core`'s new standalone `browse_batching` binary — 3 passed
+(including the 901-file chunk-boundary test); `alexandria-core`'s
+`catalog` binary — 297 passed; `alexandria-http`'s `catalog_api` binary —
+now includes the five-type metadata+scalar table test; `alexandria-ffi`'s
+`parity` binary — 97 passed, including the rewritten, now-meaningful
+listing-parity test.
+
+(One intermediate run without `--no-fail-fast`, taken between fixing
+Findings 1–8 and the `mtime`-stripping bug, surfaced the parity test's
+`mtime` omission as a genuine failure — `left`/`right` diverging only on
+`file.mtime`'s wall-clock value. Fixed as described in Finding 2 above;
+the final run shown here is green.)
