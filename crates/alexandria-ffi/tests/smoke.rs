@@ -31,7 +31,8 @@ fn serial() -> std::sync::MutexGuard<'static, ()> {
 const ASYNC_RUN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// The editable columns of an `audio_files` row, in the order every
-/// assertion here selects them: title, artist, album, year, genre, track.
+/// assertion here selects them: title, artist, album, year, genre, track,
+/// album_artist.
 type AudioMetadataRow = (
     Option<String>,
     Option<String>,
@@ -39,6 +40,7 @@ type AudioMetadataRow = (
     Option<i64>,
     Option<String>,
     Option<i64>,
+    Option<String>,
 );
 
 use alexandria_ffi::{
@@ -579,8 +581,9 @@ fn given_indexed_audio_file_when_ffi_edit_metadata_then_ok_and_row_updated() {
     assert_eq!(wait_for_files(1), 1);
 
     let uuid = uuid_by_name(&db_path, "song.mp3");
-    let patch =
-        c(r#"{"type":"audio","title":"New Title","artist":"Artist","year":2001,"track":3}"#);
+    let patch = c(
+        r#"{"type":"audio","title":"New Title","artist":"Artist","year":2001,"track":3,"albumArtist":"New Album Artist"}"#,
+    );
     let result = alexandria_file_edit_metadata(c(&uuid).as_ptr(), patch.as_ptr(), token.as_ptr());
 
     let json = metadata_json(result);
@@ -589,12 +592,13 @@ fn given_indexed_audio_file_when_ffi_edit_metadata_then_ok_and_row_updated() {
     assert_eq!(json["metadata"]["type"], "audio");
     assert_eq!(json["metadata"]["title"], "New Title");
     assert_eq!(json["metadata"]["track"], 3);
+    assert_eq!(json["metadata"]["albumArtist"], "New Album Artist");
 
     // Persisted subtype row reflects the full-replace PATCH.
     let uuid_clone = uuid.clone();
     let row = with_db(&db_path, move |pool| async move {
         let row: AudioMetadataRow = sqlx::query_as(
-            "SELECT title, artist, album, year, genre, track FROM audio_files \
+            "SELECT title, artist, album, year, genre, track, album_artist FROM audio_files \
              JOIN files ON files.id = audio_files.file_id WHERE files.uuid = ?",
         )
         .bind(uuid_clone)
@@ -609,6 +613,7 @@ fn given_indexed_audio_file_when_ffi_edit_metadata_then_ok_and_row_updated() {
     assert_eq!(row.3, Some(2001));
     assert_eq!(row.4, None, "genre absent -> NULL");
     assert_eq!(row.5, Some(3));
+    assert_eq!(row.6.as_deref(), Some("New Album Artist"));
 }
 
 #[test]

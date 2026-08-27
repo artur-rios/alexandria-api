@@ -94,7 +94,7 @@ graph LR
 | FR-FC-11 | The system shall, on re-index, detect a path that no longer exists on disk and set the File's `missingAt` marker without deleting the record or changing its `state`. |
 | FR-FC-12 | The system shall list and query files filtered by type and lifecycle state, answering each matching file as the same record its single-file lookup (FR-FC-13) would answer: the File plus its subtype metadata and extracted scalars. Filtering by containing collection is delivered with Collections (FR-CO-07), since no collection exists before then. |
 | FR-FC-13 | The system shall return a single file's metadata by its public UUID. |
-| FR-FC-14 | The system shall allow editing audio metadata (title, artist, album, year, genre, track). |
+| FR-FC-14 | The system shall allow editing audio metadata (title, artist, album, year, genre, track, albumArtist). |
 | FR-FC-15 | The system shall allow editing video metadata (title, year, resolution; `mediaKind` movie/series). |
 | FR-FC-16 | The system shall allow editing document metadata (title, author, year; `formatKind` book/ebook). |
 | FR-FC-17 | The system shall allow editing comic-book metadata (title, series, issueNumber). |
@@ -273,7 +273,7 @@ type-specific metadata. Representative subtype fields:
 
 | Subtype | Extra Fields |
 | --- | --- |
-| AudioFile | title, artist, album, year, genre, track |
+| AudioFile | title, artist, album, year, genre, track, albumArtist |
 | VideoFile | title, year, resolution, mediaKind (movie/series), episodeCount (series), durationSeconds |
 | HtmlPage | title, sourceUrl, savedAt |
 | TextFile | (content is read/written on disk, not stored) |

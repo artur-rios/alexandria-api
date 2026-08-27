@@ -88,7 +88,8 @@ fn take_json(json: *mut std::os::raw::c_char) -> String {
 const ASYNC_RUN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// The editable columns of an `audio_files` row, in the order every
-/// assertion here selects them: title, artist, album, year, genre, track.
+/// assertion here selects them: title, artist, album, year, genre, track,
+/// album_artist.
 type AudioMetadataRow = (
     Option<String>,
     Option<String>,
@@ -96,6 +97,7 @@ type AudioMetadataRow = (
     Option<i64>,
     Option<String>,
     Option<i64>,
+    Option<String>,
 );
 
 /// The shape a `GET /v1/files` / `alexandria_files_list` array is reduced
@@ -742,7 +744,7 @@ async fn given_same_audio_file_when_metadata_edited_via_http_and_ffi_then_respon
 ) {
     let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
-    let patch_json = r#"{"type":"audio","title":"Parity Title","artist":"Artist","album":"Album","year":2001,"genre":"Rock","track":3}"#;
+    let patch_json = r#"{"type":"audio","title":"Parity Title","artist":"Artist","album":"Album","year":2001,"genre":"Rock","track":3,"albumArtist":"Parity Album Artist"}"#;
     let patch_value: serde_json::Value = serde_json::from_str(patch_json).unwrap();
 
     // ---- HTTP leg ----
@@ -794,7 +796,7 @@ async fn given_same_audio_file_when_metadata_edited_via_http_and_ffi_then_respon
             .unwrap();
 
     let http_audio_row: AudioMetadataRow = sqlx::query_as(
-        "SELECT title, artist, album, year, genre, track FROM audio_files \
+        "SELECT title, artist, album, year, genre, track, album_artist FROM audio_files \
          JOIN files ON files.id = audio_files.file_id WHERE files.uuid = ?",
     )
     .bind(&http_uuid)
@@ -889,8 +891,9 @@ async fn given_same_audio_file_when_metadata_edited_via_http_and_ffi_then_respon
                             .await
                             .unwrap();
                         let row: AudioMetadataRow = sqlx::query_as(
-                            "SELECT title, artist, album, year, genre, track FROM audio_files \
-                                 JOIN files ON files.id = audio_files.file_id WHERE files.uuid = ?",
+                            "SELECT title, artist, album, year, genre, track, album_artist \
+                                 FROM audio_files JOIN files ON files.id = audio_files.file_id \
+                                 WHERE files.uuid = ?",
                         )
                         .bind(ffi_uuid)
                         .fetch_one(&pool)

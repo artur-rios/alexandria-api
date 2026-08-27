@@ -168,6 +168,11 @@ pub enum SubtypeMetadata {
         genre: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         track: Option<i64>,
+        /// The artist of the record, distinct from `artist` (the artist of
+        /// the track) — see `AudioTags::album_artist`'s doc comment for why
+        /// the core never derives one from the other.
+        #[serde(rename = "albumArtist", skip_serializing_if = "Option::is_none")]
+        album_artist: Option<String>,
     },
     Video {
         #[serde(skip_serializing_if = "Option::is_none")]

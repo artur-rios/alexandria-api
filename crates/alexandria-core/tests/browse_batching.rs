@@ -154,6 +154,7 @@ async fn seed_audio_files(repo: &SqliteCatalogRepository, count: usize) {
                 year: None,
                 genre: None,
                 track: None,
+                album_artist: None,
             },
         )
         .await

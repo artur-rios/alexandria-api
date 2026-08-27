@@ -53,6 +53,7 @@ async fn given_active_audio_file_when_edit_audio_metadata_then_metadata_replaced
         year: Some(2001),
         genre: Some("Rock".into()),
         track: Some(3),
+        album_artist: Some("Various Artists".into()),
     };
 
     let result = h.edit(uuid, metadata.clone(), TOKEN).await.expect("edit");
@@ -69,6 +70,58 @@ async fn given_active_audio_file_when_edit_audio_metadata_then_metadata_replaced
         Some(metadata),
         "repo got the metadata"
     );
+}
+
+/// FR-FC-14 / the design (issue #120): `album_artist` is settable and, on a
+/// later PATCH that omits it, clearable — and clearing it must actually
+/// write `None` back to the repo, not merely skip an already-absent field,
+/// since a PATCH is a full replace (every other field's own tests already
+/// establish this; this one pins it for the field this branch adds).
+#[tokio::test]
+async fn given_audio_file_with_album_artist_when_cleared_then_none_persisted() {
+    let (uuid, repo, h) = seeded(FileType::Audio);
+    let with_album_artist = SubtypeMetadata::Audio {
+        title: Some("Song".into()),
+        artist: Some("Artist".into()),
+        album: None,
+        year: None,
+        genre: None,
+        track: None,
+        album_artist: Some("Various Artists".into()),
+    };
+    h.edit(uuid, with_album_artist, TOKEN)
+        .await
+        .expect("first edit sets album_artist");
+    assert_eq!(
+        repo.metadata_for(uuid).and_then(|m| match m {
+            SubtypeMetadata::Audio { album_artist, .. } => album_artist,
+            _ => None,
+        }),
+        Some("Various Artists".to_string())
+    );
+
+    let cleared = SubtypeMetadata::Audio {
+        title: Some("Song".into()),
+        artist: Some("Artist".into()),
+        album: None,
+        year: None,
+        genre: None,
+        track: None,
+        album_artist: None,
+    };
+    h.edit(uuid, cleared, TOKEN)
+        .await
+        .expect("second edit clears album_artist");
+
+    match repo.metadata_for(uuid) {
+        Some(SubtypeMetadata::Audio { album_artist, .. }) => {
+            assert_eq!(
+                album_artist, None,
+                "clearing must overwrite the previously-set value, not leave it stale"
+            );
+        }
+        other => panic!("expected audio metadata, got {other:?}"),
+    }
 }
 
 // ---------- Video (FR-FC-15) ----------
@@ -204,6 +257,7 @@ async fn given_text_file_when_edit_with_any_metadata_then_invalid_input() {
         year: None,
         genre: None,
         track: None,
+        album_artist: None,
     };
 
     let result = h.edit(uuid, audio, TOKEN).await;
@@ -239,6 +293,7 @@ async fn given_missing_uuid_when_edit_then_not_found() {
         year: None,
         genre: None,
         track: None,
+        album_artist: None,
     };
 
     let result = h.edit(uuid, audio, TOKEN).await;
@@ -258,6 +313,7 @@ async fn given_unauthenticated_when_edit_then_unauthorized() {
         year: None,
         genre: None,
         track: None,
+        album_artist: None,
     };
 
     let result = h.edit(Uuid::new_v4(), audio, "").await;
@@ -281,6 +337,7 @@ async fn given_deleted_file_when_edit_then_invalid_state() {
         year: None,
         genre: None,
         track: None,
+        album_artist: None,
     };
 
     let result = h.edit(uuid, audio, TOKEN).await;

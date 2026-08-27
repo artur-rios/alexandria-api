@@ -373,8 +373,8 @@ impl SqliteCatalogRepository {
         let mut out = HashMap::new();
         for chunk in ids.chunks(MAX_SQLITE_PARAMS) {
             let sql = format!(
-                "SELECT file_id, title, artist, album, year, genre, track FROM audio_files \
-                 WHERE file_id IN ({})",
+                "SELECT file_id, title, artist, album, year, genre, track, album_artist \
+                 FROM audio_files WHERE file_id IN ({})",
                 Self::in_placeholders(chunk)
             );
             let mut query = sqlx::query_as::<_, AudioBatchRow>(sqlx::AssertSqlSafe(sql));
@@ -382,13 +382,14 @@ impl SqliteCatalogRepository {
                 query = query.bind(id);
             }
             let rows = query.fetch_all(&self.pool).await?;
-            for (file_id, title, artist, album, year, genre, track) in rows {
+            for (file_id, title, artist, album, year, genre, track, album_artist) in rows {
                 let all_none = title.is_none()
                     && artist.is_none()
                     && album.is_none()
                     && year.is_none()
                     && genre.is_none()
-                    && track.is_none();
+                    && track.is_none()
+                    && album_artist.is_none();
                 if !all_none {
                     out.insert(
                         file_id,
@@ -399,6 +400,7 @@ impl SqliteCatalogRepository {
                             year,
                             genre,
                             track,
+                            album_artist,
                         },
                     );
                 }
@@ -597,6 +599,7 @@ type AudioRow = (
     Option<i64>,
     Option<String>,
     Option<i64>,
+    Option<String>,
 );
 type VideoRow = (Option<String>, Option<i64>, Option<String>, Option<String>);
 type DocumentRow = (Option<String>, Option<String>, Option<i64>, Option<String>);
@@ -638,6 +641,7 @@ type AudioBatchRow = (
     Option<i64>,
     Option<String>,
     Option<i64>,
+    Option<String>,
 );
 type VideoBatchRow = (
     i64,
@@ -835,10 +839,12 @@ impl CatalogRepository for SqliteCatalogRepository {
                 year,
                 genre,
                 track,
+                album_artist,
             } => {
                 sqlx::query(
                     "UPDATE audio_files \
-                     SET title = ?, artist = ?, album = ?, year = ?, genre = ?, track = ? \
+                     SET title = ?, artist = ?, album = ?, year = ?, genre = ?, track = ?, \
+                     album_artist = ? \
                      WHERE file_id = ?",
                 )
                 .bind(title)
@@ -847,6 +853,7 @@ impl CatalogRepository for SqliteCatalogRepository {
                 .bind(*year)
                 .bind(genre)
                 .bind(*track)
+                .bind(album_artist)
                 .bind(id)
                 .execute(&mut *tx)
                 .await?
@@ -1147,18 +1154,21 @@ impl CatalogRepository for SqliteCatalogRepository {
         // SubtypeMetadata variant at all).
         let metadata = match file_type {
             FileType::Audio => {
-                let r: Option<AudioRow> =
-                    sqlx::query_as("SELECT title, artist, album, year, genre, track FROM audio_files WHERE file_id = ?")
-                        .bind(id)
-                        .fetch_optional(&self.pool)
-                        .await?;
-                r.and_then(|(title, artist, album, year, genre, track)| {
+                let r: Option<AudioRow> = sqlx::query_as(
+                    "SELECT title, artist, album, year, genre, track, album_artist \
+                     FROM audio_files WHERE file_id = ?",
+                )
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await?;
+                r.and_then(|(title, artist, album, year, genre, track, album_artist)| {
                     let all_none = title.is_none()
                         && artist.is_none()
                         && album.is_none()
                         && year.is_none()
                         && genre.is_none()
-                        && track.is_none();
+                        && track.is_none()
+                        && album_artist.is_none();
                     (!all_none).then_some(SubtypeMetadata::Audio {
                         title,
                         artist,
@@ -1166,6 +1176,7 @@ impl CatalogRepository for SqliteCatalogRepository {
                         year,
                         genre,
                         track,
+                        album_artist,
                     })
                 })
             }

@@ -2,7 +2,7 @@ use crate::catalog::model::SubtypeMetadata;
 
 /// Tags read from an audio file's embedded metadata (ID3/Vorbis/MP4),
 /// before being mapped onto a `SubtypeMetadata::Audio` write (issue #44
-/// pilot). Every field is `Option` because a real file rarely has all six
+/// pilot). Every field is `Option` because a real file rarely has all seven
 /// populated.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AudioTags {
@@ -12,6 +12,18 @@ pub struct AudioTags {
     pub year: Option<i64>,
     pub genre: Option<String>,
     pub track: Option<i64>,
+    /// The artist of the *record*, distinct from `artist` (the artist of the
+    /// *track*) — `ALBUMARTIST` (Vorbis), `TPE2` (ID3v2), `aART` (MP4). The
+    /// two agree for most albums, but a compilation scatters `artist` across
+    /// every track while `album_artist` names the release as a whole, and a
+    /// guest feature ("A feat. B") files `artist` apart from the rest of the
+    /// album it belongs to. Never derived from `artist` when absent — see
+    /// `into_subtype_metadata`'s doc comment and the design doc (issue
+    /// #120): an absent tag and a present one that happens to match are
+    /// different things, and folding a fallback into the core would erase
+    /// that distinction for every client, not just the ones without one of
+    /// their own.
+    pub album_artist: Option<String>,
 }
 
 /// The year `lofty::tag::Accessor::year()` used to return.
@@ -51,6 +63,7 @@ impl AudioTags {
             && self.year.is_none()
             && self.genre.is_none()
             && self.track.is_none()
+            && self.album_artist.is_none()
         {
             return None;
         }
@@ -61,6 +74,7 @@ impl AudioTags {
             year: self.year,
             genre: self.genre,
             track: self.track,
+            album_artist: self.album_artist,
         })
     }
 }
@@ -125,6 +139,17 @@ impl LoftyAudioMetadataReader {
                 .map(|s| s.to_string())
                 .filter(|s| !s.trim().is_empty()),
             track: tag.track().map(i64::from),
+            // `lofty::tag::Accessor` has no dedicated `album_artist()`
+            // convenience (unlike `title`/`artist`/`album`/`genre` above) —
+            // `ItemKey::AlbumArtist` is read the same way `year_of` reads
+            // `ItemKey::Year`: a direct `get_string` lookup. It maps
+            // `TPE2` (ID3v2), `ALBUMARTIST` (Vorbis comments), and `aART`
+            // (MP4 atoms) uniformly, across every tag format this reader
+            // parses.
+            album_artist: tag
+                .get_string(lofty::tag::ItemKey::AlbumArtist)
+                .map(|s| s.to_string())
+                .filter(|s| !s.trim().is_empty()),
         };
 
         tags.clone()
@@ -342,6 +367,7 @@ mod tests {
             year: Some(1999),
             genre: None,
             track: Some(3),
+            album_artist: None,
         };
 
         let metadata = tags.into_subtype_metadata().expect("some fields set");
@@ -355,6 +381,35 @@ mod tests {
                 year: Some(1999),
                 genre: None,
                 track: Some(3),
+                album_artist: None,
+            }
+        );
+    }
+
+    #[test]
+    fn given_only_album_artist_set_when_into_subtype_metadata_then_some() {
+        // `album_artist` alone must be enough to make the record worth
+        // writing — it participates in the all-`None` check exactly like
+        // the other six fields, not as an afterthought bolted on beside it.
+        let tags = AudioTags {
+            album_artist: Some("Various Artists".to_string()),
+            ..AudioTags::default()
+        };
+
+        let metadata = tags
+            .into_subtype_metadata()
+            .expect("album_artist alone set");
+
+        assert_eq!(
+            metadata,
+            SubtypeMetadata::Audio {
+                title: None,
+                artist: None,
+                album: None,
+                year: None,
+                genre: None,
+                track: None,
+                album_artist: Some("Various Artists".to_string()),
             }
         );
     }
@@ -385,7 +440,7 @@ mod tests {
         file.write_all(&bytes).expect("write wav");
     }
 
-    /// Write an ID3v2 tag with all six fields onto an existing WAV file.
+    /// Write an ID3v2 tag with all seven fields onto an existing WAV file.
     fn write_test_tags(path: &std::path::Path) {
         use lofty::config::WriteOptions;
         use lofty::tag::{Accessor, Tag, TagExt, TagType};
@@ -398,6 +453,31 @@ mod tests {
         // What `set_year` did for an ID3v2 tag: that format maps no dedicated
         // `Year` item, so the year goes to `RecordingDate`, which is where
         // `year_of` falls back to reading it.
+        tag.insert_text(lofty::tag::ItemKey::RecordingDate, "2020".to_string());
+        tag.set_track(7);
+        // `TPE2` — no `Accessor` convenience exists for it, unlike `artist`
+        // above, so it's written the same way it's read: a direct item key.
+        tag.insert_text(
+            lofty::tag::ItemKey::AlbumArtist,
+            "Test Album Artist".to_string(),
+        );
+        tag.save_to_path(path, WriteOptions::default())
+            .expect("save tag");
+    }
+
+    /// `write_test_tags` minus the album artist item — every other field
+    /// present, so a test against this fixture proves `album_artist` reads
+    /// `None` specifically because the tag carries none, not because
+    /// extraction failed wholesale.
+    fn write_test_tags_without_album_artist(path: &std::path::Path) {
+        use lofty::config::WriteOptions;
+        use lofty::tag::{Accessor, Tag, TagExt, TagType};
+
+        let mut tag = Tag::new(TagType::Id3v2);
+        tag.set_title("Test Title".to_string());
+        tag.set_artist("Test Artist".to_string());
+        tag.set_album("Test Album".to_string());
+        tag.set_genre("Test Genre".to_string());
         tag.insert_text(lofty::tag::ItemKey::RecordingDate, "2020".to_string());
         tag.set_track(7);
         tag.save_to_path(path, WriteOptions::default())
@@ -419,6 +499,39 @@ mod tests {
 
         assert_eq!(tags.title.as_deref(), Some("Test Title"));
         assert_eq!(tags.artist.as_deref(), Some("Test Artist"));
+        assert_eq!(tags.album.as_deref(), Some("Test Album"));
+        assert_eq!(tags.genre.as_deref(), Some("Test Genre"));
+        assert_eq!(tags.year, Some(2020));
+        assert_eq!(tags.track, Some(7));
+        assert_eq!(tags.album_artist.as_deref(), Some("Test Album Artist"));
+    }
+
+    /// The design's core rule (issue #120): a file that carries no album
+    /// artist tag must read `None` for it — never a copy of `artist` — while
+    /// every other tag the same file carries still extracts normally.
+    #[tokio::test]
+    async fn given_tagged_wav_without_album_artist_when_read_then_album_artist_none_others_present()
+    {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("no_album_artist.wav");
+        write_minimal_wav(&path);
+        write_test_tags_without_album_artist(&path);
+
+        let reader = LoftyAudioMetadataReader;
+        let tags = reader
+            .read(path.to_str().unwrap())
+            .await
+            .expect("tags extracted");
+
+        assert_eq!(
+            tags.album_artist, None,
+            "no ALBUMARTIST/TPE2/aART tag written, none must be read back"
+        );
+        // Not a copy of `artist` (the design's own rule, issue #120): the
+        // file's track artist is present and non-empty, yet `album_artist`
+        // above is still `None`.
+        assert_eq!(tags.artist.as_deref(), Some("Test Artist"));
+        assert_eq!(tags.title.as_deref(), Some("Test Title"));
         assert_eq!(tags.album.as_deref(), Some("Test Album"));
         assert_eq!(tags.genre.as_deref(), Some("Test Genre"));
         assert_eq!(tags.year, Some(2020));
@@ -452,6 +565,7 @@ mod tests {
         // `Year` item, so the year goes to `RecordingDate`, which is where
         // `year_of` falls back to reading it.
         tag.insert_text(lofty::tag::ItemKey::RecordingDate, "2021".to_string());
+        tag.insert_text(lofty::tag::ItemKey::AlbumArtist, String::new());
         tag.save_to_path(path, WriteOptions::default())
             .expect("save tag");
     }
@@ -477,6 +591,10 @@ mod tests {
         assert_eq!(tags.album, None);
         assert_eq!(tags.genre, None);
         assert_eq!(tags.year, Some(2021));
+        assert_eq!(
+            tags.album_artist, None,
+            "empty string must not become Some(\"\")"
+        );
     }
 
     #[tokio::test]
