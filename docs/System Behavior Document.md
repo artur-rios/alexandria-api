@@ -675,7 +675,7 @@ counted in the run's `failed` tally.
 
 | Type | Read from | Fields |
 | --- | --- | --- |
-| Audio | embedded tags (`lofty`) | title, artist, album, year, genre, track |
+| Audio | embedded tags (`lofty`) | title, artist, album, year, genre, track, albumArtist |
 | Image | EXIF (`kamadak-exif`) | dimensions, title |
 | Document | PDF (`lopdf`) / EPUB (`epub`) | title, author, year, page count, `formatKind` |
 | Video | container (`ffmpeg-next`) | title, year, resolution, duration |
@@ -684,6 +684,17 @@ counted in the run's `failed` tally.
 Two fields are never inferred: a video's `mediaKind` (nothing in the file
 distinguishes a movie from an episode) and an image's `caption`. Each type's
 writes are independent — one failing does not block the other.
+
+An audio file's `albumArtist` is read the same as its other six fields (issue
+#120) — `ALBUMARTIST` / `TPE2` / `aART`, whichever the file carries — but it is
+never derived from `artist` when the tag is absent. A file with no album
+artist tag reads `albumArtist: null`, not a copy of its track artist: an
+absent tag and a present one that happens to equal the track artist are
+different things, and the core reports what the file says rather than
+guessing on a client's behalf. Because extraction runs only at first index
+(FR-FC-25) and re-index never re-runs it, a library already indexed before
+this field existed gains no `albumArtist` values until it is indexed afresh
+— the same consequence `duration_seconds` had when that field was added.
 
 `formatKind` is set from the format itself: `book` for PDF, `ebook` for EPUB.
 

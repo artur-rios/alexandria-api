@@ -90,7 +90,7 @@ never fails the file's indexing.
 
 | Package | Used for | Notes |
 | --- | --- | --- |
-| **lofty** | audio tags (title, artist, album, year, genre, track) | pure Rust, no system dependency |
+| **lofty** | audio tags (title, artist, album, year, genre, track, albumArtist) | pure Rust, no system dependency |
 | **kamadak-exif** | image EXIF (title, pixel dimensions) | raw EXIF dimensions; `Orientation` is not applied |
 | **lopdf** | PDF metadata and page count | pure Rust |
 | **epub** / **quick-xml** | EPUB metadata | EPUB is reflowable, so it never yields a page count |

@@ -14,7 +14,8 @@ use crate::common::{
 };
 
 /// The editable columns of an `audio_files` row, in the order every
-/// assertion here selects them: title, artist, album, year, genre, track.
+/// assertion here selects them: title, artist, album, year, genre, track,
+/// album_artist.
 type AudioMetadataRow = (
     Option<String>,
     Option<String>,
@@ -22,6 +23,7 @@ type AudioMetadataRow = (
     Option<i64>,
     Option<String>,
     Option<i64>,
+    Option<String>,
 );
 
 fn index_request(root: &str) -> Request<Body> {
@@ -337,7 +339,8 @@ async fn given_indexed_audio_file_when_patch_audio_metadata_then_200_and_row_upd
         "album": "New Album",
         "year": 2001,
         "genre": "Rock",
-        "track": 3
+        "track": 3,
+        "albumArtist": "New Album Artist"
     });
 
     let response = app(Settings::default(), test.services)
@@ -356,10 +359,11 @@ async fn given_indexed_audio_file_when_patch_audio_metadata_then_200_and_row_upd
     assert_eq!(json["metadata"]["type"], "audio");
     assert_eq!(json["metadata"]["title"], "New Title");
     assert_eq!(json["metadata"]["track"], 3);
+    assert_eq!(json["metadata"]["albumArtist"], "New Album Artist");
 
     // Persisted subtype row reflects the full-replace PATCH.
     let row: AudioMetadataRow = sqlx::query_as(
-        "SELECT title, artist, album, year, genre, track FROM audio_files \
+        "SELECT title, artist, album, year, genre, track, album_artist FROM audio_files \
              JOIN files ON files.id = audio_files.file_id WHERE files.uuid = ?",
     )
     .bind(&uuid)
@@ -372,6 +376,70 @@ async fn given_indexed_audio_file_when_patch_audio_metadata_then_200_and_row_upd
     assert_eq!(row.3, Some(2001));
     assert_eq!(row.4.as_deref(), Some("Rock"));
     assert_eq!(row.5, Some(3));
+    assert_eq!(row.6.as_deref(), Some("New Album Artist"));
+}
+
+/// FR-FC-14 / issue #120: a subsequent PATCH that omits `albumArtist`
+/// clears it — a PATCH is a full replace (AudioMetadataRow's own doc
+/// comment), so the field's absence in the body must write `NULL`, not
+/// leave the previous value in place.
+#[tokio::test]
+async fn given_album_artist_set_when_patched_without_it_then_cleared_to_null() {
+    let lib = tempdir().unwrap();
+    common::write_file(&lib, "song.mp3", b"audio bytes");
+
+    let test = test_app().await;
+    let router = app(Settings::default(), test.services.clone());
+    let _ = router
+        .oneshot(index_request(lib.path().to_str().unwrap()))
+        .await
+        .expect("index one-shot");
+    wait_for_files(&test.pool, 1).await;
+
+    let uuid = uuid_for_name(&test.pool, "song.mp3").await;
+
+    let with_album_artist = json!({
+        "type": "audio",
+        "title": "Title",
+        "albumArtist": "Various Artists"
+    });
+    let response = app(Settings::default(), test.services.clone())
+        .oneshot(patch_metadata(&uuid, with_album_artist))
+        .await
+        .expect("first patch one-shot");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let without_album_artist = json!({
+        "type": "audio",
+        "title": "Title"
+    });
+    let response = app(Settings::default(), test.services)
+        .oneshot(patch_metadata(&uuid, without_album_artist))
+        .await
+        .expect("second patch one-shot");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let bytes = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    let json: Value = serde_json::from_slice(&bytes).expect("json");
+    assert!(
+        json["metadata"].get("albumArtist").is_none(),
+        "cleared field is omitted (skip_serializing_if), not written as null"
+    );
+
+    let row: AudioMetadataRow = sqlx::query_as(
+        "SELECT title, artist, album, year, genre, track, album_artist FROM audio_files \
+             JOIN files ON files.id = audio_files.file_id WHERE files.uuid = ?",
+    )
+    .bind(&uuid)
+    .fetch_one(&test.pool)
+    .await
+    .expect("audio row");
+    assert_eq!(
+        row.6, None,
+        "second PATCH must overwrite the stored value with NULL"
+    );
 }
 
 #[tokio::test]
@@ -827,13 +895,14 @@ async fn given_each_metadata_bearing_type_when_get_files_then_element_carries_me
         Case {
             file_name: "song.mp3",
             update_sql: "UPDATE audio_files SET title='Title', artist='Artist', album=NULL, \
-                          year=2001, genre=NULL, track=NULL \
+                          year=2001, genre=NULL, track=NULL, album_artist='Album Artist' \
                           FROM files WHERE audio_files.file_id = files.id AND files.uuid = ?",
             expected_type: "audio",
             assert_view: |el| {
                 assert_eq!(el["metadata"]["type"], "audio");
                 assert_eq!(el["metadata"]["title"], "Title");
                 assert_eq!(el["metadata"]["artist"], "Artist");
+                assert_eq!(el["metadata"]["albumArtist"], "Album Artist");
             },
         },
         Case {

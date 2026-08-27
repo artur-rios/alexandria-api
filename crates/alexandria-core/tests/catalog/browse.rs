@@ -112,6 +112,7 @@ async fn given_listing_of_one_type_when_list_then_each_row_carries_its_metadata(
             year: None,
             genre: None,
             track: None,
+            album_artist: None,
         },
     );
     repo.seed_metadata(
@@ -123,6 +124,7 @@ async fn given_listing_of_one_type_when_list_then_each_row_carries_its_metadata(
             year: None,
             genre: None,
             track: None,
+            album_artist: None,
         },
     );
 
@@ -158,6 +160,7 @@ async fn given_mixed_type_listing_when_list_then_each_row_carries_its_own_metada
             year: None,
             genre: None,
             track: None,
+            album_artist: None,
         },
     );
     repo.seed_metadata(
@@ -370,6 +373,7 @@ async fn given_file_with_written_metadata_when_get_by_uuid_then_metadata_echoed(
         year: Some(2001),
         genre: None,
         track: None,
+        album_artist: None,
     };
     repo.seed_metadata(uuid, metadata.clone());
 

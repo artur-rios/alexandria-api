@@ -775,6 +775,7 @@ async fn given_tagged_audio_file_when_execute_then_subtype_metadata_written() {
             year: Some(2001),
             genre: Some("Rock".to_string()),
             track: Some(4),
+            album_artist: Some("Various Artists".to_string()),
         },
     );
     let handler = handler(
@@ -809,6 +810,7 @@ async fn given_tagged_audio_file_when_execute_then_subtype_metadata_written() {
             year: Some(2001),
             genre: Some("Rock".to_string()),
             track: Some(4),
+            album_artist: Some("Various Artists".to_string()),
         }
     );
 }

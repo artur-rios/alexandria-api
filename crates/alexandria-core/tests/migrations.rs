@@ -1,3 +1,5 @@
+use alexandria_core::catalog::model::{FileType, StateFilter, SubtypeMetadata};
+use alexandria_core::catalog::repos::{CatalogRepository, SqliteCatalogRepository};
 use alexandria_core::migrate::run_migrations;
 use sqlx::sqlite::SqlitePoolOptions;
 
@@ -191,4 +193,152 @@ async fn given_a_populated_pre_14_database_when_migrated_then_the_credential_row
     );
 
     pool.close().await;
+}
+
+/// The risk migration 15 (issue #120) names about itself: every
+/// `audio_files` row that already existed when the column was added reads
+/// `NULL` for `album_artist`, and nothing that indexes fresh data would ever
+/// notice that — a fresh index writes every column, migrated or not, so a
+/// test that only ever inserts through today's schema exercises a case the
+/// real upgrade path never hits.
+///
+/// This reproduces the actual upgrade: apply migrations 0 … 14 by hand (the
+/// same subset-`Migrator` technique
+/// `given_a_populated_pre_14_database_when_migrated_then_the_credential_row_survives`
+/// uses), insert a `files` row and an `audio_files` row through *that*
+/// schema — one with no `album_artist` column to write to, because at
+/// migration 14 there is none — then let `run_migrations` apply migration
+/// 15 on top of data that already exists. The row's five other populated
+/// columns must survive the `ALTER TABLE ADD COLUMN` untouched, and the new
+/// column must read back as `None` through both of the repository's own
+/// audio read paths: `find_metadata_by_uuid` (the single-file read) and
+/// `list_filtered_view` (the batched listing read, issue #116) — the design
+/// names both as the ones a client actually calls, and a bug isolated to
+/// only one of the two hard-coded `SELECT`s would pass a test that checked
+/// just the other.
+#[tokio::test]
+async fn given_a_pre_15_audio_row_when_migrated_then_album_artist_reads_null_not_missing_data() {
+    use sqlx::migrate::{Migrate, Migrator};
+
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .expect("connect");
+
+    let migrator = Migrator::new(std::path::Path::new("./migrations"))
+        .await
+        .expect("read migrations");
+
+    let mut conn = pool.acquire().await.expect("acquire");
+    conn.ensure_migrations_table(&migrator.table_name)
+        .await
+        .expect("meta table");
+    for migration in migrator.iter().filter(|m| m.version <= 14) {
+        conn.apply(&migrator.table_name, migration)
+            .await
+            .expect("apply");
+    }
+    drop(conn);
+
+    // Seed a `files` row and its `audio_files` row exactly as an install
+    // predating this branch would hold one: five of the six pre-existing
+    // fields populated (the sixth, `track`, deliberately left `NULL` too,
+    // proving that column's own pre-existing `NULL`s are undisturbed by the
+    // migration alongside the new column's).
+    let uuid = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO files \
+         (uuid, path, name, type, content_hash, size_bytes, mtime, state, deleted_at, \
+          indexed_at, missing_at) \
+         VALUES (?, '/lib/old.mp3', 'old.mp3', 'audio', NULL, NULL, NULL, 'active', NULL, ?, NULL)",
+    )
+    .bind(uuid.to_string())
+    .bind(chrono::Utc::now().to_rfc3339())
+    .execute(&pool)
+    .await
+    .expect("seed file");
+
+    let (file_id,): (i64,) = sqlx::query_as("SELECT id FROM files WHERE uuid = ?")
+        .bind(uuid.to_string())
+        .fetch_one(&pool)
+        .await
+        .expect("resolve file id");
+
+    // No `album_artist` in this INSERT — at migration 14 the column does
+    // not exist, so this is the only INSERT a pre-branch install could ever
+    // have run.
+    sqlx::query(
+        "INSERT INTO audio_files (file_id, title, artist, album, year, genre, track) \
+         VALUES (?, 'Old Title', 'Old Artist', 'Old Album', 1999, 'Old Genre', NULL)",
+    )
+    .bind(file_id)
+    .execute(&pool)
+    .await
+    .expect("seed pre-15 audio row");
+
+    // The upgrade: migration 15 (and any later ones) applies on top of the
+    // row that already exists.
+    run_migrations(&pool).await.expect("migrate to head");
+
+    let repo = SqliteCatalogRepository::new(pool);
+
+    // Path 1: the single-file read.
+    let metadata = repo
+        .find_metadata_by_uuid(uuid)
+        .await
+        .expect("query")
+        .expect("five populated fields keep this Some, not None");
+    match metadata {
+        SubtypeMetadata::Audio {
+            title,
+            artist,
+            album,
+            year,
+            genre,
+            track,
+            album_artist,
+        } => {
+            assert_eq!(title.as_deref(), Some("Old Title"));
+            assert_eq!(artist.as_deref(), Some("Old Artist"));
+            assert_eq!(album.as_deref(), Some("Old Album"));
+            assert_eq!(year, Some(1999));
+            assert_eq!(genre.as_deref(), Some("Old Genre"));
+            assert_eq!(
+                track, None,
+                "pre-existing NULL column, unrelated to the migration"
+            );
+            assert_eq!(
+                album_artist, None,
+                "a column that did not exist when this row was written must read \
+                 null, not fail and not silently drop the row's other five fields"
+            );
+        }
+        other => panic!("expected audio metadata, got {other:?}"),
+    }
+
+    // Path 2: the batched listing read (`list_filtered_view` /
+    // `batch_audio`), issue #116's other hard-coded `SELECT` naming the same
+    // columns — a mistake isolated to only one of the two would pass a test
+    // that checked just the other.
+    let views = repo
+        .list_filtered_view(Some(FileType::Audio), StateFilter::Active, None)
+        .await
+        .expect("list");
+    assert_eq!(views.len(), 1);
+    match &views[0].metadata {
+        Some(SubtypeMetadata::Audio {
+            title,
+            album_artist,
+            ..
+        }) => {
+            assert_eq!(title.as_deref(), Some("Old Title"));
+            assert_eq!(
+                *album_artist, None,
+                "the batched listing path must read the same null the \
+                 single-file path does"
+            );
+        }
+        other => panic!("expected audio metadata in listing, got {other:?}"),
+    }
 }
