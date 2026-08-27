@@ -153,7 +153,19 @@ trip exercises the same code path.
 
 ## Commands run
 
-(filled in after verification — see below)
+The coordinator ran a first full verification pass independently (`cargo
+fmt`, `cargo clippy --workspace --all-targets -D warnings`, `cargo test
+--workspace`, all clean) against the state committed as `af00668`, before
+review returned five findings (below). After addressing them I re-ran the
+same three commands myself against the amended tree:
+
+- `cargo fmt --all` — clean, no reformatting needed.
+- `cargo clippy --workspace --all-targets -- -D warnings` — clean.
+- `cargo test --workspace` — green, full workspace (`alexandria-core`,
+  `alexandria-http`, `alexandria-ffi`).
+
+So: the coordinator ran the first pass on the pre-review commit; I ran the
+second pass myself on the post-review amendments before committing them.
 
 ## Open questions the design left to this implementation
 
@@ -177,6 +189,40 @@ trip exercises the same code path.
   test (migration 14's credential-row survival test) and the same
   subset-`Migrator` technique applies directly.
 
+## Review findings addressed (round 1)
+
+1. **Important — extraction parity never carried an album artist.**
+   `write_test_tags` in `alexandria-ffi/tests/parity.rs` (the fixture behind
+   `given_tagged_audio_file_when_indexed_via_http_and_ffi_then_extracted_metadata_matches`)
+   now sets `ItemKey::AlbumArtist`, and that test explicitly asserts
+   `albumArtist` on both legs rather than relying only on the whole-body
+   `assert_eq!` (a field both sides omit passes that check silently — how
+   the gap got through the first time). Added a companion test,
+   `given_untagged_album_artist_when_indexed_via_http_and_ffi_then_both_report_null`,
+   covering the design's other half: a file with its other six tags present
+   but no album-artist item, asserting both surfaces agree it's absent.
+2. **Important — placeholder report sections.** Filled in above ("Commands
+   run") and this section.
+3. **Minor — design/test contradiction on clearing.** The design's testing
+   bullet now says what the code actually guarantees ("a later PATCH that
+   omits it overwrites the stored value with `NULL` rather than being a
+   no-op"), not a tri-state claim. Dropped the "reach the same state
+   deliberately" sentence from `catalog_api.rs`'s test doc comment so it no
+   longer argues a distinction the implementation doesn't make.
+4. **Minor — FR-FC-01 vs the §4.2 table.** Design's requirements-impact
+   bullet now names the System Requirements Document's §4.2 subtype-fields
+   table directly, rather than FR-FC-01 (whose own prose enumerates no
+   fields and so never became stale).
+5. **Minor — the first-index-only consequence lived only in the design.**
+   Added one sentence to `docs/System Behavior Document.md` (§5.12, after
+   the no-fallback paragraph): a library indexed before this field existed
+   gains no `albumArtist` until re-indexed afresh, the same consequence
+   `duration_seconds` had.
+
 ## Concerns
 
-(filled in after verification — see below)
+None outstanding. The one open risk the design named by name — pre-existing
+rows reading null after the migration — is covered by
+`tests/migrations.rs`'s dedicated test through both repository read paths.
+The parity gap review caught (Finding 1) is now closed with an explicit,
+non-vacuous assertion plus a dedicated "does not have one" test.

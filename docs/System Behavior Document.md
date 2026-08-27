@@ -691,7 +691,10 @@ never derived from `artist` when the tag is absent. A file with no album
 artist tag reads `albumArtist: null`, not a copy of its track artist: an
 absent tag and a present one that happens to equal the track artist are
 different things, and the core reports what the file says rather than
-guessing on a client's behalf.
+guessing on a client's behalf. Because extraction runs only at first index
+(FR-FC-25) and re-index never re-runs it, a library already indexed before
+this field existed gains no `albumArtist` values until it is indexed afresh
+— the same consequence `duration_seconds` had when that field was added.
 
 `formatKind` is set from the format itself: `book` for PDF, `ebook` for EPUB.
 

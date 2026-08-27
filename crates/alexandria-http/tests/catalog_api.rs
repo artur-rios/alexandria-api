@@ -382,8 +382,7 @@ async fn given_indexed_audio_file_when_patch_audio_metadata_then_200_and_row_upd
 /// FR-FC-14 / issue #120: a subsequent PATCH that omits `albumArtist`
 /// clears it — a PATCH is a full replace (AudioMetadataRow's own doc
 /// comment), so the field's absence in the body must write `NULL`, not
-/// leave the previous value in place. This is what makes "cleared" and
-/// "never set" reach the same state deliberately, rather than by accident.
+/// leave the previous value in place.
 #[tokio::test]
 async fn given_album_artist_set_when_patched_without_it_then_cleared_to_null() {
     let lib = tempdir().unwrap();

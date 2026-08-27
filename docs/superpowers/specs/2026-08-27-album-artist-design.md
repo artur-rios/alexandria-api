@@ -66,8 +66,9 @@ the track artist is what makes an un-re-indexed library keep working meanwhile.
 
 ## Requirements impact
 
-- **FR-FC-01** lists what an audio file's record holds, and gains the album
-  artist.
+- The System Requirements Document's §4.2 subtype-fields table — what
+  FR-FC-01 indexes an `AudioFile` record as holding — lists the six fields
+  and gains the album artist as a seventh.
 - **FR-FC-14** covers editing an audio file's metadata, and gains it too.
 
 No new use case: UC-01 indexes, UC-04 edits, and both already cover this field's
@@ -84,8 +85,9 @@ Following Testing Specification §3:
   with one; extraction failure still leaves the file indexed.
 - **Integration, against SQLite:** the column round-trips, and a listing carries
   it (FR-FC-12) as it carries the other six.
-- **Integration, editing:** an owner can set and clear it, and clearing it is
-  distinguishable from never having had one.
+- **Integration, editing:** an owner can set it, and a later PATCH that omits
+  it overwrites the stored value with `NULL` rather than being a no-op — a
+  full-replace PATCH must actually clear the field, not just leave it stale.
 - **Parity:** HTTP and FFI answer identically for a file that has one and a
   file that does not (NFR-09, FR-FC-24).
 
