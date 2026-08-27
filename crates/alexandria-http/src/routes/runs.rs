@@ -6,6 +6,7 @@ use serde::Deserialize;
 use uuid::Uuid;
 
 use alexandria_core::catalog::commands::index::IndexStarted;
+use alexandria_core::catalog::index_scope::IndexScope;
 use alexandria_core::catalog::runs::{CatalogRun, RunKind, RunPriority};
 
 use crate::middleware::auth::invalid_input;
@@ -125,7 +126,9 @@ pub struct ResumeBody {
 /// `index()` and `refresh()` spawn their own — the handler stays free of the
 /// runtime so whichever transport owns one is the one that spawns. Which
 /// handler gets spawned depends on `RunResumed::kind`: an index run resumes
-/// into `index_handler.execute(&root, run_id)`, a refresh into
+/// into `index_handler.execute(&root, run_id, &IndexScope::all())` — every
+/// type, because a run's scope is not persisted and a resume has none to
+/// reinstate — a refresh into
 /// `refresh_handler.execute(run_id)` (a refresh carries no root — it touches
 /// everything cataloged). A resumed index run whose stored `root` is somehow
 /// absent — it should never be, every row `RunKind::Index` writes carries one
@@ -191,7 +194,13 @@ pub async fn resume_run(
                 // the run could not resume at all; `execute` has already
                 // written its own terminal row on that path (UC-48), so the
                 // failure is recorded, not lost.
-                if let Err(err) = handler.execute(&root, spawned_run_id).await {
+                // Every type: a run's scope is not persisted (`IndexScope`),
+                // so a resume has none to reinstate. Inventing a narrower one
+                // here would be guessing at what the original call asked for.
+                if let Err(err) = handler
+                    .execute(&root, spawned_run_id, &IndexScope::all())
+                    .await
+                {
                     tracing::error!(run_id = %spawned_run_id, error = %err, "resumed index run aborted");
                 }
             });

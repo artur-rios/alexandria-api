@@ -303,7 +303,7 @@ sequenceDiagram
     participant R as catalog_runs
     participant W as Walk task
 
-    CL->>T: POST /v1/index {root, priority}
+    CL->>T: POST /v1/index {root, priority, types}
     T->>H: start(request, token)
     H->>H: authenticate
     H->>H: root exists?
@@ -311,7 +311,7 @@ sequenceDiagram
     H->>R: insert run (running, concurrency from priority)
     Note over R: FR-FC-27 — the record opens only after<br/>validation, so an invalid root leaves no stray row
     H-->>T: run id
-    T->>W: spawn execute(root, run_id)
+    T->>W: spawn execute(root, run_id, scope)
     T-->>CL: 202 Accepted {runId}
     W->>W: walk, classify, stat, persist
 ```
@@ -350,7 +350,7 @@ deployment changes behavior on upgrade. Re-index takes no root and is unaffected
 
 ```mermaid
 flowchart TD
-    START(["execute(root, run_id)"]) --> READ["Read the run's stored concurrency<br/>and segment"]
+    START(["execute(root, run_id, scope)"]) --> READ["Read the run's stored concurrency<br/>and segment"]
     READ --> OPEN["Open the run's cell in the registry<br/>phase = discovering"]
     OPEN --> LIST["list_files(root)"]
     LIST -->|"could not list"| FAIL["status = failed<br/>record the error"]
@@ -364,7 +364,9 @@ flowchart TD
     SIG2 -->|"yes"| DRAIN["Halted — counted nowhere,<br/>does not advance `processed`"]
     SIG2 -->|"no"| CLASS{"extension<br/>recognised?"}
     CLASS -->|"no"| SKIP["Skipped"]
-    CLASS -->|"yes"| SEEN{"path already<br/>in the catalog?"}
+    CLASS -->|"yes"| SCOPE{"type in the<br/>run's scope?"}
+    SCOPE -->|"no"| SKIP
+    SCOPE -->|"yes"| SEEN{"path already<br/>in the catalog?"}
     SEEN -->|"yes"| ALREADY["AlreadyCataloged"]
     SEEN -->|"no"| INS["Insert the record<br/>path · name · type · size · mtime<br/>content_hash stays NULL"]
     INS --> META["Best-effort metadata extraction<br/>(FR-FC-25)"]
@@ -714,6 +716,31 @@ By extension alone, matched case-insensitively. Anything else is skipped.
 
 A `.pdf` indexes as a Document even when it is a comic: extension alone cannot
 distinguish a comic PDF from a book PDF.
+
+### 5.14 The run's scope
+
+A run records the file types its **scope** names (`FR-FC-01`), spelled the same
+way the catalog reads a type back — `audio`, `video`, `html`, `text`,
+`document`, `comic`, `image`. HTTP takes them as an array
+(`{"types": ["audio"]}`), the FFI as one comma-separated string
+(`"audio,image"`); an absent key, an empty array, NULL, and the empty string
+all mean **every type**, so every caller predating the scope keeps its
+behaviour.
+
+The check sits *after* classification, because the type is what is being
+filtered on and only the classifier knows it. An out-of-scope file takes the
+same `Skipped` outcome an unsupported extension takes: in both cases the run
+saw a file and chose not to record it, and a second counter would split one
+fact across two numbers every reader would then have to add together.
+
+An unrecognised type name is **rejected** — the one place a wire word is not
+defaulted. An unreadable priority has a safe fallback to fall back to; a
+scope's only candidate is "every type", which is the opposite of what a caller
+asking for a narrower scope wants, and it fails in the direction of
+cataloguing exactly the files the owner meant to exclude.
+
+Nothing about the scope is persisted: it matters only while the run walks. A
+resumed run (§5.9) therefore has none to reinstate and walks every type.
 
 ---
 

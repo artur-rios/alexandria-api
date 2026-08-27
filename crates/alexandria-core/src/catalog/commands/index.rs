@@ -12,6 +12,7 @@ use crate::catalog::commands::{flush_progress, record_halt, PROGRESS_FLUSH_SECON
 use crate::catalog::document_tags::DocumentMetadataReader;
 use crate::catalog::fs::{FileEntry, Filesystem};
 use crate::catalog::image_tags::ImageMetadataReader;
+use crate::catalog::index_scope::IndexScope;
 use crate::catalog::model::{FileType, NewFile};
 use crate::catalog::repos::CatalogRepository;
 use crate::catalog::run_registry::{RunCell, RunPhase, RunRegistry, RunSignal};
@@ -25,6 +26,10 @@ pub struct IndexRequest {
     pub root: String,
     /// How hard this run should push (FR-FC-08). See `RunPriority`.
     pub priority: RunPriority,
+    /// The file types this run records. Default is every supported type, so a
+    /// caller that says nothing indexes what it always did. See `IndexScope`
+    /// for why the scope travels to `execute` rather than onto the run row.
+    pub scope: IndexScope,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -358,7 +363,18 @@ where
     /// a repository write for it fails — is counted in `failed`, logged at
     /// `warn`, and the walk continues. One locked file must not abandon the
     /// rest of the library. Only a failure to list the root at all aborts.
-    pub async fn execute(&self, root: &str, run_id: Uuid) -> Result<IndexOutcome, DomainError> {
+    ///
+    /// `scope` is the request's own (`IndexRequest::scope`) rather than a
+    /// column read back off the run, because nothing persists it: it is an
+    /// argument here for the same reason `root` is. A resumed run therefore
+    /// has none to reinstate and walks at `IndexScope::all` — see
+    /// `RunControlHandler::resume`'s callers.
+    pub async fn execute(
+        &self,
+        root: &str,
+        run_id: Uuid,
+        scope: &IndexScope,
+    ) -> Result<IndexOutcome, DomainError> {
         let now = self.clock.now();
         // Read from the run's own row rather than carried in as a parameter
         // or held in a field: `IndexHandler` is long-lived (built once at
@@ -513,6 +529,15 @@ where
                 let Some(file_type) = classify_by_extension(&entry.name) else {
                     return EntryOutcome::Skipped;
                 };
+                // Filtered after classification because the type is what is
+                // being filtered on, and only the classifier knows it. The
+                // outcome is the same `Skipped` an unsupported extension
+                // takes: in both cases the run saw the file and chose not to
+                // record it, and a second counter would split one fact across
+                // two numbers every reader would then have to add up.
+                if !scope.includes(file_type) {
+                    return EntryOutcome::Skipped;
+                }
                 let path = entry.path.clone();
                 match self.index_entry(entry, file_type, now).await {
                     Ok(outcome) => outcome,
