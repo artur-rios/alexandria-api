@@ -5,6 +5,8 @@
 use chrono::{TimeZone, Utc};
 use uuid::Uuid;
 
+use alexandria_core::catalog::index_scope::IndexScope;
+use alexandria_core::catalog::model::FileType;
 use alexandria_core::catalog::run_registry::{RunPhase, RunProgress};
 use alexandria_core::catalog::runs::{
     CatalogRunRepository, RunCounts, RunKind, RunStatus, SqliteCatalogRunRepository,
@@ -41,7 +43,7 @@ async fn given_a_started_run_when_read_then_it_is_running_with_no_counts() {
     let (repo, _dir) = repo().await;
     let id = Uuid::new_v4();
 
-    repo.start(id, RunKind::Index, Some("/library"), t(1), 4)
+    repo.start(id, RunKind::Index, Some("/library"), t(1), 4, None)
         .await
         .expect("start");
 
@@ -71,7 +73,7 @@ async fn given_a_run_started_at_a_given_width_when_read_then_the_width_round_tri
     let (repo, _dir) = repo().await;
     let id = Uuid::new_v4();
 
-    repo.start(id, RunKind::Index, Some("/library"), t(1), 1)
+    repo.start(id, RunKind::Index, Some("/library"), t(1), 1, None)
         .await
         .expect("start");
 
@@ -79,11 +81,57 @@ async fn given_a_run_started_at_a_given_width_when_read_then_the_width_round_tri
     assert_eq!(run.concurrency, Some(1));
 }
 
+/// The real-SQL counterpart of the handler-level scope tests
+/// (`tests/catalog/index.rs`): `start`'s `scope` INSERT and `get`'s `scope`
+/// SELECT round-trip through an actual `catalog_runs` row, so a resume can
+/// read back the types the run was told to record.
+#[tokio::test]
+async fn given_a_scoped_run_when_read_then_the_scope_round_trips() {
+    let (repo, _dir) = repo().await;
+    let id = Uuid::new_v4();
+
+    repo.start(
+        id,
+        RunKind::Index,
+        Some("/library"),
+        t(1),
+        4,
+        Some("audio,image"),
+    )
+    .await
+    .expect("start");
+
+    let run = repo.get(id).await.expect("get").expect("run exists");
+    assert!(run.scope.includes(FileType::Audio));
+    assert!(run.scope.includes(FileType::Image));
+    assert!(
+        !run.scope.includes(FileType::Video),
+        "a stored scope names what it covers, and nothing else"
+    );
+}
+
+/// A row written before `catalog_runs.scope` existed holds NULL there, which
+/// has to go on meaning what an absent scope has always meant. That is what
+/// makes the added column need no backfill.
+#[tokio::test]
+async fn given_a_run_with_no_stored_scope_when_read_then_it_covers_every_type() {
+    let (repo, _dir) = repo().await;
+    let id = Uuid::new_v4();
+
+    repo.start(id, RunKind::Index, Some("/library"), t(1), 4, None)
+        .await
+        .expect("start");
+
+    let run = repo.get(id).await.expect("get").expect("run exists");
+    assert_eq!(run.scope, IndexScope::all());
+    assert!(run.scope.includes(FileType::Image));
+}
+
 #[tokio::test]
 async fn given_a_running_index_run_when_finished_then_it_is_complete_with_its_counts() {
     let (repo, _dir) = repo().await;
     let id = Uuid::new_v4();
-    repo.start(id, RunKind::Index, Some("/library"), t(1), 4)
+    repo.start(id, RunKind::Index, Some("/library"), t(1), 4, None)
         .await
         .expect("start");
 
@@ -123,7 +171,7 @@ async fn given_a_run_with_per_file_failures_when_finished_then_it_is_complete_no
     // `failed` counts them; the run still completed its walk.
     let (repo, _dir) = repo().await;
     let id = Uuid::new_v4();
-    repo.start(id, RunKind::Refresh, None, t(1), 4)
+    repo.start(id, RunKind::Refresh, None, t(1), 4, None)
         .await
         .expect("start");
 
@@ -152,7 +200,7 @@ async fn given_a_run_with_per_file_failures_when_finished_then_it_is_complete_no
 async fn given_a_running_refresh_run_when_failed_then_it_carries_the_error() {
     let (repo, _dir) = repo().await;
     let id = Uuid::new_v4();
-    repo.start(id, RunKind::Refresh, None, t(1), 4)
+    repo.start(id, RunKind::Refresh, None, t(1), 4, None)
         .await
         .expect("start");
 
@@ -175,7 +223,7 @@ async fn given_a_refresh_run_when_started_then_it_has_no_root() {
     // A refresh touches every cataloged path and takes no root.
     let (repo, _dir) = repo().await;
     let id = Uuid::new_v4();
-    repo.start(id, RunKind::Refresh, None, t(1), 4)
+    repo.start(id, RunKind::Refresh, None, t(1), 4, None)
         .await
         .expect("start");
 
@@ -203,10 +251,10 @@ async fn given_running_and_terminal_runs_when_reconciled_then_only_running_becom
     let completed = Uuid::new_v4();
     let failed = Uuid::new_v4();
 
-    repo.start(running, RunKind::Index, Some("/library"), t(1), 4)
+    repo.start(running, RunKind::Index, Some("/library"), t(1), 4, None)
         .await
         .expect("start running");
-    repo.start(completed, RunKind::Refresh, None, t(1), 4)
+    repo.start(completed, RunKind::Refresh, None, t(1), 4, None)
         .await
         .expect("start completed");
     repo.finish(
@@ -221,7 +269,7 @@ async fn given_running_and_terminal_runs_when_reconciled_then_only_running_becom
     )
     .await
     .expect("finish");
-    repo.start(failed, RunKind::Refresh, None, t(1), 4)
+    repo.start(failed, RunKind::Refresh, None, t(1), 4, None)
         .await
         .expect("start failed");
     repo.fail(failed, "catalog unreadable", t(2))
@@ -267,7 +315,7 @@ async fn given_a_run_still_marked_running_at_startup_when_reconciled_then_it_is_
 
     let repo = SqliteCatalogRunRepository::new(pool.clone());
     let id = Uuid::new_v4();
-    repo.start(id, RunKind::Refresh, None, t(1), 4)
+    repo.start(id, RunKind::Refresh, None, t(1), 4, None)
         .await
         .expect("start");
 
@@ -289,7 +337,7 @@ async fn given_an_index_run_when_finished_with_refresh_counts_then_error_and_row
     // `get` would otherwise report as a `Complete` run with no counts.
     let (repo, _dir) = repo().await;
     let id = Uuid::new_v4();
-    repo.start(id, RunKind::Index, Some("/library"), t(1), 4)
+    repo.start(id, RunKind::Index, Some("/library"), t(1), 4, None)
         .await
         .expect("start");
 
@@ -317,7 +365,7 @@ async fn given_an_index_run_when_finished_with_refresh_counts_then_error_and_row
 async fn given_a_refresh_run_when_finished_with_index_counts_then_error_and_row_untouched() {
     let (repo, _dir) = repo().await;
     let id = Uuid::new_v4();
-    repo.start(id, RunKind::Refresh, None, t(1), 4)
+    repo.start(id, RunKind::Refresh, None, t(1), 4, None)
         .await
         .expect("start");
 
@@ -346,7 +394,7 @@ async fn given_a_refresh_run_when_finished_with_index_counts_then_error_and_row_
 async fn given_a_running_index_run_when_serialized_then_only_running_fields_present() {
     let (repo, _dir) = repo().await;
     let id = Uuid::new_v4();
-    repo.start(id, RunKind::Index, Some("/library"), t(1), 4)
+    repo.start(id, RunKind::Index, Some("/library"), t(1), 4, None)
         .await
         .expect("start");
     let run = repo.get(id).await.expect("get").expect("run exists");
@@ -380,7 +428,7 @@ async fn given_a_running_index_run_when_serialized_then_only_running_fields_pres
 async fn given_a_completed_refresh_run_when_serialized_then_counts_are_flattened_top_level() {
     let (repo, _dir) = repo().await;
     let id = Uuid::new_v4();
-    repo.start(id, RunKind::Refresh, None, t(1), 4)
+    repo.start(id, RunKind::Refresh, None, t(1), 4, None)
         .await
         .expect("start");
     repo.finish(
@@ -417,7 +465,7 @@ async fn given_a_completed_index_run_when_serialized_then_counts_and_root_are_fl
 {
     let (repo, _dir) = repo().await;
     let id = Uuid::new_v4();
-    repo.start(id, RunKind::Index, Some("/library"), t(1), 4)
+    repo.start(id, RunKind::Index, Some("/library"), t(1), 4, None)
         .await
         .expect("start");
     repo.finish(
@@ -458,7 +506,7 @@ async fn given_a_completed_index_run_when_serialized_then_counts_and_root_are_fl
 async fn given_a_failed_run_when_serialized_then_error_present_and_no_counts() {
     let (repo, _dir) = repo().await;
     let id = Uuid::new_v4();
-    repo.start(id, RunKind::Refresh, None, t(1), 4)
+    repo.start(id, RunKind::Refresh, None, t(1), 4, None)
         .await
         .expect("start");
     repo.fail(id, "catalog unreadable", t(2))
@@ -494,7 +542,7 @@ async fn given_a_running_run_when_progress_is_recorded_then_it_reads_back_from_t
     // real SQL, not just against the in-memory fake.
     let (repo, _dir) = repo().await;
     let id = Uuid::new_v4();
-    repo.start(id, RunKind::Index, Some("/library"), t(1), 4)
+    repo.start(id, RunKind::Index, Some("/library"), t(1), 4, None)
         .await
         .expect("start");
 
@@ -531,7 +579,7 @@ async fn given_a_run_still_discovering_when_progress_is_recorded_then_the_total_
     // NULL and read back as `None`, not as some large number.
     let (repo, _dir) = repo().await;
     let id = Uuid::new_v4();
-    repo.start(id, RunKind::Index, Some("/library"), t(1), 4)
+    repo.start(id, RunKind::Index, Some("/library"), t(1), 4, None)
         .await
         .expect("start");
 
@@ -559,7 +607,7 @@ async fn given_a_run_with_progress_when_finished_then_the_phase_clears_and_the_t
     // numbers are still true, so they stay.
     let (repo, _dir) = repo().await;
     let id = Uuid::new_v4();
-    repo.start(id, RunKind::Index, Some("/library"), t(1), 4)
+    repo.start(id, RunKind::Index, Some("/library"), t(1), 4, None)
         .await
         .expect("start");
     repo.record_progress(
@@ -603,7 +651,7 @@ async fn given_a_run_with_progress_when_finished_then_the_phase_clears_and_the_t
 async fn given_a_run_with_progress_when_it_fails_then_the_phase_clears() {
     let (repo, _dir) = repo().await;
     let id = Uuid::new_v4();
-    repo.start(id, RunKind::Refresh, None, t(1), 4)
+    repo.start(id, RunKind::Refresh, None, t(1), 4, None)
         .await
         .expect("start");
     repo.record_progress(
@@ -639,7 +687,7 @@ async fn given_a_run_reconciled_at_startup_when_read_then_it_publishes_no_phase(
     // where its still-live walk stopped.
     let (repo, _dir) = repo().await;
     let id = Uuid::new_v4();
-    repo.start(id, RunKind::Index, Some("/library"), t(1), 4)
+    repo.start(id, RunKind::Index, Some("/library"), t(1), 4, None)
         .await
         .expect("start");
     repo.record_progress(
@@ -675,7 +723,7 @@ async fn given_a_running_run_with_progress_when_paused_then_it_keeps_its_phase_a
     // needs to know before resuming.
     let (repo, _dir) = repo().await;
     let id = Uuid::new_v4();
-    repo.start(id, RunKind::Index, Some("/library"), t(1), 4)
+    repo.start(id, RunKind::Index, Some("/library"), t(1), 4, None)
         .await
         .expect("start");
     repo.record_progress(
@@ -717,7 +765,7 @@ async fn given_a_run_with_progress_when_cancelled_then_it_is_terminal_and_clears
     // tell a client two contradictory things.
     let (repo, _dir) = repo().await;
     let id = Uuid::new_v4();
-    repo.start(id, RunKind::Refresh, None, t(1), 4)
+    repo.start(id, RunKind::Refresh, None, t(1), 4, None)
         .await
         .expect("start");
     repo.record_progress(
@@ -756,7 +804,7 @@ async fn given_a_paused_run_when_startup_reconciles_then_it_is_left_paused() {
     // to work from.
     let (repo, _dir) = repo().await;
     let id = Uuid::new_v4();
-    repo.start(id, RunKind::Index, Some("/library"), t(1), 4)
+    repo.start(id, RunKind::Index, Some("/library"), t(1), 4, None)
         .await
         .expect("start");
     assert!(repo.pause(id, t(2), None).await.expect("pause"));
@@ -777,7 +825,7 @@ async fn given_a_row_with_pause_columns_set_when_read_then_they_come_back_off_th
     // rather than resting on a test-only fake setter.
     let (repo, pool, _dir) = repo_with_pool().await;
     let id = Uuid::new_v4();
-    repo.start(id, RunKind::Index, Some("/library"), t(1), 4)
+    repo.start(id, RunKind::Index, Some("/library"), t(1), 4, None)
         .await
         .expect("start");
 
@@ -809,7 +857,7 @@ async fn given_a_cancelled_run_when_a_pause_write_lands_afterwards_then_the_canc
     // to abandon would look resumable.
     let (repo, _dir) = repo().await;
     let id = Uuid::new_v4();
-    repo.start(id, RunKind::Index, Some("/library"), t(1), 4)
+    repo.start(id, RunKind::Index, Some("/library"), t(1), 4, None)
         .await
         .expect("start");
     repo.cancel(id, None, t(2), None).await.expect("cancel");
@@ -835,7 +883,7 @@ async fn given_a_resumed_run_when_the_previous_segments_pause_lands_then_it_is_r
     // otherwise apply, leaving `paused` on a run a live segment is walking.
     let (repo, _dir) = repo().await;
     let id = Uuid::new_v4();
-    repo.start(id, RunKind::Index, Some("/library"), t(1), 4)
+    repo.start(id, RunKind::Index, Some("/library"), t(1), 4, None)
         .await
         .expect("start");
     let segment = repo
@@ -875,7 +923,7 @@ async fn given_a_resumed_run_when_the_previous_segments_cancel_lands_then_it_is_
     // lets it through.
     let (repo, _dir) = repo().await;
     let id = Uuid::new_v4();
-    repo.start(id, RunKind::Index, Some("/library"), t(1), 4)
+    repo.start(id, RunKind::Index, Some("/library"), t(1), 4, None)
         .await
         .expect("start");
     let segment = repo
@@ -927,7 +975,7 @@ async fn given_a_running_run_when_its_own_segments_pause_lands_then_it_applies()
     // above is that nobody resumed in between.
     let (repo, _dir) = repo().await;
     let id = Uuid::new_v4();
-    repo.start(id, RunKind::Refresh, None, t(1), 4)
+    repo.start(id, RunKind::Refresh, None, t(1), 4, None)
         .await
         .expect("start");
     let segment = repo
@@ -951,7 +999,7 @@ async fn given_a_completed_run_when_a_pause_write_lands_afterwards_then_it_is_re
     // between a control call's lookup and its write.
     let (repo, _dir) = repo().await;
     let id = Uuid::new_v4();
-    repo.start(id, RunKind::Refresh, None, t(1), 4)
+    repo.start(id, RunKind::Refresh, None, t(1), 4, None)
         .await
         .expect("start");
     repo.finish(
@@ -983,7 +1031,7 @@ async fn given_a_cancelled_run_with_a_tally_when_read_then_the_counts_are_kept()
     // not just `processed` from the last flush.
     let (repo, _dir) = repo().await;
     let id = Uuid::new_v4();
-    repo.start(id, RunKind::Index, Some("/library"), t(1), 4)
+    repo.start(id, RunKind::Index, Some("/library"), t(1), 4, None)
         .await
         .expect("start");
 
@@ -1031,7 +1079,7 @@ async fn given_an_index_run_when_cancelled_with_refresh_counts_then_error_and_ro
     // the wrong variant would leave the row's real columns NULL.
     let (repo, _dir) = repo().await;
     let id = Uuid::new_v4();
-    repo.start(id, RunKind::Index, Some("/library"), t(1), 4)
+    repo.start(id, RunKind::Index, Some("/library"), t(1), 4, None)
         .await
         .expect("start");
 
@@ -1066,7 +1114,7 @@ async fn given_a_paused_run_with_progress_when_resumed_then_the_segment_counters
     // counts it again for itself.
     let (repo, _dir) = repo().await;
     let id = Uuid::new_v4();
-    repo.start(id, RunKind::Index, Some("/library"), t(1), 4)
+    repo.start(id, RunKind::Index, Some("/library"), t(1), 4, None)
         .await
         .expect("start");
     repo.record_progress(
@@ -1114,7 +1162,7 @@ async fn given_a_paused_run_with_progress_when_resumed_then_the_segment_counters
 async fn given_a_paused_run_when_resumed_with_a_width_then_the_stored_concurrency_is_replaced() {
     let (repo, _dir) = repo().await;
     let id = Uuid::new_v4();
-    repo.start(id, RunKind::Index, Some("/library"), t(1), 4)
+    repo.start(id, RunKind::Index, Some("/library"), t(1), 4, None)
         .await
         .expect("start");
     assert!(repo.pause(id, t(2), None).await.expect("pause"));
@@ -1136,7 +1184,7 @@ async fn given_a_paused_run_when_resumed_with_a_width_then_the_stored_concurrenc
 async fn given_a_run_with_no_stored_width_when_resumed_without_one_then_it_stays_absent() {
     let (repo, pool, _dir) = repo_with_pool().await;
     let id = Uuid::new_v4();
-    repo.start(id, RunKind::Index, Some("/library"), t(1), 4)
+    repo.start(id, RunKind::Index, Some("/library"), t(1), 4, None)
         .await
         .expect("start");
     // Seeded directly, the way `repo_with_pool` exists to allow: `start`
@@ -1161,11 +1209,11 @@ async fn given_a_run_that_is_not_paused_when_resumed_then_the_write_is_refused()
     // run would revive a run its owner abandoned.
     let (repo, _dir) = repo().await;
     let running = Uuid::new_v4();
-    repo.start(running, RunKind::Index, Some("/library"), t(1), 4)
+    repo.start(running, RunKind::Index, Some("/library"), t(1), 4, None)
         .await
         .expect("start");
     let cancelled = Uuid::new_v4();
-    repo.start(cancelled, RunKind::Index, Some("/library"), t(1), 4)
+    repo.start(cancelled, RunKind::Index, Some("/library"), t(1), 4, None)
         .await
         .expect("start");
     repo.cancel(cancelled, None, t(2), None)
@@ -1204,7 +1252,7 @@ async fn given_a_completed_run_when_a_cancel_write_lands_afterwards_then_the_com
     // stays internally coherent, which is exactly why nothing else catches it.
     let (repo, _dir) = repo().await;
     let id = Uuid::new_v4();
-    repo.start(id, RunKind::Index, Some("/library"), t(1), 4)
+    repo.start(id, RunKind::Index, Some("/library"), t(1), 4, None)
         .await
         .expect("start");
     repo.finish(
@@ -1240,7 +1288,7 @@ async fn given_a_completed_run_when_a_cancel_with_a_tally_lands_afterwards_then_
     // the guard would hold for the control handler and leak for the walk.
     let (repo, _dir) = repo().await;
     let id = Uuid::new_v4();
-    repo.start(id, RunKind::Index, Some("/library"), t(1), 4)
+    repo.start(id, RunKind::Index, Some("/library"), t(1), 4, None)
         .await
         .expect("start");
     repo.finish(
@@ -1296,7 +1344,7 @@ async fn given_a_paused_run_when_cancelled_then_the_write_applies() {
     // `running` alone would make a paused run impossible to be rid of.
     let (repo, _dir) = repo().await;
     let id = Uuid::new_v4();
-    repo.start(id, RunKind::Index, Some("/library"), t(1), 4)
+    repo.start(id, RunKind::Index, Some("/library"), t(1), 4, None)
         .await
         .expect("start");
     assert!(repo.pause(id, t(2), None).await.expect("pause"));
@@ -1321,7 +1369,7 @@ async fn given_a_cancelled_run_when_the_walks_own_cancel_lands_afterwards_then_i
     // stopped.
     let (repo, _dir) = repo().await;
     let id = Uuid::new_v4();
-    repo.start(id, RunKind::Index, Some("/library"), t(1), 4)
+    repo.start(id, RunKind::Index, Some("/library"), t(1), 4, None)
         .await
         .expect("start");
     // What the walk captured when it began, and what it names below. The
@@ -1383,7 +1431,7 @@ async fn given_a_failed_run_when_a_cancel_with_a_tally_lands_afterwards_then_it_
     // else: a run that closed itself is still not one a cancel may rewrite.
     let (repo, _dir) = repo().await;
     let id = Uuid::new_v4();
-    repo.start(id, RunKind::Index, Some("/library"), t(1), 4)
+    repo.start(id, RunKind::Index, Some("/library"), t(1), 4, None)
         .await
         .expect("start");
     repo.fail(id, "root unreadable", t(2)).await.expect("fail");
@@ -1422,15 +1470,15 @@ async fn given_rows_inserted_out_of_order_when_active_runs_are_listed_then_they_
     // query that quietly relied on it anyway.
     let (repo, _dir) = repo().await;
     let middle = Uuid::new_v4();
-    repo.start(middle, RunKind::Index, Some("/library"), t(5), 4)
+    repo.start(middle, RunKind::Index, Some("/library"), t(5), 4, None)
         .await
         .expect("start middle");
     let newest = Uuid::new_v4();
-    repo.start(newest, RunKind::Refresh, None, t(9), 4)
+    repo.start(newest, RunKind::Refresh, None, t(9), 4, None)
         .await
         .expect("start newest");
     let oldest = Uuid::new_v4();
-    repo.start(oldest, RunKind::Index, Some("/library"), t(1), 4)
+    repo.start(oldest, RunKind::Index, Some("/library"), t(1), 4, None)
         .await
         .expect("start oldest");
 
@@ -1447,7 +1495,7 @@ async fn given_runs_in_every_terminal_status_when_active_runs_are_listed_then_no
     let (repo, _dir) = repo().await;
 
     let complete = Uuid::new_v4();
-    repo.start(complete, RunKind::Index, Some("/library"), t(1), 4)
+    repo.start(complete, RunKind::Index, Some("/library"), t(1), 4, None)
         .await
         .expect("start");
     repo.finish(
@@ -1465,7 +1513,7 @@ async fn given_runs_in_every_terminal_status_when_active_runs_are_listed_then_no
     .expect("finish");
 
     let failed = Uuid::new_v4();
-    repo.start(failed, RunKind::Index, Some("/library"), t(1), 4)
+    repo.start(failed, RunKind::Index, Some("/library"), t(1), 4, None)
         .await
         .expect("start");
     repo.fail(failed, "root unreadable", t(2))
@@ -1473,7 +1521,7 @@ async fn given_runs_in_every_terminal_status_when_active_runs_are_listed_then_no
         .expect("fail");
 
     let cancelled = Uuid::new_v4();
-    repo.start(cancelled, RunKind::Index, Some("/library"), t(1), 4)
+    repo.start(cancelled, RunKind::Index, Some("/library"), t(1), 4, None)
         .await
         .expect("start");
     assert!(repo
@@ -1490,11 +1538,11 @@ async fn given_runs_in_every_terminal_status_when_active_runs_are_listed_then_no
 async fn given_a_running_and_a_paused_run_when_active_runs_are_listed_then_both_are_returned() {
     let (repo, _dir) = repo().await;
     let running = Uuid::new_v4();
-    repo.start(running, RunKind::Index, Some("/library"), t(1), 4)
+    repo.start(running, RunKind::Index, Some("/library"), t(1), 4, None)
         .await
         .expect("start running");
     let paused = Uuid::new_v4();
-    repo.start(paused, RunKind::Refresh, None, t(2), 4)
+    repo.start(paused, RunKind::Refresh, None, t(2), 4, None)
         .await
         .expect("start paused");
     assert!(repo.pause(paused, t(3), None).await.expect("pause"));

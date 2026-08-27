@@ -241,7 +241,7 @@ by the id `start` returns (`FR-FC-27`).
 
 | Column group | Columns | Written by |
 | --- | --- | --- |
-| Identity | `id`, `kind`, `root`, `started_at` | `start` |
+| Identity | `id`, `kind`, `root`, `scope`, `started_at` | `start` |
 | Lifecycle | `status`, `finished_at`, `error` | terminal writes and the control verbs |
 | Index counts | `scanned`, `indexed`, `skipped`, `already_cataloged`, `failed` | `finish` / `cancel` |
 | Re-index counts | `refreshed`, `marked_missing`, `unchanged`, `failed` | `finish` / `cancel` |
@@ -739,8 +739,14 @@ scope's only candidate is "every type", which is the opposite of what a caller
 asking for a narrower scope wants, and it fails in the direction of
 cataloguing exactly the files the owner meant to exclude.
 
-Nothing about the scope is persisted: it matters only while the run walks. A
-resumed run (§5.9) therefore has none to reinstate and walks every type.
+The scope is stored on the run, in `catalog_runs.scope`, as the same
+comma-separated list the FFI accepts — for the reason `root` is stored: it is
+what the run was told to cover, and a resume that could not read it back would
+catalogue precisely the files the owner excluded. NULL is every type, so a row
+written before the column existed keeps the meaning it had and needs no
+backfill. A resumed segment (§5.9) walks the scope its run was started with;
+nothing re-scopes a run, and a resume that wanted a different one would be
+starting a different run.
 
 ---
 

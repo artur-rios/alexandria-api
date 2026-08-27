@@ -335,6 +335,11 @@ where
         let run_id = Uuid::new_v4();
         let started_at = self.clock.now();
         let concurrency = self.concurrency_for(request.priority) as u32;
+        // The scope is recorded here, beside the root, for the reason the
+        // root is: both are what the run was told to cover, and a resume
+        // that could not read the scope back would walk the very types the
+        // owner excluded (FR-FC-33).
+        let scope = request.scope.to_wire();
         retry_on_busy(BUSY_ATTEMPTS, || {
             self.runs.start(
                 run_id,
@@ -342,6 +347,7 @@ where
                 Some(&request.root),
                 started_at,
                 concurrency,
+                scope.as_deref(),
             )
         })
         .await?;
@@ -364,11 +370,10 @@ where
     /// `warn`, and the walk continues. One locked file must not abandon the
     /// rest of the library. Only a failure to list the root at all aborts.
     ///
-    /// `scope` is the request's own (`IndexRequest::scope`) rather than a
-    /// column read back off the run, because nothing persists it: it is an
-    /// argument here for the same reason `root` is. A resumed run therefore
-    /// has none to reinstate and walks at `IndexScope::all` — see
-    /// `RunControlHandler::resume`'s callers.
+    /// `scope` is an argument for the same reason `root` is: both say what
+    /// this walk is to cover, and both are handed in by whoever spawned it —
+    /// `IndexRequest::scope` for a fresh run, and `RunResumed::scope`, read
+    /// back off the run's row, for a resumed one.
     pub async fn execute(
         &self,
         root: &str,

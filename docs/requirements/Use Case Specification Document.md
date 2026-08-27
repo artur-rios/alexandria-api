@@ -1581,7 +1581,7 @@ have only one of.
 2. The system confirms the caller is authenticated as the owner and that the run is `paused`.
 3. The system adds the length of the pause that is ending to the time the run has spent paused, so that pause never counts as work (FR-FC-28), and records the run `running` again under the **same id** — a resume continues a run, it does not start a new one.
 4. The owner may name a priority for the resumed segment (FR-FC-33). Naming one re-paces the run and is remembered, so it holds across a further pause; naming none keeps the priority the run already has, which is what an owner who only wants their run back is asking for. This is the whole answer to changing your mind about throttling mid-run: the priority is fixed while a segment walks, and a pause and a resume is what changes it (FR-FC-31).
-5. The system walks again at that priority, from the root for an index run or across every cataloged path for a re-index. There is no cursor: the run rediscovers its total and counts from zero, and everything an earlier segment already cataloged falls out as `alreadyCataloged` in seconds.
+5. The system walks again at that priority, from the root for an index run or across every cataloged path for a re-index, and **within the scope the index run was started with** (FR-FC-01) — a resume continues a run, so it records the same file types that run was always going to. There is no cursor: the run rediscovers its total and counts from zero, and everything an earlier segment already cataloged falls out as `alreadyCataloged` in seconds.
 
 **Main Flow — cancel** (FR-FC-34)
 

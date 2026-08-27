@@ -802,9 +802,16 @@ async fn given_a_completed_refresh_when_execute_then_the_final_progress_is_flush
         registry.clone(),
     );
     let run_id = Uuid::new_v4();
-    runs.start(run_id, RunKind::Refresh, None, now(), TEST_CONCURRENCY)
-        .await
-        .unwrap();
+    runs.start(
+        run_id,
+        RunKind::Refresh,
+        None,
+        now(),
+        TEST_CONCURRENCY,
+        None,
+    )
+    .await
+    .unwrap();
 
     handler.execute(run_id).await.expect("execute");
 
@@ -839,9 +846,16 @@ async fn given_a_progress_flush_that_fails_when_execute_then_the_refresh_still_c
         runs.clone(),
     );
     let run_id = Uuid::new_v4();
-    runs.start(run_id, RunKind::Refresh, None, now(), TEST_CONCURRENCY)
-        .await
-        .unwrap();
+    runs.start(
+        run_id,
+        RunKind::Refresh,
+        None,
+        now(),
+        TEST_CONCURRENCY,
+        None,
+    )
+    .await
+    .unwrap();
 
     handler.execute(run_id).await.expect("execute");
 
@@ -874,9 +888,16 @@ async fn given_a_refresh_walk_in_flight_when_paused_then_it_stops_with_paths_unp
     let runs = FakeCatalogRunRepository::new();
     let registry = RunRegistry::new();
     let run_id = Uuid::new_v4();
-    runs.start(run_id, RunKind::Refresh, None, now(), TEST_CONCURRENCY)
-        .await
-        .unwrap();
+    runs.start(
+        run_id,
+        RunKind::Refresh,
+        None,
+        now(),
+        TEST_CONCURRENCY,
+        None,
+    )
+    .await
+    .unwrap();
     let control = Arc::new(RunControlHandler::new(
         FakeAuth::Allowing,
         runs.clone(),
@@ -954,9 +975,16 @@ async fn given_a_run_resumed_before_a_refreshs_pause_lands_when_it_lands_then_th
     let runs = FakeCatalogRunRepository::new();
     let registry = RunRegistry::new();
     let run_id = Uuid::new_v4();
-    runs.start(run_id, RunKind::Refresh, None, now(), TEST_CONCURRENCY)
-        .await
-        .unwrap();
+    runs.start(
+        run_id,
+        RunKind::Refresh,
+        None,
+        now(),
+        TEST_CONCURRENCY,
+        None,
+    )
+    .await
+    .unwrap();
     let control = Arc::new(RunControlHandler::new(
         FakeAuth::Allowing,
         runs.clone(),
@@ -1013,9 +1041,16 @@ async fn given_a_run_resumed_before_a_refreshs_cancel_lands_when_it_lands_then_i
     let runs = FakeCatalogRunRepository::new();
     let registry = RunRegistry::new();
     let run_id = Uuid::new_v4();
-    runs.start(run_id, RunKind::Refresh, None, now(), TEST_CONCURRENCY)
-        .await
-        .unwrap();
+    runs.start(
+        run_id,
+        RunKind::Refresh,
+        None,
+        now(),
+        TEST_CONCURRENCY,
+        None,
+    )
+    .await
+    .unwrap();
     let control = Arc::new(RunControlHandler::new(
         FakeAuth::Allowing,
         runs.clone(),

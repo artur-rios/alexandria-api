@@ -2504,9 +2504,16 @@ async fn given_a_completed_index_when_execute_then_the_final_progress_is_flushed
         registry.clone(),
     );
     let run_id = Uuid::new_v4();
-    runs.start(run_id, RunKind::Index, Some(ROOT), now(), TEST_CONCURRENCY)
-        .await
-        .unwrap();
+    runs.start(
+        run_id,
+        RunKind::Index,
+        Some(ROOT),
+        now(),
+        TEST_CONCURRENCY,
+        None,
+    )
+    .await
+    .unwrap();
 
     handler
         .execute(ROOT, run_id, &IndexScope::all())
@@ -2556,9 +2563,16 @@ async fn given_a_progress_flush_that_fails_when_execute_then_the_run_still_compl
         runs.clone(),
     );
     let run_id = Uuid::new_v4();
-    runs.start(run_id, RunKind::Index, Some(ROOT), now(), TEST_CONCURRENCY)
-        .await
-        .unwrap();
+    runs.start(
+        run_id,
+        RunKind::Index,
+        Some(ROOT),
+        now(),
+        TEST_CONCURRENCY,
+        None,
+    )
+    .await
+    .unwrap();
 
     let outcome = handler
         .execute(ROOT, run_id, &IndexScope::all())
@@ -2597,9 +2611,16 @@ async fn given_a_run_that_cannot_list_its_root_when_execute_then_the_cell_is_clo
         registry.clone(),
     );
     let run_id = Uuid::new_v4();
-    runs.start(run_id, RunKind::Index, Some(ROOT), now(), TEST_CONCURRENCY)
-        .await
-        .unwrap();
+    runs.start(
+        run_id,
+        RunKind::Index,
+        Some(ROOT),
+        now(),
+        TEST_CONCURRENCY,
+        None,
+    )
+    .await
+    .unwrap();
 
     handler
         .execute(ROOT, run_id, &IndexScope::all())
@@ -2644,9 +2665,16 @@ async fn given_a_walk_longer_than_the_flush_interval_when_execute_then_intermedi
         runs.clone(),
     );
     let run_id = Uuid::new_v4();
-    runs.start(run_id, RunKind::Index, Some(ROOT), now(), TEST_CONCURRENCY)
-        .await
-        .unwrap();
+    runs.start(
+        run_id,
+        RunKind::Index,
+        Some(ROOT),
+        now(),
+        TEST_CONCURRENCY,
+        None,
+    )
+    .await
+    .unwrap();
 
     let outcome = handler
         .execute(ROOT, run_id, &IndexScope::all())
@@ -2771,9 +2799,16 @@ async fn given_an_index_walk_in_flight_when_paused_then_it_stops_with_entries_un
     let registry = RunRegistry::new();
     let catalog = FakeCatalogRepository::new();
     let run_id = Uuid::new_v4();
-    runs.start(run_id, RunKind::Index, Some(ROOT), now(), TEST_CONCURRENCY)
-        .await
-        .unwrap();
+    runs.start(
+        run_id,
+        RunKind::Index,
+        Some(ROOT),
+        now(),
+        TEST_CONCURRENCY,
+        None,
+    )
+    .await
+    .unwrap();
     let pause_mid_walk = control_interrupt(
         control_handler(runs.clone(), registry.clone()),
         run_id,
@@ -2862,9 +2897,16 @@ async fn given_a_run_resumed_before_a_walks_pause_lands_when_it_lands_then_the_p
     let runs = FakeCatalogRunRepository::new();
     let registry = RunRegistry::new();
     let run_id = Uuid::new_v4();
-    runs.start(run_id, RunKind::Index, Some(ROOT), now(), TEST_CONCURRENCY)
-        .await
-        .unwrap();
+    runs.start(
+        run_id,
+        RunKind::Index,
+        Some(ROOT),
+        now(),
+        TEST_CONCURRENCY,
+        None,
+    )
+    .await
+    .unwrap();
     let pause_mid_walk = control_interrupt(
         control_handler(runs.clone(), registry.clone()),
         run_id,
@@ -2917,9 +2959,16 @@ async fn given_a_run_resumed_before_a_walks_cancel_lands_when_it_lands_then_the_
     let runs = FakeCatalogRunRepository::new();
     let registry = RunRegistry::new();
     let run_id = Uuid::new_v4();
-    runs.start(run_id, RunKind::Index, Some(ROOT), now(), TEST_CONCURRENCY)
-        .await
-        .unwrap();
+    runs.start(
+        run_id,
+        RunKind::Index,
+        Some(ROOT),
+        now(),
+        TEST_CONCURRENCY,
+        None,
+    )
+    .await
+    .unwrap();
     let cancel_mid_walk = control_interrupt(
         control_handler(runs.clone(), registry.clone()),
         run_id,
@@ -2968,9 +3017,16 @@ async fn given_an_index_walk_in_flight_when_cancelled_then_it_stops_and_is_termi
     let runs = FakeCatalogRunRepository::new();
     let registry = RunRegistry::new();
     let run_id = Uuid::new_v4();
-    runs.start(run_id, RunKind::Index, Some(ROOT), now(), TEST_CONCURRENCY)
-        .await
-        .unwrap();
+    runs.start(
+        run_id,
+        RunKind::Index,
+        Some(ROOT),
+        now(),
+        TEST_CONCURRENCY,
+        None,
+    )
+    .await
+    .unwrap();
     let cancel_mid_walk = control_interrupt(
         control_handler(runs.clone(), registry.clone()),
         run_id,
@@ -3037,9 +3093,16 @@ async fn given_a_run_paused_during_discovery_when_execute_then_no_entry_is_proce
     let registry = RunRegistry::new();
     let catalog = FakeCatalogRepository::new();
     let run_id = Uuid::new_v4();
-    runs.start(run_id, RunKind::Index, Some(ROOT), now(), TEST_CONCURRENCY)
-        .await
-        .unwrap();
+    runs.start(
+        run_id,
+        RunKind::Index,
+        Some(ROOT),
+        now(),
+        TEST_CONCURRENCY,
+        None,
+    )
+    .await
+    .unwrap();
     let pause_during_discovery = control_interrupt(
         control_handler(runs.clone(), registry.clone()),
         run_id,
@@ -3100,9 +3163,16 @@ async fn given_a_paused_index_run_when_resumed_then_it_re_walks_and_finishes_the
     let registry = RunRegistry::new();
     let catalog = FakeCatalogRepository::new();
     let run_id = Uuid::new_v4();
-    runs.start(run_id, RunKind::Index, Some(ROOT), now(), TEST_CONCURRENCY)
-        .await
-        .unwrap();
+    runs.start(
+        run_id,
+        RunKind::Index,
+        Some(ROOT),
+        now(),
+        TEST_CONCURRENCY,
+        None,
+    )
+    .await
+    .unwrap();
     let pause_mid_walk = control_interrupt(
         control_handler(runs.clone(), registry.clone()),
         run_id,
@@ -3244,6 +3314,7 @@ async fn given_a_resumed_run_when_executed_then_it_walks_at_the_width_it_was_sta
         Some(ROOT),
         now(),
         RESUMED_AT_CONCURRENCY,
+        None,
     )
     .await
     .unwrap();
@@ -3326,6 +3397,7 @@ async fn given_a_paused_run_when_resumed_at_low_priority_then_it_walks_at_the_ne
         Some(ROOT),
         now(),
         STARTED_AT_CONCURRENCY,
+        None,
     )
     .await
     .unwrap();
@@ -3572,4 +3644,166 @@ async fn given_an_unknown_type_name_when_scope_parsed_then_invalid_input() {
     let result = IndexScope::parse(["audio", "sculpture"]);
 
     assert!(matches!(result, Err(DomainError::InvalidInput(_))));
+}
+
+/// The reason the scope is a stored column rather than a walk-local argument
+/// (FR-FC-33). A run scoped to audio is paused mid-library and resumed; the
+/// second segment must still leave the cover art alone. Were `resume` to hand
+/// back `IndexScope::all()` — which it did before the scope was recorded —
+/// the JPEG would be catalogued here and this test would fail, which is the
+/// whole point of it.
+#[tokio::test]
+async fn given_a_paused_scoped_run_when_resumed_then_the_second_segment_keeps_the_scope() {
+    let runs = FakeCatalogRunRepository::new();
+    let registry = RunRegistry::new();
+    let repo = FakeCatalogRepository::new();
+    let repo_handle = repo.clone();
+    let handler = handler_with_registry(
+        FakeAuth::Allowing,
+        repo,
+        album_with_cover_art(),
+        fixed_clock(now()),
+        FakeAudioMetadataReader::new(),
+        FakeImageMetadataReader::new(),
+        FakeDocumentMetadataReader::new(),
+        FakeVideoMetadataReader::new(),
+        FakeComicMetadataReader::new(),
+        runs.clone(),
+        registry.clone(),
+    );
+
+    // Started through the handler rather than against the repository
+    // directly, so the scope reaches the row by the path a real run takes.
+    let audio_only = IndexScope::parse(["audio"]).expect("scope");
+    let started = handler
+        .start(
+            IndexRequest {
+                root: ROOT.to_string(),
+                priority: RunPriority::Normal,
+                scope: audio_only.clone(),
+            },
+            TOKEN,
+        )
+        .await
+        .expect("start");
+    assert!(runs
+        .pause(started.run_id, now(), None)
+        .await
+        .expect("pause"));
+
+    let resumed = control_handler(runs.clone(), registry)
+        .resume(started.run_id, TOKEN, None)
+        .await
+        .expect("resume");
+
+    assert_eq!(
+        resumed.scope, audio_only,
+        "a resume hands back the scope the run was started with — nothing else knows it"
+    );
+
+    let outcome = handler
+        .execute(ROOT, started.run_id, &resumed.scope)
+        .await
+        .expect("second segment");
+
+    assert_eq!(outcome.indexed, 2, "both FLACs are still in scope");
+    assert_eq!(outcome.skipped, 1, "and the cover art is still skipped");
+    assert!(
+        !repo_handle.has_path("/library/cover.jpg"),
+        "a resumed run must not catalog the type its scope excluded"
+    );
+}
+
+/// A run recorded before `catalog_runs.scope` existed holds NULL there, and
+/// must go on meaning what an absent scope has always meant — which is what
+/// makes the added column need no backfill.
+#[tokio::test]
+async fn given_a_run_with_no_stored_scope_when_resumed_then_it_walks_every_type() {
+    let runs = FakeCatalogRunRepository::new();
+    let registry = RunRegistry::new();
+    let repo = FakeCatalogRepository::new();
+    let repo_handle = repo.clone();
+    let run_id = Uuid::new_v4();
+    // No scope on the row, which is exactly the shape of a run started before
+    // the column existed.
+    runs.start(
+        run_id,
+        RunKind::Index,
+        Some(ROOT),
+        now(),
+        TEST_CONCURRENCY,
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(runs.pause(run_id, now(), None).await.expect("pause"));
+
+    let resumed = control_handler(runs.clone(), registry.clone())
+        .resume(run_id, TOKEN, None)
+        .await
+        .expect("resume");
+
+    assert_eq!(resumed.scope, IndexScope::all());
+
+    let handler = handler_with_registry(
+        FakeAuth::Allowing,
+        repo,
+        album_with_cover_art(),
+        fixed_clock(now()),
+        FakeAudioMetadataReader::new(),
+        FakeImageMetadataReader::new(),
+        FakeDocumentMetadataReader::new(),
+        FakeVideoMetadataReader::new(),
+        FakeComicMetadataReader::new(),
+        runs,
+        registry,
+    );
+    let outcome = handler
+        .execute(ROOT, run_id, &resumed.scope)
+        .await
+        .expect("second segment");
+
+    assert_eq!(outcome.indexed, 3);
+    assert_eq!(outcome.skipped, 0);
+    assert!(repo_handle.has_path("/library/cover.jpg"));
+}
+
+/// `start` records the scope on the run, which is the write the resume above
+/// reads back. Asserted on the row itself so a regression that dropped the
+/// column from the INSERT fails here, naming the write, rather than only in
+/// the resume test that depends on it.
+#[tokio::test]
+async fn given_a_scoped_index_when_started_then_the_run_records_the_scope() {
+    let runs = FakeCatalogRunRepository::new();
+    let handler = handler(
+        FakeAuth::Allowing,
+        FakeCatalogRepository::new(),
+        album_with_cover_art(),
+        fixed_clock(now()),
+        FakeAudioMetadataReader::new(),
+        FakeImageMetadataReader::new(),
+        FakeDocumentMetadataReader::new(),
+        FakeVideoMetadataReader::new(),
+        FakeComicMetadataReader::new(),
+        runs.clone(),
+    );
+
+    let started = handler
+        .start(
+            IndexRequest {
+                root: ROOT.to_string(),
+                priority: RunPriority::Normal,
+                scope: IndexScope::parse(["audio"]).expect("scope"),
+            },
+            TOKEN,
+        )
+        .await
+        .expect("start");
+
+    let recorded = runs.get_recorded(started.run_id).expect("run");
+    assert_eq!(
+        recorded.scope,
+        IndexScope::parse(["audio"]).expect("scope"),
+        "the run's row carries the scope it was started with"
+    );
 }

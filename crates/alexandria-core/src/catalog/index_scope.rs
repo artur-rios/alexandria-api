@@ -71,6 +71,33 @@ impl IndexScope {
         })
     }
 
+    /// Parse one comma-separated list of wire names — the form the FFI's
+    /// `types` argument arrives in and the form `catalog_runs.scope` stores.
+    ///
+    /// The single place that encoding is read, so the boundary that accepts a
+    /// scope and the column that keeps it cannot drift apart on what a comma
+    /// means. [`IndexScope::to_wire`] is its inverse.
+    pub fn parse_list(raw: &str) -> Result<Self, DomainError> {
+        Self::parse(raw.split(','))
+    }
+
+    /// The scope as the one comma-separated string `catalog_runs.scope`
+    /// stores — `"audio"`, `"audio,image"` — or `None` for every type, which
+    /// is that column's NULL.
+    ///
+    /// `None` rather than an empty string on purpose: NULL is what a row
+    /// written before the column existed already holds, so an unscoped run
+    /// and a legacy row read back identically and neither needs a backfill.
+    pub fn to_wire(&self) -> Option<String> {
+        self.types.as_ref().map(|types| {
+            types
+                .iter()
+                .map(|file_type| file_type.as_str())
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+    }
+
     /// Whether a file the classifier resolved to `file_type` is one this run
     /// records. Always true for [`IndexScope::all`].
     pub fn includes(&self, file_type: FileType) -> bool {
@@ -136,6 +163,24 @@ mod tests {
 
         assert!(scope.includes(FileType::Audio));
         assert!(!scope.includes(FileType::Text));
+    }
+
+    /// The column and the FFI argument share one encoding, so what is written
+    /// is what parses back — otherwise a resumed run would walk a scope its
+    /// start never asked for.
+    #[test]
+    fn given_a_scope_when_written_to_wire_then_it_parses_back_the_same() {
+        let scope = IndexScope::parse(["audio", "image"]).expect("parse");
+
+        let wire = scope.to_wire().expect("a narrowed scope has a wire form");
+
+        assert_eq!(wire, "audio,image");
+        assert_eq!(IndexScope::parse_list(&wire).expect("parse back"), scope);
+    }
+
+    #[test]
+    fn given_every_type_when_written_to_wire_then_none() {
+        assert_eq!(IndexScope::all().to_wire(), None);
     }
 
     #[test]
