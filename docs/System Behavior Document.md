@@ -250,8 +250,9 @@ by the id `start` returns (`FR-FC-27`).
 | Pacing | `concurrency` | `start`, and `resume` when it re-paces |
 | Race guard | `segment` | `resume` only |
 
-`skipped` (unsupported extension) and `already_cataloged` (a path the catalog
-already held) are counted **apart**. Folding them together made a resumed run
+`skipped` (an unsupported extension, or a type the run's scope excludes —
+§5.14) and `already_cataloged` (a path the catalog already held) are counted
+**apart**. Folding them together made a resumed run
 report every entry an earlier segment had cataloged as a skip — a tally that
 misdescribes what happened.
 

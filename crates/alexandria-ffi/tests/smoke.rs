@@ -2558,7 +2558,7 @@ fn given_an_empty_types_string_when_ffi_index_start_then_every_type_is_recorded(
 #[test]
 fn given_an_unknown_type_when_ffi_index_start_then_invalid_input() {
     let _g = serial();
-    let _db = init_temp_db();
+    let (_dir, db_path) = init_temp_db();
     let lib = tempdir().unwrap();
     std::fs::write(lib.path().join("song.flac"), b"audio").unwrap();
 
@@ -2582,5 +2582,49 @@ fn given_an_unknown_type_when_ffi_index_start_then_invalid_input() {
         alexandria_index_count_files(),
         0,
         "a refused start must index nothing"
+    );
+    // The claim the HTTP twin makes too: the scope is parsed ahead of
+    // `start`, so a refused request leaves no run record behind (FR-FC-27).
+    let runs = with_db(&db_path, |pool| async move {
+        let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM catalog_runs")
+            .fetch_one(&pool)
+            .await
+            .expect("count runs");
+        count
+    });
+    assert_eq!(runs, 0, "a refused start must not open a run record");
+}
+
+/// What the authentication gate in `alexandria_index_start` actually buys,
+/// and the only test that fails without it: a caller with a bad token *and*
+/// an unspellable scope must be told it is unauthorized, not that its scope
+/// did not parse.
+///
+/// `start` authenticates too, so every other unauthorized test here passes
+/// with the gate deleted — the parse would simply never be reached. This one
+/// reaches it. HTTP answers `401` to the same pair because `require_auth` is
+/// a route layer that runs before the body is ever extracted, so without the
+/// gate the two surfaces would disagree about which fault a caller is told
+/// about first (FR-FC-24 / NFR-09).
+#[test]
+fn given_a_bad_token_and_an_unknown_type_when_ffi_index_start_then_unauthorized() {
+    let _g = serial();
+    let _db = init_temp_db();
+    let lib = tempdir().unwrap();
+    std::fs::write(lib.path().join("song.flac"), b"audio").unwrap();
+
+    let root = c(lib.path().to_str().unwrap());
+    let token = c("");
+    let types = c("sculpture");
+    let result = alexandria_index_start(
+        root.as_ptr(),
+        token.as_ptr(),
+        std::ptr::null(),
+        types.as_ptr(),
+    );
+
+    assert_eq!(
+        result.status, STATUS_UNAUTHORIZED,
+        "an unauthenticated caller must not learn that its scope failed to parse"
     );
 }

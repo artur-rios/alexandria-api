@@ -414,6 +414,7 @@ kept indefinitely.
 | kind | text | required | `index` or `refresh`. |
 | status | text | required | `running`, `paused`, `complete`, `failed`, or `cancelled` (FR-FC-27). |
 | root | text | nullable | The indexed root, for an index run only; `NULL` for a refresh, which takes no root. |
+| scope | text | nullable | The file types the run records (FR-FC-01), as the comma-separated list of type names the caller sent (`audio`, `audio,image`). Written at start beside `root` — both are what the run was told to cover — and read back when the run is resumed (FR-FC-33), so a paused run continues under the scope it started with rather than widening to every type. `NULL` is every type: what an absent scope means, what a refresh has, and what every row written before this column holds. Internal; it is an input to how the run is walked, not part of the run body a client reads. |
 | startedAt | timestamp | required | When the run started. |
 | finishedAt | timestamp | nullable | When the run reached a terminal status; `NULL` while `running` or `paused`. |
 | phase | text | nullable | `discovering` or `processing` while a walk is executing the run, and kept across an owner's pause so a client can see where the walk stopped. `NULL` once the run is terminal — `complete` beside `processing` would say two contradictory things — `NULL` for a run paused by startup reconciliation, whose process is gone so it is in no phase until it resumes, and `NULL` for a run that never published one. |
@@ -424,7 +425,7 @@ kept indefinitely.
 | concurrency | integer | nullable | The width the run's priority (FR-FC-31) resolved to. Written at start, and rewritten by a resume that names a priority of its own (FR-FC-33) — that write is what re-paces the run, since the next segment is walked at whatever this column says. A resume naming no priority leaves it alone. Internal; `NULL` only for a run started before priority existed, which resumes at the configured default. |
 | scanned | integer | nullable | Index only: entries scanned. |
 | indexed | integer | nullable | Index only: files newly indexed. |
-| skipped | integer | nullable | Index only: entries classified out (an unsupported extension). |
+| skipped | integer | nullable | Index only: entries the run saw and did not record — an unsupported extension, or a file whose type the run's scope excludes (FR-FC-01). One counter rather than two: in both cases the run classified the entry out, and splitting them would leave every reader adding the two back together. |
 | alreadyCataloged | integer | nullable | Index only: entries whose path the catalog already held. |
 | refreshed | integer | nullable | Refresh only: records refreshed. |
 | markedMissing | integer | nullable | Refresh only: records marked missing. |
@@ -457,7 +458,7 @@ endpoint requires authentication from the active mode (see §7).
 
 | Method | Path | Description | Requirement |
 | --- | --- | --- | --- |
-| POST | /v1/index | Start an asynchronous indexing scan of a root path, optionally at a `priority` of `normal` or `low`. | FR-FC-01..09, FR-FC-31 |
+| POST | /v1/index | Start an asynchronous indexing scan of a root path, optionally at a `priority` of `normal` or `low`, and optionally scoped to a `types` array naming the file types to record. | FR-FC-01..09, FR-FC-31 |
 | POST | /v1/index/refresh | Re-index existing records (compare size and mtime, mark missing), optionally at a `priority`. | FR-FC-10, FR-FC-11, FR-FC-31 |
 | GET | /v1/settings | Report the client-relevant configuration, beginning with the retention window. | FR-FC-30 |
 | GET | /v1/index/runs/{runId} | Report an index or re-index run's status, progress, and outcome. | FR-FC-27, FR-FC-28 |

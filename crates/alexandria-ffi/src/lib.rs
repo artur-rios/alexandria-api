@@ -186,7 +186,10 @@ fn parse_priority(raw: Option<String>) -> RunPriority {
 /// HTTP body rejects the same name for the same reason (FR-FC-24).
 fn parse_scope(raw: Option<String>) -> Result<IndexScope, DomainError> {
     match raw {
-        Some(list) => IndexScope::parse(list.split(',')),
+        // Through `parse_list` rather than splitting here, so this argument
+        // and `catalog_runs.scope` have exactly one reader of the encoding
+        // between them and cannot drift on what a comma means.
+        Some(list) => IndexScope::parse_list(&list),
         None => Ok(IndexScope::all()),
     }
 }
@@ -315,12 +318,19 @@ pub extern "C" fn alexandria_index_start(
         None => return IndexStartResult::err(INDEX_ERR_INVALID_INPUT),
     };
     let token = cstr_lossy(token).unwrap_or_default();
-    // Denied before the scope is looked at, the way every other payload-
-    // parsing entry point here gates (see `authenticated`): `start`
+    // Denied before the scope is looked at (see `authenticated`): `start`
     // authenticates, but only after its arguments are parsed, and the HTTP
-    // surface's `require_auth` runs before its extractors do. Without this an
-    // unauthenticated caller would learn from the FFI that its `types` did not
-    // parse while HTTP told it only `401` (FR-FC-24 / NFR-09).
+    // surface's `require_auth` is a route layer that runs before its
+    // extractors. Without this gate an unauthenticated caller would learn
+    // from the FFI that its `types` did not parse where HTTP told it only
+    // `401` (FR-FC-24 / NFR-09).
+    //
+    // Not the full "deny before any payload is looked at" the collection
+    // entry points keep: the NULL-`root` check above still answers
+    // `INVALID_INPUT` to an unauthenticated caller, where HTTP answers
+    // `401`. That gap predates this argument and is left as it is rather
+    // than changed in passing — this gate covers the parameter it was added
+    // with.
     if !authenticated(&services, &token) {
         return IndexStartResult::err(INDEX_ERR_UNAUTHORIZED);
     }

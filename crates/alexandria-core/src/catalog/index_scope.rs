@@ -7,9 +7,13 @@ use crate::errors::DomainError;
 /// and reading that as "index nothing" would turn a missing argument into a
 /// run that does no work at all.
 ///
-/// It is carried on the request and passed to the walk rather than stored on
-/// the run. A scope matters only while the run walks, and a column recording
-/// it would exist to answer a question nobody has asked yet.
+/// It is recorded on the run (`catalog_runs.scope`) and read back when the run
+/// is resumed, for the reason the run's root is: both say what the run was
+/// told to cover, and a paused run has to continue under the scope it started
+/// with. A resume that reinvented the scope would default to every type —
+/// cataloguing precisely the files the owner drew the scope to exclude, and
+/// undoing the feature for any run they paused. [`IndexScope::to_wire`] is the
+/// form the column holds, and [`IndexScope::parse_list`] reads it back.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct IndexScope {
     /// `None` is every type, not an empty selection — see the type's own doc

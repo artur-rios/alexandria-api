@@ -27,8 +27,11 @@ pub struct IndexRequest {
     /// How hard this run should push (FR-FC-08). See `RunPriority`.
     pub priority: RunPriority,
     /// The file types this run records. Default is every supported type, so a
-    /// caller that says nothing indexes what it always did. See `IndexScope`
-    /// for why the scope travels to `execute` rather than onto the run row.
+    /// caller that says nothing indexes what it always did.
+    ///
+    /// `start` writes it to the run's row beside the root, and a resume reads
+    /// it back (`RunResumed::scope`), so a run paused mid-library continues
+    /// under the scope it began with rather than widening to every type.
     pub scope: IndexScope,
 }
 

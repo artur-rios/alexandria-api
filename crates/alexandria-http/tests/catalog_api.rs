@@ -2356,3 +2356,36 @@ async fn given_an_unknown_type_when_index_posted_then_400_and_no_run_started() {
         .expect("count");
     assert_eq!(runs.0, 0, "a rejected start must not open a run record");
 }
+
+/// The HTTP twin of the FFI's
+/// `given_a_bad_token_and_an_unknown_type_when_ffi_index_start_then_unauthorized`:
+/// with both faults present, the caller learns only that it is
+/// unauthenticated. `require_auth` is a route layer, so it runs before the
+/// body is extracted at all and the unspellable scope is never reached — the
+/// FFI gates by hand to reach the same answer (FR-FC-24 / NFR-09).
+#[tokio::test]
+async fn given_no_bearer_and_an_unknown_type_when_index_posted_then_401_not_400() {
+    let lib = tempdir().unwrap();
+    common::write_file(&lib, "song.flac", b"audio bytes");
+
+    let test = test_app().await;
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/index")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({ "root": lib.path().to_str().unwrap(), "types": ["sculpture"] }).to_string(),
+        ))
+        .unwrap();
+
+    let response = app(Settings::default(), test.services)
+        .oneshot(request)
+        .await
+        .expect("one-shot");
+
+    assert_eq!(
+        response.status(),
+        StatusCode::UNAUTHORIZED,
+        "an unauthenticated caller must not learn that its scope failed to parse"
+    );
+}
