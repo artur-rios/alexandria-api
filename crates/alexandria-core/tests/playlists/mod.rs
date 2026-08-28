@@ -49,8 +49,6 @@ pub async fn create_playlist(repo: &SqlitePlaylistRepository, name: &str) -> Pla
 
 /// Insert an audio file directly through the catalog repository, for tests
 /// that add entries to a playlist and need a real `file_id` to reference.
-/// Unused by Task 1's own test; kept `pub` for Tasks 2-6.
-#[allow(dead_code)]
 pub async fn insert_audio_file(repo: &SqliteCatalogRepository, path: &str) -> Uuid {
     let uuid = Uuid::new_v4();
     repo.insert_file(NewFile {
@@ -79,4 +77,25 @@ pub async fn insert_four_audio_files(repo: &SqliteCatalogRepository) -> [Uuid; 4
         insert_audio_file(repo, "/library/track-3.mp3").await,
         insert_audio_file(repo, "/library/track-4.mp3").await,
     ]
+}
+
+/// Insert a non-audio (text) file directly through the catalog repository,
+/// for the Task 3 test that `add_entries` rejects a non-audio file (a
+/// playlist holds audio only -- video and documents have their own
+/// watchlists/reading lists).
+pub async fn insert_text_file(repo: &SqliteCatalogRepository, path: &str) -> Uuid {
+    let uuid = Uuid::new_v4();
+    repo.insert_file(NewFile {
+        uuid,
+        path: path.to_string(),
+        name: path.rsplit('/').next().unwrap_or(path).to_string(),
+        file_type: FileType::Text,
+        content_hash: Some("0".repeat(64)),
+        size_bytes: None,
+        mtime: None,
+        indexed_at: chrono::Utc::now(),
+    })
+    .await
+    .expect("insert text file");
+    uuid
 }

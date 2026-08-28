@@ -12,3 +12,6 @@ mod rename;
 
 #[path = "playlists/delete.rs"]
 mod delete;
+
+#[path = "playlists/add_entries.rs"]
+mod add_entries;

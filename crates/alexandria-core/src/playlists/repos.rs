@@ -2,8 +2,9 @@ use sqlx::sqlite::SqlitePool;
 use sqlx::Row;
 use uuid::Uuid;
 
+use crate::catalog::model::FileType;
 use crate::errors::{DomainError, WRITE_TX};
-use crate::playlists::model::{NewPlaylist, Playlist};
+use crate::playlists::model::{NewPlaylist, Playlist, PlaylistEntry};
 
 /// Playlists repository port. The create handler depends on this trait so
 /// its decision logic (validation, uuid minting) is unit-tested against an
@@ -33,6 +34,33 @@ pub trait PlaylistRepository: Send + Sync {
     /// foreign key (nothing cascades to it), so the entries must be deleted
     /// explicitly, in the same transaction, before the playlist itself.
     async fn delete_playlist(&self, uuid: Uuid) -> Result<(), DomainError>;
+
+    /// Append `file_uuids` to the playlist identified by `playlist_uuid`, in
+    /// order, at consecutive positions starting after whatever the playlist
+    /// already holds, and return the new entries.
+    ///
+    /// All-or-nothing, in one transaction: every uuid must resolve to an
+    /// audio file, or nothing is added. "Add this whole album" is one call
+    /// so a rejected track cannot leave the rest of the album behind — the
+    /// reason the caller passes a slice rather than looping one uuid at a
+    /// time. `NotFound` when `playlist_uuid` or any `file_uuids` entry does
+    /// not resolve to a file; `InvalidInput` when a resolved file is not
+    /// `FileType::Audio` (a playlist holds audio only — video and documents
+    /// have their own watchlists/reading lists).
+    ///
+    /// Deliberately not idempotent, unlike `ReadingListRepository::add_item`:
+    /// `playlist_entries` carries no `UNIQUE (playlist_id, file_id)` (a set
+    /// may open and close with the same song), so adding an already-present
+    /// track appends a second entry rather than returning the existing one.
+    async fn add_entries(
+        &self,
+        playlist_uuid: Uuid,
+        file_uuids: &[Uuid],
+    ) -> Result<Vec<PlaylistEntry>, DomainError>;
+
+    /// Every entry the playlist identified by `playlist_uuid` holds, ordered
+    /// by `position`.
+    async fn list_entries(&self, playlist_uuid: Uuid) -> Result<Vec<PlaylistEntry>, DomainError>;
 }
 
 #[derive(Clone)]
@@ -137,5 +165,103 @@ impl PlaylistRepository for SqlitePlaylistRepository {
 
         tx.commit().await?;
         Ok(())
+    }
+
+    async fn add_entries(
+        &self,
+        playlist_uuid: Uuid,
+        file_uuids: &[Uuid],
+    ) -> Result<Vec<PlaylistEntry>, DomainError> {
+        let mut tx = self.pool.begin_with(WRITE_TX).await?;
+
+        let playlist_id: i64 = sqlx::query("SELECT id FROM playlists WHERE uuid = ?")
+            .bind(playlist_uuid.to_string())
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or(DomainError::NotFound)?
+            .try_get("id")?;
+
+        // Resolve every uuid to a `files.id` and confirm it is audio before
+        // inserting anything -- a uuid that fails partway must not leave
+        // the earlier ones in the slice added (the whole reason this takes
+        // a slice rather than being called once per uuid).
+        let mut resolved: Vec<i64> = Vec::with_capacity(file_uuids.len());
+        for file_uuid in file_uuids {
+            let row = sqlx::query("SELECT id, type FROM files WHERE uuid = ?")
+                .bind(file_uuid.to_string())
+                .fetch_optional(&mut *tx)
+                .await?
+                .ok_or(DomainError::NotFound)?;
+
+            let file_id: i64 = row.try_get("id")?;
+            let file_type: String = row.try_get("type")?;
+            if file_type != FileType::Audio.as_str() {
+                return Err(DomainError::InvalidInput(format!(
+                    "file {file_uuid} is not audio"
+                )));
+            }
+            resolved.push(file_id);
+        }
+
+        let next_position: i64 = sqlx::query(
+            "SELECT COALESCE(MAX(position), -1) + 1 AS next_position \
+             FROM playlist_entries WHERE playlist_id = ?",
+        )
+        .bind(playlist_id)
+        .fetch_one(&mut *tx)
+        .await?
+        .try_get("next_position")?;
+
+        let mut entries = Vec::with_capacity(file_uuids.len());
+        for (offset, (file_uuid, file_id)) in file_uuids.iter().zip(resolved).enumerate() {
+            let position = next_position + offset as i64;
+            let id = sqlx::query(
+                "INSERT INTO playlist_entries (playlist_id, file_id, position) \
+                 VALUES (?, ?, ?)",
+            )
+            .bind(playlist_id)
+            .bind(file_id)
+            .bind(position)
+            .execute(&mut *tx)
+            .await?
+            .last_insert_rowid();
+
+            entries.push(PlaylistEntry {
+                id,
+                file_uuid: *file_uuid,
+                position,
+            });
+        }
+
+        tx.commit().await?;
+        Ok(entries)
+    }
+
+    async fn list_entries(&self, playlist_uuid: Uuid) -> Result<Vec<PlaylistEntry>, DomainError> {
+        let rows = sqlx::query(
+            "SELECT pe.id, f.uuid AS file_uuid, pe.position \
+             FROM playlist_entries pe \
+             JOIN files f ON f.id = pe.file_id \
+             WHERE pe.playlist_id = (SELECT id FROM playlists WHERE uuid = ?) \
+             ORDER BY pe.position",
+        )
+        .bind(playlist_uuid.to_string())
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter()
+            .map(|row| {
+                let id: i64 = row.try_get("id")?;
+                let file_uuid: String = row.try_get("file_uuid")?;
+                let position: i64 = row.try_get("position")?;
+                Ok(PlaylistEntry {
+                    id,
+                    file_uuid: Uuid::parse_str(&file_uuid).map_err(|err| {
+                        DomainError::internal(format!("corrupt playlist entry file uuid: {err}"))
+                    })?,
+                    position,
+                })
+            })
+            .collect()
     }
 }

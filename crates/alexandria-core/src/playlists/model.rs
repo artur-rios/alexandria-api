@@ -18,3 +18,15 @@ pub struct Playlist {
     pub uuid: Uuid,
     pub name: String,
 }
+
+/// One track held by a playlist. `id` is the entry's own identity, not the
+/// file's — `playlist_entries` deliberately carries no `UNIQUE
+/// (playlist_id, file_id)`, so the same track may appear as two distinct
+/// entries. `position` is contiguous `0..n-1` within the playlist.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlaylistEntry {
+    pub id: i64,
+    pub file_uuid: Uuid,
+    pub position: i64,
+}
