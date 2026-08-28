@@ -50,7 +50,10 @@ use alexandria_ffi::{
     alexandria_index_count_missing, alexandria_index_files_json, alexandria_index_init,
     alexandria_index_pause, alexandria_index_refresh_start, alexandria_index_resume,
     alexandria_index_run_status_json, alexandria_index_runs_active_json, alexandria_index_start,
-    FileMetadataResult, IndexStartResult,
+    alexandria_playlist_add_entries, alexandria_playlist_create, alexandria_playlist_delete,
+    alexandria_playlist_move_entry, alexandria_playlist_read, alexandria_playlist_remove_entry,
+    alexandria_playlist_rename, alexandria_playlists_list, FileMetadataResult, IndexStartResult,
+    PlaylistJsonResult,
 };
 
 const STATUS_RUN_OK: i32 = alexandria_ffi::RUN_OK;
@@ -71,6 +74,11 @@ const STATUS_FILE_INVALID_STATE: i32 = alexandria_ffi::FILE_ERR_INVALID_STATE;
 const STATUS_FILE_OK: i32 = alexandria_ffi::FILE_OK;
 const STATUS_FILE_OTHER: i32 = alexandria_ffi::FILE_ERR_OTHER;
 const STATUS_FILE_DISK: i32 = alexandria_ffi::FILE_ERR_DISK;
+
+const STATUS_PLAYLIST_OK: i32 = alexandria_ffi::PLAYLIST_OK;
+const STATUS_PLAYLIST_INVALID_INPUT: i32 = alexandria_ffi::PLAYLIST_ERR_INVALID_INPUT;
+const STATUS_PLAYLIST_UNAUTHORIZED: i32 = alexandria_ffi::PLAYLIST_ERR_UNAUTHORIZED;
+const STATUS_PLAYLIST_NOT_FOUND: i32 = alexandria_ffi::PLAYLIST_ERR_NOT_FOUND;
 
 /// Bearer token every smoke test authenticates with. A valid UUID: the
 /// active auth mode is local (`init_temp_db` sets `ALEXANDRIA_AUTH_MODE`), so
@@ -2627,4 +2635,213 @@ fn given_a_bad_token_and_an_unknown_type_when_ffi_index_start_then_unauthorized(
         result.status, STATUS_UNAUTHORIZED,
         "an unauthenticated caller must not learn that its scope failed to parse"
     );
+}
+
+// ---------------- playlists (Task 9) ----------------
+
+fn playlist_json_ok(result: PlaylistJsonResult) -> serde_json::Value {
+    assert_eq!(
+        result.status, STATUS_PLAYLIST_OK,
+        "expected PLAYLIST_OK, got {}",
+        result.status
+    );
+    assert!(!result.json.is_null(), "success must carry a json pointer");
+    let json = unsafe { CStr::from_ptr(result.json) }
+        .to_str()
+        .unwrap()
+        .to_string();
+    unsafe {
+        alexandria_free_string(result.json);
+    }
+    serde_json::from_str(&json).expect("playlist json")
+}
+
+/// Smoke-test the plain success path: creating a playlist over FFI returns
+/// `PLAYLIST_OK` with a body carrying a valid uuid, matching what
+/// `POST /v1/playlists` answers over HTTP (FR-FC-24 / NFR-09).
+#[test]
+fn given_a_valid_name_when_ffi_playlist_created_then_ok_with_a_uuid() {
+    let _g = serial();
+    let _db = init_temp_db();
+
+    let body = c(&serde_json::json!({ "name": "Road trip" }).to_string());
+    let token = c(TEST_TOKEN);
+    let result = alexandria_playlist_create(body.as_ptr(), token.as_ptr());
+
+    let value = playlist_json_ok(result);
+    let uuid = value["uuid"].as_str().unwrap_or_default();
+    assert!(
+        uuid::Uuid::parse_str(uuid).is_ok(),
+        "create must answer a valid uuid, got {uuid:?}"
+    );
+    assert_eq!(value["name"], "Road trip");
+}
+
+/// An unknown playlist uuid must be reported as `PLAYLIST_ERR_NOT_FOUND`,
+/// matching HTTP's `404` for `GET /v1/playlists/{uuid}`.
+#[test]
+fn given_an_unknown_uuid_when_ffi_playlist_read_then_not_found() {
+    let _g = serial();
+    let _db = init_temp_db();
+
+    let uuid = c("11111111-1111-1111-1111-111111111111");
+    let token = c(TEST_TOKEN);
+    let result = alexandria_playlist_read(uuid.as_ptr(), token.as_ptr());
+
+    assert_eq!(result.status, STATUS_PLAYLIST_NOT_FOUND);
+    assert!(result.json.is_null());
+}
+
+/// A blank name must be reported as `PLAYLIST_ERR_INVALID_INPUT`, matching
+/// HTTP's `400` for the same body on `POST /v1/playlists`
+/// (`validate_playlist_name`).
+#[test]
+fn given_a_blank_name_when_ffi_playlist_created_then_invalid_input() {
+    let _g = serial();
+    let _db = init_temp_db();
+
+    let body = c(&serde_json::json!({ "name": "   " }).to_string());
+    let token = c(TEST_TOKEN);
+    let result = alexandria_playlist_create(body.as_ptr(), token.as_ptr());
+
+    assert_eq!(result.status, STATUS_PLAYLIST_INVALID_INPUT);
+    assert!(result.json.is_null());
+}
+
+/// What the authentication gate in `alexandria_playlist_create` actually
+/// buys, and the only test that fails without it: a caller with a bad token
+/// *and* a malformed body must be told it is unauthorized, not that its body
+/// failed to parse.
+///
+/// `create` parses the body too, so every other unauthorized test for this
+/// function would pass with the gate deleted — the parse would simply never
+/// be reached with a *well-formed* body. This one reaches it. HTTP answers
+/// `401` to the same pair because `require_auth` is a route layer that runs
+/// before the body is ever extracted, so without the gate the two surfaces
+/// would disagree about which fault a caller is told about first
+/// (FR-FC-24 / NFR-09). Task 8's HTTP surface had exactly this gap and had
+/// to be sent back for it.
+#[test]
+fn given_a_bad_token_and_a_malformed_body_when_ffi_playlist_created_then_unauthorized() {
+    let _g = serial();
+    let _db = init_temp_db();
+
+    let body = c("{ not json");
+    let token = c("");
+    let result = alexandria_playlist_create(body.as_ptr(), token.as_ptr());
+
+    assert_eq!(
+        result.status, STATUS_PLAYLIST_UNAUTHORIZED,
+        "create must deny before parsing the body"
+    );
+    assert!(result.json.is_null());
+}
+
+/// `alexandria_playlists_list` must deny an unauthenticated caller,
+/// matching HTTP's `401` for `GET /v1/playlists`.
+#[test]
+fn given_no_token_when_ffi_playlists_list_then_unauthorized() {
+    let _g = serial();
+    let _db = init_temp_db();
+
+    let empty = c("");
+    let result = alexandria_playlists_list(empty.as_ptr());
+
+    assert_eq!(result.status, STATUS_PLAYLIST_UNAUTHORIZED);
+    assert!(result.json.is_null());
+}
+
+/// End-to-end round trip over the whole surface: create, rename, list, add
+/// entries (seeding an audio file directly, mirroring `parity.rs`'s
+/// `seed_file`), move the one entry (a no-op move at its own index, just to
+/// exercise the call), remove it, then delete the playlist — every step
+/// answering `PLAYLIST_OK`.
+#[test]
+fn given_a_full_lifecycle_when_driven_entirely_over_ffi_then_every_step_is_ok() {
+    let _g = serial();
+    let (_dir, db_path) = init_temp_db();
+    let token = c(TEST_TOKEN);
+
+    let create_body = c(&serde_json::json!({ "name": "Road trip" }).to_string());
+    let created = playlist_json_ok(alexandria_playlist_create(
+        create_body.as_ptr(),
+        token.as_ptr(),
+    ));
+    let playlist_uuid = created["uuid"].as_str().unwrap().to_string();
+    let puuid = c(&playlist_uuid);
+
+    let rename_body = c(&serde_json::json!({ "name": "Summer trip" }).to_string());
+    let renamed = playlist_json_ok(alexandria_playlist_rename(
+        puuid.as_ptr(),
+        rename_body.as_ptr(),
+        token.as_ptr(),
+    ));
+    assert_eq!(renamed["name"], "Summer trip");
+
+    let listed = playlist_json_ok(alexandria_playlists_list(token.as_ptr()));
+    assert!(listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|p| p["uuid"] == playlist_uuid));
+
+    let file_uuid = with_db(&db_path, |pool| async move {
+        let file_uuid = uuid::Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO files (uuid, path, name, type, content_hash, indexed_at) \
+             VALUES (?, ?, ?, ?, 'hash', ?)",
+        )
+        .bind(&file_uuid)
+        .bind(format!("/lib/{file_uuid}"))
+        .bind("seeded.flac")
+        .bind("audio")
+        .bind(chrono::Utc::now().to_rfc3339())
+        .execute(&pool)
+        .await
+        .expect("seed audio file");
+        file_uuid
+    });
+
+    let add_body = c(&serde_json::json!({ "fileUuids": [file_uuid] }).to_string());
+    let entries = playlist_json_ok(alexandria_playlist_add_entries(
+        puuid.as_ptr(),
+        add_body.as_ptr(),
+        token.as_ptr(),
+    ));
+    let entry_uuid = entries.as_array().unwrap()[0]["uuid"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let entry_uuid_c = c(&entry_uuid);
+
+    let view = playlist_json_ok(alexandria_playlist_read(puuid.as_ptr(), token.as_ptr()));
+    assert_eq!(view["entries"].as_array().unwrap().len(), 1);
+
+    let move_body = c(&serde_json::json!({ "toIndex": 0 }).to_string());
+    let moved = playlist_json_ok(alexandria_playlist_move_entry(
+        puuid.as_ptr(),
+        entry_uuid_c.as_ptr(),
+        move_body.as_ptr(),
+        token.as_ptr(),
+    ));
+    assert_eq!(moved.as_array().unwrap().len(), 1);
+
+    let removed =
+        alexandria_playlist_remove_entry(puuid.as_ptr(), entry_uuid_c.as_ptr(), token.as_ptr());
+    assert_eq!(removed.status, STATUS_PLAYLIST_OK);
+    assert!(!removed.json.is_null());
+    let removed_json = unsafe { CStr::from_ptr(removed.json) }
+        .to_str()
+        .unwrap()
+        .to_string();
+    unsafe {
+        alexandria_free_string(removed.json);
+    }
+    assert_eq!(
+        removed_json, "{}",
+        "remove_entry echoes nothing but success"
+    );
+
+    let deleted = playlist_json_ok(alexandria_playlist_delete(puuid.as_ptr(), token.as_ptr()));
+    assert_eq!(deleted["uuid"], playlist_uuid);
 }

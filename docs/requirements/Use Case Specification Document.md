@@ -1625,6 +1625,86 @@ have only one of.
 
 ---
 
+### UC-49: Manage a playlist
+
+| Field | Value |
+| --- | --- |
+| **ID** | UC-49 |
+| **Name** | Manage a playlist |
+| **Actors** | Owner |
+| **Description** | Create, rename, and delete a named playlist of audio tracks; add tracks to it, remove one entry, and reorder its entries. |
+| **Preconditions** | The caller is authenticated; for every operation but creation, the playlist exists, and for remove/reorder the addressed entry exists in it. |
+| **Postconditions** | The playlist and its entries reflect the requested change. Entry positions remain contiguous `0..n-1`. The audio files a playlist references are never modified or deleted by a playlist operation — deleting a playlist removes only its entries. |
+| **Requirements** | FR-TR-01, FR-TR-02, FR-TR-03, FR-TR-04, FR-TR-05, FR-TR-06, FR-TR-08, FR-TR-09, FR-FC-24 |
+
+**Main Flow**
+
+1. The owner creates a playlist by submitting a name; the system validates the name is non-blank and creates the playlist, returning its UUID.
+2. The owner may rename the playlist by submitting a new name, validated the same way.
+3. The owner adds one or more audio files to the playlist by UUID; the system appends them, in order, at consecutive positions after whatever the playlist already holds. A track already on the playlist may be added again — it becomes a second, independent entry.
+4. The owner may remove one entry from the playlist by its entry id; the system deletes it and renumbers the remaining entries so positions stay contiguous.
+5. The owner may move one entry to a requested index; the system computes the playlist's full new order in one transaction, renumbers every entry, and returns the new order.
+6. The owner may delete the playlist; the system removes the playlist and every entry it holds, and returns the pre-delete record as confirmation. The referenced audio files are untouched.
+
+**Alternative Flows**
+
+| ID | Condition | Outcome |
+| --- | --- | --- |
+| AF-01 | The submitted name is blank, is whitespace-only, or has leading/trailing whitespace | The system rejects with an invalid-input error without creating or renaming anything. |
+| AF-02 | The playlist UUID, or an entry id addressed within it, does not exist | The system responds with a not-found error. |
+| AF-03 | A file submitted to be added is not an audio file | The system rejects the whole submitted batch with an invalid-input error and adds none of it. |
+| AF-04 | A file UUID submitted to be added does not resolve to any file | The system responds with a not-found error and adds none of the submitted batch — one unresolvable UUID among several means nothing from the batch is added, not just the one entry that failed to resolve. |
+| AF-05 | The requested move index is negative, or is not less than the playlist's current entry count | The system rejects with an invalid-input error; the playlist's order is unchanged. |
+| AF-06 | The caller is not authenticated | The system denies with an unauthorized error. |
+
+> An entry is addressed by its own id, not by the file it references (AF-02,
+> main flow steps 4-5): `playlist_entries` carries no `UNIQUE (playlistId,
+> fileId)`, so the same track may sit at two positions in the same playlist,
+> and only the entry's own id tells them apart.
+>
+> Reordering (main flow step 5) is always "put entry X at index N": the
+> system computes the resulting order and renumbers every entry itself. A
+> caller never submits its own list of positions — that would be a second
+> implementation of the ordering rule, and the two would eventually drift.
+
+---
+
+### UC-50: Play a playlist
+
+| Field | Value |
+| --- | --- |
+| **ID** | UC-50 |
+| **Name** | Play a playlist |
+| **Actors** | Owner |
+| **Description** | Read a playlist's tracks in position order so they can be played in sequence. Playback itself — transport controls, the currently-playing track, and advancing to the next one — is implemented by the Alexandria UI, not by this repository; this use case is this core's contribution: the ordered, resolved read that playback consumes. |
+| **Preconditions** | The caller is authenticated; the playlist exists. |
+| **Postconditions** | The caller holds the playlist's tracks in position order, each resolved to its file (including its audio metadata), and each flagged whether its underlying file is currently missing on disk. |
+| **Requirements** | FR-TR-07, FR-TR-11, FR-FC-24 |
+
+**Main Flow**
+
+1. The owner requests a playlist by UUID to begin playback.
+2. The system reads the playlist's entries in position order and resolves each to its file, batched rather than one lookup per track.
+3. The system reports, for each entry, whether its file's `missingAt` is set, without dropping the entry from the list.
+4. The caller receives the ordered, resolved list and drives playback against it — starting at position 0 and advancing through the returned order, which already reflects any reordering (UC-49) applied earlier.
+
+**Alternative Flows**
+
+| ID | Condition | Outcome |
+| --- | --- | --- |
+| AF-01 | The playlist UUID does not exist | The system responds with a not-found error. |
+| AF-02 | The caller is not authenticated | The system denies with an unauthorized error. |
+| AF-03 | An entry's file has gone missing on disk | The entry is kept in the returned order and flagged `missing: true`, rather than dropped or skipped. A soft-deleted file is reported `missing: false`; whether to skip a flagged entry during playback, and how to tell trashed apart from missing, are UI decisions this use case does not make. |
+
+> This core never advances a "current track," never holds playback state,
+> and never decides what happens when a flagged entry is reached — those are
+> the Alexandria UI's responsibility. What this use case guarantees is that
+> the order the UI plays is exactly the order UC-49's reorder flow last
+> produced, and that a missing file surfaces as a flag the UI can act on
+> rather than as a silently shortened playlist.
+
+---
+
 ## 3. Use Case — Requirements Traceability
 
 | Use Case | Requirements |
@@ -1676,15 +1756,19 @@ have only one of.
 | UC-46: Browse collections | FR-CO-08, FR-FC-24 |
 | UC-47: Report the retention window | FR-FC-30, FR-FC-24 |
 | UC-48: Pause, resume, or cancel an index run | FR-FC-24, FR-FC-27, FR-FC-29, FR-FC-31, FR-FC-32, FR-FC-33, FR-FC-34 |
+| UC-49: Manage a playlist | FR-TR-01, FR-TR-02, FR-TR-03, FR-TR-04, FR-TR-05, FR-TR-06, FR-TR-08, FR-TR-09, FR-FC-24 |
+| UC-50: Play a playlist | FR-TR-07, FR-TR-11, FR-FC-24 |
 
 Every functional requirement in [System Requirements Document](System%20Requirements%20Document.md)
 §3 appears in at least one row above except FR-AU-12, FR-AU-18, FR-AU-21,
-FR-AU-23, and FR-AU-24, which are cross-cutting (the error envelope shape, the
-account query, the Windows startup account check, the Windows-mode refusal of
-local-mode operations, and the loopback-bind warning, respectively) rather
-than tied to one use case: FR-FC-01..35, FR-CO-01..07, FR-BM-01..06,
-FR-WL-01..08, FR-RL-01..08, FR-TX-01..03, FR-AU-01..11, FR-AU-13..17,
-FR-AU-19, FR-AU-20, FR-AU-22, FR-MP-01..06.
+FR-AU-23, FR-AU-24, and FR-TR-10, which are cross-cutting (the error envelope
+shape, the account query, the Windows startup account check, the
+Windows-mode refusal of local-mode operations, the loopback-bind warning,
+and the playlist-entry cleanup a file purge performs regardless of which
+playlist use case is or is not in play, respectively) rather than tied to
+one use case: FR-FC-01..35, FR-CO-01..07, FR-BM-01..06, FR-WL-01..08,
+FR-RL-01..08, FR-TX-01..03, FR-AU-01..11, FR-AU-13..17, FR-AU-19, FR-AU-20,
+FR-AU-22, FR-MP-01..06, FR-TR-01..09, FR-TR-11.
 UC-37 (Health check) is specified in the
 [Operations & Infrastructure Document](Operations%20%26%20Infrastructure%20Document.md)
 §5.3, not here, since it is an operational concern rather than a catalog use case.

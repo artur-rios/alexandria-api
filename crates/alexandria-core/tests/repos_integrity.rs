@@ -3,12 +3,13 @@
 //!
 //! Foreign keys *are* enforced — sqlx sets `PRAGMA foreign_keys = ON` on every
 //! connection — but only the subtype tables declare one. `watch_progress`,
-//! `reading_progress`, and the two `collection_id` columns have no foreign key
-//! at all (SQLite cannot add one via `ALTER TABLE`), so nothing cascades to
-//! them and the repository performing a delete has to clear them by hand.
-//! These tests pin the two places where it had not: UC-12's unlink of a
-//! bookmark collection's members, and UC-08/UC-09's removal of the progress
-//! rows that tracked a purged file.
+//! `reading_progress`, `playlist_entries`, and the two `collection_id`
+//! columns have no foreign key at all (SQLite cannot add one via `ALTER
+//! TABLE`), so nothing cascades to them and the repository performing a
+//! delete has to clear them by hand. These tests pin the places where it had
+//! not: UC-12's unlink of a bookmark collection's members, UC-08/UC-09's
+//! removal of the progress rows that tracked a purged file, and a purged
+//! file's playlist entries.
 
 use alexandria_core::bookmarks::model::NewBookmark;
 use alexandria_core::bookmarks::repos::{BookmarkRepository, SqliteBookmarkRepository};
@@ -17,6 +18,8 @@ use alexandria_core::catalog::repos::{CatalogRepository, SqliteCatalogRepository
 use alexandria_core::collections::model::{CollectionKind, NewCollection};
 use alexandria_core::collections::repos::{CollectionRepository, SqliteCollectionRepository};
 use alexandria_core::migrate::run_migrations;
+use alexandria_core::playlists::model::NewPlaylist;
+use alexandria_core::playlists::repos::{PlaylistRepository, SqlitePlaylistRepository};
 use alexandria_core::reading_lists::model::{NewReadingList, ReadingTargetKind};
 use alexandria_core::reading_lists::repos::{ReadingListRepository, SqliteReadingListRepository};
 use alexandria_core::watchlists::model::NewWatchlist;
@@ -194,6 +197,98 @@ async fn given_item_on_a_reading_list_when_purged_then_its_reading_progress_is_r
         .await
         .expect("find reading list")
         .is_some());
+
+    pool.close().await;
+}
+
+/// `playlist_entries` declares no foreign key either (SQLite cannot add one
+/// via `ALTER TABLE`), so nothing cascades to it. Without an explicit DELETE
+/// a purged track leaves an entry pointing at a `files.id` that no longer
+/// exists: invisible to the playlist read, which inner-joins `files`, and
+/// permanently orphaned.
+#[tokio::test]
+async fn given_a_track_on_a_playlist_when_the_file_is_purged_then_its_entries_go_too() {
+    let pool = migrated_pool().await;
+    let catalog = SqliteCatalogRepository::new(pool.clone());
+    let playlists = SqlitePlaylistRepository::new(pool.clone());
+
+    let song_uuid = insert_file(&catalog, "/library/a.flac", FileType::Audio).await;
+
+    let playlist_uuid = Uuid::new_v4();
+    playlists
+        .insert_playlist(NewPlaylist {
+            uuid: playlist_uuid,
+            name: "Road trip".to_string(),
+        })
+        .await
+        .expect("insert playlist");
+    playlists
+        .add_entries(playlist_uuid, &[song_uuid])
+        .await
+        .expect("add entry");
+
+    catalog.purge(song_uuid).await.expect("purge");
+
+    let (remaining,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM playlist_entries")
+        .fetch_one(&pool)
+        .await
+        .expect("query");
+    assert_eq!(
+        remaining, 0,
+        "a purged file left a playlist entry pointing at nothing"
+    );
+
+    pool.close().await;
+}
+
+/// The test above uses a ONE-entry playlist, so it can only see that the
+/// purged entry's own row disappears -- it cannot see whether purging left
+/// a hole in the *other* entries' positions, because there are none.
+/// FR-TR-09 requires positions to stay contiguous `0..n-1` after every
+/// mutation, including a purge; the plain `DELETE FROM playlist_entries
+/// WHERE file_id = ?` a purge issues does not renumber what it leaves
+/// behind on its own. This purges the *middle* track of a three-track
+/// playlist and asserts the remaining two land back at `[0, 1]`, not `[0,
+/// 2]`.
+#[tokio::test]
+async fn given_a_middle_track_when_purged_then_the_remaining_positions_stay_contiguous() {
+    let pool = migrated_pool().await;
+    let catalog = SqliteCatalogRepository::new(pool.clone());
+    let playlists = SqlitePlaylistRepository::new(pool.clone());
+
+    let a_uuid = insert_file(&catalog, "/library/a.flac", FileType::Audio).await;
+    let b_uuid = insert_file(&catalog, "/library/b.flac", FileType::Audio).await;
+    let c_uuid = insert_file(&catalog, "/library/c.flac", FileType::Audio).await;
+
+    let playlist_uuid = Uuid::new_v4();
+    playlists
+        .insert_playlist(NewPlaylist {
+            uuid: playlist_uuid,
+            name: "Road trip".to_string(),
+        })
+        .await
+        .expect("insert playlist");
+    playlists
+        .add_entries(playlist_uuid, &[a_uuid, b_uuid, c_uuid])
+        .await
+        .expect("add entries");
+
+    catalog.purge(b_uuid).await.expect("purge");
+
+    let remaining = playlists
+        .list_entries(playlist_uuid)
+        .await
+        .expect("list entries");
+    assert_eq!(
+        remaining.iter().map(|e| e.file_uuid).collect::<Vec<_>>(),
+        vec![a_uuid, c_uuid],
+        "the purged track's entry should be gone, the other two untouched in order"
+    );
+    assert_eq!(
+        remaining.iter().map(|e| e.position).collect::<Vec<_>>(),
+        vec![0, 1],
+        "purging the middle track must close the gap it leaves, not just delete the row"
+    );
 
     pool.close().await;
 }

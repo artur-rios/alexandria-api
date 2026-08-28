@@ -1656,13 +1656,14 @@ impl CatalogRepository for SqliteCatalogRepository {
             .await?;
 
         // The progress rows that tracked this file go with it. Unlike the
-        // subtype tables, `watch_progress` and `reading_progress` declare no
-        // foreign key (SQLite cannot add one via `ALTER TABLE`), so the
-        // cascade that covers the subtype row does not reach them — see
-        // `delete_subtype_sql`. Without these two statements a purged
-        // video/document/comic leaves rows pointing at a `files.id` that no
-        // longer exists: invisible to UC-21/UC-27, which inner-join `files`,
-        // but permanently orphaned. A zero-row DELETE is the normal case here,
+        // subtype tables, `watch_progress`, `reading_progress`, and
+        // `playlist_entries` declare no foreign key (SQLite cannot add one
+        // via `ALTER TABLE`), so the cascade that covers the subtype row does
+        // not reach them — see `delete_subtype_sql`. Without these
+        // statements a purged video/document/comic/track leaves rows
+        // pointing at a `files.id` that no longer exists: invisible to
+        // UC-21/UC-27 and the playlist read, which inner-join `files`, but
+        // permanently orphaned. A zero-row DELETE is the normal case here,
         // not an error.
         sqlx::query("DELETE FROM watch_progress WHERE video_file_id = ?")
             .bind(id)
@@ -1673,6 +1674,54 @@ impl CatalogRepository for SqliteCatalogRepository {
             .bind(id)
             .execute(&mut *tx)
             .await?;
+
+        // Collect the playlists this file's entries belong to *before*
+        // deleting them -- once the rows are gone there is nothing left to
+        // read `playlist_id` off of. A file can sit in more than one
+        // playlist, and more than once in the same one (no `UNIQUE
+        // (playlist_id, file_id)`), so this is a distinct list, not one
+        // playlist_id per entry.
+        let affected_playlists: Vec<(i64,)> =
+            sqlx::query_as("SELECT DISTINCT playlist_id FROM playlist_entries WHERE file_id = ?")
+                .bind(id)
+                .fetch_all(&mut *tx)
+                .await?;
+
+        sqlx::query("DELETE FROM playlist_entries WHERE file_id = ?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+
+        // The DELETE above can punch one or more holes in each affected
+        // playlist's position sequence -- unlike `remove_entry`, which
+        // removes exactly one row and can shift everything after it down
+        // by one, a purge may remove several entries (the same file
+        // appearing more than once, or several purges since the playlist
+        // was last touched) at scattered positions. Re-reading each
+        // playlist's remaining entries in position order and rewriting
+        // them to `0..n-1` closes every gap at once, the same read-move-
+        // rewrite approach `PlaylistRepository::move_entry` uses, rather
+        // than computing which positions shift by how much. Without this,
+        // FR-TR-09's contiguity guarantee holds for every mutation except
+        // this one -- positions never return to `0..n-1` on their own, and
+        // nothing else in this schema renumbers past what the removal
+        // itself already touched.
+        for (playlist_id,) in affected_playlists {
+            let remaining: Vec<(i64,)> = sqlx::query_as(
+                "SELECT id FROM playlist_entries WHERE playlist_id = ? ORDER BY position",
+            )
+            .bind(playlist_id)
+            .fetch_all(&mut *tx)
+            .await?;
+
+            for (position, (entry_id,)) in remaining.into_iter().enumerate() {
+                sqlx::query("UPDATE playlist_entries SET position = ? WHERE id = ?")
+                    .bind(position as i64)
+                    .bind(entry_id)
+                    .execute(&mut *tx)
+                    .await?;
+            }
+        }
 
         let affected = sqlx::query("DELETE FROM files WHERE id = ?")
             .bind(id)

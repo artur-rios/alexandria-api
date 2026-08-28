@@ -3318,6 +3318,503 @@ pub extern "C" fn alexandria_reading_list_delete(
     }
 }
 
+/// FFI status codes returned by playlist operations (Tasks 1-6).
+/// Deliberately separate from `READING_LIST_*` / `WATCHLIST_*` — per the
+/// convention above — so playlist use cases can grow their own set without
+/// colliding; `PLAYLIST_OK == READING_LIST_OK == WATCHLIST_OK == 0` by
+/// convention.
+pub const PLAYLIST_OK: c_int = 0;
+pub const PLAYLIST_ERR_INVALID_INPUT: c_int = 1;
+pub const PLAYLIST_ERR_UNAUTHORIZED: c_int = 2;
+pub const PLAYLIST_ERR_NOT_INITIALIZED: c_int = 3;
+pub const PLAYLIST_ERR_NOT_FOUND: c_int = 4;
+pub const PLAYLIST_ERR_INVALID_STATE: c_int = 5;
+pub const PLAYLIST_ERR_OTHER: c_int = 9;
+
+/// Result of every playlist FFI function. On success `status` is
+/// `PLAYLIST_OK` and `json` is a NUL-terminated JSON string of the response
+/// body — byte-for-byte the same shape HTTP returns from the matching
+/// `/v1/playlists*` route (FR-FC-24 / NFR-09). On failure `json` is NULL
+/// and `status` carries the mapped error code. The caller must free `json`
+/// with `alexandria_free_string`.
+#[repr(C)]
+#[derive(Debug)]
+pub struct PlaylistJsonResult {
+    pub status: c_int,
+    pub json: *mut c_char,
+}
+
+impl PlaylistJsonResult {
+    fn err(status: c_int) -> Self {
+        Self {
+            status,
+            json: std::ptr::null_mut(),
+        }
+    }
+
+    fn ok(json: String) -> Self {
+        let cstring = CString::new(json).unwrap_or_default();
+        Self {
+            status: PLAYLIST_OK,
+            json: cstring.into_raw(),
+        }
+    }
+}
+
+fn map_playlist_err(err: DomainError) -> PlaylistJsonResult {
+    match err {
+        DomainError::NotFound => PlaylistJsonResult::err(PLAYLIST_ERR_NOT_FOUND),
+        DomainError::Unauthorized => PlaylistJsonResult::err(PLAYLIST_ERR_UNAUTHORIZED),
+        DomainError::InvalidInput(_) => PlaylistJsonResult::err(PLAYLIST_ERR_INVALID_INPUT),
+        DomainError::InvalidState => PlaylistJsonResult::err(PLAYLIST_ERR_INVALID_STATE),
+        _ => PlaylistJsonResult::err(PLAYLIST_ERR_OTHER),
+    }
+}
+
+/// Request body accepted by `alexandria_playlist_create` and
+/// `alexandria_playlist_rename` — the same JSON `POST /v1/playlists` /
+/// `PATCH /v1/playlists/{uuid}` take: `{"name":"Road trip"}`.
+#[derive(Debug)]
+struct PlaylistNameBody {
+    name: String,
+}
+
+impl PlaylistNameBody {
+    fn from_json_str(s: &str) -> Option<Self> {
+        let value: serde_json::Value = serde_json::from_str(s).ok()?;
+        let obj = value.as_object()?;
+        let name = obj.get("name")?.as_str()?.to_string();
+        Some(Self { name })
+    }
+}
+
+/// Create a named, empty playlist (Task 1).
+///
+/// `json_body` is the JSON body HTTP would send (`name`). The function
+/// deserializes it, calls the same `CreatePlaylistHandler` the HTTP route
+/// uses, and on success serializes the returned `Playlist` back to JSON —
+/// so the FFI and HTTP surfaces agree byte-for-byte modulo key ordering
+/// (parity, FR-FC-24 / NFR-09). `token` is the bearer auth token.
+#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
+#[no_mangle]
+pub extern "C" fn alexandria_playlist_create(
+    json_body: *const c_char,
+    token: *const c_char,
+) -> PlaylistJsonResult {
+    let services = match services_slot().lock().unwrap().clone() {
+        Some(s) => s,
+        None => return PlaylistJsonResult::err(PLAYLIST_ERR_NOT_INITIALIZED),
+    };
+
+    let token = cstr_lossy(token).unwrap_or_default();
+    if !authenticated(&services, &token) {
+        return PlaylistJsonResult::err(PLAYLIST_ERR_UNAUTHORIZED);
+    }
+
+    let body_str = match cstr_lossy(json_body) {
+        Some(s) => s,
+        None => return PlaylistJsonResult::err(PLAYLIST_ERR_INVALID_INPUT),
+    };
+    let body = match PlaylistNameBody::from_json_str(&body_str) {
+        Some(b) => b,
+        None => return PlaylistJsonResult::err(PLAYLIST_ERR_INVALID_INPUT),
+    };
+
+    let result = runtime().block_on(async {
+        services
+            .create_playlist_handler
+            .create(&body.name, &token)
+            .await
+    });
+
+    match result {
+        Ok(playlist) => {
+            let json = serde_json::to_string(&playlist).unwrap_or_default();
+            PlaylistJsonResult::ok(json)
+        }
+        Err(err) => map_playlist_err(err),
+    }
+}
+
+/// Rename a playlist, leaving its entries and their order untouched
+/// (Task 2).
+///
+/// `uuid` is the playlist's public UUID (NUL-terminated string).
+/// `json_body` is the JSON body HTTP would send (`name`). Both surfaces
+/// call the same `RenamePlaylistHandler` so they stay at parity (FR-FC-24 /
+/// NFR-09). `token` is the bearer auth token.
+#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
+#[no_mangle]
+pub extern "C" fn alexandria_playlist_rename(
+    uuid: *const c_char,
+    json_body: *const c_char,
+    token: *const c_char,
+) -> PlaylistJsonResult {
+    let services = match services_slot().lock().unwrap().clone() {
+        Some(s) => s,
+        None => return PlaylistJsonResult::err(PLAYLIST_ERR_NOT_INITIALIZED),
+    };
+
+    let token = cstr_lossy(token).unwrap_or_default();
+    if !authenticated(&services, &token) {
+        return PlaylistJsonResult::err(PLAYLIST_ERR_UNAUTHORIZED);
+    }
+
+    let uuid = match cstr_lossy(uuid).and_then(|s| uuid::Uuid::parse_str(&s).ok()) {
+        Some(u) => u,
+        None => return PlaylistJsonResult::err(PLAYLIST_ERR_INVALID_INPUT),
+    };
+
+    let body_str = match cstr_lossy(json_body) {
+        Some(s) => s,
+        None => return PlaylistJsonResult::err(PLAYLIST_ERR_INVALID_INPUT),
+    };
+    let body = match PlaylistNameBody::from_json_str(&body_str) {
+        Some(b) => b,
+        None => return PlaylistJsonResult::err(PLAYLIST_ERR_INVALID_INPUT),
+    };
+
+    let result = runtime().block_on(async {
+        services
+            .rename_playlist_handler
+            .rename(uuid, &body.name, &token)
+            .await
+    });
+
+    match result {
+        Ok(playlist) => {
+            let json = serde_json::to_string(&playlist).unwrap_or_default();
+            PlaylistJsonResult::ok(json)
+        }
+        Err(err) => map_playlist_err(err),
+    }
+}
+
+/// Delete a playlist, removing its entries; referenced audio files are
+/// preserved (Task 3).
+///
+/// `uuid` is the playlist's public UUID (NUL-terminated string). On success
+/// `json` carries the pre-delete `Playlist` — byte-for-byte the same shape
+/// HTTP returns from `DELETE /v1/playlists/{uuid}` (parity, FR-FC-24 /
+/// NFR-09). `token` is the bearer auth token.
+#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
+#[no_mangle]
+pub extern "C" fn alexandria_playlist_delete(
+    uuid: *const c_char,
+    token: *const c_char,
+) -> PlaylistJsonResult {
+    let services = match services_slot().lock().unwrap().clone() {
+        Some(s) => s,
+        None => return PlaylistJsonResult::err(PLAYLIST_ERR_NOT_INITIALIZED),
+    };
+
+    // Deny before touching the payload — an unauthenticated caller must not
+    // learn whether the uuid would have parsed.
+    let token = cstr_lossy(token).unwrap_or_default();
+    if !authenticated(&services, &token) {
+        return PlaylistJsonResult::err(PLAYLIST_ERR_UNAUTHORIZED);
+    }
+
+    let uuid = match cstr_lossy(uuid).and_then(|s| uuid::Uuid::parse_str(&s).ok()) {
+        Some(u) => u,
+        None => return PlaylistJsonResult::err(PLAYLIST_ERR_INVALID_INPUT),
+    };
+
+    let result =
+        runtime().block_on(async { services.delete_playlist_handler.delete(uuid, &token).await });
+
+    match result {
+        Ok(playlist) => {
+            let json = serde_json::to_string(&playlist).unwrap_or_default();
+            PlaylistJsonResult::ok(json)
+        }
+        Err(err) => map_playlist_err(err),
+    }
+}
+
+/// Every persisted playlist, without their tracks (Task 6).
+///
+/// `token` is the bearer auth token. On success `json` carries a
+/// `Vec<Playlist>` — byte-for-byte the same shape HTTP returns from
+/// `GET /v1/playlists` (parity, FR-FC-24 / NFR-09).
+#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
+#[no_mangle]
+pub extern "C" fn alexandria_playlists_list(token: *const c_char) -> PlaylistJsonResult {
+    let services = match services_slot().lock().unwrap().clone() {
+        Some(s) => s,
+        None => return PlaylistJsonResult::err(PLAYLIST_ERR_NOT_INITIALIZED),
+    };
+
+    let token = cstr_lossy(token).unwrap_or_default();
+    if !authenticated(&services, &token) {
+        return PlaylistJsonResult::err(PLAYLIST_ERR_UNAUTHORIZED);
+    }
+
+    let result = runtime().block_on(async { services.browse_playlists_handler.list(&token).await });
+
+    match result {
+        Ok(playlists) => {
+            let json = serde_json::to_string(&playlists).unwrap_or_default();
+            PlaylistJsonResult::ok(json)
+        }
+        Err(err) => map_playlist_err(err),
+    }
+}
+
+/// Read a playlist back with its tracks, in position order (Task 6).
+///
+/// `uuid` is the playlist's public UUID (NUL-terminated string). On success
+/// `json` carries a `PlaylistView` — byte-for-byte the same shape HTTP
+/// returns from `GET /v1/playlists/{uuid}` (parity, FR-FC-24 / NFR-09).
+/// `token` is the bearer auth token.
+#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
+#[no_mangle]
+pub extern "C" fn alexandria_playlist_read(
+    uuid: *const c_char,
+    token: *const c_char,
+) -> PlaylistJsonResult {
+    let services = match services_slot().lock().unwrap().clone() {
+        Some(s) => s,
+        None => return PlaylistJsonResult::err(PLAYLIST_ERR_NOT_INITIALIZED),
+    };
+
+    let token = cstr_lossy(token).unwrap_or_default();
+    if !authenticated(&services, &token) {
+        return PlaylistJsonResult::err(PLAYLIST_ERR_UNAUTHORIZED);
+    }
+
+    let uuid = match cstr_lossy(uuid).and_then(|s| uuid::Uuid::parse_str(&s).ok()) {
+        Some(u) => u,
+        None => return PlaylistJsonResult::err(PLAYLIST_ERR_INVALID_INPUT),
+    };
+
+    let result =
+        runtime().block_on(async { services.browse_playlists_handler.read(uuid, &token).await });
+
+    match result {
+        Ok(view) => {
+            let json = serde_json::to_string(&view).unwrap_or_default();
+            PlaylistJsonResult::ok(json)
+        }
+        Err(err) => map_playlist_err(err),
+    }
+}
+
+/// Request body accepted by `alexandria_playlist_add_entries` — the same
+/// JSON `POST /v1/playlists/{uuid}/entries` takes: `{"fileUuids":["…"]}`.
+#[derive(Debug)]
+struct AddEntriesToPlaylistBody {
+    file_uuids: Vec<uuid::Uuid>,
+}
+
+impl AddEntriesToPlaylistBody {
+    fn from_json_str(s: &str) -> Option<Self> {
+        let value: serde_json::Value = serde_json::from_str(s).ok()?;
+        let obj = value.as_object()?;
+        let raw = obj.get("fileUuids")?.as_array()?;
+        let mut file_uuids = Vec::with_capacity(raw.len());
+        for v in raw {
+            file_uuids.push(uuid::Uuid::parse_str(v.as_str()?).ok()?);
+        }
+        Some(Self { file_uuids })
+    }
+}
+
+/// Append tracks to a playlist, in order, at consecutive positions after
+/// whatever it already holds (Task 4). The whole slice succeeds or none of
+/// it does.
+///
+/// `uuid` is the playlist's public UUID (NUL-terminated string).
+/// `json_body` is the JSON body HTTP would send (`fileUuids`). On success
+/// `json` carries the new `Vec<PlaylistEntry>` — byte-for-byte the same
+/// shape HTTP returns from `POST /v1/playlists/{uuid}/entries` (parity,
+/// FR-FC-24 / NFR-09). `token` is the bearer auth token.
+#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
+#[no_mangle]
+pub extern "C" fn alexandria_playlist_add_entries(
+    uuid: *const c_char,
+    json_body: *const c_char,
+    token: *const c_char,
+) -> PlaylistJsonResult {
+    let services = match services_slot().lock().unwrap().clone() {
+        Some(s) => s,
+        None => return PlaylistJsonResult::err(PLAYLIST_ERR_NOT_INITIALIZED),
+    };
+
+    let token = cstr_lossy(token).unwrap_or_default();
+    if !authenticated(&services, &token) {
+        return PlaylistJsonResult::err(PLAYLIST_ERR_UNAUTHORIZED);
+    }
+
+    let uuid = match cstr_lossy(uuid).and_then(|s| uuid::Uuid::parse_str(&s).ok()) {
+        Some(u) => u,
+        None => return PlaylistJsonResult::err(PLAYLIST_ERR_INVALID_INPUT),
+    };
+
+    let body_str = match cstr_lossy(json_body) {
+        Some(s) => s,
+        None => return PlaylistJsonResult::err(PLAYLIST_ERR_INVALID_INPUT),
+    };
+    let body = match AddEntriesToPlaylistBody::from_json_str(&body_str) {
+        Some(b) => b,
+        None => return PlaylistJsonResult::err(PLAYLIST_ERR_INVALID_INPUT),
+    };
+
+    let result = runtime().block_on(async {
+        services
+            .add_entries_handler
+            .add(uuid, &body.file_uuids, &token)
+            .await
+    });
+
+    match result {
+        Ok(entries) => {
+            let json = serde_json::to_string(&entries).unwrap_or_default();
+            PlaylistJsonResult::ok(json)
+        }
+        Err(err) => map_playlist_err(err),
+    }
+}
+
+/// Remove one entry from a playlist, addressed by its own `entry_uuid`
+/// rather than a file uuid, since a playlist may hold the same track more
+/// than once (Task 4).
+///
+/// `playlist_uuid` is the playlist's public UUID (NUL-terminated string);
+/// `entry_uuid` is the entry's own public UUID (NUL-terminated string),
+/// passed directly rather than through a body (there is nothing else to
+/// carry) -- the internal rowid is never exposed on this transport, matching
+/// HTTP's `{entryUuid}` path parameter (SRD §4.0). On success `json` is an
+/// empty JSON object (`"{}"`) — the core handler answers
+/// `Result<(), DomainError>`, nothing beyond success is available to echo
+/// back, matching `DELETE /v1/playlists/{uuid}/entries/{entryUuid}`'s
+/// `200 {}` exactly (parity, FR-FC-24 / NFR-09) rather than inventing an
+/// FFI-only shape. `token` is the bearer auth token.
+#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
+#[no_mangle]
+pub extern "C" fn alexandria_playlist_remove_entry(
+    playlist_uuid: *const c_char,
+    entry_uuid: *const c_char,
+    token: *const c_char,
+) -> PlaylistJsonResult {
+    let services = match services_slot().lock().unwrap().clone() {
+        Some(s) => s,
+        None => return PlaylistJsonResult::err(PLAYLIST_ERR_NOT_INITIALIZED),
+    };
+
+    let token = cstr_lossy(token).unwrap_or_default();
+    if !authenticated(&services, &token) {
+        return PlaylistJsonResult::err(PLAYLIST_ERR_UNAUTHORIZED);
+    }
+
+    let playlist_uuid = match cstr_lossy(playlist_uuid).and_then(|s| uuid::Uuid::parse_str(&s).ok())
+    {
+        Some(u) => u,
+        None => return PlaylistJsonResult::err(PLAYLIST_ERR_INVALID_INPUT),
+    };
+
+    let entry_uuid = match cstr_lossy(entry_uuid).and_then(|s| uuid::Uuid::parse_str(&s).ok()) {
+        Some(u) => u,
+        None => return PlaylistJsonResult::err(PLAYLIST_ERR_INVALID_INPUT),
+    };
+
+    let result = runtime().block_on(async {
+        services
+            .remove_entry_handler
+            .remove(playlist_uuid, entry_uuid, &token)
+            .await
+    });
+
+    match result {
+        Ok(()) => PlaylistJsonResult::ok("{}".to_string()),
+        Err(err) => map_playlist_err(err),
+    }
+}
+
+/// Request body accepted by `alexandria_playlist_move_entry` — the same
+/// JSON `POST /v1/playlists/{uuid}/entries/{entryUuid}/move` takes:
+/// `{"toIndex":…}`.
+#[derive(Debug)]
+struct MoveEntryBody {
+    to_index: i64,
+}
+
+impl MoveEntryBody {
+    fn from_json_str(s: &str) -> Option<Self> {
+        let value: serde_json::Value = serde_json::from_str(s).ok()?;
+        let obj = value.as_object()?;
+        Some(Self {
+            to_index: obj.get("toIndex")?.as_i64()?,
+        })
+    }
+}
+
+/// Move one playlist entry to a new index, renumbering the rest in one
+/// transaction (Task 5), addressed by its own `entry_uuid` rather than a
+/// file uuid, since a playlist may hold the same track more than once.
+///
+/// `playlist_uuid` is the playlist's public UUID (NUL-terminated string);
+/// `entry_uuid` is the entry's own public UUID (NUL-terminated string) —
+/// the internal rowid is never exposed on this transport (SRD §4.0).
+/// `json_body` is the JSON body HTTP would send (`toIndex`). On success
+/// `json` carries the playlist's full new order (`Vec<PlaylistEntry>`) —
+/// byte-for-byte the same shape HTTP returns from `POST
+/// /v1/playlists/{uuid}/entries/{entryUuid}/move` (parity, FR-FC-24 /
+/// NFR-09). `token` is the bearer auth token.
+#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
+#[no_mangle]
+pub extern "C" fn alexandria_playlist_move_entry(
+    playlist_uuid: *const c_char,
+    entry_uuid: *const c_char,
+    json_body: *const c_char,
+    token: *const c_char,
+) -> PlaylistJsonResult {
+    let services = match services_slot().lock().unwrap().clone() {
+        Some(s) => s,
+        None => return PlaylistJsonResult::err(PLAYLIST_ERR_NOT_INITIALIZED),
+    };
+
+    let token = cstr_lossy(token).unwrap_or_default();
+    if !authenticated(&services, &token) {
+        return PlaylistJsonResult::err(PLAYLIST_ERR_UNAUTHORIZED);
+    }
+
+    let playlist_uuid = match cstr_lossy(playlist_uuid).and_then(|s| uuid::Uuid::parse_str(&s).ok())
+    {
+        Some(u) => u,
+        None => return PlaylistJsonResult::err(PLAYLIST_ERR_INVALID_INPUT),
+    };
+
+    let entry_uuid = match cstr_lossy(entry_uuid).and_then(|s| uuid::Uuid::parse_str(&s).ok()) {
+        Some(u) => u,
+        None => return PlaylistJsonResult::err(PLAYLIST_ERR_INVALID_INPUT),
+    };
+
+    let body_str = match cstr_lossy(json_body) {
+        Some(s) => s,
+        None => return PlaylistJsonResult::err(PLAYLIST_ERR_INVALID_INPUT),
+    };
+    let body = match MoveEntryBody::from_json_str(&body_str) {
+        Some(b) => b,
+        None => return PlaylistJsonResult::err(PLAYLIST_ERR_INVALID_INPUT),
+    };
+
+    let result = runtime().block_on(async {
+        services
+            .reorder_playlist_handler
+            .move_entry(playlist_uuid, entry_uuid, body.to_index, &token)
+            .await
+    });
+
+    match result {
+        Ok(entries) => {
+            let json = serde_json::to_string(&entries).unwrap_or_default();
+            PlaylistJsonResult::ok(json)
+        }
+        Err(err) => map_playlist_err(err),
+    }
+}
+
 /// FFI status codes returned by local-auth operations (UC-34/UC-35).
 /// Deliberately separate from the other `*_OK == 0` families — per the
 /// convention above — so local-auth use cases can grow their own set
