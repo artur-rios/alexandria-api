@@ -15,3 +15,6 @@ mod delete;
 
 #[path = "playlists/add_entries.rs"]
 mod add_entries;
+
+#[path = "playlists/remove_entry.rs"]
+mod remove_entry;

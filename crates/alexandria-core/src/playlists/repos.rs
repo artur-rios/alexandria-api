@@ -61,6 +61,20 @@ pub trait PlaylistRepository: Send + Sync {
     /// Every entry the playlist identified by `playlist_uuid` holds, ordered
     /// by `position`.
     async fn list_entries(&self, playlist_uuid: Uuid) -> Result<Vec<PlaylistEntry>, DomainError>;
+
+    /// Remove the entry identified by `entry_id` from the playlist
+    /// identified by `playlist_uuid`, then renumber the remaining entries so
+    /// `position` stays contiguous `0..n-1`. Delete and renumber happen in
+    /// one transaction: a failure between them would leave a gap, and every
+    /// later position calculation (`add_entries`'s `next_position`,
+    /// reordering) assumes contiguity.
+    ///
+    /// `entry_id` is global, not scoped to a playlist (`playlist_entries`
+    /// carries no compound key), so this confirms the entry belongs to
+    /// `playlist_uuid` before touching it -- otherwise one playlist could
+    /// delete another's row. `NotFound` when `playlist_uuid` does not
+    /// resolve, or when `entry_id` does not resolve to a row inside it.
+    async fn remove_entry(&self, playlist_uuid: Uuid, entry_id: i64) -> Result<(), DomainError>;
 }
 
 #[derive(Clone)]
@@ -263,5 +277,48 @@ impl PlaylistRepository for SqlitePlaylistRepository {
                 })
             })
             .collect()
+    }
+
+    async fn remove_entry(&self, playlist_uuid: Uuid, entry_id: i64) -> Result<(), DomainError> {
+        let mut tx = self.pool.begin_with(WRITE_TX).await?;
+
+        let playlist_id: i64 = sqlx::query("SELECT id FROM playlists WHERE uuid = ?")
+            .bind(playlist_uuid.to_string())
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or(DomainError::NotFound)?
+            .try_get("id")?;
+
+        // Confirm the entry belongs to this playlist before deleting it --
+        // entry ids are global, so without this check one playlist could
+        // delete another's row.
+        let position: i64 =
+            sqlx::query("SELECT position FROM playlist_entries WHERE id = ? AND playlist_id = ?")
+                .bind(entry_id)
+                .bind(playlist_id)
+                .fetch_optional(&mut *tx)
+                .await?
+                .ok_or(DomainError::NotFound)?
+                .try_get("position")?;
+
+        sqlx::query("DELETE FROM playlist_entries WHERE id = ?")
+            .bind(entry_id)
+            .execute(&mut *tx)
+            .await?;
+
+        // Close the gap the removed entry left so positions stay contiguous
+        // `0..n-1` -- everything downstream of it, including this repo's own
+        // `add_entries` `next_position` calculation, assumes that.
+        sqlx::query(
+            "UPDATE playlist_entries SET position = position - 1 \
+             WHERE playlist_id = ? AND position > ?",
+        )
+        .bind(playlist_id)
+        .bind(position)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok(())
     }
 }
