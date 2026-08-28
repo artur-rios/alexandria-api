@@ -2,7 +2,7 @@ use sqlx::sqlite::SqlitePool;
 use sqlx::Row;
 use uuid::Uuid;
 
-use crate::errors::DomainError;
+use crate::errors::{DomainError, WRITE_TX};
 use crate::playlists::model::{NewPlaylist, Playlist};
 
 /// Playlists repository port. The create handler depends on this trait so
@@ -22,6 +22,17 @@ pub trait PlaylistRepository: Send + Sync {
 
     /// Every persisted playlist, ordered by name.
     async fn list_all(&self) -> Result<Vec<Playlist>, DomainError>;
+
+    /// Rename the playlist identified by `uuid` to `name` and return the
+    /// updated record. The caller has already validated the name and
+    /// confirmed the playlist exists.
+    async fn rename_playlist(&self, uuid: Uuid, name: String) -> Result<Playlist, DomainError>;
+
+    /// Delete the playlist identified by `uuid`, along with every
+    /// `playlist_entries` row it holds. `playlist_entries` carries no
+    /// foreign key (nothing cascades to it), so the entries must be deleted
+    /// explicitly, in the same transaction, before the playlist itself.
+    async fn delete_playlist(&self, uuid: Uuid) -> Result<(), DomainError>;
 }
 
 #[derive(Clone)]
@@ -87,5 +98,44 @@ impl PlaylistRepository for SqlitePlaylistRepository {
                 })
             })
             .collect()
+    }
+
+    async fn rename_playlist(&self, uuid: Uuid, name: String) -> Result<Playlist, DomainError> {
+        let affected = sqlx::query("UPDATE playlists SET name = ? WHERE uuid = ?")
+            .bind(&name)
+            .bind(uuid.to_string())
+            .execute(&self.pool)
+            .await?
+            .rows_affected();
+        if affected == 0 {
+            return Err(DomainError::NotFound);
+        }
+
+        Ok(Playlist { uuid, name })
+    }
+
+    async fn delete_playlist(&self, uuid: Uuid) -> Result<(), DomainError> {
+        let mut tx = self.pool.begin_with(WRITE_TX).await?;
+
+        // Delete every `playlist_entries` row the playlist holds before
+        // removing the playlist itself -- a deleted playlist must not leave
+        // orphaned `playlist_entries` rows (nothing cascades to them; see
+        // the migration's comment). The referenced files themselves are
+        // untouched.
+        sqlx::query(
+            "DELETE FROM playlist_entries \
+             WHERE playlist_id = (SELECT id FROM playlists WHERE uuid = ?)",
+        )
+        .bind(uuid.to_string())
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query("DELETE FROM playlists WHERE uuid = ?")
+            .bind(uuid.to_string())
+            .execute(&mut *tx)
+            .await?;
+
+        tx.commit().await?;
+        Ok(())
     }
 }

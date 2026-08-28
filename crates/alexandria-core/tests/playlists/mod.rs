@@ -37,9 +37,7 @@ pub async fn repo_with_pool() -> (SqlitePlaylistRepository, SqlitePool, tempfile
 /// Insert a playlist directly through the repository port, bypassing
 /// `CreatePlaylistHandler`'s auth/validation — for tests that need a
 /// playlist to already exist and are not exercising creation itself.
-/// Unused by Task 1's own test; kept `pub` for Tasks 2-6, which add entries
-/// to a playlist that must already exist.
-#[allow(dead_code)]
+/// Used by Task 2 onward, which need a playlist to already exist.
 pub async fn create_playlist(repo: &SqlitePlaylistRepository, name: &str) -> Playlist {
     repo.insert_playlist(NewPlaylist {
         uuid: Uuid::new_v4(),
