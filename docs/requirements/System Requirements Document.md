@@ -656,10 +656,10 @@ returns a playback descriptor instead of bytes (FR-MP-06).
 | PATCH | /v1/playlists/{uuid} | Rename a playlist. | FR-TR-02 |
 | DELETE | /v1/playlists/{uuid} | Delete a playlist (preserves its audio files). | FR-TR-03 |
 | POST | /v1/playlists/{uuid}/entries | Add audio files, in order (rejects non-audio). | FR-TR-04 |
-| DELETE | /v1/playlists/{uuid}/entries/{entryId} | Remove one entry. | FR-TR-05 |
-| POST | /v1/playlists/{uuid}/entries/{entryId}/move | Move one entry to a new index, renumbering the rest. | FR-TR-06 |
+| DELETE | /v1/playlists/{uuid}/entries/{entryUuid} | Remove one entry. | FR-TR-05 |
+| POST | /v1/playlists/{uuid}/entries/{entryUuid}/move | Move one entry to a new index, renumbering the rest. | FR-TR-06 |
 
-`DELETE /v1/playlists/{uuid}/entries/{entryId}` answers `200 {}`: the core
+`DELETE /v1/playlists/{uuid}/entries/{entryUuid}` answers `200 {}`: the core
 handler removing the entry returns nothing beyond success, so there is
 nothing to echo back beyond the identifiers already in the URL. The FFI
 counterpart (`alexandria_playlist_remove_entry`) mirrors this with the same
