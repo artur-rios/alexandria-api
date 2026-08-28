@@ -1,7 +1,18 @@
-//! Shared fixtures for the playlists integration tests (mirrors
-//! `tests/common/mod.rs` at the group level). Tasks 2-6 reuse
-//! `create_playlist`, `insert_audio_file`, and `insert_four_audio_files` to
-//! seed entries against a real migrated database.
+//! Shared fixtures for the playlists integration tests.
+//!
+//! Deliberate divergence from how the sibling test groups are laid out:
+//! `tests/reading_lists/`, `tests/watchlists/`, `tests/catalog/`, and
+//! `tests/repos_integrity.rs` each define their own private, per-file
+//! helper instead of sharing one (`catalog/runs.rs` has its own
+//! `repo_with_pool`, `repos_integrity.rs` its own
+//! `migrated_pool`/`insert_file`). Here that would mean copying
+//! `repo_with_pool`, `create_playlist`, `insert_audio_file`, and
+//! `insert_four_audio_files` into as many as six files — Tasks 1-6 all seed
+//! playlists and audio files against a real migrated database — where six
+//! near-identical copies would drift apart over the life of the feature.
+//! One group-scoped module, playing `tests/common/mod.rs`'s role but
+//! scoped to this one group instead of the whole workspace, is worth the
+//! departure from the sibling groups' convention.
 
 use alexandria_core::catalog::model::{FileType, NewFile};
 use alexandria_core::catalog::repos::{CatalogRepository, SqliteCatalogRepository};
