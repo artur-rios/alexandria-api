@@ -1658,9 +1658,9 @@ have only one of.
 | AF-06 | The caller is not authenticated | The system denies with an unauthorized error. |
 
 > An entry is addressed by its own id, not by the file it references (AF-02,
-> AF-05): `playlist_entries` carries no `UNIQUE (playlistId, fileId)`, so the
-> same track may sit at two positions in the same playlist, and only the
-> entry's own id tells them apart.
+> main flow steps 4-5): `playlist_entries` carries no `UNIQUE (playlistId,
+> fileId)`, so the same track may sit at two positions in the same playlist,
+> and only the entry's own id tells them apart.
 >
 > Reordering (main flow step 5) is always "put entry X at index N": the
 > system computes the resulting order and renumbers every entry itself. A
