@@ -215,6 +215,27 @@ graph LR
 | FR-MP-05 | The system shall return a downscaled thumbnail image for a video, image, comic, or audio File. For audio, the thumbnail is the front-cover picture embedded in the file's own tag; a file with no embedded picture returns no thumbnail. |
 | FR-MP-06 | The system shall expose playback operations via both the HTTP and FFI surfaces. Because the FFI surface cannot carry a byte stream, FR-MP-01 over FFI returns a **playback descriptor** — resolved absolute path, MIME type, and byte size — and parity for it is defined on that descriptor and on the authorization, state, and error decisions rather than on byte transfer. FR-MP-04 and FR-MP-05 return their bytes over both surfaces and are byte-exact across them. |
 
+### 3.9 Playlists (TR)
+
+Playlists are named, ordered groupings of audio tracks — audio's counterpart
+to watchlists (video) and reading lists (books/comics), one medium over from
+UC-31. Every operation below is exposed identically over the HTTP and FFI
+surfaces (FR-FC-24, NFR-09).
+
+| ID | Requirement |
+| --- | --- |
+| FR-TR-01 | The system shall create a named playlist for holding audio tracks. |
+| FR-TR-02 | The system shall rename a playlist, leaving its entries and their order untouched. |
+| FR-TR-03 | The system shall delete a playlist, removing its entries but preserving the audio files they reference. |
+| FR-TR-04 | The system shall add one or more audio files to a playlist, in order, at consecutive positions after whatever the playlist already holds, all-or-nothing: a submitted file that does not resolve to an audio file rejects the whole batch and adds none of it. |
+| FR-TR-05 | The system shall remove one entry from a playlist, addressed by the entry's own id rather than by file, since a playlist may hold the same track more than once (FR-TR-08). |
+| FR-TR-06 | The system shall move one playlist entry to a requested index, computing the playlist's full new order and renumbering every entry in one transaction; the caller supplies only the target index, never a list of positions, so there is exactly one implementation of the ordering rule. |
+| FR-TR-07 | The system shall list playlists, and read a single playlist back with its tracks resolved and returned in position order. |
+| FR-TR-08 | The system shall allow a playlist to hold the same track more than once: an entry's identity is its own row, not its file. |
+| FR-TR-09 | The system shall keep a playlist's entry positions contiguous, `0..n-1`, renumbering the remaining entries whenever one is added, removed, or moved. |
+| FR-TR-10 | The system shall delete a file's playlist entries when the file is purged, since `playlist_entries` carries no foreign key and nothing cascades to it automatically. |
+| FR-TR-11 | The system shall keep a playlist entry whose file has gone missing on disk, reporting it flagged (`missing: true`) rather than dropping it. A soft-deleted file (`state = deleted`, `missingAt` still unset) is reported `missing: false` — the two are different failure modes with different remedies, and a caller that wants to tell them apart reads the file's own `state`. |
+
 ---
 
 ## 4. Data Model
@@ -446,6 +467,26 @@ last flush, so it can still say how far it got across a restart; resuming it
 resets them, because the resumed segment rediscovers its own total and counts
 from zero (FR-FC-33).
 
+### 4.12 Playlist Fields
+
+| Field | Type | Constraints | Description |
+| --- | --- | --- | --- |
+| id | integer | PK | Internal primary key. |
+| uuid | UUID | required, unique | Public identifier. |
+| name | text | required, non-empty | Playlist name. |
+
+### 4.13 PlaylistEntry Fields
+
+| Field | Type | Constraints | Description |
+| --- | --- | --- | --- |
+| id | integer | PK | Internal primary key, and an entry's own identity — not its file. A playlist may hold the same track more than once (FR-TR-08), so removing or reordering "that track" means acting on this id, not on `fileId`. |
+| playlistId | integer | required, no FK | Containing playlist. `playlist_entries` carries no foreign key — SQLite cannot add one via `ALTER TABLE` — so purging a file deletes its entries explicitly (FR-TR-10) rather than relying on a cascade. |
+| fileId | integer | required, no FK | Referenced audio file. Adding rejects anything that is not `FileType::Audio`. Deliberately **not** `UNIQUE (playlistId, fileId)`, unlike ReadingProgress: the same track may appear as two distinct entries. |
+| position | integer | required | Contiguous `0..n-1` within the playlist; renumbered on every mutation so the stored position is always the position displayed (FR-TR-09). |
+
+`missing` (FR-TR-11) is not a stored column: it is computed when a playlist is
+read back, from whether the referenced File's own `missingAt` is set.
+
 ---
 
 ## 5. API Endpoints Overview
@@ -604,6 +645,33 @@ read and UC-33's editor, which exchange a JSON document rather than a seekable
 byte stream. Over FFI the same three operations exist, except that FR-MP-01
 returns a playback descriptor instead of bytes (FR-MP-06).
 
+### 5.10 Playlists
+
+| Method | Path | Description | Requirement |
+| --- | --- | --- | --- |
+| POST | /v1/playlists | Create a playlist. | FR-TR-01 |
+| GET | /v1/playlists | List playlists (without their tracks). | FR-TR-07 |
+| GET | /v1/playlists/{uuid} | Read a playlist back with its tracks, in position order. | FR-TR-07, FR-TR-11 |
+| PATCH | /v1/playlists/{uuid} | Rename a playlist. | FR-TR-02 |
+| DELETE | /v1/playlists/{uuid} | Delete a playlist (preserves its audio files). | FR-TR-03 |
+| POST | /v1/playlists/{uuid}/entries | Add audio files, in order (rejects non-audio). | FR-TR-04 |
+| DELETE | /v1/playlists/{uuid}/entries/{entryId} | Remove one entry. | FR-TR-05 |
+| POST | /v1/playlists/{uuid}/entries/{entryId}/move | Move one entry to a new index, renumbering the rest. | FR-TR-06 |
+
+`DELETE /v1/playlists/{uuid}/entries/{entryId}` answers `200 {}`: the core
+handler removing the entry returns nothing beyond success, so there is
+nothing to echo back beyond the identifiers already in the URL. The FFI
+counterpart (`alexandria_playlist_remove_entry`) mirrors this with the same
+literal `"{}"` payload rather than inventing an FFI-only field to fill it
+out.
+
+Over FFI, playlist operations report failure through a `PLAYLIST_ERR_*`
+family (`INVALID_INPUT`, `UNAUTHORIZED`, `NOT_INITIALIZED`, `NOT_FOUND`,
+`INVALID_STATE`, `OTHER`) that mirrors `READING_LIST_ERR_*` value for value,
+the same convention every other feature area's FFI error family follows so
+that a value never means one thing for playlists and another for reading
+lists.
+
 ---
 
 ## 6. Non-Functional Requirements
@@ -635,6 +703,7 @@ returns a playback descriptor instead of bytes (FR-MP-06).
 | Create / update / delete / restore bookmark | ✅ | ❌ |
 | Create / update / delete watchlist and progress | ✅ | ❌ |
 | Create / update / delete reading list and progress | ✅ | ❌ |
+| Create / rename / delete playlist; add / remove / reorder entries | ✅ | ❌ |
 | Local login (local mode) | ✅ (open to verify) | ⚠️ only the login verification endpoint; all other operations denied |
 | Register the local account (local mode) | n/a — no account exists yet to authenticate as | ⚠️ only once, while no local account exists; a second attempt is denied with a conflict (UC-41) |
 | Set or change local credentials (local mode) | ✅ | ❌ |
