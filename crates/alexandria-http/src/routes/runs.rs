@@ -125,7 +125,9 @@ pub struct ResumeBody {
 /// `index()` and `refresh()` spawn their own — the handler stays free of the
 /// runtime so whichever transport owns one is the one that spawns. Which
 /// handler gets spawned depends on `RunResumed::kind`: an index run resumes
-/// into `index_handler.execute(&root, run_id)`, a refresh into
+/// into `index_handler.execute(&root, run_id, &scope)` — the scope read
+/// back off the run, so a resumed segment covers the file types the run was
+/// started with — a refresh into
 /// `refresh_handler.execute(run_id)` (a refresh carries no root — it touches
 /// everything cataloged). A resumed index run whose stored `root` is somehow
 /// absent — it should never be, every row `RunKind::Index` writes carries one
@@ -185,13 +187,16 @@ pub async fn resume_run(
                 }
             };
             let handler = state.services.index_handler.clone();
+            // The run's own scope, off its row (FR-FC-01): a resumed segment
+            // walks the file types the run was started with, not every type.
+            let scope = resumed.scope;
             let spawned_run_id = resumed.run_id;
             tokio::spawn(async move {
                 // Same shape as `index()`'s own spawn: an `Err` here means
                 // the run could not resume at all; `execute` has already
                 // written its own terminal row on that path (UC-48), so the
                 // failure is recorded, not lost.
-                if let Err(err) = handler.execute(&root, spawned_run_id).await {
+                if let Err(err) = handler.execute(&root, spawned_run_id, &scope).await {
                     tracing::error!(run_id = %spawned_run_id, error = %err, "resumed index run aborted");
                 }
             });

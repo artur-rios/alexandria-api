@@ -9,6 +9,7 @@ use tokio::runtime::{Builder, Runtime};
 use alexandria_core::auth::windows_identity::{verify_owner, ProcessWindowsIdentity};
 use alexandria_core::auth::AuthService;
 use alexandria_core::catalog::commands::index::IndexRequest;
+use alexandria_core::catalog::index_scope::IndexScope;
 use alexandria_core::catalog::runs::{RunKind, RunPriority};
 use alexandria_core::config::AuthMode;
 use alexandria_core::config::Settings;
@@ -170,6 +171,29 @@ fn parse_priority(raw: Option<String>) -> RunPriority {
     }
 }
 
+/// Parse a comma-separated list of wire type names into an [`IndexScope`].
+///
+/// NULL and the empty string are the same absence and both mean every type.
+/// At this boundary a client with no scope to send has only those two ways to
+/// say so, and reading either as "index nothing" would turn a missing
+/// argument into a run that does no work at all.
+///
+/// An unrecognised name is rejected, which is the one place this deliberately
+/// parts company with [`parse_priority`]. An unreadable priority has a *safe*
+/// fallback to fall back to; a scope's only candidate is "every type", the
+/// opposite of what a caller asking for a narrower scope wants, and it fails
+/// in the direction of cataloguing exactly the files the owner excluded. The
+/// HTTP body rejects the same name for the same reason (FR-FC-24).
+fn parse_scope(raw: Option<String>) -> Result<IndexScope, DomainError> {
+    match raw {
+        // Through `parse_list` rather than splitting here, so this argument
+        // and `catalog_runs.scope` have exactly one reader of the encoding
+        // between them and cannot drift on what a comma means.
+        Some(list) => IndexScope::parse_list(&list),
+        None => Ok(IndexScope::all()),
+    }
+}
+
 /// Parse a wire priority string for `alexandria_index_resume`, where the
 /// answer is three-valued rather than two.
 ///
@@ -270,12 +294,20 @@ fn load_settings() -> Settings {
 /// body's spelling exactly — FR-FC-24). NULL or any other string is treated
 /// as `"normal"`: a client that cannot spell the value gets the safe default
 /// rather than a rejected call.
+///
+/// `types` is the run's scope: a comma-separated list of the wire names
+/// `FileType` reads back (`"audio,image"`), the same words the HTTP body's
+/// `types` array carries (FR-FC-24). NULL and the empty string are the same
+/// absence and mean every type — see [`parse_scope`] for why an unrecognised
+/// name is `INDEX_ERR_INVALID_INPUT` here where an unrecognised priority is
+/// not.
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
 pub extern "C" fn alexandria_index_start(
     root: *const c_char,
     token: *const c_char,
     priority: *const c_char,
+    types: *const c_char,
 ) -> IndexStartResult {
     let services = match services_slot().lock().unwrap().clone() {
         Some(s) => s,
@@ -286,7 +318,29 @@ pub extern "C" fn alexandria_index_start(
         None => return IndexStartResult::err(INDEX_ERR_INVALID_INPUT),
     };
     let token = cstr_lossy(token).unwrap_or_default();
+    // Denied before the scope is looked at (see `authenticated`): `start`
+    // authenticates, but only after its arguments are parsed, and the HTTP
+    // surface's `require_auth` is a route layer that runs before its
+    // extractors. Without this gate an unauthenticated caller would learn
+    // from the FFI that its `types` did not parse where HTTP told it only
+    // `401` (FR-FC-24 / NFR-09).
+    //
+    // Not the full "deny before any payload is looked at" the collection
+    // entry points keep: the NULL-`root` check above still answers
+    // `INVALID_INPUT` to an unauthenticated caller, where HTTP answers
+    // `401`. That gap predates this argument and is left as it is rather
+    // than changed in passing — this gate covers the parameter it was added
+    // with.
+    if !authenticated(&services, &token) {
+        return IndexStartResult::err(INDEX_ERR_UNAUTHORIZED);
+    }
     let priority = parse_priority(cstr_lossy(priority));
+    // Parsed before `start`, so a misspelt type is refused without a run
+    // record being opened — the same order the root check keeps (FR-FC-27).
+    let scope = match parse_scope(cstr_lossy(types)) {
+        Ok(scope) => scope,
+        Err(_) => return IndexStartResult::err(INDEX_ERR_INVALID_INPUT),
+    };
     let rt = runtime();
 
     let started = rt.block_on(async {
@@ -296,6 +350,7 @@ pub extern "C" fn alexandria_index_start(
                 IndexRequest {
                     root: root.clone(),
                     priority,
+                    scope: scope.clone(),
                 },
                 &token,
             )
@@ -312,7 +367,7 @@ pub extern "C" fn alexandria_index_start(
                 // already written the `failed` run record on its own error
                 // path (UC-48), so the failure is recorded, not lost. This
                 // log line is for the operator.
-                if let Err(err) = handler.execute(&root, run_id).await {
+                if let Err(err) = handler.execute(&root, run_id, &scope).await {
                     tracing::error!(%run_id, error = %err, "index run aborted");
                 }
             });
@@ -3990,7 +4045,9 @@ pub extern "C" fn alexandria_index_cancel(run_id: *const c_char, token: *const c
 /// `alexandria_index_start` spawns its own — the handler is kept free of the
 /// runtime so `execute` is always spawned by whichever transport owns one.
 /// Which handler gets spawned depends on `RunResumed::kind`: an index run
-/// resumes into `index_handler.execute(&root, run_id)`, a refresh into
+/// resumes into `index_handler.execute(&root, run_id, &scope)` — the scope
+/// read back off the run, so a resumed segment covers the file types the run
+/// was started with — a refresh into
 /// `refresh_handler.execute(run_id)` (a refresh carries no root — it touches
 /// everything cataloged). A resumed index run whose stored `root` is somehow
 /// absent — it should never be, every row `RunKind::Index` writes carries one
@@ -4067,13 +4124,16 @@ pub extern "C" fn alexandria_index_resume(
                 }
             };
             let handler = services.index_handler.clone();
+            // The run's own scope, off its row (FR-FC-01): a resumed segment
+            // walks the file types the run was started with, not every type.
+            let scope = resumed.scope;
             let spawned_run_id = resumed.run_id;
             rt.spawn(async move {
                 // Same shape as `alexandria_index_start`'s own spawn: an
                 // `Err` here means the run could not resume at all;
                 // `execute` has already written its own terminal row on that
                 // path (UC-48), so the failure is recorded, not lost.
-                if let Err(err) = handler.execute(&root, spawned_run_id).await {
+                if let Err(err) = handler.execute(&root, spawned_run_id, &scope).await {
                     tracing::error!(run_id = %spawned_run_id, error = %err, "resumed index run aborted");
                 }
             });

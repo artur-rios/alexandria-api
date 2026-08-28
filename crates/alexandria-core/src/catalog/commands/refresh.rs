@@ -146,8 +146,17 @@ where
         let started_at = self.clock.now();
         let concurrency = self.concurrency_for(priority) as u32;
         retry_on_busy(BUSY_ATTEMPTS, || {
-            self.runs
-                .start(run_id, RunKind::Refresh, None, started_at, concurrency)
+            // No root and no scope: a refresh discovers through the catalog
+            // rather than through a walk (FR-FC-28), so it has neither a tree
+            // to be pointed at nor types to filter out of one.
+            self.runs.start(
+                run_id,
+                RunKind::Refresh,
+                None,
+                started_at,
+                concurrency,
+                None,
+            )
         })
         .await?;
         Ok(RefreshStarted { run_id })

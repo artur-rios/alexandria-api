@@ -30,6 +30,7 @@ use alexandria_core::catalog::comic_tags::{ComicMetadataReader, ComicTags};
 use alexandria_core::catalog::document_tags::{DocumentMetadataReader, DocumentTags};
 use alexandria_core::catalog::fs::{FileEntry, FileStat, Filesystem};
 use alexandria_core::catalog::image_tags::{ImageMetadataReader, ImageTags};
+use alexandria_core::catalog::index_scope::IndexScope;
 use alexandria_core::catalog::model::{
     File, FileState, FileType, FileView, NewFile, StateFilter, SubtypeMetadata,
 };
@@ -2458,7 +2459,16 @@ impl CatalogRunRepository for FakeCatalogRunRepository {
         root: Option<&str>,
         started_at: DateTime<Utc>,
         concurrency: u32,
+        scope: Option<&str>,
     ) -> Result<(), DomainError> {
+        // Mirrors the SQLite adapter's read side: the stored list parses back
+        // into the scope, and NULL is every type. A stored value that will
+        // not parse is this fake's own bug, so it panics rather than quietly
+        // widening the run to every type.
+        let scope = match scope {
+            Some(raw) => IndexScope::parse_list(raw).expect("a stored scope must parse back"),
+            None => IndexScope::all(),
+        };
         self.runs.lock().unwrap().insert(
             id,
             CatalogRun {
@@ -2482,6 +2492,7 @@ impl CatalogRunRepository for FakeCatalogRunRepository {
                 // The first execution of the run, as the column's default
                 // says. `resume` counts from here.
                 segment: 0,
+                scope,
             },
         );
         Ok(())
@@ -3000,6 +3011,7 @@ impl CatalogRunRepository for FailingCatalogRunRepository {
         _root: Option<&str>,
         _started_at: DateTime<Utc>,
         _concurrency: u32,
+        _scope: Option<&str>,
     ) -> Result<(), DomainError> {
         match self {
             Self::StartFails => Err(DomainError::Disk("run store unavailable".into())),

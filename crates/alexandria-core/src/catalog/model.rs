@@ -27,6 +27,24 @@ impl FileType {
         }
     }
 
+    /// The inverse of [`FileType::as_str`]: the wire name a client reads back
+    /// is the one it may spell, so a caller never has to learn a second
+    /// vocabulary for the same seven types. `None` for anything else — the
+    /// caller decides whether that is a rejection (`IndexScope`) or a
+    /// filter that matches nothing.
+    pub fn from_wire(name: &str) -> Option<Self> {
+        Some(match name {
+            "audio" => FileType::Audio,
+            "video" => FileType::Video,
+            "html" => FileType::Html,
+            "text" => FileType::Text,
+            "document" => FileType::Document,
+            "comic" => FileType::Comic,
+            "image" => FileType::Image,
+            _ => return None,
+        })
+    }
+
     pub fn subtype_table(&self) -> &'static str {
         match self {
             FileType::Audio => "audio_files",

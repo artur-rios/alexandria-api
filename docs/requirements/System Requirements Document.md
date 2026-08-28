@@ -81,7 +81,7 @@ graph LR
 
 | ID | Requirement |
 | --- | --- |
-| FR-FC-01 | The system shall index audio files from a specified root path, creating a File record with path, name, type, size, and modification time (FR-FC-09), plus an AudioFile subtype record. Its metadata fields are prefilled from the file's embedded tags at first index (FR-FC-25) and are editable by the owner via FR-FC-14. |
+| FR-FC-01 | The system shall index audio files from a specified root path, creating a File record with path, name, type, size, and modification time (FR-FC-09), plus an AudioFile subtype record. Its metadata fields are prefilled from the file's embedded tags at first index (FR-FC-25) and are editable by the owner via FR-FC-14. A run shall accept an optional **scope** — the set of file types it records, named with the same words the catalog reads a type back as — and shall record only files of those types, counting one of any other type as `skipped` (FR-FC-27), the same outcome an unsupported extension takes: in both cases the run saw the file and chose not to record it. An absent or empty scope shall mean every supported type, so a caller that names none indexes them all and every caller predating the scope keeps its behaviour. An unrecognised type name shall be rejected as invalid input on both surfaces (FR-FC-24) rather than falling back to every type: that fallback is the opposite of what a caller asking for a narrower scope wants, and it fails in the direction of cataloguing exactly the files the owner meant to exclude. The scope shall be stored on the run and reused when the run is resumed (FR-FC-33), for the reason its root is: it is what the run was told to cover, and a resumed segment that could not read it back would record exactly the types the owner excluded. A run recorded before the scope existed has none stored, which means every type, as an absent scope always has. |
 | FR-FC-02 | The system shall index video files as VideoFiles. Title, year, resolution and duration are prefilled from the container at first index (FR-FC-25), but `mediaKind` (movie/series) is owner-supplied via FR-FC-15: nothing in a video file distinguishes a movie from an episode, so indexing does not infer it. |
 | FR-FC-03 | The system shall index saved HTML pages. |
 | FR-FC-04 | The system shall index Markdown and plain-text files as TextFiles. |
@@ -414,6 +414,7 @@ kept indefinitely.
 | kind | text | required | `index` or `refresh`. |
 | status | text | required | `running`, `paused`, `complete`, `failed`, or `cancelled` (FR-FC-27). |
 | root | text | nullable | The indexed root, for an index run only; `NULL` for a refresh, which takes no root. |
+| scope | text | nullable | The file types the run records (FR-FC-01), as the comma-separated list of type names the caller sent (`audio`, `audio,image`). Written at start beside `root` — both are what the run was told to cover — and read back when the run is resumed (FR-FC-33), so a paused run continues under the scope it started with rather than widening to every type. `NULL` is every type: what an absent scope means, what a refresh has, and what every row written before this column holds. Internal; it is an input to how the run is walked, not part of the run body a client reads. |
 | startedAt | timestamp | required | When the run started. |
 | finishedAt | timestamp | nullable | When the run reached a terminal status; `NULL` while `running` or `paused`. |
 | phase | text | nullable | `discovering` or `processing` while a walk is executing the run, and kept across an owner's pause so a client can see where the walk stopped. `NULL` once the run is terminal — `complete` beside `processing` would say two contradictory things — `NULL` for a run paused by startup reconciliation, whose process is gone so it is in no phase until it resumes, and `NULL` for a run that never published one. |
@@ -424,7 +425,7 @@ kept indefinitely.
 | concurrency | integer | nullable | The width the run's priority (FR-FC-31) resolved to. Written at start, and rewritten by a resume that names a priority of its own (FR-FC-33) — that write is what re-paces the run, since the next segment is walked at whatever this column says. A resume naming no priority leaves it alone. Internal; `NULL` only for a run started before priority existed, which resumes at the configured default. |
 | scanned | integer | nullable | Index only: entries scanned. |
 | indexed | integer | nullable | Index only: files newly indexed. |
-| skipped | integer | nullable | Index only: entries classified out (an unsupported extension). |
+| skipped | integer | nullable | Index only: entries the run saw and did not record — an unsupported extension, or a file whose type the run's scope excludes (FR-FC-01). One counter rather than two: in both cases the run classified the entry out, and splitting them would leave every reader adding the two back together. |
 | alreadyCataloged | integer | nullable | Index only: entries whose path the catalog already held. |
 | refreshed | integer | nullable | Refresh only: records refreshed. |
 | markedMissing | integer | nullable | Refresh only: records marked missing. |
@@ -457,7 +458,7 @@ endpoint requires authentication from the active mode (see §7).
 
 | Method | Path | Description | Requirement |
 | --- | --- | --- | --- |
-| POST | /v1/index | Start an asynchronous indexing scan of a root path, optionally at a `priority` of `normal` or `low`. | FR-FC-01..09, FR-FC-31 |
+| POST | /v1/index | Start an asynchronous indexing scan of a root path, optionally at a `priority` of `normal` or `low`, and optionally scoped to a `types` array naming the file types to record. | FR-FC-01..09, FR-FC-31 |
 | POST | /v1/index/refresh | Re-index existing records (compare size and mtime, mark missing), optionally at a `priority`. | FR-FC-10, FR-FC-11, FR-FC-31 |
 | GET | /v1/settings | Report the client-relevant configuration, beginning with the retention window. | FR-FC-30 |
 | GET | /v1/index/runs/{runId} | Report an index or re-index run's status, progress, and outcome. | FR-FC-27, FR-FC-28 |

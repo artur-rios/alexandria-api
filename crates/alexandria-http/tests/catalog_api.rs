@@ -2225,3 +2225,167 @@ async fn given_non_boolean_purge_on_disk_query_when_delete_then_400_with_error_e
         serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
     assert!(body["error"].as_str().is_some(), "error envelope present");
 }
+
+/// `POST /v1/index` with a scope (issue #122): the `types` array names the
+/// file types the run records, spelled the way `FileType` reads back.
+fn index_request_with_types(root: &str, types: &[&str]) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri("/v1/index")
+        .header(
+            "authorization",
+            format!("Bearer {}", common::TEST_TOKEN).as_str(),
+        )
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({ "root": root, "types": types }).to_string(),
+        ))
+        .unwrap()
+}
+
+/// The owner's symptom over HTTP: a music folder whose cover art would
+/// otherwise make it an image library too.
+#[tokio::test]
+async fn given_an_audio_scope_when_index_posted_then_only_the_audio_is_recorded() {
+    let lib = tempdir().unwrap();
+    common::write_file(&lib, "song.flac", b"audio bytes");
+    common::write_file(&lib, "cover.jpg", b"image bytes");
+
+    let test = test_app().await;
+    let router = app(Settings::default(), test.services.clone());
+
+    let response = router
+        .oneshot(index_request_with_types(
+            lib.path().to_str().unwrap(),
+            &["audio"],
+        ))
+        .await
+        .expect("one-shot");
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let started: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let run_id = started["runId"].as_str().expect("runId").to_string();
+
+    // The run has to be over before the absence of a second row means
+    // anything — until then it only means the walk has not reached it yet.
+    let run = wait_for_run_terminal(&test.services, &run_id, common::TEST_TOKEN).await;
+    assert_eq!(run["status"], "complete");
+    assert_eq!(run["skipped"], 1, "the cover art was skipped, not failed");
+    assert_eq!(run["failed"], 0);
+
+    let rows = file_rows(&test.pool).await;
+    assert_eq!(
+        rows.iter().map(|r| r.1.as_str()).collect::<Vec<_>>(),
+        vec!["song.flac"],
+        "the cover art is out of scope and must not be catalogued"
+    );
+}
+
+/// An absent `types` is every type — what every client predating the field
+/// sends, and what `index_request` above still sends.
+#[tokio::test]
+async fn given_no_types_when_index_posted_then_every_type_is_recorded() {
+    let lib = tempdir().unwrap();
+    common::write_file(&lib, "song.flac", b"audio bytes");
+    common::write_file(&lib, "cover.jpg", b"image bytes");
+
+    let test = test_app().await;
+    let router = app(Settings::default(), test.services);
+
+    let response = router
+        .oneshot(index_request(lib.path().to_str().unwrap()))
+        .await
+        .expect("one-shot");
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+    wait_for_files(&test.pool, 2).await;
+    let rows = file_rows(&test.pool).await;
+    assert_eq!(rows.len(), 2);
+}
+
+/// An empty `types` array is the same absence an omitted one is — never
+/// "index nothing".
+#[tokio::test]
+async fn given_an_empty_types_array_when_index_posted_then_every_type_is_recorded() {
+    let lib = tempdir().unwrap();
+    common::write_file(&lib, "song.flac", b"audio bytes");
+    common::write_file(&lib, "cover.jpg", b"image bytes");
+
+    let test = test_app().await;
+    let router = app(Settings::default(), test.services);
+
+    let response = router
+        .oneshot(index_request_with_types(lib.path().to_str().unwrap(), &[]))
+        .await
+        .expect("one-shot");
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+    wait_for_files(&test.pool, 2).await;
+    let rows = file_rows(&test.pool).await;
+    assert_eq!(rows.len(), 2);
+}
+
+/// Unlike an unrecognised `priority`, an unrecognised type is refused: the
+/// only fallback available is "every type", which is the opposite of what the
+/// caller asked for. The run must not start either — a rejected request
+/// leaves no record behind (FR-FC-27).
+#[tokio::test]
+async fn given_an_unknown_type_when_index_posted_then_400_and_no_run_started() {
+    let lib = tempdir().unwrap();
+    common::write_file(&lib, "song.flac", b"audio bytes");
+
+    let test = test_app().await;
+    let router = app(Settings::default(), test.services);
+
+    let response = router
+        .oneshot(index_request_with_types(
+            lib.path().to_str().unwrap(),
+            &["sculpture"],
+        ))
+        .await
+        .expect("one-shot");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert!(body["error"].as_str().is_some(), "error envelope present");
+
+    let runs: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM catalog_runs")
+        .fetch_one(&test.pool)
+        .await
+        .expect("count");
+    assert_eq!(runs.0, 0, "a rejected start must not open a run record");
+}
+
+/// The HTTP twin of the FFI's
+/// `given_a_bad_token_and_an_unknown_type_when_ffi_index_start_then_unauthorized`:
+/// with both faults present, the caller learns only that it is
+/// unauthenticated. `require_auth` is a route layer, so it runs before the
+/// body is extracted at all and the unspellable scope is never reached — the
+/// FFI gates by hand to reach the same answer (FR-FC-24 / NFR-09).
+#[tokio::test]
+async fn given_no_bearer_and_an_unknown_type_when_index_posted_then_401_not_400() {
+    let lib = tempdir().unwrap();
+    common::write_file(&lib, "song.flac", b"audio bytes");
+
+    let test = test_app().await;
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/index")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({ "root": lib.path().to_str().unwrap(), "types": ["sculpture"] }).to_string(),
+        ))
+        .unwrap();
+
+    let response = app(Settings::default(), test.services)
+        .oneshot(request)
+        .await
+        .expect("one-shot");
+
+    assert_eq!(
+        response.status(),
+        StatusCode::UNAUTHORIZED,
+        "an unauthenticated caller must not learn that its scope failed to parse"
+    );
+}

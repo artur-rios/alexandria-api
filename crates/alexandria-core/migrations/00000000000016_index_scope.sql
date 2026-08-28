@@ -1,0 +1,19 @@
+-- UC-01: the file types an index run was told to record (FR-FC-01).
+--
+-- Stacked rather than folded into the `catalog_runs` baseline (migration 11)
+-- because that file's checksum is what an existing database validates against:
+-- editing it would fail startup with `DomainError::Migration` for every
+-- database already in the field, where an added nullable column costs them
+-- nothing.
+--
+-- Stored as the comma-separated list of wire type names the caller sent
+-- (`audio`, `audio,image`) — the same words `FileType::as_str` writes and the
+-- FFI's `types` argument takes, so nothing has to be translated on the way in
+-- or out. NULL is every type, which is what an absent scope means, so every
+-- row written before this column existed keeps exactly the meaning it had and
+-- no backfill is needed.
+--
+-- Recorded for the same reason `root` is: it is what the run was told to
+-- cover, and a resume that could not read it back would walk the very types
+-- the owner excluded.
+ALTER TABLE catalog_runs ADD COLUMN scope TEXT;

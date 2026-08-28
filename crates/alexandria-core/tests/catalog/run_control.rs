@@ -69,6 +69,7 @@ impl ControlHarness {
             Some("/library"),
             t(1),
             DEFAULT_CONCURRENCY,
+            None,
         )
         .await
         .expect("start");
@@ -366,6 +367,7 @@ async fn given_a_cancelled_run_when_a_pause_write_lands_afterwards_then_the_fake
         Some("/library"),
         t(1),
         DEFAULT_CONCURRENCY,
+        None,
     )
     .await
     .expect("start");
@@ -435,6 +437,7 @@ async fn paused_run(
         Some("D:/music"),
         t(1),
         DEFAULT_CONCURRENCY,
+        None,
     )
     .await
     .expect("start");
@@ -512,7 +515,7 @@ async fn paused_run_at_width(
 ) {
     let runs = FakeCatalogRunRepository::new();
     let run_id = Uuid::new_v4();
-    runs.start(run_id, RunKind::Index, Some("D:/music"), t(1), width)
+    runs.start(run_id, RunKind::Index, Some("D:/music"), t(1), width, None)
         .await
         .expect("start");
     assert!(runs.pause(run_id, t(2), None).await.expect("pause"));
@@ -843,6 +846,7 @@ async fn given_a_cancelled_run_when_a_walks_cancel_lands_afterwards_then_the_fak
         Some("/library"),
         t(1),
         DEFAULT_CONCURRENCY,
+        None,
     )
     .await
     .expect("start");

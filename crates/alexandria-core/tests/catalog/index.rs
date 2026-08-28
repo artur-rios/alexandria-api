@@ -12,6 +12,7 @@ use alexandria_core::catalog::commands::run_control::RunControlHandler;
 use alexandria_core::catalog::document_tags::{DocumentMetadataReader, DocumentTags};
 use alexandria_core::catalog::fs::Filesystem;
 use alexandria_core::catalog::image_tags::{ImageMetadataReader, ImageTags};
+use alexandria_core::catalog::index_scope::IndexScope;
 use alexandria_core::catalog::model::{FileType, FormatKind, SubtypeMetadata};
 use alexandria_core::catalog::repos::CatalogRepository;
 use alexandria_core::catalog::run_registry::{RunPhase, RunRegistry};
@@ -211,6 +212,7 @@ async fn given_valid_root_and_authenticated_when_start_then_returns_run_id() {
             IndexRequest {
                 root: ROOT.to_string(),
                 priority: RunPriority::Normal,
+                scope: IndexScope::all(),
             },
             TOKEN,
         )
@@ -242,6 +244,7 @@ async fn given_missing_root_when_start_then_invalid_input() {
             IndexRequest {
                 root: "/nope".to_string(),
                 priority: RunPriority::Normal,
+                scope: IndexScope::all(),
             },
             TOKEN,
         )
@@ -278,6 +281,7 @@ async fn given_unauthenticated_when_start_then_unauthorized() {
             IndexRequest {
                 root: ROOT.to_string(),
                 priority: RunPriority::Normal,
+                scope: IndexScope::all(),
             },
             "",
         )
@@ -312,7 +316,7 @@ async fn given_already_cataloged_path_when_execute_then_already_cataloged_no_dup
     );
 
     let outcome = handler
-        .execute(ROOT, Uuid::new_v4())
+        .execute(ROOT, Uuid::new_v4(), &IndexScope::all())
         .await
         .expect("execute");
 
@@ -357,7 +361,7 @@ async fn given_supported_files_when_execute_then_indexed_with_no_hash_and_indexe
     );
 
     let outcome = handler
-        .execute(ROOT, Uuid::new_v4())
+        .execute(ROOT, Uuid::new_v4(), &IndexScope::all())
         .await
         .expect("execute");
 
@@ -405,12 +409,16 @@ async fn given_a_file_on_disk_when_indexed_then_its_size_and_mtime_are_recorded(
             IndexRequest {
                 root: ROOT.into(),
                 priority: RunPriority::Normal,
+                scope: IndexScope::all(),
             },
             TOKEN,
         )
         .await
         .unwrap();
-    handler.execute(ROOT, run_id).await.unwrap();
+    handler
+        .execute(ROOT, run_id, &IndexScope::all())
+        .await
+        .unwrap();
 
     let file = repo_handle
         .find_by_path("/library/song.txt")
@@ -449,12 +457,16 @@ async fn given_a_file_when_indexed_then_no_content_hash_is_computed() {
             IndexRequest {
                 root: ROOT.into(),
                 priority: RunPriority::Normal,
+                scope: IndexScope::all(),
             },
             TOKEN,
         )
         .await
         .unwrap();
-    handler.execute(ROOT, run_id).await.unwrap();
+    handler
+        .execute(ROOT, run_id, &IndexScope::all())
+        .await
+        .unwrap();
 
     let file = repo_handle
         .find_by_path("/library/song.txt")
@@ -518,7 +530,7 @@ async fn given_any_concurrency_when_execute_then_same_counts_and_same_catalog() 
         );
 
         let outcome = handler
-            .execute(ROOT, Uuid::new_v4())
+            .execute(ROOT, Uuid::new_v4(), &IndexScope::all())
             .await
             .expect("execute");
 
@@ -566,7 +578,7 @@ async fn given_zero_concurrency_when_execute_then_runs_sequentially_rather_than_
     );
 
     let outcome = handler
-        .execute(ROOT, Uuid::new_v4())
+        .execute(ROOT, Uuid::new_v4(), &IndexScope::all())
         .await
         .expect("execute");
 
@@ -607,12 +619,16 @@ async fn given_zero_low_priority_concurrency_when_a_low_priority_run_executes_th
             IndexRequest {
                 root: ROOT.into(),
                 priority: RunPriority::Low,
+                scope: IndexScope::all(),
             },
             TOKEN,
         )
         .await
         .unwrap();
-    let outcome = handler.execute(ROOT, run_id).await.expect("execute");
+    let outcome = handler
+        .execute(ROOT, run_id, &IndexScope::all())
+        .await
+        .expect("execute");
 
     assert_eq!(outcome.indexed, 2);
 }
@@ -638,7 +654,7 @@ async fn given_unsupported_extension_when_execute_then_skipped() {
     );
 
     let outcome = handler
-        .execute(ROOT, Uuid::new_v4())
+        .execute(ROOT, Uuid::new_v4(), &IndexScope::all())
         .await
         .expect("execute");
 
@@ -675,7 +691,7 @@ async fn given_unreadable_file_when_execute_then_it_is_indexed_anyway() {
     );
 
     let outcome = handler
-        .execute(ROOT, Uuid::new_v4())
+        .execute(ROOT, Uuid::new_v4(), &IndexScope::all())
         .await
         .expect("an unreadable file must not fail the whole run");
 
@@ -726,7 +742,7 @@ async fn given_failing_repository_write_when_execute_then_run_continues_and_coun
     );
 
     let outcome = handler
-        .execute(ROOT, Uuid::new_v4())
+        .execute(ROOT, Uuid::new_v4(), &IndexScope::all())
         .await
         .expect("a per-file repository error must not fail the whole run");
 
@@ -792,7 +808,7 @@ async fn given_tagged_audio_file_when_execute_then_subtype_metadata_written() {
     );
 
     let outcome = handler
-        .execute(ROOT, Uuid::new_v4())
+        .execute(ROOT, Uuid::new_v4(), &IndexScope::all())
         .await
         .expect("execute");
 
@@ -838,7 +854,7 @@ async fn given_untagged_audio_file_when_execute_then_subtype_metadata_stays_empt
     );
 
     let outcome = handler
-        .execute(ROOT, Uuid::new_v4())
+        .execute(ROOT, Uuid::new_v4(), &IndexScope::all())
         .await
         .expect("execute");
 
@@ -873,7 +889,7 @@ async fn given_non_audio_file_when_execute_then_reader_never_consulted() {
     );
 
     let outcome = handler
-        .execute(ROOT, Uuid::new_v4())
+        .execute(ROOT, Uuid::new_v4(), &IndexScope::all())
         .await
         .expect("execute");
 
@@ -921,7 +937,7 @@ async fn given_tagged_image_file_when_execute_then_dimensions_and_title_written(
     );
 
     let outcome = handler
-        .execute(ROOT, Uuid::new_v4())
+        .execute(ROOT, Uuid::new_v4(), &IndexScope::all())
         .await
         .expect("execute");
 
@@ -970,7 +986,7 @@ async fn given_image_with_dimensions_but_no_title_when_execute_then_only_dimensi
     );
 
     let outcome = handler
-        .execute(ROOT, Uuid::new_v4())
+        .execute(ROOT, Uuid::new_v4(), &IndexScope::all())
         .await
         .expect("execute");
 
@@ -1013,7 +1029,7 @@ async fn given_image_with_title_but_no_dimensions_when_execute_then_only_title_w
     );
 
     let outcome = handler
-        .execute(ROOT, Uuid::new_v4())
+        .execute(ROOT, Uuid::new_v4(), &IndexScope::all())
         .await
         .expect("execute");
 
@@ -1066,7 +1082,7 @@ async fn given_image_with_partial_dimensions_when_execute_then_dimensions_write_
     );
 
     let outcome = handler
-        .execute(ROOT, Uuid::new_v4())
+        .execute(ROOT, Uuid::new_v4(), &IndexScope::all())
         .await
         .expect("execute");
 
@@ -1104,7 +1120,7 @@ async fn given_untagged_image_file_when_execute_then_neither_write_happens() {
     );
 
     let outcome = handler
-        .execute(ROOT, Uuid::new_v4())
+        .execute(ROOT, Uuid::new_v4(), &IndexScope::all())
         .await
         .expect("execute");
 
@@ -1137,7 +1153,7 @@ async fn given_non_image_file_when_execute_then_image_reader_never_consulted() {
     );
 
     let outcome = handler
-        .execute(ROOT, Uuid::new_v4())
+        .execute(ROOT, Uuid::new_v4(), &IndexScope::all())
         .await
         .expect("execute");
 
@@ -1181,7 +1197,7 @@ async fn given_tagged_pdf_when_execute_then_page_count_and_metadata_written() {
     );
 
     let outcome = handler
-        .execute(ROOT, Uuid::new_v4())
+        .execute(ROOT, Uuid::new_v4(), &IndexScope::all())
         .await
         .expect("execute");
 
@@ -1234,7 +1250,7 @@ async fn given_tagged_epub_when_execute_then_metadata_written_no_page_count() {
     );
 
     let outcome = handler
-        .execute(ROOT, Uuid::new_v4())
+        .execute(ROOT, Uuid::new_v4(), &IndexScope::all())
         .await
         .expect("execute");
 
@@ -1296,7 +1312,7 @@ async fn given_document_with_page_count_but_no_other_fields_when_execute_then_bo
     );
 
     let outcome = handler
-        .execute(ROOT, Uuid::new_v4())
+        .execute(ROOT, Uuid::new_v4(), &IndexScope::all())
         .await
         .expect("execute");
 
@@ -1338,7 +1354,7 @@ async fn given_untagged_document_file_when_execute_then_neither_write_happens() 
     );
 
     let outcome = handler
-        .execute(ROOT, Uuid::new_v4())
+        .execute(ROOT, Uuid::new_v4(), &IndexScope::all())
         .await
         .expect("execute");
 
@@ -1372,7 +1388,7 @@ async fn given_non_document_file_when_execute_then_document_reader_never_consult
     );
 
     let outcome = handler
-        .execute(ROOT, Uuid::new_v4())
+        .execute(ROOT, Uuid::new_v4(), &IndexScope::all())
         .await
         .expect("execute");
 
@@ -1415,7 +1431,7 @@ async fn given_tagged_video_when_execute_then_duration_and_metadata_written() {
     );
 
     let outcome = handler
-        .execute(ROOT, Uuid::new_v4())
+        .execute(ROOT, Uuid::new_v4(), &IndexScope::all())
         .await
         .expect("execute");
 
@@ -1467,7 +1483,7 @@ async fn given_video_with_duration_but_no_other_fields_when_execute_then_only_du
     );
 
     let outcome = handler
-        .execute(ROOT, Uuid::new_v4())
+        .execute(ROOT, Uuid::new_v4(), &IndexScope::all())
         .await
         .expect("execute");
 
@@ -1511,7 +1527,7 @@ async fn given_video_with_resolution_but_no_duration_when_execute_then_only_meta
     );
 
     let outcome = handler
-        .execute(ROOT, Uuid::new_v4())
+        .execute(ROOT, Uuid::new_v4(), &IndexScope::all())
         .await
         .expect("execute");
 
@@ -1557,7 +1573,7 @@ async fn given_untagged_video_file_when_execute_then_neither_write_happens() {
     );
 
     let outcome = handler
-        .execute(ROOT, Uuid::new_v4())
+        .execute(ROOT, Uuid::new_v4(), &IndexScope::all())
         .await
         .expect("execute");
 
@@ -1592,7 +1608,7 @@ async fn given_non_video_file_when_execute_then_video_reader_never_consulted() {
     );
 
     let outcome = handler
-        .execute(ROOT, Uuid::new_v4())
+        .execute(ROOT, Uuid::new_v4(), &IndexScope::all())
         .await
         .expect("execute");
 
@@ -1635,7 +1651,7 @@ async fn given_tagged_comic_when_execute_then_page_count_and_metadata_written() 
     );
 
     let outcome = handler
-        .execute(ROOT, Uuid::new_v4())
+        .execute(ROOT, Uuid::new_v4(), &IndexScope::all())
         .await
         .expect("execute");
 
@@ -1687,7 +1703,7 @@ async fn given_comic_with_page_count_but_no_other_fields_when_execute_then_only_
     );
 
     let outcome = handler
-        .execute(ROOT, Uuid::new_v4())
+        .execute(ROOT, Uuid::new_v4(), &IndexScope::all())
         .await
         .expect("execute");
 
@@ -1731,7 +1747,7 @@ async fn given_comic_with_issue_number_but_no_page_count_when_execute_then_only_
     );
 
     let outcome = handler
-        .execute(ROOT, Uuid::new_v4())
+        .execute(ROOT, Uuid::new_v4(), &IndexScope::all())
         .await
         .expect("execute");
 
@@ -1776,7 +1792,7 @@ async fn given_unopenable_comic_file_when_execute_then_neither_write_happens() {
     );
 
     let outcome = handler
-        .execute(ROOT, Uuid::new_v4())
+        .execute(ROOT, Uuid::new_v4(), &IndexScope::all())
         .await
         .expect("execute");
 
@@ -1812,7 +1828,7 @@ async fn given_non_comic_file_when_execute_then_comic_reader_never_consulted() {
     );
 
     let outcome = handler
-        .execute(ROOT, Uuid::new_v4())
+        .execute(ROOT, Uuid::new_v4(), &IndexScope::all())
         .await
         .expect("execute");
 
@@ -1870,6 +1886,7 @@ async fn start_bounded_with_runs(
             IndexRequest {
                 root: requested.to_string(),
                 priority: RunPriority::Normal,
+                scope: IndexScope::all(),
             },
             TOKEN,
         )
@@ -2003,6 +2020,7 @@ async fn given_empty_configured_library_root_when_start_then_any_root_accepted()
             IndexRequest {
                 root: requested,
                 priority: RunPriority::Normal,
+                scope: IndexScope::all(),
             },
             TOKEN,
         )
@@ -2042,6 +2060,7 @@ async fn given_unresolvable_configured_library_root_when_start_then_invalid_inpu
             IndexRequest {
                 root: requested,
                 priority: RunPriority::Normal,
+                scope: IndexScope::all(),
             },
             TOKEN,
         )
@@ -2075,6 +2094,7 @@ async fn given_a_started_index_when_started_then_the_run_is_recorded_running() {
             IndexRequest {
                 root: ROOT.to_string(),
                 priority: RunPriority::Normal,
+                scope: IndexScope::all(),
             },
             TOKEN,
         )
@@ -2113,6 +2133,7 @@ async fn given_a_low_priority_index_when_started_then_the_run_records_the_low_co
             IndexRequest {
                 root: ROOT.into(),
                 priority: RunPriority::Low,
+                scope: IndexScope::all(),
             },
             TOKEN,
         )
@@ -2150,6 +2171,7 @@ async fn given_a_normal_priority_index_when_started_then_the_run_records_the_nor
             IndexRequest {
                 root: ROOT.into(),
                 priority: RunPriority::Normal,
+                scope: IndexScope::all(),
             },
             TOKEN,
         )
@@ -2190,13 +2212,14 @@ async fn given_an_index_that_walks_when_executed_then_the_run_is_recorded_comple
             IndexRequest {
                 root: ROOT.to_string(),
                 priority: RunPriority::Normal,
+                scope: IndexScope::all(),
             },
             TOKEN,
         )
         .await
         .expect("start");
     let outcome = handler
-        .execute(ROOT, started.run_id)
+        .execute(ROOT, started.run_id, &IndexScope::all())
         .await
         .expect("execute");
 
@@ -2238,13 +2261,14 @@ async fn given_a_root_that_cannot_be_listed_when_executed_then_the_run_is_record
             IndexRequest {
                 root: ROOT.to_string(),
                 priority: RunPriority::Normal,
+                scope: IndexScope::all(),
             },
             TOKEN,
         )
         .await
         .expect("start");
     let err = handler
-        .execute(ROOT, started.run_id)
+        .execute(ROOT, started.run_id, &IndexScope::all())
         .await
         .expect_err("must fail");
 
@@ -2291,13 +2315,14 @@ async fn given_files_that_individually_fail_when_executed_then_the_run_is_comple
             IndexRequest {
                 root: ROOT.to_string(),
                 priority: RunPriority::Normal,
+                scope: IndexScope::all(),
             },
             TOKEN,
         )
         .await
         .expect("start");
     let outcome = handler
-        .execute(ROOT, started.run_id)
+        .execute(ROOT, started.run_id, &IndexScope::all())
         .await
         .expect("execute");
 
@@ -2339,7 +2364,7 @@ async fn given_run_completion_cannot_be_recorded_when_executed_then_the_outcome_
     );
 
     let outcome = handler
-        .execute(ROOT, Uuid::new_v4())
+        .execute(ROOT, Uuid::new_v4(), &IndexScope::all())
         .await
         .expect("a failed run-completion write must not fail the walk");
 
@@ -2379,7 +2404,7 @@ async fn given_the_run_lookup_fails_when_executed_then_the_walk_still_completes_
     );
 
     let outcome = handler
-        .execute(ROOT, Uuid::new_v4())
+        .execute(ROOT, Uuid::new_v4(), &IndexScope::all())
         .await
         .expect("a failed concurrency lookup must not fail the walk");
 
@@ -2417,24 +2442,32 @@ async fn given_a_cataloged_file_and_an_unsupported_one_when_indexed_then_the_two
             IndexRequest {
                 root: ROOT.into(),
                 priority: RunPriority::Normal,
+                scope: IndexScope::all(),
             },
             TOKEN,
         )
         .await
         .unwrap();
-    handler.execute(ROOT, run_id).await.unwrap();
+    handler
+        .execute(ROOT, run_id, &IndexScope::all())
+        .await
+        .unwrap();
 
     let IndexStarted { run_id } = handler
         .start(
             IndexRequest {
                 root: ROOT.into(),
                 priority: RunPriority::Normal,
+                scope: IndexScope::all(),
             },
             TOKEN,
         )
         .await
         .unwrap();
-    let outcome = handler.execute(ROOT, run_id).await.unwrap();
+    let outcome = handler
+        .execute(ROOT, run_id, &IndexScope::all())
+        .await
+        .unwrap();
 
     assert_eq!(outcome.indexed, 0);
     assert_eq!(
@@ -2471,11 +2504,21 @@ async fn given_a_completed_index_when_execute_then_the_final_progress_is_flushed
         registry.clone(),
     );
     let run_id = Uuid::new_v4();
-    runs.start(run_id, RunKind::Index, Some(ROOT), now(), TEST_CONCURRENCY)
-        .await
-        .unwrap();
+    runs.start(
+        run_id,
+        RunKind::Index,
+        Some(ROOT),
+        now(),
+        TEST_CONCURRENCY,
+        None,
+    )
+    .await
+    .unwrap();
 
-    handler.execute(ROOT, run_id).await.expect("execute");
+    handler
+        .execute(ROOT, run_id, &IndexScope::all())
+        .await
+        .expect("execute");
 
     let recorded = runs.get_recorded(run_id).expect("recorded run");
     assert_eq!(
@@ -2520,11 +2563,21 @@ async fn given_a_progress_flush_that_fails_when_execute_then_the_run_still_compl
         runs.clone(),
     );
     let run_id = Uuid::new_v4();
-    runs.start(run_id, RunKind::Index, Some(ROOT), now(), TEST_CONCURRENCY)
-        .await
-        .unwrap();
+    runs.start(
+        run_id,
+        RunKind::Index,
+        Some(ROOT),
+        now(),
+        TEST_CONCURRENCY,
+        None,
+    )
+    .await
+    .unwrap();
 
-    let outcome = handler.execute(ROOT, run_id).await.expect("execute");
+    let outcome = handler
+        .execute(ROOT, run_id, &IndexScope::all())
+        .await
+        .expect("execute");
 
     assert_eq!(outcome.indexed, 1);
     assert!(
@@ -2558,12 +2611,19 @@ async fn given_a_run_that_cannot_list_its_root_when_execute_then_the_cell_is_clo
         registry.clone(),
     );
     let run_id = Uuid::new_v4();
-    runs.start(run_id, RunKind::Index, Some(ROOT), now(), TEST_CONCURRENCY)
-        .await
-        .unwrap();
+    runs.start(
+        run_id,
+        RunKind::Index,
+        Some(ROOT),
+        now(),
+        TEST_CONCURRENCY,
+        None,
+    )
+    .await
+    .unwrap();
 
     handler
-        .execute(ROOT, run_id)
+        .execute(ROOT, run_id, &IndexScope::all())
         .await
         .expect_err("the walk could not proceed");
 
@@ -2605,11 +2665,21 @@ async fn given_a_walk_longer_than_the_flush_interval_when_execute_then_intermedi
         runs.clone(),
     );
     let run_id = Uuid::new_v4();
-    runs.start(run_id, RunKind::Index, Some(ROOT), now(), TEST_CONCURRENCY)
-        .await
-        .unwrap();
+    runs.start(
+        run_id,
+        RunKind::Index,
+        Some(ROOT),
+        now(),
+        TEST_CONCURRENCY,
+        None,
+    )
+    .await
+    .unwrap();
 
-    let outcome = handler.execute(ROOT, run_id).await.expect("execute");
+    let outcome = handler
+        .execute(ROOT, run_id, &IndexScope::all())
+        .await
+        .expect("execute");
 
     assert_eq!(outcome.indexed, 6);
     // Each entry of the history is a write the repository actually performed
@@ -2729,9 +2799,16 @@ async fn given_an_index_walk_in_flight_when_paused_then_it_stops_with_entries_un
     let registry = RunRegistry::new();
     let catalog = FakeCatalogRepository::new();
     let run_id = Uuid::new_v4();
-    runs.start(run_id, RunKind::Index, Some(ROOT), now(), TEST_CONCURRENCY)
-        .await
-        .unwrap();
+    runs.start(
+        run_id,
+        RunKind::Index,
+        Some(ROOT),
+        now(),
+        TEST_CONCURRENCY,
+        None,
+    )
+    .await
+    .unwrap();
     let pause_mid_walk = control_interrupt(
         control_handler(runs.clone(), registry.clone()),
         run_id,
@@ -2751,7 +2828,10 @@ async fn given_an_index_walk_in_flight_when_paused_then_it_stops_with_entries_un
         registry.clone(),
     );
 
-    let outcome = handler.execute(ROOT, run_id).await.expect("execute");
+    let outcome = handler
+        .execute(ROOT, run_id, &IndexScope::all())
+        .await
+        .expect("execute");
 
     assert_eq!(outcome.scanned, HALT_WALK_FILES, "discovery found them all");
     let tallied = outcome.indexed + outcome.skipped + outcome.already_cataloged + outcome.failed;
@@ -2817,9 +2897,16 @@ async fn given_a_run_resumed_before_a_walks_pause_lands_when_it_lands_then_the_p
     let runs = FakeCatalogRunRepository::new();
     let registry = RunRegistry::new();
     let run_id = Uuid::new_v4();
-    runs.start(run_id, RunKind::Index, Some(ROOT), now(), TEST_CONCURRENCY)
-        .await
-        .unwrap();
+    runs.start(
+        run_id,
+        RunKind::Index,
+        Some(ROOT),
+        now(),
+        TEST_CONCURRENCY,
+        None,
+    )
+    .await
+    .unwrap();
     let pause_mid_walk = control_interrupt(
         control_handler(runs.clone(), registry.clone()),
         run_id,
@@ -2842,7 +2929,10 @@ async fn given_a_run_resumed_before_a_walks_pause_lands_when_it_lands_then_the_p
     // closed its cell and before its own pause is evaluated.
     runs.pause_and_resume_before_next_halt(run_id);
 
-    handler.execute(ROOT, run_id).await.expect("execute");
+    handler
+        .execute(ROOT, run_id, &IndexScope::all())
+        .await
+        .expect("execute");
 
     let recorded = runs.get_recorded(run_id).expect("recorded run");
     assert_eq!(
@@ -2869,9 +2959,16 @@ async fn given_a_run_resumed_before_a_walks_cancel_lands_when_it_lands_then_the_
     let runs = FakeCatalogRunRepository::new();
     let registry = RunRegistry::new();
     let run_id = Uuid::new_v4();
-    runs.start(run_id, RunKind::Index, Some(ROOT), now(), TEST_CONCURRENCY)
-        .await
-        .unwrap();
+    runs.start(
+        run_id,
+        RunKind::Index,
+        Some(ROOT),
+        now(),
+        TEST_CONCURRENCY,
+        None,
+    )
+    .await
+    .unwrap();
     let cancel_mid_walk = control_interrupt(
         control_handler(runs.clone(), registry.clone()),
         run_id,
@@ -2894,7 +2991,10 @@ async fn given_a_run_resumed_before_a_walks_cancel_lands_when_it_lands_then_the_
     // closed its cell and before its own cancel is evaluated.
     runs.pause_and_resume_before_next_halt(run_id);
 
-    handler.execute(ROOT, run_id).await.expect("execute");
+    handler
+        .execute(ROOT, run_id, &IndexScope::all())
+        .await
+        .expect("execute");
 
     let recorded = runs.get_recorded(run_id).expect("recorded run");
     assert_eq!(
@@ -2917,9 +3017,16 @@ async fn given_an_index_walk_in_flight_when_cancelled_then_it_stops_and_is_termi
     let runs = FakeCatalogRunRepository::new();
     let registry = RunRegistry::new();
     let run_id = Uuid::new_v4();
-    runs.start(run_id, RunKind::Index, Some(ROOT), now(), TEST_CONCURRENCY)
-        .await
-        .unwrap();
+    runs.start(
+        run_id,
+        RunKind::Index,
+        Some(ROOT),
+        now(),
+        TEST_CONCURRENCY,
+        None,
+    )
+    .await
+    .unwrap();
     let cancel_mid_walk = control_interrupt(
         control_handler(runs.clone(), registry.clone()),
         run_id,
@@ -2939,7 +3046,10 @@ async fn given_an_index_walk_in_flight_when_cancelled_then_it_stops_and_is_termi
         registry.clone(),
     );
 
-    let outcome = handler.execute(ROOT, run_id).await.expect("execute");
+    let outcome = handler
+        .execute(ROOT, run_id, &IndexScope::all())
+        .await
+        .expect("execute");
 
     let tallied = outcome.indexed + outcome.skipped + outcome.already_cataloged + outcome.failed;
     assert!(tallied < HALT_WALK_FILES, "entries were left unprocessed");
@@ -2983,9 +3093,16 @@ async fn given_a_run_paused_during_discovery_when_execute_then_no_entry_is_proce
     let registry = RunRegistry::new();
     let catalog = FakeCatalogRepository::new();
     let run_id = Uuid::new_v4();
-    runs.start(run_id, RunKind::Index, Some(ROOT), now(), TEST_CONCURRENCY)
-        .await
-        .unwrap();
+    runs.start(
+        run_id,
+        RunKind::Index,
+        Some(ROOT),
+        now(),
+        TEST_CONCURRENCY,
+        None,
+    )
+    .await
+    .unwrap();
     let pause_during_discovery = control_interrupt(
         control_handler(runs.clone(), registry.clone()),
         run_id,
@@ -3005,7 +3122,10 @@ async fn given_a_run_paused_during_discovery_when_execute_then_no_entry_is_proce
         registry.clone(),
     );
 
-    let outcome = handler.execute(ROOT, run_id).await.expect("execute");
+    let outcome = handler
+        .execute(ROOT, run_id, &IndexScope::all())
+        .await
+        .expect("execute");
 
     assert_eq!(
         outcome.scanned, HALT_WALK_FILES,
@@ -3043,9 +3163,16 @@ async fn given_a_paused_index_run_when_resumed_then_it_re_walks_and_finishes_the
     let registry = RunRegistry::new();
     let catalog = FakeCatalogRepository::new();
     let run_id = Uuid::new_v4();
-    runs.start(run_id, RunKind::Index, Some(ROOT), now(), TEST_CONCURRENCY)
-        .await
-        .unwrap();
+    runs.start(
+        run_id,
+        RunKind::Index,
+        Some(ROOT),
+        now(),
+        TEST_CONCURRENCY,
+        None,
+    )
+    .await
+    .unwrap();
     let pause_mid_walk = control_interrupt(
         control_handler(runs.clone(), registry.clone()),
         run_id,
@@ -3066,7 +3193,7 @@ async fn given_a_paused_index_run_when_resumed_then_it_re_walks_and_finishes_the
     );
 
     let first = first_segment
-        .execute(ROOT, run_id)
+        .execute(ROOT, run_id, &IndexScope::all())
         .await
         .expect("first segment");
     assert!(
@@ -3109,7 +3236,7 @@ async fn given_a_paused_index_run_when_resumed_then_it_re_walks_and_finishes_the
     );
 
     let second = second_segment
-        .execute(ROOT, run_id)
+        .execute(ROOT, run_id, &IndexScope::all())
         .await
         .expect("second segment");
 
@@ -3187,6 +3314,7 @@ async fn given_a_resumed_run_when_executed_then_it_walks_at_the_width_it_was_sta
         Some(ROOT),
         now(),
         RESUMED_AT_CONCURRENCY,
+        None,
     )
     .await
     .unwrap();
@@ -3217,7 +3345,7 @@ async fn given_a_resumed_run_when_executed_then_it_walks_at_the_width_it_was_sta
     );
 
     second_segment
-        .execute(ROOT, run_id)
+        .execute(ROOT, run_id, &IndexScope::all())
         .await
         .expect("second segment");
 
@@ -3269,6 +3397,7 @@ async fn given_a_paused_run_when_resumed_at_low_priority_then_it_walks_at_the_ne
         Some(ROOT),
         now(),
         STARTED_AT_CONCURRENCY,
+        None,
     )
     .await
     .unwrap();
@@ -3307,7 +3436,7 @@ async fn given_a_paused_run_when_resumed_at_low_priority_then_it_walks_at_the_ne
     );
 
     second_segment
-        .execute(ROOT, run_id)
+        .execute(ROOT, run_id, &IndexScope::all())
         .await
         .expect("second segment");
 
@@ -3320,5 +3449,361 @@ async fn given_a_paused_run_when_resumed_at_low_priority_then_it_walks_at_the_ne
          answered but never persisted, and not at the handler's own configured \
          concurrency ({TEST_CONCURRENCY}), which is what would show if it were \
          persisted but never read"
+    );
+}
+
+/// A library shaped like the one that motivated the scope (issue #122): an
+/// album's audio next to the cover art that comes with it.
+fn album_with_cover_art() -> FakeFilesystem {
+    FakeFilesystem::builder()
+        .with_file(ROOT, "/library/a.flac", "a.flac", "h-a")
+        .with_file(ROOT, "/library/b.flac", "b.flac", "h-b")
+        .with_file(ROOT, "/library/cover.jpg", "cover.jpg", "h-cover")
+        .build()
+}
+
+/// The owner's actual symptom: a music folder catalogued as an image library
+/// because its cover art is, correctly, an image. A scope of `audio` is how
+/// they say what the folder is *for*.
+#[tokio::test]
+async fn given_an_audio_scope_when_execute_then_only_the_audio_is_recorded() {
+    let repo = FakeCatalogRepository::new();
+    let repo_handle = repo.clone();
+    let handler = handler(
+        FakeAuth::Allowing,
+        repo,
+        album_with_cover_art(),
+        fixed_clock(now()),
+        FakeAudioMetadataReader::new(),
+        FakeImageMetadataReader::new(),
+        FakeDocumentMetadataReader::new(),
+        FakeVideoMetadataReader::new(),
+        FakeComicMetadataReader::new(),
+        FakeCatalogRunRepository::new(),
+    );
+
+    let outcome = handler
+        .execute(
+            ROOT,
+            Uuid::new_v4(),
+            &IndexScope::parse(["audio"]).expect("scope"),
+        )
+        .await
+        .expect("execute");
+
+    assert_eq!(outcome.indexed, 2, "both FLACs are in scope");
+    assert!(repo_handle.has_path("/library/a.flac"));
+    assert!(repo_handle.has_path("/library/b.flac"));
+    assert!(
+        !repo_handle.has_path("/library/cover.jpg"),
+        "the cover art is out of scope and must not be catalogued"
+    );
+}
+
+/// An out-of-scope file is `skipped`, the same outcome an unsupported
+/// extension takes: the run saw it and chose not to record it. It is
+/// emphatically not `failed` — nothing went wrong.
+#[tokio::test]
+async fn given_an_audio_scope_when_execute_then_the_image_counts_as_skipped_not_failed() {
+    let handler = handler(
+        FakeAuth::Allowing,
+        FakeCatalogRepository::new(),
+        album_with_cover_art(),
+        fixed_clock(now()),
+        FakeAudioMetadataReader::new(),
+        FakeImageMetadataReader::new(),
+        FakeDocumentMetadataReader::new(),
+        FakeVideoMetadataReader::new(),
+        FakeComicMetadataReader::new(),
+        FakeCatalogRunRepository::new(),
+    );
+
+    let outcome = handler
+        .execute(
+            ROOT,
+            Uuid::new_v4(),
+            &IndexScope::parse(["audio"]).expect("scope"),
+        )
+        .await
+        .expect("execute");
+
+    assert_eq!(outcome.scanned, 3);
+    assert_eq!(outcome.skipped, 1, "the cover art was skipped");
+    assert_eq!(outcome.failed, 0, "skipping a file is not a failure");
+    assert_eq!(outcome.already_cataloged, 0);
+}
+
+/// Every caller predating the scope sends none, and must keep indexing what
+/// it always did.
+#[tokio::test]
+async fn given_no_scope_when_execute_then_every_type_is_recorded() {
+    let repo = FakeCatalogRepository::new();
+    let repo_handle = repo.clone();
+    let handler = handler(
+        FakeAuth::Allowing,
+        repo,
+        album_with_cover_art(),
+        fixed_clock(now()),
+        FakeAudioMetadataReader::new(),
+        FakeImageMetadataReader::new(),
+        FakeDocumentMetadataReader::new(),
+        FakeVideoMetadataReader::new(),
+        FakeComicMetadataReader::new(),
+        FakeCatalogRunRepository::new(),
+    );
+
+    let outcome = handler
+        .execute(ROOT, Uuid::new_v4(), &IndexScope::all())
+        .await
+        .expect("execute");
+
+    assert_eq!(outcome.indexed, 3);
+    assert_eq!(outcome.skipped, 0);
+    assert!(repo_handle.has_path("/library/cover.jpg"));
+}
+
+/// An empty scope is the same absence an omitted one is — never "index
+/// nothing", which would turn a caller's missing argument into a run that
+/// does no work at all.
+#[tokio::test]
+async fn given_an_empty_scope_when_execute_then_every_type_is_recorded() {
+    let repo = FakeCatalogRepository::new();
+    let repo_handle = repo.clone();
+    let handler = handler(
+        FakeAuth::Allowing,
+        repo,
+        album_with_cover_art(),
+        fixed_clock(now()),
+        FakeAudioMetadataReader::new(),
+        FakeImageMetadataReader::new(),
+        FakeDocumentMetadataReader::new(),
+        FakeVideoMetadataReader::new(),
+        FakeComicMetadataReader::new(),
+        FakeCatalogRunRepository::new(),
+    );
+
+    let outcome = handler
+        .execute(
+            ROOT,
+            Uuid::new_v4(),
+            &IndexScope::parse(Vec::<String>::new()).expect("scope"),
+        )
+        .await
+        .expect("execute");
+
+    assert_eq!(outcome.indexed, 3);
+    assert_eq!(outcome.skipped, 0);
+    assert!(repo_handle.has_path("/library/cover.jpg"));
+}
+
+/// A scope is a set, not a single type: naming two records both and still
+/// excludes the third.
+#[tokio::test]
+async fn given_a_two_type_scope_when_execute_then_both_are_recorded_and_the_third_is_not() {
+    let fs = FakeFilesystem::builder()
+        .with_file(ROOT, "/library/a.flac", "a.flac", "h-a")
+        .with_file(ROOT, "/library/notes.md", "notes.md", "h-notes")
+        .with_file(ROOT, "/library/cover.jpg", "cover.jpg", "h-cover")
+        .build();
+    let repo = FakeCatalogRepository::new();
+    let repo_handle = repo.clone();
+    let handler = handler(
+        FakeAuth::Allowing,
+        repo,
+        fs,
+        fixed_clock(now()),
+        FakeAudioMetadataReader::new(),
+        FakeImageMetadataReader::new(),
+        FakeDocumentMetadataReader::new(),
+        FakeVideoMetadataReader::new(),
+        FakeComicMetadataReader::new(),
+        FakeCatalogRunRepository::new(),
+    );
+
+    let outcome = handler
+        .execute(
+            ROOT,
+            Uuid::new_v4(),
+            &IndexScope::parse(["audio", "text"]).expect("scope"),
+        )
+        .await
+        .expect("execute");
+
+    assert_eq!(outcome.indexed, 2);
+    assert_eq!(outcome.skipped, 1);
+    assert!(repo_handle.has_path("/library/a.flac"));
+    assert!(repo_handle.has_path("/library/notes.md"));
+    assert!(!repo_handle.has_path("/library/cover.jpg"));
+}
+
+/// An unrecognised type name is refused rather than falling back, unlike an
+/// unrecognised priority. "Every type" is the only fallback available, and it
+/// is the opposite of what a caller asking for a narrower scope wants.
+#[tokio::test]
+async fn given_an_unknown_type_name_when_scope_parsed_then_invalid_input() {
+    let result = IndexScope::parse(["audio", "sculpture"]);
+
+    assert!(matches!(result, Err(DomainError::InvalidInput(_))));
+}
+
+/// The reason the scope is a stored column rather than a walk-local argument
+/// (FR-FC-33). A run scoped to audio is paused mid-library and resumed; the
+/// second segment must still leave the cover art alone. Were `resume` to hand
+/// back `IndexScope::all()` — which it did before the scope was recorded —
+/// the JPEG would be catalogued here and this test would fail, which is the
+/// whole point of it.
+#[tokio::test]
+async fn given_a_paused_scoped_run_when_resumed_then_the_second_segment_keeps_the_scope() {
+    let runs = FakeCatalogRunRepository::new();
+    let registry = RunRegistry::new();
+    let repo = FakeCatalogRepository::new();
+    let repo_handle = repo.clone();
+    let handler = handler_with_registry(
+        FakeAuth::Allowing,
+        repo,
+        album_with_cover_art(),
+        fixed_clock(now()),
+        FakeAudioMetadataReader::new(),
+        FakeImageMetadataReader::new(),
+        FakeDocumentMetadataReader::new(),
+        FakeVideoMetadataReader::new(),
+        FakeComicMetadataReader::new(),
+        runs.clone(),
+        registry.clone(),
+    );
+
+    // Started through the handler rather than against the repository
+    // directly, so the scope reaches the row by the path a real run takes.
+    let audio_only = IndexScope::parse(["audio"]).expect("scope");
+    let started = handler
+        .start(
+            IndexRequest {
+                root: ROOT.to_string(),
+                priority: RunPriority::Normal,
+                scope: audio_only.clone(),
+            },
+            TOKEN,
+        )
+        .await
+        .expect("start");
+    assert!(runs
+        .pause(started.run_id, now(), None)
+        .await
+        .expect("pause"));
+
+    let resumed = control_handler(runs.clone(), registry)
+        .resume(started.run_id, TOKEN, None)
+        .await
+        .expect("resume");
+
+    assert_eq!(
+        resumed.scope, audio_only,
+        "a resume hands back the scope the run was started with — nothing else knows it"
+    );
+
+    let outcome = handler
+        .execute(ROOT, started.run_id, &resumed.scope)
+        .await
+        .expect("second segment");
+
+    assert_eq!(outcome.indexed, 2, "both FLACs are still in scope");
+    assert_eq!(outcome.skipped, 1, "and the cover art is still skipped");
+    assert!(
+        !repo_handle.has_path("/library/cover.jpg"),
+        "a resumed run must not catalog the type its scope excluded"
+    );
+}
+
+/// A run recorded before `catalog_runs.scope` existed holds NULL there, and
+/// must go on meaning what an absent scope has always meant — which is what
+/// makes the added column need no backfill.
+#[tokio::test]
+async fn given_a_run_with_no_stored_scope_when_resumed_then_it_walks_every_type() {
+    let runs = FakeCatalogRunRepository::new();
+    let registry = RunRegistry::new();
+    let repo = FakeCatalogRepository::new();
+    let repo_handle = repo.clone();
+    let run_id = Uuid::new_v4();
+    // No scope on the row, which is exactly the shape of a run started before
+    // the column existed.
+    runs.start(
+        run_id,
+        RunKind::Index,
+        Some(ROOT),
+        now(),
+        TEST_CONCURRENCY,
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(runs.pause(run_id, now(), None).await.expect("pause"));
+
+    let resumed = control_handler(runs.clone(), registry.clone())
+        .resume(run_id, TOKEN, None)
+        .await
+        .expect("resume");
+
+    assert_eq!(resumed.scope, IndexScope::all());
+
+    let handler = handler_with_registry(
+        FakeAuth::Allowing,
+        repo,
+        album_with_cover_art(),
+        fixed_clock(now()),
+        FakeAudioMetadataReader::new(),
+        FakeImageMetadataReader::new(),
+        FakeDocumentMetadataReader::new(),
+        FakeVideoMetadataReader::new(),
+        FakeComicMetadataReader::new(),
+        runs,
+        registry,
+    );
+    let outcome = handler
+        .execute(ROOT, run_id, &resumed.scope)
+        .await
+        .expect("second segment");
+
+    assert_eq!(outcome.indexed, 3);
+    assert_eq!(outcome.skipped, 0);
+    assert!(repo_handle.has_path("/library/cover.jpg"));
+}
+
+/// `start` records the scope on the run, which is the write the resume above
+/// reads back. Asserted on the row itself so a regression that dropped the
+/// column from the INSERT fails here, naming the write, rather than only in
+/// the resume test that depends on it.
+#[tokio::test]
+async fn given_a_scoped_index_when_started_then_the_run_records_the_scope() {
+    let runs = FakeCatalogRunRepository::new();
+    let handler = handler(
+        FakeAuth::Allowing,
+        FakeCatalogRepository::new(),
+        album_with_cover_art(),
+        fixed_clock(now()),
+        FakeAudioMetadataReader::new(),
+        FakeImageMetadataReader::new(),
+        FakeDocumentMetadataReader::new(),
+        FakeVideoMetadataReader::new(),
+        FakeComicMetadataReader::new(),
+        runs.clone(),
+    );
+
+    let started = handler
+        .start(
+            IndexRequest {
+                root: ROOT.to_string(),
+                priority: RunPriority::Normal,
+                scope: IndexScope::parse(["audio"]).expect("scope"),
+            },
+            TOKEN,
+        )
+        .await
+        .expect("start");
+
+    let recorded = runs.get_recorded(started.run_id).expect("run");
+    assert_eq!(
+        recorded.scope,
+        IndexScope::parse(["audio"]).expect("scope"),
+        "the run's row carries the scope it was started with"
     );
 }

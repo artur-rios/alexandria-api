@@ -32,7 +32,7 @@ fn at(hour: u32, minute: u32, second: u32) -> chrono::DateTime<Utc> {
 async fn given_a_completed_run_when_read_then_it_is_returned_with_its_counts() {
     let runs = FakeCatalogRunRepository::new();
     let id = Uuid::new_v4();
-    runs.start(id, RunKind::Refresh, None, t(1), 4)
+    runs.start(id, RunKind::Refresh, None, t(1), 4, None)
         .await
         .unwrap();
     runs.finish(
@@ -75,7 +75,7 @@ async fn given_a_running_run_when_read_then_it_has_no_counts_yet() {
     // AF-03: no tally exists until the walk finishes.
     let runs = FakeCatalogRunRepository::new();
     let id = Uuid::new_v4();
-    runs.start(id, RunKind::Index, Some("/library"), t(1), 4)
+    runs.start(id, RunKind::Index, Some("/library"), t(1), 4, None)
         .await
         .unwrap();
     let handler = GetRunStatusHandler::new(
@@ -115,7 +115,7 @@ async fn given_an_unauthenticated_caller_when_read_then_unauthorized() {
     // AF-02.
     let runs = FakeCatalogRunRepository::new();
     let id = Uuid::new_v4();
-    runs.start(id, RunKind::Refresh, None, t(1), 4)
+    runs.start(id, RunKind::Refresh, None, t(1), 4, None)
         .await
         .unwrap();
     let handler = GetRunStatusHandler::new(
@@ -166,7 +166,7 @@ async fn given_a_running_run_with_a_live_cell_when_read_then_it_reports_live_pro
     // flush — so a pass proves the overlay read the cell rather than the row.
     let runs = FakeCatalogRunRepository::new();
     let id = Uuid::new_v4();
-    runs.start(id, RunKind::Index, Some("/library"), t(1), 4)
+    runs.start(id, RunKind::Index, Some("/library"), t(1), 4, None)
         .await
         .unwrap();
     runs.record_progress(
@@ -206,7 +206,7 @@ async fn given_a_discovering_run_with_a_live_cell_when_read_then_the_total_is_st
     // publish — the client is told "unknown", not zero.
     let runs = FakeCatalogRunRepository::new();
     let id = Uuid::new_v4();
-    runs.start(id, RunKind::Index, Some("/library"), t(1), 4)
+    runs.start(id, RunKind::Index, Some("/library"), t(1), 4, None)
         .await
         .unwrap();
     let registry = RunRegistry::new();
@@ -227,7 +227,7 @@ async fn given_a_run_with_no_live_cell_when_read_then_it_reports_the_persisted_p
     // this id, so the last flush is the best answer there is.
     let runs = FakeCatalogRunRepository::new();
     let id = Uuid::new_v4();
-    runs.start(id, RunKind::Index, Some("/library"), t(1), 4)
+    runs.start(id, RunKind::Index, Some("/library"), t(1), 4, None)
         .await
         .unwrap();
     runs.record_progress(
@@ -264,7 +264,7 @@ async fn given_a_run_that_never_flushed_when_read_then_it_reports_no_progress() 
     // "unknown", not zero-of-zero.
     let runs = FakeCatalogRunRepository::new();
     let id = Uuid::new_v4();
-    runs.start(id, RunKind::Index, Some("/library"), t(1), 4)
+    runs.start(id, RunKind::Index, Some("/library"), t(1), 4, None)
         .await
         .unwrap();
     let handler = GetRunStatusHandler::new(
@@ -287,7 +287,7 @@ async fn given_a_running_run_when_read_then_active_millis_counts_up_to_now() {
     // which is why the handler holds one.
     let runs = FakeCatalogRunRepository::new();
     let id = Uuid::new_v4();
-    runs.start(id, RunKind::Index, Some("/library"), at(1, 0, 0), 4)
+    runs.start(id, RunKind::Index, Some("/library"), at(1, 0, 0), 4, None)
         .await
         .unwrap();
     let handler = GetRunStatusHandler::new(
@@ -306,7 +306,7 @@ async fn given_a_running_run_when_read_then_active_millis_counts_up_to_now() {
 async fn given_a_finished_run_when_read_then_active_millis_stops_at_finished_at() {
     let runs = FakeCatalogRunRepository::new();
     let id = Uuid::new_v4();
-    runs.start(id, RunKind::Refresh, None, at(1, 0, 0), 4)
+    runs.start(id, RunKind::Refresh, None, at(1, 0, 0), 4, None)
         .await
         .unwrap();
     runs.finish(
@@ -342,7 +342,7 @@ async fn given_a_run_that_spent_time_paused_when_read_then_active_millis_exclude
     // `paused_millis`; this asserts the arithmetic it feeds.
     let runs = FakeCatalogRunRepository::new();
     let id = Uuid::new_v4();
-    runs.start(id, RunKind::Index, Some("/library"), at(1, 0, 0), 4)
+    runs.start(id, RunKind::Index, Some("/library"), at(1, 0, 0), 4, None)
         .await
         .unwrap();
     runs.set_paused_millis(id, 20_000);
@@ -371,7 +371,7 @@ async fn given_a_paused_run_when_read_later_then_active_millis_does_not_grow_wit
     // that degrades the longer the owner leaves the run alone.
     let runs = FakeCatalogRunRepository::new();
     let id = Uuid::new_v4();
-    runs.start(id, RunKind::Index, Some("/library"), at(1, 0, 0), 4)
+    runs.start(id, RunKind::Index, Some("/library"), at(1, 0, 0), 4, None)
         .await
         .unwrap();
     assert!(runs.pause(id, at(1, 10, 0), None).await.expect("pause"));
@@ -403,7 +403,7 @@ async fn given_a_run_cancelled_while_paused_when_read_then_its_clock_is_frozen()
     // run's elapsed time would start moving again, in the wrong direction.
     let runs = FakeCatalogRunRepository::new();
     let id = Uuid::new_v4();
-    runs.start(id, RunKind::Index, Some("/library"), at(1, 0, 0), 4)
+    runs.start(id, RunKind::Index, Some("/library"), at(1, 0, 0), 4, None)
         .await
         .unwrap();
     assert!(runs.pause(id, at(1, 10, 0), None).await.expect("pause"));
@@ -461,7 +461,7 @@ impl ActiveRunsHarness {
     async fn a_run(&self, status: RunStatus) -> Uuid {
         let id = Uuid::new_v4();
         self.runs
-            .start(id, RunKind::Index, Some("/library"), t(1), 4)
+            .start(id, RunKind::Index, Some("/library"), t(1), 4, None)
             .await
             .unwrap();
         match status {
@@ -585,13 +585,13 @@ async fn given_active_runs_when_listed_then_they_come_back_newest_first() {
     let older = Uuid::new_v4();
     harness
         .runs
-        .start(older, RunKind::Index, Some("/library"), t(1), 4)
+        .start(older, RunKind::Index, Some("/library"), t(1), 4, None)
         .await
         .unwrap();
     let newer = Uuid::new_v4();
     harness
         .runs
-        .start(newer, RunKind::Index, Some("/library"), t(5), 4)
+        .start(newer, RunKind::Index, Some("/library"), t(5), 4, None)
         .await
         .unwrap();
 
