@@ -8,6 +8,7 @@ pub mod config;
 pub mod errors;
 pub mod migrate;
 pub mod playback;
+pub mod playlists;
 pub mod reading_lists;
 pub mod retry;
 pub mod services;

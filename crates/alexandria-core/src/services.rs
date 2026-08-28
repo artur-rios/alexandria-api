@@ -59,6 +59,8 @@ use crate::playback::comic_page::{ComicPageHandler, ZipComicArchive};
 use crate::playback::source::PlaybackSourceHandler;
 use crate::playback::thumbnail::{DiskThumbnailCache, ImageThumbnailRenderer, ThumbnailHandler};
 use crate::playback::StdFileStat;
+use crate::playlists::commands::create::CreatePlaylistHandler;
+use crate::playlists::repos::SqlitePlaylistRepository;
 use crate::reading_lists::commands::add_item::AddItemToReadingListHandler;
 use crate::reading_lists::commands::create::CreateReadingListHandler;
 use crate::reading_lists::commands::delete::DeleteReadingListHandler;
@@ -250,6 +252,9 @@ pub type DefaultRemoveItemFromReadingListHandler =
 pub type DefaultDeleteReadingListHandler =
     DeleteReadingListHandler<RuntimeAuthService, SqliteReadingListRepository>;
 
+pub type DefaultCreatePlaylistHandler =
+    CreatePlaylistHandler<RuntimeAuthService, SqlitePlaylistRepository>;
+
 pub type DefaultSetLocalCredentialsHandler =
     SetLocalCredentialsHandler<RuntimeAuthService, SqliteLocalCredentialRepository, SystemClock>;
 
@@ -329,6 +334,7 @@ pub struct Services {
     pub update_reading_progress_handler: Arc<DefaultUpdateReadingProgressHandler>,
     pub remove_item_from_reading_list_handler: Arc<DefaultRemoveItemFromReadingListHandler>,
     pub delete_reading_list_handler: Arc<DefaultDeleteReadingListHandler>,
+    pub create_playlist_handler: Arc<DefaultCreatePlaylistHandler>,
     pub set_local_credentials_handler: Arc<DefaultSetLocalCredentialsHandler>,
     pub local_login_handler: Arc<DefaultLocalLoginHandler>,
     pub windows_login_handler: Arc<DefaultWindowsLoginHandler>,
@@ -654,6 +660,8 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         auth.clone(),
         reading_list_repo,
     ));
+    let playlist_repo = SqlitePlaylistRepository::new(pool.clone());
+    let create_playlist_handler = Arc::new(CreatePlaylistHandler::new(auth.clone(), playlist_repo));
     let set_local_credentials_handler = Arc::new(SetLocalCredentialsHandler::new(
         auth.clone(),
         credential_repo.clone(),
@@ -744,6 +752,7 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         update_reading_progress_handler,
         remove_item_from_reading_list_handler,
         delete_reading_list_handler,
+        create_playlist_handler,
         set_local_credentials_handler,
         local_login_handler,
         windows_login_handler,
