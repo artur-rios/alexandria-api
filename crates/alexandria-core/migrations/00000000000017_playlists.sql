@@ -18,10 +18,21 @@ CREATE TABLE IF NOT EXISTS playlists (
 -- identity is therefore its own `id`, not its file, and removing "that track"
 -- means removing that entry.
 --
--- `position` is contiguous 0..n-1 within a playlist and is renumbered on
--- every mutation, so the stored position is always the position displayed.
+-- `position` is contiguous 0..n-1 within a playlist. An append extends the
+-- sequence with new positions after whatever the playlist already holds; a
+-- removal or a purge shifts later positions down to close the gap it
+-- leaves; a move recomputes and rewrites the playlist's full stored order.
+-- Every mutation restores contiguity, but not every mutation renumbers --
+-- an append never touches an existing row's position.
+--
+-- `uuid` is the entry's public identifier (§4.0's identifier strategy):
+-- `id` stays internal, the way `playlists.id` does for `playlists.uuid`.
+-- An entry's identity is its own row, not its file (see above), so this is
+-- the token HTTP and FFI address an entry by -- not `id`, which is an
+-- internal rowid no other public identifier in this schema exposes.
 CREATE TABLE IF NOT EXISTS playlist_entries (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    uuid        TEXT    NOT NULL UNIQUE,
     playlist_id INTEGER NOT NULL,
     file_id     INTEGER NOT NULL,
     position    INTEGER NOT NULL

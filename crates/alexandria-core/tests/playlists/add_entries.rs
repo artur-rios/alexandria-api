@@ -54,7 +54,10 @@ async fn given_a_playlist_holding_a_track_when_the_same_track_is_added_then_it_i
     let entries = repo.list_entries(playlist.uuid).await.expect("listed");
     assert_eq!(entries.len(), 2);
     assert_eq!(entries[0].file_uuid, entries[1].file_uuid);
-    assert_ne!(entries[0].id, entries[1].id, "each entry is its own row");
+    assert_ne!(
+        entries[0].uuid, entries[1].uuid,
+        "each entry is its own row"
+    );
     assert_eq!(
         entries.iter().map(|e| e.position).collect::<Vec<_>>(),
         vec![0, 1]

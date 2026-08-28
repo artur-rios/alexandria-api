@@ -240,3 +240,55 @@ async fn given_a_track_on_a_playlist_when_the_file_is_purged_then_its_entries_go
 
     pool.close().await;
 }
+
+/// The test above uses a ONE-entry playlist, so it can only see that the
+/// purged entry's own row disappears -- it cannot see whether purging left
+/// a hole in the *other* entries' positions, because there are none.
+/// FR-TR-09 requires positions to stay contiguous `0..n-1` after every
+/// mutation, including a purge; the plain `DELETE FROM playlist_entries
+/// WHERE file_id = ?` a purge issues does not renumber what it leaves
+/// behind on its own. This purges the *middle* track of a three-track
+/// playlist and asserts the remaining two land back at `[0, 1]`, not `[0,
+/// 2]`.
+#[tokio::test]
+async fn given_a_middle_track_when_purged_then_the_remaining_positions_stay_contiguous() {
+    let pool = migrated_pool().await;
+    let catalog = SqliteCatalogRepository::new(pool.clone());
+    let playlists = SqlitePlaylistRepository::new(pool.clone());
+
+    let a_uuid = insert_file(&catalog, "/library/a.flac", FileType::Audio).await;
+    let b_uuid = insert_file(&catalog, "/library/b.flac", FileType::Audio).await;
+    let c_uuid = insert_file(&catalog, "/library/c.flac", FileType::Audio).await;
+
+    let playlist_uuid = Uuid::new_v4();
+    playlists
+        .insert_playlist(NewPlaylist {
+            uuid: playlist_uuid,
+            name: "Road trip".to_string(),
+        })
+        .await
+        .expect("insert playlist");
+    playlists
+        .add_entries(playlist_uuid, &[a_uuid, b_uuid, c_uuid])
+        .await
+        .expect("add entries");
+
+    catalog.purge(b_uuid).await.expect("purge");
+
+    let remaining = playlists
+        .list_entries(playlist_uuid)
+        .await
+        .expect("list entries");
+    assert_eq!(
+        remaining.iter().map(|e| e.file_uuid).collect::<Vec<_>>(),
+        vec![a_uuid, c_uuid],
+        "the purged track's entry should be gone, the other two untouched in order"
+    );
+    assert_eq!(
+        remaining.iter().map(|e| e.position).collect::<Vec<_>>(),
+        vec![0, 1],
+        "purging the middle track must close the gap it leaves, not just delete the row"
+    );
+
+    pool.close().await;
+}

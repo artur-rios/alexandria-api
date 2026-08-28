@@ -5,7 +5,7 @@ use crate::errors::DomainError;
 use crate::playlists::model::PlaylistEntry;
 use crate::playlists::repos::PlaylistRepository;
 
-/// Move one playlist entry to a new index. Addressed by `entry_id`, not by
+/// Move one playlist entry to a new index. Addressed by `entry_uuid`, not by
 /// file uuid, for the same reason as `RemoveEntryHandler`: a playlist may
 /// hold the same track more than once, so a file uuid does not identify a
 /// row.
@@ -35,13 +35,13 @@ where
         Self { auth, repo }
     }
 
-    /// Move the entry identified by `entry_id` to `to_index` within the
+    /// Move the entry identified by `entry_uuid` to `to_index` within the
     /// playlist identified by `playlist_uuid`, and return the playlist's
     /// full new order.
     pub async fn move_entry(
         &self,
         playlist_uuid: Uuid,
-        entry_id: i64,
+        entry_uuid: Uuid,
         to_index: i64,
         token: &str,
     ) -> Result<Vec<PlaylistEntry>, DomainError> {
@@ -56,12 +56,12 @@ where
             .ok_or(DomainError::NotFound)?;
 
         // `move_entry` itself confirms the entry belongs to this playlist
-        // and validates `to_index` -- entry ids are global, and index
+        // and validates `to_index` -- entry uuids are global, and index
         // bounds depend on the playlist's current entry count, both of
         // which only the repository, inside its transaction, can check
         // consistently.
         self.repo
-            .move_entry(playlist_uuid, entry_id, to_index)
+            .move_entry(playlist_uuid, entry_uuid, to_index)
             .await
     }
 }

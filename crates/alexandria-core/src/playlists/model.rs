@@ -21,14 +21,17 @@ pub struct Playlist {
     pub name: String,
 }
 
-/// One track held by a playlist. `id` is the entry's own identity, not the
-/// file's — `playlist_entries` deliberately carries no `UNIQUE
+/// One track held by a playlist. `uuid` is the entry's own public identity,
+/// not the file's — `playlist_entries` deliberately carries no `UNIQUE
 /// (playlist_id, file_id)`, so the same track may appear as two distinct
-/// entries. `position` is contiguous `0..n-1` within the playlist.
+/// entries, and only this uuid tells them apart. Like `Playlist::uuid`, the
+/// internal integer primary key stays inside the repository; callers over
+/// HTTP and FFI address an entry by this uuid, never by the rowid (SRD
+/// §4.0). `position` is contiguous `0..n-1` within the playlist.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PlaylistEntry {
-    pub id: i64,
+    pub uuid: Uuid,
     pub file_uuid: Uuid,
     pub position: i64,
 }
@@ -36,7 +39,7 @@ pub struct PlaylistEntry {
 /// A playlist read back with its tracks (Task 6). Each track is answered as
 /// `FileView` — the same shape every other listing answers (`catalog::
 /// queries::browse`) — so a client parses a playlist with what it already
-/// has for the catalog, plus `entry_id`/`position` (the playlist-specific
+/// has for the catalog, plus `entry_uuid`/`position` (the playlist-specific
 /// facts `FileView` has no room for) and `missing` (design section 5).
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -65,7 +68,7 @@ pub struct PlaylistView {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PlaylistTrack {
-    pub entry_id: i64,
+    pub entry_uuid: Uuid,
     pub position: i64,
     pub file: FileView,
     pub missing: bool,

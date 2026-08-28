@@ -23,7 +23,7 @@ async fn given_a_playlist_when_read_then_its_tracks_come_back_in_position_order(
         .add_entries(playlist.uuid, &[a, b, c, d])
         .await
         .expect("added");
-    repo.move_entry(playlist.uuid, added[3].id, 0)
+    repo.move_entry(playlist.uuid, added[3].uuid, 0)
         .await
         .expect("moved");
 
@@ -67,6 +67,44 @@ async fn given_an_entry_whose_file_is_missing_when_read_then_it_is_present_and_f
         "the entry was dropped rather than flagged"
     );
     assert!(view.entries[0].missing);
+}
+
+#[tokio::test]
+async fn given_a_soft_deleted_entry_when_read_then_it_is_present_and_not_flagged_missing() {
+    // FR-TR-11: a soft-deleted file (`state = deleted`, `missingAt` still
+    // unset) is a different failure mode from a missing one -- "check the
+    // trash" versus "look for the disk" -- and is reported `missing: false`.
+    // `list_view`'s plain `JOIN files` (not a `state`-filtered view) is what
+    // makes this true; nothing pinned that before this test, so adding
+    // `WHERE f.state = 'active'` to that join -- a plausible-looking future
+    // "fix" -- would silently drop every trashed track from every playlist
+    // with no test here to catch it.
+    let (repo, pool, _dir) = repo_with_pool().await;
+    let catalog_repo = SqliteCatalogRepository::new(pool.clone());
+    let playlist = create_playlist(&repo, "Road trip").await;
+    let song = insert_audio_file(&catalog_repo, "a.flac").await;
+    repo.add_entries(playlist.uuid, &[song])
+        .await
+        .expect("added");
+    catalog_repo
+        .soft_delete(song, chrono::Utc::now())
+        .await
+        .expect("soft delete");
+
+    let view = BrowsePlaylistsHandler::new(FakeAuth::Allowing, repo)
+        .read(playlist.uuid, "token")
+        .await
+        .expect("read");
+
+    assert_eq!(
+        view.entries.len(),
+        1,
+        "a soft-deleted file's entry was dropped rather than kept"
+    );
+    assert!(
+        !view.entries[0].missing,
+        "a soft-deleted file is a different failure mode than a missing one"
+    );
 }
 
 #[tokio::test]

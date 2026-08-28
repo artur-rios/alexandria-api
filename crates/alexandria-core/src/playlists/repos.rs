@@ -73,21 +73,21 @@ pub trait PlaylistRepository: Send + Sync {
     /// by `position`.
     async fn list_entries(&self, playlist_uuid: Uuid) -> Result<Vec<PlaylistEntry>, DomainError>;
 
-    /// Remove the entry identified by `entry_id` from the playlist
+    /// Remove the entry identified by `entry_uuid` from the playlist
     /// identified by `playlist_uuid`, then renumber the remaining entries so
     /// `position` stays contiguous `0..n-1`. Delete and renumber happen in
     /// one transaction: a failure between them would leave a gap, and every
     /// later position calculation (`add_entries`'s `next_position`,
     /// reordering) assumes contiguity.
     ///
-    /// `entry_id` is global, not scoped to a playlist (`playlist_entries`
+    /// `entry_uuid` is global, not scoped to a playlist (`playlist_entries`
     /// carries no compound key), so this confirms the entry belongs to
     /// `playlist_uuid` before touching it -- otherwise one playlist could
     /// delete another's row. `NotFound` when `playlist_uuid` does not
-    /// resolve, or when `entry_id` does not resolve to a row inside it.
-    async fn remove_entry(&self, playlist_uuid: Uuid, entry_id: i64) -> Result<(), DomainError>;
+    /// resolve, or when `entry_uuid` does not resolve to a row inside it.
+    async fn remove_entry(&self, playlist_uuid: Uuid, entry_uuid: Uuid) -> Result<(), DomainError>;
 
-    /// Move the entry identified by `entry_id` to `to_index` within the
+    /// Move the entry identified by `entry_uuid` to `to_index` within the
     /// playlist identified by `playlist_uuid`, and return the playlist's
     /// full new order.
     ///
@@ -107,16 +107,16 @@ pub trait PlaylistRepository: Send + Sync {
     /// index must be a no-op, which that kind of span-shifting arithmetic
     /// can easily land one off from.
     ///
-    /// `NotFound` when `playlist_uuid` does not resolve, or when `entry_id`
-    /// does not resolve to a row inside it (entry ids are global, so this
-    /// confirms membership the same way `remove_entry` does).
-    /// `InvalidInput` when `to_index` is negative or `>=` the playlist's
-    /// entry count -- there is no position past the end or before the start
-    /// to move into.
+    /// `NotFound` when `playlist_uuid` does not resolve, or when
+    /// `entry_uuid` does not resolve to a row inside it (entry uuids are
+    /// global, so this confirms membership the same way `remove_entry`
+    /// does). `InvalidInput` when `to_index` is negative or `>=` the
+    /// playlist's entry count -- there is no position past the end or
+    /// before the start to move into.
     async fn move_entry(
         &self,
         playlist_uuid: Uuid,
-        entry_id: i64,
+        entry_uuid: Uuid,
         to_index: i64,
     ) -> Result<Vec<PlaylistEntry>, DomainError>;
 
@@ -294,19 +294,26 @@ impl PlaylistRepository for SqlitePlaylistRepository {
         let mut entries = Vec::with_capacity(file_uuids.len());
         for (offset, (file_uuid, file_id)) in file_uuids.iter().zip(resolved).enumerate() {
             let position = next_position + offset as i64;
-            let id = sqlx::query(
-                "INSERT INTO playlist_entries (playlist_id, file_id, position) \
-                 VALUES (?, ?, ?)",
+            // Unlike a playlist's own uuid (minted by the handler, in
+            // `NewPlaylist`, so a unit test can assert it against a fake),
+            // an entry has no caller-supplied "new entry" request to carry
+            // one -- `add_entries` takes bare file uuids -- so the entry's
+            // public identifier is minted here, the only place a new row
+            // comes into being.
+            let entry_uuid = Uuid::new_v4();
+            sqlx::query(
+                "INSERT INTO playlist_entries (uuid, playlist_id, file_id, position) \
+                 VALUES (?, ?, ?, ?)",
             )
+            .bind(entry_uuid.to_string())
             .bind(playlist_id)
             .bind(file_id)
             .bind(position)
             .execute(&mut *tx)
-            .await?
-            .last_insert_rowid();
+            .await?;
 
             entries.push(PlaylistEntry {
-                id,
+                uuid: entry_uuid,
                 file_uuid: *file_uuid,
                 position,
             });
@@ -318,7 +325,7 @@ impl PlaylistRepository for SqlitePlaylistRepository {
 
     async fn list_entries(&self, playlist_uuid: Uuid) -> Result<Vec<PlaylistEntry>, DomainError> {
         let rows = sqlx::query(
-            "SELECT pe.id, f.uuid AS file_uuid, pe.position \
+            "SELECT pe.uuid, f.uuid AS file_uuid, pe.position \
              FROM playlist_entries pe \
              JOIN files f ON f.id = pe.file_id \
              WHERE pe.playlist_id = (SELECT id FROM playlists WHERE uuid = ?) \
@@ -330,11 +337,13 @@ impl PlaylistRepository for SqlitePlaylistRepository {
 
         rows.into_iter()
             .map(|row| {
-                let id: i64 = row.try_get("id")?;
+                let uuid: String = row.try_get("uuid")?;
                 let file_uuid: String = row.try_get("file_uuid")?;
                 let position: i64 = row.try_get("position")?;
                 Ok(PlaylistEntry {
-                    id,
+                    uuid: Uuid::parse_str(&uuid).map_err(|err| {
+                        DomainError::internal(format!("corrupt playlist entry uuid: {err}"))
+                    })?,
                     file_uuid: Uuid::parse_str(&file_uuid).map_err(|err| {
                         DomainError::internal(format!("corrupt playlist entry file uuid: {err}"))
                     })?,
@@ -344,7 +353,7 @@ impl PlaylistRepository for SqlitePlaylistRepository {
             .collect()
     }
 
-    async fn remove_entry(&self, playlist_uuid: Uuid, entry_id: i64) -> Result<(), DomainError> {
+    async fn remove_entry(&self, playlist_uuid: Uuid, entry_uuid: Uuid) -> Result<(), DomainError> {
         let mut tx = self.pool.begin_with(WRITE_TX).await?;
 
         let playlist_id: i64 = sqlx::query("SELECT id FROM playlists WHERE uuid = ?")
@@ -355,19 +364,19 @@ impl PlaylistRepository for SqlitePlaylistRepository {
             .try_get("id")?;
 
         // Confirm the entry belongs to this playlist before deleting it --
-        // entry ids are global, so without this check one playlist could
+        // entry uuids are global, so without this check one playlist could
         // delete another's row.
         let position: i64 =
-            sqlx::query("SELECT position FROM playlist_entries WHERE id = ? AND playlist_id = ?")
-                .bind(entry_id)
+            sqlx::query("SELECT position FROM playlist_entries WHERE uuid = ? AND playlist_id = ?")
+                .bind(entry_uuid.to_string())
                 .bind(playlist_id)
                 .fetch_optional(&mut *tx)
                 .await?
                 .ok_or(DomainError::NotFound)?
                 .try_get("position")?;
 
-        sqlx::query("DELETE FROM playlist_entries WHERE id = ?")
-            .bind(entry_id)
+        sqlx::query("DELETE FROM playlist_entries WHERE uuid = ?")
+            .bind(entry_uuid.to_string())
             .execute(&mut *tx)
             .await?;
 
@@ -390,7 +399,7 @@ impl PlaylistRepository for SqlitePlaylistRepository {
     async fn move_entry(
         &self,
         playlist_uuid: Uuid,
-        entry_id: i64,
+        entry_uuid: Uuid,
         to_index: i64,
     ) -> Result<Vec<PlaylistEntry>, DomainError> {
         let mut tx = self.pool.begin_with(WRITE_TX).await?;
@@ -406,7 +415,7 @@ impl PlaylistRepository for SqlitePlaylistRepository {
         // as the write below, so the move is computed against a consistent
         // snapshot.
         let rows = sqlx::query(
-            "SELECT pe.id, f.uuid AS file_uuid, pe.position \
+            "SELECT pe.id, pe.uuid, f.uuid AS file_uuid, pe.position \
              FROM playlist_entries pe \
              JOIN files f ON f.id = pe.file_id \
              WHERE pe.playlist_id = ? \
@@ -416,24 +425,28 @@ impl PlaylistRepository for SqlitePlaylistRepository {
         .fetch_all(&mut *tx)
         .await?;
 
-        let mut entries: Vec<(i64, Uuid)> = Vec::with_capacity(rows.len());
+        let mut entries: Vec<(i64, Uuid, Uuid)> = Vec::with_capacity(rows.len());
         for row in rows {
             let id: i64 = row.try_get("id")?;
+            let uuid: String = row.try_get("uuid")?;
             let file_uuid: String = row.try_get("file_uuid")?;
             entries.push((
                 id,
+                Uuid::parse_str(&uuid).map_err(|err| {
+                    DomainError::internal(format!("corrupt playlist entry uuid: {err}"))
+                })?,
                 Uuid::parse_str(&file_uuid).map_err(|err| {
                     DomainError::internal(format!("corrupt playlist entry file uuid: {err}"))
                 })?,
             ));
         }
 
-        // `entry_id` is global, not scoped to a playlist, so confirm it
+        // `entry_uuid` is global, not scoped to a playlist, so confirm it
         // belongs to this one before moving anything -- otherwise one
-        // playlist could reorder using another's row id.
+        // playlist could reorder using another's row.
         let from_index = entries
             .iter()
-            .position(|(id, _)| *id == entry_id)
+            .position(|(_, uuid, _)| *uuid == entry_uuid)
             .ok_or(DomainError::NotFound)?;
 
         if to_index < 0 || to_index as usize >= entries.len() {
@@ -451,7 +464,7 @@ impl PlaylistRepository for SqlitePlaylistRepository {
         let moved = entries.remove(from_index);
         entries.insert(to_index, moved);
 
-        for (position, (id, _)) in entries.iter().enumerate() {
+        for (position, (id, _, _)) in entries.iter().enumerate() {
             sqlx::query("UPDATE playlist_entries SET position = ? WHERE id = ?")
                 .bind(position as i64)
                 .bind(id)
@@ -464,8 +477,8 @@ impl PlaylistRepository for SqlitePlaylistRepository {
         Ok(entries
             .into_iter()
             .enumerate()
-            .map(|(position, (id, file_uuid))| PlaylistEntry {
-                id,
+            .map(|(position, (_, uuid, file_uuid))| PlaylistEntry {
+                uuid,
                 file_uuid,
                 position: position as i64,
             })
@@ -481,9 +494,9 @@ impl PlaylistRepository for SqlitePlaylistRepository {
         // *state-filtered* view instead would silently drop exactly the
         // entries design section 5 says must be kept and flagged.
         let rows = sqlx::query(
-            "SELECT pe.id, pe.position, f.id AS file_id, f.uuid, f.path, f.name, f.type, \
-             f.content_hash, f.state, f.deleted_at, f.indexed_at, f.missing_at, f.size_bytes, \
-             f.mtime \
+            "SELECT pe.uuid AS entry_uuid, pe.position, f.id AS file_id, f.uuid, f.path, \
+             f.name, f.type, f.content_hash, f.state, f.deleted_at, f.indexed_at, \
+             f.missing_at, f.size_bytes, f.mtime \
              FROM playlist_entries pe \
              JOIN files f ON f.id = pe.file_id \
              WHERE pe.playlist_id = (SELECT id FROM playlists WHERE uuid = ?) \
@@ -494,7 +507,7 @@ impl PlaylistRepository for SqlitePlaylistRepository {
         .await?;
 
         struct EntryFile {
-            entry_id: i64,
+            entry_uuid: Uuid,
             position: i64,
             file_id: i64,
             file: File,
@@ -503,13 +516,16 @@ impl PlaylistRepository for SqlitePlaylistRepository {
         let mut entries = Vec::with_capacity(rows.len());
         let mut file_ids = Vec::with_capacity(rows.len());
         for row in rows {
-            let entry_id: i64 = row.try_get("id")?;
+            let entry_uuid: String = row.try_get("entry_uuid")?;
+            let entry_uuid = Uuid::parse_str(&entry_uuid).map_err(|err| {
+                DomainError::internal(format!("corrupt playlist entry uuid: {err}"))
+            })?;
             let position: i64 = row.try_get("position")?;
             let file_id: i64 = row.try_get("file_id")?;
             let file = parse_playlist_file_row(&row)?;
             file_ids.push(file_id);
             entries.push(EntryFile {
-                entry_id,
+                entry_uuid,
                 position,
                 file_id,
                 file,
@@ -535,7 +551,7 @@ impl PlaylistRepository for SqlitePlaylistRepository {
             .map(|entry| {
                 let missing = entry.file.missing_at.is_some();
                 PlaylistTrack {
-                    entry_id: entry.entry_id,
+                    entry_uuid: entry.entry_uuid,
                     position: entry.position,
                     missing,
                     file: FileView {

@@ -21,13 +21,13 @@ async fn given_a_track_held_twice_when_one_entry_is_removed_then_the_other_stays
         .expect("added");
 
     RemoveEntryHandler::new(FakeAuth::Allowing, repo.clone())
-        .remove(playlist.uuid, added[0].id, "token")
+        .remove(playlist.uuid, added[0].uuid, "token")
         .await
         .expect("removed");
 
     let left = repo.list_entries(playlist.uuid).await.expect("listed");
     assert_eq!(left.len(), 1);
-    assert_eq!(left[0].id, added[1].id, "the wrong entry was removed");
+    assert_eq!(left[0].uuid, added[1].uuid, "the wrong entry was removed");
 }
 
 #[tokio::test]
@@ -44,7 +44,7 @@ async fn given_a_middle_entry_when_it_is_removed_then_positions_stay_contiguous(
         .expect("added");
 
     RemoveEntryHandler::new(FakeAuth::Allowing, repo.clone())
-        .remove(playlist.uuid, added[1].id, "token")
+        .remove(playlist.uuid, added[1].uuid, "token")
         .await
         .expect("removed");
 
@@ -71,7 +71,7 @@ async fn given_an_entry_of_another_playlist_when_removed_then_not_found() {
     let added = repo.add_entries(theirs.uuid, &[song]).await.expect("added");
 
     let outcome = RemoveEntryHandler::new(FakeAuth::Allowing, repo.clone())
-        .remove(mine.uuid, added[0].id, "token")
+        .remove(mine.uuid, added[0].uuid, "token")
         .await;
 
     assert!(matches!(outcome, Err(DomainError::NotFound)));
@@ -88,7 +88,7 @@ async fn given_an_unknown_playlist_when_an_entry_is_removed_then_not_found() {
     let (repo, _pool, _dir) = repo_with_pool().await;
 
     let outcome = RemoveEntryHandler::new(FakeAuth::Allowing, repo)
-        .remove(Uuid::new_v4(), 1, "token")
+        .remove(Uuid::new_v4(), Uuid::new_v4(), "token")
         .await;
 
     assert!(matches!(outcome, Err(DomainError::NotFound)));

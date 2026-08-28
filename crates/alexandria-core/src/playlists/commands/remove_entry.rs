@@ -4,10 +4,10 @@ use crate::auth::AuthService;
 use crate::errors::DomainError;
 use crate::playlists::repos::PlaylistRepository;
 
-/// Remove one entry from a playlist. Addressed by `entry_id`, not by file
+/// Remove one entry from a playlist. Addressed by `entry_uuid`, not by file
 /// uuid: a playlist may hold the same track more than once (see
 /// `AddEntriesHandler`), so a file uuid does not identify a row -- only the
-/// entry's own id does.
+/// entry's own uuid does.
 ///
 /// Like `DeletePlaylistHandler` the command is the handler itself: no
 /// `Clock` or `Filesystem` collaborator, since removing an entry carries no
@@ -26,12 +26,12 @@ where
         Self { auth, repo }
     }
 
-    /// Remove the entry identified by `entry_id` from the playlist
+    /// Remove the entry identified by `entry_uuid` from the playlist
     /// identified by `playlist_uuid`.
     pub async fn remove(
         &self,
         playlist_uuid: Uuid,
-        entry_id: i64,
+        entry_uuid: Uuid,
         token: &str,
     ) -> Result<(), DomainError> {
         // The caller must be authenticated. Evaluated before the playlist
@@ -45,8 +45,8 @@ where
             .ok_or(DomainError::NotFound)?;
 
         // `remove_entry` itself confirms the entry belongs to this
-        // playlist -- entry ids are global, so without that check one
+        // playlist -- entry uuids are global, so without that check one
         // playlist could delete another's row.
-        self.repo.remove_entry(playlist_uuid, entry_id).await
+        self.repo.remove_entry(playlist_uuid, entry_uuid).await
     }
 }

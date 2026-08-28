@@ -21,6 +21,24 @@ async fn ordered_uuids(repo: &SqlitePlaylistRepository, playlist: Uuid) -> Vec<U
         .collect()
 }
 
+/// The stored `position` of every entry, in the order `list_entries`
+/// returns them (already `ORDER BY position`). `ordered_uuids` above
+/// discards `position` once it has used it to sort, which is exactly why it
+/// cannot catch a reorder that gets the *values* wrong while still landing
+/// the right uuids in the right slots -- e.g. writing `1, 2, 3, 4` instead
+/// of `0, 1, 2, 3`. `remove_entry.rs`'s contiguity test asserts stored
+/// positions directly for the same reason; a move must too (design's
+/// testing bullet: reorder puts the track where it was dropped, AND the
+/// positions after it stay contiguous).
+async fn ordered_positions(repo: &SqlitePlaylistRepository, playlist: Uuid) -> Vec<i64> {
+    repo.list_entries(playlist)
+        .await
+        .expect("listed")
+        .into_iter()
+        .map(|e| e.position)
+        .collect()
+}
+
 #[tokio::test]
 async fn given_four_tracks_when_the_last_moves_to_the_front_then_the_rest_shift_down() {
     let (repo, pool, _dir) = repo_with_pool().await;
@@ -33,7 +51,7 @@ async fn given_four_tracks_when_the_last_moves_to_the_front_then_the_rest_shift_
         .expect("added");
 
     let after = ReorderPlaylistHandler::new(FakeAuth::Allowing, repo.clone())
-        .move_entry(playlist.uuid, added[3].id, 0, "token")
+        .move_entry(playlist.uuid, added[3].uuid, 0, "token")
         .await
         .expect("moved");
 
@@ -42,6 +60,11 @@ async fn given_four_tracks_when_the_last_moves_to_the_front_then_the_rest_shift_
         after.iter().map(|e| e.file_uuid).collect::<Vec<_>>(),
         vec![d, a, b, c],
         "the returned order should match what was actually persisted"
+    );
+    assert_eq!(
+        ordered_positions(&repo, playlist.uuid).await,
+        vec![0, 1, 2, 3],
+        "positions must stay contiguous 0..n-1 after the move"
     );
 }
 
@@ -57,11 +80,16 @@ async fn given_four_tracks_when_the_first_moves_to_the_end_then_the_rest_shift_u
         .expect("added");
 
     ReorderPlaylistHandler::new(FakeAuth::Allowing, repo.clone())
-        .move_entry(playlist.uuid, added[0].id, 3, "token")
+        .move_entry(playlist.uuid, added[0].uuid, 3, "token")
         .await
         .expect("moved");
 
     assert_eq!(ordered_uuids(&repo, playlist.uuid).await, vec![b, c, d, a]);
+    assert_eq!(
+        ordered_positions(&repo, playlist.uuid).await,
+        vec![0, 1, 2, 3],
+        "positions must stay contiguous 0..n-1 after the move"
+    );
 }
 
 #[tokio::test]
@@ -78,7 +106,7 @@ async fn given_an_entry_when_moved_to_where_it_already_is_then_nothing_changes()
         .expect("added");
 
     ReorderPlaylistHandler::new(FakeAuth::Allowing, repo.clone())
-        .move_entry(playlist.uuid, added[2].id, 2, "token")
+        .move_entry(playlist.uuid, added[2].uuid, 2, "token")
         .await
         .expect("moved");
 
@@ -97,7 +125,7 @@ async fn given_an_index_past_the_end_when_moved_then_invalid_input() {
         .expect("added");
 
     let outcome = ReorderPlaylistHandler::new(FakeAuth::Allowing, repo.clone())
-        .move_entry(playlist.uuid, added[0].id, 4, "token")
+        .move_entry(playlist.uuid, added[0].uuid, 4, "token")
         .await;
 
     assert!(matches!(outcome, Err(DomainError::InvalidInput(_))));
@@ -122,7 +150,7 @@ async fn given_a_negative_index_when_moved_then_invalid_input() {
         .expect("added");
 
     let outcome = ReorderPlaylistHandler::new(FakeAuth::Allowing, repo.clone())
-        .move_entry(playlist.uuid, added[0].id, -1, "token")
+        .move_entry(playlist.uuid, added[0].uuid, -1, "token")
         .await;
 
     assert!(matches!(outcome, Err(DomainError::InvalidInput(_))));
@@ -131,8 +159,8 @@ async fn given_a_negative_index_when_moved_then_invalid_input() {
 
 #[tokio::test]
 async fn given_an_entry_of_another_playlist_when_moved_then_not_found() {
-    // The entry id is global; without the playlist check, one playlist
-    // could reorder using another's row id -- mirrors
+    // The entry uuid is global; without the playlist check, one playlist
+    // could reorder using another's row -- mirrors
     // `remove_entry.rs`'s equivalent test for the same hazard.
     let (repo, pool, _dir) = repo_with_pool().await;
     let catalog_repo = SqliteCatalogRepository::new(pool.clone());
@@ -147,7 +175,7 @@ async fn given_an_entry_of_another_playlist_when_moved_then_not_found() {
         .expect("added");
 
     let outcome = ReorderPlaylistHandler::new(FakeAuth::Allowing, repo.clone())
-        .move_entry(mine.uuid, added[0].id, 2, "token")
+        .move_entry(mine.uuid, added[0].uuid, 2, "token")
         .await;
 
     assert!(matches!(outcome, Err(DomainError::NotFound)));
@@ -159,7 +187,7 @@ async fn given_an_unknown_playlist_when_an_entry_is_moved_then_not_found() {
     let (repo, _pool, _dir) = repo_with_pool().await;
 
     let outcome = ReorderPlaylistHandler::new(FakeAuth::Allowing, repo)
-        .move_entry(Uuid::new_v4(), 1, 0, "token")
+        .move_entry(Uuid::new_v4(), Uuid::new_v4(), 0, "token")
         .await;
 
     assert!(matches!(outcome, Err(DomainError::NotFound)));
