@@ -3,12 +3,13 @@
 //!
 //! Foreign keys *are* enforced — sqlx sets `PRAGMA foreign_keys = ON` on every
 //! connection — but only the subtype tables declare one. `watch_progress`,
-//! `reading_progress`, and the two `collection_id` columns have no foreign key
-//! at all (SQLite cannot add one via `ALTER TABLE`), so nothing cascades to
-//! them and the repository performing a delete has to clear them by hand.
-//! These tests pin the two places where it had not: UC-12's unlink of a
-//! bookmark collection's members, and UC-08/UC-09's removal of the progress
-//! rows that tracked a purged file.
+//! `reading_progress`, `playlist_entries`, and the two `collection_id`
+//! columns have no foreign key at all (SQLite cannot add one via `ALTER
+//! TABLE`), so nothing cascades to them and the repository performing a
+//! delete has to clear them by hand. These tests pin the places where it had
+//! not: UC-12's unlink of a bookmark collection's members, UC-08/UC-09's
+//! removal of the progress rows that tracked a purged file, and a purged
+//! file's playlist entries.
 
 use alexandria_core::bookmarks::model::NewBookmark;
 use alexandria_core::bookmarks::repos::{BookmarkRepository, SqliteBookmarkRepository};
@@ -17,6 +18,8 @@ use alexandria_core::catalog::repos::{CatalogRepository, SqliteCatalogRepository
 use alexandria_core::collections::model::{CollectionKind, NewCollection};
 use alexandria_core::collections::repos::{CollectionRepository, SqliteCollectionRepository};
 use alexandria_core::migrate::run_migrations;
+use alexandria_core::playlists::model::NewPlaylist;
+use alexandria_core::playlists::repos::{PlaylistRepository, SqlitePlaylistRepository};
 use alexandria_core::reading_lists::model::{NewReadingList, ReadingTargetKind};
 use alexandria_core::reading_lists::repos::{ReadingListRepository, SqliteReadingListRepository};
 use alexandria_core::watchlists::model::NewWatchlist;
@@ -194,6 +197,46 @@ async fn given_item_on_a_reading_list_when_purged_then_its_reading_progress_is_r
         .await
         .expect("find reading list")
         .is_some());
+
+    pool.close().await;
+}
+
+/// `playlist_entries` declares no foreign key either (SQLite cannot add one
+/// via `ALTER TABLE`), so nothing cascades to it. Without an explicit DELETE
+/// a purged track leaves an entry pointing at a `files.id` that no longer
+/// exists: invisible to the playlist read, which inner-joins `files`, and
+/// permanently orphaned.
+#[tokio::test]
+async fn given_a_track_on_a_playlist_when_the_file_is_purged_then_its_entries_go_too() {
+    let pool = migrated_pool().await;
+    let catalog = SqliteCatalogRepository::new(pool.clone());
+    let playlists = SqlitePlaylistRepository::new(pool.clone());
+
+    let song_uuid = insert_file(&catalog, "/library/a.flac", FileType::Audio).await;
+
+    let playlist_uuid = Uuid::new_v4();
+    playlists
+        .insert_playlist(NewPlaylist {
+            uuid: playlist_uuid,
+            name: "Road trip".to_string(),
+        })
+        .await
+        .expect("insert playlist");
+    playlists
+        .add_entries(playlist_uuid, &[song_uuid])
+        .await
+        .expect("add entry");
+
+    catalog.purge(song_uuid).await.expect("purge");
+
+    let (remaining,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM playlist_entries")
+        .fetch_one(&pool)
+        .await
+        .expect("query");
+    assert_eq!(
+        remaining, 0,
+        "a purged file left a playlist entry pointing at nothing"
+    );
 
     pool.close().await;
 }

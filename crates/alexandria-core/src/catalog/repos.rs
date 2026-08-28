@@ -1656,13 +1656,14 @@ impl CatalogRepository for SqliteCatalogRepository {
             .await?;
 
         // The progress rows that tracked this file go with it. Unlike the
-        // subtype tables, `watch_progress` and `reading_progress` declare no
-        // foreign key (SQLite cannot add one via `ALTER TABLE`), so the
-        // cascade that covers the subtype row does not reach them — see
-        // `delete_subtype_sql`. Without these two statements a purged
-        // video/document/comic leaves rows pointing at a `files.id` that no
-        // longer exists: invisible to UC-21/UC-27, which inner-join `files`,
-        // but permanently orphaned. A zero-row DELETE is the normal case here,
+        // subtype tables, `watch_progress`, `reading_progress`, and
+        // `playlist_entries` declare no foreign key (SQLite cannot add one
+        // via `ALTER TABLE`), so the cascade that covers the subtype row does
+        // not reach them — see `delete_subtype_sql`. Without these
+        // statements a purged video/document/comic/track leaves rows
+        // pointing at a `files.id` that no longer exists: invisible to
+        // UC-21/UC-27 and the playlist read, which inner-join `files`, but
+        // permanently orphaned. A zero-row DELETE is the normal case here,
         // not an error.
         sqlx::query("DELETE FROM watch_progress WHERE video_file_id = ?")
             .bind(id)
@@ -1670,6 +1671,11 @@ impl CatalogRepository for SqliteCatalogRepository {
             .await?;
 
         sqlx::query("DELETE FROM reading_progress WHERE item_file_id = ?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+
+        sqlx::query("DELETE FROM playlist_entries WHERE file_id = ?")
             .bind(id)
             .execute(&mut *tx)
             .await?;
