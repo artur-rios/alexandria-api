@@ -7,6 +7,7 @@ pub mod edit_metadata;
 pub mod health;
 pub mod index;
 pub mod playback;
+pub mod playlists;
 pub mod reading_lists;
 pub mod refresh;
 pub mod rename;
