@@ -32,7 +32,8 @@ use alexandria_ffi::{
     alexandria_index_count_files, alexandria_index_files_json, alexandria_index_init,
     alexandria_index_pause, alexandria_index_refresh_start, alexandria_index_resume,
     alexandria_index_run_status_json, alexandria_index_runs_active_json, alexandria_index_start,
-    alexandria_reading_list_add_item, alexandria_reading_list_create,
+    alexandria_playlist_add_entries, alexandria_playlist_create, alexandria_playlist_move_entry,
+    alexandria_playlist_read, alexandria_reading_list_add_item, alexandria_reading_list_create,
     alexandria_reading_list_delete, alexandria_reading_list_remove_item,
     alexandria_reading_list_update_progress, alexandria_reading_lists_list,
     alexandria_settings_json, alexandria_watchlist_add_video, alexandria_watchlist_create,
@@ -13258,4 +13259,327 @@ async fn given_an_audio_scope_when_started_via_http_and_ffi_then_both_catalog_on
         http_names, ffi_names,
         "HTTP and FFI must resolve the same scope to the same set of files"
     );
+}
+
+// ---------------- playlists (Task 9) ----------------
+
+/// Insert an audio file with a specific `name` (and matching path) so a
+/// playlist-order assertion can identify tracks by name rather than by
+/// per-database uuid.
+async fn seed_named_audio_file(pool: &sqlx::sqlite::SqlitePool, name: &str) -> String {
+    let file_uuid = uuid::Uuid::new_v4().to_string();
+    sqlx::query(
+        "INSERT INTO files (uuid, path, name, type, content_hash, indexed_at) \
+         VALUES (?, ?, ?, 'audio', 'hash', ?)",
+    )
+    .bind(&file_uuid)
+    .bind(format!("/lib/{name}"))
+    .bind(name)
+    .bind(chrono::Utc::now().to_rfc3339())
+    .execute(pool)
+    .await
+    .unwrap();
+    file_uuid
+}
+
+/// The playlist's tracks, in the order the body already carries them
+/// (`PlaylistView.entries` is answered in position order by the handler —
+/// see `BrowsePlaylistsHandler::read`), reduced to just their file names.
+fn track_names(view: &serde_json::Value) -> Vec<String> {
+    view["entries"]
+        .as_array()
+        .expect("entries array")
+        .iter()
+        .map(|entry| entry["file"]["file"]["name"].as_str().unwrap().to_string())
+        .collect()
+}
+
+/// FR-FC-24 / NFR-09 parity - read the same playlist back over both
+/// transports and assert they answer the tracks in the same order.
+///
+/// A move runs first so insertion order and position order differ (`d.flac`
+/// is added last but moved to the front): a parity test comparing two
+/// playlists that both happen to be in insertion order could pass without
+/// the ordering logic being exercised at all. Each leg's order is asserted
+/// against the expected value on its own, before the two legs are compared
+/// to each other -- the same discipline as
+/// `given_a_playlist_when_read_then_the_body_carries_its_tracks_in_order` in
+/// `playlists_api.rs`, but pinning it across transports.
+#[tokio::test]
+async fn given_a_playlist_when_read_via_http_and_ffi_then_both_answer_the_same_order() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+
+    let expected = vec![
+        "d.flac".to_string(),
+        "a.flac".to_string(),
+        "b.flac".to_string(),
+        "c.flac".to_string(),
+    ];
+
+    // ---- HTTP leg ----
+    let http_dir = tempdir().unwrap();
+    let http_db = db_path(&http_dir, "http.sqlite");
+    let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    seed_session(&http_pool, TEST_TOKEN).await;
+    let http_services =
+        std::sync::Arc::new(build_services(&local_settings(), http_pool.clone()).await);
+
+    let create_req = Request::builder()
+        .method("POST")
+        .uri("/v1/playlists")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
+        .header("content-type", "application/json")
+        .body(Body::from(json!({ "name": "Road trip" }).to_string()))
+        .unwrap();
+    let create_resp = app(Settings::default(), http_services.clone())
+        .oneshot(create_req)
+        .await
+        .expect("http create playlist");
+    let http_playlist_uuid = serde_json::from_slice::<serde_json::Value>(
+        &to_bytes(create_resp.into_body(), usize::MAX).await.unwrap(),
+    )
+    .unwrap()["uuid"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let http_a = seed_named_audio_file(&http_pool, "a.flac").await;
+    let http_b = seed_named_audio_file(&http_pool, "b.flac").await;
+    let http_c = seed_named_audio_file(&http_pool, "c.flac").await;
+    let http_d = seed_named_audio_file(&http_pool, "d.flac").await;
+
+    let add_req = Request::builder()
+        .method("POST")
+        .uri(format!("/v1/playlists/{http_playlist_uuid}/entries"))
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({ "fileUuids": [http_a, http_b, http_c, http_d] }).to_string(),
+        ))
+        .unwrap();
+    let add_resp = app(Settings::default(), http_services.clone())
+        .oneshot(add_req)
+        .await
+        .expect("http add entries");
+    assert_eq!(add_resp.status(), axum::http::StatusCode::OK);
+    let http_entries: serde_json::Value =
+        serde_json::from_slice(&to_bytes(add_resp.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let http_d_entry_id = http_entries.as_array().unwrap()[3]["id"].as_i64().unwrap();
+
+    let move_req = Request::builder()
+        .method("POST")
+        .uri(format!(
+            "/v1/playlists/{http_playlist_uuid}/entries/{http_d_entry_id}/move"
+        ))
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
+        .header("content-type", "application/json")
+        .body(Body::from(json!({ "toIndex": 0 }).to_string()))
+        .unwrap();
+    let move_resp = app(Settings::default(), http_services.clone())
+        .oneshot(move_req)
+        .await
+        .expect("http move entry");
+    assert_eq!(move_resp.status(), axum::http::StatusCode::OK);
+
+    let read_req = Request::builder()
+        .method("GET")
+        .uri(format!("/v1/playlists/{http_playlist_uuid}"))
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
+        .body(Body::empty())
+        .unwrap();
+    let read_resp = app(Settings::default(), http_services)
+        .oneshot(read_req)
+        .await
+        .expect("http read playlist");
+    assert_eq!(read_resp.status(), axum::http::StatusCode::OK);
+    let over_http: serde_json::Value =
+        serde_json::from_slice(&to_bytes(read_resp.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
+
+    // ---- FFI leg ----
+    let ffi_dir = tempdir().unwrap();
+    let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
+    let ffi_pool_for_seed = migrate_database(&ffi_db).await.expect("ffi open");
+    let ffi_a = seed_named_audio_file(&ffi_pool_for_seed, "a.flac").await;
+    let ffi_b = seed_named_audio_file(&ffi_pool_for_seed, "b.flac").await;
+    let ffi_c = seed_named_audio_file(&ffi_pool_for_seed, "c.flac").await;
+    let ffi_d = seed_named_audio_file(&ffi_pool_for_seed, "d.flac").await;
+    ffi_pool_for_seed.close().await;
+
+    let over_ffi: serde_json::Value = tokio::task::spawn_blocking(move || -> serde_json::Value {
+        let cdb = CString::new(ffi_db).unwrap();
+        assert_eq!(
+            alexandria_index_init(cdb.as_ptr()),
+            alexandria_ffi::INDEX_OK
+        );
+
+        let token = CString::new(TEST_TOKEN).unwrap();
+        let create_body = CString::new(json!({ "name": "Road trip" }).to_string()).unwrap();
+        let create_r = alexandria_playlist_create(create_body.as_ptr(), token.as_ptr());
+        assert_eq!(create_r.status, alexandria_ffi::PLAYLIST_OK, "ffi create");
+        let playlist_uuid = unsafe { CStr::from_ptr(create_r.json) }
+            .to_string_lossy()
+            .into_owned();
+        unsafe {
+            alexandria_free_string(create_r.json);
+        }
+        let playlist_uuid = serde_json::from_str::<serde_json::Value>(&playlist_uuid).unwrap()
+            ["uuid"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let playlist_uuid_c = CString::new(playlist_uuid).unwrap();
+
+        let add_body =
+            CString::new(json!({ "fileUuids": [ffi_a, ffi_b, ffi_c, ffi_d] }).to_string()).unwrap();
+        let add_r = alexandria_playlist_add_entries(
+            playlist_uuid_c.as_ptr(),
+            add_body.as_ptr(),
+            token.as_ptr(),
+        );
+        assert_eq!(add_r.status, alexandria_ffi::PLAYLIST_OK, "ffi add entries");
+        let entries_json = unsafe { CStr::from_ptr(add_r.json) }
+            .to_string_lossy()
+            .into_owned();
+        unsafe {
+            alexandria_free_string(add_r.json);
+        }
+        let entries: serde_json::Value = serde_json::from_str(&entries_json).unwrap();
+        let d_entry_id = entries.as_array().unwrap()[3]["id"].as_i64().unwrap();
+
+        let move_body = CString::new(json!({ "toIndex": 0 }).to_string()).unwrap();
+        let move_r = alexandria_playlist_move_entry(
+            playlist_uuid_c.as_ptr(),
+            d_entry_id,
+            move_body.as_ptr(),
+            token.as_ptr(),
+        );
+        assert_eq!(move_r.status, alexandria_ffi::PLAYLIST_OK, "ffi move entry");
+        unsafe {
+            alexandria_free_string(move_r.json);
+        }
+
+        let read_r = alexandria_playlist_read(playlist_uuid_c.as_ptr(), token.as_ptr());
+        assert_eq!(read_r.status, alexandria_ffi::PLAYLIST_OK, "ffi read");
+        assert!(!read_r.json.is_null());
+        let s = unsafe { CStr::from_ptr(read_r.json) }
+            .to_string_lossy()
+            .into_owned();
+        unsafe {
+            alexandria_free_string(read_r.json);
+        }
+        serde_json::from_str(&s).unwrap()
+    })
+    .await
+    .unwrap();
+
+    // ---- compare: each leg checked against `expected` on its own first ----
+    assert_eq!(track_names(&over_http), expected, "the HTTP leg");
+    assert_eq!(track_names(&over_ffi), expected, "the FFI leg");
+
+    // The two databases mint their own uuids and timestamps, so the bodies
+    // cannot compare equal byte-for-byte; what parity means here is that
+    // both legs agree on the *shape* -- the same positions and the same
+    // `missing` flag at each index -- once the two are already known
+    // (above) to hold the same names in the same order.
+    let http_entries = over_http["entries"].as_array().unwrap();
+    let ffi_entries = over_ffi["entries"].as_array().unwrap();
+    assert_eq!(http_entries.len(), ffi_entries.len());
+    for (i, (h, f)) in http_entries.iter().zip(ffi_entries.iter()).enumerate() {
+        assert_eq!(h["position"], i as i64, "http entry {i} position");
+        assert_eq!(f["position"], i as i64, "ffi entry {i} position");
+        assert_eq!(h["missing"], f["missing"], "entry {i} missing flag");
+        assert_eq!(
+            h["file"]["file"]["name"], f["file"]["file"]["name"],
+            "entry {i} file name"
+        );
+    }
+}
+
+/// FR-FC-24 / NFR-09 parity - create the same playlist over both transports
+/// and assert the returned bodies agree (modulo the per-database uuid) and
+/// that each database persisted the one row. Each leg's body is asserted
+/// against the expected shape on its own before the two are compared, so a
+/// silent shared failure (e.g. both legs answering an empty name) cannot
+/// pass as parity.
+#[tokio::test]
+async fn given_same_playlist_when_created_via_http_and_ffi_then_bodies_and_rows_identical() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+
+    // ---- HTTP leg ----
+    let http_dir = tempdir().unwrap();
+    let http_db = db_path(&http_dir, "http.sqlite");
+    let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    seed_session(&http_pool, TEST_TOKEN).await;
+    let http_services =
+        std::sync::Arc::new(build_services(&local_settings(), http_pool.clone()).await);
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/playlists")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
+        .header("content-type", "application/json")
+        .body(Body::from(json!({ "name": "Road trip" }).to_string()))
+        .unwrap();
+    let resp = app(Settings::default(), http_services)
+        .oneshot(req)
+        .await
+        .expect("http create");
+    assert_eq!(resp.status(), axum::http::StatusCode::CREATED);
+    let http_body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
+
+    let http_rows: Vec<(String, String)> = sqlx::query_as("SELECT uuid, name FROM playlists")
+        .fetch_all(&http_pool)
+        .await
+        .unwrap();
+
+    // ---- FFI leg ----
+    let ffi_dir = tempdir().unwrap();
+    let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
+    let ffi_db_for_rows = ffi_db.clone();
+    let ffi_body: serde_json::Value = tokio::task::spawn_blocking(move || -> serde_json::Value {
+        let cdb = CString::new(ffi_db).unwrap();
+        assert_eq!(
+            alexandria_index_init(cdb.as_ptr()),
+            alexandria_ffi::INDEX_OK
+        );
+
+        let body = CString::new(json!({ "name": "Road trip" }).to_string()).unwrap();
+        let token = CString::new(TEST_TOKEN).unwrap();
+        let r = alexandria_playlist_create(body.as_ptr(), token.as_ptr());
+        assert_eq!(r.status, alexandria_ffi::PLAYLIST_OK, "ffi create");
+        assert!(!r.json.is_null());
+        let s = unsafe { CStr::from_ptr(r.json) }
+            .to_string_lossy()
+            .into_owned();
+        unsafe {
+            alexandria_free_string(r.json);
+        }
+        serde_json::from_str(&s).unwrap()
+    })
+    .await
+    .unwrap();
+
+    let ffi_pool = migrate_database(&ffi_db_for_rows).await.expect("ffi open");
+    let ffi_rows: Vec<(String, String)> = sqlx::query_as("SELECT uuid, name FROM playlists")
+        .fetch_all(&ffi_pool)
+        .await
+        .unwrap();
+
+    // ---- compare: each leg checked against the expected shape on its own first ----
+    for (label, body) in [("http", &http_body), ("ffi", &ffi_body)] {
+        let uuid = body["uuid"].as_str().unwrap_or_default();
+        assert!(
+            uuid::Uuid::parse_str(uuid).is_ok(),
+            "{label} body carries a valid uuid"
+        );
+        assert_eq!(body["name"], "Road trip", "{label} body carries the name");
+    }
+    assert_eq!(http_rows.len(), 1, "http persisted one playlist");
+    assert_eq!(ffi_rows.len(), 1, "ffi persisted one playlist");
+    assert_eq!(http_rows[0].1, "Road trip");
+    assert_eq!(ffi_rows[0].1, "Road trip");
+
+    ffi_pool.close().await;
 }
