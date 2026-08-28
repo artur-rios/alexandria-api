@@ -64,6 +64,7 @@ use crate::playlists::commands::create::CreatePlaylistHandler;
 use crate::playlists::commands::delete::DeletePlaylistHandler;
 use crate::playlists::commands::remove_entry::RemoveEntryHandler;
 use crate::playlists::commands::rename::RenamePlaylistHandler;
+use crate::playlists::commands::reorder::ReorderPlaylistHandler;
 use crate::playlists::repos::SqlitePlaylistRepository;
 use crate::reading_lists::commands::add_item::AddItemToReadingListHandler;
 use crate::reading_lists::commands::create::CreateReadingListHandler;
@@ -270,6 +271,9 @@ pub type DefaultAddEntriesHandler = AddEntriesHandler<RuntimeAuthService, Sqlite
 pub type DefaultRemoveEntryHandler =
     RemoveEntryHandler<RuntimeAuthService, SqlitePlaylistRepository>;
 
+pub type DefaultReorderPlaylistHandler =
+    ReorderPlaylistHandler<RuntimeAuthService, SqlitePlaylistRepository>;
+
 pub type DefaultSetLocalCredentialsHandler =
     SetLocalCredentialsHandler<RuntimeAuthService, SqliteLocalCredentialRepository, SystemClock>;
 
@@ -354,6 +358,7 @@ pub struct Services {
     pub delete_playlist_handler: Arc<DefaultDeletePlaylistHandler>,
     pub add_entries_handler: Arc<DefaultAddEntriesHandler>,
     pub remove_entry_handler: Arc<DefaultRemoveEntryHandler>,
+    pub reorder_playlist_handler: Arc<DefaultReorderPlaylistHandler>,
     pub set_local_credentials_handler: Arc<DefaultSetLocalCredentialsHandler>,
     pub local_login_handler: Arc<DefaultLocalLoginHandler>,
     pub windows_login_handler: Arc<DefaultWindowsLoginHandler>,
@@ -693,7 +698,10 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         playlist_repo.clone(),
     ));
     let add_entries_handler = Arc::new(AddEntriesHandler::new(auth.clone(), playlist_repo.clone()));
-    let remove_entry_handler = Arc::new(RemoveEntryHandler::new(auth.clone(), playlist_repo));
+    let remove_entry_handler =
+        Arc::new(RemoveEntryHandler::new(auth.clone(), playlist_repo.clone()));
+    let reorder_playlist_handler =
+        Arc::new(ReorderPlaylistHandler::new(auth.clone(), playlist_repo));
     let set_local_credentials_handler = Arc::new(SetLocalCredentialsHandler::new(
         auth.clone(),
         credential_repo.clone(),
@@ -789,6 +797,7 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         delete_playlist_handler,
         add_entries_handler,
         remove_entry_handler,
+        reorder_playlist_handler,
         set_local_credentials_handler,
         local_login_handler,
         windows_login_handler,

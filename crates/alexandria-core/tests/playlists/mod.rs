@@ -67,9 +67,7 @@ pub async fn insert_audio_file(repo: &SqliteCatalogRepository, path: &str) -> Uu
 }
 
 /// Insert four distinct audio files, for tests that exercise ordering
-/// across a playlist's entries. Unused by Task 1's own test; kept `pub`
-/// for Tasks 3-5 (reordering and reading entries).
-#[allow(dead_code)]
+/// across a playlist's entries. Used by Task 5's reorder tests.
 pub async fn insert_four_audio_files(repo: &SqliteCatalogRepository) -> [Uuid; 4] {
     [
         insert_audio_file(repo, "/library/track-1.mp3").await,

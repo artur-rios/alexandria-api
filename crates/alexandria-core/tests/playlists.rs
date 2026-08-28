@@ -18,3 +18,6 @@ mod add_entries;
 
 #[path = "playlists/remove_entry.rs"]
 mod remove_entry;
+
+#[path = "playlists/reorder.rs"]
+mod reorder;

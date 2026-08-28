@@ -75,6 +75,37 @@ pub trait PlaylistRepository: Send + Sync {
     /// delete another's row. `NotFound` when `playlist_uuid` does not
     /// resolve, or when `entry_id` does not resolve to a row inside it.
     async fn remove_entry(&self, playlist_uuid: Uuid, entry_id: i64) -> Result<(), DomainError>;
+
+    /// Move the entry identified by `entry_id` to `to_index` within the
+    /// playlist identified by `playlist_uuid`, and return the playlist's
+    /// full new order.
+    ///
+    /// The contract is deliberately "put entry X at index N", computed and
+    /// renumbered here in one transaction -- never a list of positions the
+    /// caller believes are correct. A caller sending its own arithmetic
+    /// would be a second implementation of the ordering rule, and the two
+    /// would drift (design, Risks; BR-02).
+    ///
+    /// Implemented as read-move-rewrite rather than shifting only the
+    /// affected span: entries are read in position order, the target
+    /// element is moved within an in-memory `Vec`, then every position is
+    /// written back. Index arithmetic that shifts only the span between the
+    /// old and new index is exactly where off-by-one errors live -- moving
+    /// an entry to its own current index must be a no-op, which a
+    /// remove-then-insert implementation can easily land one off from.
+    ///
+    /// `NotFound` when `playlist_uuid` does not resolve, or when `entry_id`
+    /// does not resolve to a row inside it (entry ids are global, so this
+    /// confirms membership the same way `remove_entry` does).
+    /// `InvalidInput` when `to_index` is negative or `>= ` the playlist's
+    /// entry count -- there is no position past the end or before the start
+    /// to move into.
+    async fn move_entry(
+        &self,
+        playlist_uuid: Uuid,
+        entry_id: i64,
+        to_index: i64,
+    ) -> Result<Vec<PlaylistEntry>, DomainError>;
 }
 
 #[derive(Clone)]
@@ -320,5 +351,90 @@ impl PlaylistRepository for SqlitePlaylistRepository {
 
         tx.commit().await?;
         Ok(())
+    }
+
+    async fn move_entry(
+        &self,
+        playlist_uuid: Uuid,
+        entry_id: i64,
+        to_index: i64,
+    ) -> Result<Vec<PlaylistEntry>, DomainError> {
+        let mut tx = self.pool.begin_with(WRITE_TX).await?;
+
+        let playlist_id: i64 = sqlx::query("SELECT id FROM playlists WHERE uuid = ?")
+            .bind(playlist_uuid.to_string())
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or(DomainError::NotFound)?
+            .try_get("id")?;
+
+        // Read every entry in position order, inside the same transaction
+        // as the write below, so the move is computed against a consistent
+        // snapshot.
+        let rows = sqlx::query(
+            "SELECT pe.id, f.uuid AS file_uuid, pe.position \
+             FROM playlist_entries pe \
+             JOIN files f ON f.id = pe.file_id \
+             WHERE pe.playlist_id = ? \
+             ORDER BY pe.position",
+        )
+        .bind(playlist_id)
+        .fetch_all(&mut *tx)
+        .await?;
+
+        let mut entries: Vec<(i64, Uuid)> = Vec::with_capacity(rows.len());
+        for row in rows {
+            let id: i64 = row.try_get("id")?;
+            let file_uuid: String = row.try_get("file_uuid")?;
+            entries.push((
+                id,
+                Uuid::parse_str(&file_uuid).map_err(|err| {
+                    DomainError::internal(format!("corrupt playlist entry file uuid: {err}"))
+                })?,
+            ));
+        }
+
+        // `entry_id` is global, not scoped to a playlist, so confirm it
+        // belongs to this one before moving anything -- otherwise one
+        // playlist could reorder using another's row id.
+        let from_index = entries
+            .iter()
+            .position(|(id, _)| *id == entry_id)
+            .ok_or(DomainError::NotFound)?;
+
+        if to_index < 0 || to_index as usize >= entries.len() {
+            return Err(DomainError::InvalidInput(format!(
+                "to_index {to_index} is out of range for a playlist of {} entries",
+                entries.len()
+            )));
+        }
+        let to_index = to_index as usize;
+
+        // Move the element within an in-memory Vec rather than computing
+        // which positions shift by how much -- simple and obviously
+        // correct, including the "moved to where it already is" case,
+        // which stays a no-op here without a special case.
+        let moved = entries.remove(from_index);
+        entries.insert(to_index, moved);
+
+        for (position, (id, _)) in entries.iter().enumerate() {
+            sqlx::query("UPDATE playlist_entries SET position = ? WHERE id = ?")
+                .bind(position as i64)
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+        }
+
+        tx.commit().await?;
+
+        Ok(entries
+            .into_iter()
+            .enumerate()
+            .map(|(position, (id, file_uuid))| PlaylistEntry {
+                id,
+                file_uuid,
+                position: position as i64,
+            })
+            .collect())
     }
 }
