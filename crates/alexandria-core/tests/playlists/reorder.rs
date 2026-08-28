@@ -8,7 +8,9 @@ use alexandria_core::playlists::repos::{PlaylistRepository, SqlitePlaylistReposi
 use uuid::Uuid;
 
 use crate::common::FakeAuth;
-use crate::playlists_fixtures::{create_playlist, insert_four_audio_files, repo_with_pool};
+use crate::playlists_fixtures::{
+    create_playlist, insert_audio_file, insert_four_audio_files, repo_with_pool,
+};
 
 async fn ordered_uuids(repo: &SqlitePlaylistRepository, playlist: Uuid) -> Vec<Uuid> {
     repo.list_entries(playlist)
@@ -37,8 +39,9 @@ async fn given_four_tracks_when_the_last_moves_to_the_front_then_the_rest_shift_
 
     assert_eq!(ordered_uuids(&repo, playlist.uuid).await, vec![d, a, b, c]);
     assert_eq!(
-        after.iter().map(|e| e.position).collect::<Vec<_>>(),
-        vec![0, 1, 2, 3]
+        after.iter().map(|e| e.file_uuid).collect::<Vec<_>>(),
+        vec![d, a, b, c],
+        "the returned order should match what was actually persisted"
     );
 }
 
@@ -103,6 +106,12 @@ async fn given_an_index_past_the_end_when_moved_then_invalid_input() {
 
 #[tokio::test]
 async fn given_a_negative_index_when_moved_then_invalid_input() {
+    // Note: this does not discriminate the `to_index < 0` guard on its own
+    // -- `-1 as usize` wraps to a huge value that the `>= entries.len()`
+    // arm alone would also reject with the same `InvalidInput`. It pins the
+    // bounds guard as a whole (negative input is refused, order untouched),
+    // not that specific arm; the guard is correct and worth keeping as a
+    // statement of intent regardless.
     let (repo, pool, _dir) = repo_with_pool().await;
     let catalog_repo = SqliteCatalogRepository::new(pool.clone());
     let playlist = create_playlist(&repo, "Road trip").await;
@@ -118,4 +127,40 @@ async fn given_a_negative_index_when_moved_then_invalid_input() {
 
     assert!(matches!(outcome, Err(DomainError::InvalidInput(_))));
     assert_eq!(ordered_uuids(&repo, playlist.uuid).await, vec![a, b, c, d]);
+}
+
+#[tokio::test]
+async fn given_an_entry_of_another_playlist_when_moved_then_not_found() {
+    // The entry id is global; without the playlist check, one playlist
+    // could reorder using another's row id -- mirrors
+    // `remove_entry.rs`'s equivalent test for the same hazard.
+    let (repo, pool, _dir) = repo_with_pool().await;
+    let catalog_repo = SqliteCatalogRepository::new(pool.clone());
+    let mine = create_playlist(&repo, "Mine").await;
+    let theirs = create_playlist(&repo, "Theirs").await;
+    let a = insert_audio_file(&catalog_repo, "a.flac").await;
+    let b = insert_audio_file(&catalog_repo, "b.flac").await;
+    let c = insert_audio_file(&catalog_repo, "c.flac").await;
+    let added = repo
+        .add_entries(theirs.uuid, &[a, b, c])
+        .await
+        .expect("added");
+
+    let outcome = ReorderPlaylistHandler::new(FakeAuth::Allowing, repo.clone())
+        .move_entry(mine.uuid, added[0].id, 2, "token")
+        .await;
+
+    assert!(matches!(outcome, Err(DomainError::NotFound)));
+    assert_eq!(ordered_uuids(&repo, theirs.uuid).await, vec![a, b, c]);
+}
+
+#[tokio::test]
+async fn given_an_unknown_playlist_when_an_entry_is_moved_then_not_found() {
+    let (repo, _pool, _dir) = repo_with_pool().await;
+
+    let outcome = ReorderPlaylistHandler::new(FakeAuth::Allowing, repo)
+        .move_entry(Uuid::new_v4(), 1, 0, "token")
+        .await;
+
+    assert!(matches!(outcome, Err(DomainError::NotFound)));
 }

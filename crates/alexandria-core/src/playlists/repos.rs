@@ -90,14 +90,16 @@ pub trait PlaylistRepository: Send + Sync {
     /// affected span: entries are read in position order, the target
     /// element is moved within an in-memory `Vec`, then every position is
     /// written back. Index arithmetic that shifts only the span between the
-    /// old and new index is exactly where off-by-one errors live -- moving
-    /// an entry to its own current index must be a no-op, which a
-    /// remove-then-insert implementation can easily land one off from.
+    /// old and new index -- computing which positions move up or down by
+    /// one, in SQL, without ever materializing the full order -- is exactly
+    /// where off-by-one errors live; moving an entry to its own current
+    /// index must be a no-op, which that kind of span-shifting arithmetic
+    /// can easily land one off from.
     ///
     /// `NotFound` when `playlist_uuid` does not resolve, or when `entry_id`
     /// does not resolve to a row inside it (entry ids are global, so this
     /// confirms membership the same way `remove_entry` does).
-    /// `InvalidInput` when `to_index` is negative or `>= ` the playlist's
+    /// `InvalidInput` when `to_index` is negative or `>=` the playlist's
     /// entry count -- there is no position past the end or before the start
     /// to move into.
     async fn move_entry(
