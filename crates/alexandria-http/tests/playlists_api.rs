@@ -117,6 +117,33 @@ async fn given_no_bearer_when_a_playlist_is_created_then_401() {
 }
 
 #[tokio::test]
+async fn given_no_bearer_and_malformed_body_when_a_playlist_is_created_then_401() {
+    // Authentication is evaluated before the body is parsed (FR-AU-07 / SRD
+    // §7): an unauthenticated caller must not learn that its payload was
+    // also unacceptable. Mirrors `reading_lists_api.rs`'s
+    // `given_no_token_and_malformed_body_when_posted_then_401_not_400` --
+    // with a well-formed body a no-bearer request would answer 401 whether
+    // the route sits inside `require_auth`'s `route_layer` or not, since
+    // the core handler's own `authenticate()` also answers 401. Only a
+    // syntactically invalid body separates the two: a route registered
+    // outside the layer would hit `create`'s `body.map_err(...)?` before
+    // the core handler is ever reached and answer 400 instead.
+    let test = test_app().await;
+    let router = app(Settings::default(), test.services);
+
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/playlists")
+        .header("content-type", "application/json")
+        .body(Body::from("{ not json"))
+        .unwrap();
+    let response = router.oneshot(request).await.expect("one-shot");
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert!(playlist_rows(&test.pool).await.is_empty());
+}
+
+#[tokio::test]
 async fn given_a_blank_name_when_a_playlist_is_created_then_400() {
     let test = test_app().await;
     let router = app(Settings::default(), test.services);
