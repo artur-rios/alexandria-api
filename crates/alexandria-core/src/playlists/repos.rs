@@ -1,10 +1,21 @@
+use std::collections::HashMap;
+
+use chrono::{DateTime, Utc};
 use sqlx::sqlite::SqlitePool;
 use sqlx::Row;
 use uuid::Uuid;
 
-use crate::catalog::model::FileType;
+use crate::catalog::model::{File, FileState, FileType, FileView, SubtypeMetadata};
 use crate::errors::{DomainError, WRITE_TX};
-use crate::playlists::model::{NewPlaylist, Playlist, PlaylistEntry};
+use crate::playlists::model::{NewPlaylist, Playlist, PlaylistEntry, PlaylistTrack};
+
+/// The largest number of `?` placeholders one batched `WHERE file_id IN
+/// (…)` query binds, mirroring `catalog::repos::MAX_SQLITE_PARAMS` (see
+/// that constant's doc comment for why 900, not SQLite's actual compiled-in
+/// ceiling). Duplicated here rather than imported because the catalog's
+/// constant is private to its own module — playlists needs the same number,
+/// not a dependency on the catalog repository's internals.
+const MAX_SQLITE_PARAMS: usize = 900;
 
 /// Playlists repository port. The create handler depends on this trait so
 /// its decision logic (validation, uuid minting) is unit-tested against an
@@ -108,6 +119,27 @@ pub trait PlaylistRepository: Send + Sync {
         entry_id: i64,
         to_index: i64,
     ) -> Result<Vec<PlaylistEntry>, DomainError>;
+
+    /// Every entry the playlist identified by `playlist_uuid` holds, in
+    /// position order, each resolved to the full `FileView` shape every
+    /// other listing answers (`catalog::queries::browse`) plus a `missing`
+    /// flag (design section 5).
+    ///
+    /// Batched like `CatalogRepository::list_filtered_view`: one query for
+    /// the entries plus their files, then one further query for audio
+    /// metadata chunked at `MAX_SQLITE_PARAMS`, regardless of how many
+    /// tracks the playlist holds -- never one query per track. Only the
+    /// audio subtype needs batching (unlike the catalog's five-way fan-out)
+    /// because `add_entries` accepts nothing but `FileType::Audio`.
+    ///
+    /// An entry whose file has since gone missing on disk (`missing_at`
+    /// set) is still returned, with `missing: true` -- dropping it would
+    /// delete curation work invisibly and make an unplugged drive look
+    /// like an empty playlist rather than a broken one. Returns an empty
+    /// `Vec` when `playlist_uuid` does not resolve; the caller (the browse
+    /// handler) is responsible for the `NotFound` check via `find_by_uuid`,
+    /// the same division of responsibility `list_entries` already has.
+    async fn list_view(&self, playlist_uuid: Uuid) -> Result<Vec<PlaylistTrack>, DomainError>;
 }
 
 #[derive(Clone)]
@@ -439,4 +471,201 @@ impl PlaylistRepository for SqlitePlaylistRepository {
             })
             .collect())
     }
+
+    async fn list_view(&self, playlist_uuid: Uuid) -> Result<Vec<PlaylistTrack>, DomainError> {
+        // Query 1: entries joined to their files, in position order. A
+        // plain INNER JOIN against `files` is safe here -- a row leaves
+        // `files` only on a hard purge (UC-09), never merely by going
+        // missing (`missing_at` is a column on the still-present row) or by
+        // soft-delete (`state`, likewise still present). Joining against a
+        // *state-filtered* view instead would silently drop exactly the
+        // entries design section 5 says must be kept and flagged.
+        let rows = sqlx::query(
+            "SELECT pe.id, pe.position, f.id AS file_id, f.uuid, f.path, f.name, f.type, \
+             f.content_hash, f.state, f.deleted_at, f.indexed_at, f.missing_at, f.size_bytes, \
+             f.mtime \
+             FROM playlist_entries pe \
+             JOIN files f ON f.id = pe.file_id \
+             WHERE pe.playlist_id = (SELECT id FROM playlists WHERE uuid = ?) \
+             ORDER BY pe.position",
+        )
+        .bind(playlist_uuid.to_string())
+        .fetch_all(&self.pool)
+        .await?;
+
+        struct EntryFile {
+            entry_id: i64,
+            position: i64,
+            file_id: i64,
+            file: File,
+        }
+
+        let mut entries = Vec::with_capacity(rows.len());
+        let mut file_ids = Vec::with_capacity(rows.len());
+        for row in rows {
+            let entry_id: i64 = row.try_get("id")?;
+            let position: i64 = row.try_get("position")?;
+            let file_id: i64 = row.try_get("file_id")?;
+            let file = parse_playlist_file_row(&row)?;
+            file_ids.push(file_id);
+            entries.push(EntryFile {
+                entry_id,
+                position,
+                file_id,
+                file,
+            });
+        }
+
+        // Query 2 (chunked): audio metadata for every distinct file, keyed
+        // by internal id so a track appearing twice in the playlist
+        // resolves the file once and both entries attach to the same
+        // fetched row -- never a second query for the repeat.
+        let audio = self.batch_audio_metadata(&file_ids).await?;
+
+        Ok(entries
+            .into_iter()
+            .map(|entry| {
+                let missing = entry.file.missing_at.is_some();
+                PlaylistTrack {
+                    entry_id: entry.entry_id,
+                    position: entry.position,
+                    missing,
+                    file: FileView {
+                        metadata: audio.get(&entry.file_id).cloned(),
+                        file: entry.file,
+                        width: None,
+                        height: None,
+                        page_count: None,
+                        duration_seconds: None,
+                        comic_page_count: None,
+                    },
+                }
+            })
+            .collect())
+    }
+}
+
+impl SqlitePlaylistRepository {
+    /// Batch-fetch audio metadata for every id in `ids`, chunked at
+    /// `MAX_SQLITE_PARAMS` -- the same technique
+    /// `CatalogRepository::list_filtered_view`'s `batch_audio` uses, kept
+    /// as its own copy here because a playlist only ever needs the one
+    /// subtype (`add_entries` rejects everything but audio).
+    async fn batch_audio_metadata(
+        &self,
+        ids: &[i64],
+    ) -> Result<HashMap<i64, SubtypeMetadata>, DomainError> {
+        let mut out = HashMap::new();
+        for chunk in ids.chunks(MAX_SQLITE_PARAMS) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+            let sql = format!(
+                "SELECT file_id, title, artist, album, year, genre, track, album_artist \
+                 FROM audio_files WHERE file_id IN ({placeholders})"
+            );
+            let mut query = sqlx::query(sqlx::AssertSqlSafe(sql));
+            for id in chunk {
+                query = query.bind(id);
+            }
+            let rows = query.fetch_all(&self.pool).await?;
+            for row in rows {
+                let file_id: i64 = row.try_get("file_id")?;
+                let title: Option<String> = row.try_get("title")?;
+                let artist: Option<String> = row.try_get("artist")?;
+                let album: Option<String> = row.try_get("album")?;
+                let year: Option<i64> = row.try_get("year")?;
+                let genre: Option<String> = row.try_get("genre")?;
+                let track: Option<i64> = row.try_get("track")?;
+                let album_artist: Option<String> = row.try_get("album_artist")?;
+                let all_none = title.is_none()
+                    && artist.is_none()
+                    && album.is_none()
+                    && year.is_none()
+                    && genre.is_none()
+                    && track.is_none()
+                    && album_artist.is_none();
+                if !all_none {
+                    out.insert(
+                        file_id,
+                        SubtypeMetadata::Audio {
+                            title,
+                            artist,
+                            album,
+                            year,
+                            genre,
+                            track,
+                            album_artist,
+                        },
+                    );
+                }
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// Parse the file half of `list_view`'s query-1 row into a `File`. A
+/// smaller copy of `catalog::repos::parse_file_row`, which is private to
+/// its own module and keyed off a positional tuple rather than named
+/// columns -- this reads by column name since the query above interleaves
+/// entry and file columns.
+fn parse_playlist_file_row(row: &sqlx::sqlite::SqliteRow) -> Result<File, DomainError> {
+    let uuid: String = row.try_get("uuid")?;
+    let path: String = row.try_get("path")?;
+    let name: String = row.try_get("name")?;
+    let type_str: String = row.try_get("type")?;
+    let content_hash: Option<String> = row.try_get("content_hash")?;
+    let state_str: String = row.try_get("state")?;
+    let deleted_at: Option<String> = row.try_get("deleted_at")?;
+    let indexed_at: String = row.try_get("indexed_at")?;
+    let missing_at: Option<String> = row.try_get("missing_at")?;
+    let size_bytes: Option<i64> = row.try_get("size_bytes")?;
+    let mtime: Option<String> = row.try_get("mtime")?;
+
+    let file_type = FileType::from_wire(&type_str).ok_or_else(|| {
+        DomainError::internal(format!("corrupt playlist entry file type: {type_str}"))
+    })?;
+    let state = match state_str.as_str() {
+        "active" => FileState::Active,
+        "deleted" => FileState::Deleted,
+        other => {
+            return Err(DomainError::internal(format!(
+                "corrupt playlist entry file state: {other}"
+            )))
+        }
+    };
+
+    Ok(File {
+        uuid: Uuid::parse_str(&uuid).map_err(|err| {
+            DomainError::internal(format!("corrupt playlist entry file uuid: {err}"))
+        })?,
+        path,
+        name,
+        file_type,
+        content_hash,
+        size_bytes,
+        mtime: mtime
+            .map(|s| parse_playlist_timestamp(&s, "mtime"))
+            .transpose()?,
+        state,
+        deleted_at: deleted_at
+            .map(|s| parse_playlist_timestamp(&s, "deleted_at"))
+            .transpose()?,
+        indexed_at: parse_playlist_timestamp(&indexed_at, "indexed_at")?,
+        missing_at: missing_at
+            .map(|s| parse_playlist_timestamp(&s, "missing_at"))
+            .transpose()?,
+    })
+}
+
+fn parse_playlist_timestamp(value: &str, column: &str) -> Result<DateTime<Utc>, DomainError> {
+    DateTime::parse_from_rfc3339(value)
+        .map(|dt| dt.with_timezone(&Utc))
+        .map_err(|_| {
+            DomainError::internal(format!(
+                "corrupt playlist entry row: unparseable {column} {value:?}"
+            ))
+        })
 }

@@ -21,3 +21,6 @@ mod remove_entry;
 
 #[path = "playlists/reorder.rs"]
 mod reorder;
+
+#[path = "playlists/browse.rs"]
+mod browse;

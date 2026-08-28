@@ -77,6 +77,21 @@ pub async fn insert_four_audio_files(repo: &SqliteCatalogRepository) -> [Uuid; 4
     ]
 }
 
+/// Mark a cataloged file as missing, mirroring the column re-index writes
+/// when it finds an on-disk file gone (`CatalogRepository::mark_missing`,
+/// UC-02 AF-01) rather than inventing a second "missing" state -- for
+/// Task 6's test that a playlist entry survives its file going missing
+/// (design section 5). `mark_missing` itself is keyed by path, not uuid;
+/// this writes the same column directly since the test only has the uuid.
+pub async fn mark_file_missing(pool: &SqlitePool, uuid: Uuid) {
+    sqlx::query("UPDATE files SET missing_at = ? WHERE uuid = ?")
+        .bind(chrono::Utc::now().to_rfc3339())
+        .bind(uuid.to_string())
+        .execute(pool)
+        .await
+        .expect("mark file missing");
+}
+
 /// Insert a non-audio (text) file directly through the catalog repository,
 /// for the Task 3 test that `add_entries` rejects a non-audio file (a
 /// playlist holds audio only -- video and documents have their own
