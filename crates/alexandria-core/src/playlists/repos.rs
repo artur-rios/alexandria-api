@@ -519,8 +519,16 @@ impl PlaylistRepository for SqlitePlaylistRepository {
         // Query 2 (chunked): audio metadata for every distinct file, keyed
         // by internal id so a track appearing twice in the playlist
         // resolves the file once and both entries attach to the same
-        // fetched row -- never a second query for the repeat.
-        let audio = self.batch_audio_metadata(&file_ids).await?;
+        // fetched row -- never a second query for the repeat. Deduped here
+        // so a repeated track doesn't inflate the chunk count or bind the
+        // same id twice in one `IN (...)` list -- `file_ids` above is
+        // pushed one-per-entry, so without this a playlist holding the same
+        // track many times would pad the batch with duplicate parameters
+        // for no benefit.
+        let mut distinct_file_ids = file_ids.clone();
+        distinct_file_ids.sort_unstable();
+        distinct_file_ids.dedup();
+        let audio = self.batch_audio_metadata(&distinct_file_ids).await?;
 
         Ok(entries
             .into_iter()

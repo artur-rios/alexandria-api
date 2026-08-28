@@ -1,7 +1,8 @@
 //! Integration test for `BrowsePlaylistsHandler` against a real migrated
 //! database (Testing Specification §6.4).
 
-use alexandria_core::catalog::repos::SqliteCatalogRepository;
+use alexandria_core::catalog::model::SubtypeMetadata;
+use alexandria_core::catalog::repos::{CatalogRepository, SqliteCatalogRepository};
 use alexandria_core::errors::DomainError;
 use alexandria_core::playlists::queries::browse::BrowsePlaylistsHandler;
 use alexandria_core::playlists::repos::PlaylistRepository;
@@ -84,11 +85,31 @@ async fn given_a_track_appearing_twice_when_read_then_both_entries_carry_its_met
     // Pins the batching's dedup: `list_view` resolves each distinct file id
     // once, so a track appearing twice (playlist_entries carries no unique
     // constraint on (playlist_id, file_id)) must still attach to both
-    // entries rather than only the first.
+    // entries rather than only the first (or only the last, or neither).
+    // Metadata is seeded so the assertion below can only pass if the fetched
+    // row genuinely reached both entries -- an implementation that resolves
+    // the repeat only once and forgets to reuse the result for the second
+    // entry (e.g. `HashMap::remove` instead of a lookup that leaves the
+    // entry in place) would leave one of the two `None`.
     let (repo, pool, _dir) = repo_with_pool().await;
     let catalog_repo = SqliteCatalogRepository::new(pool.clone());
     let playlist = create_playlist(&repo, "Repeats").await;
     let song = insert_audio_file(&catalog_repo, "again.flac").await;
+    catalog_repo
+        .update_metadata(
+            song,
+            &SubtypeMetadata::Audio {
+                title: Some("Again".into()),
+                artist: Some("Repeat Offender".into()),
+                album: None,
+                year: None,
+                genre: None,
+                track: None,
+                album_artist: None,
+            },
+        )
+        .await
+        .expect("write metadata");
     repo.add_entries(playlist.uuid, &[song, song])
         .await
         .expect("added");
@@ -100,6 +121,18 @@ async fn given_a_track_appearing_twice_when_read_then_both_entries_carry_its_met
 
     assert_eq!(view.entries.len(), 2);
     assert!(view.entries.iter().all(|t| t.file.file.uuid == song));
+    for track in &view.entries {
+        match &track.file.metadata {
+            Some(SubtypeMetadata::Audio { title, artist, .. }) => {
+                assert_eq!(title.as_deref(), Some("Again"));
+                assert_eq!(artist.as_deref(), Some("Repeat Offender"));
+            }
+            other => panic!(
+                "expected both entries of the repeated track to carry the batched \
+                 audio metadata, got {other:?}"
+            ),
+        }
+    }
 }
 
 #[tokio::test]
@@ -114,4 +147,50 @@ async fn given_playlists_when_listed_then_every_playlist_comes_back() {
         .expect("listed");
 
     assert_eq!(playlists.len(), 2);
+}
+
+// ---------------- FR-AU-07: auth is checked before the payload ----------------
+
+#[tokio::test]
+async fn given_unauthenticated_when_listed_then_unauthorized() {
+    let (repo, _pool, _dir) = repo_with_pool().await;
+
+    let outcome = BrowsePlaylistsHandler::new(FakeAuth::Denying, repo)
+        .list("")
+        .await;
+
+    assert!(matches!(outcome, Err(DomainError::Unauthorized)));
+}
+
+#[tokio::test]
+async fn given_unauthenticated_when_read_then_unauthorized() {
+    let (repo, pool, _dir) = repo_with_pool().await;
+    let catalog_repo = SqliteCatalogRepository::new(pool.clone());
+    let playlist = create_playlist(&repo, "Road trip").await;
+    let song = insert_audio_file(&catalog_repo, "a.flac").await;
+    repo.add_entries(playlist.uuid, &[song])
+        .await
+        .expect("added");
+
+    let outcome = BrowsePlaylistsHandler::new(FakeAuth::Denying, repo)
+        .read(playlist.uuid, "")
+        .await;
+
+    assert!(matches!(outcome, Err(DomainError::Unauthorized)));
+}
+
+#[tokio::test]
+async fn given_unauthenticated_and_unknown_uuid_when_read_then_unauthorized_not_not_found() {
+    // Pins FR-AU-07's ordering: auth runs before the playlist lookup, so an
+    // unauthenticated caller learns nothing about whether the uuid exists.
+    // Swapping `read`'s first two statements (looking the playlist up
+    // before authenticating) would pass every other test in this file but
+    // leak playlist existence here -- this is the one that catches it.
+    let (repo, _pool, _dir) = repo_with_pool().await;
+
+    let outcome = BrowsePlaylistsHandler::new(FakeAuth::Denying, repo)
+        .read(Uuid::new_v4(), "")
+        .await;
+
+    assert!(matches!(outcome, Err(DomainError::Unauthorized)));
 }

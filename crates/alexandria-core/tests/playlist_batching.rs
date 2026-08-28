@@ -163,6 +163,15 @@ async fn query_count_reading_playlist_of(count: usize) -> usize {
 /// The claim design section 5 rests on: a playlist read costs a bounded
 /// number of SQL queries, not one per track -- a 40x larger playlist must
 /// not issue more queries than a small one.
+///
+/// Asserting only `small == large` fails *open*: `browse_batching.rs`'s
+/// module doc explains why the counting mechanism can silently read zero
+/// (the `"sqlx::query"` target is sqlx's own private implementation detail,
+/// and `init_counter` swallows `set_global_default`'s error if some other
+/// subscriber wins the race) -- and `0 == 0` would pass this assertion just
+/// as happily as `2 == 2` does. Pinning the actual number, the same way
+/// `browse_batching.rs` does, is what turns a broken counter into a loud
+/// failure instead of a silent pass.
 #[tokio::test]
 async fn given_a_large_playlist_when_read_then_the_query_count_does_not_grow_with_it() {
     let small = query_count_reading_playlist_of(5).await;
@@ -171,5 +180,106 @@ async fn given_a_large_playlist_when_read_then_the_query_count_does_not_grow_wit
     assert_eq!(
         small, large,
         "reading a playlist issues a query per track: {small} for 5, {large} for 200"
+    );
+    assert_eq!(
+        small, 2,
+        "reading a playlist under the chunk boundary should cost exactly the \
+         entries+files query plus one batched audio query"
+    );
+    assert_eq!(large, 2);
+}
+
+/// `MAX_SQLITE_PARAMS` (`playlists::repos`) is 900, mirroring the catalog's
+/// own conservative assumption about SQLite's compiled-in bound-parameter
+/// ceiling (see that constant's doc comment). Nothing else in this file
+/// proves the chunking actually splits: `given_a_large_playlist_when_read_
+/// then_the_query_count_does_not_grow_with_it`'s two sizes (5 and 200) are
+/// both far under 900, so `ids.chunks(..)` never runs more than once in
+/// either -- deleting the chunking loop entirely would still pass that
+/// test, and a playlist past the real boundary would then fail at runtime
+/// with "too many SQL variables" at a size nothing here covers.
+///
+/// This seeds 901 distinct audio files -- one past the boundary -- so the
+/// audio batch is forced to split into two `IN` chunks (900 + 1), mirroring
+/// `browse_batching.rs`'s equivalent test. Asserts three things at once:
+/// every one of the 901 tracks is still present (no id lost at the chunk
+/// seam), every track still carries its metadata (the second, one-id chunk
+/// is not silently dropped), and the query count is exactly 3 (the
+/// entries+files query, plus two audio chunks) -- proving the chunk
+/// arithmetic, not just asserting a size passed.
+#[tokio::test]
+async fn given_a_playlist_past_the_chunk_boundary_when_read_then_every_track_is_still_covered() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+
+    let pool = migrated_pool().await;
+    let catalog_repo = SqliteCatalogRepository::new(pool.clone());
+    let playlist_repo = SqlitePlaylistRepository::new(pool.clone());
+
+    let playlist = playlist_repo
+        .insert_playlist(NewPlaylist {
+            uuid: Uuid::new_v4(),
+            name: "Past the boundary".into(),
+        })
+        .await
+        .expect("insert playlist");
+
+    let count = 901;
+    let mut file_uuids = Vec::with_capacity(count);
+    for i in 0..count {
+        let uuid = Uuid::new_v4();
+        catalog_repo
+            .insert_file(NewFile {
+                uuid,
+                path: format!("/lib/track-{i:04}.mp3"),
+                name: format!("track-{i:04}.mp3"),
+                file_type: FileType::Audio,
+                content_hash: Some("0".repeat(64)),
+                size_bytes: None,
+                mtime: None,
+                indexed_at: chrono::Utc::now(),
+            })
+            .await
+            .expect("insert file");
+        catalog_repo
+            .update_metadata(
+                uuid,
+                &SubtypeMetadata::Audio {
+                    title: Some(format!("Track {i}")),
+                    artist: Some("Test Artist".into()),
+                    album: None,
+                    year: None,
+                    genre: None,
+                    track: None,
+                    album_artist: None,
+                },
+            )
+            .await
+            .expect("write metadata");
+        file_uuids.push(uuid);
+    }
+    playlist_repo
+        .add_entries(playlist.uuid, &file_uuids)
+        .await
+        .expect("add entries");
+
+    let (entries, queries) = count_queries(|| playlist_repo.list_view(playlist.uuid)).await;
+    let entries = entries.expect("list view");
+
+    assert_eq!(
+        entries.len(),
+        count,
+        "every track must survive the chunk split"
+    );
+    assert!(
+        entries
+            .iter()
+            .all(|t| matches!(t.file.metadata, Some(SubtypeMetadata::Audio { .. }))),
+        "every track, including those in the second one-id chunk, must still \
+         carry its metadata"
+    );
+    assert_eq!(
+        queries, 3,
+        "901 distinct tracks at a 900-id chunk size should cost the \
+         entries+files query plus two audio chunks (900 + 1), got {queries}"
     );
 }

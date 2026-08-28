@@ -53,6 +53,15 @@ pub struct PlaylistView {
 /// the list, flagged, rather than being dropped. Dropping it would delete
 /// curation work invisibly and make an unplugged drive look like an empty
 /// playlist rather than a broken one.
+///
+/// Deliberately independent of `file.file.state`: a soft-deleted file
+/// (`state = Deleted`, `missing_at` still `None`) is *not* reported as
+/// `missing` here. The two are different failure modes with different
+/// remedies -- missing means "look for the disk", deleted means "check the
+/// trash" -- and `FileView` already carries `state` on `file.file`, so a
+/// caller that wants to tell trashed apart from missing (or from both, or
+/// neither) can do that itself rather than have this flag collapse the
+/// distinction for it.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PlaylistTrack {
