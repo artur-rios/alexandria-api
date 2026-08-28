@@ -1653,11 +1653,12 @@ have only one of.
 | AF-01 | The submitted name is blank, is whitespace-only, or has leading/trailing whitespace | The system rejects with an invalid-input error without creating or renaming anything. |
 | AF-02 | The playlist UUID, or an entry id addressed within it, does not exist | The system responds with a not-found error. |
 | AF-03 | A file submitted to be added is not an audio file | The system rejects the whole submitted batch with an invalid-input error and adds none of it. |
-| AF-04 | The requested move index is negative, or is not less than the playlist's current entry count | The system rejects with an invalid-input error; the playlist's order is unchanged. |
-| AF-05 | The caller is not authenticated | The system denies with an unauthorized error. |
+| AF-04 | A file UUID submitted to be added does not resolve to any file | The system responds with a not-found error and adds none of the submitted batch — one unresolvable UUID among several means nothing from the batch is added, not just the one entry that failed to resolve. |
+| AF-05 | The requested move index is negative, or is not less than the playlist's current entry count | The system rejects with an invalid-input error; the playlist's order is unchanged. |
+| AF-06 | The caller is not authenticated | The system denies with an unauthorized error. |
 
 > An entry is addressed by its own id, not by the file it references (AF-02,
-> AF-04): `playlist_entries` carries no `UNIQUE (playlistId, fileId)`, so the
+> AF-05): `playlist_entries` carries no `UNIQUE (playlistId, fileId)`, so the
 > same track may sit at two positions in the same playlist, and only the
 > entry's own id tells them apart.
 >
@@ -1767,7 +1768,7 @@ and the playlist-entry cleanup a file purge performs regardless of which
 playlist use case is or is not in play, respectively) rather than tied to
 one use case: FR-FC-01..35, FR-CO-01..07, FR-BM-01..06, FR-WL-01..08,
 FR-RL-01..08, FR-TX-01..03, FR-AU-01..11, FR-AU-13..17, FR-AU-19, FR-AU-20,
-FR-AU-22, FR-MP-01..06, FR-TR-01..11.
+FR-AU-22, FR-MP-01..06, FR-TR-01..09, FR-TR-11.
 UC-37 (Health check) is specified in the
 [Operations & Infrastructure Document](Operations%20%26%20Infrastructure%20Document.md)
 §5.3, not here, since it is an operational concern rather than a catalog use case.

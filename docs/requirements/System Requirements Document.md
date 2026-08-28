@@ -232,7 +232,7 @@ surfaces (FR-FC-24, NFR-09).
 | FR-TR-06 | The system shall move one playlist entry to a requested index, computing the playlist's full new order and renumbering every entry in one transaction; the caller supplies only the target index, never a list of positions, so there is exactly one implementation of the ordering rule. |
 | FR-TR-07 | The system shall list playlists, and read a single playlist back with its tracks resolved and returned in position order. |
 | FR-TR-08 | The system shall allow a playlist to hold the same track more than once: an entry's identity is its own row, not its file. |
-| FR-TR-09 | The system shall keep a playlist's entry positions contiguous, `0..n-1`, renumbering the remaining entries whenever one is added, removed, or moved. |
+| FR-TR-09 | The system shall keep a playlist's entry positions contiguous, `0..n-1`: adding entries extends the sequence with new consecutive positions after whatever the playlist already holds, removing an entry shifts every later position down by one to close the gap it leaves, and moving an entry recomputes and rewrites the playlist's full stored order. |
 | FR-TR-10 | The system shall delete a file's playlist entries when the file is purged, since `playlist_entries` carries no foreign key and nothing cascades to it automatically. |
 | FR-TR-11 | The system shall keep a playlist entry whose file has gone missing on disk, reporting it flagged (`missing: true`) rather than dropping it. A soft-deleted file (`state = deleted`, `missingAt` still unset) is reported `missing: false` — the two are different failure modes with different remedies, and a caller that wants to tell them apart reads the file's own `state`. |
 
@@ -482,7 +482,7 @@ from zero (FR-FC-33).
 | id | integer | PK | Internal primary key, and an entry's own identity — not its file. A playlist may hold the same track more than once (FR-TR-08), so removing or reordering "that track" means acting on this id, not on `fileId`. |
 | playlistId | integer | required, no FK | Containing playlist. `playlist_entries` carries no foreign key — SQLite cannot add one via `ALTER TABLE` — so purging a file deletes its entries explicitly (FR-TR-10) rather than relying on a cascade. |
 | fileId | integer | required, no FK | Referenced audio file. Adding rejects anything that is not `FileType::Audio`. Deliberately **not** `UNIQUE (playlistId, fileId)`, unlike ReadingProgress: the same track may appear as two distinct entries. |
-| position | integer | required | Contiguous `0..n-1` within the playlist; renumbered on every mutation so the stored position is always the position displayed (FR-TR-09). |
+| position | integer | required | Contiguous `0..n-1` within the playlist, so the stored position is always the position displayed. An append extends the sequence; a removal shifts every later position down by one to close the gap; a move recomputes and rewrites the playlist's full stored order (FR-TR-09). |
 
 `missing` (FR-TR-11) is not a stored column: it is computed when a playlist is
 read back, from whether the referenced File's own `missingAt` is set.
