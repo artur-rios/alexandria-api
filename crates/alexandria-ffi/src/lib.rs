@@ -3676,23 +3676,25 @@ pub extern "C" fn alexandria_playlist_add_entries(
     }
 }
 
-/// Remove one entry from a playlist, addressed by its own `entry_id` rather
-/// than a file uuid, since a playlist may hold the same track more than
-/// once (Task 4).
+/// Remove one entry from a playlist, addressed by its own `entry_uuid`
+/// rather than a file uuid, since a playlist may hold the same track more
+/// than once (Task 4).
 ///
 /// `playlist_uuid` is the playlist's public UUID (NUL-terminated string);
-/// `entry_id` is the entry's own id, passed directly as a C integer rather
-/// than through a body (there is nothing else to carry). On success `json`
-/// is an empty JSON object (`"{}"`) — the core handler answers
+/// `entry_uuid` is the entry's own public UUID (NUL-terminated string),
+/// passed directly rather than through a body (there is nothing else to
+/// carry) -- the internal rowid is never exposed on this transport, matching
+/// HTTP's `{entryUuid}` path parameter (SRD §4.0). On success `json` is an
+/// empty JSON object (`"{}"`) — the core handler answers
 /// `Result<(), DomainError>`, nothing beyond success is available to echo
-/// back, matching `DELETE /v1/playlists/{uuid}/entries/{entryId}`'s
+/// back, matching `DELETE /v1/playlists/{uuid}/entries/{entryUuid}`'s
 /// `200 {}` exactly (parity, FR-FC-24 / NFR-09) rather than inventing an
 /// FFI-only shape. `token` is the bearer auth token.
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
 pub extern "C" fn alexandria_playlist_remove_entry(
     playlist_uuid: *const c_char,
-    entry_id: i64,
+    entry_uuid: *const c_char,
     token: *const c_char,
 ) -> PlaylistJsonResult {
     let services = match services_slot().lock().unwrap().clone() {
@@ -3711,10 +3713,15 @@ pub extern "C" fn alexandria_playlist_remove_entry(
         None => return PlaylistJsonResult::err(PLAYLIST_ERR_INVALID_INPUT),
     };
 
+    let entry_uuid = match cstr_lossy(entry_uuid).and_then(|s| uuid::Uuid::parse_str(&s).ok()) {
+        Some(u) => u,
+        None => return PlaylistJsonResult::err(PLAYLIST_ERR_INVALID_INPUT),
+    };
+
     let result = runtime().block_on(async {
         services
             .remove_entry_handler
-            .remove(playlist_uuid, entry_id, &token)
+            .remove(playlist_uuid, entry_uuid, &token)
             .await
     });
 
@@ -3725,7 +3732,7 @@ pub extern "C" fn alexandria_playlist_remove_entry(
 }
 
 /// Request body accepted by `alexandria_playlist_move_entry` — the same
-/// JSON `POST /v1/playlists/{uuid}/entries/{entryId}/move` takes:
+/// JSON `POST /v1/playlists/{uuid}/entries/{entryUuid}/move` takes:
 /// `{"toIndex":…}`.
 #[derive(Debug)]
 struct MoveEntryBody {
@@ -3743,21 +3750,22 @@ impl MoveEntryBody {
 }
 
 /// Move one playlist entry to a new index, renumbering the rest in one
-/// transaction (Task 5), addressed by its own `entry_id` rather than a
+/// transaction (Task 5), addressed by its own `entry_uuid` rather than a
 /// file uuid, since a playlist may hold the same track more than once.
 ///
 /// `playlist_uuid` is the playlist's public UUID (NUL-terminated string);
-/// `entry_id` is the entry's own id, passed directly as a C integer.
+/// `entry_uuid` is the entry's own public UUID (NUL-terminated string) —
+/// the internal rowid is never exposed on this transport (SRD §4.0).
 /// `json_body` is the JSON body HTTP would send (`toIndex`). On success
 /// `json` carries the playlist's full new order (`Vec<PlaylistEntry>`) —
 /// byte-for-byte the same shape HTTP returns from `POST
-/// /v1/playlists/{uuid}/entries/{entryId}/move` (parity, FR-FC-24 /
+/// /v1/playlists/{uuid}/entries/{entryUuid}/move` (parity, FR-FC-24 /
 /// NFR-09). `token` is the bearer auth token.
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
 pub extern "C" fn alexandria_playlist_move_entry(
     playlist_uuid: *const c_char,
-    entry_id: i64,
+    entry_uuid: *const c_char,
     json_body: *const c_char,
     token: *const c_char,
 ) -> PlaylistJsonResult {
@@ -3777,6 +3785,11 @@ pub extern "C" fn alexandria_playlist_move_entry(
         None => return PlaylistJsonResult::err(PLAYLIST_ERR_INVALID_INPUT),
     };
 
+    let entry_uuid = match cstr_lossy(entry_uuid).and_then(|s| uuid::Uuid::parse_str(&s).ok()) {
+        Some(u) => u,
+        None => return PlaylistJsonResult::err(PLAYLIST_ERR_INVALID_INPUT),
+    };
+
     let body_str = match cstr_lossy(json_body) {
         Some(s) => s,
         None => return PlaylistJsonResult::err(PLAYLIST_ERR_INVALID_INPUT),
@@ -3789,7 +3802,7 @@ pub extern "C" fn alexandria_playlist_move_entry(
     let result = runtime().block_on(async {
         services
             .reorder_playlist_handler
-            .move_entry(playlist_uuid, entry_id, body.to_index, &token)
+            .move_entry(playlist_uuid, entry_uuid, body.to_index, &token)
             .await
     });
 

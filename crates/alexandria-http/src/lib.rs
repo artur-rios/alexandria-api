@@ -148,11 +148,11 @@ pub fn app(settings: Settings, services: Arc<Services>) -> Router {
             post(routes::playlists::add_entries),
         )
         .route(
-            "/v1/playlists/{uuid}/entries/{entry_id}",
+            "/v1/playlists/{uuid}/entries/{entry_uuid}",
             delete(routes::playlists::remove_entry),
         )
         .route(
-            "/v1/playlists/{uuid}/entries/{entry_id}/move",
+            "/v1/playlists/{uuid}/entries/{entry_uuid}/move",
             post(routes::playlists::move_entry),
         )
         .route_layer(from_fn_with_state(

@@ -512,7 +512,7 @@ async fn given_an_unknown_playlist_when_entries_are_added_then_404() {
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }
 
-// ---------------- DELETE /v1/playlists/{uuid}/entries/{entryId} ----------------
+// ---------------- DELETE /v1/playlists/{uuid}/entries/{entryUuid} ----------------
 
 #[tokio::test]
 async fn given_no_bearer_when_an_entry_is_removed_then_401() {
@@ -530,9 +530,10 @@ async fn given_no_bearer_when_an_entry_is_removed_then_401() {
         ))
         .await
         .expect("add entries");
-    let entry_id = body_json(add_response).await[0]["id"]
-        .as_i64()
-        .expect("entry id");
+    let entry_id = body_json(add_response).await[0]["uuid"]
+        .as_str()
+        .expect("entry uuid")
+        .to_string();
 
     let response = router
         .oneshot(unauthenticated_request(
@@ -562,9 +563,10 @@ async fn given_a_known_entry_when_removed_then_200_and_row_removed() {
         ))
         .await
         .expect("add entries");
-    let entry_id = body_json(add_response).await[0]["id"]
-        .as_i64()
-        .expect("entry id");
+    let entry_id = body_json(add_response).await[0]["uuid"]
+        .as_str()
+        .expect("entry uuid")
+        .to_string();
 
     let response = router
         .clone()
@@ -598,7 +600,7 @@ async fn given_an_unknown_entry_when_removed_then_404() {
     let response = router
         .oneshot(authed_request(
             "DELETE",
-            &format!("/v1/playlists/{uuid}/entries/999999"),
+            &format!("/v1/playlists/{uuid}/entries/{}", uuid::Uuid::new_v4()),
             None,
         ))
         .await
@@ -607,7 +609,7 @@ async fn given_an_unknown_entry_when_removed_then_404() {
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }
 
-// ---------------- POST /v1/playlists/{uuid}/entries/{entryId}/move ----------------
+// ---------------- POST /v1/playlists/{uuid}/entries/{entryUuid}/move ----------------
 
 #[tokio::test]
 async fn given_no_bearer_when_an_entry_is_moved_then_401() {
@@ -626,9 +628,10 @@ async fn given_no_bearer_when_an_entry_is_moved_then_401() {
         ))
         .await
         .expect("add entries");
-    let entry_id = body_json(add_response).await[0]["id"]
-        .as_i64()
-        .expect("entry id");
+    let entry_id = body_json(add_response).await[0]["uuid"]
+        .as_str()
+        .expect("entry uuid")
+        .to_string();
 
     let response = router
         .oneshot(unauthenticated_request(
@@ -660,7 +663,7 @@ async fn given_a_valid_index_when_an_entry_is_moved_then_200_with_new_order() {
         .await
         .expect("add entries");
     let entries = body_json(add_response).await;
-    let first_entry_id = entries[0]["id"].as_i64().expect("entry id");
+    let first_entry_id = entries[0]["uuid"].as_str().expect("entry uuid").to_string();
 
     let response = router
         .oneshot(authed_request(
@@ -675,7 +678,7 @@ async fn given_a_valid_index_when_an_entry_is_moved_then_200_with_new_order() {
     let body = body_json(response).await;
     let order = body.as_array().expect("array");
     assert_eq!(order.len(), 2);
-    assert_eq!(order[1]["id"], first_entry_id);
+    assert_eq!(order[1]["uuid"], first_entry_id);
     assert_eq!(order[1]["position"], 1);
     assert_eq!(order[0]["position"], 0);
 }
@@ -696,9 +699,10 @@ async fn given_an_index_past_the_end_when_an_entry_is_moved_then_400() {
         ))
         .await
         .expect("add entries");
-    let entry_id = body_json(add_response).await[0]["id"]
-        .as_i64()
-        .expect("entry id");
+    let entry_id = body_json(add_response).await[0]["uuid"]
+        .as_str()
+        .expect("entry uuid")
+        .to_string();
 
     let response = router
         .oneshot(authed_request(
@@ -722,7 +726,7 @@ async fn given_an_unknown_entry_when_moved_then_404() {
     let response = router
         .oneshot(authed_request(
             "POST",
-            &format!("/v1/playlists/{uuid}/entries/999999/move"),
+            &format!("/v1/playlists/{uuid}/entries/{}/move", uuid::Uuid::new_v4()),
             Some(json!({ "toIndex": 0 })),
         ))
         .await

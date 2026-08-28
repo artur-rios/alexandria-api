@@ -197,8 +197,8 @@ pub async fn add_entries(
     Ok((StatusCode::OK, Json(result)))
 }
 
-/// `DELETE /v1/playlists/{uuid}/entries/{entryId}` — remove one entry from a
-/// playlist (Task 4), addressed by its own `entryId` rather than a file
+/// `DELETE /v1/playlists/{uuid}/entries/{entryUuid}` — remove one entry from
+/// a playlist (Task 4), addressed by its own `entryUuid` rather than a file
 /// uuid, since a playlist may hold the same track more than once. Returns
 /// `200` with an empty JSON object as confirmation — the core handler
 /// answers nothing beyond success (`Result<(), DomainError>`), so nothing
@@ -211,25 +211,25 @@ pub async fn add_entries(
 /// `400` + `{"error": …}` envelope rather than axum's bare-text `400`.
 pub async fn remove_entry(
     State(state): State<AppState>,
-    path: Result<Path<(Uuid, i64)>, PathRejection>,
+    path: Result<Path<(Uuid, Uuid)>, PathRejection>,
     headers: HeaderMap,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     let token = bearer_token(&headers);
 
-    let Path((playlist_uuid, entry_id)) =
-        path.map_err(|_| invalid_input("path segment is not a valid UUID or entry id"))?;
+    let Path((playlist_uuid, entry_uuid)) =
+        path.map_err(|_| invalid_input("path segment is not a valid UUID"))?;
 
     state
         .services
         .remove_entry_handler
-        .remove(playlist_uuid, entry_id, &token)
+        .remove(playlist_uuid, entry_uuid, &token)
         .await
         .map_err(ApiError)?;
 
     Ok((StatusCode::OK, Json(json!({}))))
 }
 
-/// Request body for `POST /v1/playlists/{uuid}/entries/{entryId}/move`
+/// Request body for `POST /v1/playlists/{uuid}/entries/{entryUuid}/move`
 /// (Task 5): the `toIndex` to move the entry to. Required — an absent or
 /// malformed value is rejected as invalid input, matching the FFI surface's
 /// handling of the same payload (FR-FC-24 / NFR-09).
@@ -239,8 +239,8 @@ pub struct MoveEntryRequest {
     pub to_index: i64,
 }
 
-/// `POST /v1/playlists/{uuid}/entries/{entryId}/move` — move one playlist
-/// entry to a new index (Task 5), addressed by its own `entryId` rather
+/// `POST /v1/playlists/{uuid}/entries/{entryUuid}/move` — move one playlist
+/// entry to a new index (Task 5), addressed by its own `entryUuid` rather
 /// than a file uuid, since a playlist may hold the same track more than
 /// once. The body carries `toIndex`; the handler computes the new order and
 /// renumbers every entry in one transaction. Returns `200` with the
@@ -254,21 +254,21 @@ pub struct MoveEntryRequest {
 /// `422`/`400`.
 pub async fn move_entry(
     State(state): State<AppState>,
-    path: Result<Path<(Uuid, i64)>, PathRejection>,
+    path: Result<Path<(Uuid, Uuid)>, PathRejection>,
     headers: HeaderMap,
     body: Result<Json<MoveEntryRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<Vec<PlaylistEntry>>), ApiError> {
     let token = bearer_token(&headers);
 
-    let Path((playlist_uuid, entry_id)) =
-        path.map_err(|_| invalid_input("path segment is not a valid UUID or entry id"))?;
+    let Path((playlist_uuid, entry_uuid)) =
+        path.map_err(|_| invalid_input("path segment is not a valid UUID"))?;
     let Json(request) =
         body.map_err(|err| invalid_input(format!("invalid move entry body: {err}")))?;
 
     let result = state
         .services
         .reorder_playlist_handler
-        .move_entry(playlist_uuid, entry_id, request.to_index, &token)
+        .move_entry(playlist_uuid, entry_uuid, request.to_index, &token)
         .await
         .map_err(ApiError)?;
 

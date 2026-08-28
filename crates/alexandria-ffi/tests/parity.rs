@@ -13364,12 +13364,15 @@ async fn given_a_playlist_when_read_via_http_and_ffi_then_both_answer_the_same_o
     assert_eq!(add_resp.status(), axum::http::StatusCode::OK);
     let http_entries: serde_json::Value =
         serde_json::from_slice(&to_bytes(add_resp.into_body(), usize::MAX).await.unwrap()).unwrap();
-    let http_d_entry_id = http_entries.as_array().unwrap()[3]["id"].as_i64().unwrap();
+    let http_d_entry_uuid = http_entries.as_array().unwrap()[3]["uuid"]
+        .as_str()
+        .unwrap()
+        .to_string();
 
     let move_req = Request::builder()
         .method("POST")
         .uri(format!(
-            "/v1/playlists/{http_playlist_uuid}/entries/{http_d_entry_id}/move"
+            "/v1/playlists/{http_playlist_uuid}/entries/{http_d_entry_uuid}/move"
         ))
         .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .header("content-type", "application/json")
@@ -13445,12 +13448,16 @@ async fn given_a_playlist_when_read_via_http_and_ffi_then_both_answer_the_same_o
             alexandria_free_string(add_r.json);
         }
         let entries: serde_json::Value = serde_json::from_str(&entries_json).unwrap();
-        let d_entry_id = entries.as_array().unwrap()[3]["id"].as_i64().unwrap();
+        let d_entry_uuid = entries.as_array().unwrap()[3]["uuid"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let d_entry_uuid_c = CString::new(d_entry_uuid).unwrap();
 
         let move_body = CString::new(json!({ "toIndex": 0 }).to_string()).unwrap();
         let move_r = alexandria_playlist_move_entry(
             playlist_uuid_c.as_ptr(),
-            d_entry_id,
+            d_entry_uuid_c.as_ptr(),
             move_body.as_ptr(),
             token.as_ptr(),
         );

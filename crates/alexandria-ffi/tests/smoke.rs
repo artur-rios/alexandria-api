@@ -2808,7 +2808,11 @@ fn given_a_full_lifecycle_when_driven_entirely_over_ffi_then_every_step_is_ok() 
         add_body.as_ptr(),
         token.as_ptr(),
     ));
-    let entry_id = entries.as_array().unwrap()[0]["id"].as_i64().unwrap();
+    let entry_uuid = entries.as_array().unwrap()[0]["uuid"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let entry_uuid_c = c(&entry_uuid);
 
     let view = playlist_json_ok(alexandria_playlist_read(puuid.as_ptr(), token.as_ptr()));
     assert_eq!(view["entries"].as_array().unwrap().len(), 1);
@@ -2816,13 +2820,14 @@ fn given_a_full_lifecycle_when_driven_entirely_over_ffi_then_every_step_is_ok() 
     let move_body = c(&serde_json::json!({ "toIndex": 0 }).to_string());
     let moved = playlist_json_ok(alexandria_playlist_move_entry(
         puuid.as_ptr(),
-        entry_id,
+        entry_uuid_c.as_ptr(),
         move_body.as_ptr(),
         token.as_ptr(),
     ));
     assert_eq!(moved.as_array().unwrap().len(), 1);
 
-    let removed = alexandria_playlist_remove_entry(puuid.as_ptr(), entry_id, token.as_ptr());
+    let removed =
+        alexandria_playlist_remove_entry(puuid.as_ptr(), entry_uuid_c.as_ptr(), token.as_ptr());
     assert_eq!(removed.status, STATUS_PLAYLIST_OK);
     assert!(!removed.json.is_null());
     let removed_json = unsafe { CStr::from_ptr(removed.json) }
