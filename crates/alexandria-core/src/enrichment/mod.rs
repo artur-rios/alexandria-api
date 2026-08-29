@@ -16,3 +16,7 @@ pub mod model;
 pub mod providers;
 pub mod queries;
 pub mod repos;
+
+/// One successful lookup end to end, against local stubs.
+#[cfg(test)]
+mod end_to_end;

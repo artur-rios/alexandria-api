@@ -84,6 +84,10 @@ struct DataValue {
 /// Fetches artist photography from Commons via Wikidata.
 pub struct CommonsImageClient {
     http: Client,
+    /// The Wikidata API and the Commons file root. Only the tests ever
+    /// change them — see `MusicBrainzClient::base_url`.
+    wikidata_api: String,
+    file_path_root: String,
 }
 
 impl CommonsImageClient {
@@ -94,14 +98,32 @@ impl CommonsImageClient {
             .build()
             .map_err(|e| ProviderError::Unreachable(e.to_string()))?;
 
-        Ok(Self { http })
+        Ok(Self {
+            http,
+            wikidata_api: WIKIDATA_API.to_string(),
+            file_path_root: COMMONS_FILE_PATH.to_string(),
+        })
+    }
+
+    /// The same client against local stubs, for tests.
+    #[cfg(test)]
+    pub(crate) fn against(
+        contact: &str,
+        wikidata_api: &str,
+        file_path_root: &str,
+    ) -> Result<Self, ProviderError> {
+        Ok(Self {
+            wikidata_api: wikidata_api.to_string(),
+            file_path_root: file_path_root.trim_end_matches('/').to_string(),
+            ..Self::new(contact)?
+        })
     }
 
     /// The Wikidata entity carrying `mbid` as its MusicBrainz artist id.
     async fn entity_for(&self, mbid: &str) -> Result<Option<String>, ProviderError> {
         let response = self
             .http
-            .get(WIKIDATA_API)
+            .get(&self.wikidata_api)
             .query(&[
                 ("action", "query"),
                 ("list", "search"),
@@ -138,7 +160,7 @@ impl CommonsImageClient {
     async fn image_name_for(&self, entity: &str) -> Result<Option<String>, ProviderError> {
         let response = self
             .http
-            .get(WIKIDATA_API)
+            .get(&self.wikidata_api)
             .query(&[
                 ("action", "wbgetclaims"),
                 ("entity", entity),
@@ -183,7 +205,8 @@ impl ArtistImageProvider for CommonsImageClient {
         // beside a track listing needs none of it; asking for a rendering is
         // both far less to download and far less of theirs to spend.
         let source_url = format!(
-            "{COMMONS_FILE_PATH}/{}?width={MAX_IMAGE_WIDTH}",
+            "{}/{}?width={MAX_IMAGE_WIDTH}",
+            self.file_path_root,
             urlencode(&file_name)
         );
         let response = self

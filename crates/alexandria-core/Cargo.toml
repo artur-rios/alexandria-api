@@ -44,6 +44,14 @@ windows-sys.workspace = true
 # Tests only: `jsonwebtoken` will not encode an `alg: none` token — refusing
 # to produce one is the point of the library — so the test that proves we
 # reject it assembles the token by hand.
+# Tests only: the three enrichment clients are pointed at a local stub
+# server rather than at MusicBrainz, Wikidata and LRCLIB. Their URL building
+# and their JSON parsing are otherwise covered by nothing — the handler tests
+# above replace the clients wholesale with fakes, so the one part that talks
+# to a real HTTP surface is the part no test reaches. Already in the
+# workspace for `alexandria-http`; a dev-dependency here adds no runtime
+# weight.
+axum.workspace = true
 base64.workspace = true
 little_exif.workspace = true
 tempfile.workspace = true
