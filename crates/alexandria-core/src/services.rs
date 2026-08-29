@@ -55,6 +55,12 @@ use crate::collections::queries::list_items::ListCollectionItemsHandler;
 use crate::collections::repos::SqliteCollectionRepository;
 use crate::config::AuthMode;
 use crate::config::Settings;
+use crate::enrichment::commands::{EnrichHandler, FsArtistImageStore};
+use crate::enrichment::providers::commons::CommonsImageClient;
+use crate::enrichment::providers::lrclib::LrclibClient;
+use crate::enrichment::providers::musicbrainz::MusicBrainzClient;
+use crate::enrichment::queries::ReadEnrichmentHandler;
+use crate::enrichment::repos::SqliteEnrichmentRepository;
 use crate::playback::comic_page::{ComicPageHandler, ZipComicArchive};
 use crate::playback::source::PlaybackSourceHandler;
 use crate::playback::thumbnail::{DiskThumbnailCache, ImageThumbnailRenderer, ThumbnailHandler};
@@ -258,6 +264,20 @@ pub type DefaultRemoveItemFromReadingListHandler =
 pub type DefaultDeleteReadingListHandler =
     DeleteReadingListHandler<RuntimeAuthService, SqliteReadingListRepository>;
 
+/// The enrichment run, over the three real service clients.
+pub type DefaultEnrichHandler = EnrichHandler<
+    RuntimeAuthService,
+    SqliteEnrichmentRepository,
+    MusicBrainzClient,
+    CommonsImageClient,
+    LrclibClient,
+    FsArtistImageStore,
+    SystemClock,
+>;
+
+pub type DefaultReadEnrichmentHandler =
+    ReadEnrichmentHandler<RuntimeAuthService, SqliteEnrichmentRepository>;
+
 pub type DefaultCreatePlaylistHandler =
     CreatePlaylistHandler<RuntimeAuthService, SqlitePlaylistRepository>;
 
@@ -357,6 +377,20 @@ pub struct Services {
     pub update_reading_progress_handler: Arc<DefaultUpdateReadingProgressHandler>,
     pub remove_item_from_reading_list_handler: Arc<DefaultRemoveItemFromReadingListHandler>,
     pub delete_reading_list_handler: Arc<DefaultDeleteReadingListHandler>,
+    /// `None` when enrichment is unavailable — switched off, or on with no
+    /// contact configured (`MetadataSettings::unavailable_reason`).
+    ///
+    /// An `Option` rather than a handler that always exists and refuses,
+    /// because the three service clients are only built when they can
+    /// legitimately be used: constructing a MusicBrainz client with no
+    /// contact would produce an agent string its own terms forbid sending,
+    /// and having one to hand is how it eventually gets sent.
+    pub enrich_handler: Option<Arc<DefaultEnrichHandler>>,
+    /// Always present: reading what was already cached is not a network
+    /// operation and stays available after enrichment is switched back off,
+    /// so an owner who turns it on, runs it once and turns it off keeps what
+    /// they fetched.
+    pub read_enrichment_handler: Arc<DefaultReadEnrichmentHandler>,
     pub create_playlist_handler: Arc<DefaultCreatePlaylistHandler>,
     pub rename_playlist_handler: Arc<DefaultRenamePlaylistHandler>,
     pub delete_playlist_handler: Arc<DefaultDeletePlaylistHandler>,
@@ -689,6 +723,45 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         auth.clone(),
         reading_list_repo,
     ));
+    let enrichment_repo = SqliteEnrichmentRepository::new(pool.clone());
+    let read_enrichment_handler = Arc::new(ReadEnrichmentHandler::new(
+        auth.clone(),
+        SqliteEnrichmentRepository::new(pool.clone()),
+    ));
+    // Built only when it can actually run. A client that cannot lawfully
+    // send its own User-Agent is one this process should not be holding.
+    let enrich_handler = if settings.metadata.is_available() {
+        match (
+            MusicBrainzClient::new(&settings.metadata.contact),
+            CommonsImageClient::new(&settings.metadata.contact),
+            LrclibClient::new(&settings.metadata.contact),
+        ) {
+            (Ok(identity), Ok(images), Ok(lyrics)) => Some(Arc::new(EnrichHandler::new(
+                auth.clone(),
+                enrichment_repo,
+                identity,
+                images,
+                lyrics,
+                FsArtistImageStore::new(&settings.metadata.image_cache_dir),
+                clock,
+                settings.metadata.clone(),
+            ))),
+            // A client that will not build is a configuration this process
+            // cannot honour; enrichment stays unavailable rather than
+            // half-wired, and the reason is logged once here rather than
+            // rediscovered on every call.
+            _ => {
+                tracing::warn!(
+                    "music enrichment is enabled but its service clients could not be built; \
+                     it will report as unavailable"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let playlist_repo = SqlitePlaylistRepository::new(pool.clone());
     let create_playlist_handler = Arc::new(CreatePlaylistHandler::new(
         auth.clone(),
@@ -801,6 +874,8 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         update_reading_progress_handler,
         remove_item_from_reading_list_handler,
         delete_reading_list_handler,
+        enrich_handler,
+        read_enrichment_handler,
         create_playlist_handler,
         rename_playlist_handler,
         delete_playlist_handler,

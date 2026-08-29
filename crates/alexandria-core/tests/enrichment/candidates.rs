@@ -76,6 +76,19 @@ async fn insert_tagged(
     uuid
 }
 
+async fn settle_image(repo: &SqliteEnrichmentRepository, artist: &str) {
+    repo.put_artist_image(ArtistImage {
+        artist_name: artist.to_string(),
+        mbid: Some("mb-1".to_string()),
+        source_url: Some("https://commons.example/p.jpg".to_string()),
+        image_path: Some("mb-1.jpg".to_string()),
+        outcome: EnrichmentOutcome::Found,
+        fetched_at: Utc::now(),
+    })
+    .await
+    .expect("image");
+}
+
 async fn settle_lyrics(repo: &SqliteEnrichmentRepository, file_uuid: Uuid) {
     repo.put_lyrics(TrackLyrics {
         file_uuid,
@@ -141,8 +154,34 @@ async fn given_the_catalog_when_a_candidate_is_read_then_it_carries_no_duration(
 }
 
 #[tokio::test]
-async fn given_settled_lyrics_when_pending_is_queried_then_the_file_is_excluded() {
+async fn given_both_facts_settled_when_pending_is_queried_then_the_file_is_excluded() {
     // Resumability: a second pass must not re-ask what is already answered.
+    // BOTH facts have to be settled -- a file is pending while either one is
+    // outstanding.
+    let (repo, catalog, _dir) = fixtures().await;
+    let uuid = insert_tagged(
+        &catalog,
+        "/library/so-what.flac",
+        "So What",
+        "Miles Davis",
+        None,
+    )
+    .await;
+    settle_lyrics(&repo, uuid).await;
+    settle_image(&repo, "Miles Davis").await;
+
+    let pending = repo
+        .candidates(&EnrichmentScope::Pending)
+        .await
+        .expect("candidates");
+
+    assert!(pending.is_empty());
+}
+
+#[tokio::test]
+async fn given_settled_lyrics_but_no_image_yet_when_pending_is_queried_then_it_returns() {
+    // The other half of the same rule, and the one whose absence stranded
+    // artist images: lyrics settled is not the whole story.
     let (repo, catalog, _dir) = fixtures().await;
     let uuid = insert_tagged(
         &catalog,
@@ -159,7 +198,7 @@ async fn given_settled_lyrics_when_pending_is_queried_then_the_file_is_excluded(
         .await
         .expect("candidates");
 
-    assert!(pending.is_empty());
+    assert_eq!(pending.len(), 1);
 }
 
 #[tokio::test]
@@ -195,15 +234,12 @@ async fn given_failed_lyrics_when_pending_is_queried_then_the_file_returns() {
 }
 
 #[tokio::test]
-async fn given_settled_lyrics_and_a_failed_image_when_pending_runs_then_the_image_is_stranded() {
-    // A defect this file's absence would have hidden too, and it is real:
-    // `Pending` selects on the LYRICS outcome alone, so a track whose lyrics
-    // are settled drops out of the run entirely — taking its artist's failed
-    // image lookup with it. That image is then never retried by any
-    // `Pending` run, however many times it is started.
-    //
-    // Asserted as it currently behaves rather than as it should, so the
-    // behaviour is recorded and the test turns red the moment it is fixed.
+async fn given_settled_lyrics_and_a_failed_image_when_pending_runs_then_the_file_returns() {
+    // One run with MusicBrainz down and LRCLIB up settles every file's
+    // lyrics and fails every artist image. Selecting on the lyrics outcome
+    // alone made those images unreachable by any number of later runs --
+    // exactly the resumability the `outcome` column exists to provide,
+    // defeated. The file comes back so the image can be retried.
     let (repo, catalog, _dir) = fixtures().await;
     let uuid = insert_tagged(
         &catalog,
@@ -230,10 +266,46 @@ async fn given_settled_lyrics_and_a_failed_image_when_pending_runs_then_the_imag
         .await
         .expect("candidates");
 
-    assert!(
-        pending.is_empty(),
-        "if this now returns the file, the stranded-image gap is fixed — \
-         delete this test and assert the retry instead"
+    assert_eq!(pending.len(), 1, "the failed image was stranded");
+}
+
+#[tokio::test]
+async fn given_an_unrecognized_stored_outcome_when_pending_is_queried_then_it_is_retried() {
+    // The rule has to mean the same thing in Rust and in SQL. Reading it as
+    // `outcome <> 'failed'` made an unrecognized value settled here while
+    // `EnrichmentOutcome::from_stored` called it retryable -- so a row from a
+    // newer version, or a corrupted one, would drop out of every run.
+    let (repo, catalog, dir) = fixtures().await;
+    let uuid = insert_tagged(
+        &catalog,
+        "/library/so-what.flac",
+        "So What",
+        "Miles Davis",
+        Some("Miles Davis"),
+    )
+    .await;
+    settle_lyrics(&repo, uuid).await;
+    settle_image(&repo, "Miles Davis").await;
+
+    // Written straight to the table: no code path produces this value, which
+    // is the point -- a future version's might.
+    let pool = migrate_database(dir.path().join("alexandria.sqlite").to_str().expect("path"))
+        .await
+        .expect("reopen");
+    sqlx::query("UPDATE track_lyrics SET outcome = 'partial'")
+        .execute(&pool)
+        .await
+        .expect("update");
+
+    let pending = repo
+        .candidates(&EnrichmentScope::Pending)
+        .await
+        .expect("candidates");
+
+    assert_eq!(
+        pending.len(),
+        1,
+        "an unknown outcome was treated as settled"
     );
 }
 

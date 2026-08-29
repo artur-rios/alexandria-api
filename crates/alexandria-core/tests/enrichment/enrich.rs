@@ -386,3 +386,80 @@ async fn given_a_file_purged_mid_run_when_its_lyrics_are_written_then_the_run_co
     assert_eq!(report.found, 2);
     assert_eq!(report.skipped, 2);
 }
+
+#[tokio::test]
+async fn given_a_rejected_image_when_the_artist_is_named_explicitly_then_it_is_asked_again() {
+    // Naming an artist is the caller asking for it to be redone, and it is
+    // the only way to clear a wrong match: a low-scoring hit settles as
+    // `Rejected`, and a sweep would skip it forever even after Wikidata
+    // gained a photograph.
+    let repo = FakeEnrichmentRepository::with_candidates(vec![candidate("So What", "Miles Davis")]);
+    repo.images.lock().unwrap().insert(
+        "Miles Davis".to_string(),
+        alexandria_core::enrichment::model::ArtistImage {
+            artist_name: "Miles Davis".to_string(),
+            mbid: Some("mb-wrong".to_string()),
+            source_url: None,
+            image_path: None,
+            outcome: EnrichmentOutcome::Rejected,
+            fetched_at: chrono::Utc::now(),
+        },
+    );
+    let identity = FakeIdentity::matching("mb-right", "Miles Davis", 100);
+    let handler = handler!(
+        repo.clone(),
+        identity.clone(),
+        FakeImages::with_image(),
+        FakeLyrics::with_nothing(),
+        FakeImageStore::default(),
+        available_settings()
+    );
+
+    handler
+        .enrich(EnrichmentScope::Artist("Miles Davis".to_string()), "token")
+        .await
+        .expect("run");
+
+    assert_eq!(
+        identity.ask_count(),
+        1,
+        "an explicit scope was skipped as settled"
+    );
+    let stored = repo.stored_image("Miles Davis").expect("a row");
+    assert_eq!(stored.outcome, EnrichmentOutcome::Found);
+    assert_eq!(stored.mbid.as_deref(), Some("mb-right"));
+}
+
+#[tokio::test]
+async fn given_a_settled_image_when_a_sweep_runs_then_it_is_still_skipped() {
+    // The pair of the test above: a sweep must not re-ask what is answered,
+    // or the rate limit is spent re-confirming a whole library every run.
+    let repo = FakeEnrichmentRepository::with_candidates(vec![candidate("So What", "Miles Davis")]);
+    repo.images.lock().unwrap().insert(
+        "Miles Davis".to_string(),
+        alexandria_core::enrichment::model::ArtistImage {
+            artist_name: "Miles Davis".to_string(),
+            mbid: Some("mb-1".to_string()),
+            source_url: None,
+            image_path: Some("mb-1.jpg".to_string()),
+            outcome: EnrichmentOutcome::Found,
+            fetched_at: chrono::Utc::now(),
+        },
+    );
+    let identity = FakeIdentity::matching("mb-1", "Miles Davis", 100);
+    let handler = handler!(
+        repo,
+        identity.clone(),
+        FakeImages::with_image(),
+        FakeLyrics::with_nothing(),
+        FakeImageStore::default(),
+        available_settings()
+    );
+
+    handler
+        .enrich(EnrichmentScope::Pending, "token")
+        .await
+        .expect("run");
+
+    assert_eq!(identity.ask_count(), 0);
+}

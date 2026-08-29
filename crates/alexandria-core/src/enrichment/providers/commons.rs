@@ -28,6 +28,13 @@ const COMMONS_FILE_PATH: &str = "https://commons.wikimedia.org/wiki/Special:File
 /// down and then discarded.
 const MAX_IMAGE_BYTES: usize = 8 * 1024 * 1024;
 
+/// The width requested from Commons, in pixels.
+///
+/// Ample for a portrait shown beside a track listing or on a now-playing
+/// screen, and small enough that the byte cap above is a guard against the
+/// unexpected rather than something a normal image trips.
+const MAX_IMAGE_WIDTH: u32 = 1000;
+
 #[derive(Debug, Deserialize)]
 struct SearchEnvelope {
     #[serde(default)]
@@ -171,7 +178,14 @@ impl ArtistImageProvider for CommonsImageClient {
             return Ok(None);
         };
 
-        let source_url = format!("{COMMONS_FILE_PATH}/{}", urlencode(&file_name));
+        // A width is requested rather than the original. Commons holds
+        // originals running to tens of megabytes and an artist portrait
+        // beside a track listing needs none of it; asking for a rendering is
+        // both far less to download and far less of theirs to spend.
+        let source_url = format!(
+            "{COMMONS_FILE_PATH}/{}?width={MAX_IMAGE_WIDTH}",
+            urlencode(&file_name)
+        );
         let response = self
             .http
             .get(&source_url)
@@ -187,10 +201,19 @@ impl ArtistImageProvider for CommonsImageClient {
         }
 
         // Checked before the body is read where the server declared a length,
-        // so an oversized original is refused rather than downloaded first.
+        // so an oversized rendering is refused rather than downloaded first.
+        //
+        // `Unusable`, not `Ok(None)`. `None` means the service had nothing,
+        // which the command settles and never re-asks — and "larger than a
+        // cap this code chose" is not that. Recorded as retryable, so
+        // raising the cap or a smaller rendering appearing is enough to get
+        // the image, rather than the artist being permanently marked as
+        // having no photograph anywhere.
         if let Some(length) = response.content_length() {
             if length as usize > MAX_IMAGE_BYTES {
-                return Ok(None);
+                return Err(ProviderError::Unusable(format!(
+                    "image is {length} bytes, over the {MAX_IMAGE_BYTES} cap"
+                )));
             }
         }
 
@@ -201,7 +224,10 @@ impl ArtistImageProvider for CommonsImageClient {
 
         // And again after, for a response that declared no length at all.
         if bytes.len() > MAX_IMAGE_BYTES {
-            return Ok(None);
+            return Err(ProviderError::Unusable(format!(
+                "image is {} bytes, over the {MAX_IMAGE_BYTES} cap",
+                bytes.len()
+            )));
         }
 
         Ok(Some(ArtistImageAsset {

@@ -31,6 +31,17 @@ pub enum EnrichmentOutcome {
     Rejected,
 }
 
+/// The stored values that count as settled, as a SQL list literal.
+///
+/// The resumability rule lives in `EnrichmentOutcome::is_settled`, and the
+/// candidate query has to implement the *same* rule in SQL. Writing that
+/// query as `outcome <> 'failed'` looked equivalent and was not: an
+/// unrecognized value — a row from a newer version, or corruption — reads as
+/// `Failed` and therefore retryable in Rust, while `<> 'failed'` makes it
+/// settled and drops the file out of every run. Naming the settled values
+/// positively, once, is what keeps the two halves from disagreeing.
+pub const SETTLED_OUTCOMES_SQL: &str = "('found', 'notFound', 'rejected')";
+
 impl EnrichmentOutcome {
     pub fn as_str(&self) -> &'static str {
         match self {

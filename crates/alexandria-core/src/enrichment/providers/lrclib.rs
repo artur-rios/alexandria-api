@@ -11,7 +11,7 @@
 use reqwest::Client;
 use serde::Deserialize;
 
-use super::{user_agent, LyricsMatch, LyricsProvider, LyricsQuery, ProviderError};
+use super::{user_agent, LyricsMatch, LyricsProvider, LyricsQuery, ProviderError, RateGate};
 
 const GET_URL: &str = "https://lrclib.net/api/get";
 const SOURCE: &str = "lrclib";
@@ -28,6 +28,11 @@ struct LyricsResponse {
 /// Fetches lyrics from LRCLIB.
 pub struct LrclibClient {
     http: Client,
+    /// LRCLIB publishes no rate limit, which is why this is here rather than
+    /// left out: a run over a large library would otherwise burst every
+    /// track at it at once, earn a 429, and record all of them as retryable
+    /// so the next run bursts again.
+    gate: RateGate,
 }
 
 impl LrclibClient {
@@ -38,7 +43,10 @@ impl LrclibClient {
             .build()
             .map_err(|e| ProviderError::Unreachable(e.to_string()))?;
 
-        Ok(Self { http })
+        Ok(Self {
+            http,
+            gate: RateGate::courteous(),
+        })
     }
 }
 
@@ -57,6 +65,8 @@ impl LyricsProvider for LrclibClient {
         if let Some(duration) = query.duration_seconds {
             params.push(("duration", duration.to_string()));
         }
+
+        self.gate.admit().await;
 
         let response = self
             .http

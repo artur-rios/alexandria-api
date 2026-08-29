@@ -138,19 +138,41 @@ impl EnrichmentRepository for SqliteEnrichmentRepository {
                 .fetch_all(&self.pool)
                 .await
             }
-            // Only files with no settled lyrics outcome. A `failed` row is
-            // deliberately still included -- that is what makes a run
-            // resumable after an outage rather than permanently skipping
-            // whatever it could not reach that day.
+            // A file is pending while EITHER of its two facts is unsettled.
+            //
+            // Filtering on the lyrics outcome alone looked right and was not:
+            // one run where MusicBrainz is down and LRCLIB is up settles
+            // every file's lyrics and fails every artist image, and those
+            // images are then unreachable by any number of later runs — the
+            // exact resumability the `outcome` column exists to provide,
+            // defeated. The image half is keyed by artist, so it is checked
+            // through the same album-artist-then-performer fallback the
+            // handler applies.
+            //
+            // Settled is named positively (`IN (…)`) rather than as `<>
+            // 'failed'`, so an unrecognized value is retried here exactly as
+            // `EnrichmentOutcome::from_stored` retries it — see
+            // `SETTLED_OUTCOMES_SQL`.
             EnrichmentScope::Pending => {
                 sqlx::query(
                     "SELECT f.uuid AS uuid, a.title, a.artist, a.album_artist, a.album
                      FROM files f
                      JOIN audio_files a ON a.file_id = f.id
                      WHERE f.state = 'active'
-                       AND NOT EXISTS (
-                           SELECT 1 FROM track_lyrics l
-                           WHERE l.file_id = f.id AND l.outcome <> 'failed'
+                       AND (
+                           NOT EXISTS (
+                               SELECT 1 FROM track_lyrics l
+                               WHERE l.file_id = f.id
+                                 AND l.outcome IN ('found', 'notFound', 'rejected')
+                           )
+                           OR NOT EXISTS (
+                               SELECT 1 FROM artist_images i
+                               WHERE i.artist_name = COALESCE(
+                                         NULLIF(TRIM(a.album_artist), ''),
+                                         TRIM(a.artist)
+                                     )
+                                 AND i.outcome IN ('found', 'notFound', 'rejected')
+                           )
                        )",
                 )
                 .fetch_all(&self.pool)

@@ -154,7 +154,7 @@ where
         let mut seen_artists: HashMap<String, ()> = HashMap::new();
 
         for candidate in candidates {
-            self.enrich_artist_image(&candidate, &mut seen_artists, &mut report)
+            self.enrich_artist_image(&candidate, &scope, &mut seen_artists, &mut report)
                 .await?;
             self.enrich_lyrics(&candidate, &scope, &mut report).await?;
         }
@@ -166,6 +166,7 @@ where
     async fn enrich_artist_image(
         &self,
         candidate: &EnrichmentCandidate,
+        scope: &EnrichmentScope,
         seen: &mut HashMap<String, ()>,
         report: &mut EnrichmentReport,
     ) -> Result<(), DomainError> {
@@ -181,11 +182,21 @@ where
             return Ok(());
         }
 
-        if let Some(stored) = self.repo.artist_image(&artist).await? {
-            if stored.outcome.is_settled() {
-                seen.insert(artist, ());
-                report.skip();
-                return Ok(());
+        // The settled check applies to a sweep, not to a scope the caller
+        // named. Asking for one track or one artist explicitly is the caller
+        // saying "do this again" — the same rule `enrich_lyrics` applies, and
+        // for the same reason. It is also the only way to clear a wrong
+        // image: a low-scoring match stores `Rejected`, and without this an
+        // artist whose Wikidata entry has since gained a photograph could
+        // never be re-asked, however many times enrichment was pointed at
+        // them.
+        if matches!(scope, EnrichmentScope::Pending) {
+            if let Some(stored) = self.repo.artist_image(&artist).await? {
+                if stored.outcome.is_settled() {
+                    seen.insert(artist, ());
+                    report.skip();
+                    return Ok(());
+                }
             }
         }
 

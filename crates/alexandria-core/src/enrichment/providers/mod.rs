@@ -178,6 +178,31 @@ impl RateGate {
         Self::new(MUSICBRAINZ_INTERVAL)
     }
 
+    /// The one MusicBrainz gate for this process.
+    ///
+    /// A gate per client enforces the limit per client, which is not what
+    /// MusicBrainz's terms say and not what this module's own documentation
+    /// claimed. Two clients — one per built service graph, or one per
+    /// request — would silently double the outbound rate against a term the
+    /// code otherwise refuses to start without honouring. A `OnceLock` makes
+    /// "one per process" a property of the type rather than an instruction
+    /// to whoever wires it up next.
+    pub fn shared_musicbrainz() -> &'static RateGate {
+        static GATE: std::sync::OnceLock<RateGate> = std::sync::OnceLock::new();
+        GATE.get_or_init(RateGate::musicbrainz)
+    }
+
+    /// A self-imposed pace for services that publish no limit.
+    ///
+    /// Not a documented rate anyone gave us — LRCLIB publishes none — which
+    /// is exactly why it is here: a `Pending` run over a ten-thousand-track
+    /// library would otherwise fire ten thousand requests as fast as the
+    /// network allows, earn a `429`, record every one of them as retryable,
+    /// and repeat the burst on the next run.
+    pub fn courteous() -> Self {
+        Self::new(Duration::from_millis(250))
+    }
+
     /// Wait until another request may be sent, then record that it was.
     pub async fn admit(&self) {
         let mut last = self.last.lock().await;
