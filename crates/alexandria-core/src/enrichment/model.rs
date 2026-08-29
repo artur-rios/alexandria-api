@@ -146,6 +146,17 @@ pub struct EnrichmentReport {
     /// Items skipped because a settled outcome was already stored, or
     /// because the item carries no artist to search on.
     pub skipped: u32,
+    /// How many files still have something outstanding once this run
+    /// finished.
+    ///
+    /// What makes a batched sweep showable: a caller asking for twenty at a
+    /// time has no other way to know whether it is twenty from the end or
+    /// twenty thousand, and "working…" with no denominator is the thing
+    /// people cancel out of.
+    ///
+    /// Zero means the sweep is complete — which is also how a caller knows
+    /// to stop asking.
+    pub remaining: u32,
 }
 
 impl EnrichmentReport {
@@ -180,7 +191,33 @@ pub enum EnrichmentScope {
     /// One artist by name: their image, and the lyrics of every audio file
     /// they are the album artist of.
     Artist(String),
-    /// Every audio file with no settled outcome yet. Resumable, and the
-    /// expensive one.
-    Pending,
+    /// Every audio file with no settled outcome yet, at most `limit` of them.
+    ///
+    /// The expensive one: a library of any size runs for hours at
+    /// MusicBrainz's one request per second. `limit` is what makes that
+    /// bearable to sit in front of — a caller asks for a small batch, shows
+    /// what happened, and asks again, so progress is visible and stopping is
+    /// simply not asking for the next batch.
+    ///
+    /// Bounded here rather than by a cancellation token the caller has to
+    /// hold and the core has to poll: each call is short and complete in
+    /// itself, so there is no half-finished run to reason about, nothing to
+    /// clean up if the caller goes away, and resumability falls out of the
+    /// settled outcomes that were already being recorded.
+    ///
+    /// `None` is the whole of it, which is what a script wants and what no
+    /// interface should ask for.
+    Pending { limit: Option<u32> },
+}
+
+impl EnrichmentScope {
+    /// The sweep, unbounded.
+    pub fn pending() -> Self {
+        EnrichmentScope::Pending { limit: None }
+    }
+
+    /// The next `limit` items of the sweep.
+    pub fn batch(limit: u32) -> Self {
+        EnrichmentScope::Pending { limit: Some(limit) }
+    }
 }

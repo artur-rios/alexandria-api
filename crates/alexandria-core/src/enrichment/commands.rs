@@ -159,6 +159,12 @@ where
             self.enrich_lyrics(&candidate, &scope, &mut report).await?;
         }
 
+        // Counted after the work, so a caller batching through the sweep can
+        // show what is left and knows to stop when it reaches zero. One
+        // extra count per batch, which against a batch that spent seconds
+        // per item at a rate limit is not a cost worth avoiding.
+        report.remaining = self.repo.pending_count().await?;
+
         Ok(report)
     }
 
@@ -190,7 +196,7 @@ where
         // artist whose Wikidata entry has since gained a photograph could
         // never be re-asked, however many times enrichment was pointed at
         // them.
-        if matches!(scope, EnrichmentScope::Pending) {
+        if matches!(scope, EnrichmentScope::Pending { .. }) {
             if let Some(stored) = self.repo.artist_image(&artist).await? {
                 if stored.outcome.is_settled() {
                     seen.insert(artist, ());
@@ -275,7 +281,7 @@ where
         // `Pending` has already excluded settled rows in SQL; the explicit
         // scopes deliberately have not, because naming one track or one
         // artist is the caller asking for it to be done again.
-        if matches!(scope, EnrichmentScope::Pending) {
+        if matches!(scope, EnrichmentScope::Pending { .. }) {
             if let Some(stored) = self.repo.lyrics(candidate.file_uuid).await? {
                 if stored.outcome.is_settled() {
                     report.skip();

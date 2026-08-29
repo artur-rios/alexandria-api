@@ -118,7 +118,7 @@ async fn given_a_tagged_audio_file_when_pending_is_queried_then_its_tags_come_ba
     .await;
 
     let pending = repo
-        .candidates(&EnrichmentScope::Pending)
+        .candidates(&EnrichmentScope::pending())
         .await
         .expect("candidates");
 
@@ -148,7 +148,7 @@ async fn given_an_extracted_duration_when_a_candidate_is_read_then_it_is_carried
         .expect("duration");
 
     let pending = repo
-        .candidates(&EnrichmentScope::Pending)
+        .candidates(&EnrichmentScope::pending())
         .await
         .expect("candidates");
 
@@ -172,7 +172,7 @@ async fn given_no_extracted_duration_when_a_candidate_is_read_then_it_is_absent(
     .await;
 
     let pending = repo
-        .candidates(&EnrichmentScope::Pending)
+        .candidates(&EnrichmentScope::pending())
         .await
         .expect("candidates");
 
@@ -197,7 +197,7 @@ async fn given_both_facts_settled_when_pending_is_queried_then_the_file_is_exclu
     settle_image(&repo, "Miles Davis").await;
 
     let pending = repo
-        .candidates(&EnrichmentScope::Pending)
+        .candidates(&EnrichmentScope::pending())
         .await
         .expect("candidates");
 
@@ -220,7 +220,7 @@ async fn given_settled_lyrics_but_no_image_yet_when_pending_is_queried_then_it_r
     settle_lyrics(&repo, uuid).await;
 
     let pending = repo
-        .candidates(&EnrichmentScope::Pending)
+        .candidates(&EnrichmentScope::pending())
         .await
         .expect("candidates");
 
@@ -252,7 +252,7 @@ async fn given_failed_lyrics_when_pending_is_queried_then_the_file_returns() {
     .expect("lyrics");
 
     let pending = repo
-        .candidates(&EnrichmentScope::Pending)
+        .candidates(&EnrichmentScope::pending())
         .await
         .expect("candidates");
 
@@ -288,7 +288,7 @@ async fn given_settled_lyrics_and_a_failed_image_when_pending_runs_then_the_file
     .expect("image");
 
     let pending = repo
-        .candidates(&EnrichmentScope::Pending)
+        .candidates(&EnrichmentScope::pending())
         .await
         .expect("candidates");
 
@@ -324,7 +324,7 @@ async fn given_an_unrecognized_stored_outcome_when_pending_is_queried_then_it_is
         .expect("update");
 
     let pending = repo
-        .candidates(&EnrichmentScope::Pending)
+        .candidates(&EnrichmentScope::pending())
         .await
         .expect("candidates");
 
@@ -400,9 +400,110 @@ async fn given_a_video_file_when_pending_is_queried_then_it_is_not_a_candidate()
         .expect("insert");
 
     let pending = repo
-        .candidates(&EnrichmentScope::Pending)
+        .candidates(&EnrichmentScope::pending())
         .await
         .expect("candidates");
 
     assert!(pending.is_empty());
+}
+
+#[tokio::test]
+async fn given_a_batch_limit_when_pending_is_queried_then_only_that_many_come_back() {
+    // What makes a sweep showable: a caller asks for a few, reports, and
+    // asks again. Without a bound the only options are one call that runs
+    // for hours with nothing on screen, or a cancellation token the core has
+    // to hold and poll.
+    let (repo, catalog, _dir) = fixtures().await;
+    for i in 0..5 {
+        insert_tagged(
+            &catalog,
+            &format!("/library/track-{i}.flac"),
+            &format!("Track {i}"),
+            "Miles Davis",
+            Some("Miles Davis"),
+        )
+        .await;
+    }
+
+    let batch = repo
+        .candidates(&EnrichmentScope::batch(2))
+        .await
+        .expect("candidates");
+
+    assert_eq!(batch.len(), 2);
+}
+
+#[tokio::test]
+async fn given_successive_batches_when_walked_then_they_advance_rather_than_repeat() {
+    // Ordered by file id in both the bounded and unbounded queries, so a
+    // second batch continues the walk. Unordered, SQLite may hand back the
+    // same rows and a sweep would never finish.
+    let (repo, catalog, _dir) = fixtures().await;
+    for i in 0..4 {
+        insert_tagged(
+            &catalog,
+            &format!("/library/track-{i}.flac"),
+            &format!("Track {i}"),
+            "Miles Davis",
+            Some("Miles Davis"),
+        )
+        .await;
+    }
+
+    let first = repo
+        .candidates(&EnrichmentScope::batch(2))
+        .await
+        .expect("first");
+    // Settling the first two is what a real run does between batches.
+    for candidate in &first {
+        settle_lyrics(&repo, candidate.file_uuid).await;
+    }
+    settle_image(&repo, "Miles Davis").await;
+
+    let second = repo
+        .candidates(&EnrichmentScope::batch(2))
+        .await
+        .expect("second");
+
+    let firsts: Vec<_> = first.iter().map(|c| c.file_uuid).collect();
+    assert!(
+        second.iter().all(|c| !firsts.contains(&c.file_uuid)),
+        "a batch re-offered what the one before it had already settled"
+    );
+}
+
+#[tokio::test]
+async fn given_outstanding_files_when_counted_then_the_number_is_what_is_left() {
+    // The denominator a batched sweep is shown against. Without it a caller
+    // asking for twenty at a time cannot tell twenty from the end from
+    // twenty thousand, and "working…" with no denominator is what people
+    // cancel out of.
+    let (repo, catalog, _dir) = fixtures().await;
+    for i in 0..3 {
+        insert_tagged(
+            &catalog,
+            &format!("/library/track-{i}.flac"),
+            &format!("Track {i}"),
+            "Miles Davis",
+            Some("Miles Davis"),
+        )
+        .await;
+    }
+
+    assert_eq!(repo.pending_count().await.expect("count"), 3);
+
+    let all = repo
+        .candidates(&EnrichmentScope::pending())
+        .await
+        .expect("candidates");
+    for candidate in &all {
+        settle_lyrics(&repo, candidate.file_uuid).await;
+    }
+    settle_image(&repo, "Miles Davis").await;
+
+    assert_eq!(
+        repo.pending_count().await.expect("count"),
+        0,
+        "a fully enriched library still reported work outstanding"
+    );
 }

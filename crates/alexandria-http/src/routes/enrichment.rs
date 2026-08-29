@@ -29,6 +29,9 @@ pub struct EnrichmentRunRequest {
     pub file_uuid: Option<Uuid>,
     /// Enrich one artist by name, and the lyrics of every track of theirs.
     pub artist: Option<String>,
+    /// How many of the sweep to do in this call, when neither of the above
+    /// is named. What lets a caller show progress and stop between batches.
+    pub limit: Option<u32>,
 }
 
 impl EnrichmentRunRequest {
@@ -38,6 +41,7 @@ impl EnrichmentRunRequest {
     /// that sent both does not know what it asked for, and picking for it
     /// would hide that from them until the results looked wrong.
     fn scope(self) -> Result<EnrichmentScope, ApiError> {
+        let limit = self.limit;
         match (self.file_uuid, self.artist) {
             (Some(_), Some(_)) => Err(invalid_input("name either fileUuid or artist, not both")),
             (Some(uuid), None) => Ok(EnrichmentScope::File(uuid)),
@@ -45,7 +49,9 @@ impl EnrichmentRunRequest {
                 Ok(EnrichmentScope::Artist(artist.trim().to_string()))
             }
             (None, Some(_)) => Err(invalid_input("artist is blank")),
-            (None, None) => Ok(EnrichmentScope::Pending),
+            (None, None) => Ok(EnrichmentScope::Pending {
+                limit: limit.filter(|limit| *limit > 0),
+            }),
         }
     }
 }
