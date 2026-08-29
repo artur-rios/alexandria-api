@@ -10,8 +10,7 @@ use super::{
     RecordingIdentityProvider, RecordingMatch,
 };
 
-const SEARCH_URL: &str = "https://musicbrainz.org/ws/2/artist";
-const RECORDING_URL: &str = "https://musicbrainz.org/ws/2/recording";
+const BASE_URL: &str = "https://musicbrainz.org/ws/2";
 
 #[derive(Debug, Deserialize)]
 struct SearchResponse {
@@ -53,6 +52,10 @@ pub struct MusicBrainzClient {
     http: Client,
     /// Borrowed, not owned: the limit is per process, not per client.
     gate: &'static RateGate,
+    /// The `ws/2` root. Only the tests ever change it — pointing the client
+    /// at a local stub is the only way to cover the query it builds and the
+    /// payload it parses without calling MusicBrainz from a test suite.
+    base_url: String,
 }
 
 impl MusicBrainzClient {
@@ -73,6 +76,16 @@ impl MusicBrainzClient {
         Ok(Self {
             http,
             gate: RateGate::shared_musicbrainz(),
+            base_url: BASE_URL.to_string(),
+        })
+    }
+
+    /// The same client against `base_url`, for tests.
+    #[cfg(test)]
+    pub(crate) fn against(contact: &str, base_url: &str) -> Result<Self, ProviderError> {
+        Ok(Self {
+            base_url: base_url.trim_end_matches('/').to_string(),
+            ..Self::new(contact)?
         })
     }
 }
@@ -91,7 +104,7 @@ impl ArtistIdentityProvider for MusicBrainzClient {
 
         let response = self
             .http
-            .get(SEARCH_URL)
+            .get(format!("{}/artist", self.base_url))
             // `limit=1`: only the top hit is ever considered, and asking for
             // more would be fetching candidates this code has no rule for
             // choosing between. The score on that one hit is what decides
@@ -167,7 +180,7 @@ impl RecordingIdentityProvider for MusicBrainzClient {
 
         let response = self
             .http
-            .get(RECORDING_URL)
+            .get(format!("{}/recording", self.base_url))
             .query(&[("query", search.as_str()), ("fmt", "json"), ("limit", "1")])
             .send()
             .await
@@ -202,6 +215,112 @@ impl RecordingIdentityProvider for MusicBrainzClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A stub MusicBrainz answering `body` with `status`, and recording the
+    /// query string it was asked with.
+    ///
+    /// The point of these tests: the handler suite replaces this client
+    /// wholesale with a fake, so the query it builds and the payload it
+    /// parses are covered by nothing at all otherwise. Calling the real
+    /// service from a test suite would be slow, flaky, and rude to a host
+    /// that rate-limits to one request per second.
+    async fn stub(
+        status: u16,
+        body: &'static str,
+    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        use axum::extract::RawQuery;
+        use axum::routing::get;
+
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let recorder = asked.clone();
+
+        let app = axum::Router::new().route(
+            "/artist",
+            get(move |RawQuery(query): RawQuery| {
+                let recorder = recorder.clone();
+                async move {
+                    recorder.lock().unwrap().push(query.unwrap_or_default());
+                    (
+                        axum::http::StatusCode::from_u16(status).unwrap(),
+                        [(axum::http::header::CONTENT_TYPE, "application/json")],
+                        body,
+                    )
+                }
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        (base, asked)
+    }
+
+    #[tokio::test]
+    async fn given_an_artist_when_searched_then_the_top_hit_is_parsed() {
+        let (base, _) = stub(
+            200,
+            r#"{"artists":[{"id":"mb-1","name":"Miles Davis","score":100}]}"#,
+        )
+        .await;
+        let client = MusicBrainzClient::against("owner@example.com", &base).unwrap();
+
+        let found = client.find_artist("Miles Davis").await.unwrap().unwrap();
+
+        assert_eq!(found.mbid, "mb-1");
+        assert_eq!(found.score, 100);
+    }
+
+    #[tokio::test]
+    async fn given_a_slashed_name_when_searched_then_it_is_sent_as_a_phrase() {
+        // `AC/DC` is Lucene syntax. Sent raw it is a malformed query the
+        // server answers 400 to, which this client records as retryable — so
+        // the band is re-asked, wastefully, on every run and never resolved.
+        let (base, asked) = stub(200, r#"{"artists":[]}"#).await;
+        let client = MusicBrainzClient::against("owner@example.com", &base).unwrap();
+
+        client.find_artist("AC/DC").await.unwrap();
+
+        let query = asked.lock().unwrap().first().cloned().unwrap();
+        assert!(
+            query.contains("artist%3A%22AC%2FDC%22"),
+            "the name was not sent as a quoted phrase: {query}"
+        );
+    }
+
+    #[tokio::test]
+    async fn given_an_empty_result_when_searched_then_there_is_no_match() {
+        let (base, _) = stub(200, r#"{"artists":[]}"#).await;
+        let client = MusicBrainzClient::against("owner@example.com", &base).unwrap();
+
+        assert!(client.find_artist("Nobody At All").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn given_a_rate_limit_when_searched_then_it_is_reported_as_one() {
+        // Its own error rather than a generic failure: it is the one that
+        // says the gate is set wrong, and it reads very differently in a log.
+        let (base, _) = stub(429, "").await;
+        let client = MusicBrainzClient::against("owner@example.com", &base).unwrap();
+
+        assert_eq!(
+            client.find_artist("Miles Davis").await,
+            Err(ProviderError::RateLimited)
+        );
+    }
+
+    #[tokio::test]
+    async fn given_an_unreadable_payload_when_searched_then_it_is_unusable() {
+        let (base, _) = stub(200, "not json").await;
+        let client = MusicBrainzClient::against("owner@example.com", &base).unwrap();
+
+        assert!(matches!(
+            client.find_artist("Miles Davis").await,
+            Err(ProviderError::Unusable(_))
+        ));
+    }
 
     #[test]
     fn given_a_name_with_lucene_syntax_when_quoted_then_it_is_a_phrase() {
