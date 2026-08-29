@@ -275,8 +275,19 @@ where
 
         let row = self.fetch_lyrics(candidate).await;
         let outcome = row.outcome;
-        self.repo.put_lyrics(row).await?;
-        report.record(outcome);
+
+        match self.repo.put_lyrics(row).await {
+            Ok(()) => report.record(outcome),
+            // The file went away between being listed as a candidate and the
+            // write — an owner purging something while a run over their whole
+            // library is in flight, which is a long window. There is nothing
+            // to record it against and nothing wrong with the run, so it is
+            // skipped rather than raised: aborting thousands of remaining
+            // tracks because one of them was deleted is exactly the failure
+            // design section 5 rules out.
+            Err(DomainError::NotFound) => report.skip(),
+            Err(other) => return Err(other),
+        }
 
         Ok(())
     }

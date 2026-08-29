@@ -8,7 +8,7 @@
 --
 -- Keyed by `artist_name` because that is the only artist identity this
 -- catalog has -- there is no `artists` table, an artist is a tag value on a
--- file (see `files_audio.album_artist`). The name is stored exactly as the
+-- file (see `audio_files.album_artist`). The name is stored exactly as the
 -- catalog holds it; matching is the enrichment command's job, not the
 -- schema's.
 --

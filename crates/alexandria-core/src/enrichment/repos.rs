@@ -116,10 +116,9 @@ impl EnrichmentRepository for SqliteEnrichmentRepository {
         let rows = match scope {
             EnrichmentScope::File(uuid) => {
                 sqlx::query(
-                    "SELECT f.uuid AS uuid, a.title, a.artist, a.album_artist, a.album,
-                            a.duration_seconds
+                    "SELECT f.uuid AS uuid, a.title, a.artist, a.album_artist, a.album
                      FROM files f
-                     JOIN files_audio a ON a.file_id = f.id
+                     JOIN audio_files a ON a.file_id = f.id
                      WHERE f.state = 'active' AND f.uuid = ?",
                 )
                 .bind(uuid.to_string())
@@ -128,10 +127,9 @@ impl EnrichmentRepository for SqliteEnrichmentRepository {
             }
             EnrichmentScope::Artist(name) => {
                 sqlx::query(
-                    "SELECT f.uuid AS uuid, a.title, a.artist, a.album_artist, a.album,
-                            a.duration_seconds
+                    "SELECT f.uuid AS uuid, a.title, a.artist, a.album_artist, a.album
                      FROM files f
-                     JOIN files_audio a ON a.file_id = f.id
+                     JOIN audio_files a ON a.file_id = f.id
                      WHERE f.state = 'active'
                        AND (a.album_artist = ? OR (a.album_artist IS NULL AND a.artist = ?))",
                 )
@@ -146,10 +144,9 @@ impl EnrichmentRepository for SqliteEnrichmentRepository {
             // whatever it could not reach that day.
             EnrichmentScope::Pending => {
                 sqlx::query(
-                    "SELECT f.uuid AS uuid, a.title, a.artist, a.album_artist, a.album,
-                            a.duration_seconds
+                    "SELECT f.uuid AS uuid, a.title, a.artist, a.album_artist, a.album
                      FROM files f
-                     JOIN files_audio a ON a.file_id = f.id
+                     JOIN audio_files a ON a.file_id = f.id
                      WHERE f.state = 'active'
                        AND NOT EXISTS (
                            SELECT 1 FROM track_lyrics l
@@ -174,11 +171,19 @@ impl EnrichmentRepository for SqliteEnrichmentRepository {
                     artist: row.try_get("artist").ok(),
                     album_artist: row.try_get("album_artist").ok(),
                     album: row.try_get("album").ok(),
-                    duration_seconds: row
-                        .try_get::<Option<i64>, _>("duration_seconds")
-                        .ok()
-                        .flatten()
-                        .and_then(|seconds| u32::try_from(seconds).ok()),
+                    // Always `None` today, and deliberately still carried on
+                    // the type. `audio_files` has no duration column — only
+                    // `video_files` does (migration 10) — so the catalog
+                    // simply does not know how long a track is. LRCLIB
+                    // matches far better with one, since duration is what
+                    // separates a radio edit from an album cut, so this is a
+                    // real loss of match quality rather than a tidy default.
+                    // Closing it means extracting duration during indexing
+                    // (lofty already reads it) and a column to put it in,
+                    // which is a change to the catalog's audio model and its
+                    // wire shape — out of this feature's scope, and the one
+                    // thing that would most improve lyrics matching.
+                    duration_seconds: None,
                 })
             })
             .collect()

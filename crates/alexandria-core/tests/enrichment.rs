@@ -9,3 +9,6 @@ mod enrich;
 
 #[path = "enrichment/persistence.rs"]
 mod persistence;
+
+#[path = "enrichment/candidates.rs"]
+mod candidates;

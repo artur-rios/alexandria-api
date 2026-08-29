@@ -250,9 +250,15 @@ async fn given_a_track_with_no_artist_when_enriched_then_nothing_is_asked() {
 }
 
 #[tokio::test]
-async fn given_a_track_when_lyrics_are_searched_then_the_duration_is_sent() {
-    // Duration is what tells a radio edit from an album cut. Without it a
-    // provider answers with whichever version it happens to hold.
+async fn given_a_candidate_with_a_duration_when_lyrics_are_searched_then_it_is_sent() {
+    // The handler passes a duration through when it has one, and duration is
+    // what tells a radio edit from an album cut.
+    //
+    // Note what this does NOT claim: the real repository cannot produce one
+    // today, because `audio_files` has no duration column — see
+    // `candidates.rs`'s own test pinning that. This covers the handler so
+    // that the day a duration exists it is already carried, not that the
+    // system currently sends one.
     let repo = FakeEnrichmentRepository::with_candidates(vec![candidate("So What", "Miles Davis")]);
     let lyrics = FakeLyrics::with_text();
     let handler = handler!(
@@ -348,4 +354,35 @@ async fn given_a_denied_caller_when_a_run_starts_then_nothing_is_asked() {
 
     assert!(matches!(outcome, Err(DomainError::Unauthorized)));
     assert_eq!(identity.ask_count(), 0);
+}
+
+#[tokio::test]
+async fn given_a_file_purged_mid_run_when_its_lyrics_are_written_then_the_run_continues() {
+    // A run over a whole library is long, and the owner may purge something
+    // while it is in flight. Aborting the thousands of remaining tracks
+    // because one of them was deleted is the failure design section 5 rules
+    // out.
+    let mut repo = FakeEnrichmentRepository::with_candidates(vec![
+        candidate("So What", "Miles Davis"),
+        candidate("Blue Train", "John Coltrane"),
+    ]);
+    repo.lyrics_file_vanished = true;
+
+    let handler = handler!(
+        repo.clone(),
+        FakeIdentity::matching("mb-1", "Miles Davis", 100),
+        FakeImages::with_image(),
+        FakeLyrics::with_text(),
+        FakeImageStore::default(),
+        available_settings()
+    );
+
+    let report = handler
+        .enrich(EnrichmentScope::Pending, "token")
+        .await
+        .expect("one purged file aborted the whole run");
+
+    // Both artists still got their images; both tracks were skipped.
+    assert_eq!(report.found, 2);
+    assert_eq!(report.skipped, 2);
 }

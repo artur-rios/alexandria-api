@@ -51,6 +51,9 @@ pub struct FakeEnrichmentRepository {
     pub candidates: Arc<Mutex<Vec<EnrichmentCandidate>>>,
     pub images: Arc<Mutex<HashMap<String, ArtistImage>>>,
     pub lyrics: Arc<Mutex<HashMap<Uuid, TrackLyrics>>>,
+    /// Answer every lyrics write with `NotFound`, standing in for a file
+    /// purged between being listed as a candidate and the write.
+    pub lyrics_file_vanished: bool,
 }
 
 impl FakeEnrichmentRepository {
@@ -95,6 +98,9 @@ impl EnrichmentRepository for FakeEnrichmentRepository {
     }
 
     async fn put_lyrics(&self, lyrics: TrackLyrics) -> Result<(), DomainError> {
+        if self.lyrics_file_vanished {
+            return Err(DomainError::NotFound);
+        }
         self.lyrics.lock().unwrap().insert(lyrics.file_uuid, lyrics);
         Ok(())
     }
