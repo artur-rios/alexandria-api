@@ -2,7 +2,7 @@ use std::env;
 use std::fmt;
 use std::path::Path;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::errors::DomainError;
@@ -382,6 +382,104 @@ impl Default for PlaybackSettings {
     }
 }
 
+/// Music enrichment: artist photography and lyrics fetched from public
+/// services (music enrichment design).
+///
+/// The only part of Alexandria that reaches the network outbound, and the
+/// reason the Vision Document's "no network calls" now reads "no network
+/// calls except this, off by default". Everything here exists to keep that
+/// exception narrow and deliberate.
+#[derive(Debug, Clone, Deserialize)]
+pub struct MetadataSettings {
+    /// Whether enrichment may run at all. **False by default**, and that
+    /// default is the design, not caution: a product whose pitch is that the
+    /// owner's library is theirs does not start talking to third parties
+    /// because it was installed.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// How MusicBrainz can reach whoever runs this instance — an email
+    /// address or a URL.
+    ///
+    /// Not politeness. MusicBrainz's terms require a `User-Agent` that
+    /// identifies the application *and* carries a contact, and they are
+    /// entitled to block clients that supply neither. Enrichment refuses to
+    /// start while this is empty rather than sending an anonymous agent
+    /// string and having the whole feature blocked at their end for every
+    /// user of this software.
+    #[serde(default)]
+    pub contact: String,
+
+    /// Directory holding fetched artist images, created on first use.
+    /// Relative by default, matching `playback.thumbnail_cache_dir`.
+    ///
+    /// The bytes live here and never in SQLite; the database holds the path
+    /// and the provenance. Entries are keyed by the artist's MusicBrainz id,
+    /// so an artist re-resolved to the same id reuses the file. Nothing
+    /// evicts old entries — delete the directory to reclaim the space, the
+    /// same as the thumbnail cache.
+    #[serde(default = "default_image_cache_dir")]
+    pub image_cache_dir: String,
+}
+
+fn default_image_cache_dir() -> String {
+    "artist-images".to_string()
+}
+
+impl Default for MetadataSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            contact: String::new(),
+            image_cache_dir: default_image_cache_dir(),
+        }
+    }
+}
+
+impl MetadataSettings {
+    /// Why enrichment cannot run, or `None` when it can.
+    ///
+    /// One place, so the command, the settings view a client reads, and the
+    /// startup log cannot disagree about whether the feature is available —
+    /// and so "it is off" and "it is on but unusable" stay distinguishable.
+    /// A client that only knew `enabled` would tell the owner enrichment was
+    /// available and then watch every lookup fail.
+    pub fn unavailable_reason(&self) -> Option<MetadataUnavailable> {
+        if !self.enabled {
+            return Some(MetadataUnavailable::Disabled);
+        }
+        if self.contact.trim().is_empty() {
+            return Some(MetadataUnavailable::ContactMissing);
+        }
+        None
+    }
+
+    /// Whether enrichment can run.
+    pub fn is_available(&self) -> bool {
+        self.unavailable_reason().is_none()
+    }
+}
+
+/// Why music enrichment is not available.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum MetadataUnavailable {
+    /// The operator has not turned it on. The shipped default.
+    Disabled,
+    /// Turned on, but with no contact for the `User-Agent` MusicBrainz
+    /// requires.
+    ContactMissing,
+}
+
+impl MetadataUnavailable {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            MetadataUnavailable::Disabled => "disabled",
+            MetadataUnavailable::ContactMissing => "contactMissing",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct Settings {
     #[serde(default)]
@@ -400,6 +498,8 @@ pub struct Settings {
     pub filesystem: FilesystemSettings,
     #[serde(default)]
     pub playback: PlaybackSettings,
+    #[serde(default)]
+    pub metadata: MetadataSettings,
 }
 
 impl Settings {
@@ -497,6 +597,23 @@ impl Settings {
         }
         if let Ok(dir) = env::var("ALEXANDRIA_PLAYBACK_THUMBNAIL_CACHE_DIR") {
             self.playback.thumbnail_cache_dir = dir;
+        }
+        if let Ok(enabled) = env::var("ALEXANDRIA_METADATA_ENABLED") {
+            // Only an explicit, recognized truth value moves this. An
+            // unparseable value leaves the setting alone rather than
+            // defaulting to `false`, which would silently turn the feature
+            // off for an operator who meant to turn it on and mistyped.
+            match enabled.trim().to_ascii_lowercase().as_str() {
+                "true" | "1" | "yes" | "on" => self.metadata.enabled = true,
+                "false" | "0" | "no" | "off" => self.metadata.enabled = false,
+                _ => {}
+            }
+        }
+        if let Ok(contact) = env::var("ALEXANDRIA_METADATA_CONTACT") {
+            self.metadata.contact = contact;
+        }
+        if let Ok(dir) = env::var("ALEXANDRIA_METADATA_IMAGE_CACHE_DIR") {
+            self.metadata.image_cache_dir = dir;
         }
     }
 }
