@@ -1,0 +1,13 @@
+-- How long a track runs, in fractional seconds. `REAL` and nullable,
+-- mirroring `video_files.duration_seconds` (migration 10).
+--
+-- Not owner-editable, so it is deliberately absent from
+-- `SubtypeMetadata::Audio` and written through its own repository call, the
+-- same division `video_files.duration_seconds` already makes: what the owner
+-- may correct is what their tags say, and how long the audio actually runs
+-- is a property of the stream rather than a claim about it.
+--
+-- NULL means extraction never ran, or ran and could not read a length --
+-- a library indexed before this column existed reads NULL until it is
+-- re-indexed, and nothing depends on it being present.
+ALTER TABLE audio_files ADD COLUMN duration_seconds REAL;

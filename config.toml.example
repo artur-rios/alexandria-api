@@ -108,3 +108,31 @@ level = "info"
 # stale would cost more than making the thumbnail. Nothing evicts old entries;
 # delete the directory to reclaim the space.
 thumbnail_cache_dir = "thumbnails"
+
+[metadata]
+# Music enrichment: artist photography and lyrics fetched from public
+# services (MusicBrainz for identity, Wikidata/Wikimedia Commons for images,
+# LRCLIB for lyrics).
+#
+# This is the ONLY part of Alexandria that makes outbound network calls, and
+# it is off by default deliberately — a product whose pitch is that the
+# owner's library is theirs does not start talking to third parties because
+# it was installed. Nothing about the owner is sent: the queries carry an
+# artist name, a track title, an album name and a duration, and nothing else.
+# Everything fetched is cached in the catalog, so a lookup happens once per
+# artist and once per recording rather than once per play.
+enabled = false
+
+# How MusicBrainz can reach whoever runs this instance — an email address or
+# a URL. Not politeness: their terms require a User-Agent identifying the
+# application and carrying a contact, and they block clients that send
+# neither. Enrichment refuses to start while this is empty rather than send an
+# anonymous agent and risk the block landing on every user of this software.
+contact = ""
+
+# Directory holding fetched artist images, created on first use. The bytes
+# live here and never in SQLite; the database holds the path and the
+# provenance. Entries are keyed by the artist's MusicBrainz id. Nothing evicts
+# old entries — delete the directory to reclaim the space, as with
+# playback.thumbnail_cache_dir.
+image_cache_dir = "artist-images"

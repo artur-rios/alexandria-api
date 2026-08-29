@@ -5,6 +5,7 @@ pub mod bookmarks;
 pub mod catalog;
 pub mod collections;
 pub mod config;
+pub mod enrichment;
 pub mod errors;
 pub mod migrate;
 pub mod playback;

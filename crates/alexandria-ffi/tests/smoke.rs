@@ -44,16 +44,16 @@ type AudioMetadataRow = (
 );
 
 use alexandria_ffi::{
-    alexandria_file_edit_metadata, alexandria_file_purge, alexandria_file_purge_on_disk,
-    alexandria_file_rename, alexandria_file_restore, alexandria_file_soft_delete,
-    alexandria_free_string, alexandria_index_cancel, alexandria_index_count_files,
-    alexandria_index_count_missing, alexandria_index_files_json, alexandria_index_init,
-    alexandria_index_pause, alexandria_index_refresh_start, alexandria_index_resume,
-    alexandria_index_run_status_json, alexandria_index_runs_active_json, alexandria_index_start,
-    alexandria_playlist_add_entries, alexandria_playlist_create, alexandria_playlist_delete,
-    alexandria_playlist_move_entry, alexandria_playlist_read, alexandria_playlist_remove_entry,
-    alexandria_playlist_rename, alexandria_playlists_list, FileMetadataResult, IndexStartResult,
-    PlaylistJsonResult,
+    alexandria_enrichment_read_track, alexandria_enrichment_run, alexandria_file_edit_metadata,
+    alexandria_file_purge, alexandria_file_purge_on_disk, alexandria_file_rename,
+    alexandria_file_restore, alexandria_file_soft_delete, alexandria_free_string,
+    alexandria_index_cancel, alexandria_index_count_files, alexandria_index_count_missing,
+    alexandria_index_files_json, alexandria_index_init, alexandria_index_pause,
+    alexandria_index_refresh_start, alexandria_index_resume, alexandria_index_run_status_json,
+    alexandria_index_runs_active_json, alexandria_index_start, alexandria_playlist_add_entries,
+    alexandria_playlist_create, alexandria_playlist_delete, alexandria_playlist_move_entry,
+    alexandria_playlist_read, alexandria_playlist_remove_entry, alexandria_playlist_rename,
+    alexandria_playlists_list, FileMetadataResult, IndexStartResult, PlaylistJsonResult,
 };
 
 const STATUS_RUN_OK: i32 = alexandria_ffi::RUN_OK;
@@ -79,6 +79,9 @@ const STATUS_PLAYLIST_OK: i32 = alexandria_ffi::PLAYLIST_OK;
 const STATUS_PLAYLIST_INVALID_INPUT: i32 = alexandria_ffi::PLAYLIST_ERR_INVALID_INPUT;
 const STATUS_PLAYLIST_UNAUTHORIZED: i32 = alexandria_ffi::PLAYLIST_ERR_UNAUTHORIZED;
 const STATUS_PLAYLIST_NOT_FOUND: i32 = alexandria_ffi::PLAYLIST_ERR_NOT_FOUND;
+const STATUS_ENRICHMENT_UNAVAILABLE: i32 = alexandria_ffi::ENRICHMENT_ERR_UNAVAILABLE;
+const STATUS_ENRICHMENT_INVALID_INPUT: i32 = alexandria_ffi::ENRICHMENT_ERR_INVALID_INPUT;
+const STATUS_ENRICHMENT_OK: i32 = alexandria_ffi::ENRICHMENT_OK;
 
 /// Bearer token every smoke test authenticates with. A valid UUID: the
 /// active auth mode is local (`init_temp_db` sets `ALEXANDRIA_AUTH_MODE`), so
@@ -2844,4 +2847,86 @@ fn given_a_full_lifecycle_when_driven_entirely_over_ffi_then_every_step_is_ok() 
 
     let deleted = playlist_json_ok(alexandria_playlist_delete(puuid.as_ptr(), token.as_ptr()));
     assert_eq!(deleted["uuid"], playlist_uuid);
+}
+
+// ---------------- music enrichment ----------------
+
+/// Enrichment is off in every test process — `init_temp_db` sets no
+/// `[metadata]` configuration — so a run must be refused as unavailable
+/// rather than attempted. This is the assertion that matters most for a
+/// feature that reaches the network: the shipped default does not.
+#[test]
+fn given_enrichment_is_not_configured_when_a_run_is_started_then_it_is_unavailable() {
+    let _g = serial();
+    let _db = init_temp_db();
+
+    let token = c(TEST_TOKEN);
+    let result = alexandria_enrichment_run(std::ptr::null(), token.as_ptr());
+
+    assert_eq!(result.status, STATUS_ENRICHMENT_UNAVAILABLE);
+    assert!(result.json.is_null());
+}
+
+/// Naming both scopes is the caller not knowing what it asked for, and is
+/// refused rather than resolved in its favour — matching the HTTP route's
+/// own `400` for the same body.
+#[test]
+fn given_both_scopes_named_when_a_run_is_started_then_it_is_invalid_input() {
+    let _g = serial();
+    let _db = init_temp_db();
+
+    let body = c(&serde_json::json!({
+        "fileUuid": "11111111-1111-1111-1111-111111111111",
+        "artist": "Miles Davis"
+    })
+    .to_string());
+    let token = c(TEST_TOKEN);
+    let result = alexandria_enrichment_run(body.as_ptr(), token.as_ptr());
+
+    // Refused for the body, before the unavailable check would have been
+    // reached — a malformed request is the caller's to fix either way.
+    assert_eq!(result.status, STATUS_ENRICHMENT_INVALID_INPUT);
+}
+
+/// Reading what enrichment stored is a plain database read and must work
+/// whether or not enrichment itself is switched on — an owner who enabled
+/// it, ran it once, and turned it off keeps what they fetched.
+#[test]
+fn given_enrichment_is_off_when_a_track_is_read_then_it_still_answers() {
+    let _g = serial();
+    let _db = init_temp_db();
+
+    let uuid = c("11111111-1111-1111-1111-111111111111");
+    let token = c(TEST_TOKEN);
+    let result = alexandria_enrichment_read_track(uuid.as_ptr(), std::ptr::null(), token.as_ptr());
+
+    assert_eq!(
+        result.status, STATUS_ENRICHMENT_OK,
+        "reading a cached result must not depend on the network switch"
+    );
+    assert!(!result.json.is_null());
+
+    let json = unsafe { std::ffi::CStr::from_ptr(result.json) }
+        .to_string_lossy()
+        .into_owned();
+    let value: serde_json::Value = serde_json::from_str(&json).expect("enrichment json");
+    // Nothing has been looked up, so both halves are absent — which is a
+    // state, not a failure.
+    assert!(value["artistImage"].is_null());
+    assert!(value["lyrics"].is_null());
+    unsafe { alexandria_ffi::alexandria_free_string(result.json) };
+}
+
+/// An unparseable file uuid is the caller's error, not a missing record.
+#[test]
+fn given_a_malformed_uuid_when_a_track_is_read_then_it_is_invalid_input() {
+    let _g = serial();
+    let _db = init_temp_db();
+
+    let uuid = c("not-a-uuid");
+    let token = c(TEST_TOKEN);
+    let result = alexandria_enrichment_read_track(uuid.as_ptr(), std::ptr::null(), token.as_ptr());
+
+    assert_eq!(result.status, STATUS_ENRICHMENT_INVALID_INPUT);
+    assert!(result.json.is_null());
 }

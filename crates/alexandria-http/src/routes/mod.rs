@@ -4,6 +4,7 @@ pub mod browse;
 pub mod collections;
 pub mod delete_file;
 pub mod edit_metadata;
+pub mod enrichment;
 pub mod health;
 pub mod index;
 pub mod playback;

@@ -24,7 +24,23 @@ pub struct AudioTags {
     /// that distinction for every client, not just the ones without one of
     /// their own.
     pub album_artist: Option<String>,
+    /// How long the track runs, in fractional seconds.
+    ///
+    /// A property of the stream rather than a tag, which is why it is read
+    /// from `properties()` below and not from any `ItemKey` — and why a file
+    /// carrying no tags at all still has one.
+    pub duration_seconds: Option<AudioDuration>,
 }
+
+/// Wraps an `f64` so `AudioTags` can derive `PartialEq`/`Eq` (raw `f64`
+/// implements neither), exactly as `VideoDuration` does for `VideoTags`.
+/// `Eq` is sound here because a duration read from a real file is always
+/// finite and non-NaN; this type carries and compares an extracted length,
+/// it is not used for arbitrary float arithmetic.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AudioDuration(pub f64);
+
+impl Eq for AudioDuration {}
 
 /// The year `lofty::tag::Accessor::year()` used to return.
 ///
@@ -104,7 +120,7 @@ impl LoftyAudioMetadataReader {
     /// The synchronous probe. `read` runs it on the blocking pool — see
     /// [`crate::catalog::read_blocking`].
     fn parse(path: &str) -> Option<AudioTags> {
-        use lofty::file::TaggedFileExt;
+        use lofty::file::{AudioFile, TaggedFileExt};
         use lofty::probe::Probe;
         use lofty::tag::Accessor;
 
@@ -116,9 +132,28 @@ impl LoftyAudioMetadataReader {
             }
         };
 
-        let tag = tagged_file
+        // Read before the tag lookup below, and deliberately so: duration is
+        // a property of the stream, so an audio file carrying no tags at all
+        // still has a length worth recording. Zero reads as absent — lofty
+        // answers `0` for a container whose length it could not determine,
+        // and a zero-second track is not a thing.
+        let duration = {
+            let seconds = tagged_file.properties().duration().as_secs_f64();
+            (seconds > 0.0).then_some(AudioDuration(seconds))
+        };
+
+        let Some(tag) = tagged_file
             .primary_tag()
-            .or_else(|| tagged_file.first_tag())?;
+            .or_else(|| tagged_file.first_tag())
+        else {
+            // No tags, but a readable length is still worth having: it is
+            // what a lyrics lookup matches an edit on, and what a listing
+            // shows beside an untitled track.
+            return duration.map(|duration_seconds| AudioTags {
+                duration_seconds: Some(duration_seconds),
+                ..AudioTags::default()
+            });
+        };
 
         let tags = AudioTags {
             title: tag
@@ -150,12 +185,16 @@ impl LoftyAudioMetadataReader {
                 .get_string(lofty::tag::ItemKey::AlbumArtist)
                 .map(|s| s.to_string())
                 .filter(|s| !s.trim().is_empty()),
+            duration_seconds: duration,
         };
 
-        tags.clone()
-            .into_subtype_metadata()
-            .is_some()
-            .then_some(tags)
+        // Kept when there is *anything* worth keeping. Previously this was
+        // "some tag was populated", which would now discard a file whose
+        // only readable fact is how long it runs — and a length is exactly
+        // what an untitled track most needs, both to show beside it and to
+        // match a lyrics lookup on.
+        let has_tags = tags.clone().into_subtype_metadata().is_some();
+        (has_tags || tags.duration_seconds.is_some()).then_some(tags)
     }
 }
 
@@ -368,6 +407,7 @@ mod tests {
             genre: None,
             track: Some(3),
             album_artist: None,
+            duration_seconds: None,
         };
 
         let metadata = tags.into_subtype_metadata().expect("some fields set");
@@ -539,15 +579,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn given_untagged_wav_when_read_then_none() {
+    async fn given_untagged_wav_when_read_then_only_its_duration_comes_back() {
+        // This asserted `None` until duration extraction arrived, and the
+        // change is deliberate: a length is a property of the stream, not a
+        // tag, so a file carrying no tags at all still has one — and it is
+        // exactly what an untitled track most needs, both to show beside it
+        // and to match a lyrics lookup on. Every *tag* field is still None,
+        // which is what "no tag written, no tag read" actually meant.
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("untagged.wav");
         write_minimal_wav(&path);
 
         let reader = LoftyAudioMetadataReader;
-        let tags = reader.read(path.to_str().unwrap()).await;
+        let tags = reader
+            .read(path.to_str().unwrap())
+            .await
+            .expect("a duration");
 
-        assert!(tags.is_none(), "no tag written, no tag read");
+        assert_eq!(tags.title, None);
+        assert_eq!(tags.artist, None);
+        assert_eq!(tags.album, None);
+        assert_eq!(tags.album_artist, None);
+        assert!(
+            tags.duration_seconds.is_some(),
+            "the stream's own length was dropped with its absent tags"
+        );
+        // And it still writes no owner-editable metadata: a file with no
+        // tags has nothing for `update_metadata` to store.
+        assert!(tags.into_subtype_metadata().is_none());
     }
 
     /// Write a WAV with a blank (empty-string) title/artist/album/genre but

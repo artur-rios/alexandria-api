@@ -13,6 +13,7 @@ use alexandria_core::catalog::index_scope::IndexScope;
 use alexandria_core::catalog::runs::{RunKind, RunPriority};
 use alexandria_core::config::AuthMode;
 use alexandria_core::config::Settings;
+use alexandria_core::enrichment::model::EnrichmentScope;
 use alexandria_core::errors::{error_body, DomainError};
 use alexandria_core::migrate::migrate_database;
 use alexandria_core::services::{build_services, Services};
@@ -4818,5 +4819,208 @@ mod tests {
             map_run_err_code(DomainError::InvalidInput("bad".into())),
             RUN_ERR_INVALID_INPUT
         );
+    }
+}
+
+/// FFI status codes returned by music enrichment (music enrichment design).
+/// Its own set, per the convention above, so it can grow without colliding;
+/// `ENRICHMENT_OK == PLAYLIST_OK == 0`.
+pub const ENRICHMENT_OK: c_int = 0;
+pub const ENRICHMENT_ERR_INVALID_INPUT: c_int = 1;
+pub const ENRICHMENT_ERR_UNAUTHORIZED: c_int = 2;
+pub const ENRICHMENT_ERR_NOT_INITIALIZED: c_int = 3;
+pub const ENRICHMENT_ERR_NOT_FOUND: c_int = 4;
+/// Enrichment is switched off, or is on with no contact configured.
+///
+/// Its own code rather than folded into `INVALID_INPUT`, because it is not
+/// something the *caller* did: the request was well formed and the
+/// installation is not configured for it. A client that can tell the two
+/// apart says "your administrator has not enabled this" instead of marking
+/// the owner's input wrong. `alexandria_settings_json` reports the same
+/// fact up front, so a client need never discover it by being refused.
+pub const ENRICHMENT_ERR_UNAVAILABLE: c_int = 5;
+pub const ENRICHMENT_ERR_OTHER: c_int = 9;
+
+/// Result of every enrichment FFI function. On success `status` is
+/// `ENRICHMENT_OK` and `json` is a NUL-terminated JSON string of the
+/// response body — byte-for-byte the same shape HTTP returns from the
+/// matching `/v1/enrichment*` route (FR-FC-24 / NFR-09). On failure `json`
+/// is NULL. The caller must free `json` with `alexandria_free_string`.
+#[repr(C)]
+#[derive(Debug)]
+pub struct EnrichmentJsonResult {
+    pub status: c_int,
+    pub json: *mut c_char,
+}
+
+impl EnrichmentJsonResult {
+    fn err(status: c_int) -> Self {
+        Self {
+            status,
+            json: std::ptr::null_mut(),
+        }
+    }
+
+    fn ok(json: String) -> Self {
+        let cstring = CString::new(json).unwrap_or_default();
+        Self {
+            status: ENRICHMENT_OK,
+            json: cstring.into_raw(),
+        }
+    }
+}
+
+fn map_enrichment_err(err: DomainError) -> EnrichmentJsonResult {
+    match err {
+        DomainError::NotFound => EnrichmentJsonResult::err(ENRICHMENT_ERR_NOT_FOUND),
+        DomainError::Unauthorized => EnrichmentJsonResult::err(ENRICHMENT_ERR_UNAUTHORIZED),
+        // `InvalidState` is how the run handler reports "switched off", and
+        // `InvalidInput` mentioning the contact is how it reports the other
+        // half. Both are the installation's configuration rather than the
+        // caller's request, so both map to UNAVAILABLE — a caller that saw
+        // INVALID_INPUT for a missing contact would tell the owner their
+        // input was wrong when they never gave any.
+        DomainError::InvalidState => EnrichmentJsonResult::err(ENRICHMENT_ERR_UNAVAILABLE),
+        DomainError::InvalidInput(ref message) if message.contains("metadata.contact") => {
+            EnrichmentJsonResult::err(ENRICHMENT_ERR_UNAVAILABLE)
+        }
+        DomainError::InvalidInput(_) => EnrichmentJsonResult::err(ENRICHMENT_ERR_INVALID_INPUT),
+        _ => EnrichmentJsonResult::err(ENRICHMENT_ERR_OTHER),
+    }
+}
+
+/// Run music enrichment (music enrichment design).
+///
+/// `scope_json` is the JSON body `POST /v1/enrichment/runs` takes, and NULL
+/// or an empty string means the same thing an absent body does there: sweep
+/// everything not yet looked up. `{"fileUuid":"…"}` scopes it to one track,
+/// `{"artist":"…"}` to one artist. `token` is the bearer auth token.
+///
+/// **This call reaches the network** — the only FFI function in this library
+/// that does — and it is slow by design: MusicBrainz is rate-limited to one
+/// request per second and a sweep over a large library will take hours. A
+/// caller must run it off whatever thread its interface draws on, and should
+/// expect to show progress from the returned counts rather than a spinner.
+///
+/// A run that reached nothing still succeeds: a service being down or having
+/// no answer is counted in the report, not raised.
+#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
+#[no_mangle]
+pub extern "C" fn alexandria_enrichment_run(
+    scope_json: *const c_char,
+    token: *const c_char,
+) -> EnrichmentJsonResult {
+    let services = match services_slot().lock().unwrap().clone() {
+        Some(s) => s,
+        None => return EnrichmentJsonResult::err(ENRICHMENT_ERR_NOT_INITIALIZED),
+    };
+
+    let token = cstr_lossy(token).unwrap_or_default();
+    if !authenticated(&services, &token) {
+        return EnrichmentJsonResult::err(ENRICHMENT_ERR_UNAUTHORIZED);
+    }
+
+    let scope = match enrichment_scope_from_json(scope_json) {
+        Some(scope) => scope,
+        None => return EnrichmentJsonResult::err(ENRICHMENT_ERR_INVALID_INPUT),
+    };
+
+    // Absent for the same reason the HTTP route answers a conflict: the
+    // capability is real, this installation has not turned it on.
+    let handler = match services.enrich_handler.clone() {
+        Some(handler) => handler,
+        None => return EnrichmentJsonResult::err(ENRICHMENT_ERR_UNAVAILABLE),
+    };
+
+    let result = runtime().block_on(async { handler.enrich(scope, &token).await });
+
+    match result {
+        Ok(report) => {
+            let json = serde_json::to_string(&report).unwrap_or_default();
+            EnrichmentJsonResult::ok(json)
+        }
+        Err(err) => map_enrichment_err(err),
+    }
+}
+
+/// The scope a body names, or `None` when the body is present but unusable.
+///
+/// A NULL or empty body is the sweep, which is both the common case and the
+/// one a caller should not have to spell `{}` to ask for.
+fn enrichment_scope_from_json(scope_json: *const c_char) -> Option<EnrichmentScope> {
+    let Some(raw) = cstr_lossy(scope_json) else {
+        return Some(EnrichmentScope::Pending);
+    };
+    if raw.trim().is_empty() {
+        return Some(EnrichmentScope::Pending);
+    }
+
+    let value: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let object = value.as_object()?;
+
+    let file_uuid = object.get("fileUuid").and_then(|v| v.as_str());
+    let artist = object.get("artist").and_then(|v| v.as_str());
+
+    match (file_uuid, artist) {
+        // Refused rather than resolved in the caller's favour: a caller that
+        // sent both does not know what it asked for, and choosing for it
+        // hides that until the results look wrong.
+        (Some(_), Some(_)) => None,
+        (Some(uuid), None) => uuid::Uuid::parse_str(uuid).ok().map(EnrichmentScope::File),
+        (None, Some(artist)) if !artist.trim().is_empty() => {
+            Some(EnrichmentScope::Artist(artist.trim().to_string()))
+        }
+        (None, Some(_)) => None,
+        (None, None) => Some(EnrichmentScope::Pending),
+    }
+}
+
+/// Read what enrichment has stored for one track.
+///
+/// `uuid` is the file's public UUID. `artist` is whose image to read — the
+/// caller is a player already showing the track, so it is holding the tags
+/// and passing the name costs nothing, where resolving it here would be a
+/// second query for a fact it has. NULL means "no image wanted".
+///
+/// Unlike the run above this makes **no network call** and works whether or
+/// not enrichment is switched on: reading what was already cached is a plain
+/// database read, so an owner who enabled it, ran it once and turned it off
+/// keeps what they fetched.
+#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
+#[no_mangle]
+pub extern "C" fn alexandria_enrichment_read_track(
+    uuid: *const c_char,
+    artist: *const c_char,
+    token: *const c_char,
+) -> EnrichmentJsonResult {
+    let services = match services_slot().lock().unwrap().clone() {
+        Some(s) => s,
+        None => return EnrichmentJsonResult::err(ENRICHMENT_ERR_NOT_INITIALIZED),
+    };
+
+    let token = cstr_lossy(token).unwrap_or_default();
+    if !authenticated(&services, &token) {
+        return EnrichmentJsonResult::err(ENRICHMENT_ERR_UNAUTHORIZED);
+    }
+
+    let uuid = match cstr_lossy(uuid).and_then(|s| uuid::Uuid::parse_str(&s).ok()) {
+        Some(u) => u,
+        None => return EnrichmentJsonResult::err(ENRICHMENT_ERR_INVALID_INPUT),
+    };
+    let artist = cstr_lossy(artist);
+
+    let result = runtime().block_on(async {
+        services
+            .read_enrichment_handler
+            .read(uuid, artist.as_deref(), &token)
+            .await
+    });
+
+    match result {
+        Ok(view) => {
+            let json = serde_json::to_string(&view).unwrap_or_default();
+            EnrichmentJsonResult::ok(json)
+        }
+        Err(err) => map_enrichment_err(err),
     }
 }

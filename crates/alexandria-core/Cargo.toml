@@ -20,6 +20,11 @@ kamadak-exif.workspace = true
 lofty.workspace = true
 lopdf.workspace = true
 quick-xml.workspace = true
+# The only outbound network client in this workspace, and it is reachable
+# from exactly one module: `enrichment`, which is off unless the operator
+# turns it on (`[metadata] enabled`). See the music enrichment design for
+# why an otherwise-offline product now has an HTTP client at all.
+reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
@@ -42,7 +47,10 @@ windows-sys.workspace = true
 base64.workspace = true
 little_exif.workspace = true
 tempfile.workspace = true
-tokio.workspace = true
+# `test-util` on top of the workspace features: the rate-gate tests assert on
+# the clock (`start_paused`), and without it a one-per-second limit could only
+# be tested by actually waiting a second per case. Not in `full`.
+tokio = { workspace = true, features = ["test-util"] }
 toml.workspace = true
 # Tests only: the indexer logs each unindexable file at `warn` with its path
 # and error, which is worthless without a subscriber to receive it. See

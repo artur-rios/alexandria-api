@@ -792,6 +792,7 @@ async fn given_tagged_audio_file_when_execute_then_subtype_metadata_written() {
             genre: Some("Rock".to_string()),
             track: Some(4),
             album_artist: Some("Various Artists".to_string()),
+            duration_seconds: None,
         },
     );
     let handler = handler(
