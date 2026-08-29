@@ -1675,6 +1675,24 @@ impl CatalogRepository for SqliteCatalogRepository {
             .execute(&mut *tx)
             .await?;
 
+        // The same obligation for the lyrics fetched against this file
+        // (music enrichment design). `track_lyrics` carries no foreign key
+        // for the identical reason, so a purge that forgot this would leave
+        // a row holding lyrics for a `files.id` that no longer exists -- and
+        // a later file reusing that autoincrement id would inherit them,
+        // which is worse than an orphan: it is the wrong words shown
+        // confidently against the wrong track.
+        //
+        // `artist_images` is deliberately NOT touched here. It is keyed by
+        // artist name, not by file, and one purged track does not mean the
+        // artist has left the library -- deleting their photograph because
+        // one of their files was purged would throw away a lookup every
+        // other track by them still uses.
+        sqlx::query("DELETE FROM track_lyrics WHERE file_id = ?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+
         // Collect the playlists this file's entries belong to *before*
         // deleting them -- once the rows are gone there is nothing left to
         // read `playlist_id` off of. A file can sit in more than one
