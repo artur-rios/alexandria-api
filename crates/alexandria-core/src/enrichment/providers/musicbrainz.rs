@@ -16,6 +16,16 @@ const BASE_URL: &str = "https://musicbrainz.org/ws/2";
 struct SearchResponse {
     #[serde(default)]
     artists: Vec<SearchedArtist>,
+    /// MusicBrainz reports being overloaded as a **200** carrying
+    /// `{"error": "…currently busy…"}` and no results array at all.
+    ///
+    /// Read as an empty result — which is what `#[serde(default)]` on the
+    /// array alone makes it — that becomes "this artist does not exist",
+    /// which the command settles and never asks again. A busy afternoon
+    /// would permanently mark a library's artists as having no photograph.
+    /// Caught here so it stays a retryable failure, which is what it is.
+    #[serde(default)]
+    error: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -129,6 +139,10 @@ impl ArtistIdentityProvider for MusicBrainzClient {
             .await
             .map_err(|e| ProviderError::Unusable(e.to_string()))?;
 
+        if let Some(error) = body.error {
+            return Err(ProviderError::Unreachable(error));
+        }
+
         Ok(body.artists.into_iter().next().map(|artist| ArtistMatch {
             mbid: artist.id,
             name: artist.name,
@@ -144,6 +158,9 @@ impl ArtistIdentityProvider for MusicBrainzClient {
 struct RecordingResponse {
     #[serde(default)]
     recordings: Vec<SearchedRecording>,
+    /// See `SearchResponse::error`: a 200 that is really an outage.
+    #[serde(default)]
+    error: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -200,6 +217,10 @@ impl RecordingIdentityProvider for MusicBrainzClient {
             .json()
             .await
             .map_err(|e| ProviderError::Unusable(e.to_string()))?;
+
+        if let Some(error) = body.error {
+            return Err(ProviderError::Unreachable(error));
+        }
 
         Ok(body
             .recordings
@@ -308,6 +329,28 @@ mod tests {
         assert_eq!(
             client.find_artist("Miles Davis").await,
             Err(ProviderError::RateLimited)
+        );
+    }
+
+    #[tokio::test]
+    async fn given_a_busy_service_when_searched_then_it_is_retryable_not_absent() {
+        // MusicBrainz answers an overload with a 200 and an error body, no
+        // results array. Read as an empty result it becomes "this artist
+        // does not exist", which the command settles and never re-asks — so
+        // one busy afternoon would permanently deny a library its artwork.
+        let (base, _) = stub(
+            200,
+            r#"{"error": "The MusicBrainz web server is currently busy. Please try again later."}"#,
+        )
+        .await;
+        let client = MusicBrainzClient::against("owner@example.com", &base).unwrap();
+
+        assert!(
+            matches!(
+                client.find_artist("Miles Davis").await,
+                Err(ProviderError::Unreachable(_))
+            ),
+            "an outage was recorded as a settled absence"
         );
     }
 

@@ -4,6 +4,12 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Weekly, for the upstream contract job below. Weekly rather than daily
+  # because it reaches three public services this project does not pay for,
+  # and a contract does not drift faster than that.
+  schedule:
+    - cron: '17 6 * * 1'
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -103,4 +109,47 @@ jobs:
       - name: Measure indexing throughput and read latency
         run: |
           cargo test -p alexandria-core --test throughput \
+            -- --ignored --nocapture --test-threads=1
+
+  # Do the three services enrichment depends on still answer the shape this
+  # code parses? Nothing else asks: every other test stubs them, which is
+  # right — a suite that called MusicBrainz on every push would be slow,
+  # would fail whenever somebody else had an outage, and would spend a
+  # shared rate limit re-learning what it already knows.
+  #
+  # What stubs cannot see is drift on the other side: a field renamed, an
+  # endpoint moved, a response newly paginated. None of that surfaces until
+  # an owner's lookup quietly returns nothing.
+  #
+  # Non-gating, and never on a pull request. A red mark here means a service
+  # changed or was busy — MusicBrainz answers overload with a 200 and an
+  # error body — and it is a prompt to read the log, not a broken build.
+  # Nobody's pull request should wait on somebody else's uptime.
+  upstream-contract:
+    name: upstream contract (non-gating)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install ffmpeg dev libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libavutil-dev libavformat-dev libavcodec-dev \
+            libswscale-dev libavfilter-dev libavdevice-dev libclang-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # The tests refuse to run without this rather than sending an
+      # anonymous agent: MusicBrainz requires a contact in the `User-Agent`
+      # and is entitled to block clients that send none — a block that would
+      # land on everyone using this software, not on this one job.
+      - name: Upstream contract
+        env:
+          ALEXANDRIA_METADATA_CONTACT: ${{ vars.ALEXANDRIA_METADATA_CONTACT }}
+        run: |
+          cargo test -p alexandria-core --test upstream_contract \
             -- --ignored --nocapture --test-threads=1
