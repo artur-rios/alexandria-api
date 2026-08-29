@@ -46,7 +46,7 @@ async fn given_many_tracks_by_one_artist_when_enriched_then_the_artist_is_looked
     );
 
     let report = handler
-        .enrich(EnrichmentScope::Pending, "token")
+        .enrich(EnrichmentScope::pending(), "token")
         .await
         .expect("run");
 
@@ -80,7 +80,7 @@ async fn given_a_low_scoring_match_when_enriched_then_it_is_rejected_not_used() 
     );
 
     handler
-        .enrich(EnrichmentScope::Pending, "token")
+        .enrich(EnrichmentScope::pending(), "token")
         .await
         .expect("run");
 
@@ -112,7 +112,7 @@ async fn given_a_track_with_no_lyrics_when_enriched_then_the_outcome_is_recorded
     );
 
     handler
-        .enrich(EnrichmentScope::Pending, "token")
+        .enrich(EnrichmentScope::pending(), "token")
         .await
         .expect("run");
 
@@ -142,7 +142,7 @@ async fn given_a_settled_outcome_when_a_pending_run_repeats_then_it_is_not_re_as
         available_settings()
     );
     first
-        .enrich(EnrichmentScope::Pending, "token")
+        .enrich(EnrichmentScope::pending(), "token")
         .await
         .expect("first run");
 
@@ -155,7 +155,7 @@ async fn given_a_settled_outcome_when_a_pending_run_repeats_then_it_is_not_re_as
         available_settings()
     );
     let report = second
-        .enrich(EnrichmentScope::Pending, "token")
+        .enrich(EnrichmentScope::pending(), "token")
         .await
         .expect("second run");
 
@@ -182,7 +182,7 @@ async fn given_a_provider_that_is_down_when_enriched_then_the_run_continues() {
     );
 
     let report = handler
-        .enrich(EnrichmentScope::Pending, "token")
+        .enrich(EnrichmentScope::pending(), "token")
         .await
         .expect("a failing provider failed the whole run");
 
@@ -211,7 +211,7 @@ async fn given_the_image_cannot_be_written_when_enriched_then_it_is_retried_late
     );
 
     handler
-        .enrich(EnrichmentScope::Pending, "token")
+        .enrich(EnrichmentScope::pending(), "token")
         .await
         .expect("run");
 
@@ -240,7 +240,7 @@ async fn given_a_track_with_no_artist_when_enriched_then_nothing_is_asked() {
     );
 
     let report = handler
-        .enrich(EnrichmentScope::Pending, "token")
+        .enrich(EnrichmentScope::pending(), "token")
         .await
         .expect("run");
 
@@ -271,7 +271,7 @@ async fn given_a_candidate_with_a_duration_when_lyrics_are_searched_then_it_is_s
     );
 
     handler
-        .enrich(EnrichmentScope::Pending, "token")
+        .enrich(EnrichmentScope::pending(), "token")
         .await
         .expect("run");
 
@@ -294,7 +294,7 @@ async fn given_enrichment_is_disabled_when_a_run_starts_then_it_is_refused() {
         MetadataSettings::default()
     );
 
-    let outcome = handler.enrich(EnrichmentScope::Pending, "token").await;
+    let outcome = handler.enrich(EnrichmentScope::pending(), "token").await;
 
     assert!(matches!(outcome, Err(DomainError::InvalidState)));
     assert_eq!(
@@ -324,7 +324,7 @@ async fn given_no_contact_when_a_run_starts_then_it_is_refused_naming_the_reason
         }
     );
 
-    let outcome = handler.enrich(EnrichmentScope::Pending, "token").await;
+    let outcome = handler.enrich(EnrichmentScope::pending(), "token").await;
 
     match outcome {
         Err(DomainError::InvalidInput(message)) => {
@@ -350,7 +350,7 @@ async fn given_a_denied_caller_when_a_run_starts_then_nothing_is_asked() {
         available_settings(),
     );
 
-    let outcome = handler.enrich(EnrichmentScope::Pending, "token").await;
+    let outcome = handler.enrich(EnrichmentScope::pending(), "token").await;
 
     assert!(matches!(outcome, Err(DomainError::Unauthorized)));
     assert_eq!(identity.ask_count(), 0);
@@ -378,7 +378,7 @@ async fn given_a_file_purged_mid_run_when_its_lyrics_are_written_then_the_run_co
     );
 
     let report = handler
-        .enrich(EnrichmentScope::Pending, "token")
+        .enrich(EnrichmentScope::pending(), "token")
         .await
         .expect("one purged file aborted the whole run");
 
@@ -457,7 +457,7 @@ async fn given_a_settled_image_when_a_sweep_runs_then_it_is_still_skipped() {
     );
 
     handler
-        .enrich(EnrichmentScope::Pending, "token")
+        .enrich(EnrichmentScope::pending(), "token")
         .await
         .expect("run");
 
@@ -480,7 +480,7 @@ async fn given_lyrics_are_found_when_stored_then_the_recording_is_identified() {
     );
 
     handler
-        .enrich(EnrichmentScope::Pending, "token")
+        .enrich(EnrichmentScope::pending(), "token")
         .await
         .expect("run");
 
@@ -507,7 +507,7 @@ async fn given_no_lyrics_when_looked_up_then_the_recording_is_not_asked_for() {
     );
 
     handler
-        .enrich(EnrichmentScope::Pending, "token")
+        .enrich(EnrichmentScope::pending(), "token")
         .await
         .expect("run");
 
@@ -537,7 +537,7 @@ async fn given_a_low_scoring_recording_when_lyrics_are_stored_then_no_id_is_clai
     );
 
     handler
-        .enrich(EnrichmentScope::Pending, "token")
+        .enrich(EnrichmentScope::pending(), "token")
         .await
         .expect("run");
 

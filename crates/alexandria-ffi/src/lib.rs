@@ -4949,10 +4949,10 @@ pub extern "C" fn alexandria_enrichment_run(
 /// one a caller should not have to spell `{}` to ask for.
 fn enrichment_scope_from_json(scope_json: *const c_char) -> Option<EnrichmentScope> {
     let Some(raw) = cstr_lossy(scope_json) else {
-        return Some(EnrichmentScope::Pending);
+        return Some(EnrichmentScope::pending());
     };
     if raw.trim().is_empty() {
-        return Some(EnrichmentScope::Pending);
+        return Some(EnrichmentScope::pending());
     }
 
     let value: serde_json::Value = serde_json::from_str(&raw).ok()?;
@@ -4960,6 +4960,14 @@ fn enrichment_scope_from_json(scope_json: *const c_char) -> Option<EnrichmentSco
 
     let file_uuid = object.get("fileUuid").and_then(|v| v.as_str());
     let artist = object.get("artist").and_then(|v| v.as_str());
+    // How many of the sweep to do in this call. What lets an interface show
+    // progress and stop between batches without the core holding a
+    // half-finished run.
+    let limit = object
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .and_then(|v| u32::try_from(v).ok())
+        .filter(|limit| *limit > 0);
 
     match (file_uuid, artist) {
         // Refused rather than resolved in the caller's favour: a caller that
@@ -4971,7 +4979,7 @@ fn enrichment_scope_from_json(scope_json: *const c_char) -> Option<EnrichmentSco
             Some(EnrichmentScope::Artist(artist.trim().to_string()))
         }
         (None, Some(_)) => None,
-        (None, None) => Some(EnrichmentScope::Pending),
+        (None, None) => Some(EnrichmentScope::Pending { limit }),
     }
 }
 

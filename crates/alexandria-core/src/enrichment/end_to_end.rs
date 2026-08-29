@@ -193,7 +193,7 @@ async fn given_the_services_answer_when_a_track_is_enriched_then_it_is_stored_an
     );
 
     let report = handler
-        .enrich(EnrichmentScope::Pending, "token")
+        .enrich(EnrichmentScope::pending(), "token")
         .await
         .expect("the run failed");
 
@@ -310,13 +310,13 @@ async fn given_a_second_run_when_nothing_changed_then_the_services_are_not_re_as
     };
 
     build()
-        .enrich(EnrichmentScope::Pending, "token")
+        .enrich(EnrichmentScope::pending(), "token")
         .await
         .expect("first run");
     let after_first = seen.lock().unwrap().len();
 
     let report = build()
-        .enrich(EnrichmentScope::Pending, "token")
+        .enrich(EnrichmentScope::pending(), "token")
         .await
         .expect("second run");
 

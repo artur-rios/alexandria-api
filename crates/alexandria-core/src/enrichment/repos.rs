@@ -6,6 +6,67 @@ use uuid::Uuid;
 use crate::enrichment::model::{ArtistImage, EnrichmentOutcome, TrackLyrics};
 use crate::errors::{DomainError, WRITE_TX};
 
+/// A file is pending while EITHER of its two facts is outstanding — its own
+/// lyrics, or its artist's image.
+///
+/// Filtering on the lyrics outcome alone stranded artist images: one run
+/// with MusicBrainz down and LRCLIB up settles every file's lyrics, fails
+/// every image, and those images become unreachable by any later run.
+///
+/// Settled is named positively rather than as `<> 'failed'`, so an
+/// unrecognized value is retried here exactly as
+/// `EnrichmentOutcome::from_stored` retries it.
+const PENDING_SQL: &str = "
+    SELECT f.uuid AS uuid, a.title, a.artist, a.album_artist, a.album,
+           a.duration_seconds
+    FROM files f
+    JOIN audio_files a ON a.file_id = f.id
+    WHERE f.state = 'active'
+      AND (
+          NOT EXISTS (
+              SELECT 1 FROM track_lyrics l
+              WHERE l.file_id = f.id
+                AND l.outcome IN ('found', 'notFound', 'rejected')
+          )
+          OR NOT EXISTS (
+              SELECT 1 FROM artist_images i
+              WHERE i.artist_name = COALESCE(
+                        NULLIF(TRIM(a.album_artist), ''),
+                        TRIM(a.artist)
+                    )
+                AND i.outcome IN ('found', 'notFound', 'rejected')
+          )
+      )
+    ORDER BY f.id";
+
+/// [`PENDING_SQL`] with a bound `LIMIT`, for a batched sweep.
+///
+/// Ordered by `f.id` in both, so successive batches walk the library once
+/// rather than re-offering whatever the database felt like returning first.
+const PENDING_SQL_LIMITED: &str = "
+    SELECT f.uuid AS uuid, a.title, a.artist, a.album_artist, a.album,
+           a.duration_seconds
+    FROM files f
+    JOIN audio_files a ON a.file_id = f.id
+    WHERE f.state = 'active'
+      AND (
+          NOT EXISTS (
+              SELECT 1 FROM track_lyrics l
+              WHERE l.file_id = f.id
+                AND l.outcome IN ('found', 'notFound', 'rejected')
+          )
+          OR NOT EXISTS (
+              SELECT 1 FROM artist_images i
+              WHERE i.artist_name = COALESCE(
+                        NULLIF(TRIM(a.album_artist), ''),
+                        TRIM(a.artist)
+                    )
+                AND i.outcome IN ('found', 'notFound', 'rejected')
+          )
+      )
+    ORDER BY f.id
+    LIMIT ?";
+
 /// One audio file enrichment has something to ask about.
 ///
 /// Everything a lookup needs and nothing else — deliberately not `FileView`,
@@ -88,6 +149,13 @@ pub trait EnrichmentRepository: Send + Sync {
 
     /// Write (or replace) a lyrics row.
     async fn put_lyrics(&self, lyrics: TrackLyrics) -> Result<(), DomainError>;
+
+    /// How many files still have something outstanding.
+    ///
+    /// The denominator a batched sweep is shown against. Counted rather than
+    /// derived from the candidate list, because the list is bounded by the
+    /// batch size and the count is not.
+    async fn pending_count(&self) -> Result<u32, DomainError>;
 }
 
 /// The Sqlite implementation.
@@ -155,31 +223,20 @@ impl EnrichmentRepository for SqliteEnrichmentRepository {
             // 'failed'`, so an unrecognized value is retried here exactly as
             // `EnrichmentOutcome::from_stored` retries it — see
             // `SETTLED_OUTCOMES_SQL`.
-            EnrichmentScope::Pending => {
-                sqlx::query(
-                    "SELECT f.uuid AS uuid, a.title, a.artist, a.album_artist, a.album,
-                            a.duration_seconds
-                     FROM files f
-                     JOIN audio_files a ON a.file_id = f.id
-                     WHERE f.state = 'active'
-                       AND (
-                           NOT EXISTS (
-                               SELECT 1 FROM track_lyrics l
-                               WHERE l.file_id = f.id
-                                 AND l.outcome IN ('found', 'notFound', 'rejected')
-                           )
-                           OR NOT EXISTS (
-                               SELECT 1 FROM artist_images i
-                               WHERE i.artist_name = COALESCE(
-                                         NULLIF(TRIM(a.album_artist), ''),
-                                         TRIM(a.artist)
-                                     )
-                                 AND i.outcome IN ('found', 'notFound', 'rejected')
-                           )
-                       )",
-                )
-                .fetch_all(&self.pool)
-                .await
+            EnrichmentScope::Pending { limit } => {
+                // Two statements rather than one with an interpolated
+                // limit: sqlx takes only `&'static str` here, and building
+                // the SQL at runtime to dodge that defeats the check that
+                // stops injection rather than satisfying it.
+                match limit {
+                    Some(limit) => {
+                        sqlx::query(PENDING_SQL_LIMITED)
+                            .bind(i64::from(*limit))
+                            .fetch_all(&self.pool)
+                            .await
+                    }
+                    None => sqlx::query(PENDING_SQL).fetch_all(&self.pool).await,
+                }
             }
         }
         .map_err(|e| DomainError::Disk(e.to_string()))?;
@@ -211,6 +268,34 @@ impl EnrichmentRepository for SqliteEnrichmentRepository {
                 })
             })
             .collect()
+    }
+
+    async fn pending_count(&self) -> Result<u32, DomainError> {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM files f
+             JOIN audio_files a ON a.file_id = f.id
+             WHERE f.state = 'active'
+               AND (
+                   NOT EXISTS (
+                       SELECT 1 FROM track_lyrics l
+                       WHERE l.file_id = f.id
+                         AND l.outcome IN ('found', 'notFound', 'rejected')
+                   )
+                   OR NOT EXISTS (
+                       SELECT 1 FROM artist_images i
+                       WHERE i.artist_name = COALESCE(
+                                 NULLIF(TRIM(a.album_artist), ''),
+                                 TRIM(a.artist)
+                             )
+                         AND i.outcome IN ('found', 'notFound', 'rejected')
+                   )
+               )",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| DomainError::Disk(e.to_string()))?;
+
+        Ok(u32::try_from(count).unwrap_or(u32::MAX))
     }
 
     async fn artist_image(&self, artist_name: &str) -> Result<Option<ArtistImage>, DomainError> {

@@ -104,6 +104,13 @@ impl EnrichmentRepository for FakeEnrichmentRepository {
         self.lyrics.lock().unwrap().insert(lyrics.file_uuid, lyrics);
         Ok(())
     }
+
+    async fn pending_count(&self) -> Result<u32, DomainError> {
+        // The fake answers a canned candidate list rather than querying, so
+        // there is nothing here to count down: what a test asserts about
+        // `remaining` belongs against the real repository.
+        Ok(0)
+    }
 }
 
 /// An identity provider that counts how often it was asked.
