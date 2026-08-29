@@ -727,6 +727,7 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
     let read_enrichment_handler = Arc::new(ReadEnrichmentHandler::new(
         auth.clone(),
         SqliteEnrichmentRepository::new(pool.clone()),
+        &settings.metadata.image_cache_dir,
     ));
     // Built only when it can actually run. A client that cannot lawfully
     // send its own User-Agent is one this process should not be holding.

@@ -1,5 +1,7 @@
 //! Reading enrichment back.
 
+use std::path::PathBuf;
+
 use uuid::Uuid;
 
 use crate::auth::AuthService;
@@ -24,6 +26,16 @@ pub struct TrackEnrichmentView {
 pub struct ReadEnrichmentHandler<A, R> {
     auth: A,
     repo: R,
+    /// Where artist images live, so `image_path` can be answered as
+    /// something the caller can actually open.
+    ///
+    /// Stored relative and answered absolute, deliberately. Relative is what
+    /// survives the cache directory being moved or the catalog being opened
+    /// on another machine; absolute is what a client can hand to an image
+    /// widget. A client has no way to learn this directory otherwise — it is
+    /// the core's configuration, not theirs — so resolving it here is the
+    /// difference between a usable answer and a string they must guess at.
+    image_root: PathBuf,
 }
 
 impl<A, R> ReadEnrichmentHandler<A, R>
@@ -31,8 +43,12 @@ where
     A: AuthService,
     R: EnrichmentRepository,
 {
-    pub fn new(auth: A, repo: R) -> Self {
-        Self { auth, repo }
+    pub fn new(auth: A, repo: R, image_root: impl Into<PathBuf>) -> Self {
+        Self {
+            auth,
+            repo,
+            image_root: image_root.into(),
+        }
     }
 
     /// The stored image and lyrics for `file_uuid`.
@@ -60,7 +76,16 @@ where
                 .repo
                 .artist_image(name.trim())
                 .await?
-                .filter(|image| image.image_path.is_some()),
+                .filter(|image| image.image_path.is_some())
+                .map(|mut image| {
+                    image.image_path = image.image_path.map(|relative| {
+                        self.image_root
+                            .join(relative)
+                            .to_string_lossy()
+                            .into_owned()
+                    });
+                    image
+                }),
             _ => None,
         };
 

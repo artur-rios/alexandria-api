@@ -12,6 +12,7 @@ use alexandria_core::migrate::migrate_database;
 use chrono::{TimeZone, Utc};
 use uuid::Uuid;
 
+#[allow(clippy::type_complexity)]
 async fn repo_with_catalog() -> (
     SqliteEnrichmentRepository,
     SqliteCatalogRepository,
@@ -218,4 +219,36 @@ async fn given_a_purged_track_when_the_artist_image_is_read_then_it_survives() {
         .await
         .expect("read")
         .is_some());
+}
+
+#[tokio::test]
+async fn given_a_stored_image_when_read_back_then_its_path_is_resolvable() {
+    // Stored relative so the cache can move; answered absolute so a client
+    // can open it. A client has no way to learn the cache directory — it is
+    // the core's configuration — so a relative answer would be a string they
+    // could only guess at.
+    use alexandria_core::enrichment::queries::ReadEnrichmentHandler;
+
+    let (repo, catalog, _pool, _dir) = repo_with_catalog().await;
+    let file_uuid = insert_audio(&catalog, "/library/so-what.flac").await;
+    repo.put_artist_image(an_image("Miles Davis", EnrichmentOutcome::Found))
+        .await
+        .expect("store");
+
+    let handler = ReadEnrichmentHandler::new(
+        crate::common::FakeAuth::Allowing,
+        SqliteEnrichmentRepository::new(_pool.clone()),
+        "/var/cache/alexandria/artist-images",
+    );
+
+    let view = handler
+        .read(file_uuid, Some("Miles Davis"), "token")
+        .await
+        .expect("read");
+
+    assert_eq!(
+        view.artist_image.expect("an image").image_path.as_deref(),
+        Some("/var/cache/alexandria/artist-images/mb-1.jpg"),
+        "the client was handed a path it cannot open"
+    );
 }
