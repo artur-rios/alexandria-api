@@ -5,9 +5,13 @@
 use reqwest::Client;
 use serde::Deserialize;
 
-use super::{user_agent, ArtistIdentityProvider, ArtistMatch, ProviderError, RateGate};
+use super::{
+    user_agent, ArtistIdentityProvider, ArtistMatch, LyricsQuery, ProviderError, RateGate,
+    RecordingIdentityProvider, RecordingMatch,
+};
 
 const SEARCH_URL: &str = "https://musicbrainz.org/ws/2/artist";
+const RECORDING_URL: &str = "https://musicbrainz.org/ws/2/recording";
 
 #[derive(Debug, Deserialize)]
 struct SearchResponse {
@@ -120,6 +124,78 @@ impl ArtistIdentityProvider for MusicBrainzClient {
             // read as a bad match.
             score: artist.score.min(100) as u8,
         }))
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct RecordingResponse {
+    #[serde(default)]
+    recordings: Vec<SearchedRecording>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SearchedRecording {
+    id: String,
+    #[serde(default)]
+    score: u32,
+}
+
+impl RecordingIdentityProvider for MusicBrainzClient {
+    async fn find_recording(
+        &self,
+        query: &LyricsQuery,
+    ) -> Result<Option<RecordingMatch>, ProviderError> {
+        if query.title.trim().is_empty() || query.artist.trim().is_empty() {
+            return Ok(None);
+        }
+
+        // Every field quoted, for the reason the artist search quotes its
+        // one: these are tags, and `AC/DC` or a title with a `!` in it is
+        // Lucene syntax the server answers 400 to.
+        let mut terms = vec![
+            format!("recording:{}", lucene_phrase(query.title.trim())),
+            format!("artist:{}", lucene_phrase(query.artist.trim())),
+        ];
+        if let Some(album) = query.album.as_deref().map(str::trim) {
+            if !album.is_empty() {
+                terms.push(format!("release:{}", lucene_phrase(album)));
+            }
+        }
+        let search = terms.join(" AND ");
+
+        self.gate.admit().await;
+
+        let response = self
+            .http
+            .get(RECORDING_URL)
+            .query(&[("query", search.as_str()), ("fmt", "json"), ("limit", "1")])
+            .send()
+            .await
+            .map_err(|e| ProviderError::Unreachable(e.to_string()))?;
+
+        if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            return Err(ProviderError::RateLimited);
+        }
+        if !response.status().is_success() {
+            return Err(ProviderError::Unreachable(format!(
+                "status {}",
+                response.status()
+            )));
+        }
+
+        let body: RecordingResponse = response
+            .json()
+            .await
+            .map_err(|e| ProviderError::Unusable(e.to_string()))?;
+
+        Ok(body
+            .recordings
+            .into_iter()
+            .next()
+            .map(|recording| RecordingMatch {
+                mbid: recording.id,
+                score: recording.score.min(100) as u8,
+            }))
     }
 }
 

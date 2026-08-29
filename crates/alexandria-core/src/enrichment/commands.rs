@@ -11,7 +11,7 @@ use crate::enrichment::model::{
 };
 use crate::enrichment::providers::{
     ArtistIdentityProvider, ArtistImageAsset, ArtistImageProvider, LyricsProvider, LyricsQuery,
-    MIN_ARTIST_SCORE,
+    RecordingIdentityProvider, MIN_ARTIST_SCORE, MIN_RECORDING_SCORE,
 };
 use crate::enrichment::repos::{EnrichmentCandidate, EnrichmentRepository};
 use crate::errors::DomainError;
@@ -89,7 +89,7 @@ impl<A, R, I, P, L, S, C> EnrichHandler<A, R, I, P, L, S, C>
 where
     A: AuthService,
     R: EnrichmentRepository,
-    I: ArtistIdentityProvider,
+    I: ArtistIdentityProvider + RecordingIdentityProvider,
     P: ArtistImageProvider,
     L: LyricsProvider,
     S: ArtistImageStore,
@@ -327,14 +327,39 @@ where
         };
 
         match self.lyrics.lyrics_for(&query).await {
-            Ok(Some(found)) => row(
-                EnrichmentOutcome::Found,
-                found.plain,
-                found.synced,
-                Some(found.source),
-            ),
+            Ok(Some(found)) => {
+                let mut stored = row(
+                    EnrichmentOutcome::Found,
+                    found.plain,
+                    found.synced,
+                    Some(found.source),
+                );
+                stored.mbid = self.recording_mbid(&query).await;
+                stored
+            }
             Ok(None) => row(EnrichmentOutcome::NotFound, None, None, None),
             Err(_) => row(EnrichmentOutcome::Failed, None, None, None),
+        }
+    }
+
+    /// The MusicBrainz recording this track is, for provenance.
+    ///
+    /// Asked **only once lyrics have actually been found**, and that
+    /// ordering is the whole design of it. This costs a second of the rate
+    /// budget per *track* — where the artist lookup costs one per artist —
+    /// so asking it for every track in a library would roughly double a
+    /// sweep's wall-clock time, most of it spent identifying recordings
+    /// nothing was stored for. An id is only worth having beside something
+    /// it identifies.
+    ///
+    /// Never fails the lyrics it accompanies: a recording that cannot be
+    /// resolved, or scores below the threshold, leaves `mbid` absent while
+    /// the words themselves are still stored. Provenance is a nicety; the
+    /// lyrics are the thing the owner asked for.
+    async fn recording_mbid(&self, query: &LyricsQuery) -> Option<String> {
+        match self.identity.find_recording(query).await {
+            Ok(Some(matched)) if matched.score >= MIN_RECORDING_SCORE => Some(matched.mbid),
+            _ => None,
         }
     }
 }

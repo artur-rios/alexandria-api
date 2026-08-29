@@ -120,6 +120,9 @@ pub struct FakeCatalogRepository {
     /// Duration (seconds) last written for `uuid` via `set_video_duration`
     /// (issue #44 video slice).
     video_durations: Arc<Mutex<HashMap<Uuid, f64>>>,
+    /// Every audio duration written, so a test can assert indexing
+    /// actually extracted and stored one.
+    pub audio_durations: Arc<Mutex<HashMap<Uuid, f64>>>,
     /// Page count last written for `uuid` via `set_comic_page_count`
     /// (issue #44 comic slice).
     comic_page_counts: Arc<Mutex<HashMap<Uuid, i64>>>,
@@ -523,6 +526,27 @@ impl CatalogRepository for FakeCatalogRepository {
             .unwrap()
             .get(&uuid)
             .copied())
+    }
+
+    async fn set_audio_duration(
+        &self,
+        uuid: Uuid,
+        duration_seconds: f64,
+    ) -> Result<(), DomainError> {
+        let files = self.files.lock().unwrap();
+        let file = files
+            .values()
+            .find(|f| f.uuid == uuid)
+            .ok_or(DomainError::NotFound)?;
+        if file.file_type != alexandria_core::catalog::model::FileType::Audio {
+            return Err(DomainError::InvalidInput("file is not audio".into()));
+        }
+        drop(files);
+        self.audio_durations
+            .lock()
+            .unwrap()
+            .insert(uuid, duration_seconds);
+        Ok(())
     }
 
     async fn set_video_duration(
@@ -2853,6 +2877,14 @@ impl CatalogRepository for FailingCatalogRepository {
     }
 
     async fn find_document_page_count(&self, _uuid: Uuid) -> Result<Option<i64>, DomainError> {
+        unimplemented!("not reached by the run-fails-to-list path")
+    }
+
+    async fn set_audio_duration(
+        &self,
+        _uuid: Uuid,
+        _duration_seconds: f64,
+    ) -> Result<(), DomainError> {
         unimplemented!("not reached by the run-fails-to-list path")
     }
 

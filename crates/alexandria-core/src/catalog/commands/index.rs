@@ -746,18 +746,36 @@ where
         // A parse failure or a write failure here must not fail indexing
         // (it is not counted in `IndexOutcome::failed`).
         if file_type == FileType::Audio {
-            if let Some(metadata) = self
-                .audio_tags
-                .read(&entry.path)
-                .await
-                .and_then(|tags| tags.into_subtype_metadata())
-            {
-                if let Err(err) = self.repo.update_metadata(file.uuid, &metadata).await {
-                    tracing::warn!(
-                        path = %entry.path,
-                        error = %err,
-                        "indexed but failed to write extracted audio tags"
-                    );
+            if let Some(tags) = self.audio_tags.read(&entry.path).await {
+                // Two independent writes, as the image slice below already
+                // does: the duration (outside `SubtypeMetadata`, via
+                // `set_audio_duration`, because it is not owner-editable) and
+                // the tags themselves. Neither write's failure blocks the
+                // other or fails indexing.
+                if let Some(crate::catalog::audio_tags::AudioDuration(duration_seconds)) =
+                    tags.duration_seconds
+                {
+                    if let Err(err) = self
+                        .repo
+                        .set_audio_duration(file.uuid, duration_seconds)
+                        .await
+                    {
+                        tracing::warn!(
+                            path = %entry.path,
+                            error = %err,
+                            "indexed but failed to write extracted audio duration"
+                        );
+                    }
+                }
+
+                if let Some(metadata) = tags.into_subtype_metadata() {
+                    if let Err(err) = self.repo.update_metadata(file.uuid, &metadata).await {
+                        tracing::warn!(
+                            path = %entry.path,
+                            error = %err,
+                            "indexed but failed to write extracted audio tags"
+                        );
+                    }
                 }
             }
         }

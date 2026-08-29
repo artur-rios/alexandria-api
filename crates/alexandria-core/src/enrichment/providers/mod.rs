@@ -84,6 +84,42 @@ pub trait ArtistIdentityProvider: Send + Sync {
     async fn find_artist(&self, name: &str) -> Result<Option<ArtistMatch>, ProviderError>;
 }
 
+/// A recording MusicBrainz believes a track is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordingMatch {
+    pub mbid: String,
+    /// MusicBrainz's own confidence, 0-100, scored against
+    /// [`MIN_RECORDING_SCORE`] by the caller.
+    pub score: u8,
+}
+
+/// The smallest MusicBrainz score accepted for a recording.
+///
+/// Higher than [`MIN_ARTIST_SCORE`], and deliberately. An artist search has
+/// one field to be wrong about; a recording search matches title, artist and
+/// album together, so a genuine hit scores very high and anything middling is
+/// usually a different take, a live version, or another track from the same
+/// record. The consequence of a wrong one is only a wrong provenance id
+/// rather than wrong words on screen — LRCLIB is what supplies the lyrics —
+/// but an id that names the wrong recording is worse than no id, because it
+/// looks like an answer.
+pub const MIN_RECORDING_SCORE: u8 = 95;
+
+/// Resolves a track to a MusicBrainz recording.
+///
+/// Separate from [`ArtistIdentityProvider`] rather than a second method on
+/// it: they are asked at different times, for different reasons, and one of
+/// them costs a second of the rate budget per *track* where the other costs
+/// one per *artist*. Keeping them apart makes that difference visible at the
+/// call site instead of hidden behind a shared trait.
+#[allow(async_fn_in_trait)]
+pub trait RecordingIdentityProvider: Send + Sync {
+    async fn find_recording(
+        &self,
+        query: &LyricsQuery,
+    ) -> Result<Option<RecordingMatch>, ProviderError>;
+}
+
 /// An artist image and where it came from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArtistImageAsset {

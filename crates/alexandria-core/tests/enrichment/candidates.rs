@@ -129,12 +129,38 @@ async fn given_a_tagged_audio_file_when_pending_is_queried_then_its_tags_come_ba
 }
 
 #[tokio::test]
-async fn given_the_catalog_when_a_candidate_is_read_then_it_carries_no_duration() {
-    // Pinning a real limitation rather than a preference. `audio_files` has
-    // no duration column — only `video_files` does — so LRCLIB is queried
-    // without the one field that separates a radio edit from an album cut.
-    // If a duration column is ever added, this test fails and is the
-    // reminder to send it.
+async fn given_an_extracted_duration_when_a_candidate_is_read_then_it_is_carried() {
+    // Duration is what separates a radio edit from an album cut, and is the
+    // field LRCLIB matches best on. It is stored as REAL and sent as whole
+    // seconds, which is the unit their API takes.
+    let (repo, catalog, _dir) = fixtures().await;
+    let uuid = insert_tagged(
+        &catalog,
+        "/library/so-what.flac",
+        "So What",
+        "Miles Davis",
+        None,
+    )
+    .await;
+    catalog
+        .set_audio_duration(uuid, 545.4)
+        .await
+        .expect("duration");
+
+    let pending = repo
+        .candidates(&EnrichmentScope::Pending)
+        .await
+        .expect("candidates");
+
+    // Rounded, not truncated: 545.4 is 545 seconds to anyone who timed it,
+    // and truncating would put every track systematically short.
+    assert_eq!(pending[0].duration_seconds, Some(545));
+}
+
+#[tokio::test]
+async fn given_no_extracted_duration_when_a_candidate_is_read_then_it_is_absent() {
+    // A library indexed before the column existed reads NULL until it is
+    // re-indexed, and the lookup has to work without one.
     let (repo, catalog, _dir) = fixtures().await;
     insert_tagged(
         &catalog,

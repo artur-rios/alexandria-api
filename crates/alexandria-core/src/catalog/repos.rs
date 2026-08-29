@@ -180,6 +180,18 @@ pub trait CatalogRepository: Send + Sync {
     /// duration).
     async fn find_video_duration(&self, uuid: Uuid) -> Result<Option<f64>, DomainError>;
 
+    /// Write an audio file's duration in seconds (music enrichment design).
+    /// Its own call rather than a `SubtypeMetadata::Audio` field for the same
+    /// reason `set_video_duration` is: how long the audio actually runs is a
+    /// property of the stream, not a claim the owner may correct (UC-04).
+    /// Returns `NotFound` when no file row carries the UUID, `InvalidInput`
+    /// when the file is not audio.
+    async fn set_audio_duration(
+        &self,
+        uuid: Uuid,
+        duration_seconds: f64,
+    ) -> Result<(), DomainError>;
+
     /// Write a comic file's page count (issue #44 comic slice). Unlike
     /// `update_metadata`, this touches `comic_books.page_count` directly —
     /// `SubtypeMetadata::Comic` deliberately excludes it because it is not
@@ -1405,6 +1417,42 @@ impl CatalogRepository for SqliteCatalogRepository {
         if affected == 0 {
             return Err(DomainError::internal(format!(
                 "subtype row missing for file {uuid} (video)"
+            )));
+        }
+
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn set_audio_duration(
+        &self,
+        uuid: Uuid,
+        duration_seconds: f64,
+    ) -> Result<(), DomainError> {
+        let mut tx = self.pool.begin_with(WRITE_TX).await?;
+
+        let (id, type_str): (i64, String) =
+            sqlx::query_as("SELECT id, type FROM files WHERE uuid = ?")
+                .bind(uuid.to_string())
+                .fetch_optional(&mut *tx)
+                .await?
+                .ok_or(DomainError::NotFound)?;
+
+        let actual_type = parse_type_str(&type_str)?;
+        if actual_type != FileType::Audio {
+            return Err(DomainError::InvalidInput("file is not audio".into()));
+        }
+
+        let affected = sqlx::query("UPDATE audio_files SET duration_seconds = ? WHERE file_id = ?")
+            .bind(duration_seconds)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+
+        if affected == 0 {
+            return Err(DomainError::internal(format!(
+                "subtype row missing for file {uuid} (audio)"
             )));
         }
 

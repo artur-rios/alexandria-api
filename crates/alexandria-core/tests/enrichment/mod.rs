@@ -14,7 +14,7 @@ use alexandria_core::enrichment::commands::ArtistImageStore;
 use alexandria_core::enrichment::model::{ArtistImage, EnrichmentScope, TrackLyrics};
 use alexandria_core::enrichment::providers::{
     ArtistIdentityProvider, ArtistImageAsset, ArtistImageProvider, ArtistMatch, LyricsMatch,
-    LyricsProvider, LyricsQuery, ProviderError,
+    LyricsProvider, LyricsQuery, ProviderError, RecordingIdentityProvider, RecordingMatch,
 };
 use alexandria_core::enrichment::repos::{EnrichmentCandidate, EnrichmentRepository};
 use alexandria_core::errors::DomainError;
@@ -116,6 +116,9 @@ pub struct FakeIdentity {
     pub answer: Option<ArtistMatch>,
     pub fails: bool,
     pub asked: Arc<Mutex<Vec<String>>>,
+    /// What a recording lookup answers, and every query it was given.
+    pub recording: Option<RecordingMatch>,
+    pub recordings_asked: Arc<Mutex<Vec<LyricsQuery>>>,
 }
 
 impl FakeIdentity {
@@ -139,6 +142,32 @@ impl FakeIdentity {
 
     pub fn ask_count(&self) -> usize {
         self.asked.lock().unwrap().len()
+    }
+
+    /// Also answer a recording, at `score`.
+    pub fn with_recording(mut self, mbid: &str, score: u8) -> Self {
+        self.recording = Some(RecordingMatch {
+            mbid: mbid.to_string(),
+            score,
+        });
+        self
+    }
+
+    pub fn recording_ask_count(&self) -> usize {
+        self.recordings_asked.lock().unwrap().len()
+    }
+}
+
+impl RecordingIdentityProvider for FakeIdentity {
+    async fn find_recording(
+        &self,
+        query: &LyricsQuery,
+    ) -> Result<Option<RecordingMatch>, ProviderError> {
+        self.recordings_asked.lock().unwrap().push(query.clone());
+        if self.fails {
+            return Err(ProviderError::Unreachable("test".to_string()));
+        }
+        Ok(self.recording.clone())
     }
 }
 

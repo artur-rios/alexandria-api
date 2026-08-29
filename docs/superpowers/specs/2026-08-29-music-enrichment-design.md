@@ -136,7 +136,32 @@ repository, so the whole command layer is unit-tested with no network, no keys,
 and no flakiness. The HTTP clients themselves get a small number of tests
 against recorded payloads.
 
-### 5. A failed lookup is a recorded outcome, never a failed command
+### 5. Duration is extracted, and a recording is identified only once
+
+Two facts the first cut of this design did without, both added because the
+lookup is materially worse without them.
+
+`audio_files` gained a `duration_seconds`, extracted at index time from the
+stream's own properties — not from a tag, which is why a file carrying no tags
+at all still has one. It is deliberately absent from `SubtypeMetadata::Audio`
+and written through its own repository call, the same division
+`video_files.duration_seconds` already makes: what the owner may correct is
+what their tags claim, and how long the audio actually runs is not a claim.
+Duration is what separates a radio edit from an album cut, and it is the field
+LRCLIB matches best on.
+
+The MusicBrainz *recording* id is stored beside found lyrics, and is asked for
+**only once lyrics have actually been found**. That ordering is the design, not
+an optimisation: a recording lookup costs a second of the rate budget per
+*track*, where the artist lookup costs one per *artist*, so asking it for
+everything would roughly double a sweep and spend most of that identifying
+recordings nothing was stored for. It never fails the lyrics it accompanies —
+an unresolved or low-scoring recording leaves the id absent and the words
+stored, because provenance is a nicety and the lyrics are the thing asked for.
+Its threshold is higher than the artist one: a recording search matches title,
+artist and album together, so anything middling is usually a different take.
+
+### 6. A failed lookup is a recorded outcome, never a failed command
 
 A service being down, rate-limiting, or having nothing for a track is normal.
 None of it fails the enrichment run: each is written as an `outcome` and the run
@@ -148,6 +173,8 @@ fails the command.
 | Component | Change |
 | --- | --- |
 | `alexandria-core/migrations/…18_music_enrichment.sql` (new) | The two tables. |
+| `alexandria-core/migrations/…19_audio_duration.sql` (new) | `audio_files.duration_seconds`. |
+| `catalog/audio_tags.rs`, `commands/index.rs` | Extract and store the duration. |
 | `alexandria-core/src/enrichment/` (new) | Model, repos, providers, commands, queries. |
 | `alexandria-core/src/config.rs` | A `[metadata]` section: `enabled`, `contact`, `image_cache_dir`. |
 | `alexandria-core/src/settings/mod.rs` | Report whether enrichment is available, so a client can say why it is not. |
@@ -165,6 +192,9 @@ fails the command.
 - Enrichment refuses to start when `enabled` is false.
 - Purging a file removes its lyrics; no orphan row is left behind.
 - A file whose tags name no artist is skipped rather than queried blindly.
+- An extracted duration reaches the lyrics query, rounded to whole seconds.
+- A recording is identified for a track with lyrics, and not for one without.
+- A low-scoring recording leaves no id and does not cost the lyrics.
 
 ## Risks
 

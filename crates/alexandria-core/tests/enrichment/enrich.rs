@@ -3,7 +3,7 @@
 use alexandria_core::config::MetadataSettings;
 use alexandria_core::enrichment::commands::EnrichHandler;
 use alexandria_core::enrichment::model::{EnrichmentOutcome, EnrichmentScope};
-use alexandria_core::enrichment::providers::MIN_ARTIST_SCORE;
+use alexandria_core::enrichment::providers::{MIN_ARTIST_SCORE, MIN_RECORDING_SCORE};
 use alexandria_core::errors::DomainError;
 
 use crate::common::FakeAuth;
@@ -462,4 +462,87 @@ async fn given_a_settled_image_when_a_sweep_runs_then_it_is_still_skipped() {
         .expect("run");
 
     assert_eq!(identity.ask_count(), 0);
+}
+
+#[tokio::test]
+async fn given_lyrics_are_found_when_stored_then_the_recording_is_identified() {
+    // Provenance beside the words: which recording these lyrics belong to.
+    let track = candidate("So What", "Miles Davis");
+    let file_uuid = track.file_uuid;
+    let repo = FakeEnrichmentRepository::with_candidates(vec![track]);
+    let handler = handler!(
+        repo.clone(),
+        FakeIdentity::matching("mb-artist", "Miles Davis", 100).with_recording("mb-rec", 100),
+        FakeImages::with_image(),
+        FakeLyrics::with_text(),
+        FakeImageStore::default(),
+        available_settings()
+    );
+
+    handler
+        .enrich(EnrichmentScope::Pending, "token")
+        .await
+        .expect("run");
+
+    let stored = repo.stored_lyrics(file_uuid).expect("a row");
+    assert_eq!(stored.mbid.as_deref(), Some("mb-rec"));
+}
+
+#[tokio::test]
+async fn given_no_lyrics_when_looked_up_then_the_recording_is_not_asked_for() {
+    // The ordering that keeps a sweep affordable. A recording lookup costs a
+    // second of the rate budget per TRACK, where the artist lookup costs one
+    // per artist -- asking it for every track would roughly double a run,
+    // most of it identifying recordings nothing was stored for.
+    let repo = FakeEnrichmentRepository::with_candidates(vec![candidate("So What", "Miles Davis")]);
+    let identity =
+        FakeIdentity::matching("mb-artist", "Miles Davis", 100).with_recording("mb-rec", 100);
+    let handler = handler!(
+        repo,
+        identity.clone(),
+        FakeImages::with_image(),
+        FakeLyrics::with_nothing(),
+        FakeImageStore::default(),
+        available_settings()
+    );
+
+    handler
+        .enrich(EnrichmentScope::Pending, "token")
+        .await
+        .expect("run");
+
+    assert_eq!(
+        identity.recording_ask_count(),
+        0,
+        "a recording was identified for a track with no lyrics"
+    );
+}
+
+#[tokio::test]
+async fn given_a_low_scoring_recording_when_lyrics_are_stored_then_no_id_is_claimed() {
+    // An id naming the wrong recording is worse than no id: it looks like an
+    // answer. The lyrics themselves are still stored -- provenance is a
+    // nicety, the words are what the owner asked for.
+    let track = candidate("So What", "Miles Davis");
+    let file_uuid = track.file_uuid;
+    let repo = FakeEnrichmentRepository::with_candidates(vec![track]);
+    let handler = handler!(
+        repo.clone(),
+        FakeIdentity::matching("mb-artist", "Miles Davis", 100)
+            .with_recording("mb-maybe", MIN_RECORDING_SCORE - 1),
+        FakeImages::with_image(),
+        FakeLyrics::with_text(),
+        FakeImageStore::default(),
+        available_settings()
+    );
+
+    handler
+        .enrich(EnrichmentScope::Pending, "token")
+        .await
+        .expect("run");
+
+    let stored = repo.stored_lyrics(file_uuid).expect("a row");
+    assert_eq!(stored.mbid, None);
+    assert_eq!(stored.outcome, EnrichmentOutcome::Found);
+    assert!(stored.plain.is_some(), "the lyrics were lost with the id");
 }
