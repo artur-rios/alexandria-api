@@ -6,6 +6,7 @@ use alexandria_core::catalog::model::{FileType, NewFile, StateFilter};
 use alexandria_core::catalog::repos::{CatalogRepository, SqliteCatalogRepository};
 use alexandria_core::errors::DomainError;
 use alexandria_core::libraries::commands::{RegisterLibraryHandler, RemoveLibraryHandler};
+use alexandria_core::libraries::model::LibraryListing;
 use alexandria_core::libraries::queries::BrowseLibraryHandler;
 use alexandria_core::libraries::repos::SqliteLibraryRepository;
 use alexandria_core::migrate::migrate_database;
@@ -34,7 +35,7 @@ async fn insert(catalog: &SqliteCatalogRepository, path: &str, file_type: FileTy
         .insert_file(NewFile {
             uuid,
             path: path.to_string(),
-            name: path.rsplit('/').next().unwrap_or(path).to_string(),
+            name: path.rsplit(['/', '\\']).next().unwrap_or(path).to_string(),
             file_type,
             content_hash: Some("0".repeat(64)),
             size_bytes: None,
@@ -261,4 +262,147 @@ async fn given_no_library_when_a_file_is_indexed_then_it_belongs_to_none() {
         1,
         "an ordinary file was hidden from its panel"
     );
+}
+
+/// Windows paths, on a Linux runner (IR-01 targets both).
+///
+/// Every other test here spells its fixtures in POSIX, so all of them passed
+/// while the feature claimed nothing at all on Windows: a root of
+/// `D:\course` had `/` appended to it and matched no file in the catalog, and
+/// the level below the top arrived at `level_of` as one unsplittable name.
+/// The separator is the subject, so the paths are the fixture — there is no
+/// need for a Windows runner to say this much.
+mod windows_paths {
+    use super::*;
+
+    const WINDOWS_ROOT: &str = r"D:\courses\rust";
+
+    async fn library_over(pool: &sqlx::sqlite::SqlitePool) -> Uuid {
+        RegisterLibraryHandler::new(
+            FakeAuth::Allowing,
+            SqliteLibraryRepository::new(pool.clone()),
+        )
+        .register("Rust course", WINDOWS_ROOT, "token")
+        .await
+        .expect("register")
+        .uuid
+    }
+
+    async fn browse_at(pool: &sqlx::sqlite::SqlitePool, uuid: Uuid, path: &str) -> LibraryListing {
+        BrowseLibraryHandler::new(
+            FakeAuth::Allowing,
+            SqliteLibraryRepository::new(pool.clone()),
+            SqliteCatalogRepository::new(pool.clone()),
+        )
+        .browse(uuid, path, "token")
+        .await
+        .expect("browse")
+    }
+
+    #[tokio::test]
+    async fn given_a_windows_root_when_a_library_is_registered_then_it_claims_what_is_under_it() {
+        let (pool, catalog, _dir) = fixtures().await;
+        insert(
+            &catalog,
+            r"D:\courses\rust\class-01\lecture.mp4",
+            FileType::Video,
+        )
+        .await;
+        insert(&catalog, r"D:\films\a-film.mkv", FileType::Video).await;
+
+        library_over(&pool).await;
+
+        let listed = catalog
+            .list_filtered_view(Some(FileType::Video), StateFilter::Active, None)
+            .await
+            .expect("list");
+
+        assert_eq!(
+            listed.len(),
+            1,
+            "the lecture stayed in the type panel, so the library claimed nothing"
+        );
+        assert!(listed[0].file.path.ends_with("a-film.mkv"));
+    }
+
+    #[tokio::test]
+    async fn given_a_windows_root_when_a_file_is_indexed_under_it_then_it_is_claimed_at_once() {
+        // The insert-time half, which is a different query from the claim
+        // above and was wrong in the same way.
+        let (pool, catalog, _dir) = fixtures().await;
+        library_over(&pool).await;
+        insert(
+            &catalog,
+            r"D:\courses\rust\class-02\lecture.mp4",
+            FileType::Video,
+        )
+        .await;
+
+        let listed = catalog
+            .list_filtered_view(Some(FileType::Video), StateFilter::Active, None)
+            .await
+            .expect("list");
+
+        assert!(
+            listed.is_empty(),
+            "a file indexed into the library still appeared in the type panel"
+        );
+    }
+
+    #[tokio::test]
+    async fn given_a_windows_library_when_it_is_browsed_then_its_folders_are_seen() {
+        let (pool, catalog, _dir) = fixtures().await;
+        insert(
+            &catalog,
+            r"D:\courses\rust\class-01\lecture.mp4",
+            FileType::Video,
+        )
+        .await;
+        insert(
+            &catalog,
+            r"D:\courses\rust\syllabus.pdf",
+            FileType::Document,
+        )
+        .await;
+        let uuid = library_over(&pool).await;
+
+        let top = browse_at(&pool, uuid, "").await;
+
+        assert_eq!(
+            top.folders
+                .iter()
+                .map(|f| f.name.clone())
+                .collect::<Vec<_>>(),
+            vec!["class-01"],
+            "the class folder was invisible: the level arrived unsplit"
+        );
+        assert_eq!(top.files.len(), 1, "the syllabus was not at the top");
+
+        // Addressed with the separator the caller happens to use: a client on
+        // Windows sends what it read back from its own filesystem.
+        let inside = browse_at(&pool, uuid, r"class-01").await;
+        assert_eq!(inside.files.len(), 1, "the lecture was not in its class");
+        assert!(inside.folders.is_empty());
+    }
+
+    #[tokio::test]
+    async fn given_a_windows_library_when_a_sibling_is_registered_then_the_overlap_is_refused() {
+        // The containment test reads the same roots, so it was wrong the same
+        // way — and its failure is the dangerous direction: two libraries
+        // claiming the same files, which the refusal exists to prevent.
+        let (pool, _catalog, _dir) = fixtures().await;
+        library_over(&pool).await;
+
+        let nested = RegisterLibraryHandler::new(
+            FakeAuth::Allowing,
+            SqliteLibraryRepository::new(pool.clone()),
+        )
+        .register("One class", r"D:\courses\rust\class-01", "token")
+        .await;
+
+        assert!(
+            matches!(nested, Err(DomainError::Conflict(_))),
+            "a folder inside a library was registered as a second library"
+        );
+    }
 }

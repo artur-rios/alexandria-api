@@ -892,12 +892,20 @@ impl CatalogRepository for SqliteCatalogRepository {
             // The trailing separator is what stops `/library/course` from
             // claiming `/library/course-notes`: a different folder that
             // merely starts with the same letters.
+            //
+            // Both sides are compared with forward slashes, because on
+            // Windows a file's path is `D:\course\class-01\lecture.mp4`
+            // and the root it sits under is `D:\course` — and a prefix test
+            // that appended `/` to a backslash path matched nothing at all,
+            // so a library there silently claimed no file it had.
             "INSERT INTO files \
              (uuid, path, name, type, content_hash, size_bytes, mtime, state, deleted_at, \
              indexed_at, missing_at, library_id) \
              VALUES (?, ?, ?, ?, ?, ?, ?, 'active', NULL, ?, NULL, \
              (SELECT id FROM libraries \
-              WHERE ? LIKE (rtrim(root_path, '/\\') || '/%') LIMIT 1))",
+              WHERE replace(?, '\\', '/') \
+                    LIKE (rtrim(replace(root_path, '\\', '/'), '/') || '/%') \
+              LIMIT 1))",
         )
         .bind(new_file.uuid.to_string())
         .bind(&new_file.path)

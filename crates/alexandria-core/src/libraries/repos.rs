@@ -56,13 +56,19 @@ impl SqliteLibraryRepository {
         Self { pool }
     }
 
-    /// `path` with exactly one trailing separator.
+    /// `path` in forward slashes, with exactly one trailing separator.
     ///
     /// Prefix comparisons are how containment is decided below, and without
     /// the separator `/library/course` would contain `/library/course-notes`
     /// — a different folder that merely starts with the same letters.
+    ///
+    /// Forward slashes on both sides of every comparison, because Windows
+    /// paths arrive with backslashes: appending `/` to `D:\course` produced
+    /// `D:\course/`, which is a prefix of nothing the catalog holds, and a
+    /// library there claimed no file it had while looking registered.
     fn as_prefix(path: &str) -> String {
-        let trimmed = path.trim_end_matches(['/', '\\']);
+        let trimmed = path.replace('\\', "/");
+        let trimmed = trimmed.trim_end_matches('/');
         format!("{trimmed}/")
     }
 }
@@ -117,13 +123,14 @@ impl LibraryRepository for SqliteLibraryRepository {
         let candidate = Self::as_prefix(root_path);
 
         // Compared in SQL rather than by reading every library back, so this
-        // stays one query however many there are. The `||` concatenation
-        // builds each stored root's prefix the same way `as_prefix` builds
-        // the candidate's.
+        // stays one query however many there are. The `replace` and the `||`
+        // concatenation build each stored root's prefix the same way
+        // `as_prefix` builds the candidate's — forward slashes, one trailing
+        // separator — so a Windows root and a POSIX one compare alike.
         let row = sqlx::query(
             "SELECT uuid, name, root_path FROM libraries
-             WHERE ? LIKE (rtrim(root_path, '/\\') || '/%')
-                OR (rtrim(root_path, '/\\') || '/') LIKE (? || '%')
+             WHERE ? LIKE (rtrim(replace(root_path, '\\', '/'), '/') || '/%')
+                OR (rtrim(replace(root_path, '\\', '/'), '/') || '/') LIKE (? || '%')
              LIMIT 1",
         )
         .bind(&candidate)
@@ -154,7 +161,8 @@ impl LibraryRepository for SqliteLibraryRepository {
 
         let claimed = sqlx::query(
             "UPDATE files SET library_id = ?
-             WHERE library_id IS NULL AND path LIKE (? || '%')",
+             WHERE library_id IS NULL
+               AND replace(path, '\\', '/') LIKE (? || '%')",
         )
         .bind(id)
         .bind(Self::as_prefix(&root_path))

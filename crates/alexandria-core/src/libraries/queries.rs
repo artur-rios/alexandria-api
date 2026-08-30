@@ -146,13 +146,20 @@ where
 
         // Made relative here, once, so `level_of` works in one coordinate
         // system and never has to know what the root was.
-        let root = library.root_path.trim_end_matches(['/', '\\']).to_string();
+        //
+        // Both sides go through `normalize`, so a Windows catalog — whose
+        // paths are `D:\course\class-01\lecture.mp4` — reaches `level_of`
+        // in the separator it splits on. Stripping a backslash path against
+        // a backslash root did match, but every level below the top then
+        // arrived as one long name with no separator `level_of` could see,
+        // and the library reported no folders at all.
+        let root = normalize(&library.root_path);
         let relative_files = files
             .into_iter()
             .filter_map(|view| {
-                let path = view.file.path.clone();
+                let path = normalize(&view.file.path);
                 path.strip_prefix(&root)
-                    .map(|rest| (rest.trim_start_matches(['/', '\\']).to_string(), view))
+                    .map(|rest| (rest.trim_start_matches('/').to_string(), view))
             })
             .collect();
 
