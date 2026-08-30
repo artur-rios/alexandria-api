@@ -1703,6 +1703,63 @@ have only one of.
 > produced, and that a missing file surfaces as a flag the UI can act on
 > rather than as a silently shortened playlist.
 
+### UC-51: Group a folder as a library
+
+| Field | Value |
+| --- | --- |
+| **ID** | UC-51 |
+| **Name** | Group a folder as a library |
+| **Actors** | Owner |
+| **Description** | Mark an indexed folder as a *library* — a folder whose files are read in their folder structure rather than listed with every other file of their type — read one level of it, and stop treating it as one. |
+| **Preconditions** | The caller is authenticated. For a read or a removal, the library exists. |
+| **Postconditions** | The library exists and its files are claimed by it, or it no longer exists and its files are back in the type listings. No file is created, moved, or deleted by any of these operations. |
+| **Requirements** | FR-FC-36, FR-FC-37, FR-FC-38, FR-FC-39, FR-FC-40, FR-FC-24 |
+
+**Main Flow**
+
+1. The owner registers a library by submitting a name and a root path; the
+   system validates that both are non-blank, records the library, and returns
+   its UUID.
+2. The system claims every file already catalogued beneath that root, and every
+   file indexed beneath it afterwards is claimed as it is recorded — a folder is
+   usually marked after it has been indexed.
+3. From then on those files are absent from the type-filtered listings and from
+   the recently-indexed list, and present everywhere a file is addressed rather
+   than listed: search, a single-file read, and any collection, watchlist, or
+   reading list that references them.
+4. The owner lists the registered libraries, and reads one level of one — the
+   folders directly inside the addressed folder and the files directly in it.
+   The addressed folder is given relative to the library's root; absent, it is
+   the top.
+5. The owner may remove the library. The system stops treating the folder as
+   one; its files return to the type listings, and nothing on disk or in the
+   catalog is otherwise touched.
+
+**Alternative Flows**
+
+| ID | Condition | Outcome |
+| --- | --- | --- |
+| AF-01 | The submitted name or root path is blank or whitespace-only | The system rejects with an invalid-input error and registers nothing. |
+| AF-02 | The submitted folder contains, or sits inside, a library already registered | The system responds with a conflict that names the existing library, because "that folder is already inside Photography" is something the owner can act on where a bare refusal is a puzzle. |
+| AF-03 | The addressed library does not exist | The system responds with a not-found error. |
+| AF-04 | The addressed folder holds no catalogued file at any depth | The system answers an empty level rather than a not-found: a folder that exists on disk and whose files were scoped out of the index is empty, not missing. |
+| AF-05 | The caller is not authenticated | The system denies with an unauthorized error. |
+
+> **One level, not the tree.** A course with two hundred classes is a large
+> document to build, send, and parse so the owner can look at the six things in
+> one folder, and the folder they open next is one call away.
+>
+> **A library narrows where a file is listed, never what can be found.** The
+> exclusion is stated as its own requirement (FR-FC-38) rather than left
+> implicit in whichever queries happen to carry it, precisely so that a later
+> reader does not extend it to search and call that a fix.
+>
+> **Removal restores.** Marking a folder empties part of a type listing, and
+> that is not visible until after it is done — so the way back keeps every file
+> and returns it, or an accidental marking would cost the owner their catalog.
+
+---
+
 ---
 
 ## 3. Use Case — Requirements Traceability
@@ -1758,6 +1815,7 @@ have only one of.
 | UC-48: Pause, resume, or cancel an index run | FR-FC-24, FR-FC-27, FR-FC-29, FR-FC-31, FR-FC-32, FR-FC-33, FR-FC-34 |
 | UC-49: Manage a playlist | FR-TR-01, FR-TR-02, FR-TR-03, FR-TR-04, FR-TR-05, FR-TR-06, FR-TR-08, FR-TR-09, FR-FC-24 |
 | UC-50: Play a playlist | FR-TR-07, FR-TR-11, FR-FC-24 |
+| UC-51: Group a folder as a library | FR-FC-36, FR-FC-37, FR-FC-38, FR-FC-39, FR-FC-40, FR-FC-24 |
 
 Every functional requirement in [System Requirements Document](System%20Requirements%20Document.md)
 §3 appears in at least one row above except FR-AU-12, FR-AU-18, FR-AU-21,
@@ -1766,7 +1824,7 @@ shape, the account query, the Windows startup account check, the
 Windows-mode refusal of local-mode operations, the loopback-bind warning,
 and the playlist-entry cleanup a file purge performs regardless of which
 playlist use case is or is not in play, respectively) rather than tied to
-one use case: FR-FC-01..35, FR-CO-01..07, FR-BM-01..06, FR-WL-01..08,
+one use case: FR-FC-01..40, FR-CO-01..07, FR-BM-01..06, FR-WL-01..08,
 FR-RL-01..08, FR-TX-01..03, FR-AU-01..11, FR-AU-13..17, FR-AU-19, FR-AU-20,
 FR-AU-22, FR-MP-01..06, FR-TR-01..09, FR-TR-11.
 UC-37 (Health check) is specified in the
