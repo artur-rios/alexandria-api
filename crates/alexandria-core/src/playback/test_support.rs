@@ -15,7 +15,7 @@ use uuid::Uuid;
 
 use crate::auth::{AuthService, Principal};
 use crate::catalog::model::{
-    File, FileState, FileType, FileView, NewFile, StateFilter, SubtypeMetadata,
+    File, FileState, FileType, FileView, LibraryScope, NewFile, StateFilter, SubtypeMetadata,
 };
 use crate::catalog::repos::CatalogRepository;
 use crate::config::AuthMode;
@@ -126,6 +126,7 @@ impl CatalogRepository for FakeRepo {
         _file_type: Option<FileType>,
         _state: StateFilter,
         _collection_uuid: Option<Uuid>,
+        _scope: LibraryScope,
     ) -> Result<Vec<File>, DomainError> {
         unimplemented!()
     }
@@ -139,6 +140,7 @@ impl CatalogRepository for FakeRepo {
         _file_type: Option<FileType>,
         _state: StateFilter,
         _collection_uuid: Option<Uuid>,
+        _scope: LibraryScope,
     ) -> Result<Vec<FileView>, DomainError> {
         unimplemented!()
     }

@@ -1732,10 +1732,12 @@ have only one of.
 2. The system claims every file already catalogued beneath that root, and every
    file indexed beneath it afterwards is claimed as it is recorded — a folder is
    usually marked after it has been indexed.
-3. From then on those files are absent from the type-filtered listings and from
-   the recently-indexed list, and present everywhere a file is addressed rather
-   than listed: search, a single-file read, and any collection, watchlist, or
-   reading list that references them.
+3. From then on those files are absent from the type-filtered listings by
+   default, and reachable by a caller that asks the listing to reach into
+   libraries — which is how a client's search and its deleted-items review
+   stay truthful — as well as by a single-file read and by any collection,
+   watchlist, or reading list that references them. The default is the
+   exclusion, so a caller that says nothing sees the type-panel behaviour.
 4. The owner lists the registered libraries, and reads one level of one — the
    folders directly inside the addressed folder and the files directly in it.
    The addressed folder is given relative to the library's root; absent, it is
@@ -1770,6 +1772,15 @@ have only one of.
 > exclusion is stated as its own requirement (FR-FC-38) rather than left
 > implicit in whichever queries happen to carry it, precisely so that a later
 > reader does not extend it to search and call that a fix.
+>
+> **Which is why the reach is a filter, not a choice of query.** The first
+> version made the exclusion unconditional, on the reasoning that an exclusion
+> a caller can forget to pass is one that will be forgotten. True — but it
+> assumed the browsing listing had browsing callers only, and in a client with
+> no separate search call, that same listing *is* the search and *is* the
+> deleted-items review. A library's files became unfindable, and a deleted one
+> unrestorable, since a library shows only active files. The filter defaults
+> to the exclusion, so forgetting still falls the safe way.
 >
 > **Removal restores.** Marking a folder empties part of a type listing, and
 > that is not visible until after it is done — so the way back keeps every file

@@ -5,7 +5,7 @@ use sqlx::sqlite::SqlitePool;
 use uuid::Uuid;
 
 use crate::catalog::model::{
-    File, FileState, FileType, FileView, FormatKind, MediaKind, NewFile, StateFilter,
+    File, FileState, FileType, FileView, FormatKind, LibraryScope, MediaKind, NewFile, StateFilter,
     SubtypeMetadata,
 };
 use crate::errors::{DomainError, WRITE_TX};
@@ -93,6 +93,7 @@ pub trait CatalogRepository: Send + Sync {
         file_type: Option<FileType>,
         state: StateFilter,
         collection_uuid: Option<Uuid>,
+        scope: LibraryScope,
     ) -> Result<Vec<File>, DomainError>;
 
     /// List files filtered exactly as `list_filtered`, but answering the
@@ -118,6 +119,7 @@ pub trait CatalogRepository: Send + Sync {
         file_type: Option<FileType>,
         state: StateFilter,
         collection_uuid: Option<Uuid>,
+        scope: LibraryScope,
     ) -> Result<Vec<FileView>, DomainError>;
 
     /// Every active file belonging to the library `uuid` identifies.
@@ -487,6 +489,7 @@ impl SqliteCatalogRepository {
         file_type: Option<FileType>,
         state: StateFilter,
         collection_uuid: Option<Uuid>,
+        scope: LibraryScope,
     ) -> String {
         // The filters are enumerated (not user strings), so there is no SQL
         // injection surface here — every value below is still bound as a
@@ -518,16 +521,21 @@ impl SqliteCatalogRepository {
         }
 
         // Files in a library are browsed as that library's tree and nowhere
-        // else (libraries design section 3). Unconditional, and in the one
-        // helper both listings share: an exclusion a caller could forget to
-        // pass is an exclusion that will be forgotten.
+        // else (libraries design section 3) — unless the caller has asked
+        // for everything the catalog holds.
         //
-        // Only the *browsing* listings pass through here. Search, and the
-        // collection features, deliberately still see these files — a
-        // lecture recording is still a video the owner may want in a
-        // watchlist, and someone typing its name should find it.
-        sql.push_str(conj);
-        sql.push_str("library_id IS NULL");
+        // Carried by the filter rather than by which function was called,
+        // and defaulting to the exclusion, so that forgetting to say
+        // anything gives the type-panel behaviour rather than leaking a
+        // course into it. What the exclusion must NOT do is hide these files
+        // from callers that are not browsing: this application's search and
+        // its deleted-items review are both built from this listing, and an
+        // unconditional exclusion made a library's files unfindable and a
+        // deleted one unrestorable (FR-FC-38).
+        if matches!(scope, LibraryScope::OutsideLibraries) {
+            sql.push_str(conj);
+            sql.push_str("library_id IS NULL");
+        }
 
         sql.push_str(" ORDER BY path");
         sql
@@ -1143,6 +1151,7 @@ impl CatalogRepository for SqliteCatalogRepository {
         file_type: Option<FileType>,
         state: StateFilter,
         collection_uuid: Option<Uuid>,
+        scope: LibraryScope,
     ) -> Result<Vec<File>, DomainError> {
         // Build the query dynamically based on which filters are active —
         // see `list_filter_where_clause`.
@@ -1153,6 +1162,7 @@ impl CatalogRepository for SqliteCatalogRepository {
             file_type,
             state,
             collection_uuid,
+            scope,
         ));
 
         // sqlx 0.9 refuses a runtime-built SQL string unless the caller asserts
@@ -1179,6 +1189,7 @@ impl CatalogRepository for SqliteCatalogRepository {
         file_type: Option<FileType>,
         state: StateFilter,
         collection_uuid: Option<Uuid>,
+        scope: LibraryScope,
     ) -> Result<Vec<FileView>, DomainError> {
         // Same filter, built by the same helper `list_filtered` uses, with
         // `id` selected alongside the public columns — the subtype batches
@@ -1191,6 +1202,7 @@ impl CatalogRepository for SqliteCatalogRepository {
             file_type,
             state,
             collection_uuid,
+            scope,
         ));
 
         // See `list_filtered`'s matching comment: `sql` is assembled only

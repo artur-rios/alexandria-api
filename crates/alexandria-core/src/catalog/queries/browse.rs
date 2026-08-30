@@ -1,7 +1,7 @@
 use uuid::Uuid;
 
 use crate::auth::AuthService;
-use crate::catalog::model::{FileType, FileView, StateFilter};
+use crate::catalog::model::{FileType, FileView, LibraryScope, StateFilter};
 use crate::catalog::repos::CatalogRepository;
 use crate::errors::DomainError;
 
@@ -22,6 +22,10 @@ pub struct FileFilter {
     pub file_type: Option<FileType>,
     pub state: StateFilter,
     pub collection_uuid: Option<Uuid>,
+    /// Whether the listing reaches into libraries (libraries design). The
+    /// default excludes them, which is what a type panel wants; a search or
+    /// a deleted-items review asks for [`LibraryScope::Everywhere`].
+    pub scope: LibraryScope,
 }
 
 impl FileFilter {
@@ -41,6 +45,16 @@ impl FileFilter {
 
     pub fn with_collection(mut self, collection_uuid: Uuid) -> Self {
         self.collection_uuid = Some(collection_uuid);
+        self
+    }
+
+    /// Reach into libraries too — every file the rest of the filter matches.
+    ///
+    /// For the callers that are not browsing by type: a search that must
+    /// find a lecture recording by name, and a deleted-items review that
+    /// must be able to offer it back (FR-FC-38).
+    pub fn everywhere(mut self) -> Self {
+        self.scope = LibraryScope::Everywhere;
         self
     }
 }
@@ -90,7 +104,12 @@ where
         // AF-02: the caller must be authenticated.
         self.auth.authenticate(token).await?;
         self.repo
-            .list_filtered_view(filter.file_type, filter.state, filter.collection_uuid)
+            .list_filtered_view(
+                filter.file_type,
+                filter.state,
+                filter.collection_uuid,
+                filter.scope,
+            )
             .await
     }
 

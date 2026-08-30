@@ -2,7 +2,7 @@ use uuid::Uuid;
 
 use crate::auth::AuthService;
 use crate::bookmarks::repos::BookmarkRepository;
-use crate::catalog::model::StateFilter;
+use crate::catalog::model::{LibraryScope, StateFilter};
 use crate::catalog::repos::CatalogRepository;
 use crate::collections::model::{CollectionItems, CollectionKind, CollectionMembersResult};
 use crate::collections::repos::CollectionRepository;
@@ -61,7 +61,16 @@ where
         let items = match collection.kind {
             CollectionKind::File => CollectionItems::Files(
                 self.catalog_repo
-                    .list_filtered(None, StateFilter::Active, Some(collection_uuid))
+                    // Reaching into libraries: a collection lists what the
+                    // owner put in it, and a lecture recording they filed
+                    // under "to watch" does not stop being a member because
+                    // its folder is browsed as a tree (FR-FC-38).
+                    .list_filtered(
+                        None,
+                        StateFilter::Active,
+                        Some(collection_uuid),
+                        LibraryScope::Everywhere,
+                    )
                     .await?,
             ),
             CollectionKind::Bookmark => CollectionItems::Bookmarks(

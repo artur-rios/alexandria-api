@@ -2,7 +2,7 @@
 //! proves migration 20 applies, and that the exclusion is real rather than
 //! sound in principle.
 
-use alexandria_core::catalog::model::{FileType, NewFile, StateFilter};
+use alexandria_core::catalog::model::{FileType, LibraryScope, NewFile, StateFilter};
 use alexandria_core::catalog::repos::{CatalogRepository, SqliteCatalogRepository};
 use alexandria_core::errors::DomainError;
 use alexandria_core::libraries::commands::{RegisterLibraryHandler, RemoveLibraryHandler};
@@ -68,7 +68,12 @@ async fn given_a_registered_library_when_the_videos_are_listed_then_its_files_ar
     .expect("register");
 
     let listed = catalog
-        .list_filtered_view(Some(FileType::Video), StateFilter::Active, None)
+        .list_filtered_view(
+            Some(FileType::Video),
+            StateFilter::Active,
+            None,
+            LibraryScope::OutsideLibraries,
+        )
         .await
         .expect("list");
 
@@ -105,7 +110,12 @@ async fn given_a_library_when_it_is_removed_then_its_files_come_back() {
     .expect("remove");
 
     let listed = catalog
-        .list_filtered_view(Some(FileType::Video), StateFilter::Active, None)
+        .list_filtered_view(
+            Some(FileType::Video),
+            StateFilter::Active,
+            None,
+            LibraryScope::OutsideLibraries,
+        )
         .await
         .expect("list");
 
@@ -221,7 +231,12 @@ async fn given_a_library_when_a_file_is_indexed_into_it_later_then_it_is_claimed
     .await;
 
     let listed = catalog
-        .list_filtered_view(Some(FileType::Video), StateFilter::Active, None)
+        .list_filtered_view(
+            Some(FileType::Video),
+            StateFilter::Active,
+            None,
+            LibraryScope::OutsideLibraries,
+        )
         .await
         .expect("list");
     assert!(
@@ -253,7 +268,12 @@ async fn given_no_library_when_a_file_is_indexed_then_it_belongs_to_none() {
     insert(&catalog, "/library/films/a-film.mkv", FileType::Video).await;
 
     let listed = catalog
-        .list_filtered_view(Some(FileType::Video), StateFilter::Active, None)
+        .list_filtered_view(
+            Some(FileType::Video),
+            StateFilter::Active,
+            None,
+            LibraryScope::OutsideLibraries,
+        )
         .await
         .expect("list");
 
@@ -313,7 +333,12 @@ mod windows_paths {
         library_over(&pool).await;
 
         let listed = catalog
-            .list_filtered_view(Some(FileType::Video), StateFilter::Active, None)
+            .list_filtered_view(
+                Some(FileType::Video),
+                StateFilter::Active,
+                None,
+                LibraryScope::OutsideLibraries,
+            )
             .await
             .expect("list");
 
@@ -339,7 +364,12 @@ mod windows_paths {
         .await;
 
         let listed = catalog
-            .list_filtered_view(Some(FileType::Video), StateFilter::Active, None)
+            .list_filtered_view(
+                Some(FileType::Video),
+                StateFilter::Active,
+                None,
+                LibraryScope::OutsideLibraries,
+            )
             .await
             .expect("list");
 
@@ -409,6 +439,117 @@ mod windows_paths {
 
 /// Correcting a library's root when its folder moved (design section 1,
 /// FR-FC-41).
+mod reaching_in {
+    use super::*;
+    use alexandria_core::catalog::queries::browse::FileFilter;
+
+    /// A library's files must stay *findable* even though they are not
+    /// *listed*. The distinction was lost the first time: the exclusion was
+    /// unconditional, and an application whose search and whose
+    /// deleted-items review are both built from this listing could no longer
+    /// reach them at all (FR-FC-38).
+    async fn registered(pool: &sqlx::sqlite::SqlitePool) -> Uuid {
+        RegisterLibraryHandler::new(
+            FakeAuth::Allowing,
+            SqliteLibraryRepository::new(pool.clone()),
+        )
+        .register("Course", ROOT, "token")
+        .await
+        .expect("register")
+        .uuid
+    }
+
+    #[tokio::test]
+    async fn given_a_library_file_when_the_listing_reaches_in_then_it_is_answered() {
+        let (pool, catalog, _dir) = fixtures().await;
+        insert(
+            &catalog,
+            "/library/course/class-01/lecture.mp4",
+            FileType::Video,
+        )
+        .await;
+        registered(&pool).await;
+
+        let everywhere = catalog
+            .list_filtered_view(
+                Some(FileType::Video),
+                StateFilter::Active,
+                None,
+                LibraryScope::Everywhere,
+            )
+            .await
+            .expect("list");
+
+        assert_eq!(
+            everywhere.len(),
+            1,
+            "a library's file could not be reached at all — this is what \
+             makes it unsearchable"
+        );
+    }
+
+    #[tokio::test]
+    async fn given_a_library_file_when_the_listing_does_not_reach_in_then_it_is_absent() {
+        // The other half, and the one that keeps the type panels honest: the
+        // default must still exclude, or marking a folder would do nothing.
+        let (pool, catalog, _dir) = fixtures().await;
+        insert(
+            &catalog,
+            "/library/course/class-01/lecture.mp4",
+            FileType::Video,
+        )
+        .await;
+        registered(&pool).await;
+
+        let outside = catalog
+            .list_filtered_view(
+                Some(FileType::Video),
+                StateFilter::Active,
+                None,
+                LibraryScope::OutsideLibraries,
+            )
+            .await
+            .expect("list");
+
+        assert!(outside.is_empty(), "the type panel listed a library's file");
+    }
+
+    #[tokio::test]
+    async fn given_a_deleted_library_file_when_the_review_reaches_in_then_it_can_be_offered_back() {
+        // The worse of the two holes: a deleted library file appears in no
+        // type panel, in no deleted-items review, and not in its own library
+        // either — `list_in_library` answers only active files. It was the
+        // owner's data with no way back.
+        let (pool, catalog, _dir) = fixtures().await;
+        let uuid = insert(&catalog, "/library/course/syllabus.pdf", FileType::Document).await;
+        registered(&pool).await;
+        catalog.soft_delete(uuid, Utc::now()).await.expect("delete");
+
+        let review = catalog
+            .list_filtered_view(None, StateFilter::Deleted, None, LibraryScope::Everywhere)
+            .await
+            .expect("list");
+
+        assert_eq!(
+            review.iter().map(|view| view.file.uuid).collect::<Vec<_>>(),
+            vec![uuid],
+            "a deleted library file was unreachable, so it could never be \
+             restored"
+        );
+    }
+
+    #[tokio::test]
+    async fn given_the_default_filter_when_it_is_built_then_it_excludes_libraries() {
+        // The default is the narrow one deliberately: a caller that says
+        // nothing gets the type-panel behaviour, so forgetting leaks nothing.
+        assert_eq!(FileFilter::new().scope, LibraryScope::OutsideLibraries);
+        assert_eq!(
+            FileFilter::new().everywhere().scope,
+            LibraryScope::Everywhere
+        );
+    }
+}
+
 mod moving {
     use super::*;
     use alexandria_core::libraries::commands::MoveLibraryHandler;
@@ -624,7 +765,12 @@ mod moving {
         move_to(&pool, uuid, "/media/rust").await.expect("move");
 
         let listed = catalog
-            .list_filtered_view(Some(FileType::Document), StateFilter::Active, None)
+            .list_filtered_view(
+                Some(FileType::Document),
+                StateFilter::Active,
+                None,
+                LibraryScope::OutsideLibraries,
+            )
             .await
             .expect("list");
         assert!(

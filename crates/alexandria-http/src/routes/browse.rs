@@ -17,7 +17,11 @@ use crate::AppState;
 /// optional: an omitted or empty `type` means no type filter; an omitted or
 /// empty `state` defaults to `active` (excludes soft-deleted records per the
 /// use case's main-flow step 2); an omitted or empty `collectionUuid` means
-/// no collection filter. An unrecognised `type` or `state` is rejected as
+/// no collection filter; an omitted `includeLibraries` excludes files that
+/// belong to a library, and `includeLibraries=true` reaches into them
+/// (libraries design / FR-FC-38) — which is what a client's search and its
+/// deleted-items review need in order to be truthful about what the catalog
+/// holds. An unrecognised `type` or `state` is rejected as
 /// `400` invalid input rather than silently ignored — the FFI surface
 /// rejects the same inputs identically (FR-FC-24 / NFR-09). A malformed
 /// `collectionUuid` is likewise `400`; a well-formed one that matches no
@@ -30,6 +34,18 @@ pub struct FileListParams {
     pub state: Option<String>,
     #[serde(rename = "collectionUuid", default)]
     pub collection_uuid: Option<String>,
+    #[serde(rename = "includeLibraries", default)]
+    pub include_libraries: Option<String>,
+}
+
+/// Whether the caller asked to reach into libraries.
+///
+/// Only the exact string `true` does. Anything else — absent, empty,
+/// `false`, or a typo — leaves the listing excluding them, because that is
+/// the direction a mistake should fall: a course leaking into the type
+/// panels is the defect marking the folder was meant to prevent.
+fn parse_include_libraries(value: Option<&str>) -> bool {
+    matches!(value, Some("true"))
 }
 
 /// Map a state query value to the `StateFilter`, defaulting to `Active` per
@@ -76,6 +92,9 @@ pub async fn list_files(
             )))
         })?;
         filter = filter.with_collection(collection_uuid);
+    }
+    if parse_include_libraries(params.include_libraries.as_deref()) {
+        filter = filter.everywhere();
     }
 
     let files = state

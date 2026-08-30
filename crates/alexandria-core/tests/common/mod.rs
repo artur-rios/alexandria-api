@@ -32,7 +32,7 @@ use alexandria_core::catalog::fs::{FileEntry, FileStat, Filesystem};
 use alexandria_core::catalog::image_tags::{ImageMetadataReader, ImageTags};
 use alexandria_core::catalog::index_scope::IndexScope;
 use alexandria_core::catalog::model::{
-    File, FileState, FileType, FileView, NewFile, StateFilter, SubtypeMetadata,
+    File, FileState, FileType, FileView, LibraryScope, NewFile, StateFilter, SubtypeMetadata,
 };
 use alexandria_core::catalog::repos::CatalogRepository;
 use alexandria_core::catalog::run_registry::{RunPhase, RunProgress};
@@ -367,6 +367,11 @@ impl CatalogRepository for FakeCatalogRepository {
         file_type: Option<FileType>,
         state: StateFilter,
         collection_uuid: Option<Uuid>,
+        // The fake holds no library membership, so the scope changes nothing
+        // here. What it must not do is silently disagree with the real
+        // repository — the persistence tests are where the exclusion is
+        // asserted, against a database that has libraries in it.
+        _scope: LibraryScope,
     ) -> Result<Vec<File>, DomainError> {
         let files = self.files.lock().unwrap();
         let links = self.collection_links.lock().unwrap();
@@ -405,9 +410,10 @@ impl CatalogRepository for FakeCatalogRepository {
         file_type: Option<FileType>,
         state: StateFilter,
         collection_uuid: Option<Uuid>,
+        scope: LibraryScope,
     ) -> Result<Vec<FileView>, DomainError> {
         let files = self
-            .list_filtered(file_type, state, collection_uuid)
+            .list_filtered(file_type, state, collection_uuid, scope)
             .await?;
         let metadata = self.metadata.lock().unwrap();
         let dimensions = self.dimensions.lock().unwrap();
@@ -2839,6 +2845,7 @@ impl CatalogRepository for FailingCatalogRepository {
         _file_type: Option<FileType>,
         _state: StateFilter,
         _collection_uuid: Option<Uuid>,
+        _scope: LibraryScope,
     ) -> Result<Vec<File>, DomainError> {
         unimplemented!("not reached by the run-fails-to-list path")
     }
@@ -2852,6 +2859,7 @@ impl CatalogRepository for FailingCatalogRepository {
         _file_type: Option<FileType>,
         _state: StateFilter,
         _collection_uuid: Option<Uuid>,
+        _scope: LibraryScope,
     ) -> Result<Vec<FileView>, DomainError> {
         unimplemented!("not reached by the run-fails-to-list path")
     }

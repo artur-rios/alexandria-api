@@ -251,6 +251,39 @@ pub struct FileMetadata {
     pub metadata: SubtypeMetadata,
 }
 
+/// Whether a listing reaches into libraries (libraries design, FR-FC-38).
+///
+/// A library's files are browsed as that library's tree and are absent from
+/// the type-filtered listings — that is the whole point of marking a folder.
+/// But *absent from the listings* was read as *absent from the catalog* by
+/// every caller that had only the listing to work with: an application whose
+/// search and whose deleted-items review are both built from it loses the
+/// ability to find those files at all, and a deleted one becomes
+/// unrestorable, since the library tree shows only active files.
+///
+/// So the reach is part of the filter, and the default is the narrow one: a
+/// caller that says nothing gets the type-panel behaviour, and only a caller
+/// that means "everything the catalog holds" says so.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LibraryScope {
+    /// Only files outside every library — what a type panel lists (default).
+    #[default]
+    OutsideLibraries,
+    /// Every file the filter matches, libraries included — what a search and
+    /// a deleted-items review need in order to be truthful.
+    Everywhere,
+}
+
+impl LibraryScope {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            LibraryScope::OutsideLibraries => "outsidelibraries",
+            LibraryScope::Everywhere => "everywhere",
+        }
+    }
+}
+
 /// Lifecycle filter for catalog browse queries (UC-03 / FR-FC-12). The
 /// default view excludes soft-deleted records (`Active`); the owner may
 /// explicitly request `Deleted` (only soft-deleted) or `All` (both).

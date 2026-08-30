@@ -1,4 +1,4 @@
-use alexandria_core::catalog::model::{FileType, StateFilter, SubtypeMetadata};
+use alexandria_core::catalog::model::{FileType, LibraryScope, StateFilter, SubtypeMetadata};
 use alexandria_core::catalog::repos::{CatalogRepository, SqliteCatalogRepository};
 use alexandria_core::migrate::run_migrations;
 use sqlx::sqlite::SqlitePoolOptions;
@@ -322,7 +322,12 @@ async fn given_a_pre_15_audio_row_when_migrated_then_album_artist_reads_null_not
     // columns — a mistake isolated to only one of the two would pass a test
     // that checked just the other.
     let views = repo
-        .list_filtered_view(Some(FileType::Audio), StateFilter::Active, None)
+        .list_filtered_view(
+            Some(FileType::Audio),
+            StateFilter::Active,
+            None,
+            LibraryScope::OutsideLibraries,
+        )
         .await
         .expect("list");
     assert_eq!(views.len(), 1);

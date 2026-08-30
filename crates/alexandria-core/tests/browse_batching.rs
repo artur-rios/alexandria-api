@@ -52,7 +52,9 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, Once};
 
-use alexandria_core::catalog::model::{FileType, NewFile, StateFilter, SubtypeMetadata};
+use alexandria_core::catalog::model::{
+    FileType, LibraryScope, NewFile, StateFilter, SubtypeMetadata,
+};
 use alexandria_core::catalog::repos::{CatalogRepository, SqliteCatalogRepository};
 use alexandria_core::migrate::run_migrations;
 use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
@@ -180,7 +182,12 @@ async fn given_single_type_listing_when_listed_then_query_count_is_bounded_not_p
     seed_audio_files(&small_repo, 5).await;
 
     let (small_views, small_queries) = count_queries(|| {
-        small_repo.list_filtered_view(Some(FileType::Audio), StateFilter::Active, None)
+        small_repo.list_filtered_view(
+            Some(FileType::Audio),
+            StateFilter::Active,
+            None,
+            LibraryScope::OutsideLibraries,
+        )
     })
     .await;
     let small_views = small_views.expect("list 5");
@@ -191,7 +198,12 @@ async fn given_single_type_listing_when_listed_then_query_count_is_bounded_not_p
     seed_audio_files(&large_repo, 200).await;
 
     let (large_views, large_queries) = count_queries(|| {
-        large_repo.list_filtered_view(Some(FileType::Audio), StateFilter::Active, None)
+        large_repo.list_filtered_view(
+            Some(FileType::Audio),
+            StateFilter::Active,
+            None,
+            LibraryScope::OutsideLibraries,
+        )
     })
     .await;
     let large_views = large_views.expect("list 200");
@@ -242,8 +254,15 @@ async fn given_mixed_type_listing_when_listed_then_query_count_scales_with_types
     .await
     .expect("insert video");
 
-    let (views, queries) =
-        count_queries(|| repo.list_filtered_view(None, StateFilter::Active, None)).await;
+    let (views, queries) = count_queries(|| {
+        repo.list_filtered_view(
+            None,
+            StateFilter::Active,
+            None,
+            LibraryScope::OutsideLibraries,
+        )
+    })
+    .await;
     let views = views.expect("list mixed");
     assert_eq!(views.len(), 51);
 
@@ -280,9 +299,15 @@ async fn given_a_listing_past_the_chunk_boundary_when_listed_then_every_id_is_st
     let repo = SqliteCatalogRepository::new(pool);
     seed_audio_files(&repo, 901).await;
 
-    let (views, queries) =
-        count_queries(|| repo.list_filtered_view(Some(FileType::Audio), StateFilter::Active, None))
-            .await;
+    let (views, queries) = count_queries(|| {
+        repo.list_filtered_view(
+            Some(FileType::Audio),
+            StateFilter::Active,
+            None,
+            LibraryScope::OutsideLibraries,
+        )
+    })
+    .await;
     let views = views.expect("list 901");
 
     assert_eq!(views.len(), 901, "every id must survive the chunk split");

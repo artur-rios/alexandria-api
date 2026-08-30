@@ -7,6 +7,8 @@
 
 mod common;
 
+use alexandria_core::catalog::model::{FileType, NewFile};
+use alexandria_core::catalog::repos::{CatalogRepository, SqliteCatalogRepository};
 use alexandria_core::config::Settings;
 use alexandria_http::app;
 use axum::body::{to_bytes, Body};
@@ -37,6 +39,23 @@ async fn body_json(response: axum::response::Response) -> Value {
         .await
         .expect("body");
     serde_json::from_slice(&bytes).expect("json")
+}
+
+/// Put one active document in the catalog at `path`.
+async fn seed_file(pool: &sqlx::sqlite::SqlitePool, path: &str) {
+    SqliteCatalogRepository::new(pool.clone())
+        .insert_file(NewFile {
+            uuid: uuid::Uuid::new_v4(),
+            path: path.to_string(),
+            name: path.rsplit('/').next().unwrap_or(path).to_string(),
+            file_type: FileType::Document,
+            content_hash: Some("0".repeat(64)),
+            size_bytes: None,
+            mtime: None,
+            indexed_at: chrono::Utc::now(),
+        })
+        .await
+        .expect("insert");
 }
 
 /// Register a library and answer its uuid.
@@ -178,6 +197,75 @@ async fn given_no_credential_when_a_library_is_patched_then_it_is_unauthorized()
         .expect("patch");
 
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn given_a_library_when_the_listing_asks_to_reach_in_then_its_files_are_answered() {
+    // The listing is what a client's search and its deleted-items review are
+    // built from, so "absent from the type panels" must not mean "absent from
+    // the catalog" (FR-FC-38). Both directions are asserted here, because
+    // either one alone passes for the wrong reason.
+    let harness = test_app().await;
+    let app = app(Settings::default(), harness.services.clone());
+    seed_file(&harness.pool, "/library/course/syllabus.pdf").await;
+    register(&app, "Course", "/library/course").await;
+
+    let excluded = app
+        .clone()
+        .oneshot(authed_request("GET", "/v1/files?type=document", None))
+        .await
+        .expect("list");
+    assert_eq!(
+        body_json(excluded).await.as_array().map(|a| a.len()),
+        Some(0),
+        "the type panel listed a library's file"
+    );
+
+    let included = app
+        .clone()
+        .oneshot(authed_request(
+            "GET",
+            "/v1/files?type=document&includeLibraries=true",
+            None,
+        ))
+        .await
+        .expect("list");
+    assert_eq!(
+        body_json(included).await.as_array().map(|a| a.len()),
+        Some(1),
+        "a library's file could not be reached, so nothing could find it"
+    );
+}
+
+#[tokio::test]
+async fn given_anything_but_true_when_the_listing_is_asked_then_libraries_stay_excluded() {
+    // A typo must fall towards the exclusion: a course leaking into the type
+    // panels is the defect marking the folder was meant to prevent.
+    let harness = test_app().await;
+    let app = app(Settings::default(), harness.services.clone());
+    seed_file(&harness.pool, "/library/course/syllabus.pdf").await;
+    register(&app, "Course", "/library/course").await;
+
+    for query in [
+        "includeLibraries=false",
+        "includeLibraries=1",
+        "includeLibraries=",
+    ] {
+        let response = app
+            .clone()
+            .oneshot(authed_request(
+                "GET",
+                &format!("/v1/files?type=document&{query}"),
+                None,
+            ))
+            .await
+            .expect("list");
+        assert_eq!(
+            body_json(response).await.as_array().map(|a| a.len()),
+            Some(0),
+            "`{query}` reached into libraries"
+        );
+    }
 }
 
 #[tokio::test]

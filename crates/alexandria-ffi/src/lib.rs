@@ -622,6 +622,7 @@ struct FilesListFilter {
     file_type: Option<String>,
     state: Option<String>,
     collection_uuid: Option<String>,
+    include_libraries: bool,
 }
 
 impl FilesListFilter {
@@ -647,6 +648,16 @@ impl FilesListFilter {
                 .get("collectionUuid")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string()),
+            // Only a real `true` reaches into libraries, and both the JSON
+            // boolean and the string HTTP takes are accepted so a caller
+            // built against either surface says it the same way
+            // (FR-FC-24). Anything else leaves them excluded, which is the
+            // direction a mistake should fall.
+            include_libraries: match obj.get("includeLibraries") {
+                Some(serde_json::Value::Bool(value)) => *value,
+                Some(serde_json::Value::String(value)) => value == "true",
+                _ => false,
+            },
         })
     }
 }
@@ -654,7 +665,10 @@ impl FilesListFilter {
 /// List/query files filtered by type and lifecycle state (UC-03 / FR-FC-12).
 ///
 /// `json_filters` is a JSON string `{"type":"audio","state":"all"}` (empty
-/// string or NULL for defaults). The function deserializes it, calls the same
+/// string or NULL for defaults). `{"includeLibraries":true}` reaches into
+/// libraries, which is what a caller's search and deleted-items review need
+/// (libraries design / FR-FC-38); without it a library's files are absent,
+/// as they are from the type panels. The function deserializes it, calls the same
 /// `BrowseFilesHandler` the HTTP route uses, and on success serializes the
 /// returned `Vec<FileView>` back to a JSON array — each element the same
 /// `{"file": …, "metadata": …, …}` shape `alexandria_file_get_by_uuid`
@@ -713,6 +727,9 @@ pub extern "C" fn alexandria_files_list(
             Err(_) => return FileJsonResult::err(FILE_ERR_INVALID_INPUT),
         };
         filter = filter.with_collection(collection_uuid);
+    }
+    if parsed.include_libraries {
+        filter = filter.everywhere();
     }
 
     let result =
@@ -4714,6 +4731,43 @@ mod tests {
     // `parse_priority` and `map_run_err_code` are pure logic with no
     // filesystem or database behind them, so they are unit-tested here
     // rather than through an FFI call in `tests/`.
+
+    // `includeLibraries` decides whether a caller's search can see a
+    // library's files at all, and the only thing that can go wrong on this
+    // surface is the key being read. Unit-tested here, where the parse is,
+    // rather than through a call that would prove the same thing at the cost
+    // of a database.
+
+    #[test]
+    fn given_include_libraries_true_when_the_filter_is_parsed_then_it_reaches_in() {
+        let parsed = FilesListFilter::from_json_str(r#"{"includeLibraries":true}"#).unwrap();
+        assert!(parsed.include_libraries);
+    }
+
+    #[test]
+    fn given_include_libraries_as_a_string_when_parsed_then_it_reaches_in() {
+        // What a caller written against the HTTP surface would send, where
+        // the value is a query-string `true` (FR-FC-24).
+        let parsed = FilesListFilter::from_json_str(r#"{"includeLibraries":"true"}"#).unwrap();
+        assert!(parsed.include_libraries);
+    }
+
+    #[test]
+    fn given_no_include_libraries_when_parsed_then_libraries_stay_excluded() {
+        // The default and every near-miss fall towards the exclusion: a
+        // course leaking into the type panels is the defect marking the
+        // folder was meant to prevent.
+        for body in [
+            "",
+            "{}",
+            r#"{"includeLibraries":false}"#,
+            r#"{"includeLibraries":"yes"}"#,
+            r#"{"includeLibraries":1}"#,
+        ] {
+            let parsed = FilesListFilter::from_json_str(body).unwrap();
+            assert!(!parsed.include_libraries, "`{body}` reached into libraries");
+        }
+    }
 
     #[test]
     fn given_low_when_priority_parsed_then_low() {
