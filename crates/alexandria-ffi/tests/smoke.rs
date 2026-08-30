@@ -24,15 +24,22 @@ fn serial() -> std::sync::MutexGuard<'static, ()> {
 ///
 /// Generous on purpose. UC-01 and UC-02 return immediately and finish in the
 /// background (FR-FC-08), so every assertion about their results has to poll.
-/// The runs themselves take milliseconds; what the bound has to absorb is the
-/// machine, and under `cargo test --workspace` these binaries share a host
-/// with dozens of others and a live compile. A tighter bound does not catch a
-/// slow indexer — it just reports the runner's load as a product failure.
+/// What the bound has to absorb is the machine: under `cargo test
+/// --workspace` these binaries share a host with dozens of others and a live
+/// compile, and a tighter bound does not catch a slow indexer — it just
+/// reports the runner's load as a product failure.
 ///
-/// For the counting waits it bounds a *stall* rather than the whole wait —
-/// see [`wait_for_count`]. For the status waits below, where there is no
-/// progress to measure, it is still the total.
-const ASYNC_RUN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+/// Two minutes because that is the scale of the work being waited on, not of
+/// the wait: an index of this file's 5,000-file fixture takes ~26s alone on
+/// an idle machine, and the whole suite runs on one host.
+///
+/// A stall bound was tried here instead and is the wrong shape for this
+/// workload. The catalog count does not climb steadily — it holds for
+/// twenty seconds at a time and then jumps by thousands as the walk's writes
+/// land, so "no progress for N seconds" fires on a run that is perfectly
+/// healthy and about to finish. Observed directly: a run sitting at 4,998 of
+/// 5,000 for over thirty seconds, then completing with `failed: 0`.
+const ASYNC_RUN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// The editable columns of an `audio_files` row, in the order every
 /// assertion here selects them: title, artist, album, year, genre, track,
@@ -152,33 +159,27 @@ fn run_id_string(r: &IndexStartResult) -> String {
     .into_owned()
 }
 
-/// Poll `read` until it reaches `expected`, giving up only once it *stops
-/// climbing* for [`ASYNC_RUN_DEADLINE`].
+/// Poll `read` until it reaches `expected`, within [`ASYNC_RUN_DEADLINE`].
 ///
-/// A stall rather than a total elapsed time, because the two say different
-/// things and only one of them is a defect. A walk still recording files at
-/// 2782 of 5000 when the clock ran out is a loaded runner, and failing there
-/// reports the machine as a product failure — which is exactly what happened
-/// to a documentation-only commit on `main`. A walk that has recorded nothing
-/// new for thirty seconds is stuck, and that is the condition worth a panic.
+/// The message names what was still outstanding, because that is what tells
+/// a reader whether the run was slow or wrong — "had 2782" is a loaded
+/// machine, "had 0" is a run that never started.
+///
+/// Where the caller holds a run id, prefer waiting for that run to reach a
+/// terminal status and *then* asserting the count: the run record is the
+/// authority on whether the walk is over, and this count is a derived
+/// observation of writes that land in bursts.
 fn wait_for_count(label: &str, expected: i64, read: impl Fn() -> i64) -> i64 {
-    let mut last = i64::MIN;
-    let mut since = std::time::Instant::now();
+    let deadline = std::time::Instant::now() + ASYNC_RUN_DEADLINE;
     loop {
         let count = read();
         if count >= expected {
             return count;
         }
-        if count == last {
-            assert!(
-                since.elapsed() <= ASYNC_RUN_DEADLINE,
-                "waited {ASYNC_RUN_DEADLINE:?} with no progress towards \
-                 {expected} {label}; stuck at {count}"
-            );
-        } else {
-            last = count;
-            since = std::time::Instant::now();
-        }
+        assert!(
+            std::time::Instant::now() <= deadline,
+            "timed out waiting for {expected} {label}; had {count}"
+        );
         std::thread::sleep(std::time::Duration::from_millis(25));
     }
 }
@@ -2399,7 +2400,18 @@ fn given_a_paused_refresh_run_when_resumed_over_ffi_then_it_finishes() {
         std::ptr::null(),
     );
     assert_eq!(started.status, STATUS_OK);
-    wait_for_files(5000);
+
+    // Waited on the run rather than on the count: the run record is what
+    // says the walk is over, where the count is a derived observation of
+    // writes that land in bursts — it sits still for twenty seconds and then
+    // jumps by thousands. Asserting the count only after the run is terminal
+    // makes this a fact about the index rather than about the timing.
+    let index_run = run_id_string(&started);
+    assert_eq!(
+        wait_for_run_terminal_or_paused(&index_run, &token)["status"],
+        "complete"
+    );
+    assert_eq!(alexandria_index_count_files(), 5000);
 
     // The refresh walk re-reads every one of the 5,000 cataloged files,
     // which is what gives it enough real wall-clock time for
