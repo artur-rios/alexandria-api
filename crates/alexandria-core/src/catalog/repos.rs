@@ -120,6 +120,15 @@ pub trait CatalogRepository: Send + Sync {
         collection_uuid: Option<Uuid>,
     ) -> Result<Vec<FileView>, DomainError>;
 
+    /// Every active file belonging to the library `uuid` identifies.
+    ///
+    /// The one listing that does *not* exclude library files — it is the
+    /// place they are shown (libraries design section 3). Answers the whole
+    /// library rather than one folder: the tree level is worked out from the
+    /// paths, and a query per folder would be a round trip for every click
+    /// into a course.
+    async fn list_in_library(&self, uuid: Uuid) -> Result<Vec<FileView>, DomainError>;
+
     /// Read the stored subtype metadata for the file identified by `uuid`
     /// (UC-03 single-file view / FR-FC-13). Returns `Ok(None)` when the file
     /// does not exist, when its subtype has no `SubtypeMetadata` (Text/Html),
@@ -314,6 +323,153 @@ impl SqliteCatalogRepository {
         }
     }
 
+    /// The `FileView` for each of `files`, with its subtype row attached.
+    ///
+    /// Extracted so the type listing and the library listing share it rather
+    /// than growing two copies of the batching — one query per subtype
+    /// actually present, chunked, instead of one per file (issue #116 §2).
+    /// Two copies of that would drift, and the second one would be the slow
+    /// one nobody noticed.
+    async fn views_for(&self, files: Vec<(i64, File)>) -> Result<Vec<FileView>, DomainError> {
+        // Group the internal ids by subtype, so each subtype table the
+        // result actually contains is queried exactly once (chunking
+        // aside) rather than once per file (issue #116 §2).
+        let mut audio_ids = Vec::new();
+        let mut video_ids = Vec::new();
+        let mut document_ids = Vec::new();
+        let mut comic_ids = Vec::new();
+        let mut image_ids = Vec::new();
+        for (id, file) in &files {
+            match file.file_type {
+                FileType::Audio => audio_ids.push(*id),
+                FileType::Video => video_ids.push(*id),
+                FileType::Document => document_ids.push(*id),
+                FileType::Comic => comic_ids.push(*id),
+                FileType::Image => image_ids.push(*id),
+                // Text and Html carry no SubtypeMetadata variant and no
+                // extracted scalar — nothing to batch (UC-04).
+                FileType::Text | FileType::Html => {}
+            }
+        }
+
+        // Queries 2..N: one batch per subtype present, each chunked at
+        // `MAX_SQLITE_PARAMS`. A listing of a single type touches exactly
+        // one of these five branches.
+        let audio = self.batch_audio(&audio_ids).await?;
+        let video = self.batch_video(&video_ids).await?;
+        let document = self.batch_document(&document_ids).await?;
+        let comic = self.batch_comic(&comic_ids).await?;
+        let image = self.batch_image(&image_ids).await?;
+
+        // Stitch each file to its own batch's row in memory. A missing
+        // entry (subtype row never written, or — for Text/Html — no batch
+        // ran at all) means every `FileView` field beyond `file` stays
+        // `None`, matching `get_by_uuid`'s "absent, not failing" contract.
+        let views = files
+            .into_iter()
+            .map(|(id, file)| match file.file_type {
+                FileType::Audio => FileView {
+                    file,
+                    metadata: audio.get(&id).cloned(),
+                    width: None,
+                    height: None,
+                    page_count: None,
+                    duration_seconds: None,
+                    comic_page_count: None,
+                },
+                FileType::Video => {
+                    let (metadata, duration_seconds) =
+                        video.get(&id).cloned().unwrap_or((None, None));
+                    FileView {
+                        file,
+                        metadata,
+                        width: None,
+                        height: None,
+                        page_count: None,
+                        duration_seconds,
+                        comic_page_count: None,
+                    }
+                }
+                FileType::Document => {
+                    let (metadata, page_count) = document.get(&id).cloned().unwrap_or((None, None));
+                    FileView {
+                        file,
+                        metadata,
+                        width: None,
+                        height: None,
+                        page_count,
+                        duration_seconds: None,
+                        comic_page_count: None,
+                    }
+                }
+                FileType::Comic => {
+                    let (metadata, comic_page_count) =
+                        comic.get(&id).cloned().unwrap_or((None, None));
+                    FileView {
+                        file,
+                        metadata,
+                        width: None,
+                        height: None,
+                        page_count: None,
+                        duration_seconds: None,
+                        comic_page_count,
+                    }
+                }
+                FileType::Image => {
+                    let (metadata, width, height) =
+                        image.get(&id).cloned().unwrap_or((None, None, None));
+                    FileView {
+                        file,
+                        metadata,
+                        width,
+                        height,
+                        page_count: None,
+                        duration_seconds: None,
+                        comic_page_count: None,
+                    }
+                }
+                FileType::Text | FileType::Html => FileView {
+                    file,
+                    metadata: None,
+                    width: None,
+                    height: None,
+                    page_count: None,
+                    duration_seconds: None,
+                    comic_page_count: None,
+                },
+            })
+            .collect();
+
+        Ok(views)
+    }
+
+    async fn list_in_library_impl(&self, uuid: Uuid) -> Result<Vec<FileView>, DomainError> {
+        let rows = sqlx::query_as::<_, FileRowWithId>(
+            "SELECT f.id, f.uuid, f.path, f.name, f.type, f.content_hash, f.state, \
+             f.deleted_at, f.indexed_at, f.missing_at, f.size_bytes, f.mtime \
+             FROM files f \
+             JOIN libraries l ON l.id = f.library_id \
+             WHERE l.uuid = ? AND f.state = 'active' \
+             ORDER BY f.path",
+        )
+        .bind(uuid.to_string())
+        .fetch_all(&self.pool)
+        .await?;
+
+        let files: Vec<(i64, File)> = rows
+            .into_iter()
+            .map(|row| {
+                let id = row.0;
+                let file_row: FileRow = (
+                    row.1, row.2, row.3, row.4, row.5, row.6, row.7, row.8, row.9, row.10, row.11,
+                );
+                parse_file_row(file_row).map(|file| (id, file))
+            })
+            .collect::<Result<_, _>>()?;
+
+        self.views_for(files).await
+    }
+
     /// Build the ` WHERE …`/` ORDER BY path` suffix shared by
     /// `list_filtered` and `list_filtered_view` — the two queries select
     /// different columns (`list_filtered_view` also needs the internal
@@ -358,7 +514,21 @@ impl SqliteCatalogRepository {
         if collection_uuid.is_some() {
             sql.push_str(conj);
             sql.push_str("collection_id = (SELECT id FROM collections WHERE uuid = ?)");
+            conj = " AND ";
         }
+
+        // Files in a library are browsed as that library's tree and nowhere
+        // else (libraries design section 3). Unconditional, and in the one
+        // helper both listings share: an exclusion a caller could forget to
+        // pass is an exclusion that will be forgotten.
+        //
+        // Only the *browsing* listings pass through here. Search, and the
+        // collection features, deliberately still see these files — a
+        // lecture recording is still a video the owner may want in a
+        // watchlist, and someone typing its name should find it.
+        sql.push_str(conj);
+        sql.push_str("library_id IS NULL");
+
         sql.push_str(" ORDER BY path");
         sql
     }
@@ -1027,116 +1197,11 @@ impl CatalogRepository for SqliteCatalogRepository {
             })
             .collect::<Result<_, _>>()?;
 
-        // Group the internal ids by subtype, so each subtype table the
-        // result actually contains is queried exactly once (chunking
-        // aside) rather than once per file (issue #116 §2).
-        let mut audio_ids = Vec::new();
-        let mut video_ids = Vec::new();
-        let mut document_ids = Vec::new();
-        let mut comic_ids = Vec::new();
-        let mut image_ids = Vec::new();
-        for (id, file) in &files {
-            match file.file_type {
-                FileType::Audio => audio_ids.push(*id),
-                FileType::Video => video_ids.push(*id),
-                FileType::Document => document_ids.push(*id),
-                FileType::Comic => comic_ids.push(*id),
-                FileType::Image => image_ids.push(*id),
-                // Text and Html carry no SubtypeMetadata variant and no
-                // extracted scalar — nothing to batch (UC-04).
-                FileType::Text | FileType::Html => {}
-            }
-        }
+        self.views_for(files).await
+    }
 
-        // Queries 2..N: one batch per subtype present, each chunked at
-        // `MAX_SQLITE_PARAMS`. A listing of a single type touches exactly
-        // one of these five branches.
-        let audio = self.batch_audio(&audio_ids).await?;
-        let video = self.batch_video(&video_ids).await?;
-        let document = self.batch_document(&document_ids).await?;
-        let comic = self.batch_comic(&comic_ids).await?;
-        let image = self.batch_image(&image_ids).await?;
-
-        // Stitch each file to its own batch's row in memory. A missing
-        // entry (subtype row never written, or — for Text/Html — no batch
-        // ran at all) means every `FileView` field beyond `file` stays
-        // `None`, matching `get_by_uuid`'s "absent, not failing" contract.
-        let views = files
-            .into_iter()
-            .map(|(id, file)| match file.file_type {
-                FileType::Audio => FileView {
-                    file,
-                    metadata: audio.get(&id).cloned(),
-                    width: None,
-                    height: None,
-                    page_count: None,
-                    duration_seconds: None,
-                    comic_page_count: None,
-                },
-                FileType::Video => {
-                    let (metadata, duration_seconds) =
-                        video.get(&id).cloned().unwrap_or((None, None));
-                    FileView {
-                        file,
-                        metadata,
-                        width: None,
-                        height: None,
-                        page_count: None,
-                        duration_seconds,
-                        comic_page_count: None,
-                    }
-                }
-                FileType::Document => {
-                    let (metadata, page_count) = document.get(&id).cloned().unwrap_or((None, None));
-                    FileView {
-                        file,
-                        metadata,
-                        width: None,
-                        height: None,
-                        page_count,
-                        duration_seconds: None,
-                        comic_page_count: None,
-                    }
-                }
-                FileType::Comic => {
-                    let (metadata, comic_page_count) =
-                        comic.get(&id).cloned().unwrap_or((None, None));
-                    FileView {
-                        file,
-                        metadata,
-                        width: None,
-                        height: None,
-                        page_count: None,
-                        duration_seconds: None,
-                        comic_page_count,
-                    }
-                }
-                FileType::Image => {
-                    let (metadata, width, height) =
-                        image.get(&id).cloned().unwrap_or((None, None, None));
-                    FileView {
-                        file,
-                        metadata,
-                        width,
-                        height,
-                        page_count: None,
-                        duration_seconds: None,
-                        comic_page_count: None,
-                    }
-                }
-                FileType::Text | FileType::Html => FileView {
-                    file,
-                    metadata: None,
-                    width: None,
-                    height: None,
-                    page_count: None,
-                    duration_seconds: None,
-                    comic_page_count: None,
-                },
-            })
-            .collect();
-
-        Ok(views)
+    async fn list_in_library(&self, uuid: Uuid) -> Result<Vec<FileView>, DomainError> {
+        self.list_in_library_impl(uuid).await
     }
 
     async fn find_metadata_by_uuid(
