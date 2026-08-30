@@ -406,3 +406,230 @@ mod windows_paths {
         );
     }
 }
+
+/// Correcting a library's root when its folder moved (design section 1,
+/// FR-FC-41).
+mod moving {
+    use super::*;
+    use alexandria_core::libraries::commands::MoveLibraryHandler;
+
+    async fn registered(pool: &sqlx::sqlite::SqlitePool, root: &str) -> Uuid {
+        RegisterLibraryHandler::new(
+            FakeAuth::Allowing,
+            SqliteLibraryRepository::new(pool.clone()),
+        )
+        .register("Course", root, "token")
+        .await
+        .expect("register")
+        .uuid
+    }
+
+    async fn move_to(
+        pool: &sqlx::sqlite::SqlitePool,
+        uuid: Uuid,
+        root: &str,
+    ) -> Result<alexandria_core::libraries::model::Library, DomainError> {
+        MoveLibraryHandler::new(
+            FakeAuth::Allowing,
+            SqliteLibraryRepository::new(pool.clone()),
+        )
+        .move_to(uuid, root, "token")
+        .await
+    }
+
+    async fn browse_at(pool: &sqlx::sqlite::SqlitePool, uuid: Uuid, path: &str) -> LibraryListing {
+        BrowseLibraryHandler::new(
+            FakeAuth::Allowing,
+            SqliteLibraryRepository::new(pool.clone()),
+            SqliteCatalogRepository::new(pool.clone()),
+        )
+        .browse(uuid, path, "token")
+        .await
+        .expect("browse")
+    }
+
+    #[tokio::test]
+    async fn given_a_moved_folder_when_the_root_is_corrected_then_its_files_follow() {
+        // The whole promise: one row to correct rather than a re-index. If
+        // the paths stayed behind, the library would browse as empty and the
+        // records would all go missing at the next scan.
+        let (pool, catalog, _dir) = fixtures().await;
+        let uuid = registered(&pool, ROOT).await;
+        insert(
+            &catalog,
+            "/library/course/class-01/lecture.mp4",
+            FileType::Video,
+        )
+        .await;
+        insert(&catalog, "/library/course/syllabus.pdf", FileType::Document).await;
+
+        let moved = move_to(&pool, uuid, "/media/courses/rust")
+            .await
+            .expect("move");
+
+        assert_eq!(moved.root_path, "/media/courses/rust");
+
+        let top = browse_at(&pool, uuid, "").await;
+        assert_eq!(
+            top.folders
+                .iter()
+                .map(|f| f.name.clone())
+                .collect::<Vec<_>>(),
+            vec!["class-01"],
+            "the tree did not survive the move"
+        );
+        assert_eq!(
+            top.files[0].file.path, "/media/courses/rust/syllabus.pdf",
+            "the file kept its old path"
+        );
+    }
+
+    #[tokio::test]
+    async fn given_a_moved_library_when_its_files_are_read_then_they_are_the_same_records() {
+        // What a re-index would cost, stated as an assertion: the uuid is
+        // what a watchlist, a reading position and a collection all point
+        // at, and a move must not mint a new one.
+        let (pool, catalog, _dir) = fixtures().await;
+        let uuid = registered(&pool, ROOT).await;
+        let file = insert(&catalog, "/library/course/syllabus.pdf", FileType::Document).await;
+
+        move_to(&pool, uuid, "/media/courses/rust")
+            .await
+            .expect("move");
+
+        let top = browse_at(&pool, uuid, "").await;
+        assert_eq!(top.files[0].file.uuid, file, "the record was replaced");
+    }
+
+    #[tokio::test]
+    async fn given_a_windows_library_when_it_moves_then_the_paths_below_keep_their_separators() {
+        // The root is replaced wholesale and everything below it is kept
+        // exactly as indexed — which is what makes the slice safe on a
+        // platform whose separator is not the one the comparison uses.
+        let (pool, catalog, _dir) = fixtures().await;
+        let uuid = registered(&pool, r"D:\courses\rust").await;
+        insert(
+            &catalog,
+            r"D:\courses\rust\class-01\lecture.mp4",
+            FileType::Video,
+        )
+        .await;
+
+        move_to(&pool, uuid, r"E:\media\rust").await.expect("move");
+
+        let inside = browse_at(&pool, uuid, "class-01").await;
+        assert_eq!(
+            inside.files[0].file.path,
+            r"E:\media\rust\class-01\lecture.mp4"
+        );
+    }
+
+    #[tokio::test]
+    async fn given_a_library_when_it_moves_beneath_another_then_it_is_refused_by_name() {
+        let (pool, _catalog, _dir) = fixtures().await;
+        let uuid = registered(&pool, ROOT).await;
+        RegisterLibraryHandler::new(
+            FakeAuth::Allowing,
+            SqliteLibraryRepository::new(pool.clone()),
+        )
+        .register("Photography", "/library/photos", "token")
+        .await
+        .expect("register the other");
+
+        let refused = move_to(&pool, uuid, "/library/photos/courses").await;
+
+        assert!(
+            matches!(refused, Err(DomainError::Conflict(_))),
+            "a library was moved inside another one"
+        );
+    }
+
+    #[tokio::test]
+    async fn given_a_library_when_it_moves_within_its_own_root_then_it_is_allowed() {
+        // A library always overlaps where it already is. Without excluding
+        // itself from that question, no library could ever move at all — and
+        // moving one level down is the ordinary case of a folder that was
+        // registered a level too high.
+        let (pool, catalog, _dir) = fixtures().await;
+        let uuid = registered(&pool, ROOT).await;
+        insert(
+            &catalog,
+            "/library/course/class-01/lecture.mp4",
+            FileType::Video,
+        )
+        .await;
+
+        let moved = move_to(&pool, uuid, "/library/course/class-01").await;
+
+        assert!(moved.is_ok(), "a library could not be moved within itself");
+    }
+
+    #[tokio::test]
+    async fn given_the_destination_is_already_indexed_when_the_root_is_corrected_then_it_is_refused(
+    ) {
+        // The owner indexed the new location first, so the catalog holds both
+        // copies and `files.path` is UNIQUE. Refused by name, because the way
+        // out is a decision rather than a retry.
+        let (pool, catalog, _dir) = fixtures().await;
+        let uuid = registered(&pool, ROOT).await;
+        insert(&catalog, "/library/course/syllabus.pdf", FileType::Document).await;
+        insert(
+            &catalog,
+            "/media/courses/rust/syllabus.pdf",
+            FileType::Document,
+        )
+        .await;
+
+        let refused = move_to(&pool, uuid, "/media/courses/rust").await;
+
+        assert!(
+            matches!(refused, Err(DomainError::Conflict(_))),
+            "a move collided with the catalog and was not reported as a conflict"
+        );
+
+        // And nothing moved: the transaction is the guarantee that a refused
+        // correction leaves the library exactly where it was.
+        let top = browse_at(&pool, uuid, "").await;
+        assert_eq!(top.files[0].file.path, "/library/course/syllabus.pdf");
+    }
+
+    #[tokio::test]
+    async fn given_a_library_that_does_not_exist_when_moved_then_it_is_not_found() {
+        let (pool, _catalog, _dir) = fixtures().await;
+
+        let missing = move_to(&pool, Uuid::new_v4(), "/media/courses/rust").await;
+
+        assert!(matches!(missing, Err(DomainError::NotFound)));
+    }
+
+    #[tokio::test]
+    async fn given_a_blank_root_when_a_library_is_moved_then_it_is_rejected() {
+        let (pool, _catalog, _dir) = fixtures().await;
+        let uuid = registered(&pool, ROOT).await;
+
+        let rejected = move_to(&pool, uuid, "   ").await;
+
+        assert!(matches!(rejected, Err(DomainError::InvalidInput(_))));
+    }
+
+    #[tokio::test]
+    async fn given_files_at_the_destination_when_a_library_moves_there_then_they_join_it() {
+        // The destination may already hold files indexed before the record
+        // was corrected. They belong to the library now, for the same reason
+        // registering claims what is already there.
+        let (pool, catalog, _dir) = fixtures().await;
+        let uuid = registered(&pool, ROOT).await;
+        insert(&catalog, "/media/rust/extra.pdf", FileType::Document).await;
+
+        move_to(&pool, uuid, "/media/rust").await.expect("move");
+
+        let listed = catalog
+            .list_filtered_view(Some(FileType::Document), StateFilter::Active, None)
+            .await
+            .expect("list");
+        assert!(
+            listed.is_empty(),
+            "a file at the destination stayed in the type panel"
+        );
+    }
+}

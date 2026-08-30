@@ -61,7 +61,9 @@ use crate::enrichment::providers::lrclib::LrclibClient;
 use crate::enrichment::providers::musicbrainz::MusicBrainzClient;
 use crate::enrichment::queries::ReadEnrichmentHandler;
 use crate::enrichment::repos::SqliteEnrichmentRepository;
-use crate::libraries::commands::{RegisterLibraryHandler, RemoveLibraryHandler};
+use crate::libraries::commands::{
+    MoveLibraryHandler, RegisterLibraryHandler, RemoveLibraryHandler,
+};
 use crate::libraries::queries::{BrowseLibraryHandler, ListLibrariesHandler};
 use crate::libraries::repos::SqliteLibraryRepository;
 use crate::playback::comic_page::{ComicPageHandler, ZipComicArchive};
@@ -287,6 +289,9 @@ pub type DefaultRegisterLibraryHandler =
 pub type DefaultRemoveLibraryHandler =
     RemoveLibraryHandler<RuntimeAuthService, SqliteLibraryRepository>;
 
+pub type DefaultMoveLibraryHandler =
+    MoveLibraryHandler<RuntimeAuthService, SqliteLibraryRepository>;
+
 pub type DefaultBrowseLibraryHandler =
     BrowseLibraryHandler<RuntimeAuthService, SqliteLibraryRepository, SqliteCatalogRepository>;
 
@@ -408,6 +413,7 @@ pub struct Services {
     pub read_enrichment_handler: Arc<DefaultReadEnrichmentHandler>,
     pub register_library_handler: Arc<DefaultRegisterLibraryHandler>,
     pub remove_library_handler: Arc<DefaultRemoveLibraryHandler>,
+    pub move_library_handler: Arc<DefaultMoveLibraryHandler>,
     pub browse_library_handler: Arc<DefaultBrowseLibraryHandler>,
     pub list_libraries_handler: Arc<DefaultListLibrariesHandler>,
     pub create_playlist_handler: Arc<DefaultCreatePlaylistHandler>,
@@ -794,6 +800,10 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         auth.clone(),
         SqliteLibraryRepository::new(pool.clone()),
     ));
+    let move_library_handler = Arc::new(MoveLibraryHandler::new(
+        auth.clone(),
+        SqliteLibraryRepository::new(pool.clone()),
+    ));
     let browse_library_handler = Arc::new(BrowseLibraryHandler::new(
         auth.clone(),
         SqliteLibraryRepository::new(pool.clone()),
@@ -916,6 +926,7 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         read_enrichment_handler,
         register_library_handler,
         remove_library_handler,
+        move_library_handler,
         browse_library_handler,
         list_libraries_handler,
         create_playlist_handler,

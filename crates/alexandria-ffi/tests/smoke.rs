@@ -55,11 +55,11 @@ use alexandria_ffi::{
     alexandria_index_files_json, alexandria_index_init, alexandria_index_pause,
     alexandria_index_refresh_start, alexandria_index_resume, alexandria_index_run_status_json,
     alexandria_index_runs_active_json, alexandria_index_start, alexandria_libraries_list,
-    alexandria_library_browse, alexandria_library_register, alexandria_library_remove,
-    alexandria_playlist_add_entries, alexandria_playlist_create, alexandria_playlist_delete,
-    alexandria_playlist_move_entry, alexandria_playlist_read, alexandria_playlist_remove_entry,
-    alexandria_playlist_rename, alexandria_playlists_list, FileMetadataResult, IndexStartResult,
-    PlaylistJsonResult,
+    alexandria_library_browse, alexandria_library_move, alexandria_library_register,
+    alexandria_library_remove, alexandria_playlist_add_entries, alexandria_playlist_create,
+    alexandria_playlist_delete, alexandria_playlist_move_entry, alexandria_playlist_read,
+    alexandria_playlist_remove_entry, alexandria_playlist_rename, alexandria_playlists_list,
+    FileMetadataResult, IndexStartResult, PlaylistJsonResult,
 };
 
 const STATUS_RUN_OK: i32 = alexandria_ffi::RUN_OK;
@@ -3040,6 +3040,88 @@ fn given_a_new_library_when_browsed_over_ffi_then_it_is_simply_empty() {
     assert_eq!(listing["folders"].as_array().map(|a| a.len()), Some(0));
     assert_eq!(listing["files"].as_array().map(|a| a.len()), Some(0));
     assert_eq!(listing["path"], "");
+}
+
+/// The folder moved; the record is corrected and the library answers from
+/// its new root.
+#[test]
+fn given_a_moved_folder_when_the_root_is_corrected_over_ffi_then_the_library_follows() {
+    let _g = serial();
+    let _db = init_temp_db();
+
+    let token = c(TEST_TOKEN);
+    let body = c(&serde_json::json!({"name": "Course", "rootPath": "/library/course"}).to_string());
+    let library = library_json_ok(alexandria_library_register(body.as_ptr(), token.as_ptr()));
+    let uuid = c(library["uuid"].as_str().unwrap());
+
+    let moved = c(&serde_json::json!({"rootPath": "/media/courses/rust"}).to_string());
+    let value = library_json_ok(alexandria_library_move(
+        uuid.as_ptr(),
+        moved.as_ptr(),
+        token.as_ptr(),
+    ));
+
+    assert_eq!(value["rootPath"], "/media/courses/rust");
+    assert_eq!(value["name"], "Course", "the move renamed the library");
+}
+
+/// Moving onto another library's folder is a conflict, the same refusal
+/// registering there would give.
+#[test]
+fn given_another_librarys_folder_when_moved_onto_over_ffi_then_it_is_a_conflict() {
+    let _g = serial();
+    let _db = init_temp_db();
+
+    let token = c(TEST_TOKEN);
+    let first =
+        c(&serde_json::json!({"name": "Course", "rootPath": "/library/course"}).to_string());
+    let library = library_json_ok(alexandria_library_register(first.as_ptr(), token.as_ptr()));
+    let second =
+        c(&serde_json::json!({"name": "Photos", "rootPath": "/library/photos"}).to_string());
+    library_json_ok(alexandria_library_register(second.as_ptr(), token.as_ptr()));
+
+    let uuid = c(library["uuid"].as_str().unwrap());
+    let onto = c(&serde_json::json!({"rootPath": "/library/photos/2024"}).to_string());
+
+    assert_eq!(
+        alexandria_library_move(uuid.as_ptr(), onto.as_ptr(), token.as_ptr()).status,
+        STATUS_LIBRARY_CONFLICT
+    );
+}
+
+/// A blank root is refused rather than stored, as it is on registration.
+#[test]
+fn given_a_blank_root_when_a_library_is_moved_over_ffi_then_it_is_invalid_input() {
+    let _g = serial();
+    let _db = init_temp_db();
+
+    let token = c(TEST_TOKEN);
+    let body = c(&serde_json::json!({"name": "Course", "rootPath": "/library/course"}).to_string());
+    let library = library_json_ok(alexandria_library_register(body.as_ptr(), token.as_ptr()));
+    let uuid = c(library["uuid"].as_str().unwrap());
+    let blank = c(&serde_json::json!({"rootPath": "  "}).to_string());
+
+    assert_eq!(
+        alexandria_library_move(uuid.as_ptr(), blank.as_ptr(), token.as_ptr()).status,
+        STATUS_LIBRARY_INVALID_INPUT
+    );
+}
+
+/// An unknown uuid is not found here too, so the surfaces agree on every
+/// status this call can answer (FR-FC-24).
+#[test]
+fn given_an_unknown_uuid_when_a_library_is_moved_over_ffi_then_not_found() {
+    let _g = serial();
+    let _db = init_temp_db();
+
+    let uuid = c("11111111-1111-1111-1111-111111111111");
+    let token = c(TEST_TOKEN);
+    let body = c(&serde_json::json!({"rootPath": "/media/courses"}).to_string());
+
+    assert_eq!(
+        alexandria_library_move(uuid.as_ptr(), body.as_ptr(), token.as_ptr()).status,
+        STATUS_LIBRARY_NOT_FOUND
+    );
 }
 
 /// An unknown uuid is reported as not found, matching HTTP's 404.

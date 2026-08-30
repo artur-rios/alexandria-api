@@ -146,7 +146,9 @@ pub fn app(settings: Settings, services: Arc<Services>) -> Router {
         )
         .route(
             "/v1/libraries/{uuid}",
-            get(routes::libraries::browse).delete(routes::libraries::remove),
+            get(routes::libraries::browse)
+                .patch(routes::libraries::move_root)
+                .delete(routes::libraries::remove),
         )
         .route("/v1/enrichment/runs", post(routes::enrichment::run))
         .route(

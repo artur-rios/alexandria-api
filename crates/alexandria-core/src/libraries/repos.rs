@@ -27,7 +27,29 @@ pub trait LibraryRepository: Send + Sync {
     /// neither be created inside an existing one nor wrapped around one. A
     /// file in two libraries means two answers to "where does this appear",
     /// and every screen would need a rule for choosing (design section 5).
-    async fn find_overlapping(&self, root_path: &str) -> Result<Option<Library>, DomainError>;
+    ///
+    /// `except` is the library asking. Correcting a root has to ask this
+    /// question about itself, and a library always overlaps where it already
+    /// is — so without the exception, moving a folder one level up would be
+    /// refused on the grounds that it collides with itself.
+    async fn find_overlapping(
+        &self,
+        root_path: &str,
+        except: Option<Uuid>,
+    ) -> Result<Option<Library>, DomainError>;
+
+    /// Point the library at `new_root`, taking the files it holds with it.
+    ///
+    /// The folder moved on disk; the files under it moved with it, and their
+    /// stored paths are the part that has to follow. Every claimed path has
+    /// its root replaced, so the library is browsable immediately rather than
+    /// after a re-walk of a disk that has not changed (design section 1) —
+    /// and the records keep their identity: a file's uuid, its hash, its
+    /// place in a watchlist and its progress all survive a move, which is
+    /// exactly what re-indexing at the new location would throw away.
+    ///
+    /// Returns the moved library and how many files came with it.
+    async fn move_root(&self, uuid: Uuid, new_root: &str) -> Result<(Library, u32), DomainError>;
 
     /// Attach every active file under the library's root to it.
     ///
@@ -119,7 +141,11 @@ impl LibraryRepository for SqliteLibraryRepository {
         rows.iter().map(parse_library).collect()
     }
 
-    async fn find_overlapping(&self, root_path: &str) -> Result<Option<Library>, DomainError> {
+    async fn find_overlapping(
+        &self,
+        root_path: &str,
+        except: Option<Uuid>,
+    ) -> Result<Option<Library>, DomainError> {
         let candidate = Self::as_prefix(root_path);
 
         // Compared in SQL rather than by reading every library back, so this
@@ -127,19 +153,99 @@ impl LibraryRepository for SqliteLibraryRepository {
         // concatenation build each stored root's prefix the same way
         // `as_prefix` builds the candidate's — forward slashes, one trailing
         // separator — so a Windows root and a POSIX one compare alike.
+        // `?3 IS NULL OR uuid <> ?3` rather than two queries: the exception
+        // is part of the question, not a second pass over the answer.
         let row = sqlx::query(
             "SELECT uuid, name, root_path FROM libraries
-             WHERE ? LIKE (rtrim(replace(root_path, '\\', '/'), '/') || '/%')
-                OR (rtrim(replace(root_path, '\\', '/'), '/') || '/') LIKE (? || '%')
+             WHERE (? LIKE (rtrim(replace(root_path, '\\', '/'), '/') || '/%')
+                 OR (rtrim(replace(root_path, '\\', '/'), '/') || '/') LIKE (? || '%'))
+               AND (? IS NULL OR uuid <> ?)
              LIMIT 1",
         )
         .bind(&candidate)
         .bind(&candidate)
+        .bind(except.map(|uuid| uuid.to_string()))
+        .bind(except.map(|uuid| uuid.to_string()))
         .fetch_optional(&self.pool)
         .await
         .map_err(|e| DomainError::Disk(e.to_string()))?;
 
         row.map(|row| parse_library(&row)).transpose()
+    }
+
+    async fn move_root(&self, uuid: Uuid, new_root: &str) -> Result<(Library, u32), DomainError> {
+        let mut tx = self
+            .pool
+            .begin_with(WRITE_TX)
+            .await
+            .map_err(|e| DomainError::Disk(e.to_string()))?;
+
+        let library: Option<(String, String)> =
+            sqlx::query_as("SELECT name, root_path FROM libraries WHERE uuid = ?")
+                .bind(uuid.to_string())
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|e| DomainError::Disk(e.to_string()))?;
+        let Some((name, old_root)) = library else {
+            return Err(DomainError::NotFound);
+        };
+
+        // Sliced by the old root's length rather than by matching text.
+        // Normalizing separators replaces one character with one character,
+        // so a normalized length indexes the stored path exactly — which is
+        // what lets `D:\courses\rust\class-01\x.mp4` keep its backslashes
+        // below the root while the root itself is replaced wholesale.
+        let old_len = Self::as_prefix(&old_root).len() - 1;
+        let new_root = new_root.trim_end_matches(['/', '\\']).to_string();
+
+        let moved = sqlx::query(
+            "UPDATE files SET path = ? || substr(path, ?) WHERE library_id =
+             (SELECT id FROM libraries WHERE uuid = ?)",
+        )
+        .bind(&new_root)
+        .bind(i64::try_from(old_len).unwrap_or(i64::MAX) + 1)
+        .bind(uuid.to_string())
+        .execute(&mut *tx)
+        .await
+        // A path already taken: the owner indexed the new location before
+        // correcting the root, so the catalog holds both copies. Named
+        // rather than reported as a disk error, because the way out is a
+        // decision — re-index and let the old records go missing — and not
+        // something to retry.
+        .map_err(|e| match e {
+            sqlx::Error::Database(ref db) if db.is_unique_violation() => DomainError::Conflict(
+                "the catalog already holds files at that folder; index it and remove this \
+                 library instead of moving it"
+                    .to_string(),
+            ),
+            other => DomainError::Disk(other.to_string()),
+        })?
+        .rows_affected();
+
+        sqlx::query("UPDATE libraries SET root_path = ? WHERE uuid = ?")
+            .bind(&new_root)
+            .bind(uuid.to_string())
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| match e {
+                sqlx::Error::Database(ref db) if db.is_unique_violation() => {
+                    DomainError::Conflict("another library already has that folder".to_string())
+                }
+                other => DomainError::Disk(other.to_string()),
+            })?;
+
+        tx.commit()
+            .await
+            .map_err(|e| DomainError::Disk(e.to_string()))?;
+
+        Ok((
+            Library {
+                uuid,
+                name,
+                root_path: new_root,
+            },
+            u32::try_from(moved).unwrap_or(u32::MAX),
+        ))
     }
 
     async fn claim_files(&self, uuid: Uuid) -> Result<u32, DomainError> {

@@ -1057,6 +1057,9 @@ its status and live progress, and UC-48 pauses, resumes, or cancels it.
 | AF-03 | The post-write content hash does not match the written bytes | The system re-attempts once, then returns an integrity error. |
 | AF-04 | The file UUID does not exist | The system responds with a not-found error. |
 | AF-05 | The caller is not authenticated | The system denies with an unauthorized error. |
+| AF-06 | A correction names a folder that overlaps another library | The system responds with a conflict naming it, as registration would. The library is not asked about itself: it always overlaps where it already is, so a folder that moved within its own root corrects normally. |
+| AF-07 | The catalog already holds files at the destination | The system responds with a conflict and moves nothing. The owner indexed the new location before correcting the record, so both copies exist; the way out is a decision — remove this library and register the new folder — rather than a retry. |
+| AF-08 | The destination folder does not exist on disk | The correction is recorded anyway. The core is told a root and walks it; whether the path is there is answered by the walk, and refusing here would also refuse a drive that is merely unplugged at the moment the owner fixes the record. |
 
 ---
 
@@ -1191,6 +1194,9 @@ UC-36's externally issued JWT.
 | AF-03 | The file is marked missing on disk, or its path cannot be stat'd | The system responds with a disk-error. |
 | AF-04 | The requested `Range` is unsatisfiable | The system responds with a range-not-satisfiable error. |
 | AF-05 | The caller is not authenticated | The system denies with an unauthorized error. |
+| AF-06 | A correction names a folder that overlaps another library | The system responds with a conflict naming it, as registration would. The library is not asked about itself: it always overlaps where it already is, so a folder that moved within its own root corrects normally. |
+| AF-07 | The catalog already holds files at the destination | The system responds with a conflict and moves nothing. The owner indexed the new location before correcting the record, so both copies exist; the way out is a decision — remove this library and register the new folder — rather than a retry. |
+| AF-08 | The destination folder does not exist on disk | The correction is recorded anyway. The core is told a root and walks it; whether the path is there is answered by the walk, and refusing here would also refuse a drive that is merely unplugged at the moment the owner fixes the record. |
 
 ---
 
@@ -1257,6 +1263,9 @@ UC-36's externally issued JWT.
 | AF-03 | The file is soft-deleted | The system rejects with an invalid-state error (restore via UC-07 first). |
 | AF-04 | The file is marked missing on disk, or its bytes cannot be read or decoded — for audio, this includes a file that cannot be opened or parsed as audio at all (missing at request time despite being marked present, corrupt, or an unsupported format such as `.wma`), told apart from AF-01's "parsed fine, but carries no picture" | The system responds with a disk-error. |
 | AF-05 | The caller is not authenticated | The system denies with an unauthorized error. |
+| AF-06 | A correction names a folder that overlaps another library | The system responds with a conflict naming it, as registration would. The library is not asked about itself: it always overlaps where it already is, so a folder that moved within its own root corrects normally. |
+| AF-07 | The catalog already holds files at the destination | The system responds with a conflict and moves nothing. The owner indexed the new location before correcting the record, so both copies exist; the way out is a decision — remove this library and register the new folder — rather than a retry. |
+| AF-08 | The destination folder does not exist on disk | The correction is recorded anyway. The core is told a root and walks it; whether the path is there is answered by the walk, and refusing here would also refuse a drive that is merely unplugged at the moment the owner fixes the record. |
 
 ---
 
@@ -1710,10 +1719,10 @@ have only one of.
 | **ID** | UC-51 |
 | **Name** | Group a folder as a library |
 | **Actors** | Owner |
-| **Description** | Mark an indexed folder as a *library* — a folder whose files are read in their folder structure rather than listed with every other file of their type — read one level of it, and stop treating it as one. |
+| **Description** | Mark an indexed folder as a *library* — a folder whose files are read in their folder structure rather than listed with every other file of their type — read one level of it, correct its root when the folder moves, and stop treating it as one. |
 | **Preconditions** | The caller is authenticated. For a read or a removal, the library exists. |
 | **Postconditions** | The library exists and its files are claimed by it, or it no longer exists and its files are back in the type listings. No file is created, moved, or deleted by any of these operations. |
-| **Requirements** | FR-FC-36, FR-FC-37, FR-FC-38, FR-FC-39, FR-FC-40, FR-FC-24 |
+| **Requirements** | FR-FC-36, FR-FC-37, FR-FC-38, FR-FC-39, FR-FC-40, FR-FC-41, FR-FC-24 |
 
 **Main Flow**
 
@@ -1731,7 +1740,12 @@ have only one of.
    folders directly inside the addressed folder and the files directly in it.
    The addressed folder is given relative to the library's root; absent, it is
    the top.
-5. The owner may remove the library. The system stops treating the folder as
+5. The owner may correct the library's root after the folder moved on disk.
+   The system points the library at the new folder and rewrites the stored
+   path of every file it holds, replacing the old root and keeping everything
+   below it exactly as indexed. Files already catalogued at the destination
+   join the library, as they would on registration.
+6. The owner may remove the library. The system stops treating the folder as
    one; its files return to the type listings, and nothing on disk or in the
    catalog is otherwise touched.
 
@@ -1744,6 +1758,9 @@ have only one of.
 | AF-03 | The addressed library does not exist | The system responds with a not-found error. |
 | AF-04 | The addressed folder holds no catalogued file at any depth | The system answers an empty level rather than a not-found: a folder that exists on disk and whose files were scoped out of the index is empty, not missing. |
 | AF-05 | The caller is not authenticated | The system denies with an unauthorized error. |
+| AF-06 | A correction names a folder that overlaps another library | The system responds with a conflict naming it, as registration would. The library is not asked about itself: it always overlaps where it already is, so a folder that moved within its own root corrects normally. |
+| AF-07 | The catalog already holds files at the destination | The system responds with a conflict and moves nothing. The owner indexed the new location before correcting the record, so both copies exist; the way out is a decision — remove this library and register the new folder — rather than a retry. |
+| AF-08 | The destination folder does not exist on disk | The correction is recorded anyway. The core is told a root and walks it; whether the path is there is answered by the walk, and refusing here would also refuse a drive that is merely unplugged at the moment the owner fixes the record. |
 
 > **One level, not the tree.** A course with two hundred classes is a large
 > document to build, send, and parse so the owner can look at the six things in
@@ -1757,6 +1774,15 @@ have only one of.
 > **Removal restores.** Marking a folder empties part of a type listing, and
 > that is not visible until after it is done — so the way back keeps every file
 > and returns it, or an accidental marking would cost the owner their catalog.
+>
+> **A move is a correction, not a re-index.** The files under a folder that
+> moved are the same files: same bytes, same hashes, same records. Re-walking
+> the new location would create a second set and leave the first to be found
+> missing at the next scan, taking with it every uuid a watchlist, a reading
+> position, or a collection points at. So the root and the paths beneath it
+> are rewritten together, in one transaction, and everything below the root is
+> kept exactly as it was indexed — which is also what lets a Windows path keep
+> its separators while the root itself is replaced.
 
 ---
 
@@ -1815,7 +1841,7 @@ have only one of.
 | UC-48: Pause, resume, or cancel an index run | FR-FC-24, FR-FC-27, FR-FC-29, FR-FC-31, FR-FC-32, FR-FC-33, FR-FC-34 |
 | UC-49: Manage a playlist | FR-TR-01, FR-TR-02, FR-TR-03, FR-TR-04, FR-TR-05, FR-TR-06, FR-TR-08, FR-TR-09, FR-FC-24 |
 | UC-50: Play a playlist | FR-TR-07, FR-TR-11, FR-FC-24 |
-| UC-51: Group a folder as a library | FR-FC-36, FR-FC-37, FR-FC-38, FR-FC-39, FR-FC-40, FR-FC-24 |
+| UC-51: Group a folder as a library | FR-FC-36, FR-FC-37, FR-FC-38, FR-FC-39, FR-FC-40, FR-FC-41, FR-FC-24 |
 
 Every functional requirement in [System Requirements Document](System%20Requirements%20Document.md)
 §3 appears in at least one row above except FR-AU-12, FR-AU-18, FR-AU-21,

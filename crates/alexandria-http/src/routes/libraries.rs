@@ -103,6 +103,46 @@ pub async fn browse(
     Ok((StatusCode::OK, Json(listing)))
 }
 
+/// Body for `PATCH /v1/libraries/{uuid}`: where the folder is now.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MoveLibraryRequest {
+    pub root_path: String,
+}
+
+/// `PATCH /v1/libraries/{uuid}` — the folder moved; correct the record.
+///
+/// Returns `200` with the moved library, `400` (blank path), `401`, `404`,
+/// or `409` — the destination overlaps another library, or the catalog
+/// already holds files there.
+///
+/// A correction rather than a re-index, which is the point: the files move
+/// with the root and keep their uuids, so every watchlist place, reading
+/// position and collection membership that pointed at them still does.
+/// Re-walking the new location would mint new records and leave these
+/// missing.
+pub async fn move_root(
+    State(state): State<AppState>,
+    uuid: Result<Path<Uuid>, PathRejection>,
+    headers: HeaderMap,
+    body: Result<Json<MoveLibraryRequest>, JsonRejection>,
+) -> Result<(StatusCode, Json<Library>), ApiError> {
+    let token = bearer_token(&headers);
+
+    let Path(uuid) = uuid.map_err(|_| invalid_input("path segment is not a valid UUID"))?;
+    let Json(request) =
+        body.map_err(|err| invalid_input(format!("invalid move library body: {err}")))?;
+
+    let library = state
+        .services
+        .move_library_handler
+        .move_to(uuid, &request.root_path, &token)
+        .await
+        .map_err(ApiError)?;
+
+    Ok((StatusCode::OK, Json(library)))
+}
+
 /// `DELETE /v1/libraries/{uuid}` — stop treating the folder as a library.
 ///
 /// The files are kept and return to the type panels. Marking a folder

@@ -5137,6 +5137,59 @@ pub extern "C" fn alexandria_library_register(
     }
 }
 
+/// Point a library at the folder it moved to (libraries design).
+///
+/// `json_body` is the JSON body `PATCH /v1/libraries/{uuid}` takes
+/// (`rootPath`). The library's files move with it, keeping their uuids and
+/// everything that points at them. Answers `LIBRARY_ERR_CONFLICT` when the
+/// destination overlaps another library, or when the catalog already holds
+/// files there.
+#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
+#[no_mangle]
+pub extern "C" fn alexandria_library_move(
+    uuid: *const c_char,
+    json_body: *const c_char,
+    token: *const c_char,
+) -> LibraryJsonResult {
+    let services = match services_slot().lock().unwrap().clone() {
+        Some(s) => s,
+        None => return LibraryJsonResult::err(LIBRARY_ERR_NOT_INITIALIZED),
+    };
+
+    let token = cstr_lossy(token).unwrap_or_default();
+    if !authenticated(&services, &token) {
+        return LibraryJsonResult::err(LIBRARY_ERR_UNAUTHORIZED);
+    }
+
+    let uuid = match cstr_lossy(uuid).and_then(|s| uuid::Uuid::parse_str(&s).ok()) {
+        Some(u) => u,
+        None => return LibraryJsonResult::err(LIBRARY_ERR_INVALID_INPUT),
+    };
+
+    let body = match cstr_lossy(json_body)
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+    {
+        Some(value) => value,
+        None => return LibraryJsonResult::err(LIBRARY_ERR_INVALID_INPUT),
+    };
+    let root_path = body
+        .get("rootPath")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+
+    let result = runtime().block_on(async {
+        services
+            .move_library_handler
+            .move_to(uuid, root_path, &token)
+            .await
+    });
+
+    match result {
+        Ok(library) => LibraryJsonResult::ok(serde_json::to_string(&library).unwrap_or_default()),
+        Err(err) => map_library_err(err),
+    }
+}
+
 /// Every registered library.
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]

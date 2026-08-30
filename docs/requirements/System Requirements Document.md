@@ -121,6 +121,7 @@ graph LR
 | FR-FC-38 | The system shall exclude a library's files from the type-filtered catalog listings and from the recently-indexed list, and shall continue to answer them to search, to a single-file read, and to every collection, watchlist, and reading list that references them. A library narrows where a file is *listed*, never what can be *found*. |
 | FR-FC-39 | The system shall report one level of a library at a time — the folders directly inside the addressed folder, and the files directly in it — rather than the whole tree. A course with two hundred classes is a large document to build, send, and parse so the owner can look at the six things in one folder. |
 | FR-FC-40 | The system shall stop treating a folder as a library on request, keeping every file it grouped and returning them to the type listings. Marking a folder empties part of a listing, which is not visible until after it is done, so the way back restores rather than deletes. |
+| FR-FC-41 | The system shall correct a library's root folder on request, moving the stored paths of the files it holds to match, so that a folder that moved on disk is one record to correct rather than a catalog to re-walk. The files keep their identity — a re-index at the new location would mint new records and leave every watchlist place, reading position, and collection membership pointing at records that had gone missing. The correction is refused when the destination overlaps another library, or when the catalog already holds files there. |
 
 ### 3.2 Collections (CO)
 
@@ -516,6 +517,7 @@ endpoint requires authentication from the active mode (see §7).
 | POST | /v1/libraries | Register a folder as a library, by `name` and `rootPath`. Answers a conflict when it overlaps one already registered. | FR-FC-36, FR-FC-37 |
 | GET | /v1/libraries | List every registered library. | FR-FC-36 |
 | GET | /v1/libraries/{uuid} | Report one level of a library — the folders and files directly inside the optional `path`, which is relative to its root and defaults to the top. | FR-FC-39 |
+| PATCH | /v1/libraries/{uuid} | Correct the library's `rootPath` after its folder moved, taking its files with it. | FR-FC-41 |
 | DELETE | /v1/libraries/{uuid} | Stop treating the folder as a library, keeping its files. | FR-FC-40 |
 
 `status` on the runs listing is optional and defaults to `active`, the only

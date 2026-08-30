@@ -1,4 +1,4 @@
-//! Registering and removing a library.
+//! Registering, moving, and removing a library.
 
 use uuid::Uuid;
 
@@ -54,7 +54,7 @@ where
         // Refused rather than allowed to overlap, and the existing one is
         // named: "that folder is already inside Photography" is something
         // the owner can act on, where a bare refusal is a puzzle.
-        if let Some(existing) = self.repo.find_overlapping(root_path).await? {
+        if let Some(existing) = self.repo.find_overlapping(root_path, None).await? {
             return Err(DomainError::Conflict(format!(
                 "that folder overlaps the library \"{}\"",
                 existing.name
@@ -71,6 +71,70 @@ where
             .await?;
 
         self.repo.claim_files(library.uuid).await?;
+
+        Ok(library)
+    }
+}
+
+/// Point a library at the folder it moved to (design section 1).
+pub struct MoveLibraryHandler<A, R> {
+    auth: A,
+    repo: R,
+}
+
+impl<A, R> MoveLibraryHandler<A, R>
+where
+    A: AuthService,
+    R: LibraryRepository,
+{
+    pub fn new(auth: A, repo: R) -> Self {
+        Self { auth, repo }
+    }
+
+    /// Correct the library's root to `new_root`, bringing its files with it.
+    ///
+    /// A moved folder is a correction, not a re-index: the files are the same
+    /// files, and re-walking the new location would mint new records and
+    /// leave the old ones missing — losing every uuid, every watchlist place,
+    /// and every reading position that pointed at them.
+    ///
+    /// The folder is not checked for existing on disk. The core is told a
+    /// root and walks it; whether a path is there is answered by the walk,
+    /// and refusing here would also refuse a drive that is merely unplugged
+    /// at the moment the owner corrects the record.
+    pub async fn move_to(
+        &self,
+        uuid: Uuid,
+        new_root: &str,
+        token: &str,
+    ) -> Result<Library, DomainError> {
+        self.auth.authenticate(token).await?;
+
+        if new_root.trim().is_empty() {
+            return Err(DomainError::InvalidInput("root path is blank".to_string()));
+        }
+
+        self.repo
+            .find_by_uuid(uuid)
+            .await?
+            .ok_or(DomainError::NotFound)?;
+
+        // Excluding itself, or a library would be refused for overlapping
+        // where it already is — and so could never move at all.
+        if let Some(existing) = self.repo.find_overlapping(new_root, Some(uuid)).await? {
+            return Err(DomainError::Conflict(format!(
+                "that folder overlaps the library \"{}\"",
+                existing.name
+            )));
+        }
+
+        let (library, _moved) = self.repo.move_root(uuid, new_root.trim()).await?;
+
+        // Claimed afterwards as well as moved: the destination may already
+        // hold files the owner indexed before correcting the record, and they
+        // belong to this library now for the same reason registering claims
+        // what is already there.
+        self.repo.claim_files(uuid).await?;
 
         Ok(library)
     }
