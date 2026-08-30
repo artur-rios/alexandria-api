@@ -50,10 +50,12 @@ use alexandria_ffi::{
     alexandria_index_cancel, alexandria_index_count_files, alexandria_index_count_missing,
     alexandria_index_files_json, alexandria_index_init, alexandria_index_pause,
     alexandria_index_refresh_start, alexandria_index_resume, alexandria_index_run_status_json,
-    alexandria_index_runs_active_json, alexandria_index_start, alexandria_playlist_add_entries,
-    alexandria_playlist_create, alexandria_playlist_delete, alexandria_playlist_move_entry,
-    alexandria_playlist_read, alexandria_playlist_remove_entry, alexandria_playlist_rename,
-    alexandria_playlists_list, FileMetadataResult, IndexStartResult, PlaylistJsonResult,
+    alexandria_index_runs_active_json, alexandria_index_start, alexandria_libraries_list,
+    alexandria_library_browse, alexandria_library_register, alexandria_library_remove,
+    alexandria_playlist_add_entries, alexandria_playlist_create, alexandria_playlist_delete,
+    alexandria_playlist_move_entry, alexandria_playlist_read, alexandria_playlist_remove_entry,
+    alexandria_playlist_rename, alexandria_playlists_list, FileMetadataResult, IndexStartResult,
+    PlaylistJsonResult,
 };
 
 const STATUS_RUN_OK: i32 = alexandria_ffi::RUN_OK;
@@ -82,6 +84,10 @@ const STATUS_PLAYLIST_NOT_FOUND: i32 = alexandria_ffi::PLAYLIST_ERR_NOT_FOUND;
 const STATUS_ENRICHMENT_UNAVAILABLE: i32 = alexandria_ffi::ENRICHMENT_ERR_UNAVAILABLE;
 const STATUS_ENRICHMENT_INVALID_INPUT: i32 = alexandria_ffi::ENRICHMENT_ERR_INVALID_INPUT;
 const STATUS_ENRICHMENT_OK: i32 = alexandria_ffi::ENRICHMENT_OK;
+const STATUS_LIBRARY_OK: i32 = alexandria_ffi::LIBRARY_OK;
+const STATUS_LIBRARY_CONFLICT: i32 = alexandria_ffi::LIBRARY_ERR_CONFLICT;
+const STATUS_LIBRARY_INVALID_INPUT: i32 = alexandria_ffi::LIBRARY_ERR_INVALID_INPUT;
+const STATUS_LIBRARY_NOT_FOUND: i32 = alexandria_ffi::LIBRARY_ERR_NOT_FOUND;
 
 /// Bearer token every smoke test authenticates with. A valid UUID: the
 /// active auth mode is local (`init_temp_db` sets `ALEXANDRIA_AUTH_MODE`), so
@@ -2929,4 +2935,109 @@ fn given_a_malformed_uuid_when_a_track_is_read_then_it_is_invalid_input() {
 
     assert_eq!(result.status, STATUS_ENRICHMENT_INVALID_INPUT);
     assert!(result.json.is_null());
+}
+
+// ---------------- libraries ----------------
+
+fn library_json_ok(result: alexandria_ffi::LibraryJsonResult) -> serde_json::Value {
+    assert_eq!(result.status, STATUS_LIBRARY_OK);
+    assert!(!result.json.is_null());
+    let json = unsafe { std::ffi::CStr::from_ptr(result.json) }
+        .to_string_lossy()
+        .into_owned();
+    unsafe { alexandria_ffi::alexandria_free_string(result.json) };
+    serde_json::from_str(&json).expect("library json")
+}
+
+/// Registering answers the library, and it is then listed.
+#[test]
+fn given_a_folder_when_registered_over_ffi_then_it_is_a_library() {
+    let _g = serial();
+    let _db = init_temp_db();
+
+    let body = c(&serde_json::json!({
+        "name": "Course",
+        "rootPath": "/library/course"
+    })
+    .to_string());
+    let token = c(TEST_TOKEN);
+    let value = library_json_ok(alexandria_library_register(body.as_ptr(), token.as_ptr()));
+
+    assert_eq!(value["name"], "Course");
+    assert!(uuid::Uuid::parse_str(value["uuid"].as_str().unwrap_or_default()).is_ok());
+
+    let listed = library_json_ok(alexandria_libraries_list(token.as_ptr()));
+    assert_eq!(listed.as_array().map(|a| a.len()), Some(1));
+}
+
+/// An overlapping folder is a conflict, not an invalid input: the request was
+/// well formed and the folder is real — what is wrong is the current state.
+#[test]
+fn given_an_overlapping_folder_when_registered_over_ffi_then_it_is_a_conflict() {
+    let _g = serial();
+    let _db = init_temp_db();
+
+    let token = c(TEST_TOKEN);
+    let first =
+        c(&serde_json::json!({"name": "Course", "rootPath": "/library/course"}).to_string());
+    library_json_ok(alexandria_library_register(first.as_ptr(), token.as_ptr()));
+
+    let nested =
+        c(&serde_json::json!({"name": "Week", "rootPath": "/library/course/week-1"}).to_string());
+    let result = alexandria_library_register(nested.as_ptr(), token.as_ptr());
+
+    assert_eq!(result.status, STATUS_LIBRARY_CONFLICT);
+}
+
+/// A blank name never becomes a stored blank.
+#[test]
+fn given_a_blank_name_when_registered_over_ffi_then_it_is_invalid_input() {
+    let _g = serial();
+    let _db = init_temp_db();
+
+    let body = c(&serde_json::json!({"name": "   ", "rootPath": "/library/course"}).to_string());
+    let token = c(TEST_TOKEN);
+
+    assert_eq!(
+        alexandria_library_register(body.as_ptr(), token.as_ptr()).status,
+        STATUS_LIBRARY_INVALID_INPUT
+    );
+}
+
+/// Browsing an empty library answers a level rather than failing: a folder
+/// with nothing indexed under it yet is a state, not an error.
+#[test]
+fn given_a_new_library_when_browsed_over_ffi_then_it_is_simply_empty() {
+    let _g = serial();
+    let _db = init_temp_db();
+
+    let token = c(TEST_TOKEN);
+    let body = c(&serde_json::json!({"name": "Course", "rootPath": "/library/course"}).to_string());
+    let library = library_json_ok(alexandria_library_register(body.as_ptr(), token.as_ptr()));
+    let uuid = c(library["uuid"].as_str().unwrap());
+
+    let listing = library_json_ok(alexandria_library_browse(
+        uuid.as_ptr(),
+        std::ptr::null(),
+        token.as_ptr(),
+    ));
+
+    assert_eq!(listing["folders"].as_array().map(|a| a.len()), Some(0));
+    assert_eq!(listing["files"].as_array().map(|a| a.len()), Some(0));
+    assert_eq!(listing["path"], "");
+}
+
+/// An unknown uuid is reported as not found, matching HTTP's 404.
+#[test]
+fn given_an_unknown_uuid_when_a_library_is_removed_over_ffi_then_not_found() {
+    let _g = serial();
+    let _db = init_temp_db();
+
+    let uuid = c("11111111-1111-1111-1111-111111111111");
+    let token = c(TEST_TOKEN);
+
+    assert_eq!(
+        alexandria_library_remove(uuid.as_ptr(), token.as_ptr()).status,
+        STATUS_LIBRARY_NOT_FOUND
+    );
 }

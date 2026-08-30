@@ -5032,3 +5032,207 @@ pub extern "C" fn alexandria_enrichment_read_track(
         Err(err) => map_enrichment_err(err),
     }
 }
+
+/// FFI status codes returned by library operations (libraries design). Its
+/// own set, per the convention above; `LIBRARY_OK == PLAYLIST_OK == 0`.
+pub const LIBRARY_OK: c_int = 0;
+pub const LIBRARY_ERR_INVALID_INPUT: c_int = 1;
+pub const LIBRARY_ERR_UNAUTHORIZED: c_int = 2;
+pub const LIBRARY_ERR_NOT_INITIALIZED: c_int = 3;
+pub const LIBRARY_ERR_NOT_FOUND: c_int = 4;
+/// The folder overlaps a library that already exists.
+///
+/// Its own code rather than an invalid input: the request was well formed
+/// and the folder is a real one — what is wrong is the catalog's current
+/// state, and a client that can tell the two apart says "that folder is
+/// already inside another library" instead of "that is not a folder".
+pub const LIBRARY_ERR_CONFLICT: c_int = 6;
+pub const LIBRARY_ERR_OTHER: c_int = 9;
+
+/// Result of every library FFI function. On success `status` is `LIBRARY_OK`
+/// and `json` is a NUL-terminated JSON string of the same body HTTP returns
+/// from the matching `/v1/libraries*` route (FR-FC-24 / NFR-09). The caller
+/// must free `json` with `alexandria_free_string`.
+#[repr(C)]
+#[derive(Debug)]
+pub struct LibraryJsonResult {
+    pub status: c_int,
+    pub json: *mut c_char,
+}
+
+impl LibraryJsonResult {
+    fn err(status: c_int) -> Self {
+        Self {
+            status,
+            json: std::ptr::null_mut(),
+        }
+    }
+
+    fn ok(json: String) -> Self {
+        let cstring = CString::new(json).unwrap_or_default();
+        Self {
+            status: LIBRARY_OK,
+            json: cstring.into_raw(),
+        }
+    }
+}
+
+fn map_library_err(err: DomainError) -> LibraryJsonResult {
+    match err {
+        DomainError::NotFound => LibraryJsonResult::err(LIBRARY_ERR_NOT_FOUND),
+        DomainError::Unauthorized => LibraryJsonResult::err(LIBRARY_ERR_UNAUTHORIZED),
+        DomainError::InvalidInput(_) => LibraryJsonResult::err(LIBRARY_ERR_INVALID_INPUT),
+        DomainError::Conflict(_) => LibraryJsonResult::err(LIBRARY_ERR_CONFLICT),
+        _ => LibraryJsonResult::err(LIBRARY_ERR_OTHER),
+    }
+}
+
+/// Treat a folder as a library (libraries design).
+///
+/// `json_body` is the JSON body `POST /v1/libraries` takes (`name`,
+/// `rootPath`). Whatever is already indexed beneath the folder is claimed by
+/// this call. Answers `LIBRARY_ERR_CONFLICT` when the folder overlaps an
+/// existing library.
+#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
+#[no_mangle]
+pub extern "C" fn alexandria_library_register(
+    json_body: *const c_char,
+    token: *const c_char,
+) -> LibraryJsonResult {
+    let services = match services_slot().lock().unwrap().clone() {
+        Some(s) => s,
+        None => return LibraryJsonResult::err(LIBRARY_ERR_NOT_INITIALIZED),
+    };
+
+    let token = cstr_lossy(token).unwrap_or_default();
+    if !authenticated(&services, &token) {
+        return LibraryJsonResult::err(LIBRARY_ERR_UNAUTHORIZED);
+    }
+
+    let body = match cstr_lossy(json_body)
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+    {
+        Some(value) => value,
+        None => return LibraryJsonResult::err(LIBRARY_ERR_INVALID_INPUT),
+    };
+    let name = body
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    let root_path = body
+        .get("rootPath")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+
+    let result = runtime().block_on(async {
+        services
+            .register_library_handler
+            .register(name, root_path, &token)
+            .await
+    });
+
+    match result {
+        Ok(library) => LibraryJsonResult::ok(serde_json::to_string(&library).unwrap_or_default()),
+        Err(err) => map_library_err(err),
+    }
+}
+
+/// Every registered library.
+#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
+#[no_mangle]
+pub extern "C" fn alexandria_libraries_list(token: *const c_char) -> LibraryJsonResult {
+    let services = match services_slot().lock().unwrap().clone() {
+        Some(s) => s,
+        None => return LibraryJsonResult::err(LIBRARY_ERR_NOT_INITIALIZED),
+    };
+
+    let token = cstr_lossy(token).unwrap_or_default();
+    if !authenticated(&services, &token) {
+        return LibraryJsonResult::err(LIBRARY_ERR_UNAUTHORIZED);
+    }
+
+    let result = runtime().block_on(async { services.list_libraries_handler.list(&token).await });
+
+    match result {
+        Ok(libraries) => {
+            LibraryJsonResult::ok(serde_json::to_string(&libraries).unwrap_or_default())
+        }
+        Err(err) => map_library_err(err),
+    }
+}
+
+/// One level of a library's tree.
+///
+/// `path` is the folder to list, relative to the library's root; NULL or an
+/// empty string is the top. One level rather than the whole tree — see the
+/// matching HTTP route.
+#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
+#[no_mangle]
+pub extern "C" fn alexandria_library_browse(
+    uuid: *const c_char,
+    path: *const c_char,
+    token: *const c_char,
+) -> LibraryJsonResult {
+    let services = match services_slot().lock().unwrap().clone() {
+        Some(s) => s,
+        None => return LibraryJsonResult::err(LIBRARY_ERR_NOT_INITIALIZED),
+    };
+
+    let token = cstr_lossy(token).unwrap_or_default();
+    if !authenticated(&services, &token) {
+        return LibraryJsonResult::err(LIBRARY_ERR_UNAUTHORIZED);
+    }
+
+    let uuid = match cstr_lossy(uuid).and_then(|s| uuid::Uuid::parse_str(&s).ok()) {
+        Some(u) => u,
+        None => return LibraryJsonResult::err(LIBRARY_ERR_INVALID_INPUT),
+    };
+    let path = cstr_lossy(path).unwrap_or_default();
+
+    let result = runtime().block_on(async {
+        services
+            .browse_library_handler
+            .browse(uuid, &path, &token)
+            .await
+    });
+
+    match result {
+        Ok(listing) => LibraryJsonResult::ok(serde_json::to_string(&listing).unwrap_or_default()),
+        Err(err) => map_library_err(err),
+    }
+}
+
+/// Stop treating a folder as a library.
+///
+/// The files are kept and return to the type panels. On success `json`
+/// carries an empty object rather than NULL, so a caller can tell success
+/// from the failure codes without a special case.
+#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
+#[no_mangle]
+pub extern "C" fn alexandria_library_remove(
+    uuid: *const c_char,
+    token: *const c_char,
+) -> LibraryJsonResult {
+    let services = match services_slot().lock().unwrap().clone() {
+        Some(s) => s,
+        None => return LibraryJsonResult::err(LIBRARY_ERR_NOT_INITIALIZED),
+    };
+
+    let token = cstr_lossy(token).unwrap_or_default();
+    if !authenticated(&services, &token) {
+        return LibraryJsonResult::err(LIBRARY_ERR_UNAUTHORIZED);
+    }
+
+    let uuid = match cstr_lossy(uuid).and_then(|s| uuid::Uuid::parse_str(&s).ok()) {
+        Some(u) => u,
+        None => return LibraryJsonResult::err(LIBRARY_ERR_INVALID_INPUT),
+    };
+
+    let result =
+        runtime().block_on(async { services.remove_library_handler.remove(uuid, &token).await });
+
+    match result {
+        Ok(()) => LibraryJsonResult::ok("{}".to_string()),
+        Err(err) => map_library_err(err),
+    }
+}

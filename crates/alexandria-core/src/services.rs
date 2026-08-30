@@ -61,6 +61,9 @@ use crate::enrichment::providers::lrclib::LrclibClient;
 use crate::enrichment::providers::musicbrainz::MusicBrainzClient;
 use crate::enrichment::queries::ReadEnrichmentHandler;
 use crate::enrichment::repos::SqliteEnrichmentRepository;
+use crate::libraries::commands::{RegisterLibraryHandler, RemoveLibraryHandler};
+use crate::libraries::queries::{BrowseLibraryHandler, ListLibrariesHandler};
+use crate::libraries::repos::SqliteLibraryRepository;
 use crate::playback::comic_page::{ComicPageHandler, ZipComicArchive};
 use crate::playback::source::PlaybackSourceHandler;
 use crate::playback::thumbnail::{DiskThumbnailCache, ImageThumbnailRenderer, ThumbnailHandler};
@@ -278,6 +281,18 @@ pub type DefaultEnrichHandler = EnrichHandler<
 pub type DefaultReadEnrichmentHandler =
     ReadEnrichmentHandler<RuntimeAuthService, SqliteEnrichmentRepository>;
 
+pub type DefaultRegisterLibraryHandler =
+    RegisterLibraryHandler<RuntimeAuthService, SqliteLibraryRepository>;
+
+pub type DefaultRemoveLibraryHandler =
+    RemoveLibraryHandler<RuntimeAuthService, SqliteLibraryRepository>;
+
+pub type DefaultBrowseLibraryHandler =
+    BrowseLibraryHandler<RuntimeAuthService, SqliteLibraryRepository, SqliteCatalogRepository>;
+
+pub type DefaultListLibrariesHandler =
+    ListLibrariesHandler<RuntimeAuthService, SqliteLibraryRepository>;
+
 pub type DefaultCreatePlaylistHandler =
     CreatePlaylistHandler<RuntimeAuthService, SqlitePlaylistRepository>;
 
@@ -391,6 +406,10 @@ pub struct Services {
     /// so an owner who turns it on, runs it once and turns it off keeps what
     /// they fetched.
     pub read_enrichment_handler: Arc<DefaultReadEnrichmentHandler>,
+    pub register_library_handler: Arc<DefaultRegisterLibraryHandler>,
+    pub remove_library_handler: Arc<DefaultRemoveLibraryHandler>,
+    pub browse_library_handler: Arc<DefaultBrowseLibraryHandler>,
+    pub list_libraries_handler: Arc<DefaultListLibrariesHandler>,
     pub create_playlist_handler: Arc<DefaultCreatePlaylistHandler>,
     pub rename_playlist_handler: Arc<DefaultRenamePlaylistHandler>,
     pub delete_playlist_handler: Arc<DefaultDeletePlaylistHandler>,
@@ -763,6 +782,24 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         None
     };
 
+    let list_libraries_handler = Arc::new(ListLibrariesHandler::new(
+        auth.clone(),
+        SqliteLibraryRepository::new(pool.clone()),
+    ));
+    let register_library_handler = Arc::new(RegisterLibraryHandler::new(
+        auth.clone(),
+        SqliteLibraryRepository::new(pool.clone()),
+    ));
+    let remove_library_handler = Arc::new(RemoveLibraryHandler::new(
+        auth.clone(),
+        SqliteLibraryRepository::new(pool.clone()),
+    ));
+    let browse_library_handler = Arc::new(BrowseLibraryHandler::new(
+        auth.clone(),
+        SqliteLibraryRepository::new(pool.clone()),
+        SqliteCatalogRepository::new(pool.clone()),
+    ));
+
     let playlist_repo = SqlitePlaylistRepository::new(pool.clone());
     let create_playlist_handler = Arc::new(CreatePlaylistHandler::new(
         auth.clone(),
@@ -877,6 +914,10 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         delete_reading_list_handler,
         enrich_handler,
         read_enrichment_handler,
+        register_library_handler,
+        remove_library_handler,
+        browse_library_handler,
+        list_libraries_handler,
         create_playlist_handler,
         rename_playlist_handler,
         delete_playlist_handler,

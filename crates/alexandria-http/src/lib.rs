@@ -138,6 +138,16 @@ pub fn app(settings: Settings, services: Arc<Services>) -> Router {
         // because it changes what the catalog holds; reading one track's
         // stored result is a plain GET and stays available even when
         // enrichment itself is switched off.
+        // Libraries (libraries design). A folder browsed as a tree, whose
+        // files are shown only there.
+        .route(
+            "/v1/libraries",
+            post(routes::libraries::register).get(routes::libraries::list),
+        )
+        .route(
+            "/v1/libraries/{uuid}",
+            get(routes::libraries::browse).delete(routes::libraries::remove),
+        )
         .route("/v1/enrichment/runs", post(routes::enrichment::run))
         .route(
             "/v1/enrichment/tracks/{uuid}",

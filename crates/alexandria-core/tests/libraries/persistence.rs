@@ -191,3 +191,74 @@ async fn given_files_already_indexed_when_a_library_is_registered_then_they_are_
     assert_eq!(listing.folders.len(), 1, "the class folder was not seen");
     assert_eq!(listing.files.len(), 1, "the syllabus was not at the top");
 }
+
+#[tokio::test]
+async fn given_a_library_when_a_file_is_indexed_into_it_later_then_it_is_claimed_at_once() {
+    // Registration claims what is already there; this is the other half. A
+    // folder indexed again — a new class added, a re-scan after a download —
+    // must not leave its files in the type panels until somebody thinks to
+    // re-register the library.
+    //
+    // Resolved by the insert itself rather than by a sweep afterwards, so no
+    // future index path can forget to run it.
+    let (pool, catalog, _dir) = fixtures().await;
+
+    let library = RegisterLibraryHandler::new(
+        FakeAuth::Allowing,
+        SqliteLibraryRepository::new(pool.clone()),
+    )
+    .register("Course", ROOT, "token")
+    .await
+    .expect("register");
+
+    // Indexed after the library existed.
+    insert(
+        &catalog,
+        "/library/course/class-09/lecture.mp4",
+        FileType::Video,
+    )
+    .await;
+
+    let listed = catalog
+        .list_filtered_view(Some(FileType::Video), StateFilter::Active, None)
+        .await
+        .expect("list");
+    assert!(
+        listed.is_empty(),
+        "a file indexed into a library appeared in the type panel"
+    );
+
+    let listing = BrowseLibraryHandler::new(
+        FakeAuth::Allowing,
+        SqliteLibraryRepository::new(pool.clone()),
+        SqliteCatalogRepository::new(pool.clone()),
+    )
+    .browse(library.uuid, "", "token")
+    .await
+    .expect("browse");
+    assert_eq!(
+        listing.folders.len(),
+        1,
+        "the new class was not in the tree"
+    );
+}
+
+#[tokio::test]
+async fn given_no_library_when_a_file_is_indexed_then_it_belongs_to_none() {
+    // The great majority of files. The subquery must answer NULL rather than
+    // attaching them to whichever library happened to sort first.
+    let (_pool, catalog, _dir) = fixtures().await;
+
+    insert(&catalog, "/library/films/a-film.mkv", FileType::Video).await;
+
+    let listed = catalog
+        .list_filtered_view(Some(FileType::Video), StateFilter::Active, None)
+        .await
+        .expect("list");
+
+    assert_eq!(
+        listed.len(),
+        1,
+        "an ordinary file was hidden from its panel"
+    );
+}

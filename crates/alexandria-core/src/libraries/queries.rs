@@ -74,6 +74,31 @@ pub fn level_of(
     (folders, here)
 }
 
+/// Every registered library.
+///
+/// The read that makes the rest reachable: browsing addresses a uuid, and
+/// this is where those uuids come from.
+pub struct ListLibrariesHandler<A, L> {
+    auth: A,
+    libraries: L,
+}
+
+impl<A, L> ListLibrariesHandler<A, L>
+where
+    A: AuthService,
+    L: LibraryRepository,
+{
+    pub fn new(auth: A, libraries: L) -> Self {
+        Self { auth, libraries }
+    }
+
+    pub async fn list(&self, token: &str) -> Result<Vec<Library>, DomainError> {
+        self.auth.authenticate(token).await?;
+
+        self.libraries.list_all().await
+    }
+}
+
 /// Read one level of a library's tree (libraries design section 4).
 pub struct BrowseLibraryHandler<A, L, C> {
     auth: A,

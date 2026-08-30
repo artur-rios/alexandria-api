@@ -883,10 +883,21 @@ impl CatalogRepository for SqliteCatalogRepository {
         let mut tx = self.pool.begin_with(WRITE_TX).await?;
 
         sqlx::query(
+            // `library_id` is resolved here, by the insert itself, rather
+            // than claimed afterwards by whatever ran the walk. A file
+            // indexed into an existing library belongs to it from the moment
+            // it exists — and a rule the database applies is one no future
+            // index path can forget to apply (libraries design section 1).
+            //
+            // The trailing separator is what stops `/library/course` from
+            // claiming `/library/course-notes`: a different folder that
+            // merely starts with the same letters.
             "INSERT INTO files \
              (uuid, path, name, type, content_hash, size_bytes, mtime, state, deleted_at, \
-             indexed_at, missing_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, 'active', NULL, ?, NULL)",
+             indexed_at, missing_at, library_id) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, 'active', NULL, ?, NULL, \
+             (SELECT id FROM libraries \
+              WHERE ? LIKE (rtrim(root_path, '/\\') || '/%') LIMIT 1))",
         )
         .bind(new_file.uuid.to_string())
         .bind(&new_file.path)
@@ -896,6 +907,8 @@ impl CatalogRepository for SqliteCatalogRepository {
         .bind(new_file.size_bytes)
         .bind(new_file.mtime.map(|t| t.to_rfc3339()))
         .bind(new_file.indexed_at.to_rfc3339())
+        // The path a second time, for the library subquery above.
+        .bind(&new_file.path)
         .execute(&mut *tx)
         .await?;
 
