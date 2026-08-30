@@ -28,6 +28,10 @@ fn serial() -> std::sync::MutexGuard<'static, ()> {
 /// machine, and under `cargo test --workspace` these binaries share a host
 /// with dozens of others and a live compile. A tighter bound does not catch a
 /// slow indexer — it just reports the runner's load as a product failure.
+///
+/// For the counting waits it bounds a *stall* rather than the whole wait —
+/// see [`wait_for_count`]. For the status waits below, where there is no
+/// progress to measure, it is still the total.
 const ASYNC_RUN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// The editable columns of an `audio_files` row, in the order every
@@ -148,18 +152,39 @@ fn run_id_string(r: &IndexStartResult) -> String {
     .into_owned()
 }
 
-fn wait_for_files(expected: i64) -> i64 {
-    let deadline = std::time::Instant::now() + ASYNC_RUN_DEADLINE;
+/// Poll `read` until it reaches `expected`, giving up only once it *stops
+/// climbing* for [`ASYNC_RUN_DEADLINE`].
+///
+/// A stall rather than a total elapsed time, because the two say different
+/// things and only one of them is a defect. A walk still recording files at
+/// 2782 of 5000 when the clock ran out is a loaded runner, and failing there
+/// reports the machine as a product failure — which is exactly what happened
+/// to a documentation-only commit on `main`. A walk that has recorded nothing
+/// new for thirty seconds is stuck, and that is the condition worth a panic.
+fn wait_for_count(label: &str, expected: i64, read: impl Fn() -> i64) -> i64 {
+    let mut last = i64::MIN;
+    let mut since = std::time::Instant::now();
     loop {
-        let count = alexandria_index_count_files();
+        let count = read();
         if count >= expected {
             return count;
         }
-        if std::time::Instant::now() > deadline {
-            panic!("timed out waiting for {expected} files; had {count}");
+        if count == last {
+            assert!(
+                since.elapsed() <= ASYNC_RUN_DEADLINE,
+                "waited {ASYNC_RUN_DEADLINE:?} with no progress towards \
+                 {expected} {label}; stuck at {count}"
+            );
+        } else {
+            last = count;
+            since = std::time::Instant::now();
         }
         std::thread::sleep(std::time::Duration::from_millis(25));
     }
+}
+
+fn wait_for_files(expected: i64) -> i64 {
+    wait_for_count("files", expected, || alexandria_index_count_files())
 }
 
 /// The FFI surface runs the same startup gate as the HTTP binary: external
@@ -443,17 +468,7 @@ fn wait_for_run_terminal(run_id: &str, token: &CString) -> serde_json::Value {
 
 /// Wait until `missing_at IS NOT NULL` count reaches `expected` missing files.
 fn wait_for_missing(expected: i64) -> i64 {
-    let deadline = std::time::Instant::now() + ASYNC_RUN_DEADLINE;
-    loop {
-        let count = alexandria_index_count_missing();
-        if count >= expected {
-            return count;
-        }
-        if std::time::Instant::now() > deadline {
-            panic!("timed out waiting for {expected} missing; had {count}");
-        }
-        std::thread::sleep(std::time::Duration::from_millis(25));
-    }
+    wait_for_count("missing", expected, || alexandria_index_count_missing())
 }
 
 /// Task 4 rewrote what a re-index detects a change *by* — a `stat` call
