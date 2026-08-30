@@ -556,6 +556,12 @@ impl PlaylistRepository for SqlitePlaylistRepository {
                     missing,
                     file: FileView {
                         metadata: audio.get(&entry.file_id).cloned(),
+                        // A playlist entry names the track it points at, not
+                        // where that track is browsed. A library's audio can
+                        // sit on a playlist like any other (FR-FC-38); the
+                        // playlist read does not fetch the membership, and
+                        // nothing in a playlist asks about it.
+                        library_uuid: None,
                         file: entry.file,
                         width: None,
                         height: None,

@@ -14,6 +14,9 @@ fn at(path: &str) -> (String, FileView) {
     (
         path.to_string(),
         FileView {
+            // The tree arithmetic is about paths; membership is what put
+            // these rows in front of it.
+            library_uuid: None,
             file: File {
                 uuid: Uuid::new_v4(),
                 path: path.to_string(),

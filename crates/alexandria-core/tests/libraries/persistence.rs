@@ -441,7 +441,7 @@ mod windows_paths {
 /// FR-FC-41).
 mod reaching_in {
     use super::*;
-    use alexandria_core::catalog::queries::browse::FileFilter;
+    use alexandria_core::catalog::queries::browse::{BrowseFilesHandler, FileFilter};
 
     /// A library's files must stay *findable* even though they are not
     /// *listed*. The distinction was lost the first time: the exclusion was
@@ -536,6 +536,58 @@ mod reaching_in {
             "a deleted library file was unreachable, so it could never be \
              restored"
         );
+    }
+
+    #[tokio::test]
+    async fn given_a_listing_that_reached_in_when_it_is_read_then_each_row_says_where_it_lives() {
+        // A caller that reached into libraries has to be able to tell which
+        // rows it reached — a client's dashboard still owes the owner a view
+        // without them, and it has only this listing to work from.
+        let (pool, catalog, _dir) = fixtures().await;
+        insert(&catalog, "/library/course/syllabus.pdf", FileType::Document).await;
+        insert(&catalog, "/elsewhere/manual.pdf", FileType::Document).await;
+        let library = registered(&pool).await;
+
+        let everywhere = catalog
+            .list_filtered_view(
+                Some(FileType::Document),
+                StateFilter::Active,
+                None,
+                LibraryScope::Everywhere,
+            )
+            .await
+            .expect("list");
+
+        let marked: Vec<_> = everywhere
+            .iter()
+            .map(|view| (view.file.name.clone(), view.library_uuid))
+            .collect();
+
+        assert!(
+            marked.contains(&("syllabus.pdf".to_string(), Some(library))),
+            "a library's file did not say which library: {marked:?}"
+        );
+        assert!(
+            marked.contains(&("manual.pdf".to_string(), None)),
+            "a file outside every library claimed one: {marked:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn given_a_library_file_when_it_is_read_alone_then_it_says_the_same_thing() {
+        // One shape that means different things depending on how the caller
+        // got there is the kind of difference nobody notices until it is a
+        // bug.
+        let (pool, catalog, _dir) = fixtures().await;
+        let uuid = insert(&catalog, "/library/course/syllabus.pdf", FileType::Document).await;
+        let library = registered(&pool).await;
+
+        let view = BrowseFilesHandler::new(FakeAuth::Allowing, SqliteCatalogRepository::new(pool))
+            .get_by_uuid(uuid, "token")
+            .await
+            .expect("read");
+
+        assert_eq!(view.library_uuid, Some(library));
     }
 
     #[tokio::test]

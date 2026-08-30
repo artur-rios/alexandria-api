@@ -131,6 +131,10 @@ impl CatalogRepository for FakeRepo {
         unimplemented!()
     }
 
+    async fn find_library_uuid(&self, _uuid: Uuid) -> Result<Option<Uuid>, DomainError> {
+        Ok(None)
+    }
+
     async fn list_in_library(&self, _uuid: Uuid) -> Result<Vec<FileView>, DomainError> {
         Ok(Vec::new())
     }

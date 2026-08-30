@@ -122,6 +122,15 @@ pub trait CatalogRepository: Send + Sync {
         scope: LibraryScope,
     ) -> Result<Vec<FileView>, DomainError>;
 
+    /// The uuid of the library the file `uuid` identifies belongs to, or
+    /// `None` when it belongs to none.
+    ///
+    /// A read of its own so that a single-file view answers membership the
+    /// same way a listing does. One shape that means different things
+    /// depending on how the caller got there is the kind of difference
+    /// nobody notices until it is a bug.
+    async fn find_library_uuid(&self, uuid: Uuid) -> Result<Option<Uuid>, DomainError>;
+
     /// Every active file belonging to the library `uuid` identifies.
     ///
     /// The one listing that does *not* exclude library files — it is the
@@ -332,7 +341,10 @@ impl SqliteCatalogRepository {
     /// actually present, chunked, instead of one per file (issue #116 §2).
     /// Two copies of that would drift, and the second one would be the slow
     /// one nobody noticed.
-    async fn views_for(&self, files: Vec<(i64, File)>) -> Result<Vec<FileView>, DomainError> {
+    async fn views_for(
+        &self,
+        files: Vec<(i64, File, Option<Uuid>)>,
+    ) -> Result<Vec<FileView>, DomainError> {
         // Group the internal ids by subtype, so each subtype table the
         // result actually contains is queried exactly once (chunking
         // aside) rather than once per file (issue #116 §2).
@@ -341,7 +353,7 @@ impl SqliteCatalogRepository {
         let mut document_ids = Vec::new();
         let mut comic_ids = Vec::new();
         let mut image_ids = Vec::new();
-        for (id, file) in &files {
+        for (id, file, _) in &files {
             match file.file_type {
                 FileType::Audio => audio_ids.push(*id),
                 FileType::Video => video_ids.push(*id),
@@ -369,9 +381,10 @@ impl SqliteCatalogRepository {
         // `None`, matching `get_by_uuid`'s "absent, not failing" contract.
         let views = files
             .into_iter()
-            .map(|(id, file)| match file.file_type {
+            .map(|(id, file, library_uuid)| match file.file_type {
                 FileType::Audio => FileView {
                     file,
+                    library_uuid,
                     metadata: audio.get(&id).cloned(),
                     width: None,
                     height: None,
@@ -384,6 +397,7 @@ impl SqliteCatalogRepository {
                         video.get(&id).cloned().unwrap_or((None, None));
                     FileView {
                         file,
+                        library_uuid,
                         metadata,
                         width: None,
                         height: None,
@@ -396,6 +410,7 @@ impl SqliteCatalogRepository {
                     let (metadata, page_count) = document.get(&id).cloned().unwrap_or((None, None));
                     FileView {
                         file,
+                        library_uuid,
                         metadata,
                         width: None,
                         height: None,
@@ -409,6 +424,7 @@ impl SqliteCatalogRepository {
                         comic.get(&id).cloned().unwrap_or((None, None));
                     FileView {
                         file,
+                        library_uuid,
                         metadata,
                         width: None,
                         height: None,
@@ -422,6 +438,7 @@ impl SqliteCatalogRepository {
                         image.get(&id).cloned().unwrap_or((None, None, None));
                     FileView {
                         file,
+                        library_uuid,
                         metadata,
                         width,
                         height,
@@ -432,6 +449,7 @@ impl SqliteCatalogRepository {
                 }
                 FileType::Text | FileType::Html => FileView {
                     file,
+                    library_uuid,
                     metadata: None,
                     width: None,
                     height: None,
@@ -448,7 +466,7 @@ impl SqliteCatalogRepository {
     async fn list_in_library_impl(&self, uuid: Uuid) -> Result<Vec<FileView>, DomainError> {
         let rows = sqlx::query_as::<_, FileRowWithId>(
             "SELECT f.id, f.uuid, f.path, f.name, f.type, f.content_hash, f.state, \
-             f.deleted_at, f.indexed_at, f.missing_at, f.size_bytes, f.mtime \
+             f.deleted_at, f.indexed_at, f.missing_at, f.size_bytes, f.mtime, l.uuid \
              FROM files f \
              JOIN libraries l ON l.id = f.library_id \
              WHERE l.uuid = ? AND f.state = 'active' \
@@ -458,14 +476,18 @@ impl SqliteCatalogRepository {
         .fetch_all(&self.pool)
         .await?;
 
-        let files: Vec<(i64, File)> = rows
+        let files: Vec<(i64, File, Option<Uuid>)> = rows
             .into_iter()
             .map(|row| {
                 let id = row.0;
+                // An unparseable library uuid reads as "no library" rather
+                // than failing the listing: the row is still the owner's
+                // file, and one bad marker must not cost them the answer.
+                let library_uuid = row.12.as_deref().and_then(|s| Uuid::parse_str(s).ok());
                 let file_row: FileRow = (
                     row.1, row.2, row.3, row.4, row.5, row.6, row.7, row.8, row.9, row.10, row.11,
                 );
-                parse_file_row(file_row).map(|file| (id, file))
+                parse_file_row(file_row).map(|file| (id, file, library_uuid))
             })
             .collect::<Result<_, _>>()?;
 
@@ -813,6 +835,9 @@ type FileRowWithId = (
     String,
     Option<String>,
     Option<i64>,
+    Option<String>,
+    // The owning library's uuid, appended last so the `FileRow` slice above
+    // it keeps its positions.
     Option<String>,
 );
 
@@ -1195,8 +1220,13 @@ impl CatalogRepository for SqliteCatalogRepository {
         // `id` selected alongside the public columns — the subtype batches
         // below key on it, not on `uuid` (see `find_metadata_by_uuid`'s
         // doc comment).
+        // The library's uuid comes along by sub-select rather than a join,
+        // so the `WHERE` the shared helper builds keeps naming the columns
+        // of `files` without a table qualifier.
         let base = "SELECT id, uuid, path, name, type, content_hash, state, deleted_at, \
-                    indexed_at, missing_at, size_bytes, mtime FROM files";
+                    indexed_at, missing_at, size_bytes, mtime, \
+                    (SELECT uuid FROM libraries WHERE id = files.library_id) \
+                    FROM files";
         let mut sql = String::from(base);
         sql.push_str(&Self::list_filter_where_clause(
             file_type,
@@ -1219,18 +1249,35 @@ impl CatalogRepository for SqliteCatalogRepository {
 
         // Query 1: the files themselves.
         let rows = query.fetch_all(&self.pool).await?;
-        let files: Vec<(i64, File)> = rows
+        let files: Vec<(i64, File, Option<Uuid>)> = rows
             .into_iter()
             .map(|row| {
                 let id = row.0;
+                // An unparseable library uuid reads as "no library" rather
+                // than failing the listing: the row is still the owner's
+                // file, and one bad marker must not cost them the answer.
+                let library_uuid = row.12.as_deref().and_then(|s| Uuid::parse_str(s).ok());
                 let file_row: FileRow = (
                     row.1, row.2, row.3, row.4, row.5, row.6, row.7, row.8, row.9, row.10, row.11,
                 );
-                parse_file_row(file_row).map(|file| (id, file))
+                parse_file_row(file_row).map(|file| (id, file, library_uuid))
             })
             .collect::<Result<_, _>>()?;
 
         self.views_for(files).await
+    }
+
+    async fn find_library_uuid(&self, uuid: Uuid) -> Result<Option<Uuid>, DomainError> {
+        let row: Option<(String,)> = sqlx::query_as(
+            "SELECT l.uuid FROM libraries l \
+             JOIN files f ON f.library_id = l.id \
+             WHERE f.uuid = ?",
+        )
+        .bind(uuid.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row.and_then(|(uuid,)| Uuid::parse_str(&uuid).ok()))
     }
 
     async fn list_in_library(&self, uuid: Uuid) -> Result<Vec<FileView>, DomainError> {

@@ -129,6 +129,10 @@ where
 
         let metadata = self.repo.find_metadata_by_uuid(uuid).await?;
 
+        // Which library it belongs to, if any — so a single-file read says
+        // the same thing about membership as the listing it came from.
+        let library_uuid = self.repo.find_library_uuid(uuid).await?;
+
         // Issue #44 image slice: width/height live outside `SubtypeMetadata`
         // (see `find_image_dimensions`'s doc comment), so they're fetched
         // separately and only for image files.
@@ -170,6 +174,10 @@ where
 
         Ok(FileView {
             file,
+            // Read straight from the row this handler already fetched, so a
+            // single-file read says the same thing about membership as the
+            // listing it came from.
+            library_uuid,
             metadata,
             width,
             height,

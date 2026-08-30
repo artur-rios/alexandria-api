@@ -401,6 +401,10 @@ impl CatalogRepository for FakeCatalogRepository {
     /// (issue #116 §2); that claim is pinned by an integration test against
     /// real SQLite, not by this fake, so this method only needs to answer
     /// the right *shape*, not the right *query count*.
+    async fn find_library_uuid(&self, _uuid: Uuid) -> Result<Option<Uuid>, DomainError> {
+        Ok(None)
+    }
+
     async fn list_in_library(&self, _uuid: Uuid) -> Result<Vec<FileView>, DomainError> {
         Ok(Vec::new())
     }
@@ -446,6 +450,10 @@ impl CatalogRepository for FakeCatalogRepository {
                 };
                 FileView {
                     metadata: metadata.get(&uuid).cloned(),
+                    // The fake holds no library membership; the persistence
+                    // tests are where that is asserted, against a database
+                    // that has libraries in it.
+                    library_uuid: None,
                     file,
                     width,
                     height,
@@ -2848,6 +2856,10 @@ impl CatalogRepository for FailingCatalogRepository {
         _scope: LibraryScope,
     ) -> Result<Vec<File>, DomainError> {
         unimplemented!("not reached by the run-fails-to-list path")
+    }
+
+    async fn find_library_uuid(&self, _uuid: Uuid) -> Result<Option<Uuid>, DomainError> {
+        Ok(None)
     }
 
     async fn list_in_library(&self, _uuid: Uuid) -> Result<Vec<FileView>, DomainError> {

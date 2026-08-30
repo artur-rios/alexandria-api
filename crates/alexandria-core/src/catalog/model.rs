@@ -335,6 +335,16 @@ impl StateFilter {
 #[serde(rename_all = "camelCase")]
 pub struct FileView {
     pub file: File,
+    /// The library this file belongs to, or `None` when it belongs to none
+    /// (libraries design / FR-FC-38).
+    ///
+    /// Carried on every listing because a caller that reached into libraries
+    /// has to be able to tell which rows it reached: a client's dashboard
+    /// still owes the owner a view without them, and a search result is
+    /// clearer for saying where the hit lives. The uuid rather than the
+    /// name — the name is the library's own record to answer, and a listing
+    /// that repeated it would go stale the moment one was renamed.
+    pub library_uuid: Option<Uuid>,
     /// `None` when the subtype has no editable metadata (Text/Html), or when
     /// no metadata has been written to the subtype row yet.
     pub metadata: Option<SubtypeMetadata>,
