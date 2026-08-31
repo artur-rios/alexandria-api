@@ -169,6 +169,119 @@ async fn given_a_sibling_folder_with_a_shared_prefix_when_registered_then_it_is_
 }
 
 #[tokio::test]
+async fn given_a_root_holding_an_underscore_when_it_claims_then_a_sibling_is_left_alone() {
+    // `_` is LIKE's single-character wildcard, and it is also an entirely
+    // ordinary character in a folder name. Unescaped, a library at
+    // `/library/tv_shows` claimed every file under `/library/tv-shows` — a
+    // different folder — which took those files out of the type panels, put
+    // them in the wrong tree, and left `move_root` rewriting their paths by
+    // slicing at a root they were never under.
+    let (pool, catalog, _dir) = fixtures().await;
+    insert(&catalog, "/library/tv_shows/mine.mkv", FileType::Video).await;
+    let stranger = insert(&catalog, "/library/tv-shows/theirs.mkv", FileType::Video).await;
+
+    let library = RegisterLibraryHandler::new(
+        FakeAuth::Allowing,
+        SqliteLibraryRepository::new(pool.clone()),
+    )
+    .register("Shows", "/library/tv_shows", "token")
+    .await
+    .expect("register");
+
+    let listing = BrowseLibraryHandler::new(
+        FakeAuth::Allowing,
+        SqliteLibraryRepository::new(pool.clone()),
+        SqliteCatalogRepository::new(pool.clone()),
+    )
+    .browse(library.uuid, "", "token")
+    .await
+    .expect("browse");
+
+    assert_eq!(
+        listing.files.len(),
+        1,
+        "the library claimed a file from a sibling folder: {:?}",
+        listing
+            .files
+            .iter()
+            .map(|v| &v.file.path)
+            .collect::<Vec<_>>()
+    );
+
+    // And the stranger is still where it belongs: in the type panel.
+    let outside = SqliteCatalogRepository::new(pool.clone())
+        .list_filtered_view(
+            Some(FileType::Video),
+            StateFilter::Active,
+            None,
+            LibraryScope::OutsideLibraries,
+        )
+        .await
+        .expect("list");
+    assert!(
+        outside.iter().any(|view| view.file.uuid == stranger),
+        "a file outside the library vanished from the type panel"
+    );
+}
+
+#[tokio::test]
+async fn given_a_root_holding_an_underscore_when_a_sibling_is_indexed_then_it_is_not_claimed() {
+    // The other half of the same escape: the claim at insert time runs its
+    // own LIKE, so fixing only `claim_files` would leave the next scan
+    // putting the sibling's files back into the library.
+    let (pool, catalog, _dir) = fixtures().await;
+    RegisterLibraryHandler::new(
+        FakeAuth::Allowing,
+        SqliteLibraryRepository::new(pool.clone()),
+    )
+    .register("Shows", "/library/tv_shows", "token")
+    .await
+    .expect("register");
+
+    let stranger = insert(&catalog, "/library/tv-shows/theirs.mkv", FileType::Video).await;
+
+    let outside = SqliteCatalogRepository::new(pool.clone())
+        .list_filtered_view(
+            Some(FileType::Video),
+            StateFilter::Active,
+            None,
+            LibraryScope::OutsideLibraries,
+        )
+        .await
+        .expect("list");
+    assert!(
+        outside.iter().any(|view| view.file.uuid == stranger),
+        "a file indexed beside a library was claimed by it"
+    );
+}
+
+#[tokio::test]
+async fn given_a_padded_path_when_registered_then_the_overlap_is_still_refused() {
+    // The check ran on what the caller sent and the insert stored the
+    // trimmed form, so a path with leading spaces was compared as a prefix
+    // of nothing and then stored as a folder genuinely inside another
+    // library — the one state the design rules out.
+    let (pool, _catalog, _dir) = fixtures().await;
+    let handler = RegisterLibraryHandler::new(
+        FakeAuth::Allowing,
+        SqliteLibraryRepository::new(pool.clone()),
+    );
+    handler
+        .register("Course", ROOT, "token")
+        .await
+        .expect("register");
+
+    let nested = handler
+        .register("Week one", "  /library/course/class-01  ", "token")
+        .await;
+
+    match nested {
+        Err(DomainError::Conflict(message)) => assert!(message.contains("Course"), "{message}"),
+        other => panic!("expected a conflict naming the existing library, got {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn given_files_already_indexed_when_a_library_is_registered_then_they_are_claimed() {
     // A folder is usually marked *after* it has been indexed. A library that
     // showed nothing until the owner re-walked their disk would read as

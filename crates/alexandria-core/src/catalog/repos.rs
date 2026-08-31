@@ -931,13 +931,24 @@ impl CatalogRepository for SqliteCatalogRepository {
             // and the root it sits under is `D:\course` — and a prefix test
             // that appended `/` to a backslash path matched nothing at all,
             // so a library there silently claimed no file it had.
+            //
+            // The root is a LIKE *pattern* here, so its own wildcards are
+            // escaped before the trailing `/%` is appended — `_` matches any
+            // character, and a library at `/media/tv_shows` claimed every
+            // file under `/media/tv-shows` without this. `ORDER BY` pairs
+            // with the `LIMIT`: overlapping libraries are refused at
+            // registration, and if one ever slips through, the file lands in
+            // the same one on every insert rather than in whichever row the
+            // planner reached first.
             "INSERT INTO files \
              (uuid, path, name, type, content_hash, size_bytes, mtime, state, deleted_at, \
              indexed_at, missing_at, library_id) \
              VALUES (?, ?, ?, ?, ?, ?, ?, 'active', NULL, ?, NULL, \
              (SELECT id FROM libraries \
               WHERE replace(?, '\\', '/') \
-                    LIKE (rtrim(replace(root_path, '\\', '/'), '/') || '/%') \
+                    LIKE (replace(replace(rtrim(replace(root_path, '\\', '/'), '/'), \
+                                          '%', '\\%'), '_', '\\_') || '/%') ESCAPE '\\' \
+              ORDER BY length(root_path) DESC, id \
               LIMIT 1))",
         )
         .bind(new_file.uuid.to_string())

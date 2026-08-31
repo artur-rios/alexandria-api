@@ -47,7 +47,15 @@ where
         if let Some(reason) = validate_library_name(name) {
             return Err(DomainError::InvalidInput(reason.to_string()));
         }
-        if root_path.trim().is_empty() {
+        // Trimmed once, here, and every use below is of the trimmed value.
+        // The overlap check used to run on what the caller sent while the
+        // insert stored the trimmed form, so `"  /media/photos/2024"` was
+        // compared as a path with two leading spaces — a prefix of nothing —
+        // and then stored as a folder genuinely inside `/media/photos`. That
+        // produced the one state the design rules out: a file in two
+        // libraries, and two answers to where it appears.
+        let root_path = root_path.trim();
+        if root_path.is_empty() {
             return Err(DomainError::InvalidInput("root path is blank".to_string()));
         }
 
@@ -66,7 +74,7 @@ where
             .insert(NewLibrary {
                 uuid: Uuid::new_v4(),
                 name: name.trim().to_string(),
-                root_path: root_path.trim().to_string(),
+                root_path: root_path.to_string(),
             })
             .await?;
 
@@ -110,7 +118,11 @@ where
     ) -> Result<Library, DomainError> {
         self.auth.authenticate(token).await?;
 
-        if new_root.trim().is_empty() {
+        // Trimmed before it is either checked or stored, for the reason
+        // `register` above trims: checking one spelling and writing another
+        // lets a folder past the overlap rule it was meant to fail.
+        let new_root = new_root.trim();
+        if new_root.is_empty() {
             return Err(DomainError::InvalidInput("root path is blank".to_string()));
         }
 
@@ -128,7 +140,7 @@ where
             )));
         }
 
-        let (library, _moved) = self.repo.move_root(uuid, new_root.trim()).await?;
+        let (library, _moved) = self.repo.move_root(uuid, new_root).await?;
 
         // Claimed afterwards as well as moved: the destination may already
         // hold files the owner indexed before correcting the record, and they
