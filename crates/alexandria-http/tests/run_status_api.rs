@@ -11,7 +11,9 @@ use axum::http::{Request, StatusCode};
 use serde_json::Value;
 use tower::ServiceExt;
 
-use crate::common::{file_rows_with_missing, test_app, wait_for_files, write_file, TEST_TOKEN};
+use crate::common::{
+    file_rows_with_missing, test_app, wait_for_files, write_file, ASYNC_RUN_DEADLINE, TEST_TOKEN,
+};
 
 fn run_request(run_id: &str, token: Option<&str>) -> Request<Body> {
     let mut builder = Request::builder()
@@ -90,7 +92,7 @@ async fn given_a_started_run_when_polled_to_completion_then_it_reports_complete_
 
     let run_id = start_refresh(&router).await;
 
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let deadline = std::time::Instant::now() + ASYNC_RUN_DEADLINE;
     let run = loop {
         let response = router
             .clone()

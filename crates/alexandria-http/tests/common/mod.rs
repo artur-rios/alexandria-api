@@ -31,6 +31,29 @@ pub struct TestApp {
 /// `test_app()` so it always validates.
 pub const TEST_TOKEN: &str = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
 
+/// How long a poll waits on a run before it gives up.
+///
+/// Two minutes, matching `alexandria-ffi/tests/smoke.rs`, whose constant of
+/// the same name carries the full reasoning: the bound is the scale of the
+/// work being waited on, not of the wait, and every one of these binaries
+/// shares a host under `cargo test --workspace`. A deadline that trips
+/// because the runner was busy reports the runner's load as a product
+/// failure.
+///
+/// It was thirty seconds here, written out as a literal in three files and a
+/// named constant in a fourth. `run_control_api`'s whole binary finishes in
+/// about 1.5 seconds on an idle host; the same binary took 30.35 seconds
+/// when the suite ran alongside another, and a run failed on this deadline
+/// rather than on anything it was asserting. Thirty seconds is not a long
+/// wait for work that can stretch twentyfold under load — it is a short one,
+/// and it was the only thing that failed.
+///
+/// A poll returns the moment its condition holds, so raising the ceiling
+/// costs nothing on the path where the test passes. What it costs is two
+/// minutes rather than thirty seconds to notice a genuine hang, which is the
+/// trade `smoke.rs` already made.
+pub const ASYNC_RUN_DEADLINE: Duration = Duration::from_secs(120);
+
 pub async fn test_app() -> TestApp {
     let mut settings = Settings::default();
     settings.auth.mode = AuthMode::Local;
@@ -155,7 +178,7 @@ pub async fn wait_for_run_terminal(
     run_id: &str,
     token: &str,
 ) -> serde_json::Value {
-    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let deadline = std::time::Instant::now() + ASYNC_RUN_DEADLINE;
     loop {
         let request = axum::http::Request::builder()
             .method("GET")
@@ -178,7 +201,7 @@ pub async fn wait_for_run_terminal(
             return body;
         }
         if std::time::Instant::now() > deadline {
-            panic!("run {run_id} never left running");
+            panic!("run {run_id} never left running after {ASYNC_RUN_DEADLINE:?}");
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }

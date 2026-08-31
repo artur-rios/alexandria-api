@@ -86,7 +86,15 @@ fn take_json(json: *mut std::os::raw::c_char) -> String {
 /// machine, and under `cargo test --workspace` these binaries share a host
 /// with dozens of others and a live compile. A tighter bound does not catch a
 /// slow indexer — it just reports the runner's load as a product failure.
-const ASYNC_RUN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+///
+/// Two minutes, the same as `smoke.rs`'s constant of this name, whose comment
+/// carries the rest of the reasoning. This said thirty for a while, which is
+/// the one part of that argument it did not follow through: the paragraph
+/// above is about absorbing the machine, and thirty seconds does not absorb a
+/// machine running the rest of this workspace. The bound only decides how
+/// long a genuine hang takes to surface, because a poll returns the moment
+/// its condition holds.
+const ASYNC_RUN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// The editable columns of an `audio_files` row, in the order every
 /// assertion here selects them: title, artist, album, year, genre, track,
@@ -11503,7 +11511,7 @@ async fn given_a_completed_refresh_when_status_read_via_http_and_ffi_then_bodies
         .to_string();
 
     let http_body = {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let deadline = std::time::Instant::now() + ASYNC_RUN_DEADLINE;
         loop {
             let req = Request::builder()
                 .method("GET")
@@ -11544,7 +11552,7 @@ async fn given_a_completed_refresh_when_status_read_via_http_and_ffi_then_bodies
             let run_id = run_id_string(&started);
             assert!(!run_id.is_empty());
 
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            let deadline = std::time::Instant::now() + ASYNC_RUN_DEADLINE;
             loop {
                 let id = CString::new(run_id.clone()).unwrap();
                 let token = CString::new(TEST_TOKEN).unwrap();

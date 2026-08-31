@@ -15,13 +15,7 @@ use axum::http::{Request, StatusCode};
 use serde_json::Value;
 use tower::ServiceExt;
 
-use crate::common::{test_app, wait_for_run_terminal, write_file, TEST_TOKEN};
-
-/// How long a poll waits for a run's cell to go live or a run to finish
-/// before giving up. Generous for the same reason `parity.rs`'s
-/// `ASYNC_RUN_DEADLINE` is: these binaries share a host with a live compile
-/// under `cargo test --workspace`.
-const ASYNC_RUN_DEADLINE: Duration = Duration::from_secs(30);
+use crate::common::{test_app, wait_for_run_terminal, write_file, ASYNC_RUN_DEADLINE, TEST_TOKEN};
 
 fn index_request(root: &str, priority: Option<&str>) -> Request<Body> {
     let mut body = serde_json::json!({ "root": root });
@@ -469,22 +463,13 @@ async fn given_a_paused_run_when_resumed_then_202_same_run_id_and_it_finishes() 
     let lib = tempfile::tempdir().unwrap();
     write_library(&lib, 500);
 
-    let run_id = start_index(&router, lib.path().to_str().unwrap()).await;
-    wait_for_run_cell_live(&router, &run_id).await;
-
-    let pause_response = router
-        .clone()
-        .oneshot(control_request("pause", &run_id, Some(TEST_TOKEN)))
-        .await
-        .expect("pause");
-    assert_eq!(pause_response.status(), StatusCode::OK);
-    assert_eq!(
-        wait_for_run_terminal(&test.services, &run_id, TEST_TOKEN)
-            .await
-            .get("status")
-            .unwrap(),
-        "paused"
-    );
+    // Through the shared fixture rather than its own copy of it.
+    // `paused_index_run` says it was "factored out of
+    // given_a_paused_run_when_resumed_then_202_same_run_id_and_it_finishes
+    // unchanged" — the factoring happened, and this, the test it came from,
+    // was the one caller left behind. Four tests got any hardening of the
+    // fixture; this one did not.
+    let run_id = paused_index_run(&router, &test.services, &lib, None).await;
 
     let resume_response = router
         .clone()
