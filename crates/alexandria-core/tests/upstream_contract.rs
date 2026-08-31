@@ -23,7 +23,7 @@ use alexandria_core::enrichment::providers::commons::CommonsImageClient;
 use alexandria_core::enrichment::providers::lrclib::LrclibClient;
 use alexandria_core::enrichment::providers::musicbrainz::MusicBrainzClient;
 use alexandria_core::enrichment::providers::{
-    ArtistIdentityProvider, ArtistImageProvider, LyricsProvider, LyricsQuery,
+    ArtistIdentityProvider, ArtistImageProvider, LyricsProvider, LyricsQuery, ProviderError,
     RecordingIdentityProvider, MIN_ARTIST_SCORE,
 };
 
@@ -52,6 +52,42 @@ macro_rules! contact_or_skip {
     };
 }
 
+/// Awaits a provider call, or skips when the service simply did not answer.
+///
+/// The distinction this file turns on. `Unusable` means the response arrived
+/// and did not fit what this code reads — that is drift, and noticing it is
+/// the entire purpose here, so it still fails. `Unreachable` and
+/// `RateLimited` mean no answer came: the service was busy, the runner's
+/// shared address was throttled, the network was out. None of those are a
+/// contract change, and none of them are caused by a commit.
+///
+/// Failing on them trains the reader to ignore a red mark on this job, which
+/// costs exactly the signal the job exists to give. So they skip with a
+/// reason, the same way an absent contact does — "not checked" is a state
+/// this file already knows how to say.
+///
+/// Observed: MusicBrainz answered `503 Service Unavailable` to the first
+/// request of a run while answering two others in the same run seconds
+/// later.
+macro_rules! reached_or_skip {
+    ($call:expr, $service:literal) => {
+        match $call.await {
+            Ok(value) => value,
+            Err(err @ ProviderError::Unusable(_)) => {
+                panic!("{} answered something this cannot read: {err}", $service)
+            }
+            Err(err) => {
+                eprintln!(
+                    "SKIPPED: {} did not answer ({err}); that is not a \
+                     contract change, so nothing was checked",
+                    $service
+                );
+                return;
+            }
+        }
+    };
+}
+
 /// A subject for the identity and image checks: unambiguous, and unlikely
 /// to leave either catalogue.
 const ARTIST: &str = "Miles Davis";
@@ -72,10 +108,7 @@ async fn given_a_known_artist_when_searched_then_musicbrainz_still_answers_a_sco
     let contact = contact_or_skip!();
     let client = MusicBrainzClient::new(&contact).expect("client");
 
-    let found = client
-        .find_artist(ARTIST)
-        .await
-        .expect("MusicBrainz did not answer")
+    let found = reached_or_skip!(client.find_artist(ARTIST), "MusicBrainz")
         .expect("no match at all for an artist they certainly hold");
 
     // The threshold this code actually gates on. If a well-known exact name
@@ -103,10 +136,7 @@ async fn given_a_known_recording_when_searched_then_musicbrainz_still_answers_on
         duration_seconds: None,
     };
 
-    let found = client
-        .find_recording(&query)
-        .await
-        .expect("MusicBrainz did not answer")
+    let found = reached_or_skip!(client.find_recording(&query), "MusicBrainz")
         .expect("no recording at all for one they certainly hold");
 
     assert!(!found.mbid.is_empty());
@@ -121,20 +151,22 @@ async fn given_a_known_artist_when_an_image_is_sought_then_commons_still_serves_
     // Resolved rather than hardcoded: the id is what the production path
     // hands this client, and an id that stopped resolving is the failure
     // this whole file exists to notice.
-    let mbid = MusicBrainzClient::new(&contact)
-        .expect("client")
-        .find_artist(ARTIST)
-        .await
-        .expect("MusicBrainz did not answer")
-        .expect("no match")
-        .mbid;
+    let mbid = reached_or_skip!(
+        MusicBrainzClient::new(&contact)
+            .expect("client")
+            .find_artist(ARTIST),
+        "MusicBrainz"
+    )
+    .expect("no match")
+    .mbid;
 
-    let asset = CommonsImageClient::new(&contact)
-        .expect("client")
-        .image_for(&mbid)
-        .await
-        .expect("Wikidata or Commons did not answer")
-        .expect("no photograph for an artist Commons certainly has one of");
+    let asset = reached_or_skip!(
+        CommonsImageClient::new(&contact)
+            .expect("client")
+            .image_for(&mbid),
+        "Wikidata or Commons"
+    )
+    .expect("no photograph for an artist Commons certainly has one of");
 
     assert!(!asset.bytes.is_empty(), "an image arrived with no bytes");
     assert!(
@@ -167,10 +199,7 @@ async fn given_a_known_recording_when_looked_up_then_lrclib_still_answers_lyrics
         duration_seconds: None,
     };
 
-    let lyrics = client
-        .lyrics_for(&query)
-        .await
-        .expect("LRCLIB did not answer")
+    let lyrics = reached_or_skip!(client.lyrics_for(&query), "LRCLIB")
         .expect("no lyrics for a song they certainly hold");
 
     // Asserted rather than tolerated. A `None` here would mean either that
@@ -183,4 +212,45 @@ async fn given_a_known_recording_when_looked_up_then_lrclib_still_answers_lyrics
         lyrics.source,
         lyrics.synced.is_some()
     );
+}
+
+/// The macro's own two paths, checked here rather than left to a service to
+/// demonstrate — these run in the ordinary `cargo test`, unlike everything
+/// above, because the distinction they pin is the whole basis of this file
+/// being trustworthy: a red mark means drift, and nothing else does.
+mod reaching {
+    use super::*;
+
+    #[tokio::test]
+    #[should_panic(expected = "answered something this cannot read")]
+    async fn given_an_unusable_response_when_reached_then_it_still_fails() {
+        // A response that arrived and did not fit is drift. If this ever
+        // starts skipping, the job goes quiet exactly when it matters.
+        let _: () = reached_or_skip!(
+            async { Err::<(), _>(ProviderError::Unusable("no such field".into())) },
+            "a service"
+        );
+    }
+
+    #[tokio::test]
+    async fn given_no_answer_when_reached_then_the_check_returns_without_failing() {
+        // Reaching the end of this test is the assertion: the macro returns
+        // from the enclosing function, so the line below is never run.
+        let _: () = reached_or_skip!(
+            async { Err::<(), _>(ProviderError::Unreachable("status 503".into())) },
+            "a service"
+        );
+
+        panic!("the macro did not skip; a busy service would fail the job");
+    }
+
+    #[tokio::test]
+    async fn given_rate_limiting_when_reached_then_the_check_returns_without_failing() {
+        let _: () = reached_or_skip!(
+            async { Err::<(), _>(ProviderError::RateLimited) },
+            "a service"
+        );
+
+        panic!("the macro did not skip; a throttled service would fail the job");
+    }
 }
