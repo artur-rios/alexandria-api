@@ -3,6 +3,7 @@
 
 mod common;
 
+use alexandria_core::catalog::runs::{CatalogRunRepository, SqliteCatalogRunRepository};
 use alexandria_core::config::Settings;
 use alexandria_http::app;
 use axum::body::{to_bytes, Body};
@@ -16,6 +17,16 @@ fn run_request(run_id: &str, token: Option<&str>) -> Request<Body> {
     let mut builder = Request::builder()
         .method("GET")
         .uri(format!("/v1/index/runs/{run_id}"));
+    if let Some(token) = token {
+        builder = builder.header("authorization", format!("Bearer {token}"));
+    }
+    builder.body(Body::empty()).unwrap()
+}
+
+fn failures_request(run_id: &str, token: Option<&str>) -> Request<Body> {
+    let mut builder = Request::builder()
+        .method("GET")
+        .uri(format!("/v1/index/runs/{run_id}/failures"));
     if let Some(token) = token {
         builder = builder.header("authorization", format!("Bearer {token}"));
     }
@@ -184,6 +195,87 @@ async fn given_no_token_when_read_then_401() {
 
     let response = router
         .oneshot(run_request(&run_id, None))
+        .await
+        .expect("one-shot");
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn given_a_run_that_failed_on_a_file_when_its_failures_are_read_then_it_is_named() {
+    // The tally says how many; this route says which. Recorded through the
+    // repository rather than by contriving a failing walk: what is under
+    // test here is the surface, and the walk's own recording has its own
+    // test (FR-FC-42).
+    let test = test_app().await;
+    let router = app(Settings::default(), test.services.clone());
+    let run_id = start_refresh(&router).await;
+
+    SqliteCatalogRunRepository::new(test.pool.clone())
+        .record_failure(
+            uuid::Uuid::parse_str(&run_id).expect("uuid"),
+            "/library/locked.mp3",
+            "permission denied",
+            chrono::Utc::now(),
+        )
+        .await
+        .expect("record");
+
+    let response = router
+        .oneshot(failures_request(&run_id, Some(TEST_TOKEN)))
+        .await
+        .expect("one-shot");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_json(response).await;
+    assert_eq!(body[0]["path"], "/library/locked.mp3");
+    assert_eq!(body[0]["reason"], "permission denied");
+}
+
+#[tokio::test]
+async fn given_a_run_that_failed_on_nothing_when_its_failures_are_read_then_the_list_is_empty() {
+    let test = test_app().await;
+    let router = app(Settings::default(), test.services);
+    let run_id = start_refresh(&router).await;
+
+    let response = router
+        .oneshot(failures_request(&run_id, Some(TEST_TOKEN)))
+        .await
+        .expect("one-shot");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        body_json(response).await.as_array().map(|a| a.len()),
+        Some(0)
+    );
+}
+
+#[tokio::test]
+async fn given_an_unknown_run_id_when_its_failures_are_read_then_404() {
+    // Not an empty list: that would read as "this run failed on nothing"
+    // about a run that does not exist.
+    let test = test_app().await;
+    let router = app(Settings::default(), test.services);
+
+    let response = router
+        .oneshot(failures_request(
+            "00000000-0000-4000-8000-000000000000",
+            Some(TEST_TOKEN),
+        ))
+        .await
+        .expect("one-shot");
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn given_no_token_when_failures_are_read_then_401() {
+    let test = test_app().await;
+    let router = app(Settings::default(), test.services);
+    let run_id = start_refresh(&router).await;
+
+    let response = router
+        .oneshot(failures_request(&run_id, None))
         .await
         .expect("one-shot");
 

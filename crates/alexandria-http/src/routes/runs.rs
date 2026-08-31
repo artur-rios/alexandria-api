@@ -6,7 +6,7 @@ use serde::Deserialize;
 use uuid::Uuid;
 
 use alexandria_core::catalog::commands::index::IndexStarted;
-use alexandria_core::catalog::runs::{CatalogRun, RunKind, RunPriority};
+use alexandria_core::catalog::runs::{CatalogRun, RunFailure, RunKind, RunPriority};
 
 use crate::middleware::auth::invalid_input;
 use crate::middleware::error::ApiError;
@@ -43,6 +43,37 @@ pub async fn run_status(
         .map_err(ApiError)?;
 
     Ok((StatusCode::OK, Json(run)))
+}
+
+/// `GET /v1/index/runs/{runId}/failures` — the files this run could not
+/// record, oldest first (FR-FC-42).
+///
+/// Returns `200` with the list, `400`, `401`, or `404` when no run has that
+/// id — not an empty list, which would read as "this run failed on nothing"
+/// about a run that does not exist.
+///
+/// Its own route rather than a field on the run above: a run's status is
+/// polled every second while one is in flight, and a list that travelled
+/// with it would be re-sent on every poll to be read once, if ever. The list
+/// is bounded per run (`MAX_RECORDED_FAILURES`); the run's own `failed`
+/// tally stays the authority on how many there were.
+pub async fn run_failures(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    run_id: Result<Path<Uuid>, PathRejection>,
+) -> Result<(StatusCode, Json<Vec<RunFailure>>), ApiError> {
+    let token = bearer_token(&headers);
+
+    let Path(run_id) = run_id.map_err(|_| invalid_input("path segment is not a valid UUID"))?;
+
+    let failures = state
+        .services
+        .get_run_status_handler
+        .failures(run_id, &token)
+        .await
+        .map_err(ApiError)?;
+
+    Ok((StatusCode::OK, Json(failures)))
 }
 
 /// `POST /v1/index/runs/{runId}/pause` — stop a running run where it stands,

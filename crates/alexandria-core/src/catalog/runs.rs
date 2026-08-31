@@ -133,6 +133,24 @@ pub enum RunCounts {
 
 /// One recorded index or re-index run (UC-42 / FR-FC-27).
 ///
+/// One file a run could not record, and why (FR-FC-42).
+///
+/// The tally says how many; this says which. Without it an owner told that
+/// two files could not be read has nowhere to look — they are on disk, in no
+/// listing, and named nowhere outside a log file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunFailure {
+    /// The file's path on disk, as the walk saw it.
+    pub path: String,
+    /// What went wrong, in the words the error carried. Not a code: the
+    /// reasons are whatever the filesystem and the database said, and
+    /// classifying them here would be inventing a taxonomy this code has no
+    /// use for.
+    pub reason: String,
+    pub failed_at: DateTime<Utc>,
+}
+
 /// Fields that do not apply are omitted from the serialized body rather than
 /// sent as `null`: a running run carries no counts and no finish time, a
 /// refresh carries no root, and only a failed run carries an error.
@@ -235,6 +253,16 @@ pub struct CatalogRun {
     pub scope: IndexScope,
 }
 
+/// How many failures one run records by path.
+///
+/// A bound, not a page size: the tally stays the authority on how many
+/// failed, and this is how many are worth naming. A folder whose every file
+/// fails — a mount going read-only, a permissions change — would otherwise
+/// write a row per file and turn one bad scan into a table larger than the
+/// catalog it failed to build. Two hundred is far past what an owner will
+/// read and far short of that.
+pub const MAX_RECORDED_FAILURES: u32 = 200;
+
 /// Run records repository port (UC-42). Unit-testable against an in-memory
 /// fake with no database (Testing Specification §6.2).
 #[allow(async_fn_in_trait)]
@@ -277,6 +305,27 @@ pub trait CatalogRunRepository: Send + Sync {
         counts: RunCounts,
         finished_at: DateTime<Utc>,
     ) -> Result<(), DomainError>;
+
+    /// Record one file this run could not process (FR-FC-42).
+    ///
+    /// Best-effort by contract: the caller logs a failure to record a
+    /// failure and carries on. A walk must not abandon the rest of a library
+    /// because it could not write a note about one file, and the tally — the
+    /// authority on how many — is written separately at the end.
+    ///
+    /// Bounded per run by the implementation. A folder whose every file
+    /// fails would otherwise write a row per file, turning one bad scan into
+    /// a table larger than the catalog it failed to build.
+    async fn record_failure(
+        &self,
+        run_id: Uuid,
+        path: &str,
+        reason: &str,
+        failed_at: DateTime<Utc>,
+    ) -> Result<(), DomainError>;
+
+    /// The files this run could not record, oldest first.
+    async fn failures(&self, run_id: Uuid) -> Result<Vec<RunFailure>, DomainError>;
 
     /// Close a run's record as `failed` — it could not proceed at all.
     async fn fail(
@@ -884,6 +933,59 @@ impl CatalogRunRepository for SqliteCatalogRunRepository {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    async fn record_failure(
+        &self,
+        run_id: Uuid,
+        path: &str,
+        reason: &str,
+        failed_at: DateTime<Utc>,
+    ) -> Result<(), DomainError> {
+        // Bounded in the statement rather than by counting first and then
+        // inserting: two writers hitting the bound together would both read
+        // a count below it and both insert, and one row over is not worth a
+        // transaction. `INSERT … SELECT … WHERE` settles it in one.
+        sqlx::query(
+            "INSERT INTO catalog_run_failures (run_id, path, reason, failed_at) \
+             SELECT ?, ?, ?, ? \
+             WHERE (SELECT COUNT(*) FROM catalog_run_failures WHERE run_id = ?) < ?",
+        )
+        .bind(run_id.to_string())
+        .bind(path)
+        .bind(reason)
+        .bind(failed_at.to_rfc3339())
+        .bind(run_id.to_string())
+        .bind(i64::from(MAX_RECORDED_FAILURES))
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    async fn failures(&self, run_id: Uuid) -> Result<Vec<RunFailure>, DomainError> {
+        let rows: Vec<(String, String, String)> = sqlx::query_as(
+            "SELECT path, reason, failed_at FROM catalog_run_failures \
+             WHERE run_id = ? ORDER BY id",
+        )
+        .bind(run_id.to_string())
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|(path, reason, failed_at)| RunFailure {
+                path,
+                reason,
+                // An unparseable timestamp answers the epoch rather than
+                // failing the read: the owner is here to see *which* files,
+                // and losing the list over a malformed date would cost them
+                // the answer to keep a detail tidy.
+                failed_at: DateTime::parse_from_rfc3339(&failed_at)
+                    .map(|at| at.with_timezone(&Utc))
+                    .unwrap_or_default(),
+            })
+            .collect())
     }
 
     async fn finish(

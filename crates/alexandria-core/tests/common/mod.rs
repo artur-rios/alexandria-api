@@ -37,7 +37,7 @@ use alexandria_core::catalog::model::{
 use alexandria_core::catalog::repos::CatalogRepository;
 use alexandria_core::catalog::run_registry::{RunPhase, RunProgress};
 use alexandria_core::catalog::runs::{
-    CatalogRun, CatalogRunRepository, RunCounts, RunKind, RunStatus,
+    CatalogRun, CatalogRunRepository, RunCounts, RunFailure, RunKind, RunStatus,
 };
 use alexandria_core::catalog::video_tags::{VideoMetadataReader, VideoTags};
 use alexandria_core::collections::model::{
@@ -2367,6 +2367,10 @@ const TALLY_CANCELLABLE_FROM: [RunStatus; 3] =
 #[derive(Debug, Default, Clone)]
 pub struct FakeCatalogRunRepository {
     runs: Arc<Mutex<HashMap<Uuid, CatalogRun>>>,
+    /// Every file a run reported it could not record, in the order the walk
+    /// gave up on them (FR-FC-42). The order is the assertion a test makes:
+    /// the tally says how many, and this says which.
+    failures: Arc<Mutex<HashMap<Uuid, Vec<RunFailure>>>>,
     /// When set, every `record_progress` fails. A progress flush is
     /// best-effort (FR-FC-28), so this is what proves a run survives one.
     progress_fails: Arc<AtomicBool>,
@@ -2493,7 +2497,44 @@ impl FakeCatalogRunRepository {
     }
 }
 
+impl FakeCatalogRunRepository {
+    /// What a run recorded it could not process, for a test to assert on.
+    pub fn recorded_failures(&self, run_id: Uuid) -> Vec<RunFailure> {
+        self.failures
+            .lock()
+            .unwrap()
+            .get(&run_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+}
+
 impl CatalogRunRepository for FakeCatalogRunRepository {
+    async fn record_failure(
+        &self,
+        run_id: Uuid,
+        path: &str,
+        reason: &str,
+        failed_at: DateTime<Utc>,
+    ) -> Result<(), DomainError> {
+        self.failures
+            .lock()
+            .unwrap()
+            .entry(run_id)
+            .or_default()
+            .push(RunFailure {
+                path: path.to_string(),
+                reason: reason.to_string(),
+                failed_at,
+            });
+
+        Ok(())
+    }
+
+    async fn failures(&self, run_id: Uuid) -> Result<Vec<RunFailure>, DomainError> {
+        Ok(self.recorded_failures(run_id))
+    }
+
     async fn start(
         &self,
         id: Uuid,
@@ -3064,6 +3105,23 @@ pub enum FailingCatalogRunRepository {
 }
 
 impl CatalogRunRepository for FailingCatalogRunRepository {
+    /// Always fails, in every variant. Recording *which* file failed is
+    /// best-effort by contract — the walk logs and carries on — and this is
+    /// what a test proves that against.
+    async fn record_failure(
+        &self,
+        _run_id: Uuid,
+        _path: &str,
+        _reason: &str,
+        _failed_at: DateTime<Utc>,
+    ) -> Result<(), DomainError> {
+        Err(DomainError::Disk("run store unavailable".into()))
+    }
+
+    async fn failures(&self, _run_id: Uuid) -> Result<Vec<RunFailure>, DomainError> {
+        Err(DomainError::Disk("run store unavailable".into()))
+    }
+
     async fn start(
         &self,
         _id: Uuid,

@@ -35,6 +35,10 @@ pub fn app(settings: Settings, services: Arc<Services>) -> Router {
         .route("/v1/index/runs", get(routes::runs::active_runs))
         .route("/v1/index/runs/{run_id}", get(routes::runs::run_status))
         .route(
+            "/v1/index/runs/{run_id}/failures",
+            get(routes::runs::run_failures),
+        )
+        .route(
             "/v1/index/runs/{run_id}/pause",
             post(routes::runs::pause_run),
         )

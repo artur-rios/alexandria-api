@@ -60,13 +60,13 @@ use alexandria_ffi::{
     alexandria_file_restore, alexandria_file_soft_delete, alexandria_free_string,
     alexandria_index_cancel, alexandria_index_count_files, alexandria_index_count_missing,
     alexandria_index_files_json, alexandria_index_init, alexandria_index_pause,
-    alexandria_index_refresh_start, alexandria_index_resume, alexandria_index_run_status_json,
-    alexandria_index_runs_active_json, alexandria_index_start, alexandria_libraries_list,
-    alexandria_library_browse, alexandria_library_move, alexandria_library_register,
-    alexandria_library_remove, alexandria_playlist_add_entries, alexandria_playlist_create,
-    alexandria_playlist_delete, alexandria_playlist_move_entry, alexandria_playlist_read,
-    alexandria_playlist_remove_entry, alexandria_playlist_rename, alexandria_playlists_list,
-    FileMetadataResult, IndexStartResult, PlaylistJsonResult,
+    alexandria_index_refresh_start, alexandria_index_resume, alexandria_index_run_failures_json,
+    alexandria_index_run_status_json, alexandria_index_runs_active_json, alexandria_index_start,
+    alexandria_libraries_list, alexandria_library_browse, alexandria_library_move,
+    alexandria_library_register, alexandria_library_remove, alexandria_playlist_add_entries,
+    alexandria_playlist_create, alexandria_playlist_delete, alexandria_playlist_move_entry,
+    alexandria_playlist_read, alexandria_playlist_remove_entry, alexandria_playlist_rename,
+    alexandria_playlists_list, FileMetadataResult, IndexStartResult, PlaylistJsonResult,
 };
 
 const STATUS_RUN_OK: i32 = alexandria_ffi::RUN_OK;
@@ -3192,5 +3192,71 @@ fn given_an_unknown_uuid_when_a_library_is_removed_over_ffi_then_not_found() {
     assert_eq!(
         alexandria_library_remove(uuid.as_ptr(), token.as_ptr()).status,
         STATUS_LIBRARY_NOT_FOUND
+    );
+}
+
+/// The failures list over FFI (FR-FC-42), and the statuses it shares with
+/// HTTP (FR-FC-24).
+///
+/// A run that failed on a file is not contrived here: what this pins is the
+/// call and its answers, and the walk's own recording is tested where the
+/// walk is.
+#[test]
+fn given_a_run_with_no_failures_when_asked_over_ffi_then_an_empty_list() {
+    let _g = serial();
+    let (_db_dir, _db_path) = init_temp_db();
+    let lib = tempdir().unwrap();
+    write_library(lib.path(), 2);
+
+    let root = c(lib.path().to_str().unwrap());
+    let token = c(TEST_TOKEN);
+    let started = alexandria_index_start(
+        root.as_ptr(),
+        token.as_ptr(),
+        std::ptr::null(),
+        std::ptr::null(),
+    );
+    assert_eq!(started.status, STATUS_OK);
+    let run_id = c(&run_id_string(&started));
+
+    let result = alexandria_index_run_failures_json(run_id.as_ptr(), token.as_ptr());
+    assert_eq!(result.status, STATUS_RUN_OK);
+    assert!(!result.json.is_null());
+    let json = unsafe { CStr::from_ptr(result.json) }
+        .to_string_lossy()
+        .into_owned();
+    unsafe { alexandria_ffi::alexandria_free_string(result.json) };
+
+    let value: serde_json::Value = serde_json::from_str(&json).expect("failures json");
+    assert_eq!(value.as_array().map(|a| a.len()), Some(0));
+}
+
+#[test]
+fn given_an_unknown_run_when_failures_asked_over_ffi_then_not_found() {
+    // Not an empty list — the same answer HTTP gives, for the same reason:
+    // "failed on nothing" is a different fact from "no such run".
+    let _g = serial();
+    let (_db_dir, _db_path) = init_temp_db();
+
+    let run_id = c("00000000-0000-4000-8000-000000000000");
+    let token = c(TEST_TOKEN);
+
+    assert_eq!(
+        alexandria_index_run_failures_json(run_id.as_ptr(), token.as_ptr()).status,
+        STATUS_RUN_NOT_FOUND
+    );
+}
+
+#[test]
+fn given_a_malformed_run_id_when_failures_asked_over_ffi_then_invalid_input() {
+    let _g = serial();
+    let (_db_dir, _db_path) = init_temp_db();
+
+    let run_id = c("not-a-uuid");
+    let token = c(TEST_TOKEN);
+
+    assert_eq!(
+        alexandria_index_run_failures_json(run_id.as_ptr(), token.as_ptr()).status,
+        STATUS_RUN_INVALID_INPUT
     );
 }

@@ -4466,6 +4466,59 @@ pub extern "C" fn alexandria_index_run_status_json(
     }
 }
 
+/// The files a run could not record, oldest first (FR-FC-42). `run_id` is
+/// the id `alexandria_index_start` or `alexandria_index_refresh_start`
+/// returned. On success `json` carries the same array the HTTP
+/// `GET /v1/index/runs/{runId}/failures` route returns (FR-FC-24).
+///
+/// A call of its own rather than a field on the status above: status is
+/// polled every second while a run is in flight, and this is wanted once, if
+/// ever — when the owner asks which files. The list is bounded per run; the
+/// run's own `failed` tally stays the authority on how many.
+///
+/// Returns `RUN_ERR_NOT_FOUND` for an id naming no run (AF-01),
+/// `RUN_ERR_UNAUTHORIZED` for an unauthenticated caller (AF-02), and
+/// `RUN_ERR_INVALID_INPUT` when `run_id` is not a uuid.
+#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
+#[no_mangle]
+pub extern "C" fn alexandria_index_run_failures_json(
+    run_id: *const c_char,
+    token: *const c_char,
+) -> RunJsonResult {
+    let services = match services_slot().lock().unwrap().clone() {
+        Some(s) => s,
+        None => return RunJsonResult::err(RUN_ERR_NOT_INITIALIZED),
+    };
+
+    let token = cstr_lossy(token).unwrap_or_default();
+    if !authenticated(&services, &token) {
+        return RunJsonResult::err(RUN_ERR_UNAUTHORIZED);
+    }
+
+    let raw = match cstr_lossy(run_id) {
+        Some(s) => s,
+        None => return RunJsonResult::err(RUN_ERR_INVALID_INPUT),
+    };
+    let Ok(run_id) = uuid::Uuid::parse_str(raw.trim()) else {
+        return RunJsonResult::err(RUN_ERR_INVALID_INPUT);
+    };
+
+    let result = runtime().block_on(async {
+        services
+            .get_run_status_handler
+            .failures(run_id, &token)
+            .await
+    });
+
+    match result {
+        Ok(failures) => {
+            let json = serde_json::to_string(&failures).unwrap_or_else(|_| "[]".to_string());
+            RunJsonResult::ok(json)
+        }
+        Err(err) => map_run_err(err),
+    }
+}
+
 /// Pause a running index or re-index run where it stands, leaving it
 /// resumable (UC-48 / FR-FC-32). `run_id` is the id `alexandria_index_start`
 /// or `alexandria_index_refresh_start` returned; `token` is the bearer auth

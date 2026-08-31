@@ -3,7 +3,7 @@ use uuid::Uuid;
 use crate::auth::AuthService;
 use crate::catalog::clock::Clock;
 use crate::catalog::run_registry::RunRegistry;
-use crate::catalog::runs::{CatalogRun, CatalogRunRepository};
+use crate::catalog::runs::{CatalogRun, CatalogRunRepository, RunFailure};
 use crate::errors::DomainError;
 
 /// UC-42 — Query an index or refresh run (FR-FC-28).
@@ -58,6 +58,28 @@ where
         overlay_live_state(&mut run, &self.registry, &self.clock);
 
         Ok(run)
+    }
+
+    /// The files this run could not record, oldest first (FR-FC-42).
+    ///
+    /// A read of its own rather than a field on the run above. A run's status
+    /// is polled — every second while one is in flight — and a list that
+    /// travels with it would be re-sent on every poll to be looked at once,
+    /// if ever. This is asked for when the owner asks which files, which is
+    /// the only moment it is wanted.
+    pub async fn failures(
+        &self,
+        run_id: Uuid,
+        token: &str,
+    ) -> Result<Vec<RunFailure>, DomainError> {
+        self.auth.authenticate(token).await?;
+
+        // AF-01, before the list: an id naming no run answers not-found
+        // rather than an empty list, which would read as "this run failed on
+        // nothing" about a run that does not exist.
+        self.runs.get(run_id).await?.ok_or(DomainError::NotFound)?;
+
+        self.runs.failures(run_id).await
     }
 }
 

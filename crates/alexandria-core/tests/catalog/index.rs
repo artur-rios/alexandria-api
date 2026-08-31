@@ -752,6 +752,82 @@ async fn given_failing_repository_write_when_execute_then_run_continues_and_coun
 }
 
 #[tokio::test]
+async fn given_a_file_that_could_not_be_indexed_when_the_run_ends_then_it_is_named() {
+    // The tally says two files failed; this says which two. Without it the
+    // owner is told a number about files that are on disk, in no listing,
+    // and named nowhere they can reach — the walker knew each path at the
+    // moment it gave up and told only the log (FR-FC-42).
+    let fs = FakeFilesystem::builder()
+        .with_file(ROOT, "/library/a.mp3", "a.mp3", "h-a")
+        .with_file(ROOT, "/library/b.mp3", "b.mp3", "h-b")
+        .build();
+    let runs = FakeCatalogRunRepository::new();
+    let runs_handle = runs.clone();
+    let run_id = Uuid::new_v4();
+    let handler = handler(
+        FakeAuth::Allowing,
+        FakeCatalogRepository::new().failing_for("/library/a.mp3"),
+        fs,
+        fixed_clock(now()),
+        FakeAudioMetadataReader::new(),
+        FakeImageMetadataReader::new(),
+        FakeDocumentMetadataReader::new(),
+        FakeVideoMetadataReader::new(),
+        FakeComicMetadataReader::new(),
+        runs,
+    );
+
+    let outcome = handler
+        .execute(ROOT, run_id, &IndexScope::all())
+        .await
+        .expect("run");
+
+    assert_eq!(outcome.failed, 1);
+
+    let recorded = runs_handle.recorded_failures(run_id);
+    assert_eq!(
+        recorded.iter().map(|f| f.path.as_str()).collect::<Vec<_>>(),
+        vec!["/library/a.mp3"],
+        "the run counted a failure it could not name"
+    );
+    assert!(
+        !recorded[0].reason.is_empty(),
+        "a named failure carried no reason, which is half the answer"
+    );
+}
+
+#[tokio::test]
+async fn given_a_run_that_indexed_everything_when_it_ends_then_nothing_is_named() {
+    // The half that makes the test above mean something: a clean run must
+    // not name files it managed perfectly well.
+    let fs = FakeFilesystem::builder()
+        .with_file(ROOT, "/library/a.mp3", "a.mp3", "h-a")
+        .build();
+    let runs = FakeCatalogRunRepository::new();
+    let runs_handle = runs.clone();
+    let run_id = Uuid::new_v4();
+    let handler = handler(
+        FakeAuth::Allowing,
+        FakeCatalogRepository::new(),
+        fs,
+        fixed_clock(now()),
+        FakeAudioMetadataReader::new(),
+        FakeImageMetadataReader::new(),
+        FakeDocumentMetadataReader::new(),
+        FakeVideoMetadataReader::new(),
+        FakeComicMetadataReader::new(),
+        runs,
+    );
+
+    handler
+        .execute(ROOT, run_id, &IndexScope::all())
+        .await
+        .expect("run");
+
+    assert!(runs_handle.recorded_failures(run_id).is_empty());
+}
+
+#[tokio::test]
 async fn given_bearer_auth_when_authenticated_then_principal_owner() {
     let principal = alexandria_core::auth::BearerAuthService
         .authenticate("some-bearer")

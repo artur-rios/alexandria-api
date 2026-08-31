@@ -122,6 +122,7 @@ graph LR
 | FR-FC-39 | The system shall report one level of a library at a time — the folders directly inside the addressed folder, and the files directly in it — rather than the whole tree. A course with two hundred classes is a large document to build, send, and parse so the owner can look at the six things in one folder. |
 | FR-FC-40 | The system shall stop treating a folder as a library on request, keeping every file it grouped and returning them to the type listings. Marking a folder empties part of a listing, which is not visible until after it is done, so the way back restores rather than deletes. |
 | FR-FC-41 | The system shall correct a library's root folder on request, moving the stored paths of the files it holds to match, so that a folder that moved on disk is one record to correct rather than a catalog to re-walk. The files keep their identity — a re-index at the new location would mint new records and leave every watchlist place, reading position, and collection membership pointing at records that had gone missing. The correction is refused when the destination overlaps another library, or when the catalog already holds files there. |
+| FR-FC-42 | The system shall record which files a run could not process, each with the reason it gave up, and answer that list for a run on request. The tally already says how many; without the paths a client can only tell the owner a number about files that are on disk, in no listing, and named nowhere they can reach. The list is bounded per run — a folder whose every file fails must not write a row per file — and the tally remains the authority on how many there were. Recording a failure is best-effort: a walk that cannot write the note carries on rather than abandoning the rest of the library. |
 
 ### 3.2 Collections (CO)
 
@@ -511,6 +512,7 @@ endpoint requires authentication from the active mode (see §7).
 | GET | /v1/settings | Report the client-relevant configuration, beginning with the retention window. | FR-FC-30 |
 | GET | /v1/index/runs/{runId} | Report an index or re-index run's status, progress, and outcome. | FR-FC-27, FR-FC-28 |
 | GET | /v1/index/runs?status=active | List every outstanding (`running` or `paused`) run, newest first. | FR-FC-35 |
+| GET | /v1/index/runs/{runId}/failures | List the files that run could not record, oldest first, with the reason for each. | FR-FC-42 |
 | POST | /v1/index/runs/{runId}/pause | Pause a running run, leaving it resumable. | FR-FC-32 |
 | POST | /v1/index/runs/{runId}/resume | Resume a paused run under the same run id, optionally at a new `priority` of `normal` or `low`. | FR-FC-33, FR-FC-31 |
 | POST | /v1/index/runs/{runId}/cancel | Abandon a running or paused run. Terminal. | FR-FC-34 |

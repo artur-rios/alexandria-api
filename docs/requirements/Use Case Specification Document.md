@@ -1797,6 +1797,50 @@ have only one of.
 
 ---
 
+### UC-52: Report which files a run could not record
+
+| Field | Value |
+| --- | --- |
+| **ID** | UC-52 |
+| **Name** | Report which files a run could not record |
+| **Actors** | Owner |
+| **Description** | Read the files a walk gave up on, each with the reason, so that a count of failures can be acted on rather than only read. |
+| **Preconditions** | The caller is authenticated and the run exists. |
+| **Postconditions** | None. Reading changes nothing; the files are still absent from the catalog. |
+| **Requirements** | FR-FC-42, FR-FC-24 |
+
+**Main Flow**
+
+1. A walk cannot process a file — its bytes will not read, or a write for it
+   fails after the retry bound. It counts the file in `failed`, logs it, and
+   carries on: one locked file must not abandon a library.
+2. The system records the file's path and the reason beside the run, up to a
+   bound per run.
+3. The owner, told that a finished run failed on some files, asks which.
+4. The system answers the recorded list, oldest first.
+
+**Alternative Flows**
+
+| ID | Condition | Outcome |
+| --- | --- | --- |
+| AF-01 | The run failed on nothing | An empty list. |
+| AF-02 | The run does not exist | A not-found error, not an empty list — "failed on nothing" is a different fact from "no such run", and a client showing the first for the second would tell the owner their scan was clean. |
+| AF-03 | The run failed on more files than the bound | The list names the first of them and the run's own tally still reports the true count. The two disagreeing is the intended state: naming every file of a folder that failed entirely would write a table larger than the catalog. |
+| AF-04 | The system cannot record a failure it just met | The walk logs that and carries on. A note about one file is not worth the rest of the library. |
+| AF-05 | The caller is not authenticated | The system denies with an unauthorized error. |
+
+> **Why the paths are kept at all.** The tally has always said how many. A
+> client can do nothing with a number: those files are on disk, in no listing,
+> in no search, and named nowhere the owner can reach — the walker knew each
+> path at the moment it gave up and told only the log, which serves whoever
+> reads log files and nobody else.
+>
+> **Why it is a read of its own.** A run's status is polled every second while
+> one is in flight. A list that travelled with it would be re-sent on every
+> poll to be read once, if ever.
+
+---
+
 ---
 
 ## 3. Use Case — Requirements Traceability
@@ -1850,6 +1894,7 @@ have only one of.
 | UC-46: Browse collections | FR-CO-08, FR-FC-24 |
 | UC-47: Report the retention window | FR-FC-30, FR-FC-24 |
 | UC-48: Pause, resume, or cancel an index run | FR-FC-24, FR-FC-27, FR-FC-29, FR-FC-31, FR-FC-32, FR-FC-33, FR-FC-34 |
+| UC-52: Report which files a run could not record | FR-FC-42, FR-FC-24 |
 | UC-49: Manage a playlist | FR-TR-01, FR-TR-02, FR-TR-03, FR-TR-04, FR-TR-05, FR-TR-06, FR-TR-08, FR-TR-09, FR-FC-24 |
 | UC-50: Play a playlist | FR-TR-07, FR-TR-11, FR-FC-24 |
 | UC-51: Group a folder as a library | FR-FC-36, FR-FC-37, FR-FC-38, FR-FC-39, FR-FC-40, FR-FC-41, FR-FC-24 |

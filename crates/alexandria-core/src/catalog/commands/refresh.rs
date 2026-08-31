@@ -299,6 +299,23 @@ where
                             error = %err,
                             "skipping cataloged path that could not be refreshed"
                         );
+                        // Recorded by path as well as counted (FR-FC-42),
+                        // for the same reason the index walk does it: a
+                        // record that could not be re-checked carries
+                        // whatever state the last successful run left, and
+                        // the owner cannot act on a number alone.
+                        if let Err(note) = self
+                            .runs
+                            .record_failure(run_id, &file.path, &err.to_string(), now)
+                            .await
+                        {
+                            tracing::warn!(
+                                %run_id,
+                                path = %file.path,
+                                error = %note,
+                                "could not record which file failed"
+                            );
+                        }
                         PathOutcome::Failed
                     }
                 }

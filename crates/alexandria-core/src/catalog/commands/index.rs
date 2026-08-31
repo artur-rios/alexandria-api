@@ -556,6 +556,28 @@ where
                             error = %err,
                             "skipping file that could not be indexed"
                         );
+                        // Recorded by path as well as counted (FR-FC-42).
+                        // The log line above helps whoever reads a log file;
+                        // the owner reads the application, and "2 files
+                        // could not be read" with no way to learn which two
+                        // is a dead end — those files are on disk and in no
+                        // listing.
+                        //
+                        // Its own failure is logged and swallowed: a walk
+                        // must not abandon the rest of a library because it
+                        // could not write a note about one file.
+                        if let Err(note) = self
+                            .runs
+                            .record_failure(run_id, &path, &err.to_string(), now)
+                            .await
+                        {
+                            tracing::warn!(
+                                %run_id,
+                                path = %path,
+                                error = %note,
+                                "could not record which file failed"
+                            );
+                        }
                         EntryOutcome::Failed
                     }
                 }
