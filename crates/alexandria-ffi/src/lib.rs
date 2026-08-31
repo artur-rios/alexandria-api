@@ -82,6 +82,55 @@ fn services_slot() -> &'static Mutex<Option<Arc<Services>>> {
     SERVICES.get_or_init(|| Mutex::new(None))
 }
 
+/// The services, or `None` before `alexandria_index_init` has run.
+///
+/// Poisoning is ignored, deliberately. What the mutex guards is a single
+/// `Option<Arc<Services>>` — there is no invariant a panic could leave half
+/// built, and nothing runs while the lock is held but a clone. Now that
+/// [`ffi_guard`] keeps a panic from ending the process, a poisoned lock would
+/// be the one thing left that turned a single caught panic into every later
+/// call failing for the life of the process: precisely the outcome the guard
+/// exists to prevent.
+fn locked_services() -> Option<Arc<Services>> {
+    services_slot()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+}
+
+/// Run `body`, answering `on_panic` if it panics instead of letting the panic
+/// cross the FFI boundary.
+///
+/// The embedder links this library into its own process, so an unwinding
+/// panic here does not fail one request — it takes the whole application down
+/// with it: no message, no chance to save, and whatever the owner had open is
+/// gone. That is a poor answer to a file this core could not read, which is
+/// exactly where the risk is: the decoders below are fed arbitrary bytes off
+/// the owner's disk, damaged ones included, and a third-party decoder
+/// panicking on malformed input is an ordinary failure of this product's main
+/// job rather than a bug that should never happen.
+///
+/// So a panic is turned into the same thing every other unexpected failure
+/// turns into: the family's `_ERR_OTHER`. The caller reads a status code it
+/// already knows how to render, and the application stays up.
+///
+/// This is a boundary, not a licence. It does not make a panic acceptable —
+/// the panic is still a defect, and it is still logged by the default hook on
+/// the way past. What it buys is that the defect costs one operation instead
+/// of the session.
+///
+/// `AssertUnwindSafe` because the bodies hold `&Services` and a Tokio runtime
+/// across the boundary and neither is `UnwindSafe`. The assertion is sound
+/// here: nothing observable is left half-written by a panic that this then
+/// reports as a failure, because the core's writes are transactional and a
+/// panic rolls the open transaction back rather than committing it.
+fn ffi_guard<T>(on_panic: T, body: impl FnOnce() -> T) -> T {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)) {
+        Ok(value) => value,
+        Err(_) => on_panic,
+    }
+}
+
 /// Authenticate the caller before any payload is looked at.
 ///
 /// The handlers authenticate too, but they can only do so *after* their
@@ -243,39 +292,45 @@ pub extern "C" fn alexandria_health_status_code() -> i32 {
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
 pub extern "C" fn alexandria_index_init(db_path: *const c_char) -> c_int {
-    let path = match cstr_lossy(db_path) {
-        Some(p) => p,
-        None => return INDEX_ERR_INVALID_INPUT,
-    };
-    let mut settings = load_settings();
-    settings.database.path = path.clone();
-    // Same gate as the HTTP binary: a misconfigured mode is a startup failure
-    // on both surfaces (FR-AU-08).
-    // Both messages are logged rather than discarded: the embedder only gets an
-    // opaque status code back, and FFI is the surface an operator is most
-    // likely to hit a misconfiguration on. A SID names an account rather than
-    // authenticating one, so naming both of them costs nothing (FR-AU-21).
-    if let Err(err) = settings.auth.validate() {
-        tracing::error!(error = %err, "auth configuration is invalid; refusing to initialize");
-        return INDEX_ERR_OTHER;
-    }
-    if settings.auth.mode == AuthMode::Windows {
-        if let Err(err) = verify_owner(&ProcessWindowsIdentity, &settings.auth.windows_owner_sid) {
-            tracing::error!(error = %err, "windows-mode startup check failed");
+    ffi_guard(INDEX_ERR_OTHER, || {
+        let path = match cstr_lossy(db_path) {
+            Some(p) => p,
+            None => return INDEX_ERR_INVALID_INPUT,
+        };
+        let mut settings = load_settings();
+        settings.database.path = path.clone();
+        // Same gate as the HTTP binary: a misconfigured mode is a startup failure
+        // on both surfaces (FR-AU-08).
+        // Both messages are logged rather than discarded: the embedder only gets an
+        // opaque status code back, and FFI is the surface an operator is most
+        // likely to hit a misconfiguration on. A SID names an account rather than
+        // authenticating one, so naming both of them costs nothing (FR-AU-21).
+        if let Err(err) = settings.auth.validate() {
+            tracing::error!(error = %err, "auth configuration is invalid; refusing to initialize");
             return INDEX_ERR_OTHER;
         }
-    }
-    let _ = runtime();
-    let result = runtime().block_on(async {
-        let pool = migrate_database(&path).await?;
-        let services = Arc::new(build_services(&settings, pool).await);
-        *services_slot().lock().unwrap() = Some(services);
-        Ok::<(), DomainError>(())
-    });
-    match result {
-        Ok(()) => INDEX_OK,
-        Err(_) => INDEX_ERR_OTHER,
-    }
+        if settings.auth.mode == AuthMode::Windows {
+            if let Err(err) =
+                verify_owner(&ProcessWindowsIdentity, &settings.auth.windows_owner_sid)
+            {
+                tracing::error!(error = %err, "windows-mode startup check failed");
+                return INDEX_ERR_OTHER;
+            }
+        }
+        let _ = runtime();
+        let result = runtime().block_on(async {
+            let pool = migrate_database(&path).await?;
+            let services = Arc::new(build_services(&settings, pool).await);
+            *services_slot()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(services);
+            Ok::<(), DomainError>(())
+        });
+        match result {
+            Ok(()) => INDEX_OK,
+            Err(_) => INDEX_ERR_OTHER,
+        }
+    })
 }
 
 /// Load settings exactly as the HTTP binary does: `ALEXANDRIA_CONFIG` or
@@ -310,76 +365,78 @@ pub extern "C" fn alexandria_index_start(
     priority: *const c_char,
     types: *const c_char,
 ) -> IndexStartResult {
-    let services = match services_slot().lock().unwrap().clone() {
-        Some(s) => s,
-        None => return IndexStartResult::err(INDEX_ERR_NOT_INITIALIZED),
-    };
-    let root = match cstr_lossy(root) {
-        Some(r) => r,
-        None => return IndexStartResult::err(INDEX_ERR_INVALID_INPUT),
-    };
-    let token = cstr_lossy(token).unwrap_or_default();
-    // Denied before the scope is looked at (see `authenticated`): `start`
-    // authenticates, but only after its arguments are parsed, and the HTTP
-    // surface's `require_auth` is a route layer that runs before its
-    // extractors. Without this gate an unauthenticated caller would learn
-    // from the FFI that its `types` did not parse where HTTP told it only
-    // `401` (FR-FC-24 / NFR-09).
-    //
-    // Not the full "deny before any payload is looked at" the collection
-    // entry points keep: the NULL-`root` check above still answers
-    // `INVALID_INPUT` to an unauthenticated caller, where HTTP answers
-    // `401`. That gap predates this argument and is left as it is rather
-    // than changed in passing — this gate covers the parameter it was added
-    // with.
-    if !authenticated(&services, &token) {
-        return IndexStartResult::err(INDEX_ERR_UNAUTHORIZED);
-    }
-    let priority = parse_priority(cstr_lossy(priority));
-    // Parsed before `start`, so a misspelt type is refused without a run
-    // record being opened — the same order the root check keeps (FR-FC-27).
-    let scope = match parse_scope(cstr_lossy(types)) {
-        Ok(scope) => scope,
-        Err(_) => return IndexStartResult::err(INDEX_ERR_INVALID_INPUT),
-    };
-    let rt = runtime();
-
-    let started = rt.block_on(async {
-        services
-            .index_handler
-            .start(
-                IndexRequest {
-                    root: root.clone(),
-                    priority,
-                    scope: scope.clone(),
-                },
-                &token,
-            )
-            .await
-    });
-
-    match started {
-        Ok(s) => {
-            let run_id = s.run_id;
-            let handler = services.index_handler.clone();
-            rt.spawn(async move {
-                // Per-file failures are counted inside `execute`; an `Err`
-                // here means the run could not start at all. `execute` has
-                // already written the `failed` run record on its own error
-                // path (UC-48), so the failure is recorded, not lost. This
-                // log line is for the operator.
-                if let Err(err) = handler.execute(&root, run_id, &scope).await {
-                    tracing::error!(%run_id, error = %err, "index run aborted");
-                }
-            });
-            IndexStartResult::ok(&s.run_id.to_string())
+    ffi_guard(IndexStartResult::err(INDEX_ERR_OTHER), || {
+        let services = match locked_services() {
+            Some(s) => s,
+            None => return IndexStartResult::err(INDEX_ERR_NOT_INITIALIZED),
+        };
+        let root = match cstr_lossy(root) {
+            Some(r) => r,
+            None => return IndexStartResult::err(INDEX_ERR_INVALID_INPUT),
+        };
+        let token = cstr_lossy(token).unwrap_or_default();
+        // Denied before the scope is looked at (see `authenticated`): `start`
+        // authenticates, but only after its arguments are parsed, and the HTTP
+        // surface's `require_auth` is a route layer that runs before its
+        // extractors. Without this gate an unauthenticated caller would learn
+        // from the FFI that its `types` did not parse where HTTP told it only
+        // `401` (FR-FC-24 / NFR-09).
+        //
+        // Not the full "deny before any payload is looked at" the collection
+        // entry points keep: the NULL-`root` check above still answers
+        // `INVALID_INPUT` to an unauthenticated caller, where HTTP answers
+        // `401`. That gap predates this argument and is left as it is rather
+        // than changed in passing — this gate covers the parameter it was added
+        // with.
+        if !authenticated(&services, &token) {
+            return IndexStartResult::err(INDEX_ERR_UNAUTHORIZED);
         }
-        Err(err) => match err {
-            DomainError::InvalidInput(_) => IndexStartResult::err(INDEX_ERR_INVALID_INPUT),
-            DomainError::Unauthorized => IndexStartResult::err(INDEX_ERR_UNAUTHORIZED),
-            _ => IndexStartResult::err(INDEX_ERR_OTHER),
-        },
-    }
+        let priority = parse_priority(cstr_lossy(priority));
+        // Parsed before `start`, so a misspelt type is refused without a run
+        // record being opened — the same order the root check keeps (FR-FC-27).
+        let scope = match parse_scope(cstr_lossy(types)) {
+            Ok(scope) => scope,
+            Err(_) => return IndexStartResult::err(INDEX_ERR_INVALID_INPUT),
+        };
+        let rt = runtime();
+
+        let started = rt.block_on(async {
+            services
+                .index_handler
+                .start(
+                    IndexRequest {
+                        root: root.clone(),
+                        priority,
+                        scope: scope.clone(),
+                    },
+                    &token,
+                )
+                .await
+        });
+
+        match started {
+            Ok(s) => {
+                let run_id = s.run_id;
+                let handler = services.index_handler.clone();
+                rt.spawn(async move {
+                    // Per-file failures are counted inside `execute`; an `Err`
+                    // here means the run could not start at all. `execute` has
+                    // already written the `failed` run record on its own error
+                    // path (UC-48), so the failure is recorded, not lost. This
+                    // log line is for the operator.
+                    if let Err(err) = handler.execute(&root, run_id, &scope).await {
+                        tracing::error!(%run_id, error = %err, "index run aborted");
+                    }
+                });
+                IndexStartResult::ok(&s.run_id.to_string())
+            }
+            Err(err) => match err {
+                DomainError::InvalidInput(_) => IndexStartResult::err(INDEX_ERR_INVALID_INPUT),
+                DomainError::Unauthorized => IndexStartResult::err(INDEX_ERR_UNAUTHORIZED),
+                _ => IndexStartResult::err(INDEX_ERR_OTHER),
+            },
+        }
+    })
 }
 
 /// Start an asynchronous re-index/refresh of every cataloged path (UC-02).
@@ -397,50 +454,54 @@ pub extern "C" fn alexandria_index_refresh_start(
     token: *const c_char,
     priority: *const c_char,
 ) -> IndexStartResult {
-    let services = match services_slot().lock().unwrap().clone() {
-        Some(s) => s,
-        None => return IndexStartResult::err(INDEX_ERR_NOT_INITIALIZED),
-    };
-    let token = cstr_lossy(token).unwrap_or_default();
-    let priority = parse_priority(cstr_lossy(priority));
-    let rt = runtime();
+    ffi_guard(IndexStartResult::err(INDEX_ERR_OTHER), || {
+        let services = match locked_services() {
+            Some(s) => s,
+            None => return IndexStartResult::err(INDEX_ERR_NOT_INITIALIZED),
+        };
+        let token = cstr_lossy(token).unwrap_or_default();
+        let priority = parse_priority(cstr_lossy(priority));
+        let rt = runtime();
 
-    let started = rt.block_on(async { services.refresh_handler.start(priority, &token).await });
+        let started = rt.block_on(async { services.refresh_handler.start(priority, &token).await });
 
-    match started {
-        Ok(s) => {
-            let run_id = s.run_id;
-            let handler = services.refresh_handler.clone();
-            rt.spawn(async move {
-                // Per-file failures are counted inside `execute`; an `Err`
-                // here means the run could not start at all. `execute` has
-                // already written the `failed` run record on its own error
-                // path (UC-48), so the failure is recorded, not lost. This
-                // log line is for the operator.
-                if let Err(err) = handler.execute(run_id).await {
-                    tracing::error!(%run_id, error = %err, "re-index run aborted");
-                }
-            });
-            IndexStartResult::ok(&s.run_id.to_string())
+        match started {
+            Ok(s) => {
+                let run_id = s.run_id;
+                let handler = services.refresh_handler.clone();
+                rt.spawn(async move {
+                    // Per-file failures are counted inside `execute`; an `Err`
+                    // here means the run could not start at all. `execute` has
+                    // already written the `failed` run record on its own error
+                    // path (UC-48), so the failure is recorded, not lost. This
+                    // log line is for the operator.
+                    if let Err(err) = handler.execute(run_id).await {
+                        tracing::error!(%run_id, error = %err, "re-index run aborted");
+                    }
+                });
+                IndexStartResult::ok(&s.run_id.to_string())
+            }
+            Err(DomainError::Unauthorized) => IndexStartResult::err(INDEX_ERR_UNAUTHORIZED),
+            Err(_) => IndexStartResult::err(INDEX_ERR_OTHER),
         }
-        Err(DomainError::Unauthorized) => IndexStartResult::err(INDEX_ERR_UNAUTHORIZED),
-        Err(_) => IndexStartResult::err(INDEX_ERR_OTHER),
-    }
+    })
 }
 
 /// Count of indexed files. For tests waiting for the background scan.
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
 pub extern "C" fn alexandria_index_count_files() -> i64 {
-    let services = match services_slot().lock().unwrap().clone() {
-        Some(s) => s,
-        None => return -1,
-    };
-    runtime().block_on(async {
-        let row: Result<(i64,), _> = sqlx::query_as("SELECT COUNT(*) FROM files")
-            .fetch_one(&services.pool)
-            .await;
-        row.map(|(c,)| c).unwrap_or(-1)
+    ffi_guard(-1, || {
+        let services = match locked_services() {
+            Some(s) => s,
+            None => return -1,
+        };
+        runtime().block_on(async {
+            let row: Result<(i64,), _> = sqlx::query_as("SELECT COUNT(*) FROM files")
+                .fetch_one(&services.pool)
+                .await;
+            row.map(|(c,)| c).unwrap_or(-1)
+        })
     })
 }
 
@@ -489,57 +550,59 @@ pub extern "C" fn alexandria_file_edit_metadata(
     json_patch: *const c_char,
     token: *const c_char,
 ) -> FileMetadataResult {
-    let services = match services_slot().lock().unwrap().clone() {
-        Some(s) => s,
-        None => return FileMetadataResult::err(FILE_ERR_NOT_INITIALIZED),
-    };
+    ffi_guard(FileMetadataResult::err(FILE_ERR_OTHER), || {
+        let services = match locked_services() {
+            Some(s) => s,
+            None => return FileMetadataResult::err(FILE_ERR_NOT_INITIALIZED),
+        };
 
-    // Deny before touching the payload — an unauthenticated caller must
-    // not learn whether its uuid or body would have parsed.
-    let token = cstr_lossy(token).unwrap_or_default();
-    if !authenticated(&services, &token) {
-        return FileMetadataResult::err(FILE_ERR_UNAUTHORIZED);
-    }
+        // Deny before touching the payload — an unauthenticated caller must
+        // not learn whether its uuid or body would have parsed.
+        let token = cstr_lossy(token).unwrap_or_default();
+        if !authenticated(&services, &token) {
+            return FileMetadataResult::err(FILE_ERR_UNAUTHORIZED);
+        }
 
-    let uuid_str = match cstr_lossy(uuid) {
-        Some(s) => s,
-        None => return FileMetadataResult::err(FILE_ERR_INVALID_INPUT),
-    };
-    let uuid = match uuid::Uuid::parse_str(&uuid_str) {
-        Ok(u) => u,
-        Err(_) => return FileMetadataResult::err(FILE_ERR_INVALID_INPUT),
-    };
-
-    let patch_str = match cstr_lossy(json_patch) {
-        Some(s) => s,
-        None => return FileMetadataResult::err(FILE_ERR_INVALID_INPUT),
-    };
-    let metadata: alexandria_core::catalog::model::SubtypeMetadata =
-        match serde_json::from_str(&patch_str) {
-            Ok(m) => m,
+        let uuid_str = match cstr_lossy(uuid) {
+            Some(s) => s,
+            None => return FileMetadataResult::err(FILE_ERR_INVALID_INPUT),
+        };
+        let uuid = match uuid::Uuid::parse_str(&uuid_str) {
+            Ok(u) => u,
             Err(_) => return FileMetadataResult::err(FILE_ERR_INVALID_INPUT),
         };
 
-    let result = runtime().block_on(async {
-        services
-            .edit_metadata_handler
-            .edit(uuid, metadata, &token)
-            .await
-    });
+        let patch_str = match cstr_lossy(json_patch) {
+            Some(s) => s,
+            None => return FileMetadataResult::err(FILE_ERR_INVALID_INPUT),
+        };
+        let metadata: alexandria_core::catalog::model::SubtypeMetadata =
+            match serde_json::from_str(&patch_str) {
+                Ok(m) => m,
+                Err(_) => return FileMetadataResult::err(FILE_ERR_INVALID_INPUT),
+            };
 
-    match result {
-        Ok(file_metadata) => {
-            let json = serde_json::to_string(&file_metadata).unwrap_or_default();
-            FileMetadataResult::ok(json)
+        let result = runtime().block_on(async {
+            services
+                .edit_metadata_handler
+                .edit(uuid, metadata, &token)
+                .await
+        });
+
+        match result {
+            Ok(file_metadata) => {
+                let json = serde_json::to_string(&file_metadata).unwrap_or_default();
+                FileMetadataResult::ok(json)
+            }
+            Err(err) => match err {
+                DomainError::NotFound => FileMetadataResult::err(FILE_ERR_NOT_FOUND),
+                DomainError::Unauthorized => FileMetadataResult::err(FILE_ERR_UNAUTHORIZED),
+                DomainError::InvalidInput(_) => FileMetadataResult::err(FILE_ERR_INVALID_INPUT),
+                DomainError::InvalidState => FileMetadataResult::err(FILE_ERR_INVALID_STATE),
+                _ => FileMetadataResult::err(FILE_ERR_OTHER),
+            },
         }
-        Err(err) => match err {
-            DomainError::NotFound => FileMetadataResult::err(FILE_ERR_NOT_FOUND),
-            DomainError::Unauthorized => FileMetadataResult::err(FILE_ERR_UNAUTHORIZED),
-            DomainError::InvalidInput(_) => FileMetadataResult::err(FILE_ERR_INVALID_INPUT),
-            DomainError::InvalidState => FileMetadataResult::err(FILE_ERR_INVALID_STATE),
-            _ => FileMetadataResult::err(FILE_ERR_OTHER),
-        },
-    }
+    })
 }
 
 /// Result of `alexandria_files_list` and `alexandria_file_get_by_uuid` (UC-03).
@@ -681,67 +744,70 @@ pub extern "C" fn alexandria_files_list(
     json_filters: *const c_char,
     token: *const c_char,
 ) -> FileJsonResult {
-    let services = match services_slot().lock().unwrap().clone() {
-        Some(s) => s,
-        None => return FileJsonResult::err(FILE_ERR_NOT_INITIALIZED),
-    };
-
-    // Deny before touching the payload — an unauthenticated caller must
-    // not learn whether its filters would have validated.
-    let token = cstr_lossy(token).unwrap_or_default();
-    if !authenticated(&services, &token) {
-        return FileJsonResult::err(FILE_ERR_UNAUTHORIZED);
-    }
-
-    let filter_str = cstr_lossy(json_filters).unwrap_or_default();
-    let parsed = match FilesListFilter::from_json_str(&filter_str) {
-        Some(f) => f,
-        None => return FileJsonResult::err(FILE_ERR_INVALID_INPUT),
-    };
-
-    // An unrecognised filter value is invalid input, not a silently dropped
-    // filter — HTTP answers `400` for these and the two surfaces must agree
-    // (FR-FC-24 / NFR-09). An empty string means "no filter", as on HTTP.
-    let file_type = match parsed.file_type.as_deref().filter(|s| !s.is_empty()) {
-        Some(t) => match parse_file_type(t) {
-            Some(ft) => Some(ft),
-            None => return FileJsonResult::err(FILE_ERR_INVALID_INPUT),
-        },
-        None => None,
-    };
-    let state = match parsed.state.as_deref().filter(|s| !s.is_empty()) {
-        Some(s) => match alexandria_core::catalog::model::StateFilter::parse(s) {
-            Some(st) => st,
-            None => return FileJsonResult::err(FILE_ERR_INVALID_INPUT),
-        },
-        None => alexandria_core::catalog::model::StateFilter::Active,
-    };
-
-    let mut filter = alexandria_core::catalog::queries::browse::FileFilter::new().with_state(state);
-    if let Some(t) = file_type {
-        filter = filter.with_type(t);
-    }
-    if let Some(c) = parsed.collection_uuid.as_deref().filter(|s| !s.is_empty()) {
-        let collection_uuid = match uuid::Uuid::parse_str(c) {
-            Ok(u) => u,
-            Err(_) => return FileJsonResult::err(FILE_ERR_INVALID_INPUT),
+    ffi_guard(FileJsonResult::err(FILE_ERR_OTHER), || {
+        let services = match locked_services() {
+            Some(s) => s,
+            None => return FileJsonResult::err(FILE_ERR_NOT_INITIALIZED),
         };
-        filter = filter.with_collection(collection_uuid);
-    }
-    if parsed.include_libraries {
-        filter = filter.everywhere();
-    }
 
-    let result =
-        runtime().block_on(async { services.browse_files_handler.list(filter, &token).await });
-
-    match result {
-        Ok(files) => {
-            let json = serde_json::to_string(&files).unwrap_or_else(|_| "[]".to_string());
-            FileJsonResult::ok(json)
+        // Deny before touching the payload — an unauthenticated caller must
+        // not learn whether its filters would have validated.
+        let token = cstr_lossy(token).unwrap_or_default();
+        if !authenticated(&services, &token) {
+            return FileJsonResult::err(FILE_ERR_UNAUTHORIZED);
         }
-        Err(err) => map_file_err(err),
-    }
+
+        let filter_str = cstr_lossy(json_filters).unwrap_or_default();
+        let parsed = match FilesListFilter::from_json_str(&filter_str) {
+            Some(f) => f,
+            None => return FileJsonResult::err(FILE_ERR_INVALID_INPUT),
+        };
+
+        // An unrecognised filter value is invalid input, not a silently dropped
+        // filter — HTTP answers `400` for these and the two surfaces must agree
+        // (FR-FC-24 / NFR-09). An empty string means "no filter", as on HTTP.
+        let file_type = match parsed.file_type.as_deref().filter(|s| !s.is_empty()) {
+            Some(t) => match parse_file_type(t) {
+                Some(ft) => Some(ft),
+                None => return FileJsonResult::err(FILE_ERR_INVALID_INPUT),
+            },
+            None => None,
+        };
+        let state = match parsed.state.as_deref().filter(|s| !s.is_empty()) {
+            Some(s) => match alexandria_core::catalog::model::StateFilter::parse(s) {
+                Some(st) => st,
+                None => return FileJsonResult::err(FILE_ERR_INVALID_INPUT),
+            },
+            None => alexandria_core::catalog::model::StateFilter::Active,
+        };
+
+        let mut filter =
+            alexandria_core::catalog::queries::browse::FileFilter::new().with_state(state);
+        if let Some(t) = file_type {
+            filter = filter.with_type(t);
+        }
+        if let Some(c) = parsed.collection_uuid.as_deref().filter(|s| !s.is_empty()) {
+            let collection_uuid = match uuid::Uuid::parse_str(c) {
+                Ok(u) => u,
+                Err(_) => return FileJsonResult::err(FILE_ERR_INVALID_INPUT),
+            };
+            filter = filter.with_collection(collection_uuid);
+        }
+        if parsed.include_libraries {
+            filter = filter.everywhere();
+        }
+
+        let result =
+            runtime().block_on(async { services.browse_files_handler.list(filter, &token).await });
+
+        match result {
+            Ok(files) => {
+                let json = serde_json::to_string(&files).unwrap_or_else(|_| "[]".to_string());
+                FileJsonResult::ok(json)
+            }
+            Err(err) => map_file_err(err),
+        }
+    })
 }
 
 /// Get a single file's metadata by its public UUID (UC-03 / FR-FC-13).
@@ -757,41 +823,43 @@ pub extern "C" fn alexandria_file_get_by_uuid(
     uuid: *const c_char,
     token: *const c_char,
 ) -> FileJsonResult {
-    let services = match services_slot().lock().unwrap().clone() {
-        Some(s) => s,
-        None => return FileJsonResult::err(FILE_ERR_NOT_INITIALIZED),
-    };
+    ffi_guard(FileJsonResult::err(FILE_ERR_OTHER), || {
+        let services = match locked_services() {
+            Some(s) => s,
+            None => return FileJsonResult::err(FILE_ERR_NOT_INITIALIZED),
+        };
 
-    // Deny before touching the payload — an unauthenticated caller must
-    // not learn whether its uuid would have parsed.
-    let token = cstr_lossy(token).unwrap_or_default();
-    if !authenticated(&services, &token) {
-        return FileJsonResult::err(FILE_ERR_UNAUTHORIZED);
-    }
-
-    let uuid_str = match cstr_lossy(uuid) {
-        Some(s) => s,
-        None => return FileJsonResult::err(FILE_ERR_INVALID_INPUT),
-    };
-    let uuid = match uuid::Uuid::parse_str(&uuid_str) {
-        Ok(u) => u,
-        Err(_) => return FileJsonResult::err(FILE_ERR_INVALID_INPUT),
-    };
-
-    let result = runtime().block_on(async {
-        services
-            .browse_files_handler
-            .get_by_uuid(uuid, &token)
-            .await
-    });
-
-    match result {
-        Ok(view) => {
-            let json = serde_json::to_string(&view).unwrap_or_default();
-            FileJsonResult::ok(json)
+        // Deny before touching the payload — an unauthenticated caller must
+        // not learn whether its uuid would have parsed.
+        let token = cstr_lossy(token).unwrap_or_default();
+        if !authenticated(&services, &token) {
+            return FileJsonResult::err(FILE_ERR_UNAUTHORIZED);
         }
-        Err(err) => map_file_err(err),
-    }
+
+        let uuid_str = match cstr_lossy(uuid) {
+            Some(s) => s,
+            None => return FileJsonResult::err(FILE_ERR_INVALID_INPUT),
+        };
+        let uuid = match uuid::Uuid::parse_str(&uuid_str) {
+            Ok(u) => u,
+            Err(_) => return FileJsonResult::err(FILE_ERR_INVALID_INPUT),
+        };
+
+        let result = runtime().block_on(async {
+            services
+                .browse_files_handler
+                .get_by_uuid(uuid, &token)
+                .await
+        });
+
+        match result {
+            Ok(view) => {
+                let json = serde_json::to_string(&view).unwrap_or_default();
+                FileJsonResult::ok(json)
+            }
+            Err(err) => map_file_err(err),
+        }
+    })
 }
 
 /// Read a TextFile's content from disk (UC-32 / FR-TX-01).
@@ -806,41 +874,43 @@ pub extern "C" fn alexandria_file_read_content(
     uuid: *const c_char,
     token: *const c_char,
 ) -> FileJsonResult {
-    let services = match services_slot().lock().unwrap().clone() {
-        Some(s) => s,
-        None => return FileJsonResult::err(FILE_ERR_NOT_INITIALIZED),
-    };
+    ffi_guard(FileJsonResult::err(FILE_ERR_OTHER), || {
+        let services = match locked_services() {
+            Some(s) => s,
+            None => return FileJsonResult::err(FILE_ERR_NOT_INITIALIZED),
+        };
 
-    // Deny before touching the payload — an unauthenticated caller must
-    // not learn whether its uuid would have parsed.
-    let token = cstr_lossy(token).unwrap_or_default();
-    if !authenticated(&services, &token) {
-        return FileJsonResult::err(FILE_ERR_UNAUTHORIZED);
-    }
-
-    let uuid_str = match cstr_lossy(uuid) {
-        Some(s) => s,
-        None => return FileJsonResult::err(FILE_ERR_INVALID_INPUT),
-    };
-    let uuid = match uuid::Uuid::parse_str(&uuid_str) {
-        Ok(u) => u,
-        Err(_) => return FileJsonResult::err(FILE_ERR_INVALID_INPUT),
-    };
-
-    let result = runtime().block_on(async {
-        services
-            .read_text_file_content_handler
-            .read(uuid, &token)
-            .await
-    });
-
-    match result {
-        Ok(content) => {
-            let json = serde_json::to_string(&content).unwrap_or_default();
-            FileJsonResult::ok(json)
+        // Deny before touching the payload — an unauthenticated caller must
+        // not learn whether its uuid would have parsed.
+        let token = cstr_lossy(token).unwrap_or_default();
+        if !authenticated(&services, &token) {
+            return FileJsonResult::err(FILE_ERR_UNAUTHORIZED);
         }
-        Err(err) => map_file_err(err),
-    }
+
+        let uuid_str = match cstr_lossy(uuid) {
+            Some(s) => s,
+            None => return FileJsonResult::err(FILE_ERR_INVALID_INPUT),
+        };
+        let uuid = match uuid::Uuid::parse_str(&uuid_str) {
+            Ok(u) => u,
+            Err(_) => return FileJsonResult::err(FILE_ERR_INVALID_INPUT),
+        };
+
+        let result = runtime().block_on(async {
+            services
+                .read_text_file_content_handler
+                .read(uuid, &token)
+                .await
+        });
+
+        match result {
+            Ok(content) => {
+                let json = serde_json::to_string(&content).unwrap_or_default();
+                FileJsonResult::ok(json)
+            }
+            Err(err) => map_file_err(err),
+        }
+    })
 }
 
 /// Resolve a File to everything a local player needs to open it
@@ -859,33 +929,35 @@ pub extern "C" fn alexandria_file_playback_source(
     uuid: *const c_char,
     token: *const c_char,
 ) -> PlaybackJsonResult {
-    let services = match services_slot().lock().unwrap().clone() {
-        Some(s) => s,
-        None => return PlaybackJsonResult::err(PLAYBACK_ERR_NOT_INITIALIZED),
-    };
+    ffi_guard(PlaybackJsonResult::err(PLAYBACK_ERR_OTHER), || {
+        let services = match locked_services() {
+            Some(s) => s,
+            None => return PlaybackJsonResult::err(PLAYBACK_ERR_NOT_INITIALIZED),
+        };
 
-    // Deny before touching the payload — an unauthenticated caller must not
-    // learn whether its uuid would have parsed.
-    let token = cstr_lossy(token).unwrap_or_default();
-    if !authenticated(&services, &token) {
-        return PlaybackJsonResult::err(PLAYBACK_ERR_UNAUTHORIZED);
-    }
-
-    let uuid = match cstr_lossy(uuid).and_then(|s| uuid::Uuid::parse_str(&s).ok()) {
-        Some(u) => u,
-        None => return PlaybackJsonResult::err(PLAYBACK_ERR_INVALID_INPUT),
-    };
-
-    let result =
-        runtime().block_on(async { services.playback_source_handler.resolve(uuid, &token).await });
-
-    match result {
-        Ok(source) => {
-            let json = serde_json::to_string(&source).unwrap_or_default();
-            PlaybackJsonResult::ok(json)
+        // Deny before touching the payload — an unauthenticated caller must not
+        // learn whether its uuid would have parsed.
+        let token = cstr_lossy(token).unwrap_or_default();
+        if !authenticated(&services, &token) {
+            return PlaybackJsonResult::err(PLAYBACK_ERR_UNAUTHORIZED);
         }
-        Err(err) => map_playback_err(err),
-    }
+
+        let uuid = match cstr_lossy(uuid).and_then(|s| uuid::Uuid::parse_str(&s).ok()) {
+            Some(u) => u,
+            None => return PlaybackJsonResult::err(PLAYBACK_ERR_INVALID_INPUT),
+        };
+
+        let result = runtime()
+            .block_on(async { services.playback_source_handler.resolve(uuid, &token).await });
+
+        match result {
+            Ok(source) => {
+                let json = serde_json::to_string(&source).unwrap_or_default();
+                PlaybackJsonResult::ok(json)
+            }
+            Err(err) => map_playback_err(err),
+        }
+    })
 }
 
 /// One page of a CBZ ComicBook (UC-39 / FR-MP-04).
@@ -902,44 +974,46 @@ pub extern "C" fn alexandria_comic_page(
     page: u32,
     token: *const c_char,
 ) -> PlaybackJsonResult {
-    let services = match services_slot().lock().unwrap().clone() {
-        Some(s) => s,
-        None => return PlaybackJsonResult::err(PLAYBACK_ERR_NOT_INITIALIZED),
-    };
+    ffi_guard(PlaybackJsonResult::err(PLAYBACK_ERR_OTHER), || {
+        let services = match locked_services() {
+            Some(s) => s,
+            None => return PlaybackJsonResult::err(PLAYBACK_ERR_NOT_INITIALIZED),
+        };
 
-    let token = cstr_lossy(token).unwrap_or_default();
-    if !authenticated(&services, &token) {
-        return PlaybackJsonResult::err(PLAYBACK_ERR_UNAUTHORIZED);
-    }
-
-    let uuid = match cstr_lossy(uuid).and_then(|s| uuid::Uuid::parse_str(&s).ok()) {
-        Some(u) => u,
-        None => return PlaybackJsonResult::err(PLAYBACK_ERR_INVALID_INPUT),
-    };
-
-    let result = runtime().block_on(async {
-        services
-            .comic_page_handler
-            .read_page(uuid, page, &token)
-            .await
-    });
-
-    match result {
-        Ok(comic_page) => {
-            use base64::Engine;
-            let encoded = base64::engine::general_purpose::STANDARD.encode(&comic_page.bytes);
-            let json = serde_json::json!({
-                "uuid": comic_page.uuid,
-                "page": comic_page.page,
-                "pageCount": comic_page.page_count,
-                "mimeType": comic_page.mime_type,
-                "bytesBase64": encoded,
-            })
-            .to_string();
-            PlaybackJsonResult::ok(json)
+        let token = cstr_lossy(token).unwrap_or_default();
+        if !authenticated(&services, &token) {
+            return PlaybackJsonResult::err(PLAYBACK_ERR_UNAUTHORIZED);
         }
-        Err(err) => map_playback_err(err),
-    }
+
+        let uuid = match cstr_lossy(uuid).and_then(|s| uuid::Uuid::parse_str(&s).ok()) {
+            Some(u) => u,
+            None => return PlaybackJsonResult::err(PLAYBACK_ERR_INVALID_INPUT),
+        };
+
+        let result = runtime().block_on(async {
+            services
+                .comic_page_handler
+                .read_page(uuid, page, &token)
+                .await
+        });
+
+        match result {
+            Ok(comic_page) => {
+                use base64::Engine;
+                let encoded = base64::engine::general_purpose::STANDARD.encode(&comic_page.bytes);
+                let json = serde_json::json!({
+                    "uuid": comic_page.uuid,
+                    "page": comic_page.page,
+                    "pageCount": comic_page.page_count,
+                    "mimeType": comic_page.mime_type,
+                    "bytesBase64": encoded,
+                })
+                .to_string();
+                PlaybackJsonResult::ok(json)
+            }
+            Err(err) => map_playback_err(err),
+        }
+    })
 }
 
 /// A downscaled thumbnail for a video, image, or comic
@@ -952,38 +1026,40 @@ pub extern "C" fn alexandria_file_thumbnail(
     uuid: *const c_char,
     token: *const c_char,
 ) -> PlaybackJsonResult {
-    let services = match services_slot().lock().unwrap().clone() {
-        Some(s) => s,
-        None => return PlaybackJsonResult::err(PLAYBACK_ERR_NOT_INITIALIZED),
-    };
+    ffi_guard(PlaybackJsonResult::err(PLAYBACK_ERR_OTHER), || {
+        let services = match locked_services() {
+            Some(s) => s,
+            None => return PlaybackJsonResult::err(PLAYBACK_ERR_NOT_INITIALIZED),
+        };
 
-    let token = cstr_lossy(token).unwrap_or_default();
-    if !authenticated(&services, &token) {
-        return PlaybackJsonResult::err(PLAYBACK_ERR_UNAUTHORIZED);
-    }
-
-    let uuid = match cstr_lossy(uuid).and_then(|s| uuid::Uuid::parse_str(&s).ok()) {
-        Some(u) => u,
-        None => return PlaybackJsonResult::err(PLAYBACK_ERR_INVALID_INPUT),
-    };
-
-    let result =
-        runtime().block_on(async { services.thumbnail_handler.thumbnail(uuid, &token).await });
-
-    match result {
-        Ok(thumb) => {
-            use base64::Engine;
-            let encoded = base64::engine::general_purpose::STANDARD.encode(&thumb.bytes);
-            let json = serde_json::json!({
-                "uuid": thumb.uuid,
-                "mimeType": thumb.mime_type,
-                "bytesBase64": encoded,
-            })
-            .to_string();
-            PlaybackJsonResult::ok(json)
+        let token = cstr_lossy(token).unwrap_or_default();
+        if !authenticated(&services, &token) {
+            return PlaybackJsonResult::err(PLAYBACK_ERR_UNAUTHORIZED);
         }
-        Err(err) => map_playback_err(err),
-    }
+
+        let uuid = match cstr_lossy(uuid).and_then(|s| uuid::Uuid::parse_str(&s).ok()) {
+            Some(u) => u,
+            None => return PlaybackJsonResult::err(PLAYBACK_ERR_INVALID_INPUT),
+        };
+
+        let result =
+            runtime().block_on(async { services.thumbnail_handler.thumbnail(uuid, &token).await });
+
+        match result {
+            Ok(thumb) => {
+                use base64::Engine;
+                let encoded = base64::engine::general_purpose::STANDARD.encode(&thumb.bytes);
+                let json = serde_json::json!({
+                    "uuid": thumb.uuid,
+                    "mimeType": thumb.mime_type,
+                    "bytesBase64": encoded,
+                })
+                .to_string();
+                PlaybackJsonResult::ok(json)
+            }
+            Err(err) => map_playback_err(err),
+        }
+    })
 }
 
 /// Request body accepted by `alexandria_file_edit_content` — the same JSON
@@ -1018,48 +1094,50 @@ pub extern "C" fn alexandria_file_edit_content(
     json_body: *const c_char,
     token: *const c_char,
 ) -> FileJsonResult {
-    let services = match services_slot().lock().unwrap().clone() {
-        Some(s) => s,
-        None => return FileJsonResult::err(FILE_ERR_NOT_INITIALIZED),
-    };
+    ffi_guard(FileJsonResult::err(FILE_ERR_OTHER), || {
+        let services = match locked_services() {
+            Some(s) => s,
+            None => return FileJsonResult::err(FILE_ERR_NOT_INITIALIZED),
+        };
 
-    let token = cstr_lossy(token).unwrap_or_default();
-    if !authenticated(&services, &token) {
-        return FileJsonResult::err(FILE_ERR_UNAUTHORIZED);
-    }
-
-    let uuid_str = match cstr_lossy(uuid) {
-        Some(s) => s,
-        None => return FileJsonResult::err(FILE_ERR_INVALID_INPUT),
-    };
-    let uuid = match uuid::Uuid::parse_str(&uuid_str) {
-        Ok(u) => u,
-        Err(_) => return FileJsonResult::err(FILE_ERR_INVALID_INPUT),
-    };
-
-    let body_str = match cstr_lossy(json_body) {
-        Some(s) => s,
-        None => return FileJsonResult::err(FILE_ERR_INVALID_INPUT),
-    };
-    let body = match EditContentBody::from_json_str(&body_str) {
-        Some(b) => b,
-        None => return FileJsonResult::err(FILE_ERR_INVALID_INPUT),
-    };
-
-    let result = runtime().block_on(async {
-        services
-            .edit_text_file_content_handler
-            .edit(uuid, body.content, &token)
-            .await
-    });
-
-    match result {
-        Ok(file) => {
-            let json = serde_json::to_string(&file).unwrap_or_default();
-            FileJsonResult::ok(json)
+        let token = cstr_lossy(token).unwrap_or_default();
+        if !authenticated(&services, &token) {
+            return FileJsonResult::err(FILE_ERR_UNAUTHORIZED);
         }
-        Err(err) => map_file_err(err),
-    }
+
+        let uuid_str = match cstr_lossy(uuid) {
+            Some(s) => s,
+            None => return FileJsonResult::err(FILE_ERR_INVALID_INPUT),
+        };
+        let uuid = match uuid::Uuid::parse_str(&uuid_str) {
+            Ok(u) => u,
+            Err(_) => return FileJsonResult::err(FILE_ERR_INVALID_INPUT),
+        };
+
+        let body_str = match cstr_lossy(json_body) {
+            Some(s) => s,
+            None => return FileJsonResult::err(FILE_ERR_INVALID_INPUT),
+        };
+        let body = match EditContentBody::from_json_str(&body_str) {
+            Some(b) => b,
+            None => return FileJsonResult::err(FILE_ERR_INVALID_INPUT),
+        };
+
+        let result = runtime().block_on(async {
+            services
+                .edit_text_file_content_handler
+                .edit(uuid, body.content, &token)
+                .await
+        });
+
+        match result {
+            Ok(file) => {
+                let json = serde_json::to_string(&file).unwrap_or_default();
+                FileJsonResult::ok(json)
+            }
+            Err(err) => map_file_err(err),
+        }
+    })
 }
 
 /// Rename a file (and its on-disk file) (UC-05 / FR-FC-19).
@@ -1078,48 +1156,50 @@ pub extern "C" fn alexandria_file_rename(
     name: *const c_char,
     token: *const c_char,
 ) -> FileJsonResult {
-    let services = match services_slot().lock().unwrap().clone() {
-        Some(s) => s,
-        None => return FileJsonResult::err(FILE_ERR_NOT_INITIALIZED),
-    };
+    ffi_guard(FileJsonResult::err(FILE_ERR_OTHER), || {
+        let services = match locked_services() {
+            Some(s) => s,
+            None => return FileJsonResult::err(FILE_ERR_NOT_INITIALIZED),
+        };
 
-    // Deny before touching the payload — an unauthenticated caller must
-    // not learn whether its uuid or name would have parsed.
-    let token = cstr_lossy(token).unwrap_or_default();
-    if !authenticated(&services, &token) {
-        return FileJsonResult::err(FILE_ERR_UNAUTHORIZED);
-    }
-
-    let uuid_str = match cstr_lossy(uuid) {
-        Some(s) => s,
-        None => return FileJsonResult::err(FILE_ERR_INVALID_INPUT),
-    };
-    let uuid = match uuid::Uuid::parse_str(&uuid_str) {
-        Ok(u) => u,
-        Err(_) => return FileJsonResult::err(FILE_ERR_INVALID_INPUT),
-    };
-
-    let name = match cstr_lossy(name) {
-        Some(s) => s,
-        None => return FileJsonResult::err(FILE_ERR_INVALID_INPUT),
-    };
-    // An empty/whitespace name is rejected by the handler's validator, so it
-    // surfaces as `FILE_ERR_INVALID_INPUT` — consistent with the HTTP `400`.
-
-    let result = runtime().block_on(async {
-        services
-            .rename_file_handler
-            .rename(uuid, name, &token)
-            .await
-    });
-
-    match result {
-        Ok(file) => {
-            let json = serde_json::to_string(&file).unwrap_or_default();
-            FileJsonResult::ok(json)
+        // Deny before touching the payload — an unauthenticated caller must
+        // not learn whether its uuid or name would have parsed.
+        let token = cstr_lossy(token).unwrap_or_default();
+        if !authenticated(&services, &token) {
+            return FileJsonResult::err(FILE_ERR_UNAUTHORIZED);
         }
-        Err(err) => map_file_err(err),
-    }
+
+        let uuid_str = match cstr_lossy(uuid) {
+            Some(s) => s,
+            None => return FileJsonResult::err(FILE_ERR_INVALID_INPUT),
+        };
+        let uuid = match uuid::Uuid::parse_str(&uuid_str) {
+            Ok(u) => u,
+            Err(_) => return FileJsonResult::err(FILE_ERR_INVALID_INPUT),
+        };
+
+        let name = match cstr_lossy(name) {
+            Some(s) => s,
+            None => return FileJsonResult::err(FILE_ERR_INVALID_INPUT),
+        };
+        // An empty/whitespace name is rejected by the handler's validator, so it
+        // surfaces as `FILE_ERR_INVALID_INPUT` — consistent with the HTTP `400`.
+
+        let result = runtime().block_on(async {
+            services
+                .rename_file_handler
+                .rename(uuid, name, &token)
+                .await
+        });
+
+        match result {
+            Ok(file) => {
+                let json = serde_json::to_string(&file).unwrap_or_default();
+                FileJsonResult::ok(json)
+            }
+            Err(err) => map_file_err(err),
+        }
+    })
 }
 
 /// Soft-delete a file (UC-06 / FR-FC-20).
@@ -1137,41 +1217,43 @@ pub extern "C" fn alexandria_file_soft_delete(
     uuid: *const c_char,
     token: *const c_char,
 ) -> FileJsonResult {
-    let services = match services_slot().lock().unwrap().clone() {
-        Some(s) => s,
-        None => return FileJsonResult::err(FILE_ERR_NOT_INITIALIZED),
-    };
+    ffi_guard(FileJsonResult::err(FILE_ERR_OTHER), || {
+        let services = match locked_services() {
+            Some(s) => s,
+            None => return FileJsonResult::err(FILE_ERR_NOT_INITIALIZED),
+        };
 
-    // Deny before touching the payload — an unauthenticated caller must not
-    // learn whether its uuid would have parsed.
-    let token = cstr_lossy(token).unwrap_or_default();
-    if !authenticated(&services, &token) {
-        return FileJsonResult::err(FILE_ERR_UNAUTHORIZED);
-    }
-
-    let uuid_str = match cstr_lossy(uuid) {
-        Some(s) => s,
-        None => return FileJsonResult::err(FILE_ERR_INVALID_INPUT),
-    };
-    let uuid = match uuid::Uuid::parse_str(&uuid_str) {
-        Ok(u) => u,
-        Err(_) => return FileJsonResult::err(FILE_ERR_INVALID_INPUT),
-    };
-
-    let result = runtime().block_on(async {
-        services
-            .soft_delete_file_handler
-            .soft_delete(uuid, &token)
-            .await
-    });
-
-    match result {
-        Ok(file) => {
-            let json = serde_json::to_string(&file).unwrap_or_default();
-            FileJsonResult::ok(json)
+        // Deny before touching the payload — an unauthenticated caller must not
+        // learn whether its uuid would have parsed.
+        let token = cstr_lossy(token).unwrap_or_default();
+        if !authenticated(&services, &token) {
+            return FileJsonResult::err(FILE_ERR_UNAUTHORIZED);
         }
-        Err(err) => map_file_err(err),
-    }
+
+        let uuid_str = match cstr_lossy(uuid) {
+            Some(s) => s,
+            None => return FileJsonResult::err(FILE_ERR_INVALID_INPUT),
+        };
+        let uuid = match uuid::Uuid::parse_str(&uuid_str) {
+            Ok(u) => u,
+            Err(_) => return FileJsonResult::err(FILE_ERR_INVALID_INPUT),
+        };
+
+        let result = runtime().block_on(async {
+            services
+                .soft_delete_file_handler
+                .soft_delete(uuid, &token)
+                .await
+        });
+
+        match result {
+            Ok(file) => {
+                let json = serde_json::to_string(&file).unwrap_or_default();
+                FileJsonResult::ok(json)
+            }
+            Err(err) => map_file_err(err),
+        }
+    })
 }
 
 /// Restore a soft-deleted file (UC-07 / FR-FC-21).
@@ -1191,37 +1273,39 @@ pub extern "C" fn alexandria_file_restore(
     uuid: *const c_char,
     token: *const c_char,
 ) -> FileJsonResult {
-    let services = match services_slot().lock().unwrap().clone() {
-        Some(s) => s,
-        None => return FileJsonResult::err(FILE_ERR_NOT_INITIALIZED),
-    };
+    ffi_guard(FileJsonResult::err(FILE_ERR_OTHER), || {
+        let services = match locked_services() {
+            Some(s) => s,
+            None => return FileJsonResult::err(FILE_ERR_NOT_INITIALIZED),
+        };
 
-    // Deny before touching the payload — an unauthenticated caller must not
-    // learn whether its uuid would have parsed.
-    let token = cstr_lossy(token).unwrap_or_default();
-    if !authenticated(&services, &token) {
-        return FileJsonResult::err(FILE_ERR_UNAUTHORIZED);
-    }
-
-    let uuid_str = match cstr_lossy(uuid) {
-        Some(s) => s,
-        None => return FileJsonResult::err(FILE_ERR_INVALID_INPUT),
-    };
-    let uuid = match uuid::Uuid::parse_str(&uuid_str) {
-        Ok(u) => u,
-        Err(_) => return FileJsonResult::err(FILE_ERR_INVALID_INPUT),
-    };
-
-    let result =
-        runtime().block_on(async { services.restore_file_handler.restore(uuid, &token).await });
-
-    match result {
-        Ok(file) => {
-            let json = serde_json::to_string(&file).unwrap_or_default();
-            FileJsonResult::ok(json)
+        // Deny before touching the payload — an unauthenticated caller must not
+        // learn whether its uuid would have parsed.
+        let token = cstr_lossy(token).unwrap_or_default();
+        if !authenticated(&services, &token) {
+            return FileJsonResult::err(FILE_ERR_UNAUTHORIZED);
         }
-        Err(err) => map_file_err(err),
-    }
+
+        let uuid_str = match cstr_lossy(uuid) {
+            Some(s) => s,
+            None => return FileJsonResult::err(FILE_ERR_INVALID_INPUT),
+        };
+        let uuid = match uuid::Uuid::parse_str(&uuid_str) {
+            Ok(u) => u,
+            Err(_) => return FileJsonResult::err(FILE_ERR_INVALID_INPUT),
+        };
+
+        let result =
+            runtime().block_on(async { services.restore_file_handler.restore(uuid, &token).await });
+
+        match result {
+            Ok(file) => {
+                let json = serde_json::to_string(&file).unwrap_or_default();
+                FileJsonResult::ok(json)
+            }
+            Err(err) => map_file_err(err),
+        }
+    })
 }
 
 /// Hard-purge a soft-deleted file's catalog row (UC-08 / FR-FC-22).
@@ -1241,37 +1325,39 @@ pub extern "C" fn alexandria_file_purge(
     uuid: *const c_char,
     token: *const c_char,
 ) -> FileJsonResult {
-    let services = match services_slot().lock().unwrap().clone() {
-        Some(s) => s,
-        None => return FileJsonResult::err(FILE_ERR_NOT_INITIALIZED),
-    };
+    ffi_guard(FileJsonResult::err(FILE_ERR_OTHER), || {
+        let services = match locked_services() {
+            Some(s) => s,
+            None => return FileJsonResult::err(FILE_ERR_NOT_INITIALIZED),
+        };
 
-    // Deny before touching the payload — an unauthenticated caller must not
-    // learn whether its uuid would have parsed.
-    let token = cstr_lossy(token).unwrap_or_default();
-    if !authenticated(&services, &token) {
-        return FileJsonResult::err(FILE_ERR_UNAUTHORIZED);
-    }
-
-    let uuid_str = match cstr_lossy(uuid) {
-        Some(s) => s,
-        None => return FileJsonResult::err(FILE_ERR_INVALID_INPUT),
-    };
-    let uuid = match uuid::Uuid::parse_str(&uuid_str) {
-        Ok(u) => u,
-        Err(_) => return FileJsonResult::err(FILE_ERR_INVALID_INPUT),
-    };
-
-    let result =
-        runtime().block_on(async { services.purge_file_handler.purge(uuid, &token).await });
-
-    match result {
-        Ok(file) => {
-            let json = serde_json::to_string(&file).unwrap_or_default();
-            FileJsonResult::ok(json)
+        // Deny before touching the payload — an unauthenticated caller must not
+        // learn whether its uuid would have parsed.
+        let token = cstr_lossy(token).unwrap_or_default();
+        if !authenticated(&services, &token) {
+            return FileJsonResult::err(FILE_ERR_UNAUTHORIZED);
         }
-        Err(err) => map_file_err(err),
-    }
+
+        let uuid_str = match cstr_lossy(uuid) {
+            Some(s) => s,
+            None => return FileJsonResult::err(FILE_ERR_INVALID_INPUT),
+        };
+        let uuid = match uuid::Uuid::parse_str(&uuid_str) {
+            Ok(u) => u,
+            Err(_) => return FileJsonResult::err(FILE_ERR_INVALID_INPUT),
+        };
+
+        let result =
+            runtime().block_on(async { services.purge_file_handler.purge(uuid, &token).await });
+
+        match result {
+            Ok(file) => {
+                let json = serde_json::to_string(&file).unwrap_or_default();
+                FileJsonResult::ok(json)
+            }
+            Err(err) => map_file_err(err),
+        }
+    })
 }
 
 /// Purge a file both on disk and in the catalog (UC-09 / FR-FC-23).
@@ -1292,41 +1378,43 @@ pub extern "C" fn alexandria_file_purge_on_disk(
     uuid: *const c_char,
     token: *const c_char,
 ) -> FileJsonResult {
-    let services = match services_slot().lock().unwrap().clone() {
-        Some(s) => s,
-        None => return FileJsonResult::err(FILE_ERR_NOT_INITIALIZED),
-    };
+    ffi_guard(FileJsonResult::err(FILE_ERR_OTHER), || {
+        let services = match locked_services() {
+            Some(s) => s,
+            None => return FileJsonResult::err(FILE_ERR_NOT_INITIALIZED),
+        };
 
-    // Deny before touching the payload — an unauthenticated caller must not
-    // learn whether its uuid would have parsed.
-    let token = cstr_lossy(token).unwrap_or_default();
-    if !authenticated(&services, &token) {
-        return FileJsonResult::err(FILE_ERR_UNAUTHORIZED);
-    }
-
-    let uuid_str = match cstr_lossy(uuid) {
-        Some(s) => s,
-        None => return FileJsonResult::err(FILE_ERR_INVALID_INPUT),
-    };
-    let uuid = match uuid::Uuid::parse_str(&uuid_str) {
-        Ok(u) => u,
-        Err(_) => return FileJsonResult::err(FILE_ERR_INVALID_INPUT),
-    };
-
-    let result = runtime().block_on(async {
-        services
-            .purge_file_on_disk_handler
-            .purge_on_disk(uuid, &token)
-            .await
-    });
-
-    match result {
-        Ok(outcome) => {
-            let json = serde_json::to_string(&outcome).unwrap_or_default();
-            FileJsonResult::ok(json)
+        // Deny before touching the payload — an unauthenticated caller must not
+        // learn whether its uuid would have parsed.
+        let token = cstr_lossy(token).unwrap_or_default();
+        if !authenticated(&services, &token) {
+            return FileJsonResult::err(FILE_ERR_UNAUTHORIZED);
         }
-        Err(err) => map_file_err(err),
-    }
+
+        let uuid_str = match cstr_lossy(uuid) {
+            Some(s) => s,
+            None => return FileJsonResult::err(FILE_ERR_INVALID_INPUT),
+        };
+        let uuid = match uuid::Uuid::parse_str(&uuid_str) {
+            Ok(u) => u,
+            Err(_) => return FileJsonResult::err(FILE_ERR_INVALID_INPUT),
+        };
+
+        let result = runtime().block_on(async {
+            services
+                .purge_file_on_disk_handler
+                .purge_on_disk(uuid, &token)
+                .await
+        });
+
+        match result {
+            Ok(outcome) => {
+                let json = serde_json::to_string(&outcome).unwrap_or_default();
+                FileJsonResult::ok(json)
+            }
+            Err(err) => map_file_err(err),
+        }
+    })
 }
 
 /// Result of `alexandria_collection_create` (UC-10). On success `status` is
@@ -1400,44 +1488,46 @@ pub extern "C" fn alexandria_collection_create(
     json_body: *const c_char,
     token: *const c_char,
 ) -> CollectionJsonResult {
-    let services = match services_slot().lock().unwrap().clone() {
-        Some(s) => s,
-        None => return CollectionJsonResult::err(COLLECTION_ERR_NOT_INITIALIZED),
-    };
+    ffi_guard(CollectionJsonResult::err(COLLECTION_ERR_OTHER), || {
+        let services = match locked_services() {
+            Some(s) => s,
+            None => return CollectionJsonResult::err(COLLECTION_ERR_NOT_INITIALIZED),
+        };
 
-    // Deny before touching the payload — an unauthenticated caller must not
-    // learn whether its body would have parsed.
-    let token = cstr_lossy(token).unwrap_or_default();
-    if !authenticated(&services, &token) {
-        return CollectionJsonResult::err(COLLECTION_ERR_UNAUTHORIZED);
-    }
-
-    let body_str = match cstr_lossy(json_body) {
-        Some(s) => s,
-        None => return CollectionJsonResult::err(COLLECTION_ERR_INVALID_INPUT),
-    };
-    let body = match CreateCollectionBody::from_json_str(&body_str) {
-        Some(b) => b,
-        None => return CollectionJsonResult::err(COLLECTION_ERR_INVALID_INPUT),
-    };
-    // An empty or otherwise invalid name is rejected by the handler's
-    // validator, so it surfaces as `COLLECTION_ERR_INVALID_INPUT` —
-    // consistent with the HTTP `400`.
-
-    let result = runtime().block_on(async {
-        services
-            .create_collection_handler
-            .create(&body.name, body.kind, &token)
-            .await
-    });
-
-    match result {
-        Ok(collection) => {
-            let json = serde_json::to_string(&collection).unwrap_or_default();
-            CollectionJsonResult::ok(json)
+        // Deny before touching the payload — an unauthenticated caller must not
+        // learn whether its body would have parsed.
+        let token = cstr_lossy(token).unwrap_or_default();
+        if !authenticated(&services, &token) {
+            return CollectionJsonResult::err(COLLECTION_ERR_UNAUTHORIZED);
         }
-        Err(err) => map_collection_err(err),
-    }
+
+        let body_str = match cstr_lossy(json_body) {
+            Some(s) => s,
+            None => return CollectionJsonResult::err(COLLECTION_ERR_INVALID_INPUT),
+        };
+        let body = match CreateCollectionBody::from_json_str(&body_str) {
+            Some(b) => b,
+            None => return CollectionJsonResult::err(COLLECTION_ERR_INVALID_INPUT),
+        };
+        // An empty or otherwise invalid name is rejected by the handler's
+        // validator, so it surfaces as `COLLECTION_ERR_INVALID_INPUT` —
+        // consistent with the HTTP `400`.
+
+        let result = runtime().block_on(async {
+            services
+                .create_collection_handler
+                .create(&body.name, body.kind, &token)
+                .await
+        });
+
+        match result {
+            Ok(collection) => {
+                let json = serde_json::to_string(&collection).unwrap_or_default();
+                CollectionJsonResult::ok(json)
+            }
+            Err(err) => map_collection_err(err),
+        }
+    })
 }
 
 fn map_collection_err(err: DomainError) -> CollectionJsonResult {
@@ -1483,50 +1573,52 @@ pub extern "C" fn alexandria_collection_rename(
     json_body: *const c_char,
     token: *const c_char,
 ) -> CollectionJsonResult {
-    let services = match services_slot().lock().unwrap().clone() {
-        Some(s) => s,
-        None => return CollectionJsonResult::err(COLLECTION_ERR_NOT_INITIALIZED),
-    };
+    ffi_guard(CollectionJsonResult::err(COLLECTION_ERR_OTHER), || {
+        let services = match locked_services() {
+            Some(s) => s,
+            None => return CollectionJsonResult::err(COLLECTION_ERR_NOT_INITIALIZED),
+        };
 
-    // Deny before touching the payload — an unauthenticated caller must not
-    // learn whether its uuid or body would have parsed.
-    let token = cstr_lossy(token).unwrap_or_default();
-    if !authenticated(&services, &token) {
-        return CollectionJsonResult::err(COLLECTION_ERR_UNAUTHORIZED);
-    }
-
-    let uuid_str = match cstr_lossy(uuid) {
-        Some(s) => s,
-        None => return CollectionJsonResult::err(COLLECTION_ERR_INVALID_INPUT),
-    };
-    let uuid = match uuid::Uuid::parse_str(&uuid_str) {
-        Ok(u) => u,
-        Err(_) => return CollectionJsonResult::err(COLLECTION_ERR_INVALID_INPUT),
-    };
-
-    let body_str = match cstr_lossy(json_body) {
-        Some(s) => s,
-        None => return CollectionJsonResult::err(COLLECTION_ERR_INVALID_INPUT),
-    };
-    let body = match RenameCollectionBody::from_json_str(&body_str) {
-        Some(b) => b,
-        None => return CollectionJsonResult::err(COLLECTION_ERR_INVALID_INPUT),
-    };
-
-    let result = runtime().block_on(async {
-        services
-            .rename_collection_handler
-            .rename(uuid, &body.name, &token)
-            .await
-    });
-
-    match result {
-        Ok(collection) => {
-            let json = serde_json::to_string(&collection).unwrap_or_default();
-            CollectionJsonResult::ok(json)
+        // Deny before touching the payload — an unauthenticated caller must not
+        // learn whether its uuid or body would have parsed.
+        let token = cstr_lossy(token).unwrap_or_default();
+        if !authenticated(&services, &token) {
+            return CollectionJsonResult::err(COLLECTION_ERR_UNAUTHORIZED);
         }
-        Err(err) => map_collection_err(err),
-    }
+
+        let uuid_str = match cstr_lossy(uuid) {
+            Some(s) => s,
+            None => return CollectionJsonResult::err(COLLECTION_ERR_INVALID_INPUT),
+        };
+        let uuid = match uuid::Uuid::parse_str(&uuid_str) {
+            Ok(u) => u,
+            Err(_) => return CollectionJsonResult::err(COLLECTION_ERR_INVALID_INPUT),
+        };
+
+        let body_str = match cstr_lossy(json_body) {
+            Some(s) => s,
+            None => return CollectionJsonResult::err(COLLECTION_ERR_INVALID_INPUT),
+        };
+        let body = match RenameCollectionBody::from_json_str(&body_str) {
+            Some(b) => b,
+            None => return CollectionJsonResult::err(COLLECTION_ERR_INVALID_INPUT),
+        };
+
+        let result = runtime().block_on(async {
+            services
+                .rename_collection_handler
+                .rename(uuid, &body.name, &token)
+                .await
+        });
+
+        match result {
+            Ok(collection) => {
+                let json = serde_json::to_string(&collection).unwrap_or_default();
+                CollectionJsonResult::ok(json)
+            }
+            Err(err) => map_collection_err(err),
+        }
+    })
 }
 
 /// Delete a collection, unlinking its items (UC-12 / FR-CO-04).
@@ -1541,41 +1633,43 @@ pub extern "C" fn alexandria_collection_delete(
     uuid: *const c_char,
     token: *const c_char,
 ) -> CollectionJsonResult {
-    let services = match services_slot().lock().unwrap().clone() {
-        Some(s) => s,
-        None => return CollectionJsonResult::err(COLLECTION_ERR_NOT_INITIALIZED),
-    };
+    ffi_guard(CollectionJsonResult::err(COLLECTION_ERR_OTHER), || {
+        let services = match locked_services() {
+            Some(s) => s,
+            None => return CollectionJsonResult::err(COLLECTION_ERR_NOT_INITIALIZED),
+        };
 
-    // Deny before touching the payload — an unauthenticated caller must not
-    // learn whether the uuid would have parsed.
-    let token = cstr_lossy(token).unwrap_or_default();
-    if !authenticated(&services, &token) {
-        return CollectionJsonResult::err(COLLECTION_ERR_UNAUTHORIZED);
-    }
-
-    let uuid_str = match cstr_lossy(uuid) {
-        Some(s) => s,
-        None => return CollectionJsonResult::err(COLLECTION_ERR_INVALID_INPUT),
-    };
-    let uuid = match uuid::Uuid::parse_str(&uuid_str) {
-        Ok(u) => u,
-        Err(_) => return CollectionJsonResult::err(COLLECTION_ERR_INVALID_INPUT),
-    };
-
-    let result = runtime().block_on(async {
-        services
-            .delete_collection_handler
-            .delete(uuid, &token)
-            .await
-    });
-
-    match result {
-        Ok(collection) => {
-            let json = serde_json::to_string(&collection).unwrap_or_default();
-            CollectionJsonResult::ok(json)
+        // Deny before touching the payload — an unauthenticated caller must not
+        // learn whether the uuid would have parsed.
+        let token = cstr_lossy(token).unwrap_or_default();
+        if !authenticated(&services, &token) {
+            return CollectionJsonResult::err(COLLECTION_ERR_UNAUTHORIZED);
         }
-        Err(err) => map_collection_err(err),
-    }
+
+        let uuid_str = match cstr_lossy(uuid) {
+            Some(s) => s,
+            None => return CollectionJsonResult::err(COLLECTION_ERR_INVALID_INPUT),
+        };
+        let uuid = match uuid::Uuid::parse_str(&uuid_str) {
+            Ok(u) => u,
+            Err(_) => return CollectionJsonResult::err(COLLECTION_ERR_INVALID_INPUT),
+        };
+
+        let result = runtime().block_on(async {
+            services
+                .delete_collection_handler
+                .delete(uuid, &token)
+                .await
+        });
+
+        match result {
+            Ok(collection) => {
+                let json = serde_json::to_string(&collection).unwrap_or_default();
+                CollectionJsonResult::ok(json)
+            }
+            Err(err) => map_collection_err(err),
+        }
+    })
 }
 
 /// Request body accepted by `alexandria_collection_add_items` — the same
@@ -1616,50 +1710,52 @@ pub extern "C" fn alexandria_collection_add_items(
     json_body: *const c_char,
     token: *const c_char,
 ) -> CollectionJsonResult {
-    let services = match services_slot().lock().unwrap().clone() {
-        Some(s) => s,
-        None => return CollectionJsonResult::err(COLLECTION_ERR_NOT_INITIALIZED),
-    };
+    ffi_guard(CollectionJsonResult::err(COLLECTION_ERR_OTHER), || {
+        let services = match locked_services() {
+            Some(s) => s,
+            None => return CollectionJsonResult::err(COLLECTION_ERR_NOT_INITIALIZED),
+        };
 
-    // Deny before touching the payload — an unauthenticated caller must not
-    // learn whether its uuid or body would have parsed.
-    let token = cstr_lossy(token).unwrap_or_default();
-    if !authenticated(&services, &token) {
-        return CollectionJsonResult::err(COLLECTION_ERR_UNAUTHORIZED);
-    }
-
-    let uuid_str = match cstr_lossy(uuid) {
-        Some(s) => s,
-        None => return CollectionJsonResult::err(COLLECTION_ERR_INVALID_INPUT),
-    };
-    let uuid = match uuid::Uuid::parse_str(&uuid_str) {
-        Ok(u) => u,
-        Err(_) => return CollectionJsonResult::err(COLLECTION_ERR_INVALID_INPUT),
-    };
-
-    let body_str = match cstr_lossy(json_body) {
-        Some(s) => s,
-        None => return CollectionJsonResult::err(COLLECTION_ERR_INVALID_INPUT),
-    };
-    let body = match AddItemsBody::from_json_str(&body_str) {
-        Some(b) if !b.item_uuids.is_empty() => b,
-        _ => return CollectionJsonResult::err(COLLECTION_ERR_INVALID_INPUT),
-    };
-
-    let result = runtime().block_on(async {
-        services
-            .add_items_to_collection_handler
-            .add(uuid, body.item_uuids, &token)
-            .await
-    });
-
-    match result {
-        Ok(added) => {
-            let json = serde_json::to_string(&added).unwrap_or_default();
-            CollectionJsonResult::ok(json)
+        // Deny before touching the payload — an unauthenticated caller must not
+        // learn whether its uuid or body would have parsed.
+        let token = cstr_lossy(token).unwrap_or_default();
+        if !authenticated(&services, &token) {
+            return CollectionJsonResult::err(COLLECTION_ERR_UNAUTHORIZED);
         }
-        Err(err) => map_collection_err(err),
-    }
+
+        let uuid_str = match cstr_lossy(uuid) {
+            Some(s) => s,
+            None => return CollectionJsonResult::err(COLLECTION_ERR_INVALID_INPUT),
+        };
+        let uuid = match uuid::Uuid::parse_str(&uuid_str) {
+            Ok(u) => u,
+            Err(_) => return CollectionJsonResult::err(COLLECTION_ERR_INVALID_INPUT),
+        };
+
+        let body_str = match cstr_lossy(json_body) {
+            Some(s) => s,
+            None => return CollectionJsonResult::err(COLLECTION_ERR_INVALID_INPUT),
+        };
+        let body = match AddItemsBody::from_json_str(&body_str) {
+            Some(b) if !b.item_uuids.is_empty() => b,
+            _ => return CollectionJsonResult::err(COLLECTION_ERR_INVALID_INPUT),
+        };
+
+        let result = runtime().block_on(async {
+            services
+                .add_items_to_collection_handler
+                .add(uuid, body.item_uuids, &token)
+                .await
+        });
+
+        match result {
+            Ok(added) => {
+                let json = serde_json::to_string(&added).unwrap_or_default();
+                CollectionJsonResult::ok(json)
+            }
+            Err(err) => map_collection_err(err),
+        }
+    })
 }
 
 /// Remove an item from a collection (UC-14 / FR-CO-06).
@@ -1676,40 +1772,42 @@ pub extern "C" fn alexandria_collection_remove_item(
     item_uuid: *const c_char,
     token: *const c_char,
 ) -> CollectionJsonResult {
-    let services = match services_slot().lock().unwrap().clone() {
-        Some(s) => s,
-        None => return CollectionJsonResult::err(COLLECTION_ERR_NOT_INITIALIZED),
-    };
+    ffi_guard(CollectionJsonResult::err(COLLECTION_ERR_OTHER), || {
+        let services = match locked_services() {
+            Some(s) => s,
+            None => return CollectionJsonResult::err(COLLECTION_ERR_NOT_INITIALIZED),
+        };
 
-    let token = cstr_lossy(token).unwrap_or_default();
-    if !authenticated(&services, &token) {
-        return CollectionJsonResult::err(COLLECTION_ERR_UNAUTHORIZED);
-    }
+        let token = cstr_lossy(token).unwrap_or_default();
+        if !authenticated(&services, &token) {
+            return CollectionJsonResult::err(COLLECTION_ERR_UNAUTHORIZED);
+        }
 
-    let collection_uuid =
-        match cstr_lossy(collection_uuid).and_then(|s| uuid::Uuid::parse_str(&s).ok()) {
+        let collection_uuid =
+            match cstr_lossy(collection_uuid).and_then(|s| uuid::Uuid::parse_str(&s).ok()) {
+                Some(u) => u,
+                None => return CollectionJsonResult::err(COLLECTION_ERR_INVALID_INPUT),
+            };
+        let item_uuid = match cstr_lossy(item_uuid).and_then(|s| uuid::Uuid::parse_str(&s).ok()) {
             Some(u) => u,
             None => return CollectionJsonResult::err(COLLECTION_ERR_INVALID_INPUT),
         };
-    let item_uuid = match cstr_lossy(item_uuid).and_then(|s| uuid::Uuid::parse_str(&s).ok()) {
-        Some(u) => u,
-        None => return CollectionJsonResult::err(COLLECTION_ERR_INVALID_INPUT),
-    };
 
-    let result = runtime().block_on(async {
-        services
-            .remove_item_from_collection_handler
-            .remove(collection_uuid, item_uuid, &token)
-            .await
-    });
+        let result = runtime().block_on(async {
+            services
+                .remove_item_from_collection_handler
+                .remove(collection_uuid, item_uuid, &token)
+                .await
+        });
 
-    match result {
-        Ok(removed) => {
-            let json = serde_json::to_string(&removed).unwrap_or_default();
-            CollectionJsonResult::ok(json)
+        match result {
+            Ok(removed) => {
+                let json = serde_json::to_string(&removed).unwrap_or_default();
+                CollectionJsonResult::ok(json)
+            }
+            Err(err) => map_collection_err(err),
         }
-        Err(err) => map_collection_err(err),
-    }
+    })
 }
 
 /// List the items in a collection (UC-14 / FR-CO-07).
@@ -1724,35 +1822,37 @@ pub extern "C" fn alexandria_collection_list_items(
     uuid: *const c_char,
     token: *const c_char,
 ) -> CollectionJsonResult {
-    let services = match services_slot().lock().unwrap().clone() {
-        Some(s) => s,
-        None => return CollectionJsonResult::err(COLLECTION_ERR_NOT_INITIALIZED),
-    };
+    ffi_guard(CollectionJsonResult::err(COLLECTION_ERR_OTHER), || {
+        let services = match locked_services() {
+            Some(s) => s,
+            None => return CollectionJsonResult::err(COLLECTION_ERR_NOT_INITIALIZED),
+        };
 
-    let token = cstr_lossy(token).unwrap_or_default();
-    if !authenticated(&services, &token) {
-        return CollectionJsonResult::err(COLLECTION_ERR_UNAUTHORIZED);
-    }
-
-    let uuid = match cstr_lossy(uuid).and_then(|s| uuid::Uuid::parse_str(&s).ok()) {
-        Some(u) => u,
-        None => return CollectionJsonResult::err(COLLECTION_ERR_INVALID_INPUT),
-    };
-
-    let result = runtime().block_on(async {
-        services
-            .list_collection_items_handler
-            .list(uuid, &token)
-            .await
-    });
-
-    match result {
-        Ok(members) => {
-            let json = serde_json::to_string(&members).unwrap_or_default();
-            CollectionJsonResult::ok(json)
+        let token = cstr_lossy(token).unwrap_or_default();
+        if !authenticated(&services, &token) {
+            return CollectionJsonResult::err(COLLECTION_ERR_UNAUTHORIZED);
         }
-        Err(err) => map_collection_err(err),
-    }
+
+        let uuid = match cstr_lossy(uuid).and_then(|s| uuid::Uuid::parse_str(&s).ok()) {
+            Some(u) => u,
+            None => return CollectionJsonResult::err(COLLECTION_ERR_INVALID_INPUT),
+        };
+
+        let result = runtime().block_on(async {
+            services
+                .list_collection_items_handler
+                .list(uuid, &token)
+                .await
+        });
+
+        match result {
+            Ok(members) => {
+                let json = serde_json::to_string(&members).unwrap_or_default();
+                CollectionJsonResult::ok(json)
+            }
+            Err(err) => map_collection_err(err),
+        }
+    })
 }
 
 /// Filters accepted by `alexandria_collections_list` (UC-46). Mirrors the
@@ -1803,42 +1903,46 @@ pub extern "C" fn alexandria_collections_list(
     json_filters: *const c_char,
     token: *const c_char,
 ) -> CollectionJsonResult {
-    let services = match services_slot().lock().unwrap().clone() {
-        Some(s) => s,
-        None => return CollectionJsonResult::err(COLLECTION_ERR_NOT_INITIALIZED),
-    };
+    ffi_guard(CollectionJsonResult::err(COLLECTION_ERR_OTHER), || {
+        let services = match locked_services() {
+            Some(s) => s,
+            None => return CollectionJsonResult::err(COLLECTION_ERR_NOT_INITIALIZED),
+        };
 
-    let token = cstr_lossy(token).unwrap_or_default();
-    if !authenticated(&services, &token) {
-        return CollectionJsonResult::err(COLLECTION_ERR_UNAUTHORIZED);
-    }
-
-    let filter_str = cstr_lossy(json_filters).unwrap_or_default();
-    let parsed = match CollectionsListFilter::from_json_str(&filter_str) {
-        Some(f) => f,
-        None => return CollectionJsonResult::err(COLLECTION_ERR_INVALID_INPUT),
-    };
-
-    // AF-02: refused before the handler is reached, exactly as HTTP refuses
-    // the same value while parsing its query string.
-    let kind = match parsed.kind.as_deref().filter(|k| !k.is_empty()) {
-        None => None,
-        Some(value) => match alexandria_core::collections::model::CollectionKind::parse(value) {
-            Some(k) => Some(k),
-            None => return CollectionJsonResult::err(COLLECTION_ERR_INVALID_INPUT),
-        },
-    };
-
-    let result =
-        runtime().block_on(async { services.list_collections_handler.list(kind, &token).await });
-
-    match result {
-        Ok(collections) => {
-            let json = serde_json::to_string(&collections).unwrap_or_default();
-            CollectionJsonResult::ok(json)
+        let token = cstr_lossy(token).unwrap_or_default();
+        if !authenticated(&services, &token) {
+            return CollectionJsonResult::err(COLLECTION_ERR_UNAUTHORIZED);
         }
-        Err(err) => map_collection_err(err),
-    }
+
+        let filter_str = cstr_lossy(json_filters).unwrap_or_default();
+        let parsed = match CollectionsListFilter::from_json_str(&filter_str) {
+            Some(f) => f,
+            None => return CollectionJsonResult::err(COLLECTION_ERR_INVALID_INPUT),
+        };
+
+        // AF-02: refused before the handler is reached, exactly as HTTP refuses
+        // the same value while parsing its query string.
+        let kind = match parsed.kind.as_deref().filter(|k| !k.is_empty()) {
+            None => None,
+            Some(value) => {
+                match alexandria_core::collections::model::CollectionKind::parse(value) {
+                    Some(k) => Some(k),
+                    None => return CollectionJsonResult::err(COLLECTION_ERR_INVALID_INPUT),
+                }
+            }
+        };
+
+        let result = runtime()
+            .block_on(async { services.list_collections_handler.list(kind, &token).await });
+
+        match result {
+            Ok(collections) => {
+                let json = serde_json::to_string(&collections).unwrap_or_default();
+                CollectionJsonResult::ok(json)
+            }
+            Err(err) => map_collection_err(err),
+        }
+    })
 }
 
 /// FFI status codes returned by bookmark operations (UC-15+). Deliberately
@@ -1939,41 +2043,43 @@ pub extern "C" fn alexandria_bookmark_create(
     json_body: *const c_char,
     token: *const c_char,
 ) -> BookmarkJsonResult {
-    let services = match services_slot().lock().unwrap().clone() {
-        Some(s) => s,
-        None => return BookmarkJsonResult::err(BOOKMARK_ERR_NOT_INITIALIZED),
-    };
+    ffi_guard(BookmarkJsonResult::err(BOOKMARK_ERR_OTHER), || {
+        let services = match locked_services() {
+            Some(s) => s,
+            None => return BookmarkJsonResult::err(BOOKMARK_ERR_NOT_INITIALIZED),
+        };
 
-    // Deny before touching the payload — an unauthenticated caller must not
-    // learn whether its body would have parsed.
-    let token = cstr_lossy(token).unwrap_or_default();
-    if !authenticated(&services, &token) {
-        return BookmarkJsonResult::err(BOOKMARK_ERR_UNAUTHORIZED);
-    }
-
-    let body_str = match cstr_lossy(json_body) {
-        Some(s) => s,
-        None => return BookmarkJsonResult::err(BOOKMARK_ERR_INVALID_INPUT),
-    };
-    let body = match CreateBookmarkBody::from_json_str(&body_str) {
-        Some(b) => b,
-        None => return BookmarkJsonResult::err(BOOKMARK_ERR_INVALID_INPUT),
-    };
-
-    let result = runtime().block_on(async {
-        services
-            .create_bookmark_handler
-            .create(&body.url, &body.title, body.collection_uuid, &token)
-            .await
-    });
-
-    match result {
-        Ok(bookmark) => {
-            let json = serde_json::to_string(&bookmark).unwrap_or_default();
-            BookmarkJsonResult::ok(json)
+        // Deny before touching the payload — an unauthenticated caller must not
+        // learn whether its body would have parsed.
+        let token = cstr_lossy(token).unwrap_or_default();
+        if !authenticated(&services, &token) {
+            return BookmarkJsonResult::err(BOOKMARK_ERR_UNAUTHORIZED);
         }
-        Err(err) => map_bookmark_err(err),
-    }
+
+        let body_str = match cstr_lossy(json_body) {
+            Some(s) => s,
+            None => return BookmarkJsonResult::err(BOOKMARK_ERR_INVALID_INPUT),
+        };
+        let body = match CreateBookmarkBody::from_json_str(&body_str) {
+            Some(b) => b,
+            None => return BookmarkJsonResult::err(BOOKMARK_ERR_INVALID_INPUT),
+        };
+
+        let result = runtime().block_on(async {
+            services
+                .create_bookmark_handler
+                .create(&body.url, &body.title, body.collection_uuid, &token)
+                .await
+        });
+
+        match result {
+            Ok(bookmark) => {
+                let json = serde_json::to_string(&bookmark).unwrap_or_default();
+                BookmarkJsonResult::ok(json)
+            }
+            Err(err) => map_bookmark_err(err),
+        }
+    })
 }
 
 /// Request body accepted by `alexandria_bookmark_update` — the same JSON
@@ -2021,44 +2127,46 @@ pub extern "C" fn alexandria_bookmark_update(
     json_body: *const c_char,
     token: *const c_char,
 ) -> BookmarkJsonResult {
-    let services = match services_slot().lock().unwrap().clone() {
-        Some(s) => s,
-        None => return BookmarkJsonResult::err(BOOKMARK_ERR_NOT_INITIALIZED),
-    };
+    ffi_guard(BookmarkJsonResult::err(BOOKMARK_ERR_OTHER), || {
+        let services = match locked_services() {
+            Some(s) => s,
+            None => return BookmarkJsonResult::err(BOOKMARK_ERR_NOT_INITIALIZED),
+        };
 
-    let token = cstr_lossy(token).unwrap_or_default();
-    if !authenticated(&services, &token) {
-        return BookmarkJsonResult::err(BOOKMARK_ERR_UNAUTHORIZED);
-    }
-
-    let uuid = match cstr_lossy(uuid).and_then(|s| uuid::Uuid::parse_str(&s).ok()) {
-        Some(u) => u,
-        None => return BookmarkJsonResult::err(BOOKMARK_ERR_INVALID_INPUT),
-    };
-
-    let body_str = match cstr_lossy(json_body) {
-        Some(s) => s,
-        None => return BookmarkJsonResult::err(BOOKMARK_ERR_INVALID_INPUT),
-    };
-    let body = match UpdateBookmarkBody::from_json_str(&body_str) {
-        Some(b) => b,
-        None => return BookmarkJsonResult::err(BOOKMARK_ERR_INVALID_INPUT),
-    };
-
-    let result = runtime().block_on(async {
-        services
-            .update_bookmark_handler
-            .update(uuid, &body.url, &body.title, body.collection_uuid, &token)
-            .await
-    });
-
-    match result {
-        Ok(bookmark) => {
-            let json = serde_json::to_string(&bookmark).unwrap_or_default();
-            BookmarkJsonResult::ok(json)
+        let token = cstr_lossy(token).unwrap_or_default();
+        if !authenticated(&services, &token) {
+            return BookmarkJsonResult::err(BOOKMARK_ERR_UNAUTHORIZED);
         }
-        Err(err) => map_bookmark_err(err),
-    }
+
+        let uuid = match cstr_lossy(uuid).and_then(|s| uuid::Uuid::parse_str(&s).ok()) {
+            Some(u) => u,
+            None => return BookmarkJsonResult::err(BOOKMARK_ERR_INVALID_INPUT),
+        };
+
+        let body_str = match cstr_lossy(json_body) {
+            Some(s) => s,
+            None => return BookmarkJsonResult::err(BOOKMARK_ERR_INVALID_INPUT),
+        };
+        let body = match UpdateBookmarkBody::from_json_str(&body_str) {
+            Some(b) => b,
+            None => return BookmarkJsonResult::err(BOOKMARK_ERR_INVALID_INPUT),
+        };
+
+        let result = runtime().block_on(async {
+            services
+                .update_bookmark_handler
+                .update(uuid, &body.url, &body.title, body.collection_uuid, &token)
+                .await
+        });
+
+        match result {
+            Ok(bookmark) => {
+                let json = serde_json::to_string(&bookmark).unwrap_or_default();
+                BookmarkJsonResult::ok(json)
+            }
+            Err(err) => map_bookmark_err(err),
+        }
+    })
 }
 
 /// JSON filter body accepted by `alexandria_bookmarks_list` (UC-17 /
@@ -2112,49 +2220,51 @@ pub extern "C" fn alexandria_bookmarks_list(
     json_filters: *const c_char,
     token: *const c_char,
 ) -> BookmarkJsonResult {
-    let services = match services_slot().lock().unwrap().clone() {
-        Some(s) => s,
-        None => return BookmarkJsonResult::err(BOOKMARK_ERR_NOT_INITIALIZED),
-    };
-
-    let token = cstr_lossy(token).unwrap_or_default();
-    if !authenticated(&services, &token) {
-        return BookmarkJsonResult::err(BOOKMARK_ERR_UNAUTHORIZED);
-    }
-
-    let filter_str = cstr_lossy(json_filters).unwrap_or_default();
-    let parsed = match BookmarksListFilter::from_json_str(&filter_str) {
-        Some(f) => f,
-        None => return BookmarkJsonResult::err(BOOKMARK_ERR_INVALID_INPUT),
-    };
-
-    let bookmark_state = match parsed.state.as_deref().filter(|s| !s.is_empty()) {
-        Some(s) => match alexandria_core::catalog::model::StateFilter::parse(s) {
-            Some(st) => st,
-            None => return BookmarkJsonResult::err(BOOKMARK_ERR_INVALID_INPUT),
-        },
-        None => alexandria_core::catalog::model::StateFilter::Active,
-    };
-    let mut filter = alexandria_core::bookmarks::queries::browse::BookmarkFilter::new()
-        .with_state(bookmark_state);
-    if let Some(c) = parsed.collection_uuid.as_deref().filter(|s| !s.is_empty()) {
-        let collection_uuid = match uuid::Uuid::parse_str(c) {
-            Ok(u) => u,
-            Err(_) => return BookmarkJsonResult::err(BOOKMARK_ERR_INVALID_INPUT),
+    ffi_guard(BookmarkJsonResult::err(BOOKMARK_ERR_OTHER), || {
+        let services = match locked_services() {
+            Some(s) => s,
+            None => return BookmarkJsonResult::err(BOOKMARK_ERR_NOT_INITIALIZED),
         };
-        filter = filter.with_collection(collection_uuid);
-    }
 
-    let result =
-        runtime().block_on(async { services.browse_bookmarks_handler.list(filter, &token).await });
-
-    match result {
-        Ok(bookmarks) => {
-            let json = serde_json::to_string(&bookmarks).unwrap_or_default();
-            BookmarkJsonResult::ok(json)
+        let token = cstr_lossy(token).unwrap_or_default();
+        if !authenticated(&services, &token) {
+            return BookmarkJsonResult::err(BOOKMARK_ERR_UNAUTHORIZED);
         }
-        Err(err) => map_bookmark_err(err),
-    }
+
+        let filter_str = cstr_lossy(json_filters).unwrap_or_default();
+        let parsed = match BookmarksListFilter::from_json_str(&filter_str) {
+            Some(f) => f,
+            None => return BookmarkJsonResult::err(BOOKMARK_ERR_INVALID_INPUT),
+        };
+
+        let bookmark_state = match parsed.state.as_deref().filter(|s| !s.is_empty()) {
+            Some(s) => match alexandria_core::catalog::model::StateFilter::parse(s) {
+                Some(st) => st,
+                None => return BookmarkJsonResult::err(BOOKMARK_ERR_INVALID_INPUT),
+            },
+            None => alexandria_core::catalog::model::StateFilter::Active,
+        };
+        let mut filter = alexandria_core::bookmarks::queries::browse::BookmarkFilter::new()
+            .with_state(bookmark_state);
+        if let Some(c) = parsed.collection_uuid.as_deref().filter(|s| !s.is_empty()) {
+            let collection_uuid = match uuid::Uuid::parse_str(c) {
+                Ok(u) => u,
+                Err(_) => return BookmarkJsonResult::err(BOOKMARK_ERR_INVALID_INPUT),
+            };
+            filter = filter.with_collection(collection_uuid);
+        }
+
+        let result = runtime()
+            .block_on(async { services.browse_bookmarks_handler.list(filter, &token).await });
+
+        match result {
+            Ok(bookmarks) => {
+                let json = serde_json::to_string(&bookmarks).unwrap_or_default();
+                BookmarkJsonResult::ok(json)
+            }
+            Err(err) => map_bookmark_err(err),
+        }
+    })
 }
 
 /// Soft-delete a bookmark (UC-18 / FR-BM-03).
@@ -2169,35 +2279,37 @@ pub extern "C" fn alexandria_bookmark_soft_delete(
     uuid: *const c_char,
     token: *const c_char,
 ) -> BookmarkJsonResult {
-    let services = match services_slot().lock().unwrap().clone() {
-        Some(s) => s,
-        None => return BookmarkJsonResult::err(BOOKMARK_ERR_NOT_INITIALIZED),
-    };
+    ffi_guard(BookmarkJsonResult::err(BOOKMARK_ERR_OTHER), || {
+        let services = match locked_services() {
+            Some(s) => s,
+            None => return BookmarkJsonResult::err(BOOKMARK_ERR_NOT_INITIALIZED),
+        };
 
-    let token = cstr_lossy(token).unwrap_or_default();
-    if !authenticated(&services, &token) {
-        return BookmarkJsonResult::err(BOOKMARK_ERR_UNAUTHORIZED);
-    }
-
-    let uuid = match cstr_lossy(uuid).and_then(|s| uuid::Uuid::parse_str(&s).ok()) {
-        Some(u) => u,
-        None => return BookmarkJsonResult::err(BOOKMARK_ERR_INVALID_INPUT),
-    };
-
-    let result = runtime().block_on(async {
-        services
-            .bookmark_lifecycle_handler
-            .soft_delete(uuid, &token)
-            .await
-    });
-
-    match result {
-        Ok(bookmark) => {
-            let json = serde_json::to_string(&bookmark).unwrap_or_default();
-            BookmarkJsonResult::ok(json)
+        let token = cstr_lossy(token).unwrap_or_default();
+        if !authenticated(&services, &token) {
+            return BookmarkJsonResult::err(BOOKMARK_ERR_UNAUTHORIZED);
         }
-        Err(err) => map_bookmark_err(err),
-    }
+
+        let uuid = match cstr_lossy(uuid).and_then(|s| uuid::Uuid::parse_str(&s).ok()) {
+            Some(u) => u,
+            None => return BookmarkJsonResult::err(BOOKMARK_ERR_INVALID_INPUT),
+        };
+
+        let result = runtime().block_on(async {
+            services
+                .bookmark_lifecycle_handler
+                .soft_delete(uuid, &token)
+                .await
+        });
+
+        match result {
+            Ok(bookmark) => {
+                let json = serde_json::to_string(&bookmark).unwrap_or_default();
+                BookmarkJsonResult::ok(json)
+            }
+            Err(err) => map_bookmark_err(err),
+        }
+    })
 }
 
 /// Restore a soft-deleted bookmark (UC-18 / FR-BM-05).
@@ -2212,35 +2324,37 @@ pub extern "C" fn alexandria_bookmark_restore(
     uuid: *const c_char,
     token: *const c_char,
 ) -> BookmarkJsonResult {
-    let services = match services_slot().lock().unwrap().clone() {
-        Some(s) => s,
-        None => return BookmarkJsonResult::err(BOOKMARK_ERR_NOT_INITIALIZED),
-    };
+    ffi_guard(BookmarkJsonResult::err(BOOKMARK_ERR_OTHER), || {
+        let services = match locked_services() {
+            Some(s) => s,
+            None => return BookmarkJsonResult::err(BOOKMARK_ERR_NOT_INITIALIZED),
+        };
 
-    let token = cstr_lossy(token).unwrap_or_default();
-    if !authenticated(&services, &token) {
-        return BookmarkJsonResult::err(BOOKMARK_ERR_UNAUTHORIZED);
-    }
-
-    let uuid = match cstr_lossy(uuid).and_then(|s| uuid::Uuid::parse_str(&s).ok()) {
-        Some(u) => u,
-        None => return BookmarkJsonResult::err(BOOKMARK_ERR_INVALID_INPUT),
-    };
-
-    let result = runtime().block_on(async {
-        services
-            .bookmark_lifecycle_handler
-            .restore(uuid, &token)
-            .await
-    });
-
-    match result {
-        Ok(bookmark) => {
-            let json = serde_json::to_string(&bookmark).unwrap_or_default();
-            BookmarkJsonResult::ok(json)
+        let token = cstr_lossy(token).unwrap_or_default();
+        if !authenticated(&services, &token) {
+            return BookmarkJsonResult::err(BOOKMARK_ERR_UNAUTHORIZED);
         }
-        Err(err) => map_bookmark_err(err),
-    }
+
+        let uuid = match cstr_lossy(uuid).and_then(|s| uuid::Uuid::parse_str(&s).ok()) {
+            Some(u) => u,
+            None => return BookmarkJsonResult::err(BOOKMARK_ERR_INVALID_INPUT),
+        };
+
+        let result = runtime().block_on(async {
+            services
+                .bookmark_lifecycle_handler
+                .restore(uuid, &token)
+                .await
+        });
+
+        match result {
+            Ok(bookmark) => {
+                let json = serde_json::to_string(&bookmark).unwrap_or_default();
+                BookmarkJsonResult::ok(json)
+            }
+            Err(err) => map_bookmark_err(err),
+        }
+    })
 }
 
 /// Hard-purge a bookmark (UC-19 / FR-BM-04).
@@ -2255,31 +2369,33 @@ pub extern "C" fn alexandria_bookmark_purge(
     uuid: *const c_char,
     token: *const c_char,
 ) -> BookmarkJsonResult {
-    let services = match services_slot().lock().unwrap().clone() {
-        Some(s) => s,
-        None => return BookmarkJsonResult::err(BOOKMARK_ERR_NOT_INITIALIZED),
-    };
+    ffi_guard(BookmarkJsonResult::err(BOOKMARK_ERR_OTHER), || {
+        let services = match locked_services() {
+            Some(s) => s,
+            None => return BookmarkJsonResult::err(BOOKMARK_ERR_NOT_INITIALIZED),
+        };
 
-    let token = cstr_lossy(token).unwrap_or_default();
-    if !authenticated(&services, &token) {
-        return BookmarkJsonResult::err(BOOKMARK_ERR_UNAUTHORIZED);
-    }
-
-    let uuid = match cstr_lossy(uuid).and_then(|s| uuid::Uuid::parse_str(&s).ok()) {
-        Some(u) => u,
-        None => return BookmarkJsonResult::err(BOOKMARK_ERR_INVALID_INPUT),
-    };
-
-    let result =
-        runtime().block_on(async { services.purge_bookmark_handler.purge(uuid, &token).await });
-
-    match result {
-        Ok(bookmark) => {
-            let json = serde_json::to_string(&bookmark).unwrap_or_default();
-            BookmarkJsonResult::ok(json)
+        let token = cstr_lossy(token).unwrap_or_default();
+        if !authenticated(&services, &token) {
+            return BookmarkJsonResult::err(BOOKMARK_ERR_UNAUTHORIZED);
         }
-        Err(err) => map_bookmark_err(err),
-    }
+
+        let uuid = match cstr_lossy(uuid).and_then(|s| uuid::Uuid::parse_str(&s).ok()) {
+            Some(u) => u,
+            None => return BookmarkJsonResult::err(BOOKMARK_ERR_INVALID_INPUT),
+        };
+
+        let result =
+            runtime().block_on(async { services.purge_bookmark_handler.purge(uuid, &token).await });
+
+        match result {
+            Ok(bookmark) => {
+                let json = serde_json::to_string(&bookmark).unwrap_or_default();
+                BookmarkJsonResult::ok(json)
+            }
+            Err(err) => map_bookmark_err(err),
+        }
+    })
 }
 
 /// FFI status codes returned by watchlist operations (UC-20+). Deliberately
@@ -2366,39 +2482,41 @@ pub extern "C" fn alexandria_watchlist_create(
     json_body: *const c_char,
     token: *const c_char,
 ) -> WatchlistJsonResult {
-    let services = match services_slot().lock().unwrap().clone() {
-        Some(s) => s,
-        None => return WatchlistJsonResult::err(WATCHLIST_ERR_NOT_INITIALIZED),
-    };
+    ffi_guard(WatchlistJsonResult::err(WATCHLIST_ERR_OTHER), || {
+        let services = match locked_services() {
+            Some(s) => s,
+            None => return WatchlistJsonResult::err(WATCHLIST_ERR_NOT_INITIALIZED),
+        };
 
-    let token = cstr_lossy(token).unwrap_or_default();
-    if !authenticated(&services, &token) {
-        return WatchlistJsonResult::err(WATCHLIST_ERR_UNAUTHORIZED);
-    }
-
-    let body_str = match cstr_lossy(json_body) {
-        Some(s) => s,
-        None => return WatchlistJsonResult::err(WATCHLIST_ERR_INVALID_INPUT),
-    };
-    let body = match CreateWatchlistBody::from_json_str(&body_str) {
-        Some(b) => b,
-        None => return WatchlistJsonResult::err(WATCHLIST_ERR_INVALID_INPUT),
-    };
-
-    let result = runtime().block_on(async {
-        services
-            .create_watchlist_handler
-            .create(&body.name, &token)
-            .await
-    });
-
-    match result {
-        Ok(watchlist) => {
-            let json = serde_json::to_string(&watchlist).unwrap_or_default();
-            WatchlistJsonResult::ok(json)
+        let token = cstr_lossy(token).unwrap_or_default();
+        if !authenticated(&services, &token) {
+            return WatchlistJsonResult::err(WATCHLIST_ERR_UNAUTHORIZED);
         }
-        Err(err) => map_watchlist_err(err),
-    }
+
+        let body_str = match cstr_lossy(json_body) {
+            Some(s) => s,
+            None => return WatchlistJsonResult::err(WATCHLIST_ERR_INVALID_INPUT),
+        };
+        let body = match CreateWatchlistBody::from_json_str(&body_str) {
+            Some(b) => b,
+            None => return WatchlistJsonResult::err(WATCHLIST_ERR_INVALID_INPUT),
+        };
+
+        let result = runtime().block_on(async {
+            services
+                .create_watchlist_handler
+                .create(&body.name, &token)
+                .await
+        });
+
+        match result {
+            Ok(watchlist) => {
+                let json = serde_json::to_string(&watchlist).unwrap_or_default();
+                WatchlistJsonResult::ok(json)
+            }
+            Err(err) => map_watchlist_err(err),
+        }
+    })
 }
 
 /// Request body accepted by `alexandria_watchlist_add_video` — the same JSON
@@ -2434,48 +2552,50 @@ pub extern "C" fn alexandria_watchlist_add_video(
     json_body: *const c_char,
     token: *const c_char,
 ) -> WatchlistJsonResult {
-    let services = match services_slot().lock().unwrap().clone() {
-        Some(s) => s,
-        None => return WatchlistJsonResult::err(WATCHLIST_ERR_NOT_INITIALIZED),
-    };
+    ffi_guard(WatchlistJsonResult::err(WATCHLIST_ERR_OTHER), || {
+        let services = match locked_services() {
+            Some(s) => s,
+            None => return WatchlistJsonResult::err(WATCHLIST_ERR_NOT_INITIALIZED),
+        };
 
-    let token = cstr_lossy(token).unwrap_or_default();
-    if !authenticated(&services, &token) {
-        return WatchlistJsonResult::err(WATCHLIST_ERR_UNAUTHORIZED);
-    }
-
-    let uuid_str = match cstr_lossy(uuid) {
-        Some(s) => s,
-        None => return WatchlistJsonResult::err(WATCHLIST_ERR_INVALID_INPUT),
-    };
-    let uuid = match uuid::Uuid::parse_str(&uuid_str) {
-        Ok(u) => u,
-        Err(_) => return WatchlistJsonResult::err(WATCHLIST_ERR_INVALID_INPUT),
-    };
-
-    let body_str = match cstr_lossy(json_body) {
-        Some(s) => s,
-        None => return WatchlistJsonResult::err(WATCHLIST_ERR_INVALID_INPUT),
-    };
-    let body = match AddVideoBody::from_json_str(&body_str) {
-        Some(b) => b,
-        None => return WatchlistJsonResult::err(WATCHLIST_ERR_INVALID_INPUT),
-    };
-
-    let result = runtime().block_on(async {
-        services
-            .add_video_to_watchlist_handler
-            .add(uuid, body.video_uuid, &token)
-            .await
-    });
-
-    match result {
-        Ok(progress) => {
-            let json = serde_json::to_string(&progress).unwrap_or_default();
-            WatchlistJsonResult::ok(json)
+        let token = cstr_lossy(token).unwrap_or_default();
+        if !authenticated(&services, &token) {
+            return WatchlistJsonResult::err(WATCHLIST_ERR_UNAUTHORIZED);
         }
-        Err(err) => map_watchlist_err(err),
-    }
+
+        let uuid_str = match cstr_lossy(uuid) {
+            Some(s) => s,
+            None => return WatchlistJsonResult::err(WATCHLIST_ERR_INVALID_INPUT),
+        };
+        let uuid = match uuid::Uuid::parse_str(&uuid_str) {
+            Ok(u) => u,
+            Err(_) => return WatchlistJsonResult::err(WATCHLIST_ERR_INVALID_INPUT),
+        };
+
+        let body_str = match cstr_lossy(json_body) {
+            Some(s) => s,
+            None => return WatchlistJsonResult::err(WATCHLIST_ERR_INVALID_INPUT),
+        };
+        let body = match AddVideoBody::from_json_str(&body_str) {
+            Some(b) => b,
+            None => return WatchlistJsonResult::err(WATCHLIST_ERR_INVALID_INPUT),
+        };
+
+        let result = runtime().block_on(async {
+            services
+                .add_video_to_watchlist_handler
+                .add(uuid, body.video_uuid, &token)
+                .await
+        });
+
+        match result {
+            Ok(progress) => {
+                let json = serde_json::to_string(&progress).unwrap_or_default();
+                WatchlistJsonResult::ok(json)
+            }
+            Err(err) => map_watchlist_err(err),
+        }
+    })
 }
 
 /// Filter accepted by `alexandria_watchlists_list` — the same JSON `GET
@@ -2518,44 +2638,46 @@ pub extern "C" fn alexandria_watchlists_list(
     json_filters: *const c_char,
     token: *const c_char,
 ) -> WatchlistJsonResult {
-    let services = match services_slot().lock().unwrap().clone() {
-        Some(s) => s,
-        None => return WatchlistJsonResult::err(WATCHLIST_ERR_NOT_INITIALIZED),
-    };
+    ffi_guard(WatchlistJsonResult::err(WATCHLIST_ERR_OTHER), || {
+        let services = match locked_services() {
+            Some(s) => s,
+            None => return WatchlistJsonResult::err(WATCHLIST_ERR_NOT_INITIALIZED),
+        };
 
-    let token = cstr_lossy(token).unwrap_or_default();
-    if !authenticated(&services, &token) {
-        return WatchlistJsonResult::err(WATCHLIST_ERR_UNAUTHORIZED);
-    }
-
-    let filter_str = cstr_lossy(json_filters).unwrap_or_default();
-    let parsed = match WatchlistsListFilter::from_json_str(&filter_str) {
-        Some(f) => f,
-        None => return WatchlistJsonResult::err(WATCHLIST_ERR_INVALID_INPUT),
-    };
-
-    let watchlist_uuid = match parsed.watchlist_uuid.as_deref().filter(|s| !s.is_empty()) {
-        None => None,
-        Some(v) => match uuid::Uuid::parse_str(v) {
-            Ok(u) => Some(u),
-            Err(_) => return WatchlistJsonResult::err(WATCHLIST_ERR_INVALID_INPUT),
-        },
-    };
-
-    let result = runtime().block_on(async {
-        services
-            .browse_watchlists_handler
-            .list(watchlist_uuid, &token)
-            .await
-    });
-
-    match result {
-        Ok(watchlists) => {
-            let json = serde_json::to_string(&watchlists).unwrap_or_default();
-            WatchlistJsonResult::ok(json)
+        let token = cstr_lossy(token).unwrap_or_default();
+        if !authenticated(&services, &token) {
+            return WatchlistJsonResult::err(WATCHLIST_ERR_UNAUTHORIZED);
         }
-        Err(err) => map_watchlist_err(err),
-    }
+
+        let filter_str = cstr_lossy(json_filters).unwrap_or_default();
+        let parsed = match WatchlistsListFilter::from_json_str(&filter_str) {
+            Some(f) => f,
+            None => return WatchlistJsonResult::err(WATCHLIST_ERR_INVALID_INPUT),
+        };
+
+        let watchlist_uuid = match parsed.watchlist_uuid.as_deref().filter(|s| !s.is_empty()) {
+            None => None,
+            Some(v) => match uuid::Uuid::parse_str(v) {
+                Ok(u) => Some(u),
+                Err(_) => return WatchlistJsonResult::err(WATCHLIST_ERR_INVALID_INPUT),
+            },
+        };
+
+        let result = runtime().block_on(async {
+            services
+                .browse_watchlists_handler
+                .list(watchlist_uuid, &token)
+                .await
+        });
+
+        match result {
+            Ok(watchlists) => {
+                let json = serde_json::to_string(&watchlists).unwrap_or_default();
+                WatchlistJsonResult::ok(json)
+            }
+            Err(err) => map_watchlist_err(err),
+        }
+    })
 }
 
 /// Request body accepted by `alexandria_watchlist_update_progress` — the
@@ -2597,68 +2719,70 @@ pub extern "C" fn alexandria_watchlist_update_progress(
     json_body: *const c_char,
     token: *const c_char,
 ) -> WatchlistJsonResult {
-    let services = match services_slot().lock().unwrap().clone() {
-        Some(s) => s,
-        None => return WatchlistJsonResult::err(WATCHLIST_ERR_NOT_INITIALIZED),
-    };
+    ffi_guard(WatchlistJsonResult::err(WATCHLIST_ERR_OTHER), || {
+        let services = match locked_services() {
+            Some(s) => s,
+            None => return WatchlistJsonResult::err(WATCHLIST_ERR_NOT_INITIALIZED),
+        };
 
-    let token = cstr_lossy(token).unwrap_or_default();
-    if !authenticated(&services, &token) {
-        return WatchlistJsonResult::err(WATCHLIST_ERR_UNAUTHORIZED);
-    }
-
-    let watchlist_uuid_str = match cstr_lossy(watchlist_uuid) {
-        Some(s) => s,
-        None => return WatchlistJsonResult::err(WATCHLIST_ERR_INVALID_INPUT),
-    };
-    let watchlist_uuid = match uuid::Uuid::parse_str(&watchlist_uuid_str) {
-        Ok(u) => u,
-        Err(_) => return WatchlistJsonResult::err(WATCHLIST_ERR_INVALID_INPUT),
-    };
-
-    let video_uuid_str = match cstr_lossy(video_uuid) {
-        Some(s) => s,
-        None => return WatchlistJsonResult::err(WATCHLIST_ERR_INVALID_INPUT),
-    };
-    let video_uuid = match uuid::Uuid::parse_str(&video_uuid_str) {
-        Ok(u) => u,
-        Err(_) => return WatchlistJsonResult::err(WATCHLIST_ERR_INVALID_INPUT),
-    };
-
-    let body_str = match cstr_lossy(json_body) {
-        Some(s) => s,
-        None => return WatchlistJsonResult::err(WATCHLIST_ERR_INVALID_INPUT),
-    };
-    let body = match UpdateWatchProgressBody::from_json_str(&body_str) {
-        Some(b) => b,
-        None => return WatchlistJsonResult::err(WATCHLIST_ERR_INVALID_INPUT),
-    };
-    let new_state = match alexandria_core::watchlists::model::WatchState::parse(&body.state) {
-        Some(s) => s,
-        None => return WatchlistJsonResult::err(WATCHLIST_ERR_INVALID_INPUT),
-    };
-
-    let result = runtime().block_on(async {
-        services
-            .update_watch_progress_handler
-            .update(
-                watchlist_uuid,
-                video_uuid,
-                new_state,
-                body.current_episode,
-                body.total_episodes,
-                &token,
-            )
-            .await
-    });
-
-    match result {
-        Ok(progress) => {
-            let json = serde_json::to_string(&progress).unwrap_or_default();
-            WatchlistJsonResult::ok(json)
+        let token = cstr_lossy(token).unwrap_or_default();
+        if !authenticated(&services, &token) {
+            return WatchlistJsonResult::err(WATCHLIST_ERR_UNAUTHORIZED);
         }
-        Err(err) => map_watchlist_err(err),
-    }
+
+        let watchlist_uuid_str = match cstr_lossy(watchlist_uuid) {
+            Some(s) => s,
+            None => return WatchlistJsonResult::err(WATCHLIST_ERR_INVALID_INPUT),
+        };
+        let watchlist_uuid = match uuid::Uuid::parse_str(&watchlist_uuid_str) {
+            Ok(u) => u,
+            Err(_) => return WatchlistJsonResult::err(WATCHLIST_ERR_INVALID_INPUT),
+        };
+
+        let video_uuid_str = match cstr_lossy(video_uuid) {
+            Some(s) => s,
+            None => return WatchlistJsonResult::err(WATCHLIST_ERR_INVALID_INPUT),
+        };
+        let video_uuid = match uuid::Uuid::parse_str(&video_uuid_str) {
+            Ok(u) => u,
+            Err(_) => return WatchlistJsonResult::err(WATCHLIST_ERR_INVALID_INPUT),
+        };
+
+        let body_str = match cstr_lossy(json_body) {
+            Some(s) => s,
+            None => return WatchlistJsonResult::err(WATCHLIST_ERR_INVALID_INPUT),
+        };
+        let body = match UpdateWatchProgressBody::from_json_str(&body_str) {
+            Some(b) => b,
+            None => return WatchlistJsonResult::err(WATCHLIST_ERR_INVALID_INPUT),
+        };
+        let new_state = match alexandria_core::watchlists::model::WatchState::parse(&body.state) {
+            Some(s) => s,
+            None => return WatchlistJsonResult::err(WATCHLIST_ERR_INVALID_INPUT),
+        };
+
+        let result = runtime().block_on(async {
+            services
+                .update_watch_progress_handler
+                .update(
+                    watchlist_uuid,
+                    video_uuid,
+                    new_state,
+                    body.current_episode,
+                    body.total_episodes,
+                    &token,
+                )
+                .await
+        });
+
+        match result {
+            Ok(progress) => {
+                let json = serde_json::to_string(&progress).unwrap_or_default();
+                WatchlistJsonResult::ok(json)
+            }
+            Err(err) => map_watchlist_err(err),
+        }
+    })
 }
 
 /// Remove a video from a watchlist (UC-24 / FR-WL-06).
@@ -2675,40 +2799,42 @@ pub extern "C" fn alexandria_watchlist_remove_video(
     video_uuid: *const c_char,
     token: *const c_char,
 ) -> WatchlistJsonResult {
-    let services = match services_slot().lock().unwrap().clone() {
-        Some(s) => s,
-        None => return WatchlistJsonResult::err(WATCHLIST_ERR_NOT_INITIALIZED),
-    };
+    ffi_guard(WatchlistJsonResult::err(WATCHLIST_ERR_OTHER), || {
+        let services = match locked_services() {
+            Some(s) => s,
+            None => return WatchlistJsonResult::err(WATCHLIST_ERR_NOT_INITIALIZED),
+        };
 
-    let token = cstr_lossy(token).unwrap_or_default();
-    if !authenticated(&services, &token) {
-        return WatchlistJsonResult::err(WATCHLIST_ERR_UNAUTHORIZED);
-    }
+        let token = cstr_lossy(token).unwrap_or_default();
+        if !authenticated(&services, &token) {
+            return WatchlistJsonResult::err(WATCHLIST_ERR_UNAUTHORIZED);
+        }
 
-    let watchlist_uuid =
-        match cstr_lossy(watchlist_uuid).and_then(|s| uuid::Uuid::parse_str(&s).ok()) {
+        let watchlist_uuid =
+            match cstr_lossy(watchlist_uuid).and_then(|s| uuid::Uuid::parse_str(&s).ok()) {
+                Some(u) => u,
+                None => return WatchlistJsonResult::err(WATCHLIST_ERR_INVALID_INPUT),
+            };
+        let video_uuid = match cstr_lossy(video_uuid).and_then(|s| uuid::Uuid::parse_str(&s).ok()) {
             Some(u) => u,
             None => return WatchlistJsonResult::err(WATCHLIST_ERR_INVALID_INPUT),
         };
-    let video_uuid = match cstr_lossy(video_uuid).and_then(|s| uuid::Uuid::parse_str(&s).ok()) {
-        Some(u) => u,
-        None => return WatchlistJsonResult::err(WATCHLIST_ERR_INVALID_INPUT),
-    };
 
-    let result = runtime().block_on(async {
-        services
-            .remove_video_from_watchlist_handler
-            .remove(watchlist_uuid, video_uuid, &token)
-            .await
-    });
+        let result = runtime().block_on(async {
+            services
+                .remove_video_from_watchlist_handler
+                .remove(watchlist_uuid, video_uuid, &token)
+                .await
+        });
 
-    match result {
-        Ok(removed) => {
-            let json = serde_json::to_string(&removed).unwrap_or_default();
-            WatchlistJsonResult::ok(json)
+        match result {
+            Ok(removed) => {
+                let json = serde_json::to_string(&removed).unwrap_or_default();
+                WatchlistJsonResult::ok(json)
+            }
+            Err(err) => map_watchlist_err(err),
         }
-        Err(err) => map_watchlist_err(err),
-    }
+    })
 }
 
 /// Delete a watchlist (UC-25 / FR-WL-07).
@@ -2723,37 +2849,39 @@ pub extern "C" fn alexandria_watchlist_delete(
     uuid: *const c_char,
     token: *const c_char,
 ) -> WatchlistJsonResult {
-    let services = match services_slot().lock().unwrap().clone() {
-        Some(s) => s,
-        None => return WatchlistJsonResult::err(WATCHLIST_ERR_NOT_INITIALIZED),
-    };
+    ffi_guard(WatchlistJsonResult::err(WATCHLIST_ERR_OTHER), || {
+        let services = match locked_services() {
+            Some(s) => s,
+            None => return WatchlistJsonResult::err(WATCHLIST_ERR_NOT_INITIALIZED),
+        };
 
-    // Deny before touching the payload — an unauthenticated caller must not
-    // learn whether the uuid would have parsed.
-    let token = cstr_lossy(token).unwrap_or_default();
-    if !authenticated(&services, &token) {
-        return WatchlistJsonResult::err(WATCHLIST_ERR_UNAUTHORIZED);
-    }
-
-    let uuid_str = match cstr_lossy(uuid) {
-        Some(s) => s,
-        None => return WatchlistJsonResult::err(WATCHLIST_ERR_INVALID_INPUT),
-    };
-    let uuid = match uuid::Uuid::parse_str(&uuid_str) {
-        Ok(u) => u,
-        Err(_) => return WatchlistJsonResult::err(WATCHLIST_ERR_INVALID_INPUT),
-    };
-
-    let result =
-        runtime().block_on(async { services.delete_watchlist_handler.delete(uuid, &token).await });
-
-    match result {
-        Ok(watchlist) => {
-            let json = serde_json::to_string(&watchlist).unwrap_or_default();
-            WatchlistJsonResult::ok(json)
+        // Deny before touching the payload — an unauthenticated caller must not
+        // learn whether the uuid would have parsed.
+        let token = cstr_lossy(token).unwrap_or_default();
+        if !authenticated(&services, &token) {
+            return WatchlistJsonResult::err(WATCHLIST_ERR_UNAUTHORIZED);
         }
-        Err(err) => map_watchlist_err(err),
-    }
+
+        let uuid_str = match cstr_lossy(uuid) {
+            Some(s) => s,
+            None => return WatchlistJsonResult::err(WATCHLIST_ERR_INVALID_INPUT),
+        };
+        let uuid = match uuid::Uuid::parse_str(&uuid_str) {
+            Ok(u) => u,
+            Err(_) => return WatchlistJsonResult::err(WATCHLIST_ERR_INVALID_INPUT),
+        };
+
+        let result = runtime()
+            .block_on(async { services.delete_watchlist_handler.delete(uuid, &token).await });
+
+        match result {
+            Ok(watchlist) => {
+                let json = serde_json::to_string(&watchlist).unwrap_or_default();
+                WatchlistJsonResult::ok(json)
+            }
+            Err(err) => map_watchlist_err(err),
+        }
+    })
 }
 
 fn parse_file_type(s: &str) -> Option<alexandria_core::catalog::model::FileType> {
@@ -2786,16 +2914,18 @@ fn map_file_err(err: DomainError) -> FileJsonResult {
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
 pub extern "C" fn alexandria_index_count_missing() -> i64 {
-    let services = match services_slot().lock().unwrap().clone() {
-        Some(s) => s,
-        None => return -1,
-    };
-    runtime().block_on(async {
-        let row: Result<(i64,), _> =
-            sqlx::query_as("SELECT COUNT(*) FROM files WHERE missing_at IS NOT NULL")
-                .fetch_one(&services.pool)
-                .await;
-        row.map(|(c,)| c).unwrap_or(-1)
+    ffi_guard(-1, || {
+        let services = match locked_services() {
+            Some(s) => s,
+            None => return -1,
+        };
+        runtime().block_on(async {
+            let row: Result<(i64,), _> =
+                sqlx::query_as("SELECT COUNT(*) FROM files WHERE missing_at IS NOT NULL")
+                    .fetch_one(&services.pool)
+                    .await;
+            row.map(|(c,)| c).unwrap_or(-1)
+        })
     })
 }
 
@@ -2816,40 +2946,42 @@ pub extern "C" fn alexandria_index_count_missing() -> i64 {
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
 pub extern "C" fn alexandria_index_files_json() -> *mut c_char {
-    // `(path, name, type, content_hash, missing_at)` — `content_hash` and
-    // `missing_at` both nullable.
-    type FileRow = (String, String, String, Option<String>, Option<String>);
+    ffi_guard(std::ptr::null_mut(), || {
+        // `(path, name, type, content_hash, missing_at)` — `content_hash` and
+        // `missing_at` both nullable.
+        type FileRow = (String, String, String, Option<String>, Option<String>);
 
-    let services = match services_slot().lock().unwrap().clone() {
-        Some(s) => s,
-        None => return std::ptr::null_mut(),
-    };
-    let rows: Vec<FileRow> = runtime()
-        .block_on(async {
-            sqlx::query_as(
-                "SELECT path, name, type, content_hash, missing_at \
-                 FROM files ORDER BY path",
-            )
-            .fetch_all(&services.pool)
-            .await
-        })
-        .unwrap_or_default();
-
-    let arr: Vec<_> = rows
-        .iter()
-        .map(|(p, n, t, h, m)| {
-            serde_json::json!({
-                "path": p,
-                "name": n,
-                "type": t,
-                "hash": h,
-                "missingAt": m,
+        let services = match locked_services() {
+            Some(s) => s,
+            None => return std::ptr::null_mut(),
+        };
+        let rows: Vec<FileRow> = runtime()
+            .block_on(async {
+                sqlx::query_as(
+                    "SELECT path, name, type, content_hash, missing_at \
+                     FROM files ORDER BY path",
+                )
+                .fetch_all(&services.pool)
+                .await
             })
-        })
-        .collect();
-    let json = serde_json::Value::Array(arr).to_string();
-    let cstring = CString::new(json).unwrap_or_default();
-    cstring.into_raw()
+            .unwrap_or_default();
+
+        let arr: Vec<_> = rows
+            .iter()
+            .map(|(p, n, t, h, m)| {
+                serde_json::json!({
+                    "path": p,
+                    "name": n,
+                    "type": t,
+                    "hash": h,
+                    "missingAt": m,
+                })
+            })
+            .collect();
+        let json = serde_json::Value::Array(arr).to_string();
+        let cstring = CString::new(json).unwrap_or_default();
+        cstring.into_raw()
+    })
 }
 
 /// FFI status codes returned by reading list operations (UC-26+).
@@ -2936,39 +3068,41 @@ pub extern "C" fn alexandria_reading_list_create(
     json_body: *const c_char,
     token: *const c_char,
 ) -> ReadingListJsonResult {
-    let services = match services_slot().lock().unwrap().clone() {
-        Some(s) => s,
-        None => return ReadingListJsonResult::err(READING_LIST_ERR_NOT_INITIALIZED),
-    };
+    ffi_guard(ReadingListJsonResult::err(READING_LIST_ERR_OTHER), || {
+        let services = match locked_services() {
+            Some(s) => s,
+            None => return ReadingListJsonResult::err(READING_LIST_ERR_NOT_INITIALIZED),
+        };
 
-    let token = cstr_lossy(token).unwrap_or_default();
-    if !authenticated(&services, &token) {
-        return ReadingListJsonResult::err(READING_LIST_ERR_UNAUTHORIZED);
-    }
-
-    let body_str = match cstr_lossy(json_body) {
-        Some(s) => s,
-        None => return ReadingListJsonResult::err(READING_LIST_ERR_INVALID_INPUT),
-    };
-    let body = match CreateReadingListBody::from_json_str(&body_str) {
-        Some(b) => b,
-        None => return ReadingListJsonResult::err(READING_LIST_ERR_INVALID_INPUT),
-    };
-
-    let result = runtime().block_on(async {
-        services
-            .create_reading_list_handler
-            .create(&body.name, &token)
-            .await
-    });
-
-    match result {
-        Ok(reading_list) => {
-            let json = serde_json::to_string(&reading_list).unwrap_or_default();
-            ReadingListJsonResult::ok(json)
+        let token = cstr_lossy(token).unwrap_or_default();
+        if !authenticated(&services, &token) {
+            return ReadingListJsonResult::err(READING_LIST_ERR_UNAUTHORIZED);
         }
-        Err(err) => map_reading_list_err(err),
-    }
+
+        let body_str = match cstr_lossy(json_body) {
+            Some(s) => s,
+            None => return ReadingListJsonResult::err(READING_LIST_ERR_INVALID_INPUT),
+        };
+        let body = match CreateReadingListBody::from_json_str(&body_str) {
+            Some(b) => b,
+            None => return ReadingListJsonResult::err(READING_LIST_ERR_INVALID_INPUT),
+        };
+
+        let result = runtime().block_on(async {
+            services
+                .create_reading_list_handler
+                .create(&body.name, &token)
+                .await
+        });
+
+        match result {
+            Ok(reading_list) => {
+                let json = serde_json::to_string(&reading_list).unwrap_or_default();
+                ReadingListJsonResult::ok(json)
+            }
+            Err(err) => map_reading_list_err(err),
+        }
+    })
 }
 
 /// Request body accepted by `alexandria_reading_list_add_item` — the same
@@ -3005,48 +3139,50 @@ pub extern "C" fn alexandria_reading_list_add_item(
     json_body: *const c_char,
     token: *const c_char,
 ) -> ReadingListJsonResult {
-    let services = match services_slot().lock().unwrap().clone() {
-        Some(s) => s,
-        None => return ReadingListJsonResult::err(READING_LIST_ERR_NOT_INITIALIZED),
-    };
+    ffi_guard(ReadingListJsonResult::err(READING_LIST_ERR_OTHER), || {
+        let services = match locked_services() {
+            Some(s) => s,
+            None => return ReadingListJsonResult::err(READING_LIST_ERR_NOT_INITIALIZED),
+        };
 
-    let token = cstr_lossy(token).unwrap_or_default();
-    if !authenticated(&services, &token) {
-        return ReadingListJsonResult::err(READING_LIST_ERR_UNAUTHORIZED);
-    }
-
-    let uuid_str = match cstr_lossy(uuid) {
-        Some(s) => s,
-        None => return ReadingListJsonResult::err(READING_LIST_ERR_INVALID_INPUT),
-    };
-    let uuid = match uuid::Uuid::parse_str(&uuid_str) {
-        Ok(u) => u,
-        Err(_) => return ReadingListJsonResult::err(READING_LIST_ERR_INVALID_INPUT),
-    };
-
-    let body_str = match cstr_lossy(json_body) {
-        Some(s) => s,
-        None => return ReadingListJsonResult::err(READING_LIST_ERR_INVALID_INPUT),
-    };
-    let body = match AddItemToReadingListBody::from_json_str(&body_str) {
-        Some(b) => b,
-        None => return ReadingListJsonResult::err(READING_LIST_ERR_INVALID_INPUT),
-    };
-
-    let result = runtime().block_on(async {
-        services
-            .add_item_to_reading_list_handler
-            .add(uuid, body.item_uuid, &token)
-            .await
-    });
-
-    match result {
-        Ok(progress) => {
-            let json = serde_json::to_string(&progress).unwrap_or_default();
-            ReadingListJsonResult::ok(json)
+        let token = cstr_lossy(token).unwrap_or_default();
+        if !authenticated(&services, &token) {
+            return ReadingListJsonResult::err(READING_LIST_ERR_UNAUTHORIZED);
         }
-        Err(err) => map_reading_list_err(err),
-    }
+
+        let uuid_str = match cstr_lossy(uuid) {
+            Some(s) => s,
+            None => return ReadingListJsonResult::err(READING_LIST_ERR_INVALID_INPUT),
+        };
+        let uuid = match uuid::Uuid::parse_str(&uuid_str) {
+            Ok(u) => u,
+            Err(_) => return ReadingListJsonResult::err(READING_LIST_ERR_INVALID_INPUT),
+        };
+
+        let body_str = match cstr_lossy(json_body) {
+            Some(s) => s,
+            None => return ReadingListJsonResult::err(READING_LIST_ERR_INVALID_INPUT),
+        };
+        let body = match AddItemToReadingListBody::from_json_str(&body_str) {
+            Some(b) => b,
+            None => return ReadingListJsonResult::err(READING_LIST_ERR_INVALID_INPUT),
+        };
+
+        let result = runtime().block_on(async {
+            services
+                .add_item_to_reading_list_handler
+                .add(uuid, body.item_uuid, &token)
+                .await
+        });
+
+        match result {
+            Ok(progress) => {
+                let json = serde_json::to_string(&progress).unwrap_or_default();
+                ReadingListJsonResult::ok(json)
+            }
+            Err(err) => map_reading_list_err(err),
+        }
+    })
 }
 
 /// Filter accepted by `alexandria_reading_lists_list` — the same JSON `GET
@@ -3090,48 +3226,50 @@ pub extern "C" fn alexandria_reading_lists_list(
     json_filters: *const c_char,
     token: *const c_char,
 ) -> ReadingListJsonResult {
-    let services = match services_slot().lock().unwrap().clone() {
-        Some(s) => s,
-        None => return ReadingListJsonResult::err(READING_LIST_ERR_NOT_INITIALIZED),
-    };
+    ffi_guard(ReadingListJsonResult::err(READING_LIST_ERR_OTHER), || {
+        let services = match locked_services() {
+            Some(s) => s,
+            None => return ReadingListJsonResult::err(READING_LIST_ERR_NOT_INITIALIZED),
+        };
 
-    let token = cstr_lossy(token).unwrap_or_default();
-    if !authenticated(&services, &token) {
-        return ReadingListJsonResult::err(READING_LIST_ERR_UNAUTHORIZED);
-    }
-
-    let filter_str = cstr_lossy(json_filters).unwrap_or_default();
-    let parsed = match ReadingListsListFilter::from_json_str(&filter_str) {
-        Some(f) => f,
-        None => return ReadingListJsonResult::err(READING_LIST_ERR_INVALID_INPUT),
-    };
-
-    let reading_list_uuid = match parsed
-        .reading_list_uuid
-        .as_deref()
-        .filter(|s| !s.is_empty())
-    {
-        None => None,
-        Some(v) => match uuid::Uuid::parse_str(v) {
-            Ok(u) => Some(u),
-            Err(_) => return ReadingListJsonResult::err(READING_LIST_ERR_INVALID_INPUT),
-        },
-    };
-
-    let result = runtime().block_on(async {
-        services
-            .browse_reading_lists_handler
-            .list(reading_list_uuid, &token)
-            .await
-    });
-
-    match result {
-        Ok(reading_lists) => {
-            let json = serde_json::to_string(&reading_lists).unwrap_or_default();
-            ReadingListJsonResult::ok(json)
+        let token = cstr_lossy(token).unwrap_or_default();
+        if !authenticated(&services, &token) {
+            return ReadingListJsonResult::err(READING_LIST_ERR_UNAUTHORIZED);
         }
-        Err(err) => map_reading_list_err(err),
-    }
+
+        let filter_str = cstr_lossy(json_filters).unwrap_or_default();
+        let parsed = match ReadingListsListFilter::from_json_str(&filter_str) {
+            Some(f) => f,
+            None => return ReadingListJsonResult::err(READING_LIST_ERR_INVALID_INPUT),
+        };
+
+        let reading_list_uuid = match parsed
+            .reading_list_uuid
+            .as_deref()
+            .filter(|s| !s.is_empty())
+        {
+            None => None,
+            Some(v) => match uuid::Uuid::parse_str(v) {
+                Ok(u) => Some(u),
+                Err(_) => return ReadingListJsonResult::err(READING_LIST_ERR_INVALID_INPUT),
+            },
+        };
+
+        let result = runtime().block_on(async {
+            services
+                .browse_reading_lists_handler
+                .list(reading_list_uuid, &token)
+                .await
+        });
+
+        match result {
+            Ok(reading_lists) => {
+                let json = serde_json::to_string(&reading_lists).unwrap_or_default();
+                ReadingListJsonResult::ok(json)
+            }
+            Err(err) => map_reading_list_err(err),
+        }
+    })
 }
 
 /// Request body accepted by `alexandria_reading_list_update_progress` — the
@@ -3173,68 +3311,71 @@ pub extern "C" fn alexandria_reading_list_update_progress(
     json_body: *const c_char,
     token: *const c_char,
 ) -> ReadingListJsonResult {
-    let services = match services_slot().lock().unwrap().clone() {
-        Some(s) => s,
-        None => return ReadingListJsonResult::err(READING_LIST_ERR_NOT_INITIALIZED),
-    };
+    ffi_guard(ReadingListJsonResult::err(READING_LIST_ERR_OTHER), || {
+        let services = match locked_services() {
+            Some(s) => s,
+            None => return ReadingListJsonResult::err(READING_LIST_ERR_NOT_INITIALIZED),
+        };
 
-    let token = cstr_lossy(token).unwrap_or_default();
-    if !authenticated(&services, &token) {
-        return ReadingListJsonResult::err(READING_LIST_ERR_UNAUTHORIZED);
-    }
-
-    let reading_list_uuid_str = match cstr_lossy(reading_list_uuid) {
-        Some(s) => s,
-        None => return ReadingListJsonResult::err(READING_LIST_ERR_INVALID_INPUT),
-    };
-    let reading_list_uuid = match uuid::Uuid::parse_str(&reading_list_uuid_str) {
-        Ok(u) => u,
-        Err(_) => return ReadingListJsonResult::err(READING_LIST_ERR_INVALID_INPUT),
-    };
-
-    let item_uuid_str = match cstr_lossy(item_uuid) {
-        Some(s) => s,
-        None => return ReadingListJsonResult::err(READING_LIST_ERR_INVALID_INPUT),
-    };
-    let item_uuid = match uuid::Uuid::parse_str(&item_uuid_str) {
-        Ok(u) => u,
-        Err(_) => return ReadingListJsonResult::err(READING_LIST_ERR_INVALID_INPUT),
-    };
-
-    let body_str = match cstr_lossy(json_body) {
-        Some(s) => s,
-        None => return ReadingListJsonResult::err(READING_LIST_ERR_INVALID_INPUT),
-    };
-    let body = match UpdateReadingProgressBody::from_json_str(&body_str) {
-        Some(b) => b,
-        None => return ReadingListJsonResult::err(READING_LIST_ERR_INVALID_INPUT),
-    };
-    let new_state = match alexandria_core::reading_lists::model::ReadingState::parse(&body.state) {
-        Some(s) => s,
-        None => return ReadingListJsonResult::err(READING_LIST_ERR_INVALID_INPUT),
-    };
-
-    let result = runtime().block_on(async {
-        services
-            .update_reading_progress_handler
-            .update(
-                reading_list_uuid,
-                item_uuid,
-                new_state,
-                body.current_issue,
-                body.total_issues,
-                &token,
-            )
-            .await
-    });
-
-    match result {
-        Ok(progress) => {
-            let json = serde_json::to_string(&progress).unwrap_or_default();
-            ReadingListJsonResult::ok(json)
+        let token = cstr_lossy(token).unwrap_or_default();
+        if !authenticated(&services, &token) {
+            return ReadingListJsonResult::err(READING_LIST_ERR_UNAUTHORIZED);
         }
-        Err(err) => map_reading_list_err(err),
-    }
+
+        let reading_list_uuid_str = match cstr_lossy(reading_list_uuid) {
+            Some(s) => s,
+            None => return ReadingListJsonResult::err(READING_LIST_ERR_INVALID_INPUT),
+        };
+        let reading_list_uuid = match uuid::Uuid::parse_str(&reading_list_uuid_str) {
+            Ok(u) => u,
+            Err(_) => return ReadingListJsonResult::err(READING_LIST_ERR_INVALID_INPUT),
+        };
+
+        let item_uuid_str = match cstr_lossy(item_uuid) {
+            Some(s) => s,
+            None => return ReadingListJsonResult::err(READING_LIST_ERR_INVALID_INPUT),
+        };
+        let item_uuid = match uuid::Uuid::parse_str(&item_uuid_str) {
+            Ok(u) => u,
+            Err(_) => return ReadingListJsonResult::err(READING_LIST_ERR_INVALID_INPUT),
+        };
+
+        let body_str = match cstr_lossy(json_body) {
+            Some(s) => s,
+            None => return ReadingListJsonResult::err(READING_LIST_ERR_INVALID_INPUT),
+        };
+        let body = match UpdateReadingProgressBody::from_json_str(&body_str) {
+            Some(b) => b,
+            None => return ReadingListJsonResult::err(READING_LIST_ERR_INVALID_INPUT),
+        };
+        let new_state =
+            match alexandria_core::reading_lists::model::ReadingState::parse(&body.state) {
+                Some(s) => s,
+                None => return ReadingListJsonResult::err(READING_LIST_ERR_INVALID_INPUT),
+            };
+
+        let result = runtime().block_on(async {
+            services
+                .update_reading_progress_handler
+                .update(
+                    reading_list_uuid,
+                    item_uuid,
+                    new_state,
+                    body.current_issue,
+                    body.total_issues,
+                    &token,
+                )
+                .await
+        });
+
+        match result {
+            Ok(progress) => {
+                let json = serde_json::to_string(&progress).unwrap_or_default();
+                ReadingListJsonResult::ok(json)
+            }
+            Err(err) => map_reading_list_err(err),
+        }
+    })
 }
 
 /// Remove an item from a reading list (UC-30 / FR-RL-06).
@@ -3251,40 +3392,42 @@ pub extern "C" fn alexandria_reading_list_remove_item(
     item_uuid: *const c_char,
     token: *const c_char,
 ) -> ReadingListJsonResult {
-    let services = match services_slot().lock().unwrap().clone() {
-        Some(s) => s,
-        None => return ReadingListJsonResult::err(READING_LIST_ERR_NOT_INITIALIZED),
-    };
+    ffi_guard(ReadingListJsonResult::err(READING_LIST_ERR_OTHER), || {
+        let services = match locked_services() {
+            Some(s) => s,
+            None => return ReadingListJsonResult::err(READING_LIST_ERR_NOT_INITIALIZED),
+        };
 
-    let token = cstr_lossy(token).unwrap_or_default();
-    if !authenticated(&services, &token) {
-        return ReadingListJsonResult::err(READING_LIST_ERR_UNAUTHORIZED);
-    }
+        let token = cstr_lossy(token).unwrap_or_default();
+        if !authenticated(&services, &token) {
+            return ReadingListJsonResult::err(READING_LIST_ERR_UNAUTHORIZED);
+        }
 
-    let reading_list_uuid =
-        match cstr_lossy(reading_list_uuid).and_then(|s| uuid::Uuid::parse_str(&s).ok()) {
+        let reading_list_uuid =
+            match cstr_lossy(reading_list_uuid).and_then(|s| uuid::Uuid::parse_str(&s).ok()) {
+                Some(u) => u,
+                None => return ReadingListJsonResult::err(READING_LIST_ERR_INVALID_INPUT),
+            };
+        let item_uuid = match cstr_lossy(item_uuid).and_then(|s| uuid::Uuid::parse_str(&s).ok()) {
             Some(u) => u,
             None => return ReadingListJsonResult::err(READING_LIST_ERR_INVALID_INPUT),
         };
-    let item_uuid = match cstr_lossy(item_uuid).and_then(|s| uuid::Uuid::parse_str(&s).ok()) {
-        Some(u) => u,
-        None => return ReadingListJsonResult::err(READING_LIST_ERR_INVALID_INPUT),
-    };
 
-    let result = runtime().block_on(async {
-        services
-            .remove_item_from_reading_list_handler
-            .remove(reading_list_uuid, item_uuid, &token)
-            .await
-    });
+        let result = runtime().block_on(async {
+            services
+                .remove_item_from_reading_list_handler
+                .remove(reading_list_uuid, item_uuid, &token)
+                .await
+        });
 
-    match result {
-        Ok(removed) => {
-            let json = serde_json::to_string(&removed).unwrap_or_default();
-            ReadingListJsonResult::ok(json)
+        match result {
+            Ok(removed) => {
+                let json = serde_json::to_string(&removed).unwrap_or_default();
+                ReadingListJsonResult::ok(json)
+            }
+            Err(err) => map_reading_list_err(err),
         }
-        Err(err) => map_reading_list_err(err),
-    }
+    })
 }
 
 /// Delete a reading list (UC-31 / FR-RL-07).
@@ -3299,41 +3442,43 @@ pub extern "C" fn alexandria_reading_list_delete(
     uuid: *const c_char,
     token: *const c_char,
 ) -> ReadingListJsonResult {
-    let services = match services_slot().lock().unwrap().clone() {
-        Some(s) => s,
-        None => return ReadingListJsonResult::err(READING_LIST_ERR_NOT_INITIALIZED),
-    };
+    ffi_guard(ReadingListJsonResult::err(READING_LIST_ERR_OTHER), || {
+        let services = match locked_services() {
+            Some(s) => s,
+            None => return ReadingListJsonResult::err(READING_LIST_ERR_NOT_INITIALIZED),
+        };
 
-    // Deny before touching the payload — an unauthenticated caller must not
-    // learn whether the uuid would have parsed.
-    let token = cstr_lossy(token).unwrap_or_default();
-    if !authenticated(&services, &token) {
-        return ReadingListJsonResult::err(READING_LIST_ERR_UNAUTHORIZED);
-    }
-
-    let uuid_str = match cstr_lossy(uuid) {
-        Some(s) => s,
-        None => return ReadingListJsonResult::err(READING_LIST_ERR_INVALID_INPUT),
-    };
-    let uuid = match uuid::Uuid::parse_str(&uuid_str) {
-        Ok(u) => u,
-        Err(_) => return ReadingListJsonResult::err(READING_LIST_ERR_INVALID_INPUT),
-    };
-
-    let result = runtime().block_on(async {
-        services
-            .delete_reading_list_handler
-            .delete(uuid, &token)
-            .await
-    });
-
-    match result {
-        Ok(reading_list) => {
-            let json = serde_json::to_string(&reading_list).unwrap_or_default();
-            ReadingListJsonResult::ok(json)
+        // Deny before touching the payload — an unauthenticated caller must not
+        // learn whether the uuid would have parsed.
+        let token = cstr_lossy(token).unwrap_or_default();
+        if !authenticated(&services, &token) {
+            return ReadingListJsonResult::err(READING_LIST_ERR_UNAUTHORIZED);
         }
-        Err(err) => map_reading_list_err(err),
-    }
+
+        let uuid_str = match cstr_lossy(uuid) {
+            Some(s) => s,
+            None => return ReadingListJsonResult::err(READING_LIST_ERR_INVALID_INPUT),
+        };
+        let uuid = match uuid::Uuid::parse_str(&uuid_str) {
+            Ok(u) => u,
+            Err(_) => return ReadingListJsonResult::err(READING_LIST_ERR_INVALID_INPUT),
+        };
+
+        let result = runtime().block_on(async {
+            services
+                .delete_reading_list_handler
+                .delete(uuid, &token)
+                .await
+        });
+
+        match result {
+            Ok(reading_list) => {
+                let json = serde_json::to_string(&reading_list).unwrap_or_default();
+                ReadingListJsonResult::ok(json)
+            }
+            Err(err) => map_reading_list_err(err),
+        }
+    })
 }
 
 /// FFI status codes returned by playlist operations (Tasks 1-6).
@@ -3419,39 +3564,41 @@ pub extern "C" fn alexandria_playlist_create(
     json_body: *const c_char,
     token: *const c_char,
 ) -> PlaylistJsonResult {
-    let services = match services_slot().lock().unwrap().clone() {
-        Some(s) => s,
-        None => return PlaylistJsonResult::err(PLAYLIST_ERR_NOT_INITIALIZED),
-    };
+    ffi_guard(PlaylistJsonResult::err(PLAYLIST_ERR_OTHER), || {
+        let services = match locked_services() {
+            Some(s) => s,
+            None => return PlaylistJsonResult::err(PLAYLIST_ERR_NOT_INITIALIZED),
+        };
 
-    let token = cstr_lossy(token).unwrap_or_default();
-    if !authenticated(&services, &token) {
-        return PlaylistJsonResult::err(PLAYLIST_ERR_UNAUTHORIZED);
-    }
-
-    let body_str = match cstr_lossy(json_body) {
-        Some(s) => s,
-        None => return PlaylistJsonResult::err(PLAYLIST_ERR_INVALID_INPUT),
-    };
-    let body = match PlaylistNameBody::from_json_str(&body_str) {
-        Some(b) => b,
-        None => return PlaylistJsonResult::err(PLAYLIST_ERR_INVALID_INPUT),
-    };
-
-    let result = runtime().block_on(async {
-        services
-            .create_playlist_handler
-            .create(&body.name, &token)
-            .await
-    });
-
-    match result {
-        Ok(playlist) => {
-            let json = serde_json::to_string(&playlist).unwrap_or_default();
-            PlaylistJsonResult::ok(json)
+        let token = cstr_lossy(token).unwrap_or_default();
+        if !authenticated(&services, &token) {
+            return PlaylistJsonResult::err(PLAYLIST_ERR_UNAUTHORIZED);
         }
-        Err(err) => map_playlist_err(err),
-    }
+
+        let body_str = match cstr_lossy(json_body) {
+            Some(s) => s,
+            None => return PlaylistJsonResult::err(PLAYLIST_ERR_INVALID_INPUT),
+        };
+        let body = match PlaylistNameBody::from_json_str(&body_str) {
+            Some(b) => b,
+            None => return PlaylistJsonResult::err(PLAYLIST_ERR_INVALID_INPUT),
+        };
+
+        let result = runtime().block_on(async {
+            services
+                .create_playlist_handler
+                .create(&body.name, &token)
+                .await
+        });
+
+        match result {
+            Ok(playlist) => {
+                let json = serde_json::to_string(&playlist).unwrap_or_default();
+                PlaylistJsonResult::ok(json)
+            }
+            Err(err) => map_playlist_err(err),
+        }
+    })
 }
 
 /// Rename a playlist, leaving its entries and their order untouched
@@ -3468,44 +3615,46 @@ pub extern "C" fn alexandria_playlist_rename(
     json_body: *const c_char,
     token: *const c_char,
 ) -> PlaylistJsonResult {
-    let services = match services_slot().lock().unwrap().clone() {
-        Some(s) => s,
-        None => return PlaylistJsonResult::err(PLAYLIST_ERR_NOT_INITIALIZED),
-    };
+    ffi_guard(PlaylistJsonResult::err(PLAYLIST_ERR_OTHER), || {
+        let services = match locked_services() {
+            Some(s) => s,
+            None => return PlaylistJsonResult::err(PLAYLIST_ERR_NOT_INITIALIZED),
+        };
 
-    let token = cstr_lossy(token).unwrap_or_default();
-    if !authenticated(&services, &token) {
-        return PlaylistJsonResult::err(PLAYLIST_ERR_UNAUTHORIZED);
-    }
-
-    let uuid = match cstr_lossy(uuid).and_then(|s| uuid::Uuid::parse_str(&s).ok()) {
-        Some(u) => u,
-        None => return PlaylistJsonResult::err(PLAYLIST_ERR_INVALID_INPUT),
-    };
-
-    let body_str = match cstr_lossy(json_body) {
-        Some(s) => s,
-        None => return PlaylistJsonResult::err(PLAYLIST_ERR_INVALID_INPUT),
-    };
-    let body = match PlaylistNameBody::from_json_str(&body_str) {
-        Some(b) => b,
-        None => return PlaylistJsonResult::err(PLAYLIST_ERR_INVALID_INPUT),
-    };
-
-    let result = runtime().block_on(async {
-        services
-            .rename_playlist_handler
-            .rename(uuid, &body.name, &token)
-            .await
-    });
-
-    match result {
-        Ok(playlist) => {
-            let json = serde_json::to_string(&playlist).unwrap_or_default();
-            PlaylistJsonResult::ok(json)
+        let token = cstr_lossy(token).unwrap_or_default();
+        if !authenticated(&services, &token) {
+            return PlaylistJsonResult::err(PLAYLIST_ERR_UNAUTHORIZED);
         }
-        Err(err) => map_playlist_err(err),
-    }
+
+        let uuid = match cstr_lossy(uuid).and_then(|s| uuid::Uuid::parse_str(&s).ok()) {
+            Some(u) => u,
+            None => return PlaylistJsonResult::err(PLAYLIST_ERR_INVALID_INPUT),
+        };
+
+        let body_str = match cstr_lossy(json_body) {
+            Some(s) => s,
+            None => return PlaylistJsonResult::err(PLAYLIST_ERR_INVALID_INPUT),
+        };
+        let body = match PlaylistNameBody::from_json_str(&body_str) {
+            Some(b) => b,
+            None => return PlaylistJsonResult::err(PLAYLIST_ERR_INVALID_INPUT),
+        };
+
+        let result = runtime().block_on(async {
+            services
+                .rename_playlist_handler
+                .rename(uuid, &body.name, &token)
+                .await
+        });
+
+        match result {
+            Ok(playlist) => {
+                let json = serde_json::to_string(&playlist).unwrap_or_default();
+                PlaylistJsonResult::ok(json)
+            }
+            Err(err) => map_playlist_err(err),
+        }
+    })
 }
 
 /// Delete a playlist, removing its entries; referenced audio files are
@@ -3521,33 +3670,35 @@ pub extern "C" fn alexandria_playlist_delete(
     uuid: *const c_char,
     token: *const c_char,
 ) -> PlaylistJsonResult {
-    let services = match services_slot().lock().unwrap().clone() {
-        Some(s) => s,
-        None => return PlaylistJsonResult::err(PLAYLIST_ERR_NOT_INITIALIZED),
-    };
+    ffi_guard(PlaylistJsonResult::err(PLAYLIST_ERR_OTHER), || {
+        let services = match locked_services() {
+            Some(s) => s,
+            None => return PlaylistJsonResult::err(PLAYLIST_ERR_NOT_INITIALIZED),
+        };
 
-    // Deny before touching the payload — an unauthenticated caller must not
-    // learn whether the uuid would have parsed.
-    let token = cstr_lossy(token).unwrap_or_default();
-    if !authenticated(&services, &token) {
-        return PlaylistJsonResult::err(PLAYLIST_ERR_UNAUTHORIZED);
-    }
-
-    let uuid = match cstr_lossy(uuid).and_then(|s| uuid::Uuid::parse_str(&s).ok()) {
-        Some(u) => u,
-        None => return PlaylistJsonResult::err(PLAYLIST_ERR_INVALID_INPUT),
-    };
-
-    let result =
-        runtime().block_on(async { services.delete_playlist_handler.delete(uuid, &token).await });
-
-    match result {
-        Ok(playlist) => {
-            let json = serde_json::to_string(&playlist).unwrap_or_default();
-            PlaylistJsonResult::ok(json)
+        // Deny before touching the payload — an unauthenticated caller must not
+        // learn whether the uuid would have parsed.
+        let token = cstr_lossy(token).unwrap_or_default();
+        if !authenticated(&services, &token) {
+            return PlaylistJsonResult::err(PLAYLIST_ERR_UNAUTHORIZED);
         }
-        Err(err) => map_playlist_err(err),
-    }
+
+        let uuid = match cstr_lossy(uuid).and_then(|s| uuid::Uuid::parse_str(&s).ok()) {
+            Some(u) => u,
+            None => return PlaylistJsonResult::err(PLAYLIST_ERR_INVALID_INPUT),
+        };
+
+        let result = runtime()
+            .block_on(async { services.delete_playlist_handler.delete(uuid, &token).await });
+
+        match result {
+            Ok(playlist) => {
+                let json = serde_json::to_string(&playlist).unwrap_or_default();
+                PlaylistJsonResult::ok(json)
+            }
+            Err(err) => map_playlist_err(err),
+        }
+    })
 }
 
 /// Every persisted playlist, without their tracks (Task 6).
@@ -3558,25 +3709,28 @@ pub extern "C" fn alexandria_playlist_delete(
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
 pub extern "C" fn alexandria_playlists_list(token: *const c_char) -> PlaylistJsonResult {
-    let services = match services_slot().lock().unwrap().clone() {
-        Some(s) => s,
-        None => return PlaylistJsonResult::err(PLAYLIST_ERR_NOT_INITIALIZED),
-    };
+    ffi_guard(PlaylistJsonResult::err(PLAYLIST_ERR_OTHER), || {
+        let services = match locked_services() {
+            Some(s) => s,
+            None => return PlaylistJsonResult::err(PLAYLIST_ERR_NOT_INITIALIZED),
+        };
 
-    let token = cstr_lossy(token).unwrap_or_default();
-    if !authenticated(&services, &token) {
-        return PlaylistJsonResult::err(PLAYLIST_ERR_UNAUTHORIZED);
-    }
-
-    let result = runtime().block_on(async { services.browse_playlists_handler.list(&token).await });
-
-    match result {
-        Ok(playlists) => {
-            let json = serde_json::to_string(&playlists).unwrap_or_default();
-            PlaylistJsonResult::ok(json)
+        let token = cstr_lossy(token).unwrap_or_default();
+        if !authenticated(&services, &token) {
+            return PlaylistJsonResult::err(PLAYLIST_ERR_UNAUTHORIZED);
         }
-        Err(err) => map_playlist_err(err),
-    }
+
+        let result =
+            runtime().block_on(async { services.browse_playlists_handler.list(&token).await });
+
+        match result {
+            Ok(playlists) => {
+                let json = serde_json::to_string(&playlists).unwrap_or_default();
+                PlaylistJsonResult::ok(json)
+            }
+            Err(err) => map_playlist_err(err),
+        }
+    })
 }
 
 /// Read a playlist back with its tracks, in position order (Task 6).
@@ -3591,31 +3745,33 @@ pub extern "C" fn alexandria_playlist_read(
     uuid: *const c_char,
     token: *const c_char,
 ) -> PlaylistJsonResult {
-    let services = match services_slot().lock().unwrap().clone() {
-        Some(s) => s,
-        None => return PlaylistJsonResult::err(PLAYLIST_ERR_NOT_INITIALIZED),
-    };
+    ffi_guard(PlaylistJsonResult::err(PLAYLIST_ERR_OTHER), || {
+        let services = match locked_services() {
+            Some(s) => s,
+            None => return PlaylistJsonResult::err(PLAYLIST_ERR_NOT_INITIALIZED),
+        };
 
-    let token = cstr_lossy(token).unwrap_or_default();
-    if !authenticated(&services, &token) {
-        return PlaylistJsonResult::err(PLAYLIST_ERR_UNAUTHORIZED);
-    }
-
-    let uuid = match cstr_lossy(uuid).and_then(|s| uuid::Uuid::parse_str(&s).ok()) {
-        Some(u) => u,
-        None => return PlaylistJsonResult::err(PLAYLIST_ERR_INVALID_INPUT),
-    };
-
-    let result =
-        runtime().block_on(async { services.browse_playlists_handler.read(uuid, &token).await });
-
-    match result {
-        Ok(view) => {
-            let json = serde_json::to_string(&view).unwrap_or_default();
-            PlaylistJsonResult::ok(json)
+        let token = cstr_lossy(token).unwrap_or_default();
+        if !authenticated(&services, &token) {
+            return PlaylistJsonResult::err(PLAYLIST_ERR_UNAUTHORIZED);
         }
-        Err(err) => map_playlist_err(err),
-    }
+
+        let uuid = match cstr_lossy(uuid).and_then(|s| uuid::Uuid::parse_str(&s).ok()) {
+            Some(u) => u,
+            None => return PlaylistJsonResult::err(PLAYLIST_ERR_INVALID_INPUT),
+        };
+
+        let result = runtime()
+            .block_on(async { services.browse_playlists_handler.read(uuid, &token).await });
+
+        match result {
+            Ok(view) => {
+                let json = serde_json::to_string(&view).unwrap_or_default();
+                PlaylistJsonResult::ok(json)
+            }
+            Err(err) => map_playlist_err(err),
+        }
+    })
 }
 
 /// Request body accepted by `alexandria_playlist_add_entries` — the same
@@ -3654,44 +3810,46 @@ pub extern "C" fn alexandria_playlist_add_entries(
     json_body: *const c_char,
     token: *const c_char,
 ) -> PlaylistJsonResult {
-    let services = match services_slot().lock().unwrap().clone() {
-        Some(s) => s,
-        None => return PlaylistJsonResult::err(PLAYLIST_ERR_NOT_INITIALIZED),
-    };
+    ffi_guard(PlaylistJsonResult::err(PLAYLIST_ERR_OTHER), || {
+        let services = match locked_services() {
+            Some(s) => s,
+            None => return PlaylistJsonResult::err(PLAYLIST_ERR_NOT_INITIALIZED),
+        };
 
-    let token = cstr_lossy(token).unwrap_or_default();
-    if !authenticated(&services, &token) {
-        return PlaylistJsonResult::err(PLAYLIST_ERR_UNAUTHORIZED);
-    }
-
-    let uuid = match cstr_lossy(uuid).and_then(|s| uuid::Uuid::parse_str(&s).ok()) {
-        Some(u) => u,
-        None => return PlaylistJsonResult::err(PLAYLIST_ERR_INVALID_INPUT),
-    };
-
-    let body_str = match cstr_lossy(json_body) {
-        Some(s) => s,
-        None => return PlaylistJsonResult::err(PLAYLIST_ERR_INVALID_INPUT),
-    };
-    let body = match AddEntriesToPlaylistBody::from_json_str(&body_str) {
-        Some(b) => b,
-        None => return PlaylistJsonResult::err(PLAYLIST_ERR_INVALID_INPUT),
-    };
-
-    let result = runtime().block_on(async {
-        services
-            .add_entries_handler
-            .add(uuid, &body.file_uuids, &token)
-            .await
-    });
-
-    match result {
-        Ok(entries) => {
-            let json = serde_json::to_string(&entries).unwrap_or_default();
-            PlaylistJsonResult::ok(json)
+        let token = cstr_lossy(token).unwrap_or_default();
+        if !authenticated(&services, &token) {
+            return PlaylistJsonResult::err(PLAYLIST_ERR_UNAUTHORIZED);
         }
-        Err(err) => map_playlist_err(err),
-    }
+
+        let uuid = match cstr_lossy(uuid).and_then(|s| uuid::Uuid::parse_str(&s).ok()) {
+            Some(u) => u,
+            None => return PlaylistJsonResult::err(PLAYLIST_ERR_INVALID_INPUT),
+        };
+
+        let body_str = match cstr_lossy(json_body) {
+            Some(s) => s,
+            None => return PlaylistJsonResult::err(PLAYLIST_ERR_INVALID_INPUT),
+        };
+        let body = match AddEntriesToPlaylistBody::from_json_str(&body_str) {
+            Some(b) => b,
+            None => return PlaylistJsonResult::err(PLAYLIST_ERR_INVALID_INPUT),
+        };
+
+        let result = runtime().block_on(async {
+            services
+                .add_entries_handler
+                .add(uuid, &body.file_uuids, &token)
+                .await
+        });
+
+        match result {
+            Ok(entries) => {
+                let json = serde_json::to_string(&entries).unwrap_or_default();
+                PlaylistJsonResult::ok(json)
+            }
+            Err(err) => map_playlist_err(err),
+        }
+    })
 }
 
 /// Remove one entry from a playlist, addressed by its own `entry_uuid`
@@ -3715,38 +3873,40 @@ pub extern "C" fn alexandria_playlist_remove_entry(
     entry_uuid: *const c_char,
     token: *const c_char,
 ) -> PlaylistJsonResult {
-    let services = match services_slot().lock().unwrap().clone() {
-        Some(s) => s,
-        None => return PlaylistJsonResult::err(PLAYLIST_ERR_NOT_INITIALIZED),
-    };
+    ffi_guard(PlaylistJsonResult::err(PLAYLIST_ERR_OTHER), || {
+        let services = match locked_services() {
+            Some(s) => s,
+            None => return PlaylistJsonResult::err(PLAYLIST_ERR_NOT_INITIALIZED),
+        };
 
-    let token = cstr_lossy(token).unwrap_or_default();
-    if !authenticated(&services, &token) {
-        return PlaylistJsonResult::err(PLAYLIST_ERR_UNAUTHORIZED);
-    }
+        let token = cstr_lossy(token).unwrap_or_default();
+        if !authenticated(&services, &token) {
+            return PlaylistJsonResult::err(PLAYLIST_ERR_UNAUTHORIZED);
+        }
 
-    let playlist_uuid = match cstr_lossy(playlist_uuid).and_then(|s| uuid::Uuid::parse_str(&s).ok())
-    {
-        Some(u) => u,
-        None => return PlaylistJsonResult::err(PLAYLIST_ERR_INVALID_INPUT),
-    };
+        let playlist_uuid =
+            match cstr_lossy(playlist_uuid).and_then(|s| uuid::Uuid::parse_str(&s).ok()) {
+                Some(u) => u,
+                None => return PlaylistJsonResult::err(PLAYLIST_ERR_INVALID_INPUT),
+            };
 
-    let entry_uuid = match cstr_lossy(entry_uuid).and_then(|s| uuid::Uuid::parse_str(&s).ok()) {
-        Some(u) => u,
-        None => return PlaylistJsonResult::err(PLAYLIST_ERR_INVALID_INPUT),
-    };
+        let entry_uuid = match cstr_lossy(entry_uuid).and_then(|s| uuid::Uuid::parse_str(&s).ok()) {
+            Some(u) => u,
+            None => return PlaylistJsonResult::err(PLAYLIST_ERR_INVALID_INPUT),
+        };
 
-    let result = runtime().block_on(async {
-        services
-            .remove_entry_handler
-            .remove(playlist_uuid, entry_uuid, &token)
-            .await
-    });
+        let result = runtime().block_on(async {
+            services
+                .remove_entry_handler
+                .remove(playlist_uuid, entry_uuid, &token)
+                .await
+        });
 
-    match result {
-        Ok(()) => PlaylistJsonResult::ok("{}".to_string()),
-        Err(err) => map_playlist_err(err),
-    }
+        match result {
+            Ok(()) => PlaylistJsonResult::ok("{}".to_string()),
+            Err(err) => map_playlist_err(err),
+        }
+    })
 }
 
 /// Request body accepted by `alexandria_playlist_move_entry` — the same
@@ -3787,50 +3947,52 @@ pub extern "C" fn alexandria_playlist_move_entry(
     json_body: *const c_char,
     token: *const c_char,
 ) -> PlaylistJsonResult {
-    let services = match services_slot().lock().unwrap().clone() {
-        Some(s) => s,
-        None => return PlaylistJsonResult::err(PLAYLIST_ERR_NOT_INITIALIZED),
-    };
+    ffi_guard(PlaylistJsonResult::err(PLAYLIST_ERR_OTHER), || {
+        let services = match locked_services() {
+            Some(s) => s,
+            None => return PlaylistJsonResult::err(PLAYLIST_ERR_NOT_INITIALIZED),
+        };
 
-    let token = cstr_lossy(token).unwrap_or_default();
-    if !authenticated(&services, &token) {
-        return PlaylistJsonResult::err(PLAYLIST_ERR_UNAUTHORIZED);
-    }
-
-    let playlist_uuid = match cstr_lossy(playlist_uuid).and_then(|s| uuid::Uuid::parse_str(&s).ok())
-    {
-        Some(u) => u,
-        None => return PlaylistJsonResult::err(PLAYLIST_ERR_INVALID_INPUT),
-    };
-
-    let entry_uuid = match cstr_lossy(entry_uuid).and_then(|s| uuid::Uuid::parse_str(&s).ok()) {
-        Some(u) => u,
-        None => return PlaylistJsonResult::err(PLAYLIST_ERR_INVALID_INPUT),
-    };
-
-    let body_str = match cstr_lossy(json_body) {
-        Some(s) => s,
-        None => return PlaylistJsonResult::err(PLAYLIST_ERR_INVALID_INPUT),
-    };
-    let body = match MoveEntryBody::from_json_str(&body_str) {
-        Some(b) => b,
-        None => return PlaylistJsonResult::err(PLAYLIST_ERR_INVALID_INPUT),
-    };
-
-    let result = runtime().block_on(async {
-        services
-            .reorder_playlist_handler
-            .move_entry(playlist_uuid, entry_uuid, body.to_index, &token)
-            .await
-    });
-
-    match result {
-        Ok(entries) => {
-            let json = serde_json::to_string(&entries).unwrap_or_default();
-            PlaylistJsonResult::ok(json)
+        let token = cstr_lossy(token).unwrap_or_default();
+        if !authenticated(&services, &token) {
+            return PlaylistJsonResult::err(PLAYLIST_ERR_UNAUTHORIZED);
         }
-        Err(err) => map_playlist_err(err),
-    }
+
+        let playlist_uuid =
+            match cstr_lossy(playlist_uuid).and_then(|s| uuid::Uuid::parse_str(&s).ok()) {
+                Some(u) => u,
+                None => return PlaylistJsonResult::err(PLAYLIST_ERR_INVALID_INPUT),
+            };
+
+        let entry_uuid = match cstr_lossy(entry_uuid).and_then(|s| uuid::Uuid::parse_str(&s).ok()) {
+            Some(u) => u,
+            None => return PlaylistJsonResult::err(PLAYLIST_ERR_INVALID_INPUT),
+        };
+
+        let body_str = match cstr_lossy(json_body) {
+            Some(s) => s,
+            None => return PlaylistJsonResult::err(PLAYLIST_ERR_INVALID_INPUT),
+        };
+        let body = match MoveEntryBody::from_json_str(&body_str) {
+            Some(b) => b,
+            None => return PlaylistJsonResult::err(PLAYLIST_ERR_INVALID_INPUT),
+        };
+
+        let result = runtime().block_on(async {
+            services
+                .reorder_playlist_handler
+                .move_entry(playlist_uuid, entry_uuid, body.to_index, &token)
+                .await
+        });
+
+        match result {
+            Ok(entries) => {
+                let json = serde_json::to_string(&entries).unwrap_or_default();
+                PlaylistJsonResult::ok(json)
+            }
+            Err(err) => map_playlist_err(err),
+        }
+    })
 }
 
 /// FFI status codes returned by local-auth operations (UC-34/UC-35).
@@ -3974,39 +4136,41 @@ impl LocalCredentialsBody {
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
 pub extern "C" fn alexandria_auth_local_login(json_body: *const c_char) -> AuthJsonResult {
-    let services = match services_slot().lock().unwrap().clone() {
-        Some(s) => s,
-        None => return AuthJsonResult::err(AUTH_ERR_NOT_INITIALIZED),
-    };
+    ffi_guard(AuthJsonResult::err(AUTH_ERR_OTHER), || {
+        let services = match locked_services() {
+            Some(s) => s,
+            None => return AuthJsonResult::err(AUTH_ERR_NOT_INITIALIZED),
+        };
 
-    let body_str = match cstr_lossy(json_body) {
-        Some(s) => s,
-        None => return AuthJsonResult::rejected("malformed_body", "login body is missing"),
-    };
-    let body = match LocalCredentialsBody::from_json_str(&body_str) {
-        Some(b) => b,
-        None => {
-            return AuthJsonResult::rejected(
-                "malformed_body",
-                "invalid login body: expected an object with string 'email' and 'password'",
-            )
+        let body_str = match cstr_lossy(json_body) {
+            Some(s) => s,
+            None => return AuthJsonResult::rejected("malformed_body", "login body is missing"),
+        };
+        let body = match LocalCredentialsBody::from_json_str(&body_str) {
+            Some(b) => b,
+            None => {
+                return AuthJsonResult::rejected(
+                    "malformed_body",
+                    "invalid login body: expected an object with string 'email' and 'password'",
+                )
+            }
+        };
+
+        let result = runtime().block_on(async {
+            services
+                .local_login_handler
+                .login(&body.email, &body.password)
+                .await
+        });
+
+        match result {
+            Ok(login) => {
+                let json = serde_json::to_string(&login).unwrap_or_default();
+                AuthJsonResult::ok(json)
+            }
+            Err(err) => map_auth_err(err),
         }
-    };
-
-    let result = runtime().block_on(async {
-        services
-            .local_login_handler
-            .login(&body.email, &body.password)
-            .await
-    });
-
-    match result {
-        Ok(login) => {
-            let json = serde_json::to_string(&login).unwrap_or_default();
-            AuthJsonResult::ok(json)
-        }
-        Err(err) => map_auth_err(err),
-    }
+    })
 }
 
 /// Windows login (UC-45 / FR-AU-20, FR-AU-22): open a session for the
@@ -4019,20 +4183,22 @@ pub extern "C" fn alexandria_auth_local_login(json_body: *const c_char) -> AuthJ
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
 pub extern "C" fn alexandria_auth_windows_login(_json_body: *const c_char) -> AuthJsonResult {
-    let services = match services_slot().lock().unwrap().clone() {
-        Some(s) => s,
-        None => return AuthJsonResult::err(AUTH_ERR_NOT_INITIALIZED),
-    };
+    ffi_guard(AuthJsonResult::err(AUTH_ERR_OTHER), || {
+        let services = match locked_services() {
+            Some(s) => s,
+            None => return AuthJsonResult::err(AUTH_ERR_NOT_INITIALIZED),
+        };
 
-    let result = runtime().block_on(async { services.windows_login_handler.login().await });
+        let result = runtime().block_on(async { services.windows_login_handler.login().await });
 
-    match result {
-        Ok(login) => {
-            let json = serde_json::to_string(&login).unwrap_or_default();
-            AuthJsonResult::ok(json)
+        match result {
+            Ok(login) => {
+                let json = serde_json::to_string(&login).unwrap_or_default();
+                AuthJsonResult::ok(json)
+            }
+            Err(err) => map_auth_err(err),
         }
-        Err(err) => map_auth_err(err),
-    }
+    })
 }
 
 /// Set or change local-login credentials (UC-35 / FR-AU-05, FR-AU-06).
@@ -4045,19 +4211,21 @@ pub extern "C" fn alexandria_auth_local_set_credentials(
     json_body: *const c_char,
     token: *const c_char,
 ) -> AuthJsonResult {
-    let services = match services_slot().lock().unwrap().clone() {
-        Some(s) => s,
-        None => return AuthJsonResult::err(AUTH_ERR_NOT_INITIALIZED),
-    };
+    ffi_guard(AuthJsonResult::err(AUTH_ERR_OTHER), || {
+        let services = match locked_services() {
+            Some(s) => s,
+            None => return AuthJsonResult::err(AUTH_ERR_NOT_INITIALIZED),
+        };
 
-    let token = cstr_lossy(token).unwrap_or_default();
+        let token = cstr_lossy(token).unwrap_or_default();
 
-    let body_str = match cstr_lossy(json_body) {
-        Some(s) => s,
-        None => return AuthJsonResult::rejected("malformed_body", "credentials body is missing"),
-    };
-    let body =
-        match LocalCredentialsBody::from_json_str(&body_str) {
+        let body_str = match cstr_lossy(json_body) {
+            Some(s) => s,
+            None => {
+                return AuthJsonResult::rejected("malformed_body", "credentials body is missing")
+            }
+        };
+        let body = match LocalCredentialsBody::from_json_str(&body_str) {
             Some(b) => b,
             None => return AuthJsonResult::rejected(
                 "malformed_body",
@@ -4065,20 +4233,21 @@ pub extern "C" fn alexandria_auth_local_set_credentials(
             ),
         };
 
-    let result = runtime().block_on(async {
-        services
-            .set_local_credentials_handler
-            .set(body.email, body.password, &token)
-            .await
-    });
+        let result = runtime().block_on(async {
+            services
+                .set_local_credentials_handler
+                .set(body.email, body.password, &token)
+                .await
+        });
 
-    match result {
-        Ok(credentials) => {
-            let json = serde_json::to_string(&credentials).unwrap_or_default();
-            AuthJsonResult::ok(json)
+        match result {
+            Ok(credentials) => {
+                let json = serde_json::to_string(&credentials).unwrap_or_default();
+                AuthJsonResult::ok(json)
+            }
+            Err(err) => map_auth_err(err),
         }
-        Err(err) => map_auth_err(err),
-    }
+    })
 }
 
 /// Request body for `alexandria_auth_local_register` — the same JSON the
@@ -4114,39 +4283,41 @@ impl LocalRegisterBody {
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
 pub extern "C" fn alexandria_auth_local_register(json_body: *const c_char) -> AuthJsonResult {
-    let services = match services_slot().lock().unwrap().clone() {
-        Some(s) => s,
-        None => return AuthJsonResult::err(AUTH_ERR_NOT_INITIALIZED),
-    };
+    ffi_guard(AuthJsonResult::err(AUTH_ERR_OTHER), || {
+        let services = match locked_services() {
+            Some(s) => s,
+            None => return AuthJsonResult::err(AUTH_ERR_NOT_INITIALIZED),
+        };
 
-    let body_str = match cstr_lossy(json_body) {
-        Some(s) => s,
-        None => return AuthJsonResult::rejected("malformed_body", "register body is missing"),
-    };
-    let body = match LocalRegisterBody::from_json_str(&body_str) {
-        Some(b) => b,
-        None => {
-            return AuthJsonResult::rejected(
-                "malformed_body",
-                "invalid register body: expected an object with string 'email', 'password', and 'passwordConfirmation'",
-            )
+        let body_str = match cstr_lossy(json_body) {
+            Some(s) => s,
+            None => return AuthJsonResult::rejected("malformed_body", "register body is missing"),
+        };
+        let body = match LocalRegisterBody::from_json_str(&body_str) {
+            Some(b) => b,
+            None => {
+                return AuthJsonResult::rejected(
+                    "malformed_body",
+                    "invalid register body: expected an object with string 'email', 'password', and 'passwordConfirmation'",
+                )
+            }
+        };
+
+        let result = runtime().block_on(async {
+            services
+                .register_local_account_handler
+                .register(body.email, body.password, body.password_confirmation)
+                .await
+        });
+
+        match result {
+            Ok(registration) => {
+                let json = serde_json::to_string(&registration).unwrap_or_default();
+                AuthJsonResult::ok(json)
+            }
+            Err(err) => map_auth_err(err),
         }
-    };
-
-    let result = runtime().block_on(async {
-        services
-            .register_local_account_handler
-            .register(body.email, body.password, body.password_confirmation)
-            .await
-    });
-
-    match result {
-        Ok(registration) => {
-            let json = serde_json::to_string(&registration).unwrap_or_default();
-            AuthJsonResult::ok(json)
-        }
-        Err(err) => map_auth_err(err),
-    }
+    })
 }
 
 /// Report the authenticated owner's account state (FR-AU-18): the same body
@@ -4157,22 +4328,25 @@ pub extern "C" fn alexandria_auth_local_register(json_body: *const c_char) -> Au
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
 pub extern "C" fn alexandria_auth_local_account(token: *const c_char) -> AuthJsonResult {
-    let services = match services_slot().lock().unwrap().clone() {
-        Some(s) => s,
-        None => return AuthJsonResult::err(AUTH_ERR_NOT_INITIALIZED),
-    };
+    ffi_guard(AuthJsonResult::err(AUTH_ERR_OTHER), || {
+        let services = match locked_services() {
+            Some(s) => s,
+            None => return AuthJsonResult::err(AUTH_ERR_NOT_INITIALIZED),
+        };
 
-    let token = cstr_lossy(token).unwrap_or_default();
+        let token = cstr_lossy(token).unwrap_or_default();
 
-    let result = runtime().block_on(async { services.get_local_account_handler.get(&token).await });
+        let result =
+            runtime().block_on(async { services.get_local_account_handler.get(&token).await });
 
-    match result {
-        Ok(account) => {
-            let json = serde_json::to_string(&account).unwrap_or_default();
-            AuthJsonResult::ok(json)
+        match result {
+            Ok(account) => {
+                let json = serde_json::to_string(&account).unwrap_or_default();
+                AuthJsonResult::ok(json)
+            }
+            Err(err) => map_auth_err(err),
         }
-        Err(err) => map_auth_err(err),
-    }
+    })
 }
 
 /// Request body for `alexandria_auth_local_redeem_recovery_code` — the same
@@ -4208,41 +4382,46 @@ impl RedeemRecoveryCodeBody {
 pub extern "C" fn alexandria_auth_local_redeem_recovery_code(
     json_body: *const c_char,
 ) -> AuthJsonResult {
-    let services = match services_slot().lock().unwrap().clone() {
-        Some(s) => s,
-        None => return AuthJsonResult::err(AUTH_ERR_NOT_INITIALIZED),
-    };
+    ffi_guard(AuthJsonResult::err(AUTH_ERR_OTHER), || {
+        let services = match locked_services() {
+            Some(s) => s,
+            None => return AuthJsonResult::err(AUTH_ERR_NOT_INITIALIZED),
+        };
 
-    let body_str = match cstr_lossy(json_body) {
-        Some(s) => s,
-        None => {
-            return AuthJsonResult::rejected("malformed_body", "recovery redeem body is missing")
-        }
-    };
-    let body = match RedeemRecoveryCodeBody::from_json_str(&body_str) {
-        Some(b) => b,
-        None => {
-            return AuthJsonResult::rejected(
-                "malformed_body",
-                "invalid recovery redeem body: expected an object with string 'code', 'newPassword', and 'passwordConfirmation'",
-            )
-        }
-    };
+        let body_str = match cstr_lossy(json_body) {
+            Some(s) => s,
+            None => {
+                return AuthJsonResult::rejected(
+                    "malformed_body",
+                    "recovery redeem body is missing",
+                )
+            }
+        };
+        let body = match RedeemRecoveryCodeBody::from_json_str(&body_str) {
+            Some(b) => b,
+            None => {
+                return AuthJsonResult::rejected(
+                    "malformed_body",
+                    "invalid recovery redeem body: expected an object with string 'code', 'newPassword', and 'passwordConfirmation'",
+                )
+            }
+        };
 
-    let result = runtime().block_on(async {
-        services
-            .redeem_recovery_code_handler
-            .redeem(body.code, body.new_password, body.password_confirmation)
-            .await
-    });
+        let result = runtime().block_on(async {
+            services
+                .redeem_recovery_code_handler
+                .redeem(body.code, body.new_password, body.password_confirmation)
+                .await
+        });
 
-    match result {
-        Ok(redemption) => {
-            let json = serde_json::to_string(&redemption).unwrap_or_default();
-            AuthJsonResult::ok(json)
+        match result {
+            Ok(redemption) => {
+                let json = serde_json::to_string(&redemption).unwrap_or_default();
+                AuthJsonResult::ok(json)
+            }
+            Err(err) => map_auth_err(err),
         }
-        Err(err) => map_auth_err(err),
-    }
+    })
 }
 
 /// Replace the owner's recovery codes with a fresh set of ten (UC-44 /
@@ -4254,27 +4433,29 @@ pub extern "C" fn alexandria_auth_local_redeem_recovery_code(
 pub extern "C" fn alexandria_auth_local_regenerate_recovery_codes(
     token: *const c_char,
 ) -> AuthJsonResult {
-    let services = match services_slot().lock().unwrap().clone() {
-        Some(s) => s,
-        None => return AuthJsonResult::err(AUTH_ERR_NOT_INITIALIZED),
-    };
+    ffi_guard(AuthJsonResult::err(AUTH_ERR_OTHER), || {
+        let services = match locked_services() {
+            Some(s) => s,
+            None => return AuthJsonResult::err(AUTH_ERR_NOT_INITIALIZED),
+        };
 
-    let token = cstr_lossy(token).unwrap_or_default();
+        let token = cstr_lossy(token).unwrap_or_default();
 
-    let result = runtime().block_on(async {
-        services
-            .regenerate_recovery_codes_handler
-            .regenerate(&token)
-            .await
-    });
+        let result = runtime().block_on(async {
+            services
+                .regenerate_recovery_codes_handler
+                .regenerate(&token)
+                .await
+        });
 
-    match result {
-        Ok(regeneration) => {
-            let json = serde_json::to_string(&regeneration).unwrap_or_default();
-            AuthJsonResult::ok(json)
+        match result {
+            Ok(regeneration) => {
+                let json = serde_json::to_string(&regeneration).unwrap_or_default();
+                AuthJsonResult::ok(json)
+            }
+            Err(err) => map_auth_err(err),
         }
-        Err(err) => map_auth_err(err),
-    }
+    })
 }
 
 /// FFI status codes returned by the settings read (UC-47 / FR-FC-30).
@@ -4329,25 +4510,27 @@ impl SettingsJsonResult {
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
 pub extern "C" fn alexandria_settings_json(token: *const c_char) -> SettingsJsonResult {
-    let services = match services_slot().lock().unwrap().clone() {
-        Some(s) => s,
-        None => return SettingsJsonResult::err(SETTINGS_ERR_NOT_INITIALIZED),
-    };
+    ffi_guard(SettingsJsonResult::err(SETTINGS_ERR_OTHER), || {
+        let services = match locked_services() {
+            Some(s) => s,
+            None => return SettingsJsonResult::err(SETTINGS_ERR_NOT_INITIALIZED),
+        };
 
-    let token = cstr_lossy(token).unwrap_or_default();
+        let token = cstr_lossy(token).unwrap_or_default();
 
-    let result = runtime().block_on(async { services.get_settings_handler.get(&token).await });
+        let result = runtime().block_on(async { services.get_settings_handler.get(&token).await });
 
-    match result {
-        Ok(settings) => {
-            let json = serde_json::to_string(&settings).unwrap_or_default();
-            SettingsJsonResult::ok(json)
+        match result {
+            Ok(settings) => {
+                let json = serde_json::to_string(&settings).unwrap_or_default();
+                SettingsJsonResult::ok(json)
+            }
+            // AF-01 is the only failure this read has: it reads a value the
+            // process already holds, so there is nothing else to go wrong.
+            Err(DomainError::Unauthorized) => SettingsJsonResult::err(SETTINGS_ERR_UNAUTHORIZED),
+            Err(_) => SettingsJsonResult::err(SETTINGS_ERR_OTHER),
         }
-        // AF-01 is the only failure this read has: it reads a value the
-        // process already holds, so there is nothing else to go wrong.
-        Err(DomainError::Unauthorized) => SettingsJsonResult::err(SETTINGS_ERR_UNAUTHORIZED),
-        Err(_) => SettingsJsonResult::err(SETTINGS_ERR_OTHER),
-    }
+    })
 }
 
 /// FFI status codes returned by run-status operations (UC-42, UC-48 / FR-FC-28, FR-FC-32 … FR-FC-35).
@@ -4434,36 +4617,38 @@ pub extern "C" fn alexandria_index_run_status_json(
     run_id: *const c_char,
     token: *const c_char,
 ) -> RunJsonResult {
-    let services = match services_slot().lock().unwrap().clone() {
-        Some(s) => s,
-        None => return RunJsonResult::err(RUN_ERR_NOT_INITIALIZED),
-    };
+    ffi_guard(RunJsonResult::err(RUN_ERR_OTHER), || {
+        let services = match locked_services() {
+            Some(s) => s,
+            None => return RunJsonResult::err(RUN_ERR_NOT_INITIALIZED),
+        };
 
-    // Deny before touching the payload — an unauthenticated caller must
-    // not learn whether its run id would have parsed.
-    let token = cstr_lossy(token).unwrap_or_default();
-    if !authenticated(&services, &token) {
-        return RunJsonResult::err(RUN_ERR_UNAUTHORIZED);
-    }
-
-    let raw = match cstr_lossy(run_id) {
-        Some(s) => s,
-        None => return RunJsonResult::err(RUN_ERR_INVALID_INPUT),
-    };
-    let Ok(run_id) = uuid::Uuid::parse_str(raw.trim()) else {
-        return RunJsonResult::err(RUN_ERR_INVALID_INPUT);
-    };
-
-    let result =
-        runtime().block_on(async { services.get_run_status_handler.get(run_id, &token).await });
-
-    match result {
-        Ok(run) => {
-            let json = serde_json::to_string(&run).unwrap_or_default();
-            RunJsonResult::ok(json)
+        // Deny before touching the payload — an unauthenticated caller must
+        // not learn whether its run id would have parsed.
+        let token = cstr_lossy(token).unwrap_or_default();
+        if !authenticated(&services, &token) {
+            return RunJsonResult::err(RUN_ERR_UNAUTHORIZED);
         }
-        Err(err) => map_run_err(err),
-    }
+
+        let raw = match cstr_lossy(run_id) {
+            Some(s) => s,
+            None => return RunJsonResult::err(RUN_ERR_INVALID_INPUT),
+        };
+        let Ok(run_id) = uuid::Uuid::parse_str(raw.trim()) else {
+            return RunJsonResult::err(RUN_ERR_INVALID_INPUT);
+        };
+
+        let result =
+            runtime().block_on(async { services.get_run_status_handler.get(run_id, &token).await });
+
+        match result {
+            Ok(run) => {
+                let json = serde_json::to_string(&run).unwrap_or_default();
+                RunJsonResult::ok(json)
+            }
+            Err(err) => map_run_err(err),
+        }
+    })
 }
 
 /// The files a run could not record, oldest first (FR-FC-42). `run_id` is
@@ -4485,38 +4670,44 @@ pub extern "C" fn alexandria_index_run_failures_json(
     run_id: *const c_char,
     token: *const c_char,
 ) -> RunJsonResult {
-    let services = match services_slot().lock().unwrap().clone() {
-        Some(s) => s,
-        None => return RunJsonResult::err(RUN_ERR_NOT_INITIALIZED),
-    };
+    ffi_guard(RunJsonResult::err(RUN_ERR_OTHER), || {
+        let services = match locked_services() {
+            Some(s) => s,
+            None => return RunJsonResult::err(RUN_ERR_NOT_INITIALIZED),
+        };
 
-    let token = cstr_lossy(token).unwrap_or_default();
-    if !authenticated(&services, &token) {
-        return RunJsonResult::err(RUN_ERR_UNAUTHORIZED);
-    }
-
-    let raw = match cstr_lossy(run_id) {
-        Some(s) => s,
-        None => return RunJsonResult::err(RUN_ERR_INVALID_INPUT),
-    };
-    let Ok(run_id) = uuid::Uuid::parse_str(raw.trim()) else {
-        return RunJsonResult::err(RUN_ERR_INVALID_INPUT);
-    };
-
-    let result = runtime().block_on(async {
-        services
-            .get_run_status_handler
-            .failures(run_id, &token)
-            .await
-    });
-
-    match result {
-        Ok(failures) => {
-            let json = serde_json::to_string(&failures).unwrap_or_else(|_| "[]".to_string());
-            RunJsonResult::ok(json)
+        let token = cstr_lossy(token).unwrap_or_default();
+        if !authenticated(&services, &token) {
+            return RunJsonResult::err(RUN_ERR_UNAUTHORIZED);
         }
-        Err(err) => map_run_err(err),
-    }
+
+        let raw = match cstr_lossy(run_id) {
+            Some(s) => s,
+            None => return RunJsonResult::err(RUN_ERR_INVALID_INPUT),
+        };
+        let Ok(run_id) = uuid::Uuid::parse_str(raw.trim()) else {
+            return RunJsonResult::err(RUN_ERR_INVALID_INPUT);
+        };
+
+        let result = runtime().block_on(async {
+            services
+                .get_run_status_handler
+                .failures(run_id, &token)
+                .await
+        });
+
+        match result {
+            // Reported rather than answered as `[]`. An empty array here is a
+            // clean scan — the one thing this call exists to distinguish from a
+            // scan that dropped files — so a body that could not be built must
+            // not be spelled the same way as a run that had nothing to report.
+            Ok(failures) => match serde_json::to_string(&failures) {
+                Ok(json) => RunJsonResult::ok(json),
+                Err(_) => RunJsonResult::err(RUN_ERR_OTHER),
+            },
+            Err(err) => map_run_err(err),
+        }
+    })
 }
 
 /// Pause a running index or re-index run where it stands, leaving it
@@ -4534,30 +4725,33 @@ pub extern "C" fn alexandria_index_run_failures_json(
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
 pub extern "C" fn alexandria_index_pause(run_id: *const c_char, token: *const c_char) -> c_int {
-    let services = match services_slot().lock().unwrap().clone() {
-        Some(s) => s,
-        None => return RUN_ERR_NOT_INITIALIZED,
-    };
+    ffi_guard(RUN_ERR_OTHER, || {
+        let services = match locked_services() {
+            Some(s) => s,
+            None => return RUN_ERR_NOT_INITIALIZED,
+        };
 
-    // Deny before touching the payload — an unauthenticated caller must
-    // not learn whether its run id would have parsed.
-    let token = cstr_lossy(token).unwrap_or_default();
-    if !authenticated(&services, &token) {
-        return RUN_ERR_UNAUTHORIZED;
-    }
+        // Deny before touching the payload — an unauthenticated caller must
+        // not learn whether its run id would have parsed.
+        let token = cstr_lossy(token).unwrap_or_default();
+        if !authenticated(&services, &token) {
+            return RUN_ERR_UNAUTHORIZED;
+        }
 
-    let raw = match cstr_lossy(run_id) {
-        Some(s) => s,
-        None => return RUN_ERR_INVALID_INPUT,
-    };
-    let Ok(run_id) = uuid::Uuid::parse_str(raw.trim()) else {
-        return RUN_ERR_INVALID_INPUT;
-    };
+        let raw = match cstr_lossy(run_id) {
+            Some(s) => s,
+            None => return RUN_ERR_INVALID_INPUT,
+        };
+        let Ok(run_id) = uuid::Uuid::parse_str(raw.trim()) else {
+            return RUN_ERR_INVALID_INPUT;
+        };
 
-    match runtime().block_on(async { services.run_control_handler.pause(run_id, &token).await }) {
-        Ok(()) => RUN_OK,
-        Err(err) => map_run_err_code(err),
-    }
+        match runtime().block_on(async { services.run_control_handler.pause(run_id, &token).await })
+        {
+            Ok(()) => RUN_OK,
+            Err(err) => map_run_err_code(err),
+        }
+    })
 }
 
 /// Abandon a running or paused index or re-index run (UC-48 / FR-FC-34).
@@ -4574,30 +4768,34 @@ pub extern "C" fn alexandria_index_pause(run_id: *const c_char, token: *const c_
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
 pub extern "C" fn alexandria_index_cancel(run_id: *const c_char, token: *const c_char) -> c_int {
-    let services = match services_slot().lock().unwrap().clone() {
-        Some(s) => s,
-        None => return RUN_ERR_NOT_INITIALIZED,
-    };
+    ffi_guard(RUN_ERR_OTHER, || {
+        let services = match locked_services() {
+            Some(s) => s,
+            None => return RUN_ERR_NOT_INITIALIZED,
+        };
 
-    // Deny before touching the payload — an unauthenticated caller must
-    // not learn whether its run id would have parsed.
-    let token = cstr_lossy(token).unwrap_or_default();
-    if !authenticated(&services, &token) {
-        return RUN_ERR_UNAUTHORIZED;
-    }
+        // Deny before touching the payload — an unauthenticated caller must
+        // not learn whether its run id would have parsed.
+        let token = cstr_lossy(token).unwrap_or_default();
+        if !authenticated(&services, &token) {
+            return RUN_ERR_UNAUTHORIZED;
+        }
 
-    let raw = match cstr_lossy(run_id) {
-        Some(s) => s,
-        None => return RUN_ERR_INVALID_INPUT,
-    };
-    let Ok(run_id) = uuid::Uuid::parse_str(raw.trim()) else {
-        return RUN_ERR_INVALID_INPUT;
-    };
+        let raw = match cstr_lossy(run_id) {
+            Some(s) => s,
+            None => return RUN_ERR_INVALID_INPUT,
+        };
+        let Ok(run_id) = uuid::Uuid::parse_str(raw.trim()) else {
+            return RUN_ERR_INVALID_INPUT;
+        };
 
-    match runtime().block_on(async { services.run_control_handler.cancel(run_id, &token).await }) {
-        Ok(()) => RUN_OK,
-        Err(err) => map_run_err_code(err),
-    }
+        match runtime()
+            .block_on(async { services.run_control_handler.cancel(run_id, &token).await })
+        {
+            Ok(()) => RUN_OK,
+            Err(err) => map_run_err_code(err),
+        }
+    })
 }
 
 /// Put a paused index or re-index run back to work (UC-48 / FR-FC-33).
@@ -4642,82 +4840,84 @@ pub extern "C" fn alexandria_index_resume(
     token: *const c_char,
     priority: *const c_char,
 ) -> IndexStartResult {
-    let services = match services_slot().lock().unwrap().clone() {
-        Some(s) => s,
-        None => return IndexStartResult::err(RUN_ERR_NOT_INITIALIZED),
-    };
+    ffi_guard(IndexStartResult::err(RUN_ERR_OTHER), || {
+        let services = match locked_services() {
+            Some(s) => s,
+            None => return IndexStartResult::err(RUN_ERR_NOT_INITIALIZED),
+        };
 
-    // Deny before touching the payload — an unauthenticated caller must
-    // not learn whether its run id would have parsed.
-    let token = cstr_lossy(token).unwrap_or_default();
-    if !authenticated(&services, &token) {
-        return IndexStartResult::err(RUN_ERR_UNAUTHORIZED);
-    }
-
-    let raw = match cstr_lossy(run_id) {
-        Some(s) => s,
-        None => return IndexStartResult::err(RUN_ERR_INVALID_INPUT),
-    };
-    let Ok(run_id) = uuid::Uuid::parse_str(raw.trim()) else {
-        return IndexStartResult::err(RUN_ERR_INVALID_INPUT);
-    };
-
-    let priority = parse_resume_priority(cstr_lossy(priority));
-
-    let rt = runtime();
-    let resumed = match rt.block_on(async {
-        services
-            .run_control_handler
-            .resume(run_id, &token, priority)
-            .await
-    }) {
-        Ok(resumed) => resumed,
-        Err(err) => return IndexStartResult::err(map_run_err_code(err)),
-    };
-
-    match resumed.kind {
-        RunKind::Index => {
-            let root = match resumed.root {
-                Some(root) => root,
-                None => {
-                    // Every row `RunKind::Index` writes carries a root
-                    // (`start` requires one); reaching this means the stored
-                    // row and its kind have drifted apart. Fail loudly rather
-                    // than resume nothing and tell the caller it worked.
-                    tracing::error!(
-                        run_id = %resumed.run_id,
-                        "resumed index run has no stored root; refusing to spawn"
-                    );
-                    return IndexStartResult::err(RUN_ERR_OTHER);
-                }
-            };
-            let handler = services.index_handler.clone();
-            // The run's own scope, off its row (FR-FC-01): a resumed segment
-            // walks the file types the run was started with, not every type.
-            let scope = resumed.scope;
-            let spawned_run_id = resumed.run_id;
-            rt.spawn(async move {
-                // Same shape as `alexandria_index_start`'s own spawn: an
-                // `Err` here means the run could not resume at all;
-                // `execute` has already written its own terminal row on that
-                // path (UC-48), so the failure is recorded, not lost.
-                if let Err(err) = handler.execute(&root, spawned_run_id, &scope).await {
-                    tracing::error!(run_id = %spawned_run_id, error = %err, "resumed index run aborted");
-                }
-            });
+        // Deny before touching the payload — an unauthenticated caller must
+        // not learn whether its run id would have parsed.
+        let token = cstr_lossy(token).unwrap_or_default();
+        if !authenticated(&services, &token) {
+            return IndexStartResult::err(RUN_ERR_UNAUTHORIZED);
         }
-        RunKind::Refresh => {
-            let handler = services.refresh_handler.clone();
-            let spawned_run_id = resumed.run_id;
-            rt.spawn(async move {
-                if let Err(err) = handler.execute(spawned_run_id).await {
-                    tracing::error!(run_id = %spawned_run_id, error = %err, "resumed re-index run aborted");
-                }
-            });
-        }
-    }
 
-    IndexStartResult::ok(&resumed.run_id.to_string())
+        let raw = match cstr_lossy(run_id) {
+            Some(s) => s,
+            None => return IndexStartResult::err(RUN_ERR_INVALID_INPUT),
+        };
+        let Ok(run_id) = uuid::Uuid::parse_str(raw.trim()) else {
+            return IndexStartResult::err(RUN_ERR_INVALID_INPUT);
+        };
+
+        let priority = parse_resume_priority(cstr_lossy(priority));
+
+        let rt = runtime();
+        let resumed = match rt.block_on(async {
+            services
+                .run_control_handler
+                .resume(run_id, &token, priority)
+                .await
+        }) {
+            Ok(resumed) => resumed,
+            Err(err) => return IndexStartResult::err(map_run_err_code(err)),
+        };
+
+        match resumed.kind {
+            RunKind::Index => {
+                let root = match resumed.root {
+                    Some(root) => root,
+                    None => {
+                        // Every row `RunKind::Index` writes carries a root
+                        // (`start` requires one); reaching this means the stored
+                        // row and its kind have drifted apart. Fail loudly rather
+                        // than resume nothing and tell the caller it worked.
+                        tracing::error!(
+                            run_id = %resumed.run_id,
+                            "resumed index run has no stored root; refusing to spawn"
+                        );
+                        return IndexStartResult::err(RUN_ERR_OTHER);
+                    }
+                };
+                let handler = services.index_handler.clone();
+                // The run's own scope, off its row (FR-FC-01): a resumed segment
+                // walks the file types the run was started with, not every type.
+                let scope = resumed.scope;
+                let spawned_run_id = resumed.run_id;
+                rt.spawn(async move {
+                    // Same shape as `alexandria_index_start`'s own spawn: an
+                    // `Err` here means the run could not resume at all;
+                    // `execute` has already written its own terminal row on that
+                    // path (UC-48), so the failure is recorded, not lost.
+                    if let Err(err) = handler.execute(&root, spawned_run_id, &scope).await {
+                        tracing::error!(run_id = %spawned_run_id, error = %err, "resumed index run aborted");
+                    }
+                });
+            }
+            RunKind::Refresh => {
+                let handler = services.refresh_handler.clone();
+                let spawned_run_id = resumed.run_id;
+                rt.spawn(async move {
+                    if let Err(err) = handler.execute(spawned_run_id).await {
+                        tracing::error!(run_id = %spawned_run_id, error = %err, "resumed re-index run aborted");
+                    }
+                });
+            }
+        }
+
+        IndexStartResult::ok(&resumed.run_id.to_string())
+    })
 }
 
 /// Every outstanding (`running` or `paused`) index and re-index run at once,
@@ -4735,27 +4935,30 @@ pub extern "C" fn alexandria_index_resume(
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
 pub extern "C" fn alexandria_index_runs_active_json(token: *const c_char) -> RunJsonResult {
-    let services = match services_slot().lock().unwrap().clone() {
-        Some(s) => s,
-        None => return RunJsonResult::err(RUN_ERR_NOT_INITIALIZED),
-    };
+    ffi_guard(RunJsonResult::err(RUN_ERR_OTHER), || {
+        let services = match locked_services() {
+            Some(s) => s,
+            None => return RunJsonResult::err(RUN_ERR_NOT_INITIALIZED),
+        };
 
-    // Deny before touching the payload, same as every other run-control call
-    // in this section.
-    let token = cstr_lossy(token).unwrap_or_default();
-    if !authenticated(&services, &token) {
-        return RunJsonResult::err(RUN_ERR_UNAUTHORIZED);
-    }
-
-    let result = runtime().block_on(async { services.get_active_runs_handler.list(&token).await });
-
-    match result {
-        Ok(runs) => {
-            let json = serde_json::to_string(&runs).unwrap_or_default();
-            RunJsonResult::ok(json)
+        // Deny before touching the payload, same as every other run-control call
+        // in this section.
+        let token = cstr_lossy(token).unwrap_or_default();
+        if !authenticated(&services, &token) {
+            return RunJsonResult::err(RUN_ERR_UNAUTHORIZED);
         }
-        Err(err) => map_run_err(err),
-    }
+
+        let result =
+            runtime().block_on(async { services.get_active_runs_handler.list(&token).await });
+
+        match result {
+            Ok(runs) => {
+                let json = serde_json::to_string(&runs).unwrap_or_default();
+                RunJsonResult::ok(json)
+            }
+            Err(err) => map_run_err(err),
+        }
+    })
 }
 
 /// Free a string previously returned by an FFI accessor.
@@ -4790,6 +4993,59 @@ mod tests {
     // surface is the key being read. Unit-tested here, where the parse is,
     // rather than through a call that would prove the same thing at the cost
     // of a database.
+
+    /// The boundary itself: a panic inside a guarded body must reach the
+    /// caller as the family's status code, not as an unwind that ends the
+    /// embedder's process.
+    #[test]
+    fn given_a_body_that_panics_when_it_is_guarded_then_the_caller_gets_the_status() {
+        let answered = ffi_guard(FILE_ERR_OTHER, || panic!("a decoder gave up"));
+
+        assert_eq!(answered, FILE_ERR_OTHER);
+    }
+
+    /// The struct-returning half of the same contract: a `json` of NULL and a
+    /// status, which is what every failure on those calls already looks like.
+    #[test]
+    fn given_a_body_that_panics_when_it_returns_a_struct_then_json_is_null() {
+        let answered = ffi_guard(FileJsonResult::err(FILE_ERR_OTHER), || {
+            panic!("a decoder gave up")
+        });
+
+        assert_eq!(answered.status, FILE_ERR_OTHER);
+        assert!(answered.json.is_null());
+    }
+
+    /// A guard that swallowed the ordinary answer would be worse than no
+    /// guard at all.
+    #[test]
+    fn given_a_body_that_returns_when_it_is_guarded_then_its_answer_is_passed_through() {
+        let answered = ffi_guard(FILE_ERR_OTHER, || FILE_OK);
+
+        assert_eq!(answered, FILE_OK);
+    }
+
+    /// One panic must not cost every later call. The services lock is read
+    /// through `locked_services`, which ignores poisoning — without that, a
+    /// caught panic taken while the lock was held would leave every
+    /// subsequent call unwrapping a poisoned mutex for the life of the
+    /// process, which is the outcome the guard exists to prevent.
+    #[test]
+    fn given_the_services_lock_is_poisoned_when_it_is_read_then_it_still_answers() {
+        let lock = services_slot();
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = lock.lock().unwrap();
+            panic!("while holding the lock");
+        }));
+        assert!(
+            poisoned.is_err(),
+            "the test did not actually poison the lock"
+        );
+        assert!(lock.is_poisoned());
+
+        // The point: this reads rather than panicking a second time.
+        let _ = locked_services();
+    }
 
     #[test]
     fn given_include_libraries_true_when_the_filter_is_parsed_then_it_reaches_in() {
@@ -5017,37 +5273,39 @@ pub extern "C" fn alexandria_enrichment_run(
     scope_json: *const c_char,
     token: *const c_char,
 ) -> EnrichmentJsonResult {
-    let services = match services_slot().lock().unwrap().clone() {
-        Some(s) => s,
-        None => return EnrichmentJsonResult::err(ENRICHMENT_ERR_NOT_INITIALIZED),
-    };
+    ffi_guard(EnrichmentJsonResult::err(ENRICHMENT_ERR_OTHER), || {
+        let services = match locked_services() {
+            Some(s) => s,
+            None => return EnrichmentJsonResult::err(ENRICHMENT_ERR_NOT_INITIALIZED),
+        };
 
-    let token = cstr_lossy(token).unwrap_or_default();
-    if !authenticated(&services, &token) {
-        return EnrichmentJsonResult::err(ENRICHMENT_ERR_UNAUTHORIZED);
-    }
-
-    let scope = match enrichment_scope_from_json(scope_json) {
-        Some(scope) => scope,
-        None => return EnrichmentJsonResult::err(ENRICHMENT_ERR_INVALID_INPUT),
-    };
-
-    // Absent for the same reason the HTTP route answers a conflict: the
-    // capability is real, this installation has not turned it on.
-    let handler = match services.enrich_handler.clone() {
-        Some(handler) => handler,
-        None => return EnrichmentJsonResult::err(ENRICHMENT_ERR_UNAVAILABLE),
-    };
-
-    let result = runtime().block_on(async { handler.enrich(scope, &token).await });
-
-    match result {
-        Ok(report) => {
-            let json = serde_json::to_string(&report).unwrap_or_default();
-            EnrichmentJsonResult::ok(json)
+        let token = cstr_lossy(token).unwrap_or_default();
+        if !authenticated(&services, &token) {
+            return EnrichmentJsonResult::err(ENRICHMENT_ERR_UNAUTHORIZED);
         }
-        Err(err) => map_enrichment_err(err),
-    }
+
+        let scope = match enrichment_scope_from_json(scope_json) {
+            Some(scope) => scope,
+            None => return EnrichmentJsonResult::err(ENRICHMENT_ERR_INVALID_INPUT),
+        };
+
+        // Absent for the same reason the HTTP route answers a conflict: the
+        // capability is real, this installation has not turned it on.
+        let handler = match services.enrich_handler.clone() {
+            Some(handler) => handler,
+            None => return EnrichmentJsonResult::err(ENRICHMENT_ERR_UNAVAILABLE),
+        };
+
+        let result = runtime().block_on(async { handler.enrich(scope, &token).await });
+
+        match result {
+            Ok(report) => {
+                let json = serde_json::to_string(&report).unwrap_or_default();
+                EnrichmentJsonResult::ok(json)
+            }
+            Err(err) => map_enrichment_err(err),
+        }
+    })
 }
 
 /// The scope a body names, or `None` when the body is present but unusable.
@@ -5108,36 +5366,38 @@ pub extern "C" fn alexandria_enrichment_read_track(
     artist: *const c_char,
     token: *const c_char,
 ) -> EnrichmentJsonResult {
-    let services = match services_slot().lock().unwrap().clone() {
-        Some(s) => s,
-        None => return EnrichmentJsonResult::err(ENRICHMENT_ERR_NOT_INITIALIZED),
-    };
+    ffi_guard(EnrichmentJsonResult::err(ENRICHMENT_ERR_OTHER), || {
+        let services = match locked_services() {
+            Some(s) => s,
+            None => return EnrichmentJsonResult::err(ENRICHMENT_ERR_NOT_INITIALIZED),
+        };
 
-    let token = cstr_lossy(token).unwrap_or_default();
-    if !authenticated(&services, &token) {
-        return EnrichmentJsonResult::err(ENRICHMENT_ERR_UNAUTHORIZED);
-    }
-
-    let uuid = match cstr_lossy(uuid).and_then(|s| uuid::Uuid::parse_str(&s).ok()) {
-        Some(u) => u,
-        None => return EnrichmentJsonResult::err(ENRICHMENT_ERR_INVALID_INPUT),
-    };
-    let artist = cstr_lossy(artist);
-
-    let result = runtime().block_on(async {
-        services
-            .read_enrichment_handler
-            .read(uuid, artist.as_deref(), &token)
-            .await
-    });
-
-    match result {
-        Ok(view) => {
-            let json = serde_json::to_string(&view).unwrap_or_default();
-            EnrichmentJsonResult::ok(json)
+        let token = cstr_lossy(token).unwrap_or_default();
+        if !authenticated(&services, &token) {
+            return EnrichmentJsonResult::err(ENRICHMENT_ERR_UNAUTHORIZED);
         }
-        Err(err) => map_enrichment_err(err),
-    }
+
+        let uuid = match cstr_lossy(uuid).and_then(|s| uuid::Uuid::parse_str(&s).ok()) {
+            Some(u) => u,
+            None => return EnrichmentJsonResult::err(ENRICHMENT_ERR_INVALID_INPUT),
+        };
+        let artist = cstr_lossy(artist);
+
+        let result = runtime().block_on(async {
+            services
+                .read_enrichment_handler
+                .read(uuid, artist.as_deref(), &token)
+                .await
+        });
+
+        match result {
+            Ok(view) => {
+                let json = serde_json::to_string(&view).unwrap_or_default();
+                EnrichmentJsonResult::ok(json)
+            }
+            Err(err) => map_enrichment_err(err),
+        }
+    })
 }
 
 /// FFI status codes returned by library operations (libraries design). Its
@@ -5206,42 +5466,46 @@ pub extern "C" fn alexandria_library_register(
     json_body: *const c_char,
     token: *const c_char,
 ) -> LibraryJsonResult {
-    let services = match services_slot().lock().unwrap().clone() {
-        Some(s) => s,
-        None => return LibraryJsonResult::err(LIBRARY_ERR_NOT_INITIALIZED),
-    };
+    ffi_guard(LibraryJsonResult::err(LIBRARY_ERR_OTHER), || {
+        let services = match locked_services() {
+            Some(s) => s,
+            None => return LibraryJsonResult::err(LIBRARY_ERR_NOT_INITIALIZED),
+        };
 
-    let token = cstr_lossy(token).unwrap_or_default();
-    if !authenticated(&services, &token) {
-        return LibraryJsonResult::err(LIBRARY_ERR_UNAUTHORIZED);
-    }
+        let token = cstr_lossy(token).unwrap_or_default();
+        if !authenticated(&services, &token) {
+            return LibraryJsonResult::err(LIBRARY_ERR_UNAUTHORIZED);
+        }
 
-    let body = match cstr_lossy(json_body)
-        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
-    {
-        Some(value) => value,
-        None => return LibraryJsonResult::err(LIBRARY_ERR_INVALID_INPUT),
-    };
-    let name = body
-        .get("name")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default();
-    let root_path = body
-        .get("rootPath")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default();
+        let body = match cstr_lossy(json_body)
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        {
+            Some(value) => value,
+            None => return LibraryJsonResult::err(LIBRARY_ERR_INVALID_INPUT),
+        };
+        let name = body
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        let root_path = body
+            .get("rootPath")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
 
-    let result = runtime().block_on(async {
-        services
-            .register_library_handler
-            .register(name, root_path, &token)
-            .await
-    });
+        let result = runtime().block_on(async {
+            services
+                .register_library_handler
+                .register(name, root_path, &token)
+                .await
+        });
 
-    match result {
-        Ok(library) => LibraryJsonResult::ok(serde_json::to_string(&library).unwrap_or_default()),
-        Err(err) => map_library_err(err),
-    }
+        match result {
+            Ok(library) => {
+                LibraryJsonResult::ok(serde_json::to_string(&library).unwrap_or_default())
+            }
+            Err(err) => map_library_err(err),
+        }
+    })
 }
 
 /// Point a library at the folder it moved to (libraries design).
@@ -5258,67 +5522,74 @@ pub extern "C" fn alexandria_library_move(
     json_body: *const c_char,
     token: *const c_char,
 ) -> LibraryJsonResult {
-    let services = match services_slot().lock().unwrap().clone() {
-        Some(s) => s,
-        None => return LibraryJsonResult::err(LIBRARY_ERR_NOT_INITIALIZED),
-    };
+    ffi_guard(LibraryJsonResult::err(LIBRARY_ERR_OTHER), || {
+        let services = match locked_services() {
+            Some(s) => s,
+            None => return LibraryJsonResult::err(LIBRARY_ERR_NOT_INITIALIZED),
+        };
 
-    let token = cstr_lossy(token).unwrap_or_default();
-    if !authenticated(&services, &token) {
-        return LibraryJsonResult::err(LIBRARY_ERR_UNAUTHORIZED);
-    }
+        let token = cstr_lossy(token).unwrap_or_default();
+        if !authenticated(&services, &token) {
+            return LibraryJsonResult::err(LIBRARY_ERR_UNAUTHORIZED);
+        }
 
-    let uuid = match cstr_lossy(uuid).and_then(|s| uuid::Uuid::parse_str(&s).ok()) {
-        Some(u) => u,
-        None => return LibraryJsonResult::err(LIBRARY_ERR_INVALID_INPUT),
-    };
+        let uuid = match cstr_lossy(uuid).and_then(|s| uuid::Uuid::parse_str(&s).ok()) {
+            Some(u) => u,
+            None => return LibraryJsonResult::err(LIBRARY_ERR_INVALID_INPUT),
+        };
 
-    let body = match cstr_lossy(json_body)
-        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
-    {
-        Some(value) => value,
-        None => return LibraryJsonResult::err(LIBRARY_ERR_INVALID_INPUT),
-    };
-    let root_path = body
-        .get("rootPath")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default();
+        let body = match cstr_lossy(json_body)
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        {
+            Some(value) => value,
+            None => return LibraryJsonResult::err(LIBRARY_ERR_INVALID_INPUT),
+        };
+        let root_path = body
+            .get("rootPath")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
 
-    let result = runtime().block_on(async {
-        services
-            .move_library_handler
-            .move_to(uuid, root_path, &token)
-            .await
-    });
+        let result = runtime().block_on(async {
+            services
+                .move_library_handler
+                .move_to(uuid, root_path, &token)
+                .await
+        });
 
-    match result {
-        Ok(library) => LibraryJsonResult::ok(serde_json::to_string(&library).unwrap_or_default()),
-        Err(err) => map_library_err(err),
-    }
+        match result {
+            Ok(library) => {
+                LibraryJsonResult::ok(serde_json::to_string(&library).unwrap_or_default())
+            }
+            Err(err) => map_library_err(err),
+        }
+    })
 }
 
 /// Every registered library.
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
 pub extern "C" fn alexandria_libraries_list(token: *const c_char) -> LibraryJsonResult {
-    let services = match services_slot().lock().unwrap().clone() {
-        Some(s) => s,
-        None => return LibraryJsonResult::err(LIBRARY_ERR_NOT_INITIALIZED),
-    };
+    ffi_guard(LibraryJsonResult::err(LIBRARY_ERR_OTHER), || {
+        let services = match locked_services() {
+            Some(s) => s,
+            None => return LibraryJsonResult::err(LIBRARY_ERR_NOT_INITIALIZED),
+        };
 
-    let token = cstr_lossy(token).unwrap_or_default();
-    if !authenticated(&services, &token) {
-        return LibraryJsonResult::err(LIBRARY_ERR_UNAUTHORIZED);
-    }
-
-    let result = runtime().block_on(async { services.list_libraries_handler.list(&token).await });
-
-    match result {
-        Ok(libraries) => {
-            LibraryJsonResult::ok(serde_json::to_string(&libraries).unwrap_or_default())
+        let token = cstr_lossy(token).unwrap_or_default();
+        if !authenticated(&services, &token) {
+            return LibraryJsonResult::err(LIBRARY_ERR_UNAUTHORIZED);
         }
-        Err(err) => map_library_err(err),
-    }
+
+        let result =
+            runtime().block_on(async { services.list_libraries_handler.list(&token).await });
+
+        match result {
+            Ok(libraries) => {
+                LibraryJsonResult::ok(serde_json::to_string(&libraries).unwrap_or_default())
+            }
+            Err(err) => map_library_err(err),
+        }
+    })
 }
 
 /// One level of a library's tree.
@@ -5333,33 +5604,37 @@ pub extern "C" fn alexandria_library_browse(
     path: *const c_char,
     token: *const c_char,
 ) -> LibraryJsonResult {
-    let services = match services_slot().lock().unwrap().clone() {
-        Some(s) => s,
-        None => return LibraryJsonResult::err(LIBRARY_ERR_NOT_INITIALIZED),
-    };
+    ffi_guard(LibraryJsonResult::err(LIBRARY_ERR_OTHER), || {
+        let services = match locked_services() {
+            Some(s) => s,
+            None => return LibraryJsonResult::err(LIBRARY_ERR_NOT_INITIALIZED),
+        };
 
-    let token = cstr_lossy(token).unwrap_or_default();
-    if !authenticated(&services, &token) {
-        return LibraryJsonResult::err(LIBRARY_ERR_UNAUTHORIZED);
-    }
+        let token = cstr_lossy(token).unwrap_or_default();
+        if !authenticated(&services, &token) {
+            return LibraryJsonResult::err(LIBRARY_ERR_UNAUTHORIZED);
+        }
 
-    let uuid = match cstr_lossy(uuid).and_then(|s| uuid::Uuid::parse_str(&s).ok()) {
-        Some(u) => u,
-        None => return LibraryJsonResult::err(LIBRARY_ERR_INVALID_INPUT),
-    };
-    let path = cstr_lossy(path).unwrap_or_default();
+        let uuid = match cstr_lossy(uuid).and_then(|s| uuid::Uuid::parse_str(&s).ok()) {
+            Some(u) => u,
+            None => return LibraryJsonResult::err(LIBRARY_ERR_INVALID_INPUT),
+        };
+        let path = cstr_lossy(path).unwrap_or_default();
 
-    let result = runtime().block_on(async {
-        services
-            .browse_library_handler
-            .browse(uuid, &path, &token)
-            .await
-    });
+        let result = runtime().block_on(async {
+            services
+                .browse_library_handler
+                .browse(uuid, &path, &token)
+                .await
+        });
 
-    match result {
-        Ok(listing) => LibraryJsonResult::ok(serde_json::to_string(&listing).unwrap_or_default()),
-        Err(err) => map_library_err(err),
-    }
+        match result {
+            Ok(listing) => {
+                LibraryJsonResult::ok(serde_json::to_string(&listing).unwrap_or_default())
+            }
+            Err(err) => map_library_err(err),
+        }
+    })
 }
 
 /// Stop treating a folder as a library.
@@ -5373,26 +5648,28 @@ pub extern "C" fn alexandria_library_remove(
     uuid: *const c_char,
     token: *const c_char,
 ) -> LibraryJsonResult {
-    let services = match services_slot().lock().unwrap().clone() {
-        Some(s) => s,
-        None => return LibraryJsonResult::err(LIBRARY_ERR_NOT_INITIALIZED),
-    };
+    ffi_guard(LibraryJsonResult::err(LIBRARY_ERR_OTHER), || {
+        let services = match locked_services() {
+            Some(s) => s,
+            None => return LibraryJsonResult::err(LIBRARY_ERR_NOT_INITIALIZED),
+        };
 
-    let token = cstr_lossy(token).unwrap_or_default();
-    if !authenticated(&services, &token) {
-        return LibraryJsonResult::err(LIBRARY_ERR_UNAUTHORIZED);
-    }
+        let token = cstr_lossy(token).unwrap_or_default();
+        if !authenticated(&services, &token) {
+            return LibraryJsonResult::err(LIBRARY_ERR_UNAUTHORIZED);
+        }
 
-    let uuid = match cstr_lossy(uuid).and_then(|s| uuid::Uuid::parse_str(&s).ok()) {
-        Some(u) => u,
-        None => return LibraryJsonResult::err(LIBRARY_ERR_INVALID_INPUT),
-    };
+        let uuid = match cstr_lossy(uuid).and_then(|s| uuid::Uuid::parse_str(&s).ok()) {
+            Some(u) => u,
+            None => return LibraryJsonResult::err(LIBRARY_ERR_INVALID_INPUT),
+        };
 
-    let result =
-        runtime().block_on(async { services.remove_library_handler.remove(uuid, &token).await });
+        let result = runtime()
+            .block_on(async { services.remove_library_handler.remove(uuid, &token).await });
 
-    match result {
-        Ok(()) => LibraryJsonResult::ok("{}".to_string()),
-        Err(err) => map_library_err(err),
-    }
+        match result {
+            Ok(()) => LibraryJsonResult::ok("{}".to_string()),
+            Err(err) => map_library_err(err),
+        }
+    })
 }
