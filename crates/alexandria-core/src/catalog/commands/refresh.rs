@@ -548,11 +548,7 @@ where
     /// corrected by hand is not overwritten by whatever the tags say. And it
     /// stamps only what it actually read: a file whose tags will not parse
     /// stays behind, to be tried again by a build that can read it.
-    async fn fill_metadata(
-        &self,
-        file: &File,
-        read: ReadTags,
-    ) -> Result<Filled, DomainError> {
+    async fn fill_metadata(&self, file: &File, read: ReadTags) -> Result<Filled, DomainError> {
         if read == WhenBehind && file.metadata_version >= METADATA_VERSION {
             return Ok(Filled::No);
         }
