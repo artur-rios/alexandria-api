@@ -59,7 +59,7 @@ lyrics; it has *identity*, which is what makes the other two lookups possible.
 | --- | --- | --- |
 | MusicBrainz | The artist's MBID and the recording's MBID, from tags | No |
 | Wikidata → Wikimedia Commons | An artist image, reached by the MBID's Wikidata relation | No |
-| LRCLIB | Plain and synced lyrics, by title/artist/album/duration | No |
+| LRCLIB | Plain and synced lyrics, by title/artist/album/duration, then by search when that misses | No |
 
 All three are free, require no registration, and need no key the owner would
 have to obtain — which is what keeps this a feature rather than a setup chore.
@@ -149,6 +149,22 @@ and written through its own repository call, the same division
 what their tags claim, and how long the audio actually runs is not a claim.
 Duration is what separates a radio edit from an album cut, and it is the field
 LRCLIB matches best on.
+
+**A missed exact match is asked again, less strictly.** `/api/get` matches the
+strings it is given, whole, and no real library is tagged the way a catalog
+spells things: a file tagged `Many Men (Wish Death) (Explicit)` on
+`Get Rich Or Die Tryin'` misses a recording LRCLIB plainly holds as
+`Many Men (Wish Death)`, and an owner whose files carry `(Explicit)`,
+`(Remastered)`, a featured artist or a different apostrophe gets nothing for
+any track — which is how "lyrics never work" was first reported. So a 404
+from `/api/get` becomes one free-text `/api/search`, and what comes back is
+filtered by us rather than trusted: a candidate has to be recognisably the
+same artist (containment either way, case-insensitively, so `50 CENT` and
+`50 Cent feat. Nate Dogg` both pass) and within twenty seconds of the file's
+own length, and the closest length wins among those that qualify. Lyrics
+against the wrong recording are worse than none — the owner has to notice
+before they can correct it — which is why the filter is ours and the ranking
+is not.
 
 The MusicBrainz *recording* id is stored beside found lyrics, and is asked for
 **only once lyrics have actually been found**. That ordering is the design, not

@@ -233,7 +233,14 @@ where
         let matched = match self.identity.find_artist(artist).await {
             Ok(Some(matched)) => matched,
             Ok(None) => return row(EnrichmentOutcome::NotFound, None, None, None),
-            Err(_) => return row(EnrichmentOutcome::Failed, None, None, None),
+            // Logged rather than swallowed. A run reports counts, and a count
+            // of failures with no reason anywhere is a feature nobody can
+            // diagnose: "it does not work" was as far as anyone could get,
+            // owner and maintainer alike.
+            Err(err) => {
+                tracing::warn!(artist = %artist, error = ?err, "artist lookup failed");
+                return row(EnrichmentOutcome::Failed, None, None, None);
+            }
         };
 
         // The threshold, and the reason this is not "take the first result".
@@ -248,7 +255,10 @@ where
         let asset = match self.images.image_for(&matched.mbid).await {
             Ok(Some(asset)) => asset,
             Ok(None) => return row(EnrichmentOutcome::NotFound, Some(matched.mbid), None, None),
-            Err(_) => return row(EnrichmentOutcome::Failed, Some(matched.mbid), None, None),
+            Err(err) => {
+                tracing::warn!(artist = %artist, error = ?err, "artist image lookup failed");
+                return row(EnrichmentOutcome::Failed, Some(matched.mbid), None, None);
+            }
         };
 
         match self.store.store(&matched.mbid, &asset).await {
@@ -262,7 +272,10 @@ where
             // run tries again — a full disk is temporary, and recording this
             // as `NotFound` would permanently deny an artist a photo that
             // exists.
-            Err(_) => row(EnrichmentOutcome::Failed, Some(matched.mbid), None, None),
+            Err(err) => {
+                tracing::warn!(artist = %artist, error = ?err, "artist image could not be stored");
+                row(EnrichmentOutcome::Failed, Some(matched.mbid), None, None)
+            }
         }
     }
 
@@ -344,7 +357,15 @@ where
                 stored
             }
             Ok(None) => row(EnrichmentOutcome::NotFound, None, None, None),
-            Err(_) => row(EnrichmentOutcome::Failed, None, None, None),
+            Err(err) => {
+                tracing::warn!(
+                    title = %query.title,
+                    artist = %query.artist,
+                    error = ?err,
+                    "lyrics lookup failed"
+                );
+                row(EnrichmentOutcome::Failed, None, None, None)
+            }
         }
     }
 
