@@ -773,8 +773,7 @@ where
         // fails, is logged and stepped over. Neither is counted in
         // `IndexOutcome::failed`, because neither is a file that could not be
         // catalogued.
-        let extracted = self
-            .extractor
+        self.extractor
             .extract_into(
                 &self.repo,
                 file.uuid,
@@ -784,22 +783,22 @@ where
             )
             .await;
 
-        // Stamped only when something was actually read. A file that gave up
-        // nothing stays behind the current version, so a later refresh — or a
-        // later build that can read more of it — tries again rather than
-        // taking this row for current.
-        if extracted {
-            if let Err(err) = self
-                .repo
-                .set_metadata_version(file.uuid, METADATA_VERSION)
-                .await
-            {
-                tracing::warn!(
-                    path = %entry.path,
-                    error = %err,
-                    "indexed but failed to record which extraction wrote its metadata"
-                );
-            }
+        // Stamped whatever the reading gave up: the stamp records which
+        // extraction has been applied to the row, and this one has been,
+        // however little it found. See `RefreshHandler::fill_metadata` for
+        // why the alternative — stamping successes only — costs a re-read of
+        // every unreadable file on every later pass and buys nothing a
+        // version bump does not.
+        if let Err(err) = self
+            .repo
+            .set_metadata_version(file.uuid, METADATA_VERSION)
+            .await
+        {
+            tracing::warn!(
+                path = %entry.path,
+                error = %err,
+                "indexed but failed to record which extraction wrote its metadata"
+            );
         }
 
         Ok(EntryOutcome::Indexed)

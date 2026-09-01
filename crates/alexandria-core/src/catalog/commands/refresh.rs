@@ -546,8 +546,8 @@ where
     /// never again. It fills rather than replaces
     /// ([`CatalogRepository::fill_missing_metadata`]), so a title the owner
     /// corrected by hand is not overwritten by whatever the tags say. And it
-    /// stamps only what it actually read: a file whose tags will not parse
-    /// stays behind, to be tried again by a build that can read it.
+    /// stamps the row whatever the reading gave up, so a file nothing can be
+    /// read from is opened once rather than on every pass.
     async fn fill_metadata(&self, file: &File, read: ReadTags) -> Result<Filled, DomainError> {
         if read == WhenBehind && file.metadata_version >= METADATA_VERSION {
             return Ok(Filled::No);
@@ -564,16 +564,23 @@ where
             )
             .await;
 
-        if !filled {
-            return Ok(Filled::No);
-        }
-
+        // Stamped whatever came back, including nothing.
+        //
+        // The stamp says which extraction has been *applied* to the row, not
+        // which one succeeded, and a file that gave up nothing has had this
+        // one applied as fully as it ever will be. Stamping only a successful
+        // read looked more careful and was not: a text file named `.flac`, a
+        // truncated download, an encrypted document — every one of them would
+        // be opened again on every pass for the life of the library, and the
+        // retry that bought would only ever pay off when the extractor
+        // learned something new, which bumps `METADATA_VERSION` and revisits
+        // every row anyway.
         retry_on_busy(BUSY_ATTEMPTS, || {
             self.repo.set_metadata_version(file.uuid, METADATA_VERSION)
         })
         .await?;
 
-        Ok(Filled::Yes)
+        Ok(if filled { Filled::Yes } else { Filled::No })
     }
 }
 

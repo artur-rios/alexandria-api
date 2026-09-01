@@ -347,15 +347,18 @@ async fn given_tags_that_will_not_parse_when_refreshed_then_the_row_is_left_behi
         .await
         .expect("execute");
 
-    assert_eq!(outcome.unchanged, 1);
+    assert_eq!(
+        outcome.unchanged, 1,
+        "nothing was read, so nothing was filled"
+    );
     assert_eq!(outcome.metadata_filled, 0);
     assert_eq!(
         repo_handle
             .file_for("/library/damaged.flac")
             .unwrap()
             .metadata_version,
-        0,
-        "an extraction that read nothing must not claim the row is current"
+        METADATA_VERSION,
+        "the row must not be opened again on every later pass"
     );
 }
 
