@@ -10,10 +10,11 @@ use crate::catalog::clock::Clock;
 use crate::catalog::comic_tags::ComicMetadataReader;
 use crate::catalog::commands::{flush_progress, record_halt, PROGRESS_FLUSH_SECONDS};
 use crate::catalog::document_tags::DocumentMetadataReader;
+use crate::catalog::extraction::{MetadataExtractor, MetadataWrite};
 use crate::catalog::fs::{FileEntry, Filesystem};
 use crate::catalog::image_tags::ImageMetadataReader;
 use crate::catalog::index_scope::IndexScope;
-use crate::catalog::model::{FileType, NewFile};
+use crate::catalog::model::{FileType, NewFile, METADATA_VERSION};
 use crate::catalog::repos::CatalogRepository;
 use crate::catalog::run_registry::{RunCell, RunPhase, RunRegistry, RunSignal};
 use crate::catalog::runs::{CatalogRunRepository, RunCounts, RunKind, RunPriority};
@@ -100,11 +101,10 @@ pub struct IndexHandler<A, R, F, C, M, N, O, P, Q, RR> {
     repo: R,
     fs: F,
     clock: C,
-    audio_tags: M,
-    image_tags: N,
-    document_tags: O,
-    video_tags: P,
-    comic_tags: Q,
+    /// The five readers, held together (`MetadataExtractor`) because the
+    /// refresh reads the same files with the same readers and this is the
+    /// one description of how a file's own metadata reaches the catalog.
+    extractor: MetadataExtractor<M, N, O, P, Q>,
     concurrency: usize,
     /// The width a `RunPriority::Low` run processes at
     /// (`indexing.low_priority_concurrency`). See `concurrency` for the
@@ -249,11 +249,13 @@ where
             repo,
             fs,
             clock,
-            audio_tags,
-            image_tags,
-            document_tags,
-            video_tags,
-            comic_tags,
+            extractor: MetadataExtractor::new(
+                audio_tags,
+                image_tags,
+                document_tags,
+                video_tags,
+                comic_tags,
+            ),
             concurrency: concurrency.max(1) as usize,
             low_priority_concurrency: low_priority_concurrency.max(1) as usize,
             library_root,
@@ -763,202 +765,43 @@ where
         })
         .await?;
 
-        // Best-effort audio tag prefill (issue #44 pilot). Extraction only
-        // ever runs here, at first index — refresh never touches metadata.
-        // A parse failure or a write failure here must not fail indexing
-        // (it is not counted in `IndexOutcome::failed`).
-        if file_type == FileType::Audio {
-            if let Some(tags) = self.audio_tags.read(&entry.path).await {
-                // Two independent writes, as the image slice below already
-                // does: the duration (outside `SubtypeMetadata`, via
-                // `set_audio_duration`, because it is not owner-editable) and
-                // the tags themselves. Neither write's failure blocks the
-                // other or fails indexing.
-                if let Some(crate::catalog::audio_tags::AudioDuration(duration_seconds)) =
-                    tags.duration_seconds
-                {
-                    if let Err(err) = self
-                        .repo
-                        .set_audio_duration(file.uuid, duration_seconds)
-                        .await
-                    {
-                        tracing::warn!(
-                            path = %entry.path,
-                            error = %err,
-                            "indexed but failed to write extracted audio duration"
-                        );
-                    }
-                }
+        // Reading the file's own metadata into the row just written. Shared
+        // with the refresh, which reads the same files with the same readers
+        // and writes what it finds differently — see `MetadataExtractor`.
+        //
+        // Best-effort: a file whose tags will not parse, or a write that
+        // fails, is logged and stepped over. Neither is counted in
+        // `IndexOutcome::failed`, because neither is a file that could not be
+        // catalogued.
+        let extracted = self
+            .extractor
+            .extract_into(
+                &self.repo,
+                file.uuid,
+                &entry.path,
+                file_type,
+                MetadataWrite::Replace,
+            )
+            .await;
 
-                if let Some(metadata) = tags.into_subtype_metadata() {
-                    if let Err(err) = self.repo.update_metadata(file.uuid, &metadata).await {
-                        tracing::warn!(
-                            path = %entry.path,
-                            error = %err,
-                            "indexed but failed to write extracted audio tags"
-                        );
-                    }
-                }
+        // Stamped only when something was actually read. A file that gave up
+        // nothing stays behind the current version, so a later refresh — or a
+        // later build that can read more of it — tries again rather than
+        // taking this row for current.
+        if extracted {
+            if let Err(err) = self
+                .repo
+                .set_metadata_version(file.uuid, METADATA_VERSION)
+                .await
+            {
+                tracing::warn!(
+                    path = %entry.path,
+                    error = %err,
+                    "indexed but failed to record which extraction wrote its metadata"
+                );
             }
         }
 
-        // Best-effort image EXIF prefill (issue #44 image slice). Two
-        // independent writes: dimensions (outside SubtypeMetadata, via
-        // set_image_dimensions) and title (via the shared update_metadata,
-        // same as audio). Neither write's failure blocks the other or fails
-        // indexing.
-        if file_type == FileType::Image {
-            if let Some(tags) = self.image_tags.read(&entry.path).await {
-                if let (Some(width), Some(height)) = (tags.width, tags.height) {
-                    if let Err(err) = self
-                        .repo
-                        .set_image_dimensions(file.uuid, width, height)
-                        .await
-                    {
-                        tracing::warn!(
-                            path = %entry.path,
-                            error = %err,
-                            "indexed but failed to write extracted image dimensions"
-                        );
-                    }
-                }
-                if let Some(title) = tags.title {
-                    // caption: None is safe only because extraction runs
-                    // exactly once, at first index, before an owner could
-                    // have set one via UC-04 — update_metadata is a full
-                    // replace, so reusing this pattern anywhere caption
-                    // might already be set would silently wipe it.
-                    let metadata = crate::catalog::model::SubtypeMetadata::Image {
-                        title: Some(title),
-                        caption: None,
-                    };
-                    if let Err(err) = self.repo.update_metadata(file.uuid, &metadata).await {
-                        tracing::warn!(
-                            path = %entry.path,
-                            error = %err,
-                            "indexed but failed to write extracted image title"
-                        );
-                    }
-                }
-            }
-        }
-
-        // Best-effort document metadata prefill (issue #44 document
-        // slice). Two independent writes: page count (outside
-        // SubtypeMetadata, via set_document_page_count — PDF only, EPUB
-        // never sets it) and title/author/year/format_kind (via the
-        // shared update_metadata). Neither write's failure blocks the
-        // other or fails indexing.
-        if file_type == FileType::Document {
-            if let Some(tags) = self.document_tags.read(&entry.path).await {
-                if let Some(page_count) = tags.page_count {
-                    if let Err(err) = self
-                        .repo
-                        .set_document_page_count(file.uuid, page_count)
-                        .await
-                    {
-                        tracing::warn!(
-                            path = %entry.path,
-                            error = %err,
-                            "indexed but failed to write extracted document page count"
-                        );
-                    }
-                }
-                if tags.title.is_some()
-                    || tags.author.is_some()
-                    || tags.year.is_some()
-                    || tags.format_kind.is_some()
-                {
-                    let metadata = crate::catalog::model::SubtypeMetadata::Document {
-                        title: tags.title,
-                        author: tags.author,
-                        year: tags.year,
-                        format_kind: tags.format_kind,
-                    };
-                    if let Err(err) = self.repo.update_metadata(file.uuid, &metadata).await {
-                        tracing::warn!(
-                            path = %entry.path,
-                            error = %err,
-                            "indexed but failed to write extracted document metadata"
-                        );
-                    }
-                }
-            }
-        }
-
-        // Best-effort video metadata prefill (issue #44 video slice). Two
-        // independent writes: duration (outside SubtypeMetadata, via
-        // set_video_duration) and title/year/resolution (via the shared
-        // update_metadata, media_kind always None — it is not inferable
-        // from the file). Neither write's failure blocks the other or
-        // fails indexing.
-        if file_type == FileType::Video {
-            if let Some(tags) = self.video_tags.read(&entry.path).await {
-                if let Some(crate::catalog::video_tags::VideoDuration(duration_seconds)) =
-                    tags.duration_seconds
-                {
-                    if let Err(err) = self
-                        .repo
-                        .set_video_duration(file.uuid, duration_seconds)
-                        .await
-                    {
-                        tracing::warn!(
-                            path = %entry.path,
-                            error = %err,
-                            "indexed but failed to write extracted video duration"
-                        );
-                    }
-                }
-                if tags.title.is_some() || tags.year.is_some() || tags.resolution.is_some() {
-                    let metadata = crate::catalog::model::SubtypeMetadata::Video {
-                        title: tags.title,
-                        year: tags.year,
-                        resolution: tags.resolution,
-                        media_kind: None,
-                    };
-                    if let Err(err) = self.repo.update_metadata(file.uuid, &metadata).await {
-                        tracing::warn!(
-                            path = %entry.path,
-                            error = %err,
-                            "indexed but failed to write extracted video metadata"
-                        );
-                    }
-                }
-            }
-        }
-
-        // Best-effort comic metadata prefill (issue #44 comic slice). Two
-        // independent writes: page count (outside SubtypeMetadata, via
-        // set_comic_page_count — always present once the archive opens)
-        // and title/series/issue_number (via the shared update_metadata).
-        // Neither write's failure blocks the other or fails indexing.
-        if file_type == FileType::Comic {
-            if let Some(tags) = self.comic_tags.read(&entry.path).await {
-                if let Some(page_count) = tags.page_count {
-                    if let Err(err) = self.repo.set_comic_page_count(file.uuid, page_count).await {
-                        tracing::warn!(
-                            path = %entry.path,
-                            error = %err,
-                            "indexed but failed to write extracted comic page count"
-                        );
-                    }
-                }
-                if tags.title.is_some() || tags.series.is_some() || tags.issue_number.is_some() {
-                    let metadata = crate::catalog::model::SubtypeMetadata::Comic {
-                        title: tags.title,
-                        series: tags.series,
-                        issue_number: tags.issue_number,
-                    };
-                    if let Err(err) = self.repo.update_metadata(file.uuid, &metadata).await {
-                        tracing::warn!(
-                            path = %entry.path,
-                            error = %err,
-                            "indexed but failed to write extracted comic metadata"
-                        );
-                    }
-                }
-            }
-        }
         Ok(EntryOutcome::Indexed)
     }
 }

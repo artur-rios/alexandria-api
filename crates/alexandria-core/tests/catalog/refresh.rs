@@ -3,10 +3,12 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use alexandria_core::auth::AuthService;
+use alexandria_core::catalog::audio_tags::AudioTags;
 use alexandria_core::catalog::clock::Clock;
 use alexandria_core::catalog::commands::refresh::{RefreshHandler, RefreshStarted};
 use alexandria_core::catalog::commands::run_control::RunControlHandler;
 use alexandria_core::catalog::fs::Filesystem;
+use alexandria_core::catalog::model::{SubtypeMetadata, METADATA_VERSION};
 use alexandria_core::catalog::repos::CatalogRepository;
 use alexandria_core::catalog::run_registry::{RunPhase, RunRegistry};
 use alexandria_core::catalog::runs::{
@@ -16,8 +18,10 @@ use alexandria_core::errors::DomainError;
 
 use crate::common::{
     a_cataloged_file, a_cataloged_file_with_hash, a_cataloged_missing_file, fixed_clock, interrupt,
-    now, FailingCatalogRepository, FailingCatalogRunRepository, FakeAuth, FakeCatalogRepository,
-    FakeCatalogRunRepository, FakeFilesystem, InterruptingFilesystem, Seam,
+    now, FailingCatalogRepository, FailingCatalogRunRepository, FakeAudioMetadataReader, FakeAuth,
+    FakeCatalogRepository, FakeCatalogRunRepository, FakeComicMetadataReader,
+    FakeDocumentMetadataReader, FakeFilesystem, FakeImageMetadataReader, FakeVideoMetadataReader,
+    InterruptingFilesystem, Seam,
 };
 
 const TOKEN: &str = "bearer-token";
@@ -30,13 +34,49 @@ const TEST_CONCURRENCY: u32 = 4;
 /// distinct from [`TEST_CONCURRENCY`], mirroring `tests/catalog/index.rs`.
 const TEST_LOW_PRIORITY_CONCURRENCY: u32 = 1;
 
+/// The five readers a refresh now holds, seeded with nothing.
+///
+/// A reader that answers `None` for every path is a file whose tags will not
+/// parse, which is what these tests want: they are about stat comparison and
+/// run control, and a refresh only re-reads a file whose row is behind the
+/// current extraction. The tests that *are* about that re-reading seed a
+/// reader of their own — see `metadata backfill`.
+type TestReaders = (
+    FakeAudioMetadataReader,
+    FakeImageMetadataReader,
+    FakeDocumentMetadataReader,
+    FakeVideoMetadataReader,
+    FakeComicMetadataReader,
+);
+
+fn no_readers() -> TestReaders {
+    (
+        FakeAudioMetadataReader::new(),
+        FakeImageMetadataReader::new(),
+        FakeDocumentMetadataReader::new(),
+        FakeVideoMetadataReader::new(),
+        FakeComicMetadataReader::new(),
+    )
+}
+
 fn refresh_handler<A, R, F, C, RR>(
     auth: A,
     repo: R,
     fs: F,
     clock: C,
     runs: RR,
-) -> RefreshHandler<A, R, F, C, RR>
+) -> RefreshHandler<
+    A,
+    R,
+    F,
+    C,
+    RR,
+    FakeAudioMetadataReader,
+    FakeImageMetadataReader,
+    FakeDocumentMetadataReader,
+    FakeVideoMetadataReader,
+    FakeComicMetadataReader,
+>
 where
     A: AuthService,
     R: CatalogRepository,
@@ -44,11 +84,17 @@ where
     C: Clock,
     RR: CatalogRunRepository,
 {
+    let (audio, image, document, video, comic) = no_readers();
     RefreshHandler::new(
         auth,
         repo,
         fs,
         clock,
+        audio,
+        image,
+        document,
+        video,
+        comic,
         TEST_CONCURRENCY,
         TEST_LOW_PRIORITY_CONCURRENCY,
         runs,
@@ -114,6 +160,214 @@ async fn given_unauthenticated_when_refresh_start_then_unauthorized() {
 
     let result = handler.start(RunPriority::Normal, "").await;
     assert!(matches!(result, Err(DomainError::Unauthorized)));
+}
+
+// ---------------- Metadata backfill (UC-02) ----------------
+
+/// A handler whose audio reader is the caller's, so a test can say what the
+/// file's tags are.
+fn refresh_handler_reading(
+    repo: FakeCatalogRepository,
+    fs: FakeFilesystem,
+    audio: FakeAudioMetadataReader,
+) -> RefreshHandler<
+    FakeAuth,
+    FakeCatalogRepository,
+    FakeFilesystem,
+    impl Clock,
+    FakeCatalogRunRepository,
+    FakeAudioMetadataReader,
+    FakeImageMetadataReader,
+    FakeDocumentMetadataReader,
+    FakeVideoMetadataReader,
+    FakeComicMetadataReader,
+> {
+    RefreshHandler::new(
+        FakeAuth::Allowing,
+        repo,
+        fs,
+        fixed_clock(now()),
+        audio,
+        FakeImageMetadataReader::new(),
+        FakeDocumentMetadataReader::new(),
+        FakeVideoMetadataReader::new(),
+        FakeComicMetadataReader::new(),
+        TEST_CONCURRENCY,
+        TEST_LOW_PRIORITY_CONCURRENCY,
+        FakeCatalogRunRepository::new(),
+        RunRegistry::new(),
+    )
+}
+
+fn tags_with_album_artist() -> AudioTags {
+    AudioTags {
+        title: Some("A Guest Spot".to_string()),
+        artist: Some("The Guest".to_string()),
+        album: Some("Their Record".to_string()),
+        year: None,
+        genre: None,
+        track: None,
+        album_artist: Some("The Host".to_string()),
+        duration_seconds: None,
+    }
+}
+
+/// The owner's report, at the level it is actually caused: a row written
+/// before the extractor could read `album_artist` keeps NULL there forever,
+/// because a re-index skips a catalogued path and a refresh only compares
+/// stat. The file has not changed — the catalog's reading of it has.
+#[tokio::test]
+async fn given_a_row_an_older_extraction_wrote_when_refreshed_then_its_metadata_is_filled() {
+    let repo = FakeCatalogRepository::new();
+    let file = a_cataloged_file("/library/guest.flac", 4096, Some(now()));
+    let uuid = file.uuid;
+    repo.seed(file);
+    let repo_handle = repo.clone();
+
+    let audio = FakeAudioMetadataReader::new();
+    audio.seed("/library/guest.flac", tags_with_album_artist());
+
+    let fs = FakeFilesystem::builder()
+        .with_file("/lib", "/library/guest.flac", "guest.flac", "unused")
+        .with_stat("/library/guest.flac", 4096, Some(now()))
+        .build();
+
+    let outcome = refresh_handler_reading(repo, fs, audio)
+        .execute(Uuid::new_v4())
+        .await
+        .expect("execute");
+
+    assert_eq!(outcome.metadata_filled, 1);
+    assert_eq!(
+        outcome.unchanged, 0,
+        "a row that was re-read is not an untouched one"
+    );
+    assert_eq!(
+        repo_handle
+            .metadata_for(uuid)
+            .and_then(|metadata| match metadata {
+                SubtypeMetadata::Audio { album_artist, .. } => album_artist,
+                _ => None,
+            }),
+        Some("The Host".to_string()),
+        "the tag was in the file all along; the catalog had never read it"
+    );
+}
+
+/// Once, not once a run. The stamp is the whole reason a refresh can afford
+/// to read tags at all.
+#[tokio::test]
+async fn given_a_row_at_the_current_version_when_refreshed_then_the_file_is_not_read() {
+    let repo = FakeCatalogRepository::new();
+    let mut file = a_cataloged_file("/library/current.flac", 4096, Some(now()));
+    file.metadata_version = METADATA_VERSION;
+    repo.seed(file);
+
+    let audio = FakeAudioMetadataReader::new();
+    audio.seed("/library/current.flac", tags_with_album_artist());
+    let audio_handle = audio.clone();
+
+    let fs = FakeFilesystem::builder()
+        .with_file("/lib", "/library/current.flac", "current.flac", "unused")
+        .with_stat("/library/current.flac", 4096, Some(now()))
+        .build();
+
+    let outcome = refresh_handler_reading(repo, fs, audio)
+        .execute(Uuid::new_v4())
+        .await
+        .expect("execute");
+
+    assert_eq!(outcome.unchanged, 1);
+    assert_eq!(outcome.metadata_filled, 0);
+    assert_eq!(
+        audio_handle.call_count(),
+        0,
+        "a row already current must cost no read at all"
+    );
+}
+
+/// A file whose tags will not parse stays behind the current version, so a
+/// later run — or a later build that can read it — tries again. Stamping it
+/// would be recording an extraction that never happened.
+#[tokio::test]
+async fn given_tags_that_will_not_parse_when_refreshed_then_the_row_is_left_behind() {
+    let repo = FakeCatalogRepository::new();
+    repo.seed(a_cataloged_file("/library/damaged.flac", 4096, Some(now())));
+    let repo_handle = repo.clone();
+
+    // Nothing seeded: the reader answers `None`, exactly as the real one
+    // does for a file it cannot parse.
+    let fs = FakeFilesystem::builder()
+        .with_file("/lib", "/library/damaged.flac", "damaged.flac", "unused")
+        .with_stat("/library/damaged.flac", 4096, Some(now()))
+        .build();
+
+    let outcome = refresh_handler_reading(repo, fs, FakeAudioMetadataReader::new())
+        .execute(Uuid::new_v4())
+        .await
+        .expect("execute");
+
+    assert_eq!(outcome.unchanged, 1);
+    assert_eq!(outcome.metadata_filled, 0);
+    assert_eq!(
+        repo_handle
+            .file_for("/library/damaged.flac")
+            .unwrap()
+            .metadata_version,
+        0,
+        "an extraction that read nothing must not claim the row is current"
+    );
+}
+
+/// The refresh fills; it does not replace. The repository enforces this
+/// column by column (`fill_missing_metadata`, pinned against real SQLite in
+/// `tests/metadata_backfill.rs`); what this pins is that the *command* asks
+/// for the filling one rather than the replacing one.
+#[tokio::test]
+async fn given_metadata_the_owner_edited_when_refreshed_then_it_is_not_overwritten() {
+    let repo = FakeCatalogRepository::new();
+    let file = a_cataloged_file("/library/corrected.flac", 4096, Some(now()));
+    let uuid = file.uuid;
+    repo.seed(file);
+    repo.seed_metadata(
+        uuid,
+        SubtypeMetadata::Audio {
+            title: Some("The Owner's Title".to_string()),
+            artist: None,
+            album: None,
+            year: None,
+            genre: None,
+            track: None,
+            album_artist: None,
+        },
+    );
+    let repo_handle = repo.clone();
+
+    let audio = FakeAudioMetadataReader::new();
+    audio.seed("/library/corrected.flac", tags_with_album_artist());
+
+    let fs = FakeFilesystem::builder()
+        .with_file(
+            "/lib",
+            "/library/corrected.flac",
+            "corrected.flac",
+            "unused",
+        )
+        .with_stat("/library/corrected.flac", 4096, Some(now()))
+        .build();
+
+    refresh_handler_reading(repo, fs, audio)
+        .execute(Uuid::new_v4())
+        .await
+        .expect("execute");
+
+    assert!(
+        matches!(
+            repo_handle.metadata_for(uuid),
+            Some(SubtypeMetadata::Audio { title: Some(title), .. }) if title == "The Owner's Title"
+        ),
+        "a title the owner corrected must outrank whatever the tag says"
+    );
 }
 
 // ---------------- Stat comparison (Task 4 / FR-FC-10) ----------------
@@ -453,6 +707,11 @@ async fn given_any_concurrency_when_execute_then_same_outcome_tallies() {
             repo,
             fs,
             fixed_clock(now()),
+            FakeAudioMetadataReader::new(),
+            FakeImageMetadataReader::new(),
+            FakeDocumentMetadataReader::new(),
+            FakeVideoMetadataReader::new(),
+            FakeComicMetadataReader::new(),
             concurrency,
             TEST_LOW_PRIORITY_CONCURRENCY,
             FakeCatalogRunRepository::new(),
@@ -487,6 +746,11 @@ async fn given_zero_concurrency_when_execute_then_runs_sequentially_rather_than_
         repo,
         fs,
         fixed_clock(now()),
+        FakeAudioMetadataReader::new(),
+        FakeImageMetadataReader::new(),
+        FakeDocumentMetadataReader::new(),
+        FakeVideoMetadataReader::new(),
+        FakeComicMetadataReader::new(),
         0,
         TEST_LOW_PRIORITY_CONCURRENCY,
         FakeCatalogRunRepository::new(),
@@ -796,6 +1060,11 @@ async fn given_a_completed_refresh_when_execute_then_the_final_progress_is_flush
         repo,
         fs,
         fixed_clock(now()),
+        FakeAudioMetadataReader::new(),
+        FakeImageMetadataReader::new(),
+        FakeDocumentMetadataReader::new(),
+        FakeVideoMetadataReader::new(),
+        FakeComicMetadataReader::new(),
         TEST_CONCURRENCY,
         TEST_LOW_PRIORITY_CONCURRENCY,
         runs.clone(),
@@ -919,6 +1188,11 @@ async fn given_a_refresh_walk_in_flight_when_paused_then_it_stops_with_paths_unp
             pause_mid_walk,
         ),
         fixed_clock(now()),
+        FakeAudioMetadataReader::new(),
+        FakeImageMetadataReader::new(),
+        FakeDocumentMetadataReader::new(),
+        FakeVideoMetadataReader::new(),
+        FakeComicMetadataReader::new(),
         TEST_CONCURRENCY,
         TEST_LOW_PRIORITY_CONCURRENCY,
         runs.clone(),
@@ -1006,6 +1280,11 @@ async fn given_a_run_resumed_before_a_refreshs_pause_lands_when_it_lands_then_th
             pause_mid_walk,
         ),
         fixed_clock(now()),
+        FakeAudioMetadataReader::new(),
+        FakeImageMetadataReader::new(),
+        FakeDocumentMetadataReader::new(),
+        FakeVideoMetadataReader::new(),
+        FakeComicMetadataReader::new(),
         TEST_CONCURRENCY,
         TEST_LOW_PRIORITY_CONCURRENCY,
         runs.clone(),
@@ -1072,6 +1351,11 @@ async fn given_a_run_resumed_before_a_refreshs_cancel_lands_when_it_lands_then_i
             cancel_mid_walk,
         ),
         fixed_clock(now()),
+        FakeAudioMetadataReader::new(),
+        FakeImageMetadataReader::new(),
+        FakeDocumentMetadataReader::new(),
+        FakeVideoMetadataReader::new(),
+        FakeComicMetadataReader::new(),
         TEST_CONCURRENCY,
         TEST_LOW_PRIORITY_CONCURRENCY,
         runs.clone(),

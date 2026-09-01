@@ -121,6 +121,18 @@ impl CatalogRepository for FakeRepo {
         unimplemented!()
     }
 
+    async fn fill_missing_metadata(
+        &self,
+        _uuid: Uuid,
+        _metadata: &SubtypeMetadata,
+    ) -> Result<(), DomainError> {
+        unimplemented!()
+    }
+
+    async fn set_metadata_version(&self, _uuid: Uuid, _version: i64) -> Result<(), DomainError> {
+        unimplemented!()
+    }
+
     async fn list_filtered(
         &self,
         _file_type: Option<FileType>,
@@ -275,5 +287,8 @@ pub(crate) fn a_file(
         deleted_at: None,
         indexed_at: Utc::now(),
         missing_at,
+        // Playback reads a file to play it; which extraction wrote its
+        // metadata is nothing to do with that.
+        metadata_version: 0,
     }
 }

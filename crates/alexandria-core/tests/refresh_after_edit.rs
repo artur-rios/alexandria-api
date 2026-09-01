@@ -17,14 +17,19 @@
 //! `hashing.rs` for touching the real filesystem directly.
 
 use alexandria_core::auth::BearerAuthService;
+use alexandria_core::catalog::audio_tags::LoftyAudioMetadataReader;
 use alexandria_core::catalog::clock::SystemClock;
+use alexandria_core::catalog::comic_tags::CbzComicMetadataReader;
 use alexandria_core::catalog::commands::edit_content::EditTextFileContentHandler;
 use alexandria_core::catalog::commands::refresh::RefreshHandler;
+use alexandria_core::catalog::document_tags::PdfEpubMetadataReader;
 use alexandria_core::catalog::fs::StdFilesystem;
+use alexandria_core::catalog::image_tags::ExifImageMetadataReader;
 use alexandria_core::catalog::model::{FileType, NewFile};
 use alexandria_core::catalog::repos::{CatalogRepository, SqliteCatalogRepository};
 use alexandria_core::catalog::run_registry::RunRegistry;
 use alexandria_core::catalog::runs::{RunPriority, SqliteCatalogRunRepository};
+use alexandria_core::catalog::video_tags::FfmpegVideoMetadataReader;
 use alexandria_core::migrate::run_migrations;
 use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
 use uuid::Uuid;
@@ -96,6 +101,11 @@ async fn given_a_just_edited_text_file_when_refreshed_then_it_is_unchanged_and_i
         repo.clone(),
         StdFilesystem,
         SystemClock,
+        LoftyAudioMetadataReader,
+        ExifImageMetadataReader,
+        PdfEpubMetadataReader,
+        FfmpegVideoMetadataReader,
+        CbzComicMetadataReader,
         1,
         1,
         runs,

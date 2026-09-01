@@ -81,6 +81,36 @@ pub trait CatalogRepository: Send + Sync {
         metadata: &SubtypeMetadata,
     ) -> Result<(), DomainError>;
 
+    /// Fill the editable subtype columns the catalog is *missing* for `uuid`
+    /// from `metadata`, and leave every column that already holds something
+    /// exactly as it is (UC-02).
+    ///
+    /// The counterpart of [`CatalogRepository::update_metadata`], and the
+    /// difference between them is the whole reason this exists: that one is a
+    /// full replace, written for an owner editing a record on purpose. A
+    /// re-extraction that used it would overwrite a title the owner had
+    /// corrected with whatever the file's tags say, and would blank the
+    /// fields tags cannot carry — an image's caption, a video's media kind —
+    /// because a full replace writes `None` as `NULL`.
+    ///
+    /// So this one fills gaps and nothing else. A row indexed before the
+    /// extractor could read a field gets that field; everything the owner or
+    /// an earlier extraction wrote survives untouched. `NotFound` and the
+    /// subtype mismatch behave as they do above.
+    async fn fill_missing_metadata(
+        &self,
+        uuid: Uuid,
+        metadata: &SubtypeMetadata,
+    ) -> Result<(), DomainError>;
+
+    /// Record which extraction wrote this file's metadata
+    /// (`catalog::model::METADATA_VERSION`).
+    ///
+    /// Written after extraction has actually run, never at insert: a row
+    /// whose tags could not be read must stay behind the current version so
+    /// a later refresh tries again.
+    async fn set_metadata_version(&self, uuid: Uuid, version: i64) -> Result<(), DomainError>;
+
     /// List files filtered by type, lifecycle state, and containing
     /// collection (UC-03 / FR-FC-12; the collection filter arrived with
     /// UC-14). `file_type = None` means no type filter; `state` selects the
@@ -466,7 +496,8 @@ impl SqliteCatalogRepository {
     async fn list_in_library_impl(&self, uuid: Uuid) -> Result<Vec<FileView>, DomainError> {
         let rows = sqlx::query_as::<_, FileRowWithId>(
             "SELECT f.id, f.uuid, f.path, f.name, f.type, f.content_hash, f.state, \
-             f.deleted_at, f.indexed_at, f.missing_at, f.size_bytes, f.mtime, l.uuid \
+             f.deleted_at, f.indexed_at, f.missing_at, f.size_bytes, f.mtime, \
+             f.metadata_version, l.uuid \
              FROM files f \
              JOIN libraries l ON l.id = f.library_id \
              WHERE l.uuid = ? AND f.state = 'active' \
@@ -483,9 +514,10 @@ impl SqliteCatalogRepository {
                 // An unparseable library uuid reads as "no library" rather
                 // than failing the listing: the row is still the owner's
                 // file, and one bad marker must not cost them the answer.
-                let library_uuid = row.12.as_deref().and_then(|s| Uuid::parse_str(s).ok());
+                let library_uuid = row.13.as_deref().and_then(|s| Uuid::parse_str(s).ok());
                 let file_row: FileRow = (
                     row.1, row.2, row.3, row.4, row.5, row.6, row.7, row.8, row.9, row.10, row.11,
+                    row.12,
                 );
                 parse_file_row(file_row).map(|file| (id, file, library_uuid))
             })
@@ -785,9 +817,10 @@ fn parse_type_str(s: &str) -> Result<FileType, DomainError> {
 
 /// A `files` row as selected by every catalog read, in column order:
 /// uuid, path, name, type, content_hash, state, deleted_at, indexed_at,
-/// missing_at, size_bytes, mtime. Named so the four read paths share one
-/// shape and `parse_file_row` has a single source of truth for it.
-/// `content_hash` is nullable (Task 3): `None` means "not computed yet".
+/// missing_at, size_bytes, mtime, metadata_version. Named so the four read
+/// paths share one shape and `parse_file_row` has a single source of truth
+/// for it. `content_hash` is nullable (Task 3): `None` means "not computed
+/// yet".
 type FileRow = (
     String,
     String,
@@ -800,6 +833,7 @@ type FileRow = (
     Option<String>,
     Option<i64>,
     Option<String>,
+    i64,
 );
 
 /// The editable columns of each subtype row, as selected by
@@ -836,6 +870,7 @@ type FileRowWithId = (
     Option<String>,
     Option<i64>,
     Option<String>,
+    i64,
     // The owning library's uuid, appended last so the `FileRow` slice above
     // it keeps its positions.
     Option<String>,
@@ -893,7 +928,7 @@ impl CatalogRepository for SqliteCatalogRepository {
     async fn find_by_path(&self, path: &str) -> Result<Option<File>, DomainError> {
         let row: Option<FileRow> = sqlx::query_as(
             "SELECT uuid, path, name, type, content_hash, state, deleted_at, indexed_at, \
-             missing_at, size_bytes, mtime FROM files WHERE path = ?",
+             missing_at, size_bytes, mtime, metadata_version FROM files WHERE path = ?",
         )
         .bind(path)
         .fetch_optional(&self.pool)
@@ -904,7 +939,7 @@ impl CatalogRepository for SqliteCatalogRepository {
     async fn find_by_uuid(&self, uuid: Uuid) -> Result<Option<File>, DomainError> {
         let row: Option<FileRow> = sqlx::query_as(
             "SELECT uuid, path, name, type, content_hash, state, deleted_at, indexed_at, \
-             missing_at, size_bytes, mtime FROM files WHERE uuid = ?",
+             missing_at, size_bytes, mtime, metadata_version FROM files WHERE uuid = ?",
         )
         .bind(uuid.to_string())
         .fetch_optional(&self.pool)
@@ -987,13 +1022,18 @@ impl CatalogRepository for SqliteCatalogRepository {
             deleted_at: None,
             indexed_at: new_file.indexed_at,
             missing_at: None,
+            // Nothing has been extracted for this row yet: the caller writes
+            // the stamp once extraction has actually run, so a row whose
+            // tags could not be read is revisited rather than declared
+            // current.
+            metadata_version: 0,
         })
     }
 
     async fn list_all(&self) -> Result<Vec<File>, DomainError> {
         let rows: Vec<FileRow> = sqlx::query_as(
             "SELECT uuid, path, name, type, content_hash, state, deleted_at, indexed_at, \
-             missing_at, size_bytes, mtime FROM files ORDER BY path",
+             missing_at, size_bytes, mtime, metadata_version FROM files ORDER BY path",
         )
         .fetch_all(&self.pool)
         .await?;
@@ -1182,6 +1222,154 @@ impl CatalogRepository for SqliteCatalogRepository {
         Ok(())
     }
 
+    async fn fill_missing_metadata(
+        &self,
+        uuid: Uuid,
+        metadata: &SubtypeMetadata,
+    ) -> Result<(), DomainError> {
+        let mut tx = self.pool.begin_with(WRITE_TX).await?;
+
+        let (id, type_str): (i64, String) =
+            sqlx::query_as("SELECT id, type FROM files WHERE uuid = ?")
+                .bind(uuid.to_string())
+                .fetch_optional(&mut *tx)
+                .await?
+                .ok_or(DomainError::NotFound)?;
+
+        let actual_type = parse_type_str(&type_str)?;
+        if actual_type != metadata.file_type() {
+            return Err(DomainError::InvalidInput(
+                "metadata does not match file subtype".into(),
+            ));
+        }
+
+        // `COALESCE(column, ?)` on every column, which is the whole
+        // difference from `update_metadata` above: a column that already
+        // holds something keeps it, and a bind of `None` against an empty
+        // column leaves it empty. So a re-extraction can only ever add.
+        let affected = match metadata {
+            SubtypeMetadata::Audio {
+                title,
+                artist,
+                album,
+                year,
+                genre,
+                track,
+                album_artist,
+            } => {
+                sqlx::query(
+                    "UPDATE audio_files \
+                     SET title = COALESCE(title, ?), artist = COALESCE(artist, ?), \
+                     album = COALESCE(album, ?), year = COALESCE(year, ?), \
+                     genre = COALESCE(genre, ?), track = COALESCE(track, ?), \
+                     album_artist = COALESCE(album_artist, ?) \
+                     WHERE file_id = ?",
+                )
+                .bind(title)
+                .bind(artist)
+                .bind(album)
+                .bind(*year)
+                .bind(genre)
+                .bind(*track)
+                .bind(album_artist)
+                .bind(id)
+                .execute(&mut *tx)
+                .await?
+            }
+            SubtypeMetadata::Video {
+                title,
+                year,
+                resolution,
+                media_kind,
+            } => {
+                sqlx::query(
+                    "UPDATE video_files \
+                     SET title = COALESCE(title, ?), year = COALESCE(year, ?), \
+                     resolution = COALESCE(resolution, ?), \
+                     media_kind = COALESCE(media_kind, ?) \
+                     WHERE file_id = ?",
+                )
+                .bind(title)
+                .bind(*year)
+                .bind(resolution)
+                .bind(media_kind.map(|m| m.as_str()))
+                .bind(id)
+                .execute(&mut *tx)
+                .await?
+            }
+            SubtypeMetadata::Document {
+                title,
+                author,
+                year,
+                format_kind,
+            } => {
+                sqlx::query(
+                    "UPDATE documents \
+                     SET title = COALESCE(title, ?), author = COALESCE(author, ?), \
+                     year = COALESCE(year, ?), format_kind = COALESCE(format_kind, ?) \
+                     WHERE file_id = ?",
+                )
+                .bind(title)
+                .bind(author)
+                .bind(*year)
+                .bind(format_kind.map(|f| f.as_str()))
+                .bind(id)
+                .execute(&mut *tx)
+                .await?
+            }
+            SubtypeMetadata::Comic {
+                title,
+                series,
+                issue_number,
+            } => {
+                sqlx::query(
+                    "UPDATE comic_books \
+                     SET title = COALESCE(title, ?), series = COALESCE(series, ?), \
+                     issue_number = COALESCE(issue_number, ?) \
+                     WHERE file_id = ?",
+                )
+                .bind(title)
+                .bind(series)
+                .bind(*issue_number)
+                .bind(id)
+                .execute(&mut *tx)
+                .await?
+            }
+            SubtypeMetadata::Image { title, caption } => {
+                sqlx::query(
+                    "UPDATE images \
+                     SET title = COALESCE(title, ?), caption = COALESCE(caption, ?) \
+                     WHERE file_id = ?",
+                )
+                .bind(title)
+                .bind(caption)
+                .bind(id)
+                .execute(&mut *tx)
+                .await?
+            }
+        }
+        .rows_affected();
+
+        if affected == 0 {
+            return Err(DomainError::internal(format!(
+                "subtype row missing for file {uuid} ({})",
+                actual_type.as_str()
+            )));
+        }
+
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn set_metadata_version(&self, uuid: Uuid, version: i64) -> Result<(), DomainError> {
+        sqlx::query("UPDATE files SET metadata_version = ? WHERE uuid = ?")
+            .bind(version)
+            .bind(uuid.to_string())
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     async fn list_filtered(
         &self,
         file_type: Option<FileType>,
@@ -1192,7 +1380,8 @@ impl CatalogRepository for SqliteCatalogRepository {
         // Build the query dynamically based on which filters are active —
         // see `list_filter_where_clause`.
         let base = "SELECT uuid, path, name, type, content_hash, state, deleted_at, \
-                    indexed_at, missing_at, size_bytes, mtime FROM files";
+                    indexed_at, missing_at, size_bytes, mtime, metadata_version \
+                    FROM files";
         let mut sql = String::from(base);
         sql.push_str(&Self::list_filter_where_clause(
             file_type,
@@ -1235,7 +1424,7 @@ impl CatalogRepository for SqliteCatalogRepository {
         // so the `WHERE` the shared helper builds keeps naming the columns
         // of `files` without a table qualifier.
         let base = "SELECT id, uuid, path, name, type, content_hash, state, deleted_at, \
-                    indexed_at, missing_at, size_bytes, mtime, \
+                    indexed_at, missing_at, size_bytes, mtime, metadata_version, \
                     (SELECT uuid FROM libraries WHERE id = files.library_id) \
                     FROM files";
         let mut sql = String::from(base);
@@ -1267,9 +1456,10 @@ impl CatalogRepository for SqliteCatalogRepository {
                 // An unparseable library uuid reads as "no library" rather
                 // than failing the listing: the row is still the owner's
                 // file, and one bad marker must not cost them the answer.
-                let library_uuid = row.12.as_deref().and_then(|s| Uuid::parse_str(s).ok());
+                let library_uuid = row.13.as_deref().and_then(|s| Uuid::parse_str(s).ok());
                 let file_row: FileRow = (
                     row.1, row.2, row.3, row.4, row.5, row.6, row.7, row.8, row.9, row.10, row.11,
+                    row.12,
                 );
                 parse_file_row(file_row).map(|file| (id, file, library_uuid))
             })
@@ -2016,6 +2206,7 @@ fn parse_file_row(row: FileRow) -> Result<File, DomainError> {
         missing_at_str,
         size_bytes,
         mtime_str,
+        metadata_version,
     ) = row;
 
     let uuid = Uuid::parse_str(&uuid_str).map_err(|_| {
@@ -2056,6 +2247,7 @@ fn parse_file_row(row: FileRow) -> Result<File, DomainError> {
         deleted_at,
         indexed_at,
         missing_at,
+        metadata_version,
     })
 }
 

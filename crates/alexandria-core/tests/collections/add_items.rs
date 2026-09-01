@@ -49,6 +49,7 @@ fn a_file(uuid: Uuid) -> File {
         deleted_at: None,
         indexed_at: chrono::Utc::now(),
         missing_at: None,
+        metadata_version: 0,
     }
 }
 

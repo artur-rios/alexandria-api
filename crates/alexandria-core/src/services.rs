@@ -117,6 +117,11 @@ pub type DefaultRefreshHandler = RefreshHandler<
     StdFilesystem,
     SystemClock,
     SqliteCatalogRunRepository,
+    LoftyAudioMetadataReader,
+    ExifImageMetadataReader,
+    PdfEpubMetadataReader,
+    FfmpegVideoMetadataReader,
+    CbzComicMetadataReader,
 >;
 
 pub type DefaultEditMetadataHandler =
@@ -547,6 +552,14 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         repo.clone(),
         fs,
         clock,
+        // The same readers the index uses: a refresh that re-read a file
+        // differently from the run that first catalogued it would fill the
+        // gaps with a second opinion.
+        audio_tags,
+        image_tags,
+        document_tags,
+        video_tags,
+        comic_tags,
         indexing_concurrency,
         indexing_low_priority_concurrency,
         run_repo.clone(),

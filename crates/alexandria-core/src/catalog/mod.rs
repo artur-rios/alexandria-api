@@ -4,6 +4,7 @@ pub mod clock;
 pub mod comic_tags;
 pub mod commands;
 pub mod document_tags;
+pub mod extraction;
 pub mod fs;
 pub mod image_tags;
 pub mod index_scope;

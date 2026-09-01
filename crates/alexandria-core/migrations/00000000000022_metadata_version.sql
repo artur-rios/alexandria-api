@@ -1,0 +1,13 @@
+-- Which extraction wrote a file's metadata (UC-02).
+--
+-- Extraction has only ever run at first index, so a row written before the
+-- extractor learned a field carries a gap nothing could ever close: a library
+-- indexed before `album_artist` existed (migration 15) holds NULL there for
+-- every track, and neither a re-index (which skips a catalogued path) nor a
+-- refresh (which compares size and mtime, and never reads tags) revisits it.
+--
+-- Zero is "written by an extraction that predates this column", which is what
+-- every existing row is. A refresh reads the tags of anything behind the
+-- current version, fills the fields the catalog is missing, and stamps it —
+-- once per row, not once per run.
+ALTER TABLE files ADD COLUMN metadata_version INTEGER NOT NULL DEFAULT 0;

@@ -4,13 +4,20 @@ use serde::Serialize;
 use uuid::Uuid;
 
 use crate::auth::AuthService;
+use crate::catalog::audio_tags::AudioMetadataReader;
 use crate::catalog::clock::Clock;
+use crate::catalog::comic_tags::ComicMetadataReader;
 use crate::catalog::commands::{flush_progress, record_halt, PROGRESS_FLUSH_SECONDS};
+use crate::catalog::document_tags::DocumentMetadataReader;
+use crate::catalog::extraction::{MetadataExtractor, MetadataWrite};
 use crate::catalog::fs::Filesystem;
+use crate::catalog::image_tags::ImageMetadataReader;
 use crate::catalog::model::File;
+use crate::catalog::model::METADATA_VERSION;
 use crate::catalog::repos::CatalogRepository;
 use crate::catalog::run_registry::{RunCell, RunPhase, RunRegistry, RunSignal};
 use crate::catalog::runs::{CatalogRunRepository, RunCounts, RunKind, RunPriority};
+use crate::catalog::video_tags::VideoMetadataReader;
 use crate::errors::DomainError;
 use crate::retry::{retry_on_busy, BUSY_ATTEMPTS};
 
@@ -32,6 +39,12 @@ pub struct RefreshOutcome {
     pub marked_missing: usize,
     /// Present and unchanged since the last index — no write performed.
     pub unchanged: usize,
+    /// Rows whose metadata an older extraction wrote, re-read from the file
+    /// and filled in (UC-02). Counted apart from `refreshed`, which is about
+    /// the file having changed on disk: these files did not change at all,
+    /// the catalog's reading of them did.
+    #[serde(rename = "metadataFilled")]
+    pub metadata_filled: usize,
     /// Cataloged paths that could not be processed because an operation against
     /// that one file failed (unreadable bytes, or a repository write error).
     /// The run continues past them; each is logged at `warn`.
@@ -68,11 +81,16 @@ pub struct RefreshOutcome {
 ///
 /// Generic over collaborators so the decision logic is unit-tested against
 /// trait fakes with no real DB / filesystem / auth service (Testing Spec §6.2).
-pub struct RefreshHandler<A, R, F, C, RR> {
+pub struct RefreshHandler<A, R, F, C, RR, M, N, O, P, Q> {
     auth: A,
     repo: R,
     fs: F,
     clock: C,
+    /// The same five readers `IndexHandler` holds, for the same reason and
+    /// through the same collaborator: a row written by an older extraction
+    /// is re-read here, and it must be read exactly as a first index would
+    /// read it (`MetadataExtractor`).
+    extractor: MetadataExtractor<M, N, O, P, Q>,
     concurrency: usize,
     /// The width a `RunPriority::Low` run refreshes at
     /// (`indexing.low_priority_concurrency`). See `concurrency` for the
@@ -84,13 +102,18 @@ pub struct RefreshHandler<A, R, F, C, RR> {
     registry: RunRegistry,
 }
 
-impl<A, R, F, C, RR> RefreshHandler<A, R, F, C, RR>
+impl<A, R, F, C, RR, M, N, O, P, Q> RefreshHandler<A, R, F, C, RR, M, N, O, P, Q>
 where
     A: AuthService,
     R: CatalogRepository,
     F: Filesystem,
     C: Clock,
     RR: CatalogRunRepository,
+    M: AudioMetadataReader,
+    N: ImageMetadataReader,
+    O: DocumentMetadataReader,
+    P: VideoMetadataReader,
+    Q: ComicMetadataReader,
 {
     /// `concurrency` is how many cataloged paths `execute` refreshes at a
     /// time for a `RunPriority::Normal` run; `low_priority_concurrency` is
@@ -102,6 +125,11 @@ where
         repo: R,
         fs: F,
         clock: C,
+        audio_tags: M,
+        image_tags: N,
+        document_tags: O,
+        video_tags: P,
+        comic_tags: Q,
         concurrency: u32,
         low_priority_concurrency: u32,
         runs: RR,
@@ -112,6 +140,13 @@ where
             repo,
             fs,
             clock,
+            extractor: MetadataExtractor::new(
+                audio_tags,
+                image_tags,
+                document_tags,
+                video_tags,
+                comic_tags,
+            ),
             concurrency: concurrency.max(1) as usize,
             low_priority_concurrency: low_priority_concurrency.max(1) as usize,
             runs,
@@ -269,6 +304,7 @@ where
                 refreshed: 0,
                 marked_missing: 0,
                 unchanged: 0,
+                metadata_filled: 0,
                 failed: 0,
             });
         }
@@ -328,6 +364,7 @@ where
                         PathOutcome::Refreshed => tally.refreshed += 1,
                         PathOutcome::MarkedMissing => tally.marked_missing += 1,
                         PathOutcome::Unchanged => tally.unchanged += 1,
+                        PathOutcome::MetadataFilled => tally.metadata_filled += 1,
                         PathOutcome::Failed => tally.failed += 1,
                         // Counted nowhere and not advanced past: this path
                         // was never processed. See `EntryOutcome::Halted`.
@@ -354,6 +391,7 @@ where
             refreshed,
             marked_missing,
             unchanged,
+            metadata_filled,
             failed,
             ..
         } = tally;
@@ -375,6 +413,7 @@ where
             refreshed,
             marked_missing,
             unchanged,
+            metadata_filled,
             failed,
         };
         tracing::info!(
@@ -463,7 +502,12 @@ where
             && file.mtime == stat.modified_at
             && file.missing_at.is_none();
         if unchanged {
-            return Ok(PathOutcome::Unchanged);
+            // The file has not changed, but the catalog's reading of it may
+            // be behind: extraction has only ever run at first index, so a
+            // row written before the extractor learned a field carries a gap
+            // nothing else would ever close. This is where it closes —
+            // once per row, because the row is stamped afterwards.
+            return self.fill_metadata(file).await;
         }
 
         retry_on_busy(BUSY_ATTEMPTS, || {
@@ -472,6 +516,50 @@ where
         })
         .await?;
         Ok(PathOutcome::Refreshed)
+    }
+
+    /// Re-reads an unchanged file's own metadata when an older extraction
+    /// wrote its row, and fills what the catalog is missing (UC-02).
+    ///
+    /// The gap this closes is a real library's: `album_artist` arrived in
+    /// migration 15, every row indexed before it holds NULL there, and
+    /// nothing revisited a row once it was written — so an artists list
+    /// grouped by the record's own artist fell back to each track's
+    /// performer, and a record with guests on it appeared once per guest.
+    ///
+    /// Three things keep this cheap and safe. It reads a file only while the
+    /// row is behind [`METADATA_VERSION`], so a library pays for it once and
+    /// never again. It fills rather than replaces
+    /// ([`CatalogRepository::fill_missing_metadata`]), so a title the owner
+    /// corrected by hand is not overwritten by whatever the tags say. And it
+    /// stamps only what it actually read: a file whose tags will not parse
+    /// stays behind, to be tried again by a build that can read it.
+    async fn fill_metadata(&self, file: &File) -> Result<PathOutcome, DomainError> {
+        if file.metadata_version >= METADATA_VERSION {
+            return Ok(PathOutcome::Unchanged);
+        }
+
+        let filled = self
+            .extractor
+            .extract_into(
+                &self.repo,
+                file.uuid,
+                &file.path,
+                file.file_type,
+                MetadataWrite::FillGaps,
+            )
+            .await;
+
+        if !filled {
+            return Ok(PathOutcome::Unchanged);
+        }
+
+        retry_on_busy(BUSY_ATTEMPTS, || {
+            self.repo.set_metadata_version(file.uuid, METADATA_VERSION)
+        })
+        .await?;
+
+        Ok(PathOutcome::MetadataFilled)
     }
 }
 
@@ -483,6 +571,9 @@ enum PathOutcome {
     Refreshed,
     MarkedMissing,
     Unchanged,
+    /// Present, unchanged on disk, and re-read because an older extraction
+    /// wrote its metadata.
+    MetadataFilled,
     Failed,
     /// The run was paused or cancelled before this path did any work. The
     /// counterpart of `EntryOutcome::Halted` — it contributes to no counter
@@ -498,6 +589,7 @@ struct RefreshTally {
     refreshed: usize,
     marked_missing: usize,
     unchanged: usize,
+    metadata_filled: usize,
     failed: usize,
     last_flush: DateTime<Utc>,
 }
@@ -511,6 +603,7 @@ impl RefreshTally {
             refreshed: 0,
             marked_missing: 0,
             unchanged: 0,
+            metadata_filled: 0,
             failed: 0,
             last_flush: started,
         }

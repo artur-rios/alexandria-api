@@ -687,6 +687,10 @@ fn parse_playlist_file_row(row: &sqlx::sqlite::SqliteRow) -> Result<File, Domain
         missing_at: missing_at
             .map(|s| parse_playlist_timestamp(&s, "missing_at"))
             .transpose()?,
+        // A playlist entry is read for what it plays, not for what its
+        // extraction knew: the stamp belongs to the catalog row and is not
+        // selected here.
+        metadata_version: 0,
     })
 }
 

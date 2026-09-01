@@ -271,6 +271,9 @@ impl CatalogRepository for FakeCatalogRepository {
             deleted_at: None,
             indexed_at: new_file.indexed_at,
             missing_at: None,
+            // As the real repository does: the stamp is written once
+            // extraction has actually run, not at insert.
+            metadata_version: 0,
         };
         self.files
             .lock()
@@ -359,6 +362,43 @@ impl CatalogRepository for FakeCatalogRepository {
             ));
         }
         self.metadata.lock().unwrap().insert(uuid, metadata.clone());
+        Ok(())
+    }
+
+    /// Fills only what is missing, which for this fake means: a file with no
+    /// metadata at all takes what it is given, and a file that already has
+    /// some keeps it. The real repository does it column by column
+    /// (`COALESCE`); what a test built on this asserts is the *rule* — a
+    /// re-extraction adds and never overwrites.
+    async fn fill_missing_metadata(
+        &self,
+        uuid: Uuid,
+        metadata: &SubtypeMetadata,
+    ) -> Result<(), DomainError> {
+        let files = self.files.lock().unwrap();
+        let file = files
+            .values()
+            .find(|f| f.uuid == uuid)
+            .ok_or(DomainError::NotFound)?;
+        if file.file_type != metadata.file_type() {
+            return Err(DomainError::InvalidInput(
+                "metadata does not match file subtype".into(),
+            ));
+        }
+        self.metadata
+            .lock()
+            .unwrap()
+            .entry(uuid)
+            .or_insert_with(|| metadata.clone());
+        Ok(())
+    }
+
+    async fn set_metadata_version(&self, uuid: Uuid, version: i64) -> Result<(), DomainError> {
+        let mut files = self.files.lock().unwrap();
+        let Some(file) = files.values_mut().find(|f| f.uuid == uuid) else {
+            return Err(DomainError::NotFound);
+        };
+        file.metadata_version = version;
         Ok(())
     }
 
@@ -1330,6 +1370,9 @@ pub fn existing_file(path: &str, file_type: FileType) -> File {
         deleted_at: None,
         indexed_at: now(),
         missing_at: None,
+        // Written by an extraction that predates the stamp, which is
+        // what every row a test seeds stands for.
+        metadata_version: 0,
     }
 }
 
@@ -1366,6 +1409,9 @@ pub fn deleted_file_at(
         deleted_at: Some(deleted_at),
         indexed_at: deleted_at,
         missing_at: None,
+        // Written by an extraction that predates the stamp, which is
+        // what every row a test seeds stands for.
+        metadata_version: 0,
     }
 }
 
@@ -1384,6 +1430,9 @@ pub fn existing_file_with_hash(path: &str, name: &str, file_type: FileType, hash
         deleted_at: None,
         indexed_at: earlier(),
         missing_at: None,
+        // Written by an extraction that predates the stamp, which is
+        // what every row a test seeds stands for.
+        metadata_version: 0,
     }
 }
 
@@ -1403,6 +1452,9 @@ pub fn existing_missing_file(path: &str, name: &str, file_type: FileType, hash: 
         deleted_at: None,
         indexed_at: earlier(),
         missing_at: Some(earlier()),
+        // Written by an extraction that predates the stamp, which is
+        // what every row a test seeds stands for.
+        metadata_version: 0,
     }
 }
 
@@ -1426,6 +1478,9 @@ pub fn a_cataloged_file(path: &str, size_bytes: i64, mtime: Option<DateTime<Utc>
         deleted_at: None,
         indexed_at: earlier(),
         missing_at: None,
+        // Written by an extraction that predates the stamp, which is
+        // what every row a test seeds stands for.
+        metadata_version: 0,
     }
 }
 
@@ -2878,6 +2933,18 @@ impl CatalogRepository for FailingCatalogRepository {
         _path: &str,
         _missing_at: DateTime<Utc>,
     ) -> Result<(), DomainError> {
+        unimplemented!("not reached by the run-fails-to-list path")
+    }
+
+    async fn fill_missing_metadata(
+        &self,
+        _uuid: Uuid,
+        _metadata: &SubtypeMetadata,
+    ) -> Result<(), DomainError> {
+        unimplemented!("not reached by the run-fails-to-list path")
+    }
+
+    async fn set_metadata_version(&self, _uuid: Uuid, _version: i64) -> Result<(), DomainError> {
         unimplemented!("not reached by the run-fails-to-list path")
     }
 

@@ -401,7 +401,26 @@ pub struct File {
     /// unchanged (still `active`/`deleted`); `missing_at` is orthogonal to the
     /// soft-delete lifecycle owned by UC-06/07.
     pub missing_at: Option<DateTime<Utc>>,
+    /// Which extraction wrote this row's metadata — see [`METADATA_VERSION`].
+    ///
+    /// Zero for every row written before the stamp existed, which is the
+    /// state a library indexed by an older build is in. A refresh reads the
+    /// tags of anything behind the current version and fills what the catalog
+    /// is missing (UC-02).
+    pub metadata_version: i64,
 }
+
+/// What the extractor knows how to read, as a number that only ever goes up.
+///
+/// Bumped when extraction learns a field, and never for anything else: the
+/// number's only job is to tell a row written by an older extraction from one
+/// written by this one, so that the first can be revisited exactly once.
+///
+/// 1 — the album artist. Files indexed before migration 15 carry no
+/// `album_artist`, which is why the artists list showed a compilation's
+/// performers instead of the records' own artists: the tag was in the file
+/// and never in the catalog, and nothing revisited a row once it was written.
+pub const METADATA_VERSION: i64 = 1;
 
 /// Response of UC-09 purge-on-disk (FR-FC-23): the pre-delete snapshot of the
 /// record plus whether an on-disk file was actually present to remove.

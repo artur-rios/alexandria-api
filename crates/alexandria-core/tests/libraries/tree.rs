@@ -29,6 +29,7 @@ fn at(path: &str) -> (String, FileView) {
                 missing_at: None,
                 size_bytes: None,
                 mtime: None,
+                metadata_version: 0,
             },
             metadata: None,
             width: None,
