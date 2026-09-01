@@ -258,7 +258,11 @@ fn given_ffi_library_when_version_called_then_returns_version_string() {
     assert!(!raw.is_null());
     // SAFETY: the FFI returns a static NUL-terminated string.
     let cstr = unsafe { CStr::from_ptr(raw) };
-    assert_eq!(cstr.to_str().unwrap(), "0.1.0");
+    // The crate's own version, not a literal repeated here: a client refuses
+    // a core outside the minor line it was built against, so what this pins
+    // is that the string is *the version* — a call answering something else
+    // would strand every client at startup.
+    assert_eq!(cstr.to_str().unwrap(), env!("CARGO_PKG_VERSION"));
 }
 
 #[test]

@@ -7,7 +7,15 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.1.0"
+# 0.2.0 — the metadata stamp (migration 22) and the lyrics search fallback.
+#
+# Pre-1.0, a minor bump is what a client reads as "not the core I was built
+# against": `alexandria-ui` accepts a single minor line and refuses anything
+# else at startup, by name and version. That check is the only thing standing
+# between an owner running a stale library and a feature that quietly does
+# nothing — which is exactly what a schema this release adds to, and a lookup
+# this release changes the shape of, would otherwise look like.
+version = "0.2.0"
 edition = "2021"
 # Floor set by sqlx 0.9, the highest MSRV in the dependency graph.
 rust-version = "1.94"

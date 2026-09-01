@@ -18,7 +18,14 @@ use alexandria_core::errors::{error_body, DomainError};
 use alexandria_core::migrate::migrate_database;
 use alexandria_core::services::{build_services, Services};
 
-static VERSION_CSTRING: &[u8] = b"0.1.0\0";
+/// What `alexandria_version` answers, NUL-terminated for the C ABI.
+///
+/// Taken from the crate rather than written out. It was a literal, which
+/// meant the number a client reads had no connection to the number the
+/// workspace carries: bumping the version would have left every client
+/// believing it still had the core it was built against, which is the exact
+/// mistake the version check exists to catch.
+static VERSION_CSTRING: &[u8] = concat!(env!("CARGO_PKG_VERSION"), "\0").as_bytes();
 
 static RUNTIME: OnceLock<Runtime> = OnceLock::new();
 static SERVICES: OnceLock<Mutex<Option<Arc<Services>>>> = OnceLock::new();
