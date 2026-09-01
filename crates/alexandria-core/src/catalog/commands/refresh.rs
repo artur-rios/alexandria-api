@@ -507,7 +507,10 @@ where
             // row written before the extractor learned a field carries a gap
             // nothing else would ever close. This is where it closes —
             // once per row, because the row is stamped afterwards.
-            return self.fill_metadata(file).await;
+            return match self.fill_metadata(file, WhenBehind).await? {
+                Filled::Yes => Ok(PathOutcome::MetadataFilled),
+                Filled::No => Ok(PathOutcome::Unchanged),
+            };
         }
 
         retry_on_busy(BUSY_ATTEMPTS, || {
@@ -515,6 +518,17 @@ where
                 .refresh_stat(&file.path, stat.size_bytes, stat.modified_at, now)
         })
         .await?;
+
+        // A changed file is read whatever its stamp says: its bytes are new,
+        // so its tags may be new too, and the stamp only records which
+        // extraction last read them — not which bytes it read. Filling still
+        // only ever adds, so a retagged file gains the fields it was missing
+        // and keeps everything it already had, the owner's edits included.
+        //
+        // Counted as `Refreshed` all the same: what matters about this path
+        // is that the file itself moved on.
+        self.fill_metadata(file, Always).await?;
+
         Ok(PathOutcome::Refreshed)
     }
 
@@ -534,9 +548,13 @@ where
     /// corrected by hand is not overwritten by whatever the tags say. And it
     /// stamps only what it actually read: a file whose tags will not parse
     /// stays behind, to be tried again by a build that can read it.
-    async fn fill_metadata(&self, file: &File) -> Result<PathOutcome, DomainError> {
-        if file.metadata_version >= METADATA_VERSION {
-            return Ok(PathOutcome::Unchanged);
+    async fn fill_metadata(
+        &self,
+        file: &File,
+        read: ReadTags,
+    ) -> Result<Filled, DomainError> {
+        if read == WhenBehind && file.metadata_version >= METADATA_VERSION {
+            return Ok(Filled::No);
         }
 
         let filled = self
@@ -551,7 +569,7 @@ where
             .await;
 
         if !filled {
-            return Ok(PathOutcome::Unchanged);
+            return Ok(Filled::No);
         }
 
         retry_on_busy(BUSY_ATTEMPTS, || {
@@ -559,8 +577,38 @@ where
         })
         .await?;
 
-        Ok(PathOutcome::MetadataFilled)
+        Ok(Filled::Yes)
     }
+}
+
+/// When [`RefreshHandler::fill_metadata`] should open the file at all.
+///
+/// The stamp records which *extraction* last read a row, not which bytes it
+/// read — so it answers "is this row behind?" and says nothing about a file
+/// whose contents have since changed. The two callers want different things
+/// from it, and conflating them is what left a retagged file unread.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReadTags {
+    /// Only while the row is behind the current extraction. The unchanged
+    /// path: reading every file on every pass is what the stat comparison
+    /// exists to avoid.
+    WhenBehind,
+    /// Regardless of the stamp. The changed path: new bytes, possibly new
+    /// tags.
+    Always,
+}
+
+use ReadTags::{Always, WhenBehind};
+
+/// Whether a path's metadata was actually re-read and written.
+///
+/// Its own two-value type rather than a `bool`, because the caller does two
+/// different things with the answer: on an unchanged path it decides the
+/// path's outcome, and on a changed one it decides nothing at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Filled {
+    Yes,
+    No,
 }
 
 /// What a single cataloged path resolved to during a refresh pass.

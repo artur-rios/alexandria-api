@@ -254,6 +254,46 @@ async fn given_a_row_an_older_extraction_wrote_when_refreshed_then_its_metadata_
     );
 }
 
+/// A file whose bytes changed is re-read too, and for a better reason: its
+/// tags may have changed with them. It stays counted as refreshed — that the
+/// file itself moved on is the larger fact about that path.
+#[tokio::test]
+async fn given_a_changed_file_when_refreshed_then_its_metadata_is_read_as_well() {
+    let repo = FakeCatalogRepository::new();
+    let mut file = a_cataloged_file("/library/retagged.flac", 4096, Some(now()));
+    // Stamped current: the row is not behind, and the file is read anyway.
+    // The stamp records which extraction last read a row, not which bytes it
+    // read — a retagged file has new bytes and the same stamp.
+    file.metadata_version = METADATA_VERSION;
+    let uuid = file.uuid;
+    repo.seed(file);
+    let repo_handle = repo.clone();
+
+    let audio = FakeAudioMetadataReader::new();
+    audio.seed("/library/retagged.flac", tags_with_album_artist());
+
+    // A different size: the stat comparison calls this changed.
+    let fs = FakeFilesystem::builder()
+        .with_file("/lib", "/library/retagged.flac", "retagged.flac", "unused")
+        .with_stat("/library/retagged.flac", 8192, Some(now()))
+        .build();
+
+    let outcome = refresh_handler_reading(repo, fs, audio)
+        .execute(Uuid::new_v4())
+        .await
+        .expect("execute");
+
+    assert_eq!(outcome.refreshed, 1);
+    assert_eq!(
+        outcome.metadata_filled, 0,
+        "the path is reported by what happened to the file, not to its row"
+    );
+    assert!(
+        repo_handle.metadata_for(uuid).is_some(),
+        "a file whose bytes changed had its tags read too"
+    );
+}
+
 /// Once, not once a run. The stamp is the whole reason a refresh can afford
 /// to read tags at all.
 #[tokio::test]
