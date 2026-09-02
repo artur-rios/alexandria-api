@@ -132,17 +132,7 @@ where
     ) -> Result<EnrichmentReport, DomainError> {
         self.auth.authenticate(token).await?;
 
-        // Refused before anything is read, and refused with the reason. A
-        // caller told only "no" cannot tell the owner whether to switch the
-        // feature on or to fill in a contact.
-        if let Some(reason) = self.settings.unavailable_reason() {
-            return Err(match reason {
-                MetadataUnavailable::Disabled => DomainError::InvalidState,
-                MetadataUnavailable::ContactMissing => DomainError::InvalidInput(
-                    "metadata.contact must be set before enrichment can run".to_string(),
-                ),
-            });
-        }
+        self.ensure_available()?;
 
         let candidates = self.repo.candidates(&scope).await?;
         let mut report = EnrichmentReport::default();
@@ -166,6 +156,72 @@ where
         report.remaining = self.repo.pending_count().await?;
 
         Ok(report)
+    }
+
+    /// Refuse before anything is read, and refuse with the reason.
+    ///
+    /// A caller told only "no" cannot tell the owner whether to switch the
+    /// feature on or to fill in a contact. Shared by the run and the
+    /// single-artist lookup beside it, because both reach the network and
+    /// both are governed by the same two settings.
+    fn ensure_available(&self) -> Result<(), DomainError> {
+        if let Some(reason) = self.settings.unavailable_reason() {
+            return Err(match reason {
+                MetadataUnavailable::Disabled => DomainError::InvalidState,
+                MetadataUnavailable::ContactMissing => DomainError::InvalidInput(
+                    "metadata.contact must be set before enrichment can run".to_string(),
+                ),
+            });
+        }
+
+        Ok(())
+    }
+
+    /// Look one artist up by name, and keep what comes back (FR-PL-15).
+    ///
+    /// The gap this closes. A run over a *file* looks the artist up under
+    /// whatever that file is tagged with — its album artist, or failing that
+    /// its performer — and a client's artists list is grouped by a name it
+    /// worked out for itself across every track of the record. For a file
+    /// tagged `50 Cent feat. Nate Dogg` with no album artist, the picture was
+    /// stored under that and the list looked for `50 Cent`: fetched, paid
+    /// for, and never shown. Asking by the name being shown is what makes the
+    /// two agree.
+    ///
+    /// One request, and no lyrics: this is what an artists list needs, where
+    /// [`EnrichmentScope::Artist`] would also fetch the words of every track
+    /// the artist appears on — minutes of somebody else's rate limit for
+    /// something nobody asked to read.
+    ///
+    /// A settled row is answered from storage without a request. Nothing else
+    /// would be honest about a photograph that has already been looked for
+    /// and not found: asking again on every start is how a library of five
+    /// hundred artists becomes five hundred requests a session, for ever.
+    pub async fn artist_image(
+        &self,
+        artist_name: &str,
+        token: &str,
+    ) -> Result<ArtistImage, DomainError> {
+        self.auth.authenticate(token).await?;
+        self.ensure_available()?;
+
+        let name = artist_name.trim();
+        if name.is_empty() {
+            return Err(DomainError::InvalidInput(
+                "an artist name is required".to_string(),
+            ));
+        }
+
+        if let Some(stored) = self.repo.artist_image(name).await? {
+            if stored.outcome.is_settled() {
+                return Ok(stored);
+            }
+        }
+
+        let outcome = self.fetch_artist_image(name).await;
+        self.repo.put_artist_image(outcome.clone()).await?;
+
+        Ok(outcome)
     }
 
     /// Look up one candidate's artist image, unless it is already settled.

@@ -5462,6 +5462,110 @@ pub extern "C" fn alexandria_enrichment_read_track(
     })
 }
 
+/// UC-46 step 3 — the photograph stored for one artist, by name (FR-PL-15).
+///
+/// A read, never a lookup: an artists list is a screenful of rows, and a call
+/// per row that could reach the network would be dozens of requests a second
+/// against services that allow one. `ENRICHMENT_ERR_NOT_FOUND` for an artist
+/// nobody has looked up and for one looked up without success — a client has
+/// nothing different to draw for the two.
+///
+/// By name, not by file: a client's artists list is grouped by a name it
+/// worked out itself across every track of a record, and a picture stored
+/// under whatever one file happened to be tagged with is one that list will
+/// never find.
+#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
+#[no_mangle]
+pub extern "C" fn alexandria_artist_image(
+    name: *const c_char,
+    token: *const c_char,
+) -> EnrichmentJsonResult {
+    ffi_guard(EnrichmentJsonResult::err(ENRICHMENT_ERR_OTHER), || {
+        let services = match locked_services() {
+            Some(s) => s,
+            None => return EnrichmentJsonResult::err(ENRICHMENT_ERR_NOT_INITIALIZED),
+        };
+
+        let token = cstr_lossy(token).unwrap_or_default();
+        if !authenticated(&services, &token) {
+            return EnrichmentJsonResult::err(ENRICHMENT_ERR_UNAUTHORIZED);
+        }
+
+        let name = match cstr_lossy(name) {
+            Some(name) => name,
+            None => return EnrichmentJsonResult::err(ENRICHMENT_ERR_INVALID_INPUT),
+        };
+
+        let result = runtime().block_on(async {
+            services
+                .read_enrichment_handler
+                .artist_image(&name, &token)
+                .await
+        });
+
+        match result {
+            Ok(Some(image)) => {
+                let json = serde_json::to_string(&image).unwrap_or_default();
+                EnrichmentJsonResult::ok(json)
+            }
+            Ok(None) => EnrichmentJsonResult::err(ENRICHMENT_ERR_NOT_FOUND),
+            Err(err) => map_enrichment_err(err),
+        }
+    })
+}
+
+/// UC-46 step 3 — look one artist's photograph up, and keep it (FR-PL-15).
+///
+/// **Reaches the network**, once, for one artist: the identity service and
+/// then the picture. A row already settled — found, or looked for and not
+/// found — is answered from storage without a request, which is what keeps a
+/// library of five hundred artists from being five hundred requests every
+/// session.
+///
+/// Answers the row whatever it concluded, so a caller can tell "found" from
+/// "nothing to be found" and stop asking. The path is relative to the core's
+/// own image cache; `alexandria_artist_image` answers it resolved.
+#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
+#[no_mangle]
+pub extern "C" fn alexandria_artist_image_fetch(
+    name: *const c_char,
+    token: *const c_char,
+) -> EnrichmentJsonResult {
+    ffi_guard(EnrichmentJsonResult::err(ENRICHMENT_ERR_OTHER), || {
+        let services = match locked_services() {
+            Some(s) => s,
+            None => return EnrichmentJsonResult::err(ENRICHMENT_ERR_NOT_INITIALIZED),
+        };
+
+        let token = cstr_lossy(token).unwrap_or_default();
+        if !authenticated(&services, &token) {
+            return EnrichmentJsonResult::err(ENRICHMENT_ERR_UNAUTHORIZED);
+        }
+
+        let name = match cstr_lossy(name) {
+            Some(name) => name,
+            None => return EnrichmentJsonResult::err(ENRICHMENT_ERR_INVALID_INPUT),
+        };
+
+        // Absent for the same reason the run above is: the capability is
+        // real, this installation has not turned it on.
+        let handler = match services.enrich_handler.clone() {
+            Some(handler) => handler,
+            None => return EnrichmentJsonResult::err(ENRICHMENT_ERR_UNAVAILABLE),
+        };
+
+        let result = runtime().block_on(async { handler.artist_image(&name, &token).await });
+
+        match result {
+            Ok(image) => {
+                let json = serde_json::to_string(&image).unwrap_or_default();
+                EnrichmentJsonResult::ok(json)
+            }
+            Err(err) => map_enrichment_err(err),
+        }
+    })
+}
+
 /// FFI status codes returned by library operations (libraries design). Its
 /// own set, per the convention above; `LIBRARY_OK == PLAYLIST_OK == 0`.
 pub const LIBRARY_OK: c_int = 0;

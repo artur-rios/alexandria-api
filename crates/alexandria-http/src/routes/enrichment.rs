@@ -7,7 +7,7 @@ use axum::Json;
 use serde::Deserialize;
 use uuid::Uuid;
 
-use alexandria_core::enrichment::model::{EnrichmentReport, EnrichmentScope};
+use alexandria_core::enrichment::model::{ArtistImage, EnrichmentReport, EnrichmentScope};
 use alexandria_core::enrichment::queries::TrackEnrichmentView;
 use alexandria_core::errors::DomainError;
 
@@ -136,4 +136,70 @@ pub async fn read_track(
         .map_err(ApiError)?;
 
     Ok((StatusCode::OK, Json(view)))
+}
+
+/// The artist a picture is asked for.
+#[derive(Debug, serde::Deserialize)]
+pub struct ArtistImageQuery {
+    pub name: String,
+}
+
+/// `GET /v1/enrichment/artist-image?name=…` — the photograph stored for one
+/// artist (FR-PL-15).
+///
+/// A read, never a lookup, and available whether or not enrichment is
+/// switched on: an artists list is a screenful of rows, and reading what was
+/// already fetched is not a network operation. `404` for an artist nobody has
+/// looked up and for one looked up without success — a client has nothing
+/// different to draw for the two.
+pub async fn read_artist_image(
+    State(state): State<AppState>,
+    query: Result<Query<ArtistImageQuery>, QueryRejection>,
+    headers: HeaderMap,
+) -> Result<(StatusCode, Json<ArtistImage>), ApiError> {
+    let token = bearer_token(&headers);
+    let Query(query) = query.map_err(|err| invalid_input(format!("invalid query: {err}")))?;
+
+    let image = state
+        .services
+        .read_enrichment_handler
+        .artist_image(&query.name, &token)
+        .await
+        .map_err(ApiError)?
+        .ok_or(ApiError(DomainError::NotFound))?;
+
+    Ok((StatusCode::OK, Json(image)))
+}
+
+/// `POST /v1/enrichment/artist-image?name=…` — look one artist's photograph
+/// up and keep it (FR-PL-15).
+///
+/// **Reaches the network**, once, for one artist. A row already settled —
+/// found, or looked for and not found — is answered from storage without a
+/// request, which is what keeps a library of five hundred artists from being
+/// five hundred requests every session. Answers the row whatever it
+/// concluded, so a caller can tell "found" from "nothing to be found" and
+/// stop asking.
+pub async fn fetch_artist_image(
+    State(state): State<AppState>,
+    query: Result<Query<ArtistImageQuery>, QueryRejection>,
+    headers: HeaderMap,
+) -> Result<(StatusCode, Json<ArtistImage>), ApiError> {
+    let token = bearer_token(&headers);
+    let Query(query) = query.map_err(|err| invalid_input(format!("invalid query: {err}")))?;
+
+    // Absent for the same reason a run is refused: the capability is real,
+    // this installation has not turned it on.
+    let handler = state
+        .services
+        .enrich_handler
+        .clone()
+        .ok_or(ApiError(DomainError::InvalidState))?;
+
+    let image = handler
+        .artist_image(&query.name, &token)
+        .await
+        .map_err(ApiError)?;
+
+    Ok((StatusCode::OK, Json(image)))
 }

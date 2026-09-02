@@ -51,6 +51,58 @@ where
         }
     }
 
+    /// The stored photograph for one artist, by name (FR-PL-15).
+    ///
+    /// A read, never a lookup: an artists list is a screenful of rows and a
+    /// call per row that could reach the network would be dozens of requests
+    /// a second against services that allow one. What fills the gaps is the
+    /// fetch beside this, asked for once per artist by a caller that knows it
+    /// is doing so.
+    ///
+    /// By *name*, which is the whole point of it existing beside `read`: a
+    /// client's artists list is grouped by a name it worked out itself — from
+    /// the album-artist tag, from the same tag on another track of the record,
+    /// or from the performer most of the record's tracks name — and a picture
+    /// stored under whatever one file happened to be tagged with is a picture
+    /// that list will never find. Asking by the name being shown is what makes
+    /// the two agree.
+    ///
+    /// `None` for an artist nobody has looked up, and for one looked up
+    /// without success: a client has nothing different to draw for the two.
+    pub async fn artist_image(
+        &self,
+        artist_name: &str,
+        token: &str,
+    ) -> Result<Option<ArtistImage>, DomainError> {
+        self.auth.authenticate(token).await?;
+
+        let name = artist_name.trim();
+        if name.is_empty() {
+            return Err(DomainError::InvalidInput(
+                "an artist name is required".to_string(),
+            ));
+        }
+
+        Ok(self
+            .repo
+            .artist_image(name)
+            .await?
+            .filter(|image| image.image_path.is_some())
+            .map(|image| self.resolved(image)))
+    }
+
+    /// The same row with its path made absolute.
+    fn resolved(&self, mut image: ArtistImage) -> ArtistImage {
+        image.image_path = image.image_path.map(|relative| {
+            self.image_root
+                .join(relative)
+                .to_string_lossy()
+                .into_owned()
+        });
+
+        image
+    }
+
     /// The stored image and lyrics for `file_uuid`.
     ///
     /// `artist_name` is passed in rather than resolved here because the
@@ -77,15 +129,7 @@ where
                 .artist_image(name.trim())
                 .await?
                 .filter(|image| image.image_path.is_some())
-                .map(|mut image| {
-                    image.image_path = image.image_path.map(|relative| {
-                        self.image_root
-                            .join(relative)
-                            .to_string_lossy()
-                            .into_owned()
-                    });
-                    image
-                }),
+                .map(|image| self.resolved(image)),
             _ => None,
         };
 

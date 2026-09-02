@@ -93,6 +93,19 @@ track they appear on. It is keyed by the album artist's name as the catalog
 holds it, because that is the only artist identity the catalog has — there is no
 `artists` table, artists are tag values.
 
+Which is exactly why an artist's picture can also be asked for **by name**,
+and not only by running enrichment over a file. A run over a file looks the
+artist up under whatever that file is tagged with — its album artist, or
+failing that its performer — while a client's artists list is grouped by a
+name it worked out for itself across every track of the record (the UI's own
+FR-PL-14: the album-artist tag, then the same tag on another track, then the
+performer most of the record's tracks name). For a file tagged
+`50 Cent feat. Nate Dogg` with no album artist, the picture was stored under
+that string and the list, showing `50 Cent`, never found it: fetched, paid
+for, and never shown. `artist_image(name)` — read, and fetch — is the pair
+that makes the two agree, and it is one request per artist with no lyrics
+attached, which is what a screen full of artists actually needs.
+
 Lyrics are about a **recording**, and the closest thing the catalog has to a
 recording is a file, so `track_lyrics` is keyed by `file_id`. Two files of the
 same song get two rows; that is the honest answer, since they may differ in

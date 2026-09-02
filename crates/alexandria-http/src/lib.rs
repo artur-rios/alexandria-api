@@ -161,6 +161,10 @@ pub fn app(settings: Settings, services: Arc<Services>) -> Router {
             get(routes::enrichment::read_track),
         )
         .route(
+            "/v1/enrichment/artist-image",
+            get(routes::enrichment::read_artist_image).post(routes::enrichment::fetch_artist_image),
+        )
+        .route(
             "/v1/playlists",
             post(routes::playlists::create).get(routes::playlists::list),
         )

@@ -327,3 +327,124 @@ async fn given_a_second_run_when_nothing_changed_then_the_services_are_not_re_as
     );
     assert_eq!(report.considered, 0, "the file was still pending");
 }
+
+#[tokio::test]
+async fn given_an_artist_name_when_its_image_is_asked_for_then_it_is_stored_under_that_name() {
+    // The defect this closes, end to end. A run over a *file* looks the
+    // artist up under whatever that file is tagged with, and a client's
+    // artists list is grouped by a name it worked out across every track of
+    // the record — so a track tagged `Miles Davis Quintet` with no album
+    // artist stored a picture the list, showing `Miles Davis`, would never
+    // find. Fetched, paid for, and never shown.
+    //
+    // Nothing here inserts a file at all, which is the point: the name is the
+    // whole input, and the picture has to come back under it.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let pool = migrate_database(dir.path().join("a.sqlite").to_str().unwrap())
+        .await
+        .expect("migrate");
+
+    let (base, seen) = services().await;
+    let images = dir.path().join("artist-images");
+
+    let handler = EnrichHandler::new(
+        AllowAll,
+        SqliteEnrichmentRepository::new(pool.clone()),
+        MusicBrainzClient::against("owner@example.com", &format!("{base}/ws/2")).unwrap(),
+        CommonsImageClient::against(
+            "owner@example.com",
+            &format!("{base}/w/api.php"),
+            &format!("{base}/wiki/Special:FilePath"),
+        )
+        .unwrap(),
+        LrclibClient::against("owner@example.com", &format!("{base}/api/get")).unwrap(),
+        FsArtistImageStore::new(&images),
+        SystemClock,
+        MetadataSettings {
+            enabled: true,
+            contact: "owner@example.com".to_string(),
+            image_cache_dir: images.to_string_lossy().into_owned(),
+        },
+    );
+
+    let fetched = handler
+        .artist_image("Miles Davis", "token")
+        .await
+        .expect("the lookup failed");
+
+    assert_eq!(fetched.outcome, EnrichmentOutcome::Found);
+    assert_eq!(fetched.artist_name, "Miles Davis");
+    assert!(
+        images.join("mb-artist.jpg").exists(),
+        "no image was written"
+    );
+
+    // And it reads back by the same name, with the path resolved to
+    // something a client can open — which is the half the artists list uses.
+    let read = ReadEnrichmentHandler::new(
+        AllowAll,
+        SqliteEnrichmentRepository::new(pool.clone()),
+        &images,
+    )
+    .artist_image("Miles Davis", "token")
+    .await
+    .expect("read")
+    .expect("an image");
+
+    assert_eq!(
+        read.image_path.as_deref(),
+        images.join("mb-artist.jpg").to_str()
+    );
+
+    // Asked again, nothing is re-fetched: a settled row is the answer, which
+    // is what keeps a library of five hundred artists from being five
+    // hundred requests every session.
+    let before = seen.lock().expect("not poisoned").len();
+    let again = handler
+        .artist_image("Miles Davis", "token")
+        .await
+        .expect("the second lookup failed");
+
+    assert_eq!(again.outcome, EnrichmentOutcome::Found);
+    assert_eq!(
+        seen.lock().expect("not poisoned").len(),
+        before,
+        "the services were asked again for a picture already in hand"
+    );
+}
+
+#[tokio::test]
+async fn given_no_name_when_an_image_is_asked_for_then_it_is_refused() {
+    // Searching on nothing returns whatever is most popular under the empty
+    // string, which is how a library ends up with a confidently wrong face.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let pool = migrate_database(dir.path().join("a.sqlite").to_str().unwrap())
+        .await
+        .expect("migrate");
+
+    let (base, _) = services().await;
+    let images = dir.path().join("artist-images");
+    let handler = EnrichHandler::new(
+        AllowAll,
+        SqliteEnrichmentRepository::new(pool.clone()),
+        MusicBrainzClient::against("owner@example.com", &format!("{base}/ws/2")).unwrap(),
+        CommonsImageClient::against(
+            "owner@example.com",
+            &format!("{base}/w/api.php"),
+            &format!("{base}/wiki/Special:FilePath"),
+        )
+        .unwrap(),
+        LrclibClient::against("owner@example.com", &format!("{base}/api/get")).unwrap(),
+        FsArtistImageStore::new(&images),
+        SystemClock,
+        MetadataSettings {
+            enabled: true,
+            contact: "owner@example.com".to_string(),
+            image_cache_dir: images.to_string_lossy().into_owned(),
+        },
+    );
+
+    let refused = handler.artist_image("   ", "token").await;
+
+    assert!(matches!(refused, Err(DomainError::InvalidInput(_))));
+}
