@@ -11,6 +11,9 @@ repository.workspace = true
 alexandria-core.workspace = true
 anyhow.workspace = true
 axum.workspace = true
+# UC-21's energy envelope is bytes, and JSON has no way to carry bytes: the
+# levels ride as base64, the same way the thumbnail's do over the FFI.
+base64.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sqlx.workspace = true

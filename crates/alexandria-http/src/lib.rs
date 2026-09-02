@@ -73,6 +73,7 @@ pub fn app(settings: Settings, services: Arc<Services>) -> Router {
             "/v1/files/{uuid}/thumbnail",
             get(routes::playback::thumbnail),
         )
+        .route("/v1/files/{uuid}/energy", get(routes::playback::energy))
         .route("/v1/files/{uuid}", get(routes::browse::get_file))
         .route("/v1/files/{uuid}", delete(routes::delete_file::delete_file))
         .route("/v1/files/{uuid}/restore", post(routes::restore::restore))

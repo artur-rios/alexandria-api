@@ -1069,6 +1069,61 @@ pub extern "C" fn alexandria_file_thumbnail(
     })
 }
 
+/// UC-21 — the sound of a track, as levels a visualiser can draw.
+///
+/// `uuid` is the file's public UUID (NUL-terminated string), `token` the
+/// bearer auth token. On success the JSON carries the shape of the envelope
+/// and the levels themselves, base64 encoded: `{"uuid":…,"bands":16,
+/// "frameMs":100,"levelsBase64":"…"}` — row-major, `bands` levels per frame,
+/// each 0 (silence) to 255 (the loudest moment of this track).
+///
+/// **The first call for a track decodes it**, which is a second or two of CPU
+/// on the blocking pool; every call after it reads what was stored. A caller
+/// on a frame deadline should treat the first call as slow and draw nothing
+/// until it answers, which is exactly what the player does.
+#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
+#[no_mangle]
+pub extern "C" fn alexandria_track_energy(
+    uuid: *const c_char,
+    token: *const c_char,
+) -> PlaybackJsonResult {
+    ffi_guard(PlaybackJsonResult::err(PLAYBACK_ERR_OTHER), || {
+        let services = match locked_services() {
+            Some(s) => s,
+            None => return PlaybackJsonResult::err(PLAYBACK_ERR_NOT_INITIALIZED),
+        };
+
+        let token = cstr_lossy(token).unwrap_or_default();
+        if !authenticated(&services, &token) {
+            return PlaybackJsonResult::err(PLAYBACK_ERR_UNAUTHORIZED);
+        }
+
+        let uuid = match cstr_lossy(uuid).and_then(|s| uuid::Uuid::parse_str(&s).ok()) {
+            Some(u) => u,
+            None => return PlaybackJsonResult::err(PLAYBACK_ERR_INVALID_INPUT),
+        };
+
+        let result =
+            runtime().block_on(async { services.energy_handler.energy(uuid, &token).await });
+
+        match result {
+            Ok(energy) => {
+                use base64::Engine;
+                let encoded = base64::engine::general_purpose::STANDARD.encode(&energy.levels);
+                let json = serde_json::json!({
+                    "uuid": energy.uuid,
+                    "bands": energy.bands,
+                    "frameMs": energy.frame_ms,
+                    "levelsBase64": encoded,
+                })
+                .to_string();
+                PlaybackJsonResult::ok(json)
+            }
+            Err(err) => map_playback_err(err),
+        }
+    })
+}
+
 /// Request body accepted by `alexandria_file_edit_content` — the same JSON
 /// `PUT /v1/files/{uuid}/content` takes: `{"content":"…"}`.
 #[derive(Debug)]

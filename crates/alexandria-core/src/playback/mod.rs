@@ -5,6 +5,7 @@
 //! types, to a bounded derived artifact — a comic page or a thumbnail.
 
 pub mod comic_page;
+pub mod energy;
 pub mod mime;
 pub mod source;
 #[cfg(test)]

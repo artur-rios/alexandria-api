@@ -220,6 +220,7 @@ graph LR
 | FR-MP-03 | The system shall never re-encode, transcode, or otherwise modify the bytes it serves. |
 | FR-MP-04 | The system shall return a single page of a CBZ ComicBook as an image, addressed by 1-based page index. |
 | FR-MP-05 | The system shall return a downscaled thumbnail image for a video, image, comic, or audio File. For audio, the thumbnail is the front-cover picture embedded in the file's own tag; a file with no embedded picture returns no thumbnail. |
+| FR-MP-07 | The system shall return, for an audio File, an energy envelope of the recording it holds: a level per frequency band per frame of its duration, measured from the file's own audio, scaled against the loudest moment of that recording, and identical for two encodings of the same music. It shall measure a file at most once, storing what it measured and answering later calls from storage, and shall measure on request rather than at index time. |
 | FR-MP-06 | The system shall expose playback operations via both the HTTP and FFI surfaces. Because the FFI surface cannot carry a byte stream, FR-MP-01 over FFI returns a **playback descriptor** — resolved absolute path, MIME type, and byte size — and parity for it is defined on that descriptor and on the authorization, state, and error decisions rather than on byte transfer. FR-MP-04 and FR-MP-05 return their bytes over both surfaces and are byte-exact across them. |
 
 ### 3.9 Playlists (TR)

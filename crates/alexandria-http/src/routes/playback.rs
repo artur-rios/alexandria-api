@@ -193,6 +193,44 @@ pub async fn thumbnail(
         .into_response())
 }
 
+/// `GET /v1/files/{uuid}/energy` — the sound of a track, as levels (UC-21).
+///
+/// JSON rather than raw bytes, because there are three facts and not one: how
+/// many bands a frame holds, how long a frame covers, and the levels
+/// themselves. The levels are base64 for the reason the thumbnail's bytes are
+/// — a JSON array of forty thousand small integers is four times the size and
+/// slower to parse at both ends.
+///
+/// The first call for a track decodes it, which takes a second or two; every
+/// call after it is a read. Errors are `400` (a file with no sound to
+/// measure), `401`, `404`, `409`, `500`.
+pub async fn energy(
+    State(state): State<AppState>,
+    uuid: Result<Path<Uuid>, PathRejection>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    let token = bearer_token(&headers);
+
+    let Path(uuid) = uuid.map_err(|_| invalid_input("path segment is not a valid UUID"))?;
+
+    let energy = state
+        .services
+        .energy_handler
+        .energy(uuid, &token)
+        .await
+        .map_err(ApiError)?;
+
+    use base64::Engine;
+    let body = serde_json::json!({
+        "uuid": energy.uuid,
+        "bands": energy.bands,
+        "frameMs": energy.frame_ms,
+        "levelsBase64": base64::engine::general_purpose::STANDARD.encode(&energy.levels),
+    });
+
+    Ok(axum::Json(body).into_response())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -2087,6 +2087,16 @@ impl CatalogRepository for SqliteCatalogRepository {
             .execute(&mut *tx)
             .await?;
 
+        // And the same for the sound of it (UC-21). `track_energy` is keyed
+        // by `files.id` and carries no foreign key either, so the levels of a
+        // purged track would otherwise be drawn for whatever file inherited
+        // its autoincrement id -- one track's music, animated against
+        // another's.
+        sqlx::query("DELETE FROM track_energy WHERE file_id = ?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+
         // Collect the playlists this file's entries belong to *before*
         // deleting them -- once the rows are gone there is nothing left to
         // read `playlist_id` off of. A file can sit in more than one
