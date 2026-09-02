@@ -493,17 +493,35 @@ impl EnergyAnalyzer for FfmpegEnergyAnalyzer {
             .audio()
             .map_err(|err| DomainError::Disk(format!("could not open the decoder: {err}")))?;
 
+        // A layout the resampler will accept, which is not always the one the
+        // decoder reports.
+        //
+        // Mono files routinely carry no channel layout at all — a WAV of one
+        // channel says "one channel" and nothing about which one — and ffmpeg
+        // refuses to resample a frame whose layout does not match the one the
+        // context was built with, *including* when both are unspecified. The
+        // whole track came back as silence until this was normalised: every
+        // frame decoded, every resample refused with "input changed", and an
+        // empty envelope that looked exactly like a file with no sound in it.
+        let layout = if decoder.channel_layout().is_empty() {
+            ChannelLayout::default(decoder.channels().into())
+        } else {
+            decoder.channel_layout()
+        };
+
         // Everything measured at one rate, in one channel, in one sample
         // format: the same music in flac and in mp3 has to produce the same
         // envelope, and it only does if the analysis never sees what the
         // file was encoded at.
-        let mut resampler = decoder
-            .resampler(
-                Sample::F32(SampleType::Packed),
-                ChannelLayout::MONO,
-                ANALYSIS_RATE,
-            )
-            .map_err(|err| DomainError::Disk(format!("could not resample: {err}")))?;
+        let mut resampler = ffmpeg_next::software::resampling::context::Context::get(
+            decoder.format(),
+            layout,
+            decoder.rate(),
+            Sample::F32(SampleType::Packed),
+            ChannelLayout::MONO,
+            ANALYSIS_RATE,
+        )
+        .map_err(|err| DomainError::Disk(format!("could not resample: {err}")))?;
 
         let mut meter = EnergyMeter::new();
         let mut decoded = frame::Audio::empty();
@@ -523,6 +541,7 @@ impl EnergyAnalyzer for FfmpegEnergyAnalyzer {
             }
 
             while decoder.receive_frame(&mut decoded).is_ok() {
+                decoded.set_channel_layout(layout);
                 if resampler.run(&decoded, &mut resampled).is_err() {
                     continue;
                 }
@@ -532,6 +551,7 @@ impl EnergyAnalyzer for FfmpegEnergyAnalyzer {
 
         let _ = decoder.send_eof();
         while decoder.receive_frame(&mut decoded).is_ok() {
+            decoded.set_channel_layout(layout);
             if resampler.run(&decoded, &mut resampled).is_err() {
                 continue;
             }
