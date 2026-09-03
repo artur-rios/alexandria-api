@@ -24,7 +24,9 @@ pub async fn repos_with_pool() -> (
 ) {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("alexandria.sqlite");
-    let pool = migrate_database(path.to_str().expect("path")).await.expect("migrate");
+    let pool = migrate_database(path.to_str().expect("path"))
+        .await
+        .expect("migrate");
     (
         SqlitePlayRepository::new(pool.clone()),
         SqliteCatalogRepository::new(pool.clone()),
@@ -111,7 +113,8 @@ pub async fn record_plays(repo: &SqlitePlayRepository, file_uuid: Uuid, times: i
     for minute in 0..times {
         repo.record(
             file_uuid,
-            Utc.with_ymd_and_hms(2026, 9, 3, 12, minute as u32, 0).unwrap(),
+            Utc.with_ymd_and_hms(2026, 9, 3, 12, minute as u32, 0)
+                .unwrap(),
         )
         .await
         .expect("record play");

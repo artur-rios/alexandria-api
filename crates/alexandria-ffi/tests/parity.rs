@@ -33,7 +33,8 @@ use alexandria_ffi::{
     alexandria_index_pause, alexandria_index_refresh_start, alexandria_index_resume,
     alexandria_index_run_status_json, alexandria_index_runs_active_json, alexandria_index_start,
     alexandria_music_stats, alexandria_play_record, alexandria_playlist_add_entries,
-    alexandria_playlist_create, alexandria_playlist_move_entry, alexandria_playlist_read, alexandria_reading_list_add_item, alexandria_reading_list_create,
+    alexandria_playlist_create, alexandria_playlist_move_entry, alexandria_playlist_read,
+    alexandria_reading_list_add_item, alexandria_reading_list_create,
     alexandria_reading_list_delete, alexandria_reading_list_remove_item,
     alexandria_reading_list_update_progress, alexandria_reading_lists_list,
     alexandria_settings_json, alexandria_watchlist_add_video, alexandria_watchlist_create,
@@ -13705,10 +13706,9 @@ async fn given_the_same_plays_when_recorded_via_http_and_ffi_then_stats_are_iden
         .await
         .expect("http stats");
     assert_eq!(stats_resp.status(), axum::http::StatusCode::OK);
-    let http_stats: serde_json::Value = serde_json::from_slice(
-        &to_bytes(stats_resp.into_body(), usize::MAX).await.unwrap(),
-    )
-    .unwrap();
+    let http_stats: serde_json::Value =
+        serde_json::from_slice(&to_bytes(stats_resp.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
 
     // ---- FFI leg ----
     let ffi_dir = tempdir().unwrap();

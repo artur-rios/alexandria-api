@@ -108,7 +108,10 @@ async fn given_a_track_with_an_album_artist_when_stats_are_read_then_that_is_the
     assert_eq!(read.top_artists[0].artist, "Ada");
     assert_eq!(read.top_albums[0].artist.as_deref(), Some("Ada"));
     // The track's own row still shows the performer it names.
-    assert_eq!(read.top_tracks[0].artist.as_deref(), Some("Guest Performer"));
+    assert_eq!(
+        read.top_tracks[0].artist.as_deref(),
+        Some("Guest Performer")
+    );
 }
 
 #[tokio::test]
