@@ -32,8 +32,8 @@ use alexandria_ffi::{
     alexandria_index_count_files, alexandria_index_files_json, alexandria_index_init,
     alexandria_index_pause, alexandria_index_refresh_start, alexandria_index_resume,
     alexandria_index_run_status_json, alexandria_index_runs_active_json, alexandria_index_start,
-    alexandria_playlist_add_entries, alexandria_playlist_create, alexandria_playlist_move_entry,
-    alexandria_playlist_read, alexandria_reading_list_add_item, alexandria_reading_list_create,
+    alexandria_music_stats, alexandria_play_record, alexandria_playlist_add_entries,
+    alexandria_playlist_create, alexandria_playlist_move_entry, alexandria_playlist_read, alexandria_reading_list_add_item, alexandria_reading_list_create,
     alexandria_reading_list_delete, alexandria_reading_list_remove_item,
     alexandria_reading_list_update_progress, alexandria_reading_lists_list,
     alexandria_settings_json, alexandria_watchlist_add_video, alexandria_watchlist_create,
@@ -13597,4 +13597,171 @@ async fn given_same_playlist_when_created_via_http_and_ffi_then_bodies_and_rows_
     assert_eq!(ffi_rows[0].1, "Road trip");
 
     ffi_pool.close().await;
+}
+
+// ---------------- play history ----------------
+
+/// Insert an audio file carrying the tags the rankings group by, so a
+/// statistics assertion can name tracks, artists, and albums rather than
+/// per-database uuids.
+async fn seed_tagged_audio_file(
+    pool: &sqlx::sqlite::SqlitePool,
+    name: &str,
+    title: &str,
+    artist: &str,
+    album: &str,
+) -> String {
+    let file_uuid = seed_named_audio_file(pool, name).await;
+    sqlx::query(
+        "INSERT INTO audio_files (file_id, title, artist, album, genre) \
+         VALUES ((SELECT id FROM files WHERE uuid = ?), ?, ?, ?, 'Jazz')",
+    )
+    .bind(&file_uuid)
+    .bind(title)
+    .bind(artist)
+    .bind(album)
+    .execute(pool)
+    .await
+    .unwrap();
+    file_uuid
+}
+
+/// The rankings reduced to what does not depend on a per-database uuid or
+/// on when the test ran: the names and their counts.
+fn ranking_shape(stats: &serde_json::Value) -> serde_json::Value {
+    let list = |key: &str, name: &str| -> Vec<(String, i64)> {
+        stats[key]
+            .as_array()
+            .expect("ranking array")
+            .iter()
+            .map(|row| {
+                (
+                    row[name].as_str().unwrap().to_string(),
+                    row["plays"].as_i64().unwrap(),
+                )
+            })
+            .collect()
+    };
+    json!({
+        "totalPlays": stats["totalPlays"],
+        "distinctTracks": stats["distinctTracks"],
+        "topTracks": list("topTracks", "title"),
+        "topArtists": list("topArtists", "artist"),
+        "topAlbums": list("topAlbums", "album"),
+        "topGenres": list("topGenres", "genre"),
+    })
+}
+
+/// FR-FC-24 / NFR-09 parity - record the same plays over both transports
+/// and assert the statistics each answers are identical.
+///
+/// Two tracks played different numbers of times, so a leg that answered the
+/// rankings in insertion order rather than by count would differ from one
+/// that got it right. Each leg is asserted against the expected shape on its
+/// own before the two are compared, so a silent shared failure (both legs
+/// answering nothing) cannot pass as parity.
+#[tokio::test]
+async fn given_the_same_plays_when_recorded_via_http_and_ffi_then_stats_are_identical() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+
+    // ---- HTTP leg ----
+    let http_dir = tempdir().unwrap();
+    let http_db = db_path(&http_dir, "http.sqlite");
+    let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    seed_session(&http_pool, TEST_TOKEN).await;
+    let http_services =
+        std::sync::Arc::new(build_services(&local_settings(), http_pool.clone()).await);
+
+    let http_often =
+        seed_tagged_audio_file(&http_pool, "often.flac", "Often", "Ada", "First").await;
+    let http_seldom =
+        seed_tagged_audio_file(&http_pool, "seldom.flac", "Seldom", "Bruno", "Second").await;
+
+    for (track, times) in [(&http_often, 3), (&http_seldom, 1)] {
+        for _ in 0..times {
+            let req = Request::builder()
+                .method("POST")
+                .uri("/v1/plays")
+                .header("authorization", &format!("Bearer {TEST_TOKEN}"))
+                .header("content-type", "application/json")
+                .body(Body::from(json!({ "fileUuid": track }).to_string()))
+                .unwrap();
+            let resp = app(Settings::default(), http_services.clone())
+                .oneshot(req)
+                .await
+                .expect("http record play");
+            assert_eq!(resp.status(), axum::http::StatusCode::CREATED);
+        }
+    }
+
+    let stats_req = Request::builder()
+        .method("GET")
+        .uri("/v1/plays/stats")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
+        .body(Body::empty())
+        .unwrap();
+    let stats_resp = app(Settings::default(), http_services)
+        .oneshot(stats_req)
+        .await
+        .expect("http stats");
+    assert_eq!(stats_resp.status(), axum::http::StatusCode::OK);
+    let http_stats: serde_json::Value = serde_json::from_slice(
+        &to_bytes(stats_resp.into_body(), usize::MAX).await.unwrap(),
+    )
+    .unwrap();
+
+    // ---- FFI leg ----
+    let ffi_dir = tempdir().unwrap();
+    let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
+    let ffi_seed_pool = migrate_database(&ffi_db).await.expect("ffi seed open");
+    let ffi_often =
+        seed_tagged_audio_file(&ffi_seed_pool, "often.flac", "Often", "Ada", "First").await;
+    let ffi_seldom =
+        seed_tagged_audio_file(&ffi_seed_pool, "seldom.flac", "Seldom", "Bruno", "Second").await;
+    ffi_seed_pool.close().await;
+
+    let ffi_stats: serde_json::Value = tokio::task::spawn_blocking(move || -> serde_json::Value {
+        let cdb = CString::new(ffi_db).unwrap();
+        assert_eq!(
+            alexandria_index_init(cdb.as_ptr()),
+            alexandria_ffi::INDEX_OK
+        );
+        let token = CString::new(TEST_TOKEN).unwrap();
+
+        for (track, times) in [(&ffi_often, 3), (&ffi_seldom, 1)] {
+            for _ in 0..times {
+                let body = CString::new(json!({ "fileUuid": track }).to_string()).unwrap();
+                let r = alexandria_play_record(body.as_ptr(), token.as_ptr());
+                assert_eq!(r.status, alexandria_ffi::PLAY_OK, "ffi record play");
+                assert!(!r.json.is_null());
+                unsafe {
+                    alexandria_free_string(r.json);
+                }
+            }
+        }
+
+        let query = CString::new("{}").unwrap();
+        let r = alexandria_music_stats(query.as_ptr(), token.as_ptr());
+        assert_eq!(r.status, alexandria_ffi::PLAY_OK, "ffi stats");
+        serde_json::from_str(&take_json(r.json)).unwrap()
+    })
+    .await
+    .unwrap();
+
+    // ---- compare: each leg checked against the expected shape on its own first ----
+    let expected = json!({
+        "totalPlays": 4,
+        "distinctTracks": 2,
+        "topTracks": [["Often", 3], ["Seldom", 1]],
+        "topArtists": [["Ada", 3], ["Bruno", 1]],
+        "topAlbums": [["First", 3], ["Second", 1]],
+        "topGenres": [["Jazz", 4]],
+    });
+    assert_eq!(ranking_shape(&http_stats), expected, "http rankings");
+    assert_eq!(ranking_shape(&ffi_stats), expected, "ffi rankings");
+    assert_eq!(
+        ranking_shape(&http_stats),
+        ranking_shape(&ffi_stats),
+        "HTTP and FFI must answer the same statistics for the same plays"
+    );
 }

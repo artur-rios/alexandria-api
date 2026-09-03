@@ -4057,6 +4057,189 @@ pub extern "C" fn alexandria_playlist_move_entry(
     })
 }
 
+/// FFI status codes returned by play-history operations (play history
+/// design). Deliberately separate from `PLAYLIST_*` — per the convention
+/// above — even though the two families are about the same music: a
+/// playlist is a thing the owner curates and a play is something that
+/// happened, and the calls fail for different reasons. `PLAY_OK ==
+/// PLAYLIST_OK == 0` by convention.
+pub const PLAY_OK: c_int = 0;
+pub const PLAY_ERR_INVALID_INPUT: c_int = 1;
+pub const PLAY_ERR_UNAUTHORIZED: c_int = 2;
+pub const PLAY_ERR_NOT_INITIALIZED: c_int = 3;
+pub const PLAY_ERR_NOT_FOUND: c_int = 4;
+pub const PLAY_ERR_OTHER: c_int = 9;
+
+/// Result of every play-history FFI function. On success `status` is
+/// `PLAY_OK` and `json` is a NUL-terminated JSON string of the response
+/// body — byte-for-byte the same shape HTTP returns from the matching
+/// `/v1/plays*` route (FR-FC-24 / NFR-09). On failure `json` is NULL and
+/// `status` carries the mapped error code. The caller must free `json`
+/// with `alexandria_free_string`.
+#[repr(C)]
+#[derive(Debug)]
+pub struct PlayJsonResult {
+    pub status: c_int,
+    pub json: *mut c_char,
+}
+
+impl PlayJsonResult {
+    fn err(status: c_int) -> Self {
+        Self {
+            status,
+            json: std::ptr::null_mut(),
+        }
+    }
+
+    fn ok(json: String) -> Self {
+        let cstring = CString::new(json).unwrap_or_default();
+        Self {
+            status: PLAY_OK,
+            json: cstring.into_raw(),
+        }
+    }
+}
+
+fn map_play_err(err: DomainError) -> PlayJsonResult {
+    match err {
+        DomainError::NotFound => PlayJsonResult::err(PLAY_ERR_NOT_FOUND),
+        DomainError::Unauthorized => PlayJsonResult::err(PLAY_ERR_UNAUTHORIZED),
+        DomainError::InvalidInput(_) => PlayJsonResult::err(PLAY_ERR_INVALID_INPUT),
+        _ => PlayJsonResult::err(PLAY_ERR_OTHER),
+    }
+}
+
+/// Request body accepted by `alexandria_play_record` — the same JSON
+/// `POST /v1/plays` takes: `{"fileUuid":"…"}`.
+#[derive(Debug)]
+struct RecordPlayBody {
+    file_uuid: uuid::Uuid,
+}
+
+impl RecordPlayBody {
+    fn from_json_str(s: &str) -> Option<Self> {
+        let value: serde_json::Value = serde_json::from_str(s).ok()?;
+        let obj = value.as_object()?;
+        let file_uuid = uuid::Uuid::parse_str(obj.get("fileUuid")?.as_str()?).ok()?;
+        Some(Self { file_uuid })
+    }
+}
+
+/// Query accepted by `alexandria_music_stats` — the JSON form of the query
+/// string `GET /v1/plays/stats` takes: `{"limit":10}`. An absent or
+/// unreadable value means "not specified", which the core reads as its
+/// default of ten; a value that is present but out of range is refused by
+/// the handler on both surfaces alike.
+#[derive(Debug, Default)]
+struct MusicStatsQuery {
+    limit: Option<i64>,
+}
+
+impl MusicStatsQuery {
+    fn from_json_str(s: &str) -> Self {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(s) else {
+            return Self::default();
+        };
+        Self {
+            limit: value.get("limit").and_then(serde_json::Value::as_i64),
+        }
+    }
+}
+
+/// Record that a track was played (play history design).
+///
+/// `json_body` is the JSON body HTTP would send (`fileUuid`). The function
+/// deserializes it, calls the same `RecordPlayHandler` the HTTP route uses,
+/// and on success serializes the returned `PlayEvent` back to JSON — so the
+/// FFI and HTTP surfaces agree byte-for-byte modulo key ordering (parity,
+/// FR-FC-24 / NFR-09). `token` is the bearer auth token.
+///
+/// The play is stamped from the core's clock, not from anything passed
+/// here: the caller says *what* was played, never *when*.
+#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
+#[no_mangle]
+pub extern "C" fn alexandria_play_record(
+    json_body: *const c_char,
+    token: *const c_char,
+) -> PlayJsonResult {
+    ffi_guard(PlayJsonResult::err(PLAY_ERR_OTHER), || {
+        let services = match locked_services() {
+            Some(s) => s,
+            None => return PlayJsonResult::err(PLAY_ERR_NOT_INITIALIZED),
+        };
+
+        let token = cstr_lossy(token).unwrap_or_default();
+        if !authenticated(&services, &token) {
+            return PlayJsonResult::err(PLAY_ERR_UNAUTHORIZED);
+        }
+
+        let body_str = match cstr_lossy(json_body) {
+            Some(s) => s,
+            None => return PlayJsonResult::err(PLAY_ERR_INVALID_INPUT),
+        };
+        let body = match RecordPlayBody::from_json_str(&body_str) {
+            Some(b) => b,
+            None => return PlayJsonResult::err(PLAY_ERR_INVALID_INPUT),
+        };
+
+        let result = runtime().block_on(async {
+            services
+                .record_play_handler
+                .record(body.file_uuid, &token)
+                .await
+        });
+
+        match result {
+            Ok(play) => {
+                let json = serde_json::to_string(&play).unwrap_or_default();
+                PlayJsonResult::ok(json)
+            }
+            Err(err) => map_play_err(err),
+        }
+    })
+}
+
+/// What was played most (play history design).
+///
+/// `json_query` is the JSON form of the query string HTTP would send
+/// (`limit`); NULL or an empty string asks for the default. On success
+/// `json` carries the `MusicStats` — byte-for-byte the same shape HTTP
+/// returns from `GET /v1/plays/stats` (parity, FR-FC-24 / NFR-09).
+/// `token` is the bearer auth token.
+#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
+#[no_mangle]
+pub extern "C" fn alexandria_music_stats(
+    json_query: *const c_char,
+    token: *const c_char,
+) -> PlayJsonResult {
+    ffi_guard(PlayJsonResult::err(PLAY_ERR_OTHER), || {
+        let services = match locked_services() {
+            Some(s) => s,
+            None => return PlayJsonResult::err(PLAY_ERR_NOT_INITIALIZED),
+        };
+
+        // Deny before touching the payload — an unauthenticated caller must
+        // not learn whether its limit would have validated.
+        let token = cstr_lossy(token).unwrap_or_default();
+        if !authenticated(&services, &token) {
+            return PlayJsonResult::err(PLAY_ERR_UNAUTHORIZED);
+        }
+
+        let query = MusicStatsQuery::from_json_str(&cstr_lossy(json_query).unwrap_or_default());
+
+        let result = runtime()
+            .block_on(async { services.music_stats_handler.read(query.limit, &token).await });
+
+        match result {
+            Ok(stats) => {
+                let json = serde_json::to_string(&stats).unwrap_or_default();
+                PlayJsonResult::ok(json)
+            }
+            Err(err) => map_play_err(err),
+        }
+    })
+}
+
 /// FFI status codes returned by local-auth operations (UC-34/UC-35).
 /// Deliberately separate from the other `*_OK == 0` families — per the
 /// convention above — so local-auth use cases can grow their own set

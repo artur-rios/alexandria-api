@@ -79,6 +79,9 @@ use crate::playlists::commands::rename::RenamePlaylistHandler;
 use crate::playlists::commands::reorder::ReorderPlaylistHandler;
 use crate::playlists::queries::browse::BrowsePlaylistsHandler;
 use crate::playlists::repos::SqlitePlaylistRepository;
+use crate::plays::commands::record::RecordPlayHandler;
+use crate::plays::queries::stats::MusicStatsHandler;
+use crate::plays::repos::SqlitePlayRepository;
 use crate::reading_lists::commands::add_item::AddItemToReadingListHandler;
 use crate::reading_lists::commands::create::CreateReadingListHandler;
 use crate::reading_lists::commands::delete::DeleteReadingListHandler;
@@ -332,6 +335,11 @@ pub type DefaultReorderPlaylistHandler =
 pub type DefaultBrowsePlaylistsHandler =
     BrowsePlaylistsHandler<RuntimeAuthService, SqlitePlaylistRepository>;
 
+pub type DefaultRecordPlayHandler =
+    RecordPlayHandler<RuntimeAuthService, SystemClock, SqlitePlayRepository>;
+
+pub type DefaultMusicStatsHandler = MusicStatsHandler<RuntimeAuthService, SqlitePlayRepository>;
+
 pub type DefaultSetLocalCredentialsHandler =
     SetLocalCredentialsHandler<RuntimeAuthService, SqliteLocalCredentialRepository, SystemClock>;
 
@@ -438,6 +446,11 @@ pub struct Services {
     pub remove_entry_handler: Arc<DefaultRemoveEntryHandler>,
     pub reorder_playlist_handler: Arc<DefaultReorderPlaylistHandler>,
     pub browse_playlists_handler: Arc<DefaultBrowsePlaylistsHandler>,
+    /// Recording a play and reading the rankings it feeds (play history
+    /// design). Two handlers over one repository: everything the statistics
+    /// say is an aggregate of what this one write put there.
+    pub record_play_handler: Arc<DefaultRecordPlayHandler>,
+    pub music_stats_handler: Arc<DefaultMusicStatsHandler>,
     pub set_local_credentials_handler: Arc<DefaultSetLocalCredentialsHandler>,
     pub local_login_handler: Arc<DefaultLocalLoginHandler>,
     pub windows_login_handler: Arc<DefaultWindowsLoginHandler>,
@@ -861,6 +874,14 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
     ));
     let browse_playlists_handler =
         Arc::new(BrowsePlaylistsHandler::new(auth.clone(), playlist_repo));
+
+    let play_repo = SqlitePlayRepository::new(pool.clone());
+    let record_play_handler = Arc::new(RecordPlayHandler::new(
+        auth.clone(),
+        clock,
+        play_repo.clone(),
+    ));
+    let music_stats_handler = Arc::new(MusicStatsHandler::new(auth.clone(), play_repo));
     let set_local_credentials_handler = Arc::new(SetLocalCredentialsHandler::new(
         auth.clone(),
         credential_repo.clone(),
@@ -966,6 +987,8 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         remove_entry_handler,
         reorder_playlist_handler,
         browse_playlists_handler,
+        record_play_handler,
+        music_stats_handler,
         set_local_credentials_handler,
         local_login_handler,
         windows_login_handler,

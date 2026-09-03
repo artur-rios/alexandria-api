@@ -185,6 +185,11 @@ pub fn app(settings: Settings, services: Arc<Services>) -> Router {
             "/v1/playlists/{uuid}/entries/{entry_uuid}/move",
             post(routes::playlists::move_entry),
         )
+        // Play history (play history design). Recording a play writes, so
+        // it is a POST; the rankings it feeds are one read rather than four,
+        // so they are one route.
+        .route("/v1/plays", post(routes::plays::record))
+        .route("/v1/plays/stats", get(routes::plays::stats))
         .route_layer(from_fn_with_state(
             state.clone(),
             middleware::auth::require_auth,

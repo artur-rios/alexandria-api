@@ -10,6 +10,7 @@ pub mod index;
 pub mod libraries;
 pub mod playback;
 pub mod playlists;
+pub mod plays;
 pub mod reading_lists;
 pub mod refresh;
 pub mod rename;
