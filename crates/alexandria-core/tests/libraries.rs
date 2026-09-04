@@ -6,3 +6,6 @@ mod tree;
 
 #[path = "libraries/persistence.rs"]
 mod persistence;
+
+#[path = "libraries/indexing.rs"]
+mod indexing;
