@@ -448,3 +448,117 @@ async fn given_no_name_when_an_image_is_asked_for_then_it_is_refused() {
 
     assert!(matches!(refused, Err(DomainError::InvalidInput(_))));
 }
+
+/// What the image client refuses, against a stub that answers badly.
+///
+/// The two directions the download can go wrong, and both were found by
+/// review rather than by a failure: a response with no declared length was
+/// read into memory in full before the cap could judge it, and a picture in a
+/// format nothing can draw was stored and settled as `Found` — leaving the
+/// artist showing a placeholder for good, with no retry and nothing anywhere
+/// saying why.
+mod image_refusals {
+    use super::*;
+    use crate::enrichment::providers::{ArtistImageProvider, ProviderError};
+
+    /// The stub, with the P18 file name and the body under the caller's
+    /// control. `chunked` answers a body with no `Content-Length` at all,
+    /// which is what a real Commons rendering often is and what made the
+    /// declared-length check the only one that ran before the read.
+    async fn commons(file_name: &'static str, body_bytes: usize, chunked: bool) -> String {
+        let app = axum::Router::new()
+            .route(
+                "/w/api.php",
+                get(move |RawQuery(query): RawQuery| {
+                    let query: String = query.unwrap_or_default();
+                    async move {
+                        if query.contains("wbgetclaims") {
+                            axum::Json(serde_json::json!({
+                                "claims": {"P18": [{"mainsnak": {"datavalue":
+                                    {"value": file_name}}}]}
+                            }))
+                        } else {
+                            axum::Json(serde_json::json!({
+                                "query": {"search": [{"title": "Q101"}]}
+                            }))
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/wiki/Special:FilePath/{file}",
+                get(move || async move {
+                    let bytes = vec![0u8; body_bytes];
+                    if chunked {
+                        // A stream body carries no Content-Length, so the
+                        // cap has nothing to check before the read begins.
+                        axum::body::Body::from_stream(futures_util::stream::once(async move {
+                            Ok::<_, std::io::Error>(bytes)
+                        }))
+                    } else {
+                        axum::body::Body::from(bytes)
+                    }
+                }),
+            );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        base
+    }
+
+    fn client(base: &str) -> CommonsImageClient {
+        CommonsImageClient::against(
+            "owner@example.com",
+            &format!("{base}/w/api.php"),
+            &format!("{base}/wiki/Special:FilePath"),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn given_a_vector_picture_when_fetched_then_it_is_answered_as_none() {
+        // `Ok(None)`, not an error: "there is a picture nothing can draw" is,
+        // to every caller, the same fact as "there is no picture" — and
+        // recording it as nothing found is what settles the artist honestly
+        // instead of settling them against a file that renders as a blank.
+        let base = commons("A band logo.svg", 32, false).await;
+
+        let answer = client(&base).image_for("mb-artist").await;
+
+        assert!(matches!(answer, Ok(None)), "{answer:?}");
+    }
+
+    #[tokio::test]
+    async fn given_a_raster_picture_when_fetched_then_it_is_taken() {
+        // The guard on the guard: refusing formats must not refuse the ones
+        // the whole feature is for.
+        let base = commons("Miles Davis 1955.jpg", 32, false).await;
+
+        let asset = client(&base)
+            .image_for("mb-artist")
+            .await
+            .expect("the lookup failed")
+            .expect("no asset");
+
+        assert_eq!(asset.extension, "jpg");
+        assert_eq!(asset.bytes.len(), 32);
+    }
+
+    #[tokio::test]
+    async fn given_an_oversized_body_with_no_declared_length_when_fetched_then_it_is_refused() {
+        // The cap has to bound what is *read*, not what is kept. Nine
+        // megabytes against an eight-megabyte cap, with nothing in the
+        // headers to refuse it on.
+        let base = commons("Huge.jpg", 9 * 1024 * 1024, true).await;
+
+        let answer = client(&base).image_for("mb-artist").await;
+
+        assert!(
+            matches!(answer, Err(ProviderError::Unusable(_))),
+            "an unbounded body was accepted: {answer:?}"
+        );
+    }
+}
