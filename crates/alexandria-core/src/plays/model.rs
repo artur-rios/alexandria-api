@@ -91,12 +91,23 @@ pub struct ArtistPlays {
 
 /// One album in the ranking.
 ///
-/// Grouped by album name alone, not by album-and-artist: a compilation
-/// whose tracks each name a different performer is one album, and grouping
-/// by the pair would scatter it across as many rows as it has guests.
-/// `artist` is filled in only when every played track on the album agrees
-/// on one — otherwise there is no single answer to who the album is by, and
-/// naming one of them would be picking a winner arbitrarily.
+/// Grouped by the pair — title *and* credit — because a title is not an
+/// identity: `Greatest Hits` names a hundred different records, and grouping
+/// by title alone summed two of them into one row whose plays belonged to
+/// neither. It is also the definition a client's own album browsing uses, and
+/// one product must not answer "which album is this" two ways on two screens.
+///
+/// The credit is `album_artist` where a track carries one, falling back to
+/// `artist` — the same precedence [`ArtistPlays`] ranks by, so an album and
+/// its artist are credited alike.
+///
+/// `artist` is `None` for an album none of whose played tracks names anyone.
+/// Those rank together under the title, which is as much as the catalog can
+/// say about them. A compilation tagged with a different performer per track
+/// and no `album_artist` anywhere ranks as one row per performer: the tag is
+/// the fix, and inventing a record's artist from the rest of the record is
+/// something a client with the whole library in hand can do better than a
+/// query can.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AlbumPlays {

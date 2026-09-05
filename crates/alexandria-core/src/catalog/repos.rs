@@ -303,6 +303,27 @@ pub trait CatalogRepository: Send + Sync {
     /// with `InvalidState`); the repository defends the `NotFound` invariant.
     async fn purge(&self, uuid: Uuid) -> Result<(), DomainError>;
 
+    /// Drop what was measured or fetched from a file's *bytes*, because those
+    /// bytes have changed (UC-02).
+    ///
+    /// The energy envelope (FR-MP-07) and the fetched lyrics are both keyed
+    /// by `files.id` and both describe one particular recording. Neither is
+    /// re-derived on its own: energy is measured once and answered from
+    /// storage ever after, and a settled lyrics row is never looked up again.
+    /// So a file re-encoded, retagged in place, or simply replaced at the
+    /// same path kept the previous recording's envelope and the previous
+    /// track's words — the player animating one song's spectrum over another,
+    /// which is exactly the hazard `purge` guards against for a reused row id
+    /// and which needs no purge to happen.
+    ///
+    /// Deliberately *not* the extracted tags: those are re-read and merged by
+    /// the refresh itself, and merging keeps the owner's own edits. These two
+    /// are not the owner's, and there is nothing in them to keep.
+    ///
+    /// A file with neither is the normal case, so removing nothing is
+    /// success, not `NotFound`.
+    async fn forget_derived_content(&self, uuid: Uuid) -> Result<(), DomainError>;
+
     /// Link the file identified by `uuid` to the collection identified by
     /// `collection_uuid` (UC-13 / FR-CO-05). The caller has already confirmed
     /// both exist and that the collection is `kind = file`.
@@ -967,22 +988,32 @@ impl CatalogRepository for SqliteCatalogRepository {
             // that appended `/` to a backslash path matched nothing at all,
             // so a library there silently claimed no file it had.
             //
-            // The root is a LIKE *pattern* here, so its own wildcards are
-            // escaped before the trailing `/%` is appended — `_` matches any
-            // character, and a library at `/media/tv_shows` claimed every
-            // file under `/media/tv-shows` without this. `ORDER BY` pairs
-            // with the `LIMIT`: overlapping libraries are refused at
-            // registration, and if one ever slips through, the file lands in
-            // the same one on every insert rather than in whichever row the
-            // planner reached first.
+            // A `substr` prefix test rather than `LIKE`, matching
+            // `LibraryRepository::claim_files` and `find_overlapping` — the
+            // three have to agree, since between them they decide the same
+            // question at insert time, at registration, and at overlap. Two
+            // reasons, and the second is why this stopped being `LIKE`:
+            // `LIKE`'s `_` and `%` are wildcards, so a library at
+            // `/media/tv_shows` claimed every file under `/media/tv-shows`;
+            // and `LIKE` is case-insensitive over ASCII, so one at
+            // `/media/photos` claimed everything under `/media/Photos` — a
+            // different folder on every filesystem but Windows's, and one
+            // whose files `BrowseLibraryHandler` then could not list, because
+            // its own `strip_prefix` is case-sensitive. `=` compares under
+            // the column's BINARY collation, which agrees with that.
+            //
+            // `ORDER BY` pairs with the `LIMIT`: overlapping libraries are
+            // refused at registration, and if one ever slips through, the
+            // file lands in the same one on every insert rather than in
+            // whichever row the planner reached first.
             "INSERT INTO files \
              (uuid, path, name, type, content_hash, size_bytes, mtime, state, deleted_at, \
              indexed_at, missing_at, library_id) \
              VALUES (?, ?, ?, ?, ?, ?, ?, 'active', NULL, ?, NULL, \
              (SELECT id FROM libraries \
-              WHERE replace(?, '\\', '/') \
-                    LIKE (replace(replace(rtrim(replace(root_path, '\\', '/'), '/'), \
-                                          '%', '\\%'), '_', '\\_') || '/%') ESCAPE '\\' \
+              WHERE substr(replace(?, '\\', '/'), 1, \
+                           length(rtrim(replace(root_path, '\\', '/'), '/') || '/')) \
+                    = (rtrim(replace(root_path, '\\', '/'), '/') || '/') \
               ORDER BY length(root_path) DESC, id \
               LIMIT 1))",
         )
@@ -2155,6 +2186,36 @@ impl CatalogRepository for SqliteCatalogRepository {
                 "purge matched zero rows for uuid {uuid}"
             )));
         }
+
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn forget_derived_content(&self, uuid: Uuid) -> Result<(), DomainError> {
+        // One transaction, because the two belong to the same fact: the
+        // bytes this row describes are not the bytes those rows were made
+        // from. Half of that applied would leave a track whose words are the
+        // old song's and whose envelope is the new one's.
+        //
+        // Both are `WHERE file_id = (SELECT id …)`, so a uuid naming no file
+        // deletes nothing and still succeeds — the caller is a refresh
+        // walking rows it has just read, and it has nothing to do with a
+        // `NotFound` here that a concurrent purge could produce.
+        let mut tx = self.pool.begin_with(WRITE_TX).await?;
+
+        sqlx::query(
+            "DELETE FROM track_lyrics WHERE file_id = (SELECT id FROM files WHERE uuid = ?)",
+        )
+        .bind(uuid.to_string())
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            "DELETE FROM track_energy WHERE file_id = (SELECT id FROM files WHERE uuid = ?)",
+        )
+        .bind(uuid.to_string())
+        .execute(&mut *tx)
+        .await?;
 
         tx.commit().await?;
         Ok(())

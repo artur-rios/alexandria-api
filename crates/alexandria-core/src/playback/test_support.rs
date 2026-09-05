@@ -246,6 +246,10 @@ impl CatalogRepository for FakeRepo {
         unimplemented!()
     }
 
+    async fn forget_derived_content(&self, _uuid: Uuid) -> Result<(), DomainError> {
+        unimplemented!()
+    }
+
     async fn set_collection(&self, _uuid: Uuid, _collection_uuid: Uuid) -> Result<(), DomainError> {
         unimplemented!()
     }

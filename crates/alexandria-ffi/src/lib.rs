@@ -36,6 +36,15 @@ pub const INDEX_ERR_INVALID_INPUT: c_int = 1;
 pub const INDEX_ERR_UNAUTHORIZED: c_int = 2;
 pub const INDEX_ERR_NOT_INITIALIZED: c_int = 3;
 pub const INDEX_ERR_OTHER: c_int = 4;
+/// `alexandria_index_init` only: this core is executing a run, so it will not
+/// replace its services.
+///
+/// Its own code rather than `INDEX_ERR_OTHER` because it is a "not now", not
+/// a failure: nothing is wrong with the call, and the same call after the
+/// scan settles succeeds. A caller that can tell the two apart says "this
+/// takes effect when the scan finishes" instead of reporting an error for
+/// something that is going to work.
+pub const INDEX_ERR_BUSY: c_int = 5;
 
 /// FFI status codes returned by file operations (UC-04+). Deliberately
 /// separate from `INDEX_*` so a future use case can grow either set without
@@ -286,8 +295,19 @@ pub extern "C" fn alexandria_health_status_code() -> i32 {
 }
 
 /// Initialize the FFI services against a database path (created/migrated on
-/// demand). Safe to call again to point at a different database (replaces).
-/// Returns 0 on success, a non-zero status otherwise.
+/// demand). Returns 0 on success, a non-zero status otherwise.
+///
+/// **Safe to call again — except while this core is walking a disk.** A second
+/// call replaces the services wholesale, and a run already executing does not
+/// come with them: its cell lives in the old [`RunRegistry`], so pause and
+/// cancel stop reaching it and its progress stops being published, while the
+/// walk itself carries on writing. Worse, the new services reconcile on the
+/// way up (FR-FC-29) and rewrite that live run's row to `paused` on the
+/// assumption that nothing is walking it. So a call made while
+/// `alexandria_index_runs_active_json` would answer anything is refused with
+/// `INDEX_ERR_BUSY` and changes nothing; the same call after the run settles
+/// succeeds. Pointing at a *different* database is subject to the same rule,
+/// for the same reason.
 ///
 /// Configuration is loaded the same way `alexandria-http` loads it — from the
 /// path in `ALEXANDRIA_CONFIG` (default `config.toml`), with `ALEXANDRIA_*`
@@ -304,6 +324,19 @@ pub extern "C" fn alexandria_index_init(db_path: *const c_char) -> c_int {
             Some(p) => p,
             None => return INDEX_ERR_INVALID_INPUT,
         };
+        // Asked of the services that exist now, before anything is loaded or
+        // built: what makes this unsafe is the replacement, and the cheapest
+        // moment to refuse is before the work.
+        if let Some(existing) = locked_services() {
+            let live = existing.run_registry.live_runs();
+            if live > 0 {
+                tracing::warn!(
+                    live,
+                    "refusing to re-initialize while this core is executing runs"
+                );
+                return INDEX_ERR_BUSY;
+            }
+        }
         let mut settings = load_settings();
         settings.database.path = path.clone();
         // Same gate as the HTTP binary: a misconfigured mode is a startup failure

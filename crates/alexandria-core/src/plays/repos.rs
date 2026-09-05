@@ -7,17 +7,86 @@ use crate::catalog::model::FileType;
 use crate::errors::DomainError;
 use crate::plays::model::{AlbumPlays, ArtistPlays, GenrePlays, MusicStats, PlayEvent, TrackPlays};
 
-/// The credit a track is ranked under: its album artist where it has one,
-/// its artist otherwise, and NULL when it carries neither.
+/// The credit every ranking is built on, as a set of common table
+/// expressions the artist and album queries both select from.
 ///
-/// Written once as a constant because the artist ranking groups by it, the
-/// album ranking checks whether an album's tracks agree on it, and the two
-/// must be the same expression — an album credited one way and an artist
-/// credited another would be two answers to the same question on one
-/// screen. Blank tags are folded into NULL here (`NULLIF(TRIM(...), '')`)
-/// so a file tagged with an empty string ranks as untagged rather than as
-/// an artist whose name is nothing.
-const CREDIT: &str = "COALESCE(NULLIF(TRIM(a.album_artist), ''), NULLIF(TRIM(a.artist), ''))";
+/// Written once because the artist ranking groups by the credit and the
+/// album ranking groups by the album *and* the credit, and an album credited
+/// one way while its artist is credited another would be two answers to the
+/// same question on one screen. Blank tags are folded into NULL
+/// (`NULLIF(TRIM(...), '')`) so a file tagged with an empty string ranks as
+/// untagged rather than as an artist whose name is nothing.
+///
+/// **Four answers, in order of how much they know**, which is the same
+/// precedence a client's own album browsing applies and is why this is no
+/// longer a one-line `COALESCE`:
+///
+/// 1. the track's own `album_artist`, which is the record answering for
+///    itself;
+/// 2. the commonest `album_artist` on the *rest of that album*, for a track
+///    that carries none — files are half-tagged all the time, and one track
+///    naming the record settles it for the ones that say nothing;
+/// 3. the commonest performer on the album, with no `album_artist` anywhere:
+///    whoever most of the record is by, so a guest on one track does not
+///    become an artist in their own right;
+/// 4. the track's own performer, for a track belonging to no album.
+///
+/// Rules 2 and 3 are why the album ranking can group by the pair at all. The
+/// pair is what an album *is* — `Greatest Hits` names a hundred records, and
+/// grouping by title alone summed two of them into one row whose plays
+/// belonged to neither — but the naive pair, `album_artist` or performer per
+/// track, splits an ordinary record across its guests and splits a
+/// half-tagged one down the middle. Deriving the record's own credit first
+/// is what makes the pair right rather than merely different.
+///
+/// Ties break alphabetically, matching that client exactly: a ranking that
+/// reordered itself depending on which row the planner reached first would
+/// be a ranking the owner cannot rely on.
+///
+/// The commonest is counted in *tracks*, not in plays: the question is which
+/// artist most of the record is by, and a record where one track was played
+/// forty times is not a record by that track's guest.
+///
+/// The judgement in rule 3 is worth naming as one, and it is the client's
+/// too: a genuine various-artists compilation carrying no `album_artist`
+/// anywhere lands under whichever performer has the most tracks on it. That
+/// is a worse answer for that one record than naming none — and a far better
+/// one for every ordinary album with a guest on it, which is what most
+/// libraries are made of. An owner who disagrees has the tag, and rule 1
+/// gives it precedence over everything here.
+const CREDITED: &str = "\
+    WITH played AS ( \
+        SELECT pe.file_id AS file_id, \
+               NULLIF(TRIM(a.album), '') AS album, \
+               NULLIF(TRIM(a.album_artist), '') AS tagged, \
+               NULLIF(TRIM(a.artist), '') AS performer \
+        FROM play_events pe \
+        JOIN audio_files a ON a.file_id = pe.file_id \
+    ), \
+    tagged_seat AS ( \
+        SELECT album, tagged AS name, \
+               ROW_NUMBER() OVER (PARTITION BY album \
+                                  ORDER BY COUNT(DISTINCT file_id) DESC, tagged ASC) AS seat \
+        FROM played \
+        WHERE album IS NOT NULL AND tagged IS NOT NULL \
+        GROUP BY album, tagged \
+    ), \
+    performer_seat AS ( \
+        SELECT album, performer AS name, \
+               ROW_NUMBER() OVER (PARTITION BY album \
+                                  ORDER BY COUNT(DISTINCT file_id) DESC, performer ASC) AS seat \
+        FROM played \
+        WHERE album IS NOT NULL AND performer IS NOT NULL \
+        GROUP BY album, performer \
+    ), \
+    credited AS ( \
+        SELECT p.file_id AS file_id, \
+               p.album AS album, \
+               COALESCE(p.tagged, t.name, r.name, p.performer) AS credit \
+        FROM played p \
+        LEFT JOIN tagged_seat t ON t.album = p.album AND t.seat = 1 \
+        LEFT JOIN performer_seat r ON r.album = p.album AND r.seat = 1 \
+    ) ";
 
 /// Play history repository port. The handlers depend on this trait so
 /// their decision logic (auth, validation, the clock) is unit-tested
@@ -159,15 +228,16 @@ impl PlayRepository for SqlitePlayRepository {
             });
         }
 
-        // Query 3: the artists. `HAVING credit IS NOT NULL` rather than a
-        // `WHERE` on the same expression -- the alias is what the grouping
-        // is by, and repeating the expression in two clauses is how the
-        // two would eventually stop matching.
+        // Query 3: the artists, over the shared `credited` expression --
+        // see `CREDITED` for what a credit is and why it is derived per
+        // album rather than read straight off each track. `HAVING credit IS
+        // NOT NULL` rather than a `WHERE`: the alias is what the grouping is
+        // by, and naming the same thing in two clauses is how the two would
+        // eventually stop matching.
         let artist_sql = format!(
-            "SELECT {CREDIT} AS credit, COUNT(*) AS plays, \
-             COUNT(DISTINCT pe.file_id) AS tracks \
-             FROM play_events pe \
-             JOIN audio_files a ON a.file_id = pe.file_id \
+            "{CREDITED} \
+             SELECT credit, COUNT(*) AS plays, COUNT(DISTINCT file_id) AS tracks \
+             FROM credited \
              GROUP BY credit \
              HAVING credit IS NOT NULL \
              ORDER BY plays DESC, credit ASC \
@@ -187,19 +257,37 @@ impl PlayRepository for SqlitePlayRepository {
             });
         }
 
-        // Query 4: the albums. `COUNT(DISTINCT credit) = 1` is the "every
-        // played track that names an artist agrees" test -- `COUNT
-        // DISTINCT` skips NULLs, so an album where half the tracks are
-        // uncredited and the rest all say the same name still answers with
-        // that name, and only a genuine disagreement answers with none.
+        // Query 4: the albums, grouped by the *pair* -- title and credit --
+        // over the same `credited` expression the artists rank over, so an
+        // album and its artist are credited alike.
+        //
+        // The pair rather than the title alone, which is what this was.
+        // `Greatest Hits` names a hundred different records, and grouping by
+        // title summed two of them into one row with their plays added
+        // together and an artist of NULL, because the two records disagreed
+        // about the credit. A number that is the sum of two unrelated records
+        // is wrong rather than merely coarse, and it was drawn as confidently
+        // as a right one. A client's own album browsing keys by the pair for
+        // exactly this reason, and one product must not answer "which album
+        // is this" two ways on two screens.
+        //
+        // The pair works here only because `CREDITED` derives the record's
+        // own credit first. Grouped by the credit read off each track, an
+        // ordinary album with a guest on it would split across its guests and
+        // a half-tagged one would split down the middle -- which would be a
+        // different wrong answer, not a fix.
+        //
+        // `credit` can still be NULL: an album none of whose played tracks
+        // names anyone. NULL is its own group in SQLite's `GROUP BY`, so
+        // those rank together under the title, which is as much as the
+        // catalog can say about them.
         let album_sql = format!(
-            "SELECT NULLIF(TRIM(a.album), '') AS album, COUNT(*) AS plays, \
-             CASE WHEN COUNT(DISTINCT {CREDIT}) = 1 THEN MIN({CREDIT}) END AS credit \
-             FROM play_events pe \
-             JOIN audio_files a ON a.file_id = pe.file_id \
-             GROUP BY album \
+            "{CREDITED} \
+             SELECT album, credit, COUNT(*) AS plays \
+             FROM credited \
+             GROUP BY album, credit \
              HAVING album IS NOT NULL \
-             ORDER BY plays DESC, album ASC \
+             ORDER BY plays DESC, album ASC, credit ASC \
              LIMIT ?"
         );
         let album_rows = sqlx::query(sqlx::AssertSqlSafe(album_sql))

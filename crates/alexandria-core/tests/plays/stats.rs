@@ -115,7 +115,7 @@ async fn given_a_track_with_an_album_artist_when_stats_are_read_then_that_is_the
 }
 
 #[tokio::test]
-async fn given_an_album_whose_tracks_name_different_artists_when_read_then_it_has_no_single_one() {
+async fn given_an_album_whose_tracks_name_different_artists_when_read_then_it_stays_one_record() {
     let (plays, catalog, _pool, _dir) = repos_with_pool().await;
     let one = insert_track(
         &catalog,
@@ -144,15 +144,116 @@ async fn given_an_album_whose_tracks_name_different_artists_when_read_then_it_ha
     let read = handler.read(None, "token").await.expect("stats");
 
     // One album holding both, rather than the same album split in two by
-    // who happened to perform each track.
+    // who happened to perform each track. That is the property the album
+    // ranking must not lose now that it groups by the pair: the record's own
+    // credit is derived across the record first, so both tracks carry the
+    // same one and the pair collapses back to one row.
     assert_eq!(read.top_albums.len(), 1);
     assert_eq!(read.top_albums[0].album, "Compilation");
     assert_eq!(read.top_albums[0].plays, 2);
-    // And no artist named for it: there is no single answer, and picking
-    // one of the two would be picking a winner arbitrarily.
-    assert_eq!(read.top_albums[0].artist, None);
-    // The artists themselves still rank separately.
-    assert_eq!(read.top_artists.len(), 2);
+    // Named, where this used to answer `None`. With no `album_artist`
+    // anywhere the record is credited to its commonest performer, ties broken
+    // alphabetically — the same judgement a client's own browsing makes, and
+    // the reason the two now agree. A worse answer for a genuine
+    // various-artists compilation than naming nobody; a far better one for
+    // every ordinary album with a guest on it, which is what most libraries
+    // are. The tag is the fix, and it wins over this.
+    assert_eq!(read.top_albums[0].artist.as_deref(), Some("Ada"));
+    // And the plays land on the record's artist rather than on each
+    // performer, so a guest does not become an artist in their own right.
+    assert_eq!(read.top_artists.len(), 1);
+    assert_eq!(read.top_artists[0].artist, "Ada");
+    assert_eq!(read.top_artists[0].plays, 2);
+}
+
+#[tokio::test]
+async fn given_two_records_sharing_a_title_when_read_then_they_rank_apart() {
+    // The defect the pair exists to fix. `Greatest Hits` names a hundred
+    // different records; grouping by title alone summed two of them into one
+    // row whose play count belonged to neither, under an artist of `None`
+    // because the two disagreed — a wrong number drawn as confidently as a
+    // right one, and a row a client's own album browsing would never show.
+    let (plays, catalog, _pool, _dir) = repos_with_pool().await;
+    let hers = insert_track(
+        &catalog,
+        "hers.flac",
+        Tags {
+            artist: Some("Ada"),
+            album_artist: Some("Ada"),
+            album: Some("Greatest Hits"),
+            ..Tags::default()
+        },
+    )
+    .await;
+    let his = insert_track(
+        &catalog,
+        "his.flac",
+        Tags {
+            artist: Some("Bruno"),
+            album_artist: Some("Bruno"),
+            album: Some("Greatest Hits"),
+            ..Tags::default()
+        },
+    )
+    .await;
+    record_plays(&plays, hers, 3).await;
+    record_plays(&plays, his, 1).await;
+    let handler = MusicStatsHandler::new(FakeAuth::Allowing, plays);
+
+    let read = handler.read(None, "token").await.expect("stats");
+
+    assert_eq!(read.top_albums.len(), 2, "{:?}", read.top_albums);
+    // Ranked by plays, so the more played record comes first — and each row
+    // carries only its own plays.
+    assert_eq!(read.top_albums[0].album, "Greatest Hits");
+    assert_eq!(read.top_albums[0].artist.as_deref(), Some("Ada"));
+    assert_eq!(read.top_albums[0].plays, 3);
+    assert_eq!(read.top_albums[1].artist.as_deref(), Some("Bruno"));
+    assert_eq!(read.top_albums[1].plays, 1);
+}
+
+#[tokio::test]
+async fn given_a_half_tagged_record_when_read_then_one_tag_settles_it_for_the_rest() {
+    // Files are half-tagged all the time: one editor writes `album_artist`,
+    // another does not. Grouping by the credit read off each track would
+    // split such a record down the middle — one row for the tagged tracks and
+    // one for the rest — which is why the credit is derived across the record
+    // before the pair is formed.
+    let (plays, catalog, _pool, _dir) = repos_with_pool().await;
+    let tagged = insert_track(
+        &catalog,
+        "tagged.flac",
+        Tags {
+            artist: Some("Ada"),
+            album_artist: Some("Ada"),
+            album: Some("Record"),
+            ..Tags::default()
+        },
+    )
+    .await;
+    let untagged = insert_track(
+        &catalog,
+        "untagged.flac",
+        Tags {
+            artist: Some("Guest Performer"),
+            album: Some("Record"),
+            ..Tags::default()
+        },
+    )
+    .await;
+    record_plays(&plays, tagged, 1).await;
+    record_plays(&plays, untagged, 1).await;
+    let handler = MusicStatsHandler::new(FakeAuth::Allowing, plays);
+
+    let read = handler.read(None, "token").await.expect("stats");
+
+    assert_eq!(read.top_albums.len(), 1, "{:?}", read.top_albums);
+    assert_eq!(read.top_albums[0].artist.as_deref(), Some("Ada"));
+    assert_eq!(read.top_albums[0].plays, 2);
+    // And the guest is not an artist in their own right.
+    assert_eq!(read.top_artists.len(), 1);
+    assert_eq!(read.top_artists[0].artist, "Ada");
+    assert_eq!(read.top_artists[0].tracks, 2);
 }
 
 #[tokio::test]

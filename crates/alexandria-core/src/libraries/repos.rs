@@ -93,24 +93,6 @@ impl SqliteLibraryRepository {
         let trimmed = trimmed.trim_end_matches('/');
         format!("{trimmed}/")
     }
-
-    /// `path` with LIKE's wildcards defused, for use as a pattern.
-    ///
-    /// `LIKE` is how containment is decided below, and a folder name is not a
-    /// pattern: `_` matches any single character and `%` matches any run of
-    /// them. A library at `/media/tv_shows` was claiming every file under
-    /// `/media/tv-shows` — a different folder — because the underscore in a
-    /// perfectly ordinary directory name is a wildcard. Both characters are
-    /// legal in a filename on Windows and Linux alike, so this is a name the
-    /// owner can easily have.
-    ///
-    /// Escaped with a backslash, paired with an `ESCAPE '\'` clause on every
-    /// comparison that uses one of these. The backslash itself needs no
-    /// escaping here: every caller normalizes separators to forward slashes
-    /// first, so a pattern reaching this function holds none.
-    fn escape_like(path: &str) -> String {
-        path.replace('%', "\\%").replace('_', "\\_")
-    }
 }
 
 impl LibraryRepository for SqliteLibraryRepository {
@@ -180,7 +162,6 @@ impl LibraryRepository for SqliteLibraryRepository {
         except: Option<Uuid>,
     ) -> Result<Option<Library>, DomainError> {
         let candidate = Self::as_prefix(root_path);
-        let candidate_pattern = Self::escape_like(&candidate);
 
         // Compared in SQL rather than by reading every library back, so this
         // stays one query however many there are. The `replace` and the `||`
@@ -190,24 +171,33 @@ impl LibraryRepository for SqliteLibraryRepository {
         // `?3 IS NULL OR uuid <> ?3` rather than two queries: the exception
         // is part of the question, not a second pass over the answer.
         //
-        // Each side appears twice with different treatment, which is the
-        // fiddly part: a root is a *value* in one direction and a *pattern*
-        // in the other, and only the pattern may carry wildcards. So the
-        // candidate is bound raw where it is compared and escaped where it
-        // is matched against, and the stored root gets the same two forms
-        // from the nested `replace`s. Escaping the value side too would make
-        // a root containing `_` fail to match itself.
+        // Overlap is asked in both directions, because either folder can be
+        // the ancestor: is the candidate inside a stored root, and is a
+        // stored root inside the candidate. Both are the same `substr`
+        // comparison with the arguments swapped.
+        //
+        // `substr(…) = …` rather than `LIKE`, which is what this used to be.
+        // SQLite's `LIKE` is case-insensitive over ASCII, so a library at
+        // `/media/photos` claimed the files under `/media/Photos` — a
+        // different folder on every filesystem this runs on but one — and
+        // `find_overlapping` refused to register that folder at all.
+        // `substr` compares under the column's own BINARY collation, which
+        // is also what `BrowseLibraryHandler`'s `strip_prefix` does on the
+        // Rust side; the two must agree, or a file can be claimed by a
+        // library whose tree can then never list it. It also ends the
+        // wildcard problem at the source: `%` and `_` are ordinary
+        // characters to `=`, so nothing needs defusing.
         let row = sqlx::query(
             "SELECT uuid, name, root_path FROM libraries
-             WHERE (? LIKE (replace(replace(rtrim(replace(root_path, '\\', '/'), '/'),
-                                            '%', '\\%'), '_', '\\_') || '/%') ESCAPE '\\'
-                 OR (rtrim(replace(root_path, '\\', '/'), '/') || '/')
-                        LIKE (? || '%') ESCAPE '\\')
+             WHERE (substr(?, 1, length(rtrim(replace(root_path, '\\', '/'), '/') || '/'))
+                        = (rtrim(replace(root_path, '\\', '/'), '/') || '/')
+                 OR substr(rtrim(replace(root_path, '\\', '/'), '/') || '/', 1, length(?)) = ?)
                AND (? IS NULL OR uuid <> ?)
              LIMIT 1",
         )
         .bind(&candidate)
-        .bind(&candidate_pattern)
+        .bind(&candidate)
+        .bind(&candidate)
         .bind(except.map(|uuid| uuid.to_string()))
         .bind(except.map(|uuid| uuid.to_string()))
         .fetch_optional(&self.pool)
@@ -309,15 +299,22 @@ impl LibraryRepository for SqliteLibraryRepository {
             return Err(DomainError::NotFound);
         };
 
+        // `substr(…) = ?` rather than `LIKE`: see `find_overlapping` for why.
+        // The short version is that `LIKE` is case-insensitive over ASCII, so
+        // this claimed every file under `/media/Photos` for a library rooted
+        // at `/media/photos` — and `BrowseLibraryHandler` then dropped every
+        // one of them from the tree, because its `strip_prefix` is not. A
+        // file claimed by a library that cannot list it is reachable from
+        // nowhere but search.
+        let prefix = Self::as_prefix(&root_path);
         let claimed = sqlx::query(
             "UPDATE files SET library_id = ?
              WHERE library_id IS NULL
-               AND replace(path, '\\', '/') LIKE (? || '%') ESCAPE '\\'",
+               AND substr(replace(path, '\\', '/'), 1, length(?)) = ?",
         )
         .bind(id)
-        // The root is the pattern here, so its wildcards are defused. A
-        // library at `/media/tv_shows` claimed `/media/tv-shows` without it.
-        .bind(Self::escape_like(&Self::as_prefix(&root_path)))
+        .bind(&prefix)
+        .bind(&prefix)
         .execute(&mut *tx)
         .await
         .map_err(|e| DomainError::Disk(e.to_string()))?

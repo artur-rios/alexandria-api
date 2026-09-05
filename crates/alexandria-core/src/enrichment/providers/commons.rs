@@ -200,6 +200,28 @@ impl ArtistImageProvider for CommonsImageClient {
             return Ok(None);
         };
 
+        // Refused on the *name*, before a byte is downloaded. Wikidata's P18
+        // legitimately names vector and scientific-imaging formats — `.svg`
+        // for a band's logo, `.tif` for a scanned photograph — and a client
+        // drawing a portrait beside a track listing can decode neither. What
+        // used to happen was worse than a failed download: the file was
+        // stored, the row was settled as `Found`, and the artist was never
+        // looked up again — so the client fell back to its placeholder
+        // forever with nothing anywhere saying why.
+        //
+        // `Ok(None)` rather than an error, and deliberately. "Commons has a
+        // picture of this artist that nothing here can draw" is, from every
+        // caller's point of view, the same fact as "Commons has no picture":
+        // there is nothing to show and nothing to retry. Recording it as
+        // `NotFound` settles it, which is the truth.
+        let Some(extension) = drawable_extension(&file_name) else {
+            tracing::info!(
+                file_name = %file_name,
+                "the artist's picture is in a format no client can draw; treating it as none"
+            );
+            return Ok(None);
+        };
+
         // A width is requested rather than the original. Commons holds
         // originals running to tens of megabytes and an artist portrait
         // beside a track listing needs none of it; asking for a rendering is
@@ -240,40 +262,83 @@ impl ArtistImageProvider for CommonsImageClient {
             }
         }
 
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(|e| ProviderError::Unreachable(e.to_string()))?;
-
-        // And again after, for a response that declared no length at all.
-        if bytes.len() > MAX_IMAGE_BYTES {
-            return Err(ProviderError::Unusable(format!(
-                "image is {} bytes, over the {MAX_IMAGE_BYTES} cap",
-                bytes.len()
-            )));
-        }
+        let bytes = read_capped(response, MAX_IMAGE_BYTES).await?;
 
         Ok(Some(ArtistImageAsset {
             source_url,
-            extension: extension_of(&file_name),
-            bytes: bytes.to_vec(),
+            extension,
+            bytes,
         }))
     }
 }
 
-/// The file's extension, lowercased, or `jpg` when it names none.
+/// Read a response body, giving up the moment it passes `cap`.
+///
+/// The declared `Content-Length` above is a claim, and a chunked response
+/// makes no claim at all — which is what Commons serves for some renderings.
+/// `Response::bytes()` would buffer the whole body first and let the cap
+/// judge what had already been allocated, so the cap bounded what was *kept*
+/// and not what was *read*. This bounds the read: the stream is abandoned at
+/// the first chunk that carries the total past the cap, so nothing larger is
+/// ever held.
+/// `Response::chunk` rather than `bytes_stream`, which would mean turning on
+/// reqwest's `stream` feature for one call site; this needs no feature and
+/// says the same thing.
+async fn read_capped(
+    mut response: reqwest::Response,
+    cap: usize,
+) -> Result<Vec<u8>, ProviderError> {
+    // Sized from the declared length where there is one, clamped to the cap
+    // so a false claim cannot make this allocate more than it will accept.
+    let mut buffer =
+        Vec::with_capacity(response.content_length().unwrap_or(0).min(cap as u64) as usize);
+
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|e| ProviderError::Unreachable(e.to_string()))?
+    {
+        if buffer.len() + chunk.len() > cap {
+            return Err(ProviderError::Unusable(format!(
+                "image is over the {cap} byte cap"
+            )));
+        }
+        buffer.extend_from_slice(&chunk);
+    }
+
+    Ok(buffer)
+}
+
+/// The extensions a client can actually draw.
+///
+/// The same six raster formats the indexer's own `image` features cover, and
+/// the intersection of those with what Flutter decodes. `.svg` is the one
+/// deliberate absence worth naming: it is vector, it is common on Commons for
+/// logos, and nothing downstream renders it.
+const DRAWABLE_EXTENSIONS: [&str; 6] = ["jpg", "jpeg", "png", "webp", "gif", "bmp"];
+
+/// The file's extension when a client can draw it, `None` when it cannot.
 ///
 /// Taken from the Commons file name rather than the response's content type:
 /// the name is what Wikidata recorded and what the licence attaches to, and a
 /// redirect chain can leave the header describing something else.
-fn extension_of(file_name: &str) -> String {
-    file_name
+///
+/// A name with no extension at all is `jpg`, which is what it was before this
+/// gained an opinion: Commons file names carry one in practice, and guessing
+/// the commonest photograph format for the vanishing case is better than
+/// refusing a picture that is almost certainly fine.
+fn drawable_extension(file_name: &str) -> Option<String> {
+    let extension = file_name
         .rsplit_once('.')
         .map(|(_, ext)| ext.to_ascii_lowercase())
         .filter(|ext| {
             !ext.is_empty() && ext.len() <= 5 && ext.chars().all(|c| c.is_ascii_alphanumeric())
         })
-        .unwrap_or_else(|| "jpg".to_string())
+        .unwrap_or_else(|| "jpg".to_string());
+
+    DRAWABLE_EXTENSIONS
+        .contains(&extension.as_str())
+        .then_some(extension)
 }
 
 /// Percent-encodes a Commons file name for a path segment.
@@ -301,21 +366,44 @@ mod tests {
 
     #[test]
     fn given_a_file_name_when_its_extension_is_read_then_it_is_lowercased() {
-        assert_eq!(extension_of("Miles Davis.JPG"), "jpg");
-        assert_eq!(extension_of("portrait.png"), "png");
+        assert_eq!(
+            drawable_extension("Miles Davis.JPG").as_deref(),
+            Some("jpg")
+        );
+        assert_eq!(drawable_extension("portrait.png").as_deref(), Some("png"));
     }
 
     #[test]
     fn given_a_name_with_no_extension_when_read_then_it_falls_back() {
-        assert_eq!(extension_of("portrait"), "jpg");
+        assert_eq!(drawable_extension("portrait").as_deref(), Some("jpg"));
         // A trailing dot names no extension either.
-        assert_eq!(extension_of("portrait."), "jpg");
+        assert_eq!(drawable_extension("portrait.").as_deref(), Some("jpg"));
     }
 
     #[test]
     fn given_a_dotted_name_when_read_then_a_sentence_is_not_an_extension() {
         // Only the last segment counts, and only when it looks like one.
-        assert_eq!(extension_of("A portrait, 1959. Restored"), "jpg");
+        assert_eq!(
+            drawable_extension("A portrait, 1959. Restored").as_deref(),
+            Some("jpg")
+        );
+    }
+
+    #[test]
+    fn given_a_format_nothing_can_draw_when_read_then_there_is_no_extension() {
+        // The whole point: a picture that exists and cannot be shown is
+        // answered as no picture, so the row settles as `NotFound` rather
+        // than as a `Found` that renders as a placeholder forever.
+        assert_eq!(drawable_extension("A band logo.svg"), None);
+        assert_eq!(drawable_extension("Scanned plate.tif"), None);
+        assert_eq!(drawable_extension("Scanned plate.tiff"), None);
+    }
+
+    #[test]
+    fn given_every_drawable_format_when_read_then_each_is_kept() {
+        for name in ["a.jpg", "a.jpeg", "a.png", "a.webp", "a.gif", "a.bmp"] {
+            assert!(drawable_extension(name).is_some(), "{name}");
+        }
     }
 
     #[test]

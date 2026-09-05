@@ -519,6 +519,20 @@ where
         })
         .await?;
 
+        // The bytes moved on, so anything measured or fetched from the old
+        // ones is now describing a recording this file no longer holds. Both
+        // are re-derived on demand and neither is the owner's own work, so
+        // dropping them costs a re-measure the next time the track is played
+        // and buys back the guarantee that what is drawn is what is heard.
+        //
+        // Before the tags are re-read rather than after: `fill_metadata` can
+        // fail on a file the extractor cannot open, and a stale envelope must
+        // not survive on the strength of that.
+        retry_on_busy(BUSY_ATTEMPTS, || {
+            self.repo.forget_derived_content(file.uuid)
+        })
+        .await?;
+
         // A changed file is read whatever its stamp says: its bytes are new,
         // so its tags may be new too, and the stamp only records which
         // extraction last read them — not which bytes it read. Filling still

@@ -294,6 +294,84 @@ async fn given_a_changed_file_when_refreshed_then_its_metadata_is_read_as_well()
     );
 }
 
+/// A file whose bytes changed loses what was measured or fetched from the
+/// old ones.
+///
+/// The energy envelope (FR-MP-07) and the fetched lyrics both describe one
+/// particular recording, both are keyed by the file's row, and neither is
+/// ever re-derived once stored: energy is measured once and answered from
+/// storage ever after, and a settled lyrics row is never looked up again. So
+/// a re-encoded track — or different music dropped at the same path — kept
+/// the previous recording's envelope and the previous track's words, and the
+/// player animated one song's spectrum over another. That is the same hazard
+/// `purge` guards against for a reused row id, reached without a purge.
+#[tokio::test]
+async fn given_a_changed_file_when_refreshed_then_what_was_derived_from_its_bytes_is_dropped() {
+    let repo = FakeCatalogRepository::new();
+    let mut file = a_cataloged_file("/library/re-encoded.flac", 4096, Some(now()));
+    file.metadata_version = METADATA_VERSION;
+    let uuid = file.uuid;
+    repo.seed(file);
+    let repo_handle = repo.clone();
+
+    let audio = FakeAudioMetadataReader::new();
+    audio.seed("/library/re-encoded.flac", tags_with_album_artist());
+
+    // A different size: the stat comparison calls this changed.
+    let fs = FakeFilesystem::builder()
+        .with_file(
+            "/lib",
+            "/library/re-encoded.flac",
+            "re-encoded.flac",
+            "unused",
+        )
+        .with_stat("/library/re-encoded.flac", 8192, Some(now()))
+        .build();
+
+    refresh_handler_reading(repo, fs, audio)
+        .execute(Uuid::new_v4())
+        .await
+        .expect("execute");
+
+    assert_eq!(
+        repo_handle.derived_forgotten_for(uuid),
+        1,
+        "a re-encoded track kept the previous recording's envelope and lyrics"
+    );
+}
+
+/// And an unchanged file keeps them.
+///
+/// The other half, and the one that makes the fix affordable: a refresh walks
+/// the whole catalog, and throwing every envelope away on every re-check
+/// would mean re-decoding the library a track at a time for nothing.
+#[tokio::test]
+async fn given_an_unchanged_file_when_refreshed_then_what_was_derived_from_its_bytes_is_kept() {
+    let repo = FakeCatalogRepository::new();
+    let mut file = a_cataloged_file("/library/settled.flac", 4096, Some(now()));
+    file.metadata_version = METADATA_VERSION;
+    let uuid = file.uuid;
+    repo.seed(file);
+    let repo_handle = repo.clone();
+
+    // The same size and mtime the row carries: nothing changed.
+    let fs = FakeFilesystem::builder()
+        .with_file("/lib", "/library/settled.flac", "settled.flac", "unused")
+        .with_stat("/library/settled.flac", 4096, Some(now()))
+        .build();
+
+    refresh_handler_reading(repo, fs, FakeAudioMetadataReader::new())
+        .execute(Uuid::new_v4())
+        .await
+        .expect("execute");
+
+    assert_eq!(
+        repo_handle.derived_forgotten_for(uuid),
+        0,
+        "a re-check threw away a measurement of a file that had not changed"
+    );
+}
+
 /// Once, not once a run. The stamp is the whole reason a refresh can afford
 /// to read tags at all.
 #[tokio::test]

@@ -139,10 +139,6 @@ pub fn app(settings: Settings, services: Arc<Services>) -> Router {
             "/v1/reading-lists/{uuid}",
             delete(routes::reading_lists::delete),
         )
-        // Music enrichment (music enrichment design). A run is a POST
-        // because it changes what the catalog holds; reading one track's
-        // stored result is a plain GET and stays available even when
-        // enrichment itself is switched off.
         // Libraries (libraries design). A folder browsed as a tree, whose
         // files are shown only there.
         .route(
@@ -155,6 +151,10 @@ pub fn app(settings: Settings, services: Arc<Services>) -> Router {
                 .patch(routes::libraries::move_root)
                 .delete(routes::libraries::remove),
         )
+        // Music enrichment (music enrichment design). A run is a POST
+        // because it changes what the catalog holds; reading one track's
+        // stored result is a plain GET and stays available even when
+        // enrichment itself is switched off.
         .route("/v1/enrichment/runs", post(routes::enrichment::run))
         .route(
             "/v1/enrichment/tracks/{uuid}",

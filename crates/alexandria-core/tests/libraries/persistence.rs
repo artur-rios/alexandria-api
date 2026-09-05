@@ -944,3 +944,156 @@ mod moving {
         );
     }
 }
+
+/// A folder whose name differs from a library's only in case.
+///
+/// `LIKE` is case-insensitive over ASCII, and these three queries used it —
+/// the claim at registration, the claim at insert time, and the overlap
+/// check. On every filesystem this ships to but Windows's, `/library/Photos`
+/// and `/library/photos` are two different folders, so the case-blind
+/// comparison was three separate wrongs: files claimed by a library they are
+/// not under, files claimed at the next scan, and a legitimate second folder
+/// refused as an overlap.
+///
+/// The claim is the worst of the three, and the reason these are not merely
+/// tidiness. `BrowseLibraryHandler` strips the root with Rust's
+/// `strip_prefix`, which *is* case-sensitive, so a wrongly claimed file fails
+/// to strip and is dropped from the tree — while `library_id` keeps it out of
+/// its type panel. The owner's file is then reachable from nowhere but
+/// search.
+mod case {
+    use super::*;
+
+    #[tokio::test]
+    async fn given_a_folder_differing_only_in_case_when_a_library_claims_then_it_is_left_alone() {
+        let (pool, catalog, _dir) = fixtures().await;
+        insert(&catalog, "/library/photos/mine.jpg", FileType::Image).await;
+        let stranger = insert(&catalog, "/library/Photos/theirs.jpg", FileType::Image).await;
+
+        let library = RegisterLibraryHandler::new(
+            FakeAuth::Allowing,
+            SqliteLibraryRepository::new(pool.clone()),
+        )
+        .register("Photos", "/library/photos", "token")
+        .await
+        .expect("register");
+
+        let listing = BrowseLibraryHandler::new(
+            FakeAuth::Allowing,
+            SqliteLibraryRepository::new(pool.clone()),
+            SqliteCatalogRepository::new(pool.clone()),
+        )
+        .browse(library.uuid, "", "token")
+        .await
+        .expect("browse");
+
+        assert_eq!(
+            listing.files.len(),
+            1,
+            "the library claimed a file from a folder differing only in case: {:?}",
+            listing
+                .files
+                .iter()
+                .map(|v| &v.file.path)
+                .collect::<Vec<_>>()
+        );
+
+        // And the stranger is still findable where it belongs. This is the
+        // assertion that actually bites: before the fix it was claimed, and
+        // the tree above could not list it either.
+        let outside = SqliteCatalogRepository::new(pool.clone())
+            .list_filtered_view(
+                Some(FileType::Image),
+                StateFilter::Active,
+                None,
+                LibraryScope::OutsideLibraries,
+            )
+            .await
+            .expect("list");
+        assert!(
+            outside.iter().any(|view| view.file.uuid == stranger),
+            "a file in a folder differing only in case vanished from the type panel"
+        );
+    }
+
+    #[tokio::test]
+    async fn given_a_library_when_a_file_differing_only_in_case_is_indexed_then_it_is_not_claimed()
+    {
+        // The other half: `insert_file` resolves `library_id` itself, so a
+        // fix confined to `claim_files` would leave the next scan putting
+        // the stranger back into the library.
+        let (pool, catalog, _dir) = fixtures().await;
+        RegisterLibraryHandler::new(
+            FakeAuth::Allowing,
+            SqliteLibraryRepository::new(pool.clone()),
+        )
+        .register("Photos", "/library/photos", "token")
+        .await
+        .expect("register");
+
+        let stranger = insert(&catalog, "/library/Photos/theirs.jpg", FileType::Image).await;
+
+        let outside = SqliteCatalogRepository::new(pool.clone())
+            .list_filtered_view(
+                Some(FileType::Image),
+                StateFilter::Active,
+                None,
+                LibraryScope::OutsideLibraries,
+            )
+            .await
+            .expect("list");
+        assert!(
+            outside.iter().any(|view| view.file.uuid == stranger),
+            "a file indexed into a folder differing only in case was claimed"
+        );
+    }
+
+    #[tokio::test]
+    async fn given_a_folder_differing_only_in_case_when_registered_then_it_is_not_an_overlap() {
+        // The mirror image, and the one the owner meets first: two real
+        // folders, and the second refused with "that folder overlaps the
+        // library Photos" — a message about a folder they are not in.
+        let (pool, _catalog, _dir) = fixtures().await;
+        RegisterLibraryHandler::new(
+            FakeAuth::Allowing,
+            SqliteLibraryRepository::new(pool.clone()),
+        )
+        .register("Photos", "/library/photos", "token")
+        .await
+        .expect("register");
+
+        RegisterLibraryHandler::new(
+            FakeAuth::Allowing,
+            SqliteLibraryRepository::new(pool.clone()),
+        )
+        .register("Photographs", "/library/Photos", "token")
+        .await
+        .expect("a folder differing only in case was refused as an overlap");
+    }
+
+    #[tokio::test]
+    async fn given_the_same_folder_when_registered_twice_then_it_is_still_an_overlap() {
+        // The guard on the guard: making the comparison case-sensitive must
+        // not make it stop catching the case it exists for.
+        let (pool, _catalog, _dir) = fixtures().await;
+        RegisterLibraryHandler::new(
+            FakeAuth::Allowing,
+            SqliteLibraryRepository::new(pool.clone()),
+        )
+        .register("Photos", "/library/photos", "token")
+        .await
+        .expect("register");
+
+        let refused = RegisterLibraryHandler::new(
+            FakeAuth::Allowing,
+            SqliteLibraryRepository::new(pool.clone()),
+        )
+        .register("Inner", "/library/photos/2024", "token")
+        .await;
+
+        assert!(
+            matches!(refused, Err(DomainError::Conflict(_))),
+            "a folder inside a library was not refused: {refused:?}"
+        );
+    }
+}

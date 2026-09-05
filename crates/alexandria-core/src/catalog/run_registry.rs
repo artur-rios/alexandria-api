@@ -254,6 +254,22 @@ impl RunRegistry {
         self.lock().get(&run_id).map(Arc::clone)
     }
 
+    /// How many runs *this process* is executing right now.
+    ///
+    /// Not answerable from the database, which is the point of it: a
+    /// `running` row means some process was walking that run, and only the
+    /// live cells say whether that process is this one.
+    ///
+    /// `alexandria_index_init` asks before it replaces the services. A
+    /// replacement while a walk is in flight orphans the walk — its cell goes
+    /// with the old registry, so pause and cancel stop reaching it, its
+    /// progress stops being published, and the reconciliation the new
+    /// services run on the way up rewrites its row to `paused` while it is
+    /// still walking.
+    pub fn live_runs(&self) -> usize {
+        self.lock().len()
+    }
+
     /// Drop `run_id`'s cell, whoever it belongs to.
     ///
     /// Test-only, and deliberately: this is the by-id close whose use in

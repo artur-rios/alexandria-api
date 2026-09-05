@@ -77,6 +77,7 @@ const STATUS_RUN_INVALID_STATE: i32 = alexandria_ffi::RUN_ERR_INVALID_STATE;
 const STATUS_RUN_OTHER: i32 = alexandria_ffi::RUN_ERR_OTHER;
 
 const STATUS_OK: i32 = alexandria_ffi::INDEX_OK;
+const STATUS_INDEX_BUSY: i32 = alexandria_ffi::INDEX_ERR_BUSY;
 const STATUS_INVALID_INPUT: i32 = alexandria_ffi::INDEX_ERR_INVALID_INPUT;
 const STATUS_UNAUTHORIZED: i32 = alexandria_ffi::INDEX_ERR_UNAUTHORIZED;
 const STATUS_FILE_INVALID_INPUT: i32 = alexandria_ffi::FILE_ERR_INVALID_INPUT;
@@ -135,9 +136,36 @@ fn init_temp_db() -> (TempDir, String) {
     });
 
     let cpath = CString::new(db_path.clone()).unwrap();
-    let status = alexandria_index_init(cpath.as_ptr());
-    assert_eq!(status, STATUS_OK, "ffi services init failed");
+    init_when_idle(&cpath);
     (dir, db_path)
+}
+
+/// Initialize, waiting out any walk the previous test left running.
+///
+/// `alexandria_index_init` refuses with `INDEX_ERR_BUSY` while this process
+/// is executing a run, because replacing the services would orphan that walk.
+/// Most tests here start a scan and then assert against the catalog, which
+/// can be satisfied a moment before the walk closes its run — so the next
+/// test's setup can legitimately arrive while one is still draining.
+///
+/// Waiting rather than forcing is the point: this is the same rule an
+/// embedder has to follow, and a test harness that could opt out of it would
+/// be a harness proving something the product cannot do. The fixtures here
+/// are tiny, so the wait is milliseconds.
+fn init_when_idle(cpath: &CString) {
+    let deadline = std::time::Instant::now() + ASYNC_RUN_DEADLINE;
+    loop {
+        match alexandria_index_init(cpath.as_ptr()) {
+            STATUS_OK => return,
+            STATUS_INDEX_BUSY if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            STATUS_INDEX_BUSY => {
+                panic!("a run left by an earlier test never settled within {ASYNC_RUN_DEADLINE:?}")
+            }
+            other => panic!("ffi services init failed: {other}"),
+        }
+    }
 }
 
 fn c(s: &str) -> CString {
@@ -3262,5 +3290,76 @@ fn given_a_malformed_run_id_when_failures_asked_over_ffi_then_invalid_input() {
     assert_eq!(
         alexandria_index_run_failures_json(run_id.as_ptr(), token.as_ptr()).status,
         STATUS_RUN_INVALID_INPUT
+    );
+}
+
+/// Re-initializing while this core is walking a disk is refused.
+///
+/// A second `alexandria_index_init` replaces the services wholesale, and the
+/// run already executing does not come with them: its cell stays in the old
+/// registry, so pause and cancel stop reaching it and its progress stops
+/// being published, while the walk carries on writing. The new services then
+/// reconcile on the way up (FR-FC-29) and rewrite that live run's row to
+/// `paused` on the assumption that nothing is walking it — so an embedder
+/// that reconfigured mid-scan got a run it could no longer control, a
+/// progress bar frozen at its last flush, and a row saying the opposite of
+/// what was happening.
+///
+/// `wait_for_run_cell_live` is what makes this deterministic rather than a
+/// race: it returns exactly when the registry holds a live cell, which is
+/// exactly the condition the refusal is keyed on.
+#[test]
+fn given_a_running_run_when_the_core_is_re_initialized_then_it_is_refused_as_busy() {
+    let _g = serial();
+    let (_db_dir, db_path) = init_temp_db();
+    let lib = tempdir().unwrap();
+    write_library(lib.path(), 500);
+
+    let root = c(lib.path().to_str().unwrap());
+    let token = c(TEST_TOKEN);
+    let started = alexandria_index_start(
+        root.as_ptr(),
+        token.as_ptr(),
+        std::ptr::null(),
+        std::ptr::null(),
+    );
+    assert_eq!(started.status, STATUS_OK);
+    let run_id = run_id_string(&started);
+    wait_for_run_cell_live(&run_id, &token);
+
+    let cpath = c(&db_path);
+    assert_eq!(
+        alexandria_index_init(cpath.as_ptr()),
+        STATUS_INDEX_BUSY,
+        "the core replaced its services out from under a running walk"
+    );
+
+    // The run is still this core's to control, which is the whole point of
+    // refusing — and cancelling it here is also what leaves the process fit
+    // for the next test, since `init_temp_db` re-initializes and would now be
+    // refused while this walk is live.
+    let run_id_c = c(&run_id);
+    assert_eq!(
+        alexandria_index_cancel(run_id_c.as_ptr(), token.as_ptr()),
+        STATUS_RUN_OK,
+        "a run the refusal protected could not be cancelled"
+    );
+    let body = wait_for_run_terminal_or_paused(&run_id, &token);
+    assert_eq!(body["status"], "cancelled");
+}
+
+/// And with nothing running it still replaces, which is what the refusal must
+/// not cost. The guard on the guard: a check that refused unconditionally
+/// would pass the test above and break every reconfiguration.
+#[test]
+fn given_no_running_run_when_the_core_is_re_initialized_then_it_replaces() {
+    let _g = serial();
+    let (_db_dir, db_path) = init_temp_db();
+
+    let cpath = c(&db_path);
+    assert_eq!(
+        alexandria_index_init(cpath.as_ptr()),
+        STATUS_OK,
+        "an idle core refused to be re-initialized"
     );
 }

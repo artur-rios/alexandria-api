@@ -33,8 +33,20 @@ its open/closed state, so the tables stay in sync with the board automatically.
 | [F-07 Watchlists](https://github.com/artur-rios/alexandria-api/milestone/8) | UC-20 … UC-25 | 6 / 6 |
 | [F-08 Reading lists](https://github.com/artur-rios/alexandria-api/milestone/9) | UC-26 … UC-31 | 6 / 6 |
 | [F-09 Pluggable authentication](https://github.com/artur-rios/alexandria-api/milestone/10) | UC-34 … UC-36, UC-41 | 4 / 4 |
-| [F-10 Media playback](https://github.com/artur-rios/alexandria-api/milestone/11) | UC-38 … UC-40 | 3 / 3 |
-| **Total** | | **45 / 45** |
+| [F-10 Media playback](https://github.com/artur-rios/alexandria-api/milestone/11) | UC-38 … UC-40, and the energy envelope | 4 / 4 |
+| F-11 Playlists | UC-49 … UC-50 | 2 / 2 |
+| F-12 Libraries | UC-51 | 1 / 1 |
+| F-13 Music enrichment | Lyrics and artist photography | 1 / 1 |
+| F-14 Play history | Recording a play, and the rankings | 1 / 1 |
+| **Total** | | **50 / 50** |
+
+The last four carry no milestone links and no issue numbers, and that is
+honest rather than an omission: they were built from design documents in
+`docs/superpowers/specs/` rather than from the issue-per-use-case backlog the
+first eleven follow. What they are not is undocumented — each has its
+requirements in
+[System Requirements Document §3](docs/requirements/System%20Requirements%20Document.md)
+and its routes in §5, which is what the tables below trace against.
 
 ### F-00 — Foundation & operations
 
@@ -164,6 +176,43 @@ Serve file bytes to the front-end, plus comic pages and thumbnails.
 | [#90](https://github.com/artur-rios/alexandria-api/issues/90) | UC-38 | &#9745; | Stream file content | FR-MP-01, FR-MP-02, FR-MP-03, FR-MP-06 |
 | [#91](https://github.com/artur-rios/alexandria-api/issues/91) | UC-39 | &#9745; | Read a comic book page | FR-MP-03, FR-MP-04, FR-MP-06 |
 | [#92](https://github.com/artur-rios/alexandria-api/issues/92) | UC-40 | &#9745; | Get a file thumbnail | FR-MP-05, FR-MP-06 |
+| — | — | &#9745; | Measure a track's energy envelope | FR-MP-07 |
+
+### F-11 — Playlists
+
+Named, ordered groupings of audio tracks — audio's counterpart to watchlists
+and reading lists.
+
+| Issue | Use case | Status | Title | Requirements |
+| --- | --- | :---: | --- | --- |
+| — | UC-49 | &#9745; | Manage a playlist | FR-TR-01 … FR-TR-11 |
+| — | UC-50 | &#9745; | Play a playlist | FR-TR-07, FR-TR-11 |
+
+### F-12 — Libraries
+
+A folder browsed as its own tree, whose files are shown there and not in the
+type panels.
+
+| Issue | Use case | Status | Title | Requirements |
+| --- | --- | :---: | --- | --- |
+| — | UC-51 | &#9745; | Group a folder as a library | FR-FC-36 … FR-FC-41 |
+
+### F-13 — Music enrichment
+
+The one area that reaches services outside this machine: a track's words and
+an artist's photograph, looked up once and kept.
+
+| Issue | Use case | Status | Title | Requirements |
+| --- | --- | :---: | --- | --- |
+| — | — | &#9745; | Look up lyrics and artist photography | FR-EN-01 … FR-EN-09 |
+
+### F-14 — Play history
+
+What was played, and the rankings built from it.
+
+| Issue | Use case | Status | Title | Requirements |
+| --- | --- | :---: | --- | --- |
+| — | — | &#9745; | Record a play and rank what was played most | FR-PH-01 … FR-PH-10 |
 
 To update the tables: when an issue closes, flip its marker from **&#9744;** to
 **&#9745;** and bump the milestone's progress count. The issue number references

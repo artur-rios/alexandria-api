@@ -463,6 +463,11 @@ pub struct Services {
     /// path (FR-AU-07 / SRD §7). Handlers still authenticate independently —
     /// this is the transport gate, not a replacement for the domain check.
     pub auth: RuntimeAuthService,
+    /// The same registry the two walks publish into, exposed so an embedder
+    /// can ask whether this process is executing anything before it tears
+    /// these services down. `alexandria_index_init` is the caller: see
+    /// [`RunRegistry::live_runs`] for what replacing a live registry costs.
+    pub run_registry: RunRegistry,
     pub pool: SqlitePool,
 }
 
@@ -637,7 +642,7 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         auth.clone(),
         run_repo.clone(),
         clock,
-        run_registry,
+        run_registry.clone(),
         // The same two widths both walks are built with, so a run resumed at
         // a priority lands on exactly the width a run *started* at that
         // priority would have — and a resumed run whose row records no width
@@ -997,6 +1002,7 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         redeem_recovery_code_handler,
         regenerate_recovery_codes_handler,
         auth,
+        run_registry,
         pool,
     }
 }

@@ -126,6 +126,11 @@ pub struct FakeCatalogRepository {
     /// Page count last written for `uuid` via `set_comic_page_count`
     /// (issue #44 comic slice).
     comic_page_counts: Arc<Mutex<HashMap<Uuid, i64>>>,
+    /// Every uuid `forget_derived_content` has been called for, in order.
+    /// A `Vec` rather than a set: a refresh calling it twice for one file
+    /// would be a second measurement thrown away, which a test should be
+    /// able to see.
+    forgotten_derived: Arc<Mutex<Vec<Uuid>>>,
 }
 
 impl FakeCatalogRepository {
@@ -243,6 +248,17 @@ impl FakeCatalogRepository {
     /// `None` means no call has landed for that file yet.
     pub fn comic_page_count_for(&self, uuid: Uuid) -> Option<i64> {
         self.comic_page_counts.lock().unwrap().get(&uuid).copied()
+    }
+
+    /// How many times `forget_derived_content` has been called for `uuid` —
+    /// the lyrics and energy a changed file's bytes invalidate (UC-02).
+    pub fn derived_forgotten_for(&self, uuid: Uuid) -> usize {
+        self.forgotten_derived
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|forgotten| **forgotten == uuid)
+            .count()
     }
 }
 
@@ -760,6 +776,11 @@ impl CatalogRepository for FakeCatalogRepository {
             return Err(DomainError::internal("fake purge failure"));
         }
         files.remove(&file.path);
+        Ok(())
+    }
+
+    async fn forget_derived_content(&self, uuid: Uuid) -> Result<(), DomainError> {
+        self.forgotten_derived.lock().unwrap().push(uuid);
         Ok(())
     }
 
@@ -2892,6 +2913,10 @@ pub struct FailingCatalogRepository;
 
 impl CatalogRepository for FailingCatalogRepository {
     async fn find_by_path(&self, _path: &str) -> Result<Option<File>, DomainError> {
+        unimplemented!("not reached by the run-fails-to-list path")
+    }
+
+    async fn forget_derived_content(&self, _uuid: Uuid) -> Result<(), DomainError> {
         unimplemented!("not reached by the run-fails-to-list path")
     }
 

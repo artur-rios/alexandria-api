@@ -244,6 +244,45 @@ surfaces (FR-FC-24, NFR-09).
 | FR-TR-10 | The system shall delete a file's playlist entries when the file is purged, since `playlist_entries` carries no foreign key and nothing cascades to it automatically. |
 | FR-TR-11 | The system shall keep a playlist entry whose file has gone missing on disk, reporting it flagged (`missing: true`) rather than dropping it. A soft-deleted file (`state = deleted`, `missingAt` still unset) is reported `missing: false` — the two are different failure modes with different remedies, and a caller that wants to tell them apart reads the file's own `state`. |
 
+### 3.10 Music Enrichment (EN)
+
+The one area that reaches services outside this machine. Everything here is
+therefore optional, off unless configured, and settled once: a lookup that
+concluded — found, found nothing, or was refused — is never made again, so a
+library costs its lookups once rather than once a session.
+
+| ID | Requirement |
+| --- | --- |
+| FR-EN-01 | The system shall run music enrichment only where the owner has enabled it and supplied a contact address; with either absent it shall refuse every lookup as unavailable rather than reaching the network anonymously. The contact is a condition of use of the services this calls, not a courtesy. |
+| FR-EN-02 | The system shall identify a track against a recording-identity service by its tags, accepting a match only above a confidence threshold and recording a match below it as rejected — a confidently wrong result is worse than none. |
+| FR-EN-03 | The system shall fetch and store the words of an identified track, and shall answer a track's stored words without reaching the network. |
+| FR-EN-04 | The system shall fetch and store an artist's photograph **by the artist's name**, so that the name a client groups by and the name a picture is stored under are the same one, and shall answer a stored photograph without reaching the network. |
+| FR-EN-05 | The system shall store, for every artist and track it has looked up, the outcome of that lookup — found, nothing found, rejected, or failed — and shall not repeat a lookup that concluded. Only `failed` is retried, because only `failed` says the answer is unknown rather than known to be nothing. |
+| FR-EN-06 | The system shall accept an artist photograph only in a format a client can draw, and shall record a picture in any other format as nothing found: an image that exists and cannot be shown is, to every caller, the same fact as no image, and recording it as found would settle the artist against a file that renders as a blank forever. |
+| FR-EN-07 | The system shall bound what it downloads from an external service, refusing a response that exceeds its size cap as it is read rather than after it has been held in full. |
+| FR-EN-08 | The system shall observe the rate limits of the services it calls, at most one identity request per second, and shall report a refusal for rate limiting distinctly from a refusal for anything else. |
+| FR-EN-09 | The system shall expose enrichment over both the HTTP and FFI surfaces (FR-FC-24, NFR-09). Reading a stored result stays available while enrichment itself is switched off; only a *run* is refused. |
+
+### 3.11 Play History (PH)
+
+What was played, and the rankings built from it. The core records and counts;
+it holds no opinion about when a track counts as played, because it cannot
+see what the owner is hearing — that rule belongs to whatever is doing the
+playing.
+
+| ID | Requirement |
+| --- | --- |
+| FR-PH-01 | The system shall record that an audio File was played, stamping the moment from its own clock rather than from anything the caller supplies. A file that is not audio is refused: these are the statistics of music, and a video's viewing is the watchlists' business with its own progress model. |
+| FR-PH-02 | The system shall record every play, including repeats of the same track: playing a record twice is two plays, which is the whole of what counting them is for. |
+| FR-PH-03 | The system shall answer a summary of the history — how many plays, across how many distinct tracks, and the first and last moment they span. |
+| FR-PH-04 | The system shall answer four rankings — tracks, artists, albums, and genres — each cut to a caller-supplied limit within a bounded range, refusing a limit outside it rather than clamping: a caller that asked for a thousand and silently got a hundred would report the top hundred as though it were the whole answer. |
+| FR-PH-05 | The system shall rank a track under its own title, or under its filename where nothing tagged it, and shall rank an untagged track in the track ranking alone — it has no artist, album, or genre, and ranking it under "unknown" would invent one. |
+| FR-PH-06 | The system shall credit a played track to its record's artist: the track's own album-artist tag, else the commonest album-artist tag on the rest of that album, else the album's commonest performer, else the track's own performer. A guest on one track of a record is therefore not an artist in their own right. |
+| FR-PH-07 | The system shall rank an album by the pair of its title and that credit, never by title alone: a title names many records, and merging two of them reports a play count belonging to neither. |
+| FR-PH-08 | The system shall read a played track's tags live rather than snapshotting them onto the play, so correcting a misspelled artist corrects the history with it. |
+| FR-PH-09 | The system shall keep the plays of a soft-deleted or missing track — the play happened, and the file is still in the catalog — and shall delete a track's plays when the track is purged. |
+| FR-PH-10 | The system shall expose play history over both the HTTP and FFI surfaces (FR-FC-24, NFR-09). |
+
 ---
 
 ## 4. Data Model
@@ -655,6 +694,7 @@ account is UC-41).
 | GET | /v1/files/{uuid}/stream | Stream an `active` File's bytes from disk, honouring `Range`. | FR-MP-01, FR-MP-02, FR-MP-03 |
 | GET | /v1/files/{uuid}/pages/{page} | Return one page of a CBZ ComicBook, 1-based. | FR-MP-04 |
 | GET | /v1/files/{uuid}/thumbnail | Return a downscaled JPEG thumbnail (video, image, comic, audio). | FR-MP-05 |
+| GET | /v1/files/{uuid}/energy | Return the energy envelope of an audio File's recording, measured on the first call and answered from storage after it. | FR-MP-07 |
 
 `/stream` is deliberately not `/content`: that path is UC-32's text-content
 read and UC-33's editor, which exchange a JSON document rather than a seekable
@@ -687,6 +727,39 @@ family (`INVALID_INPUT`, `UNAUTHORIZED`, `NOT_INITIALIZED`, `NOT_FOUND`,
 the same convention every other feature area's FFI error family follows so
 that a value never means one thing for playlists and another for reading
 lists.
+
+### 5.11 Music Enrichment
+
+| Method | Path | Description | Requirement |
+| --- | --- | --- | --- |
+| POST | /v1/enrichment/runs | Run enrichment over a scope, looking up what is not already settled. | FR-EN-01..03, FR-EN-05 |
+| GET | /v1/enrichment/tracks/{uuid} | Read one track's stored enrichment, including its words. | FR-EN-03, FR-EN-09 |
+| GET | /v1/enrichment/artist-image | Read the stored photograph for an artist, by name. | FR-EN-04, FR-EN-09 |
+| POST | /v1/enrichment/artist-image | Look one artist's photograph up, by name, and keep it. | FR-EN-01, FR-EN-04..08 |
+
+A run is a `POST` because it changes what the catalog holds; reading a stored
+result is a plain `GET` and stays available even where enrichment itself is
+switched off (FR-EN-09). The artist photograph is addressed **by name** on
+both verbs rather than by a representative file: a client's artists list is
+grouped by a name it worked out across a record, and a picture stored under
+whatever one file happened to be tagged with is one that list can never find
+(FR-EN-04).
+
+### 5.12 Play History
+
+| Method | Path | Description | Requirement |
+| --- | --- | --- | --- |
+| POST | /v1/plays | Record that an audio File was played, stamped from the core's clock. | FR-PH-01, FR-PH-02 |
+| GET | /v1/plays/stats | Read the summary and the four rankings, each cut to `limit`. | FR-PH-03..FR-PH-07 |
+
+`POST /v1/plays` takes only which file was played — never when. The caller
+says *what*, the core says *when* (FR-PH-01), because a client that could name
+the moment could also name one in the middle of last year, and every ranking
+is an aggregate over exactly that column.
+
+The rankings are one route rather than four. They are read together, on one
+screen, and answering them separately would mean four round trips whose
+totals could disagree with each other because each saw a different instant.
 
 ---
 
@@ -788,7 +861,11 @@ The feature identifiers are the milestones the
 | F-07 Watchlists | FR-WL-01 through FR-WL-08 |
 | F-08 Reading lists | FR-RL-01 through FR-RL-08 |
 | F-09 Pluggable authentication | FR-AU-01 through FR-AU-24 |
-| F-10 Media playback | FR-MP-01 through FR-MP-06 |
+| F-10 Media playback | FR-MP-01 through FR-MP-07 |
+| F-11 Playlists | FR-TR-01 through FR-TR-11 |
+| F-12 Libraries | FR-FC-36 through FR-FC-41 |
+| F-13 Music enrichment | FR-EN-01 through FR-EN-09 |
+| F-14 Play history | FR-PH-01 through FR-PH-10 |
 
 Dual-transport parity (FR-FC-24, FR-AU-08, FR-MP-06, NFR-09) is not a
 milestone of its own: it is a constraint every feature above satisfies as it
