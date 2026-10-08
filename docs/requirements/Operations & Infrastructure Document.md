@@ -184,7 +184,7 @@ keys — a key not listed here does not exist, and only the keys showing an
 | `http.bind_addr` | config / `ALEXANDRIA_HTTP_BIND_ADDR` | default `127.0.0.1`; loopback by default (IR-03). |
 | `http.port` | config / `ALEXANDRIA_HTTP_PORT` | default `8080`. |
 | `database.path` | config / `ALEXANDRIA_DATABASE_PATH` | SQLite file path; bundled beside the desktop app's data dir. |
-| `filesystem.root` | config / `ALEXANDRIA_FILESYSTEM_ROOT` | the library root, in two roles. The health check probes it for reachability (IR-03 / UC-37), and it **bounds indexing**: UC-01 rejects a requested root that is neither it nor a descendant of it (FR-FC-26). Empty — the default — turns both roles off: the probe reports the filesystem unreachable, and indexing is unconstrained, so UC-01 will catalog any absolute path a caller supplies. Startup logs a warning while it is unset. UC-02 takes no root and is unaffected either way. |
+| `filesystem.root` | config / `ALEXANDRIA_FILESYSTEM_ROOT` | the library root, in two roles. The health check probes it for reachability (IR-03 / UC-37), and it **bounds what the catalog can reach** (FR-FC-26): UC-01 rejects a requested root that is neither it nor a descendant of it, UC-51 rejects correcting a library's root to a folder outside it (a folder that does not exist yet is judged by its nearest existing ancestor, so an unplugged drive mounted inside the root is still accepted), and streaming, comic pages, thumbnails, the energy envelope, text reads and edits, renames, and purge-on-disk refuse a cataloged file whose path resolves outside it. Empty — the default — turns both roles off: the probe reports the filesystem unreachable, and nothing is bounded, so UC-01 will catalog any absolute path a caller supplies and a library can be corrected to any folder. Startup logs a warning while it is unset. Setting it on an installation that already catalogued files elsewhere leaves those files refused until they are re-indexed under the root or their records purged. UC-02 takes no root and is unaffected either way. |
 | `indexing.concurrency` | config / `ALEXANDRIA_INDEXING_CONCURRENCY` | how many files a `normal`-priority UC-01 index or UC-02 re-index walk processes at a time (FR-FC-08, FR-FC-31); default `4`, `0` is treated as `1`. The filesystem half runs on the blocking pool, so this is real parallelism; the DB half still serializes behind SQLite's single writer and the 8-connection pool, so values far above that buy nothing. |
 | `indexing.low_priority_concurrency` | config / `ALEXANDRIA_INDEXING_LOW_PRIORITY_CONCURRENCY` | the same width for a run started — or resumed (FR-FC-33) — at `low` priority (FR-FC-31); default `1`, `0` is treated as `1`. A low-priority scan is meant to stay out of the way of browsing and playback rather than to finish fast, which is why the default is sequential. |
 | `deletion.retention_days` | config / `ALEXANDRIA_DELETION_RETENTION_DAYS` | soft-delete retention window; default `30` (NFR-10). |
@@ -338,11 +338,18 @@ shared dependency either way).
   FFI dynamic library; `cbindgen` generates the C header consumed by Flutter.
 - **Tests:** `cargo test` (see the
   [Testing Specification Document](Testing%20Specification%20Document.md)).
-- **Packaging:** the HTTP binary and the FFI library are bundled alongside the
-  Flutter desktop application; the SQLite database file lives in the desktop
-  app's per-user data directory. Concrete packaging specifics (installer format,
-  asset bundling) are deferred until the desktop integration is built and will be
-  documented here when decided.
+- **Packaging:** this repository publishes no packages of its own. The FFI
+  library travels inside the desktop application's packages, which
+  [alexandria-ui](https://github.com/artur-rios/alexandria-ui)'s release
+  workflow builds from a pinned commit of this repository (its `CORE_REF`); the
+  HTTP binary is not packaged and is built from source (`cargo build --release
+  -p alexandria-http`). In the desktop application the SQLite database file
+  lives in its per-user application-support directory. Installer formats and
+  bundling are documented in that repository.
+- **Releases:** a release is the tag `vx.y.z` on the merge commit of a
+  `release/x.y.z` pull request into `main`; the version is the workspace version
+  in `Cargo.toml`. The branching model, the versioning policy, and the procedure
+  are in [CONTRIBUTING.md](../../CONTRIBUTING.md#releasing).
 
 ---
 

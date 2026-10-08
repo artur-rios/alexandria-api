@@ -95,7 +95,7 @@ never fails the file's indexing.
 | **lopdf** | PDF metadata and page count | pure Rust |
 | **epub** / **quick-xml** | EPUB metadata | EPUB is reflowable, so it never yields a page count |
 | **zip** | comic archive metadata and page count (CBZ) | reads `ComicInfo.xml` when present |
-| **ffmpeg-next** | video duration, resolution, container metadata | **the one system dependency in the graph** — needs the ffmpeg C dev libraries, `pkg-config`, and `clang` present at build time. See the README's Building section for the per-platform install. |
+| **ffmpeg-next** | video duration, resolution, container metadata | **the one system dependency in the graph** — needs the ffmpeg C dev libraries, `pkg-config`, and `clang` present at build time. See [CONTRIBUTING.md](../../CONTRIBUTING.md#prerequisites) for the per-platform install. |
 
 ---
 

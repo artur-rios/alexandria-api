@@ -67,7 +67,7 @@ $($uc.R)
 
 ## Delivery workflow
 
-Follow the pause-gated flow in the [Development Workflow Document](docs/requirements/Development%20Workflow%20Document.md) — branch from `main`, pause before Testing, after Testing, before the PR, and before Done.
+Follow the pause-gated flow in the [Development Workflow Document](docs/requirements/Development%20Workflow%20Document.md) — branch from `develop`, pause before Testing, after Testing, before the PR, and before Done.
 
 ## References
 
