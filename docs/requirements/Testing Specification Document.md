@@ -287,13 +287,13 @@ impossible: extraction is strictly extra work on the same pipeline. If that
 column ever shows a figure above 100% again, suspect the harness before the
 extractor.
 
-CI runs these on pushes to `main` as a separate job carrying
+CI runs these on pushes to `develop` and `main` as a separate job carrying
 `continue-on-error: true`, so the numbers are recorded over time and the
 harness cannot rot, without a noisy runner turning a red build into something
 to ignore. That job deliberately runs the **debug** profile and without
 `ALEXANDRIA_NFR_STRICT` — it is checking that the harness still compiles and
 still finds every fixture, not measuring the requirement, and paying for an
-LTO release build on every push to `main` would buy a number the loose floors
+LTO release build on every push would buy a number the loose floors
 do not read anyway. The `--release` invocation above is for the on-request run
 that produces a figure worth recording.
 
