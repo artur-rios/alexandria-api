@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [develop, main]
   pull_request:
   # Weekly, for the upstream contract job below. Weekly rather than daily
   # because it reaches three public services this project does not pay for,
@@ -85,9 +85,10 @@ jobs:
     name: performance (non-gating)
     runs-on: ubuntu-latest
     continue-on-error: true
-    # Only on main: on a pull request this would double CI time to report a
-    # number nobody reviews — and now that the job cannot gate, running it
-    # earlier would buy nothing a post-merge reading does not already give.
+    # Only after a merge, on develop and main: on a pull request this would
+    # double CI time to report a number nobody reviews — and now that the job
+    # cannot gate, running it earlier would buy nothing a post-merge reading
+    # does not already give.
     if: github.event_name == 'push'
     steps:
       - uses: actions/checkout@v4
