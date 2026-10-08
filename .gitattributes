@@ -1,0 +1,5 @@
+# Line endings are LF in the repository and in the working tree, on every
+# platform. The index is already entirely LF, so this codifies what is there
+# rather than changing it. The FFI header (crates/alexandria-ffi/src/header.h)
+# is copied verbatim into alexandria-ui, whose CI diffs it byte for byte.
+* text=auto eol=lf

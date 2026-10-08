@@ -244,7 +244,7 @@ its status and live progress, and UC-48 pauses, resumes, or cancels it.
 | **Description** | Rename a file, which renames the underlying file on disk. |
 | **Preconditions** | The caller is authenticated; the target file exists and is `active`. |
 | **Postconditions** | The file's name and on-disk path are updated. |
-| **Requirements** | FR-FC-19, FR-FC-24 |
+| **Requirements** | FR-FC-19, FR-FC-24, FR-FC-26 |
 
 **Main Flow**
 
@@ -261,6 +261,7 @@ its status and live progress, and UC-48 pauses, resumes, or cancels it.
 | AF-02 | The on-disk rename fails (permission denied / target exists) | The system rolls back the catalog change, returns a disk-error, and leaves the on-disk file untouched. |
 | AF-03 | The file UUID does not exist | The system responds with a not-found error. |
 | AF-04 | The caller is not authenticated | The system denies with an unauthorized error. |
+| AF-05 | `filesystem.root` is configured and the file's recorded path resolves outside it (FR-FC-26) | The system rejects with an invalid-input error and renames nothing. As UC-38 AF-06. |
 
 ---
 
@@ -358,7 +359,7 @@ its status and live progress, and UC-48 pauses, resumes, or cancels it.
 | **Description** | Remove a file record and delete the underlying file on disk. |
 | **Preconditions** | The caller is authenticated; the target file record exists. |
 | **Postconditions** | The file record is removed and the on-disk file is deleted. |
-| **Requirements** | FR-FC-23, FR-FC-24 |
+| **Requirements** | FR-FC-23, FR-FC-24, FR-FC-26 |
 
 **Main Flow**
 
@@ -375,6 +376,7 @@ its status and live progress, and UC-48 pauses, resumes, or cancels it.
 | AF-02 | The on-disk delete fails (permission denied) | The system rolls back, leaves the record, and returns a disk-error. |
 | AF-03 | The file UUID does not exist | The system responds with a not-found error. |
 | AF-04 | The caller is not authenticated | The system denies with an unauthorized error. |
+| AF-05 | `filesystem.root` is configured and the file's recorded path resolves outside it (FR-FC-26) | The system rejects with an invalid-input error, deletes nothing, and keeps the record. As UC-38 AF-06. Purging the record alone (UC-08) does not touch the disk and is unaffected, so such a record can still be removed. |
 
 ---
 
@@ -1010,7 +1012,7 @@ its status and live progress, and UC-48 pauses, resumes, or cancels it.
 | **Description** | Read the content of a TextFile from disk. |
 | **Preconditions** | The caller is authenticated; the target file is a TextFile and is `active`. |
 | **Postconditions** | The caller receives the file's current on-disk content. |
-| **Requirements** | FR-TX-01, FR-FC-24 |
+| **Requirements** | FR-TX-01, FR-FC-24, FR-FC-26 |
 
 **Main Flow**
 
@@ -1026,6 +1028,7 @@ its status and live progress, and UC-48 pauses, resumes, or cancels it.
 | AF-02 | The on-disk file cannot be read (missing / permission) | The system responds with a disk-error. |
 | AF-03 | The file UUID does not exist | The system responds with a not-found error. |
 | AF-04 | The caller is not authenticated | The system denies with an unauthorized error. |
+| AF-05 | `filesystem.root` is configured and the file's recorded path resolves outside it (FR-FC-26) | The system rejects with an invalid-input error and reads nothing. As UC-38 AF-06. |
 
 ---
 
@@ -1039,7 +1042,7 @@ its status and live progress, and UC-48 pauses, resumes, or cancels it.
 | **Description** | Write edited content back to the TextFile on disk. |
 | **Preconditions** | The caller is authenticated; the target file is a TextFile and is `active`. |
 | **Postconditions** | The on-disk file holds the new content and the File's content hash is refreshed. |
-| **Requirements** | FR-TX-02, FR-TX-03, FR-FC-24 |
+| **Requirements** | FR-TX-02, FR-TX-03, FR-FC-24, FR-FC-26 |
 
 **Main Flow**
 
@@ -1058,9 +1061,7 @@ its status and live progress, and UC-48 pauses, resumes, or cancels it.
 | AF-03 | The post-write content hash does not match the written bytes | The system re-attempts once, then returns an integrity error. |
 | AF-04 | The file UUID does not exist | The system responds with a not-found error. |
 | AF-05 | The caller is not authenticated | The system denies with an unauthorized error. |
-| AF-06 | A correction names a folder that overlaps another library | The system responds with a conflict naming it, as registration would. The library is not asked about itself: it always overlaps where it already is, so a folder that moved within its own root corrects normally. |
-| AF-07 | The catalog already holds files at the destination | The system responds with a conflict and moves nothing. The owner indexed the new location before correcting the record, so both copies exist; the way out is a decision — remove this library and register the new folder — rather than a retry. |
-| AF-08 | The destination folder does not exist on disk | The correction is recorded anyway. The core is told a root and walks it; whether the path is there is answered by the walk, and refusing here would also refuse a drive that is merely unplugged at the moment the owner fixes the record. |
+| AF-06 | `filesystem.root` is configured and the file's recorded path resolves outside it (FR-FC-26) | The system rejects with an invalid-input error before writing anything. As UC-38 AF-06. |
 
 ---
 
@@ -1177,7 +1178,7 @@ UC-36's externally issued JWT.
 | **Description** | Serve the bytes of an active File from its recorded path for playback. Over HTTP the bytes are streamed with `Range` support; over FFI the system returns a playback descriptor instead, since the FFI surface cannot carry a byte stream. |
 | **Preconditions** | The caller is authenticated; the target file is `active` and present on disk. |
 | **Postconditions** | Over HTTP, the caller receives the file's bytes (in full or as the requested range). Over FFI, the caller receives the file's resolved path, MIME type, and byte size. |
-| **Requirements** | FR-MP-01, FR-MP-02, FR-MP-03, FR-MP-06 |
+| **Requirements** | FR-MP-01, FR-MP-02, FR-MP-03, FR-MP-06, FR-FC-26 |
 
 **Main Flow**
 
@@ -1195,9 +1196,7 @@ UC-36's externally issued JWT.
 | AF-03 | The file is marked missing on disk, or its path cannot be stat'd | The system responds with a disk-error. |
 | AF-04 | The requested `Range` is unsatisfiable | The system responds with a range-not-satisfiable error. |
 | AF-05 | The caller is not authenticated | The system denies with an unauthorized error. |
-| AF-06 | A correction names a folder that overlaps another library | The system responds with a conflict naming it, as registration would. The library is not asked about itself: it always overlaps where it already is, so a folder that moved within its own root corrects normally. |
-| AF-07 | The catalog already holds files at the destination | The system responds with a conflict and moves nothing. The owner indexed the new location before correcting the record, so both copies exist; the way out is a decision — remove this library and register the new folder — rather than a retry. |
-| AF-08 | The destination folder does not exist on disk | The correction is recorded anyway. The core is told a root and walks it; whether the path is there is answered by the walk, and refusing here would also refuse a drive that is merely unplugged at the moment the owner fixes the record. |
+| AF-06 | `filesystem.root` is configured and the file's recorded path resolves outside it (FR-FC-26) | The system rejects with an invalid-input error saying the file is outside the configured library root; over HTTP no byte is sent, and over FFI no descriptor is returned. Indexing and library corrections are bounded by the same root, but a record can still point outside — one catalogued before the bound was configured, or reached through a symbolic link swapped in since — and this is the check that keeps it unserved. The path is resolved as FR-FC-26 describes; the message names no path. |
 
 ---
 
@@ -1211,7 +1210,7 @@ UC-36's externally issued JWT.
 | **Description** | Return a single page of a CBZ ComicBook as an image, addressed by 1-based page index. |
 | **Preconditions** | The caller is authenticated; the target file is `active`, present on disk, a ComicBook, and stored as a CBZ archive. |
 | **Postconditions** | The caller receives the requested page's raw bytes, its MIME type, and the comic's total page count. |
-| **Requirements** | FR-MP-03, FR-MP-04, FR-MP-06 |
+| **Requirements** | FR-MP-03, FR-MP-04, FR-MP-06, FR-FC-26 |
 
 **Main Flow**
 
@@ -1232,6 +1231,7 @@ UC-36's externally issued JWT.
 | AF-05 | The file is soft-deleted | The system rejects with an invalid-state error (restore via UC-07 first). |
 | AF-06 | The file is marked missing on disk, or the archive cannot be opened or read | The system responds with a disk-error. |
 | AF-07 | The caller is not authenticated | The system denies with an unauthorized error. |
+| AF-08 | `filesystem.root` is configured and the file's recorded path resolves outside it (FR-FC-26) | The system rejects with an invalid-input error saying the file is outside the configured library root, and opens nothing. As UC-38 AF-06. |
 
 ---
 
@@ -1245,7 +1245,7 @@ UC-36's externally issued JWT.
 | **Description** | Return a downscaled JPEG thumbnail for a video, image, comic, or audio File, cached on disk keyed by the file's UUID, modification time, and target dimension. For audio, the thumbnail is the front-cover picture embedded in the file's own tag. |
 | **Preconditions** | The caller is authenticated; the target file is `active`, present on disk, and of type video, image, comic, or audio. |
 | **Postconditions** | The caller receives the thumbnail's bytes; on a cache miss, the generated thumbnail is written to the disk cache under that key. |
-| **Requirements** | FR-MP-05, FR-MP-06 |
+| **Requirements** | FR-MP-05, FR-MP-06, FR-FC-26 |
 
 **Main Flow**
 
@@ -1264,9 +1264,7 @@ UC-36's externally issued JWT.
 | AF-03 | The file is soft-deleted | The system rejects with an invalid-state error (restore via UC-07 first). |
 | AF-04 | The file is marked missing on disk, or its bytes cannot be read or decoded — for audio, this includes a file that cannot be opened or parsed as audio at all (missing at request time despite being marked present, corrupt, or an unsupported format such as `.wma`), told apart from AF-01's "parsed fine, but carries no picture" | The system responds with a disk-error. |
 | AF-05 | The caller is not authenticated | The system denies with an unauthorized error. |
-| AF-06 | A correction names a folder that overlaps another library | The system responds with a conflict naming it, as registration would. The library is not asked about itself: it always overlaps where it already is, so a folder that moved within its own root corrects normally. |
-| AF-07 | The catalog already holds files at the destination | The system responds with a conflict and moves nothing. The owner indexed the new location before correcting the record, so both copies exist; the way out is a decision — remove this library and register the new folder — rather than a retry. |
-| AF-08 | The destination folder does not exist on disk | The correction is recorded anyway. The core is told a root and walks it; whether the path is there is answered by the walk, and refusing here would also refuse a drive that is merely unplugged at the moment the owner fixes the record. |
+| AF-06 | `filesystem.root` is configured and the file's recorded path resolves outside it (FR-FC-26) | The system rejects with an invalid-input error saying the file is outside the configured library root, and reads nothing. As UC-38 AF-06. |
 
 ---
 
@@ -1723,7 +1721,7 @@ have only one of.
 | **Description** | Mark an indexed folder as a *library* — a folder whose files are read in their folder structure rather than listed with every other file of their type — read one level of it, correct its root when the folder moves, and stop treating it as one. |
 | **Preconditions** | The caller is authenticated. For a read or a removal, the library exists. |
 | **Postconditions** | The library exists and its files are claimed by it, or it no longer exists and its files are back in the type listings. No file is created, moved, or deleted by any of these operations. |
-| **Requirements** | FR-FC-36, FR-FC-37, FR-FC-38, FR-FC-39, FR-FC-40, FR-FC-41, FR-FC-24 |
+| **Requirements** | FR-FC-36, FR-FC-37, FR-FC-38, FR-FC-39, FR-FC-40, FR-FC-41, FR-FC-24, FR-FC-26 |
 
 **Main Flow**
 
@@ -1744,7 +1742,9 @@ have only one of.
    The addressed folder is given relative to the library's root; absent, it is
    the top.
 5. The owner may correct the library's root after the folder moved on disk.
-   The system points the library at the new folder and rewrites the stored
+   When `filesystem.root` is configured, the new folder must lie inside it
+   (FR-FC-26). The system points the library at the new folder and rewrites
+   the stored
    path of every file it holds, replacing the old root and keeping everything
    below it exactly as indexed. Files already catalogued at the destination
    join the library, as they would on registration.
@@ -1763,7 +1763,8 @@ have only one of.
 | AF-05 | The caller is not authenticated | The system denies with an unauthorized error. |
 | AF-06 | A correction names a folder that overlaps another library | The system responds with a conflict naming it, as registration would. The library is not asked about itself: it always overlaps where it already is, so a folder that moved within its own root corrects normally. |
 | AF-07 | The catalog already holds files at the destination | The system responds with a conflict and moves nothing. The owner indexed the new location before correcting the record, so both copies exist; the way out is a decision — remove this library and register the new folder — rather than a retry. |
-| AF-08 | The destination folder does not exist on disk | The correction is recorded anyway. The core is told a root and walks it; whether the path is there is answered by the walk, and refusing here would also refuse a drive that is merely unplugged at the moment the owner fixes the record. |
+| AF-08 | The destination folder does not exist on disk | The correction is recorded anyway. The core is told a root and walks it; whether the path is there is answered by the walk, and refusing here would also refuse a drive that is merely unplugged at the moment the owner fixes the record. When `filesystem.root` is configured the folder must still lie inside it (AF-09), which is judged without the folder existing: its longest existing ancestor is resolved and the rest of the path normalised. |
+| AF-09 | `filesystem.root` is configured and the correction's folder is neither it nor a descendant of it (FR-FC-26) | The system rejects with the same invalid-input error, and the same message, an out-of-root index request gets (UC-01 AF-06), and moves nothing. A correction rewrites every stored path under the library without walking the disk, and playback serves whatever path the catalog holds, so an unbounded correction would be a way around the index's bound. `..` segments and symbolic links are judged on where they resolve to — including through a folder that does not exist yet. Registration is not bounded: it only claims files the catalog already holds, which indexing already bounded. |
 
 > **One level, not the tree.** A course with two hundred classes is a large
 > document to build, send, and parse so the owner can look at the six things in
@@ -1852,11 +1853,11 @@ have only one of.
 | UC-02: Re-index and refresh the catalog | FR-FC-08, FR-FC-10, FR-FC-11, FR-FC-24, FR-FC-27, FR-FC-31 |
 | UC-03: Browse and view file metadata | FR-FC-12, FR-FC-13, FR-FC-24 |
 | UC-04: Edit file metadata | FR-FC-14, FR-FC-15, FR-FC-16, FR-FC-17, FR-FC-18, FR-FC-24 |
-| UC-05: Rename a file | FR-FC-19, FR-FC-24 |
+| UC-05: Rename a file | FR-FC-19, FR-FC-24, FR-FC-26 |
 | UC-06: Soft-delete a file | FR-FC-20, FR-FC-24 |
 | UC-07: Restore a soft-deleted file | FR-FC-21, FR-FC-24 |
 | UC-08: Hard-purge a file record | FR-FC-22, FR-FC-24, NFR-07 |
-| UC-09: Purge a file on disk | FR-FC-23, FR-FC-24 |
+| UC-09: Purge a file on disk | FR-FC-23, FR-FC-24, FR-FC-26 |
 | UC-10: Create a collection | FR-CO-01, FR-CO-02, FR-FC-24 |
 | UC-11: Rename a collection | FR-CO-03, FR-FC-24 |
 | UC-12: Delete a collection | FR-CO-04, FR-FC-24 |
@@ -1879,14 +1880,14 @@ have only one of.
 | UC-29: Update reading progress | FR-RL-04, FR-RL-05, FR-FC-24 |
 | UC-30: Remove an item from a reading list | FR-RL-06, FR-FC-24 |
 | UC-31: Delete a reading list | FR-RL-07, FR-FC-24 |
-| UC-32: Read text file content | FR-TX-01, FR-FC-24 |
-| UC-33: Edit text file content | FR-TX-02, FR-TX-03, FR-FC-24 |
+| UC-32: Read text file content | FR-TX-01, FR-FC-24, FR-FC-26 |
+| UC-33: Edit text file content | FR-TX-02, FR-TX-03, FR-FC-24, FR-FC-26 |
 | UC-34: Local login | FR-AU-01, FR-AU-04, FR-AU-07, FR-AU-08, FR-AU-09 |
 | UC-35: Set or change local login credentials | FR-AU-05, FR-AU-06, FR-AU-07, FR-AU-08, FR-AU-11 |
 | UC-36: Authenticate via external JWT | FR-AU-01, FR-AU-02, FR-AU-03, FR-AU-07, FR-AU-08 |
-| UC-38: Stream file content | FR-MP-01, FR-MP-02, FR-MP-03, FR-MP-06 |
-| UC-39: Read a comic book page | FR-MP-03, FR-MP-04, FR-MP-06 |
-| UC-40: Get a file thumbnail | FR-MP-05, FR-MP-06 |
+| UC-38: Stream file content | FR-MP-01, FR-MP-02, FR-MP-03, FR-MP-06, FR-FC-26 |
+| UC-39: Read a comic book page | FR-MP-03, FR-MP-04, FR-MP-06, FR-FC-26 |
+| UC-40: Get a file thumbnail | FR-MP-05, FR-MP-06, FR-FC-26 |
 | UC-41: Register the local account | FR-AU-05, FR-AU-06, FR-AU-08, FR-AU-09, FR-AU-10, FR-AU-11, FR-AU-13, FR-AU-19 |
 | UC-42: Query an index or refresh run | FR-FC-24, FR-FC-27, FR-FC-28, FR-FC-29, FR-FC-35 |
 | UC-43: Redeem a recovery code | FR-AU-11, FR-AU-14, FR-AU-15, FR-AU-16 |
@@ -1898,7 +1899,7 @@ have only one of.
 | UC-52: Report which files a run could not record | FR-FC-42, FR-FC-24 |
 | UC-49: Manage a playlist | FR-TR-01, FR-TR-02, FR-TR-03, FR-TR-04, FR-TR-05, FR-TR-06, FR-TR-08, FR-TR-09, FR-FC-24 |
 | UC-50: Play a playlist | FR-TR-07, FR-TR-11, FR-FC-24 |
-| UC-51: Group a folder as a library | FR-FC-36, FR-FC-37, FR-FC-38, FR-FC-39, FR-FC-40, FR-FC-41, FR-FC-24 |
+| UC-51: Group a folder as a library | FR-FC-36, FR-FC-37, FR-FC-38, FR-FC-39, FR-FC-40, FR-FC-41, FR-FC-24, FR-FC-26 |
 
 Every functional requirement in [System Requirements Document](System%20Requirements%20Document.md)
 §3 appears in at least one row above except FR-AU-12, FR-AU-18, FR-AU-21,

@@ -239,10 +239,27 @@ impl Default for HttpSettings {
 }
 
 impl HttpSettings {
-    pub fn socket_addr(&self) -> std::net::SocketAddr {
-        format!("{}:{}", self.bind_addr, self.port)
-            .parse()
-            .expect("invalid http bind address")
+    /// The address to listen on: `bind_addr` and `port` together.
+    ///
+    /// The address is parsed on its own and paired with the port, rather than
+    /// the two being joined into `"addr:port"` and parsed as one. That join
+    /// made an IPv6 address — `"::1"`, or `"::"` for every interface — into
+    /// `"::1:8080"`, which is not a socket address, and the binary panicked at
+    /// startup instead of reporting the setting. The bracketed form a URL
+    /// would use (`"[::1]"`) is accepted too, since it is what worked before.
+    pub fn socket_addr(&self) -> Result<std::net::SocketAddr, DomainError> {
+        let host = self.bind_addr.trim();
+        let host = host
+            .strip_prefix('[')
+            .and_then(|inner| inner.strip_suffix(']'))
+            .unwrap_or(host);
+        let ip: std::net::IpAddr = host.parse().map_err(|_| {
+            DomainError::config(format!(
+                "http.bind_addr {:?} is not an IP address",
+                self.bind_addr
+            ))
+        })?;
+        Ok(std::net::SocketAddr::new(ip, self.port))
     }
 }
 
@@ -656,7 +673,7 @@ mod tests {
     #[test]
     fn given_default_settings_when_socket_addr_built_then_is_loopback() {
         let settings = Settings::default();
-        let addr = settings.http.socket_addr();
+        let addr = settings.http.socket_addr().expect("default bind address");
         assert!(addr.ip().is_loopback());
         assert_eq!(addr.port(), 8080);
         assert_eq!(settings.logging.level.as_str(), "info");

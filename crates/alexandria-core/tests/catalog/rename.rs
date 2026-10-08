@@ -20,7 +20,12 @@ fn handler(
     repo: FakeCatalogRepository,
     fs: FakeFilesystem,
 ) -> RenameFileHandler<FakeAuth, FakeCatalogRepository, FakeFilesystem> {
-    RenameFileHandler::new(auth, repo, fs)
+    RenameFileHandler::new(
+        auth,
+        repo,
+        fs,
+        alexandria_core::catalog::library_root::LibraryRoot::unconfigured(),
+    )
 }
 
 /// Build a fake filesystem that records `path` as an on-disk entry (so the
@@ -358,4 +363,35 @@ async fn given_new_name_equals_current_when_rename_then_no_move_no_write_unchang
 fn given_name_with_nul_byte_when_validated_then_invalid_input() {
     let err = validate_file_name("a\0b");
     assert!(matches!(err, Err(DomainError::InvalidInput(_))));
+}
+
+// ---------------- FR-FC-26: the configured library root ----------------
+
+/// A row already pointing outside `filesystem.root` is not renamed on disk.
+#[tokio::test]
+async fn given_a_row_outside_the_configured_root_when_renamed_then_invalid_input_and_nothing_moved()
+{
+    let library = tempfile::tempdir().expect("tempdir");
+    let repo = FakeCatalogRepository::new();
+    let file = existing_file_with_hash(
+        "/lib/song.mp3",
+        "song.mp3",
+        alexandria_core::catalog::model::FileType::Audio,
+        "h",
+    );
+    let uuid = file.uuid;
+    repo.seed(file);
+    let fs = fs_with_file("/lib/song.mp3");
+    let h = RenameFileHandler::new(
+        FakeAuth::Allowing,
+        repo.clone(),
+        fs.clone(),
+        alexandria_core::catalog::library_root::LibraryRoot::new(library.path().to_str().unwrap()),
+    );
+
+    let result = h.rename(uuid, "renamed.mp3".to_string(), TOKEN).await;
+
+    assert!(matches!(result, Err(DomainError::InvalidInput(_))));
+    assert!(!fs.renamed_to("/lib/song.mp3", "/lib/renamed.mp3"));
+    assert_eq!(repo.file_for_uuid(uuid).unwrap().path, "/lib/song.mp3");
 }

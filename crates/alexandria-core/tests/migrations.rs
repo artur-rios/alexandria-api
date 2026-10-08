@@ -347,3 +347,27 @@ async fn given_a_pre_15_audio_row_when_migrated_then_album_artist_reads_null_not
         other => panic!("expected audio metadata in listing, got {other:?}"),
     }
 }
+
+/// The database path is a file name, not a URL. It used to be spliced into
+/// `sqlite://{path}?mode=rwc`, which sqlx splits on the first `?` and
+/// percent-decodes — so `a%41b.sqlite` opened `aAb.sqlite`, and a folder named
+/// with a `?` lost everything after it. The FFI embedder passes its path
+/// through verbatim, so either spelling is one an owner's data folder can have.
+#[tokio::test]
+async fn given_a_path_with_url_metacharacters_when_migrated_then_that_exact_file_is_used() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let folder = dir.path().join("what?");
+    std::fs::create_dir(&folder).expect("folder with a question mark");
+    let path = folder.join("a%41b.sqlite");
+
+    let pool = alexandria_core::migrate::migrate_database(path.to_str().expect("utf-8 path"))
+        .await
+        .expect("migrate");
+    pool.close().await;
+
+    assert!(path.exists(), "the database was not created at {path:?}");
+    assert!(
+        !folder.join("aAb.sqlite").exists(),
+        "the path was percent-decoded"
+    );
+}

@@ -99,6 +99,37 @@ async fn given_text_file_when_content_edited_then_200_and_disk_and_hash_updated(
     assert_eq!(rows_after[0].4.as_deref(), body["contentHash"].as_str());
 }
 
+#[tokio::test]
+async fn given_content_larger_than_axums_default_body_limit_when_edited_then_it_is_saved() {
+    // 3 MiB: past the 2 MiB cap axum applies to a JSON body by default, which
+    // refused the save as a "malformed body" although the same file could be
+    // read through GET and saved through the FFI.
+    let lib = tempdir().unwrap();
+    let path = common::write_file(&lib, "big.txt", b"small");
+
+    let test = test_app().await;
+    let router = app(Settings::default(), test.services.clone());
+    router
+        .clone()
+        .oneshot(index_request(lib.path().to_str().unwrap()))
+        .await
+        .expect("index");
+    wait_for_files(&test.pool, 1).await;
+    let uuid = file_rows_with_uuid(&test.pool).await[0].0.clone();
+
+    let content = "x".repeat(3 * 1024 * 1024);
+    let response = router
+        .oneshot(edit_content_request(&uuid, &content))
+        .await
+        .expect("one-shot");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        std::fs::metadata(&path).expect("stat").len(),
+        content.len() as u64
+    );
+}
+
 // ---------------- AF-01: invalid input (wrong file type) ----------------
 
 #[tokio::test]

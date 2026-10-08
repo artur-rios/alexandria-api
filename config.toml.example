@@ -62,16 +62,22 @@ path = "alexandria.sqlite"
 
 [filesystem]
 # The library root, used for two things. The health check probes it for
-# reachability (IR-03), and it bounds indexing: the index operation (UC-01)
-# rejects a requested root that is not this path or a descendant of it
-# (FR-FC-26). Both paths are canonicalized before the comparison, so `..`
-# segments and symlinks cannot slip past it.
+# reachability (IR-03), and it bounds what the catalog can reach (FR-FC-26):
+# the index operation (UC-01) rejects a requested root that is not this path
+# or a descendant of it, correcting a library's root (UC-51) rejects a new
+# root outside it, and streaming, thumbnails, comic pages, text reads and
+# edits, renames and purge-on-disk refuse a cataloged file whose path
+# resolves outside it. Paths are canonicalized before the comparison, so
+# `..` segments and symlinks cannot slip past it; a library may still be
+# corrected to a folder that does not exist yet, as long as it would sit
+# inside this root.
 #
 # Empty — the default — turns both off: the probe reports the filesystem
-# unreachable, and indexing is unconstrained, meaning UC-01 will catalog any
-# absolute path a caller supplies and the stream operation (UC-38) can then
-# read those bytes back. Startup logs a warning while this is unset. The
-# re-index operation (UC-02) takes no root and is unaffected either way.
+# unreachable, and nothing is bounded, meaning UC-01 will catalog any
+# absolute path a caller supplies, a library can be corrected to any folder,
+# and the stream operation (UC-38) can then read those bytes back. Startup
+# logs a warning while this is unset. The re-index operation (UC-02) takes no
+# root and is unaffected either way.
 root = ""
 
 [indexing]

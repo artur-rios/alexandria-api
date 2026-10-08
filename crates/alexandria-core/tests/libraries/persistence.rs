@@ -738,6 +738,7 @@ mod moving {
         MoveLibraryHandler::new(
             FakeAuth::Allowing,
             SqliteLibraryRepository::new(pool.clone()),
+            alexandria_core::catalog::library_root::LibraryRoot::unconfigured(),
         )
         .move_to(uuid, root, "token")
         .await
@@ -788,6 +789,35 @@ mod moving {
             top.files[0].file.path, "/media/courses/rust/syllabus.pdf",
             "the file kept its old path"
         );
+    }
+
+    #[tokio::test]
+    async fn given_a_root_with_non_ascii_letters_when_the_library_moves_then_paths_stay_whole() {
+        // SQLite's `substr` counts characters, not bytes. The old root's
+        // length was measured in bytes on the Rust side, so every multi-byte
+        // letter in it sliced one character too many off each path below:
+        // `/library/Música/class-01/lecture.mp4` moved to
+        // `/media/rustclass-01/lecture.mp4` — the separator gone, and the
+        // file's record pointing at a path that does not exist.
+        let (pool, catalog, _dir) = fixtures().await;
+        let uuid = registered(&pool, "/library/Música").await;
+        insert(
+            &catalog,
+            "/library/Música/class-01/lecture.mp4",
+            FileType::Video,
+        )
+        .await;
+        insert(&catalog, "/library/Música/syllabus.pdf", FileType::Document).await;
+
+        move_to(&pool, uuid, "/media/rust").await.expect("move");
+
+        let top = browse_at(&pool, uuid, "").await;
+        assert_eq!(
+            top.files[0].file.path, "/media/rust/syllabus.pdf",
+            "the path below the root was cut short"
+        );
+        let class = browse_at(&pool, uuid, "class-01").await;
+        assert_eq!(class.files[0].file.path, "/media/rust/class-01/lecture.mp4");
     }
 
     #[tokio::test]
@@ -916,6 +946,78 @@ mod moving {
         let rejected = move_to(&pool, uuid, "   ").await;
 
         assert!(matches!(rejected, Err(DomainError::InvalidInput(_))));
+    }
+
+    // ---- FR-FC-26: the new root must sit inside `filesystem.root` ----
+
+    async fn move_bounded(
+        pool: &sqlx::sqlite::SqlitePool,
+        uuid: Uuid,
+        root: &str,
+        library_root: &std::path::Path,
+    ) -> Result<alexandria_core::libraries::model::Library, DomainError> {
+        MoveLibraryHandler::new(
+            FakeAuth::Allowing,
+            SqliteLibraryRepository::new(pool.clone()),
+            alexandria_core::catalog::library_root::LibraryRoot::new(
+                library_root.to_str().unwrap(),
+            ),
+        )
+        .move_to(uuid, root, "token")
+        .await
+    }
+
+    #[tokio::test]
+    async fn given_a_configured_root_when_a_library_moves_outside_it_then_it_is_refused_and_nothing_moves(
+    ) {
+        // The review's D1: a move rewrites every path without walking the
+        // disk, so an unbounded move put paths outside the root in the catalog.
+        let (pool, catalog, _dir) = fixtures().await;
+        let parent = tempfile::tempdir().expect("tempdir");
+        let library = parent.path().join("library");
+        std::fs::create_dir(&library).unwrap();
+        let root = library.join("x");
+        let root = root.to_str().unwrap();
+        let uuid = registered(&pool, root).await;
+        insert(&catalog, &format!("{root}/passwd"), FileType::Document).await;
+
+        let refused = move_bounded(&pool, uuid, "/etc", &library).await;
+
+        assert!(
+            matches!(refused, Err(DomainError::InvalidInput(ref m)) if m == "root path is outside the configured library root")
+        );
+        let top = browse_at(&pool, uuid, "").await;
+        assert_eq!(top.files[0].file.path, format!("{root}/passwd"));
+    }
+
+    #[tokio::test]
+    async fn given_a_configured_root_when_a_library_moves_to_a_missing_folder_inside_then_its_files_follow(
+    ) {
+        // The unplugged drive: nothing at the destination exists yet, but
+        // its nearest existing ancestor is the library root.
+        let (pool, catalog, _dir) = fixtures().await;
+        let library = tempfile::tempdir().expect("tempdir");
+        let root = library.path().join("course");
+        let root = root.to_str().unwrap();
+        let uuid = registered(&pool, root).await;
+        insert(
+            &catalog,
+            &format!("{root}/syllabus.pdf"),
+            FileType::Document,
+        )
+        .await;
+        let destination = library.path().join("usb").join("rust");
+        let destination = destination.to_str().unwrap();
+
+        move_bounded(&pool, uuid, destination, library.path())
+            .await
+            .expect("move");
+
+        let top = browse_at(&pool, uuid, "").await;
+        assert_eq!(
+            top.files[0].file.path,
+            format!("{destination}/syllabus.pdf")
+        );
     }
 
     #[tokio::test]

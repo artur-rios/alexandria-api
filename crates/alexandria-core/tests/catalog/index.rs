@@ -797,6 +797,43 @@ async fn given_a_file_that_could_not_be_indexed_when_the_run_ends_then_it_is_nam
 }
 
 #[tokio::test]
+async fn given_a_file_that_failed_mid_run_when_it_is_named_then_it_carries_the_time_it_failed() {
+    // `failed_at` is when the file failed. It was stamped with the clock read
+    // taken as the run began, so on a walk of hours every failure claimed to
+    // have happened in its first instant.
+    let fs = FakeFilesystem::builder()
+        .with_file(ROOT, "/library/a.mp3", "a.mp3", "h-a")
+        .build();
+    let runs = FakeCatalogRunRepository::new();
+    let runs_handle = runs.clone();
+    let run_id = Uuid::new_v4();
+    let handler = handler(
+        FakeAuth::Allowing,
+        FakeCatalogRepository::new().failing_for("/library/a.mp3"),
+        fs,
+        SteppingClock::new(now(), 60),
+        FakeAudioMetadataReader::new(),
+        FakeImageMetadataReader::new(),
+        FakeDocumentMetadataReader::new(),
+        FakeVideoMetadataReader::new(),
+        FakeComicMetadataReader::new(),
+        runs,
+    );
+
+    handler
+        .execute(ROOT, run_id, &IndexScope::all())
+        .await
+        .expect("run");
+
+    let recorded = runs_handle.recorded_failures(run_id);
+    assert_eq!(recorded.len(), 1);
+    assert!(
+        recorded[0].failed_at > now(),
+        "the failure was stamped with the run's start time"
+    );
+}
+
+#[tokio::test]
 async fn given_a_run_that_indexed_everything_when_it_ends_then_nothing_is_named() {
     // The half that makes the test above mean something: a clean run must
     // not name files it managed perfectly well.
@@ -3883,4 +3920,73 @@ async fn given_a_scoped_index_when_started_then_the_run_records_the_scope() {
         IndexScope::parse(["audio"]).expect("scope"),
         "the run's row carries the scope it was started with"
     );
+}
+
+/// Start the run, stop it through the control handler *before* its walk is
+/// spawned — the window between `start` returning and `execute` opening its
+/// cell — then run the walk, as the HTTP and FFI surfaces do.
+async fn walk_stopped_before_it_began(
+    verb: ControlVerb,
+) -> (FakeCatalogRunRepository, Uuid, usize) {
+    let runs = FakeCatalogRunRepository::new();
+    let registry = RunRegistry::new();
+    let run_id = Uuid::new_v4();
+    runs.start(
+        run_id,
+        RunKind::Index,
+        Some(ROOT),
+        now(),
+        TEST_CONCURRENCY,
+        None,
+    )
+    .await
+    .unwrap();
+    let control = control_handler(runs.clone(), registry.clone());
+    match verb {
+        ControlVerb::Pause => control.pause(run_id, TOKEN).await.expect("pause"),
+        ControlVerb::Cancel => control.cancel(run_id, TOKEN).await.expect("cancel"),
+    }
+    let handler = handler_with_registry(
+        FakeAuth::Allowing,
+        FakeCatalogRepository::new(),
+        audio_library(),
+        fixed_clock(now()),
+        FakeAudioMetadataReader::new(),
+        FakeImageMetadataReader::new(),
+        FakeDocumentMetadataReader::new(),
+        FakeVideoMetadataReader::new(),
+        FakeComicMetadataReader::new(),
+        runs.clone(),
+        registry.clone(),
+    );
+
+    let outcome = handler
+        .execute(ROOT, run_id, &IndexScope::all())
+        .await
+        .expect("execute");
+
+    (runs, run_id, outcome.indexed + outcome.already_cataloged)
+}
+
+#[tokio::test]
+async fn given_a_run_cancelled_before_its_walk_began_when_executed_then_nothing_is_walked() {
+    // The cancel found no live cell and wrote the row itself. A walk that
+    // went ahead anyway indexed the whole library and then closed the run
+    // `complete` — over a cancel the owner had been told succeeded.
+    let (runs, run_id, walked) = walk_stopped_before_it_began(ControlVerb::Cancel).await;
+
+    assert_eq!(walked, 0, "a cancelled run's library was walked");
+    let recorded = runs.get_recorded(run_id).expect("recorded run");
+    assert_eq!(recorded.status, RunStatus::Cancelled);
+}
+
+#[tokio::test]
+async fn given_a_run_paused_before_its_walk_began_when_executed_then_it_stays_paused() {
+    // Left paused, so a resume is what walks it — not this stale spawn
+    // racing the resumed one over the same run id.
+    let (runs, run_id, walked) = walk_stopped_before_it_began(ControlVerb::Pause).await;
+
+    assert_eq!(walked, 0, "a paused run's library was walked");
+    let recorded = runs.get_recorded(run_id).expect("recorded run");
+    assert_eq!(recorded.status, RunStatus::Paused);
 }

@@ -20,7 +20,12 @@ fn handler(
     repo: FakeCatalogRepository,
     fs: FakeFilesystem,
 ) -> ReadTextFileContentHandler<FakeAuth, FakeCatalogRepository, FakeFilesystem> {
-    ReadTextFileContentHandler::new(auth, repo, fs)
+    ReadTextFileContentHandler::new(
+        auth,
+        repo,
+        fs,
+        alexandria_core::catalog::library_root::LibraryRoot::unconfigured(),
+    )
 }
 
 // ---------------- Main flow ----------------
@@ -133,4 +138,33 @@ async fn given_unauthenticated_and_unknown_uuid_when_read_then_unauthorized_not_
     let result = h.read(Uuid::new_v4(), "").await;
 
     assert!(matches!(result, Err(DomainError::Unauthorized)));
+}
+
+// ---------------- FR-FC-26: the configured library root ----------------
+
+/// A row already pointing outside `filesystem.root` is not read. The bound is
+/// resolved on the real disk, so the root is a real temp folder; `/lib` sits
+/// outside it whether or not it exists on the test host.
+#[tokio::test]
+async fn given_a_row_outside_the_configured_root_when_read_then_invalid_input_and_nothing_read() {
+    let library = tempfile::tempdir().expect("tempdir");
+    let repo = FakeCatalogRepository::new();
+    let file = existing_file("/lib/notes.txt", FileType::Text);
+    let uuid = file.uuid;
+    repo.seed(file);
+    let fs = FakeFilesystem::builder()
+        .with_text_content("/lib/notes.txt", "the secret")
+        .build();
+    let h = ReadTextFileContentHandler::new(
+        FakeAuth::Allowing,
+        repo,
+        fs,
+        alexandria_core::catalog::library_root::LibraryRoot::new(library.path().to_str().unwrap()),
+    );
+
+    let result = h.read(uuid, TOKEN).await;
+
+    assert!(
+        matches!(result, Err(DomainError::InvalidInput(ref m)) if m == "file is outside the configured library root")
+    );
 }

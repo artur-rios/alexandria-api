@@ -3,6 +3,7 @@
 use uuid::Uuid;
 
 use crate::auth::AuthService;
+use crate::catalog::library_root::LibraryRoot;
 use crate::errors::DomainError;
 use crate::libraries::model::{Library, NewLibrary};
 use crate::libraries::repos::LibraryRepository;
@@ -88,6 +89,11 @@ where
 pub struct MoveLibraryHandler<A, R> {
     auth: A,
     repo: R,
+    /// `filesystem.root` (FR-FC-26). A move rewrites every stored path under
+    /// the library without walking the disk, and playback serves whatever
+    /// path the catalog holds — so the new root is bounded exactly as an
+    /// index root is, or a move would be the way around the index's bound.
+    library_root: LibraryRoot,
 }
 
 impl<A, R> MoveLibraryHandler<A, R>
@@ -95,8 +101,12 @@ where
     A: AuthService,
     R: LibraryRepository,
 {
-    pub fn new(auth: A, repo: R) -> Self {
-        Self { auth, repo }
+    pub fn new(auth: A, repo: R, library_root: LibraryRoot) -> Self {
+        Self {
+            auth,
+            repo,
+            library_root,
+        }
     }
 
     /// Correct the library's root to `new_root`, bringing its files with it.
@@ -110,6 +120,13 @@ where
     /// root and walks it; whether a path is there is answered by the walk,
     /// and refusing here would also refuse a drive that is merely unplugged
     /// at the moment the owner corrects the record.
+    ///
+    /// It *is* checked against `filesystem.root` when one is configured
+    /// (FR-FC-26), with the index's own check (`LibraryRoot`). That check is
+    /// built to answer for a folder that does not exist yet: it resolves the
+    /// longest part of the path that does exist and normalises the rest, so
+    /// an unplugged drive mounted inside the root is still accepted while a
+    /// `..` or a symbolic link that leads out of it is not.
     pub async fn move_to(
         &self,
         uuid: Uuid,
@@ -130,6 +147,8 @@ where
             .find_by_uuid(uuid)
             .await?
             .ok_or(DomainError::NotFound)?;
+
+        self.library_root.check_root(new_root)?;
 
         // Excluding itself, or a library would be refused for overlapping
         // where it already is — and so could never move at all.

@@ -19,7 +19,12 @@ fn handler(
     repo: FakeCatalogRepository,
     fs: FakeFilesystem,
 ) -> PurgeFileOnDiskHandler<FakeAuth, FakeCatalogRepository, FakeFilesystem> {
-    PurgeFileOnDiskHandler::new(auth, repo, fs)
+    PurgeFileOnDiskHandler::new(
+        auth,
+        repo,
+        fs,
+        alexandria_core::catalog::library_root::LibraryRoot::unconfigured(),
+    )
 }
 
 /// Build a fake filesystem that records `path` as an on-disk entry, mirroring
@@ -165,5 +170,33 @@ async fn given_catalog_purge_failure_when_purge_on_disk_then_error_surfaced() {
     assert!(fs.removed("/lib/song.mp3"));
     // The record was not removed because the fake's purge failed before
     // mutating its map.
+    assert!(repo.file_for_uuid(uuid).is_some());
+}
+
+// ---------------- FR-FC-26: the configured library root ----------------
+
+/// A row already pointing outside `filesystem.root` is not deleted from disk,
+/// and the record stays. Purging the record alone (UC-08) does not touch the
+/// disk and is unaffected, so the owner is never stuck with the row.
+#[tokio::test]
+async fn given_a_row_outside_the_configured_root_when_purged_on_disk_then_invalid_input_and_nothing_deleted(
+) {
+    let library = tempfile::tempdir().expect("tempdir");
+    let repo = FakeCatalogRepository::new();
+    let file = existing_file("/lib/song.mp3", FileType::Audio);
+    let uuid = file.uuid;
+    repo.seed(file);
+    let fs = fs_with_file("/lib/song.mp3");
+    let h = PurgeFileOnDiskHandler::new(
+        FakeAuth::Allowing,
+        repo.clone(),
+        fs.clone(),
+        alexandria_core::catalog::library_root::LibraryRoot::new(library.path().to_str().unwrap()),
+    );
+
+    let result = h.purge_on_disk(uuid, TOKEN).await;
+
+    assert!(matches!(result, Err(DomainError::InvalidInput(_))));
+    assert!(!fs.removed("/lib/song.mp3"));
     assert!(repo.file_for_uuid(uuid).is_some());
 }

@@ -28,7 +28,13 @@ fn handler(
     FakeFilesystem,
     alexandria_core::catalog::clock::FixedClock,
 > {
-    EditTextFileContentHandler::new(auth, repo, fs, fixed_clock(now()))
+    EditTextFileContentHandler::new(
+        auth,
+        repo,
+        fs,
+        fixed_clock(now()),
+        alexandria_core::catalog::library_root::LibraryRoot::unconfigured(),
+    )
 }
 
 // ---------------- Main flow ----------------
@@ -205,4 +211,65 @@ async fn given_unauthenticated_and_unknown_uuid_when_edited_then_unauthorized_no
     let result = h.edit(Uuid::new_v4(), "new content".to_string(), "").await;
 
     assert!(matches!(result, Err(DomainError::Unauthorized)));
+}
+
+// ---------------- FR-FC-26: the configured library root ----------------
+
+/// A row already pointing outside `filesystem.root` is not written: the
+/// refusal comes before the disk is touched.
+#[tokio::test]
+async fn given_a_row_outside_the_configured_root_when_edited_then_invalid_input_and_nothing_written(
+) {
+    let library = tempfile::tempdir().expect("tempdir");
+    let repo = FakeCatalogRepository::new();
+    let file = existing_file("/lib/notes.txt", FileType::Text);
+    let uuid = file.uuid;
+    repo.seed(file);
+    let fs = FakeFilesystem::builder()
+        .with_text_content("/lib/notes.txt", "old content")
+        .build();
+    let h = EditTextFileContentHandler::new(
+        FakeAuth::Allowing,
+        repo,
+        fs.clone(),
+        fixed_clock(now()),
+        alexandria_core::catalog::library_root::LibraryRoot::new(library.path().to_str().unwrap()),
+    );
+
+    let result = h.edit(uuid, "overwritten".to_string(), TOKEN).await;
+
+    assert!(matches!(result, Err(DomainError::InvalidInput(_))));
+    assert_ne!(
+        fs.written_content("/lib/notes.txt").as_deref(),
+        Some("overwritten")
+    );
+}
+
+/// Inside the configured root the bound changes nothing — including for a
+/// path that the fake holds but the real disk does not.
+#[tokio::test]
+async fn given_a_row_inside_the_configured_root_when_edited_then_it_is_written() {
+    let library = tempfile::tempdir().expect("tempdir");
+    let path = library.path().join("notes.txt");
+    let path = path.to_str().unwrap();
+    let repo = FakeCatalogRepository::new();
+    let file = existing_file(path, FileType::Text);
+    let uuid = file.uuid;
+    repo.seed(file);
+    let fs = FakeFilesystem::builder()
+        .with_text_content(path, "old content")
+        .build();
+    let h = EditTextFileContentHandler::new(
+        FakeAuth::Allowing,
+        repo,
+        fs.clone(),
+        fixed_clock(now()),
+        alexandria_core::catalog::library_root::LibraryRoot::new(library.path().to_str().unwrap()),
+    );
+
+    h.edit(uuid, "new content".to_string(), TOKEN)
+        .await
+        .expect("edit");
+
+    assert_eq!(fs.written_content(path).as_deref(), Some("new content"));
 }

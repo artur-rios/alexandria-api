@@ -37,6 +37,7 @@ use crate::catalog::commands::soft_delete::SoftDeleteFileHandler;
 use crate::catalog::document_tags::PdfEpubMetadataReader;
 use crate::catalog::fs::StdFilesystem;
 use crate::catalog::image_tags::ExifImageMetadataReader;
+use crate::catalog::library_root::LibraryRoot;
 use crate::catalog::queries::active_runs::GetActiveRunsHandler;
 use crate::catalog::queries::browse::BrowseFilesHandler;
 use crate::catalog::queries::read_content::ReadTextFileContentHandler;
@@ -537,16 +538,20 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
     // (FR-FC-08).
     let indexing_concurrency = settings.indexing.concurrency;
     let indexing_low_priority_concurrency = settings.indexing.low_priority_concurrency;
-    // FR-FC-26: `filesystem.root` bounds which trees UC-01 will index. It is
-    // logged here, once per process, because this is the single startup path
-    // both transports go through — the HTTP binary and `alexandria_index_init`
-    // — so the two surfaces cannot disagree about whether the bound is on.
-    // UC-02 takes no root (it re-walks paths already in the catalog), so it
-    // needs no equivalent.
-    if settings.filesystem.root.trim().is_empty() {
+    // FR-FC-26: `filesystem.root` bounds which trees UC-01 will index, where
+    // UC-51 may move a library to, and which cataloged files playback and the
+    // file-content operations will read or change. It is logged here, once
+    // per process, because this is the single startup path both transports go
+    // through — the HTTP binary and `alexandria_index_init` — so the two
+    // surfaces cannot disagree about whether the bound is on. UC-02 takes no
+    // root (it re-walks paths already in the catalog), so it needs no
+    // equivalent.
+    let library_root = LibraryRoot::new(&settings.filesystem.root);
+    if !library_root.is_configured() {
         tracing::warn!(
-            "filesystem.root is unset: indexing is unconstrained and will catalog any \
-             absolute path a caller supplies; set filesystem.root to bound it"
+            "filesystem.root is unset: indexing, library moves and file access are \
+             unconstrained and will reach any absolute path a caller supplies; set \
+             filesystem.root to bound them"
         );
     } else if let Err(err) = std::fs::canonicalize(settings.filesystem.root.trim()) {
         // Not fatal: the server still starts and every other operation still
@@ -556,7 +561,8 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         tracing::error!(
             root = %settings.filesystem.root,
             error = %err,
-            "configured filesystem.root cannot be resolved; indexing will be refused until it is fixed"
+            "configured filesystem.root cannot be resolved; indexing, library moves and file \
+             access will be refused until it is fixed"
         );
     }
     let index_handler = Arc::new(IndexHandler::new(
@@ -594,7 +600,12 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         run_registry.clone(),
     ));
     let edit_metadata_handler = Arc::new(EditMetadataHandler::new(auth.clone(), repo.clone()));
-    let rename_file_handler = Arc::new(RenameFileHandler::new(auth.clone(), repo.clone(), fs));
+    let rename_file_handler = Arc::new(RenameFileHandler::new(
+        auth.clone(),
+        repo.clone(),
+        fs,
+        library_root.clone(),
+    ));
     let soft_delete_file_handler = Arc::new(SoftDeleteFileHandler::new(
         auth.clone(),
         repo.clone(),
@@ -612,13 +623,18 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         clock,
         retention_days,
     ));
-    let purge_file_on_disk_handler =
-        Arc::new(PurgeFileOnDiskHandler::new(auth.clone(), repo.clone(), fs));
+    let purge_file_on_disk_handler = Arc::new(PurgeFileOnDiskHandler::new(
+        auth.clone(),
+        repo.clone(),
+        fs,
+        library_root.clone(),
+    ));
     let browse_files_handler = Arc::new(BrowseFilesHandler::new(auth.clone(), repo.clone()));
     let read_text_file_content_handler = Arc::new(ReadTextFileContentHandler::new(
         auth.clone(),
         repo.clone(),
         fs,
+        library_root.clone(),
     ));
     let get_run_status_handler = Arc::new(GetRunStatusHandler::new(
         auth.clone(),
@@ -655,16 +671,19 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         repo.clone(),
         fs,
         clock,
+        library_root.clone(),
     ));
     let playback_source_handler = Arc::new(PlaybackSourceHandler::new(
         auth.clone(),
         repo.clone(),
         StdFileStat,
+        library_root.clone(),
     ));
     let comic_page_handler = Arc::new(ComicPageHandler::new(
         auth.clone(),
         repo.clone(),
         ZipComicArchive,
+        library_root.clone(),
     ));
     let thumbnail_handler = Arc::new(ThumbnailHandler::new(
         auth.clone(),
@@ -677,12 +696,14 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         // file, at two different times for two different reasons (see
         // `CoverArtReader`'s own doc comment).
         LoftyCoverArtReader,
+        library_root.clone(),
     ));
     let energy_handler = Arc::new(EnergyHandler::new(
         auth.clone(),
         repo.clone(),
         SqliteEnergyStore::new(pool.clone()),
         FfmpegEnergyAnalyzer,
+        library_root.clone(),
     ));
     let create_collection_handler = Arc::new(CreateCollectionHandler::new(
         auth.clone(),
@@ -850,6 +871,7 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
     let move_library_handler = Arc::new(MoveLibraryHandler::new(
         auth.clone(),
         SqliteLibraryRepository::new(pool.clone()),
+        library_root.clone(),
     ));
     let browse_library_handler = Arc::new(BrowseLibraryHandler::new(
         auth.clone(),

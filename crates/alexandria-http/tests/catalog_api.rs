@@ -762,6 +762,24 @@ async fn given_unknown_type_when_get_files_then_400() {
 }
 
 #[tokio::test]
+async fn given_a_query_that_cannot_be_read_when_get_files_then_400_in_the_error_envelope() {
+    // A repeated key is a query the extractor itself refuses. It used to
+    // answer with axum's plain-text 400, the one response on this surface
+    // a client could not parse as `{"error": …}`.
+    let test = test_app().await;
+    let response = app(Settings::default(), test.services)
+        .oneshot(get_files("/v1/files?type=audio&type=video"))
+        .await
+        .expect("list one-shot");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+            .expect("a JSON error envelope");
+    assert!(body["error"].is_string(), "{body}");
+    assert_eq!(body["code"], "malformed_body");
+}
+
+#[tokio::test]
 async fn given_unknown_state_when_get_files_then_400() {
     let test = test_app().await;
     let response = app(Settings::default(), test.services)

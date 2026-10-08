@@ -25,6 +25,7 @@ use sqlx::{Row, SqlitePool};
 use uuid::Uuid;
 
 use crate::auth::AuthService;
+use crate::catalog::library_root::LibraryRoot;
 use crate::catalog::model::FileType;
 use crate::catalog::repos::CatalogRepository;
 use crate::errors::DomainError;
@@ -135,6 +136,8 @@ pub struct EnergyHandler<A, R, S, N> {
     repo: R,
     store: S,
     analyzer: N,
+    /// `filesystem.root` (FR-FC-26): see `resolve_playable`.
+    library_root: LibraryRoot,
 }
 
 impl<A, R, S, N> EnergyHandler<A, R, S, N>
@@ -144,8 +147,9 @@ where
     S: EnergyStore,
     N: EnergyAnalyzer + Clone + 'static,
 {
-    pub fn new(auth: A, repo: R, store: S, analyzer: N) -> Self {
+    pub fn new(auth: A, repo: R, store: S, analyzer: N, library_root: LibraryRoot) -> Self {
         Self {
+            library_root,
             auth,
             repo,
             store,
@@ -155,7 +159,8 @@ where
 
     /// The levels for `uuid`, from storage or freshly measured.
     pub async fn energy(&self, uuid: Uuid, token: &str) -> Result<TrackEnergy, DomainError> {
-        let file = resolve_playable(&self.auth, &self.repo, uuid, token).await?;
+        let file =
+            resolve_playable(&self.auth, &self.repo, &self.library_root, uuid, token).await?;
 
         if file.file_type != FileType::Audio {
             return Err(DomainError::InvalidInput(format!(
@@ -746,6 +751,7 @@ mod tests {
             FakeRepo::with_file(file),
             store,
             CountingAnalyzer { calls },
+            crate::catalog::library_root::LibraryRoot::unconfigured(),
         )
     }
 

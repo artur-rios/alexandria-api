@@ -1,0 +1,25 @@
+version: 2
+
+# Dependency update pull requests. Every pull request targets develop: main only receives release/*
+# pull requests (CONTRIBUTING.md), and the branch-policy workflow accepts dependabot/* heads into
+# develop.
+
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    target-branch: develop
+    schedule:
+      interval: weekly
+    groups:
+      cargo-minor-and-patch:
+        update-types: [minor, patch]
+
+  - package-ecosystem: github-actions
+    directory: /
+    target-branch: develop
+    schedule:
+      interval: weekly
+    groups:
+      github-actions:
+        patterns:
+          - '*'

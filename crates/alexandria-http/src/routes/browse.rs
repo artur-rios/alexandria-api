@@ -1,4 +1,4 @@
-use axum::extract::rejection::PathRejection;
+use axum::extract::rejection::{PathRejection, QueryRejection};
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
@@ -72,9 +72,14 @@ fn parse_state(s: Option<&str>) -> Result<StateFilter, ApiError> {
 pub async fn list_files(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Query(params): Query<FileListParams>,
+    params: Result<Query<FileListParams>, QueryRejection>,
 ) -> Result<Json<Vec<FileView>>, ApiError> {
     let token = bearer_token(&headers);
+
+    // Taken as a `Result`, like every other extractor on this surface: a bare
+    // `Query` answered a query it could not read (a repeated key, say) with
+    // axum's own plain-text 400 instead of this API's error envelope.
+    let Query(params) = params.map_err(|err| invalid_input(format!("invalid query: {err}")))?;
 
     let mut filter = FileFilter::new().with_state(parse_state(params.state.as_deref())?);
     if let Some(t) = params.file_type.as_deref().filter(|s| !s.is_empty()) {

@@ -325,27 +325,55 @@ never receive an id it can never look up.
 ### 5.5 The library-root bound
 
 When `filesystem.root` is set, an index root must be that path or a descendant
-(`FR-FC-26`). Both sides are **canonicalized** before comparison, which is what
+(`FR-FC-26`). The same check, one function (`LibraryRoot::contains`), also
+bounds the two other ways a path reaches the disk:
+
+- **Correcting a library's root** (UC-51). A correction rewrites every stored
+  path under the library without walking the disk, so without the bound it
+  would be the way around it: index `<root>/x/notes.txt`, register `<root>/x`,
+  correct it to `/home/someone`, and the stream serves
+  `/home/someone/notes.txt`. The rejection is the index's, word for word.
+- **Serving or changing a cataloged file** — stream, comic page, thumbnail,
+  energy envelope, text read and edit, rename, purge-on-disk. A record can
+  still point outside: catalogued before the bound was configured, corrected
+  before corrections were bounded, or reached through a symbolic link swapped
+  in since. Such a record is refused with `file is outside the configured
+  library root`. Purging only the record (UC-08) never touches the disk, so it
+  stays the way to drop one.
+
+Both sides are **canonicalized** before comparison, which is what
 holds the bound against `<root>/../../etc`, against `<root>` vs `<root>/` vs
 `<root>/.`, and against a symlinked root. The comparison is `Path::starts_with`,
 matching whole components — a string prefix test would let `/library-evil` past a
 `/library` bound.
 
+A library may be corrected to a folder that does not exist yet — a drive that is
+not plugged in — so the path is not required to exist. It is resolved through
+its **longest existing ancestor**, which is canonicalized, and the remaining
+segments are normalised lexically (`..` pops, `.` drops). Nothing below a
+missing folder can be a symbolic link, so that is exact. A segment that exists
+but cannot be resolved — a dangling symbolic link, a folder the server may not
+look into, a link loop — makes the whole path count as outside.
+
 Two distinct rejections, deliberately:
 
 | Condition | Message |
 | --- | --- |
-| The requested root is genuinely outside | `root path is outside the configured library root` |
+| The requested root — to index, or to correct a library to — is genuinely outside | `root path is outside the configured library root` |
+| A cataloged file to serve or change resolves outside | `file is outside the configured library root` |
 | The server's own `filesystem.root` cannot be resolved | `the server's configured library root could not be resolved; contact the operator` |
 
-The second is a misconfiguration, not a caller error, and indexing is **refused**
+The last is a misconfiguration, not a caller error, and every bounded operation is **refused**
 rather than degraded to unconstrained. A security bound that disappears when its
 configuration is wrong is worse than no bound, because the operator believes it
 is there. Neither message names the configured path.
 
-When `filesystem.root` is unset the bound is off entirely and any readable root
-is accepted — the constraint is opt-in by configuration, so no existing
-deployment changes behavior on upgrade. Re-index takes no root and is unaffected.
+When `filesystem.root` is unset the bound is off entirely: any readable root is
+indexed, a library may be corrected to any folder, and any cataloged file is
+served — the constraint is opt-in by configuration, so a deployment without it
+behaves exactly as before. One that sets it after cataloging files elsewhere
+will find those files refused until it re-indexes them under the root or
+purges their records. Re-index takes no root and is unaffected.
 
 ### 5.6 The walk
 
@@ -1040,7 +1068,7 @@ A summary of decisions a reader is most likely to assume the other way.
 | A start with no priority is rejected | It is `normal`; unrecognised values are too |
 | Cancelling a run that already finished succeeds | It is refused as a conflict |
 | Purging a record deletes the file | It does not. Only purge-on-disk touches the disk |
-| `filesystem.root` being unset is safe by default | It disables the indexing bound entirely |
+| `filesystem.root` being unset is safe by default | It disables the bound entirely — on indexing, library corrections, and file access |
 | Windows mode authenticates the caller | It authenticates the *process*; anyone reaching the port is the owner |
 | The FFI surface can stream bytes | It returns a path descriptor instead |
 

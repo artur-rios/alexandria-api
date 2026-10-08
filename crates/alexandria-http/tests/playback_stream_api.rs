@@ -365,3 +365,135 @@ async fn given_file_deleted_from_disk_when_streamed_then_internal_error() {
     // Assert
     assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
 }
+
+// ---------------- The library-root bound (FR-FC-26, defence in depth) ----------------
+//
+// Moving a library is now bounded, but a catalog row can already point
+// outside `filesystem.root`: one indexed before the bound was configured, one
+// moved before moves were bounded, or one reached through a symbolic link
+// swapped in since. Streaming serves whatever path the row holds, so the
+// stream refuses a file whose *resolved* path is outside the root.
+
+/// Put one active text file in the catalog at `path` and answer its uuid,
+/// the way a pre-bound index or move would have left it.
+async fn seed_row(pool: &sqlx::sqlite::SqlitePool, path: &std::path::Path) -> String {
+    use alexandria_core::catalog::model::{FileType, NewFile};
+    use alexandria_core::catalog::repos::{CatalogRepository, SqliteCatalogRepository};
+    let uuid = uuid::Uuid::new_v4();
+    SqliteCatalogRepository::new(pool.clone())
+        .insert_file(NewFile {
+            uuid,
+            path: path.to_str().unwrap().to_string(),
+            name: path.file_name().unwrap().to_str().unwrap().to_string(),
+            file_type: FileType::Text,
+            content_hash: None,
+            size_bytes: None,
+            mtime: None,
+            indexed_at: chrono::Utc::now(),
+        })
+        .await
+        .expect("insert");
+    uuid.to_string()
+}
+
+async fn bounded_app(library: &std::path::Path) -> (common::TestApp, axum::Router) {
+    let mut settings = Settings::default();
+    settings.filesystem.root = library.to_str().unwrap().to_string();
+    let test = common::test_app_with_settings(settings.clone()).await;
+    let router = app(settings, test.services.clone());
+    (test, router)
+}
+
+#[tokio::test]
+async fn given_a_row_outside_the_configured_root_when_streamed_then_400() {
+    // Arrange
+    let parent = tempdir().unwrap();
+    let library = parent.path().join("library");
+    let outside = parent.path().join("secrets");
+    std::fs::create_dir(&library).unwrap();
+    std::fs::create_dir(&outside).unwrap();
+    std::fs::write(outside.join("passwd.txt"), b"the secret").unwrap();
+    let (test, router) = bounded_app(&library).await;
+    let uuid = seed_row(&test.pool, &outside.join("passwd.txt")).await;
+
+    // Act
+    let response = router.oneshot(stream_request(&uuid)).await.expect("stream");
+
+    // Assert
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        value["error"],
+        "file is outside the configured library root"
+    );
+}
+
+/// The row's text is inside the root, but a symbolic link there leads out:
+/// the bound is on where the path resolves, not on how it is spelled.
+#[cfg(unix)]
+#[tokio::test]
+async fn given_a_row_reaching_out_through_a_symlink_when_streamed_then_400() {
+    let parent = tempdir().unwrap();
+    let library = parent.path().join("library");
+    let outside = parent.path().join("secrets");
+    std::fs::create_dir(&library).unwrap();
+    std::fs::create_dir(&outside).unwrap();
+    std::fs::write(outside.join("passwd.txt"), b"the secret").unwrap();
+    std::os::unix::fs::symlink(&outside, library.join("escape")).unwrap();
+    let (test, router) = bounded_app(&library).await;
+    let uuid = seed_row(&test.pool, &library.join("escape").join("passwd.txt")).await;
+
+    let response = router.oneshot(stream_request(&uuid)).await.expect("stream");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+/// A row spelled with `..` climbing out of the root is refused too.
+#[tokio::test]
+async fn given_a_row_climbing_out_with_dot_dot_when_streamed_then_400() {
+    let parent = tempdir().unwrap();
+    let library = parent.path().join("library");
+    let outside = parent.path().join("secrets");
+    std::fs::create_dir(&library).unwrap();
+    std::fs::create_dir(&outside).unwrap();
+    std::fs::write(outside.join("passwd.txt"), b"the secret").unwrap();
+    let (test, router) = bounded_app(&library).await;
+    let uuid = seed_row(
+        &test.pool,
+        &library.join("..").join("secrets").join("passwd.txt"),
+    )
+    .await;
+
+    let response = router.oneshot(stream_request(&uuid)).await.expect("stream");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+/// Inside the root, the bound changes nothing.
+#[tokio::test]
+async fn given_a_row_inside_the_configured_root_when_streamed_then_200() {
+    let library = tempdir().unwrap();
+    std::fs::write(library.path().join("song.txt"), b"inside").unwrap();
+    let (test, router) = bounded_app(library.path()).await;
+    let uuid = seed_row(&test.pool, &library.path().join("song.txt")).await;
+
+    let response = router.oneshot(stream_request(&uuid)).await.expect("stream");
+
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+/// With `filesystem.root` unset the bound is off, and a row anywhere streams
+/// exactly as it did before the bound existed.
+#[tokio::test]
+async fn given_no_configured_root_when_a_row_anywhere_is_streamed_then_200() {
+    let anywhere = tempdir().unwrap();
+    std::fs::write(anywhere.path().join("any.txt"), b"anywhere").unwrap();
+    let test = test_app().await;
+    let router = app(Settings::default(), test.services.clone());
+    let uuid = seed_row(&test.pool, &anywhere.path().join("any.txt")).await;
+
+    let response = router.oneshot(stream_request(&uuid)).await.expect("stream");
+
+    assert_eq!(response.status(), StatusCode::OK);
+}

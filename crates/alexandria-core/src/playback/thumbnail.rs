@@ -7,6 +7,7 @@ use uuid::Uuid;
 
 use crate::auth::AuthService;
 use crate::catalog::audio_tags::{CoverArtRead, CoverArtReader};
+use crate::catalog::library_root::LibraryRoot;
 use crate::catalog::model::FileType;
 use crate::catalog::repos::CatalogRepository;
 use crate::errors::DomainError;
@@ -62,6 +63,8 @@ pub struct ThumbnailHandler<A, R, C, T, K, V> {
     renderer: T,
     cache: K,
     cover: V,
+    /// `filesystem.root` (FR-FC-26): see `resolve_playable`.
+    library_root: LibraryRoot,
 }
 
 impl<A, R, C, T, K, V> ThumbnailHandler<A, R, C, T, K, V>
@@ -73,8 +76,17 @@ where
     K: ThumbnailCache,
     V: CoverArtReader,
 {
-    pub fn new(auth: A, repo: R, archive: C, renderer: T, cache: K, cover: V) -> Self {
+    pub fn new(
+        auth: A,
+        repo: R,
+        archive: C,
+        renderer: T,
+        cache: K,
+        cover: V,
+        library_root: LibraryRoot,
+    ) -> Self {
         Self {
+            library_root,
             auth,
             repo,
             archive,
@@ -85,7 +97,8 @@ where
     }
 
     pub async fn thumbnail(&self, uuid: Uuid, token: &str) -> Result<Thumbnail, DomainError> {
-        let file = resolve_playable(&self.auth, &self.repo, uuid, token).await?;
+        let file =
+            resolve_playable(&self.auth, &self.repo, &self.library_root, uuid, token).await?;
 
         // Keyed on uuid and mtime rather than on the content hash. The hash is
         // computed on demand now (FR-FC-09), so keying on it would make the
@@ -655,6 +668,7 @@ mod tests {
             },
             FakeCache::new(Arc::clone(&entries)),
             FakeCoverArt::none(),
+            crate::catalog::library_root::LibraryRoot::unconfigured(),
         );
 
         // Act
@@ -701,6 +715,7 @@ mod tests {
             },
             cache.clone(),
             FakeCoverArt::none(),
+            crate::catalog::library_root::LibraryRoot::unconfigured(),
         );
 
         // Act — first request: nothing is cached yet.
@@ -721,6 +736,7 @@ mod tests {
             },
             cache.clone(),
             FakeCoverArt::none(),
+            crate::catalog::library_root::LibraryRoot::unconfigured(),
         );
         let second = handler_two
             .thumbnail(Uuid::nil(), "t")
@@ -755,6 +771,7 @@ mod tests {
             },
             FakeCache::new(Arc::new(Mutex::new(Vec::new()))),
             FakeCoverArt::none(),
+            crate::catalog::library_root::LibraryRoot::unconfigured(),
         );
 
         // Act
@@ -798,6 +815,7 @@ mod tests {
             },
             FailingPutCache,
             FakeCoverArt::none(),
+            crate::catalog::library_root::LibraryRoot::unconfigured(),
         );
 
         // Act
@@ -830,6 +848,7 @@ mod tests {
             },
             FakeCache::new(Arc::new(Mutex::new(Vec::new()))),
             FakeCoverArt::none(),
+            crate::catalog::library_root::LibraryRoot::unconfigured(),
         );
 
         // Act
@@ -857,11 +876,13 @@ mod tests {
             },
             FakeCache::new(Arc::new(Mutex::new(Vec::new()))),
             FakeCoverArt::none(),
+            crate::catalog::library_root::LibraryRoot::unconfigured(),
         );
         let pages = ComicPageHandler::new(
             FakeAuth { good: "t" },
             FakeRepo::with_file(file),
             FakeArchive,
+            crate::catalog::library_root::LibraryRoot::unconfigured(),
         );
 
         // Act
@@ -903,6 +924,7 @@ mod tests {
             },
             cache,
             FakeCoverArt::none(),
+            crate::catalog::library_root::LibraryRoot::unconfigured(),
         );
 
         // Act
@@ -932,6 +954,7 @@ mod tests {
             },
             FakeCache::new(Arc::new(Mutex::new(Vec::new()))),
             FakeCoverArt::none(),
+            crate::catalog::library_root::LibraryRoot::unconfigured(),
         );
 
         // Act
@@ -962,6 +985,7 @@ mod tests {
             },
             FakeCache::new(Arc::new(Mutex::new(Vec::new()))),
             FakeCoverArt::none(),
+            crate::catalog::library_root::LibraryRoot::unconfigured(),
         );
 
         // Act
@@ -1022,6 +1046,7 @@ mod tests {
             },
             FakeCache::new(Arc::new(Mutex::new(Vec::new()))),
             FakeCoverArt::with_picture(b"sleeve".to_vec()),
+            crate::catalog::library_root::LibraryRoot::unconfigured(),
         );
 
         // Act
@@ -1051,6 +1076,7 @@ mod tests {
             },
             FakeCache::new(Arc::new(Mutex::new(Vec::new()))),
             FakeCoverArt::none(),
+            crate::catalog::library_root::LibraryRoot::unconfigured(),
         );
 
         // Act
@@ -1082,6 +1108,7 @@ mod tests {
             },
             FakeCache::new(Arc::new(Mutex::new(Vec::new()))),
             FakeCoverArt::unreadable(),
+            crate::catalog::library_root::LibraryRoot::unconfigured(),
         );
 
         // Act
@@ -1113,6 +1140,7 @@ mod tests {
             },
             FakeCache::new(Arc::new(Mutex::new(Vec::new()))),
             cover.clone(),
+            crate::catalog::library_root::LibraryRoot::unconfigured(),
         );
 
         // Act
@@ -1143,6 +1171,7 @@ mod tests {
             },
             FakeCache::new(Arc::new(Mutex::new(Vec::new()))),
             cover.clone(),
+            crate::catalog::library_root::LibraryRoot::unconfigured(),
         );
 
         // Act
@@ -1193,6 +1222,7 @@ mod tests {
             },
             FakeCache::new(Arc::new(Mutex::new(Vec::new()))),
             FakeCoverArt::with_picture(b"sleeve".to_vec()),
+            crate::catalog::library_root::LibraryRoot::unconfigured(),
         );
 
         // Act
