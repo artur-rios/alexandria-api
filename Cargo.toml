@@ -63,7 +63,7 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png",
 jsonwebtoken = { version = "11", features = ["rust_crypto"] }
 kamadak-exif = "0.6"
 lofty = "0.25"
-lopdf = "0.44"
+lopdf = "0.45"
 quick-xml = "0.42"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
