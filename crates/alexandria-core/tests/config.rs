@@ -158,9 +158,36 @@ fn given_shipped_example_config_when_parsed_then_values_land_in_settings() {
 #[test]
 fn given_default_settings_when_socket_addr_built_then_is_loopback() {
     let settings = Settings::default();
-    let addr = settings.http.socket_addr();
+    let addr = settings.http.socket_addr().expect("default bind address");
     assert!(addr.ip().is_loopback());
     assert_eq!(addr.port(), 8080);
+}
+
+#[test]
+fn given_an_ipv6_bind_address_when_socket_addr_built_then_it_is_bracketed_correctly() {
+    // `"::1"` joined to its port read as `"::1:8080"` and the binary panicked
+    // at startup. Both spellings an owner might write now listen on [::1].
+    for bind_addr in ["::1", "[::1]"] {
+        let mut settings = Settings::default();
+        settings.http.bind_addr = bind_addr.to_string();
+
+        let addr = settings.http.socket_addr().expect(bind_addr);
+
+        assert_eq!(addr.to_string(), "[::1]:8080", "{bind_addr}");
+    }
+}
+
+#[test]
+fn given_a_bind_address_that_is_not_an_ip_when_socket_addr_built_then_it_is_a_config_error() {
+    let mut settings = Settings::default();
+    settings.http.bind_addr = "not-an-address".to_string();
+
+    let result = settings.http.socket_addr();
+
+    assert!(
+        matches!(result, Err(alexandria_core::errors::DomainError::Config(_))),
+        "{result:?}"
+    );
 }
 
 #[test]

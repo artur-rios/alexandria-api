@@ -112,9 +112,10 @@ pub struct MoveLibraryRequest {
 
 /// `PATCH /v1/libraries/{uuid}` — the folder moved; correct the record.
 ///
-/// Returns `200` with the moved library, `400` (blank path), `401`, `404`,
-/// or `409` — the destination overlaps another library, or the catalog
-/// already holds files there.
+/// Returns `200` with the moved library, `400` (blank path, or a path outside
+/// the configured `filesystem.root` — FR-FC-26), `401`, `404`, or `409` — the
+/// destination overlaps another library, or the catalog already holds files
+/// there.
 ///
 /// A correction rather than a re-index, which is the point: the files move
 /// with the root and keep their uuids, so every watchlist place, reading

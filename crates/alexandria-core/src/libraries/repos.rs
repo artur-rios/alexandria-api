@@ -229,7 +229,12 @@ impl LibraryRepository for SqliteLibraryRepository {
         // so a normalized length indexes the stored path exactly — which is
         // what lets `D:\courses\rust\class-01\x.mp4` keep its backslashes
         // below the root while the root itself is replaced wholesale.
-        let old_len = Self::as_prefix(&old_root).len() - 1;
+        //
+        // Counted in characters, not bytes: SQLite's `substr` on TEXT counts
+        // characters, so a byte length overshoots by one for every multi-byte
+        // letter in the root (`/media/Música`) and cuts the head off every
+        // path below it — the separator first.
+        let old_len = Self::as_prefix(&old_root).chars().count() - 1;
         let new_root = new_root.trim_end_matches(['/', '\\']).to_string();
 
         let moved = sqlx::query(

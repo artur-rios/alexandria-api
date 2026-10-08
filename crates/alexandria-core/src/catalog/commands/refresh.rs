@@ -16,7 +16,7 @@ use crate::catalog::model::File;
 use crate::catalog::model::METADATA_VERSION;
 use crate::catalog::repos::CatalogRepository;
 use crate::catalog::run_registry::{RunCell, RunPhase, RunRegistry, RunSignal};
-use crate::catalog::runs::{CatalogRunRepository, RunCounts, RunKind, RunPriority};
+use crate::catalog::runs::{CatalogRunRepository, RunCounts, RunKind, RunPriority, RunStatus};
 use crate::catalog::video_tags::VideoMetadataReader;
 use crate::errors::DomainError;
 use crate::retry::{retry_on_busy, BUSY_ATTEMPTS};
@@ -218,8 +218,35 @@ where
         // abort a walk that could perfectly well run at the default width.
         // The same comment covers why the read is retried on a busy database,
         // and why it also yields the run's segment for `record_halt` below.
+        //
+        // FR-FC-28: a refresh's discovery is `list_all` rather than a
+        // filesystem walk, but it is the same shape — a phase with no
+        // denominator, then a phase with one — so it gets the same treatment.
+        //
+        // Opened *before* the run's row is read, and a row that is no longer
+        // `running` left as it stands rather than walked — a pause or cancel
+        // that landed between `start` and this spawn wrote the row directly,
+        // having found no cell. `IndexHandler::execute` gives the reason in
+        // full; the two walks face the same race.
+        let run_cell = self.registry.open(run_id);
         let (concurrency, segment) =
             match retry_on_busy(BUSY_ATTEMPTS, || self.runs.get(run_id)).await {
+                Ok(Some(run)) if run.status != RunStatus::Running => {
+                    drop(run_cell);
+                    tracing::info!(
+                        %run_id,
+                        status = ?run.status,
+                        "run was stopped before its walk began; leaving it as it stands"
+                    );
+                    return Ok(RefreshOutcome {
+                        run_id,
+                        refreshed: 0,
+                        marked_missing: 0,
+                        unchanged: 0,
+                        metadata_filled: 0,
+                        failed: 0,
+                    });
+                }
                 Ok(Some(run)) => (
                     run.concurrency
                         .map(|c| c.max(1) as usize)
@@ -237,10 +264,6 @@ where
                     (self.concurrency, None)
                 }
             };
-        // FR-FC-28: a refresh's discovery is `list_all` rather than a
-        // filesystem walk, but it is the same shape — a phase with no
-        // denominator, then a phase with one — so it gets the same treatment.
-        let run_cell = self.registry.open(run_id);
         let files = match self.repo.list_all().await {
             Ok(files) => files,
             Err(err) => {
@@ -342,7 +365,7 @@ where
                         // the owner cannot act on a number alone.
                         if let Err(note) = self
                             .runs
-                            .record_failure(run_id, &file.path, &err.to_string(), now)
+                            .record_failure(run_id, &file.path, &err.to_string(), self.clock.now())
                             .await
                         {
                             tracing::warn!(

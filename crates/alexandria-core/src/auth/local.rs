@@ -7,7 +7,7 @@ use uuid::Uuid;
 use crate::auth::{AuthService, Principal};
 use crate::catalog::clock::Clock;
 use crate::config::AuthMode;
-use crate::errors::DomainError;
+use crate::errors::{DomainError, WRITE_TX};
 
 /// Confirmation that local-login credentials were set (UC-35 / FR-AU-05).
 /// Never carries the password or its hash (FR-AU-06).
@@ -405,7 +405,7 @@ impl RecoveryCodeRepository for SqliteRecoveryCodeRepository {
         created_at: DateTime<Utc>,
     ) -> Result<(), DomainError> {
         let created_at = created_at.to_rfc3339();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with(WRITE_TX).await?;
 
         // One transaction, unlike the cross-port writes elsewhere in this
         // module: both statements belong to this single repository, so there

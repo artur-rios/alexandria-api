@@ -56,17 +56,18 @@ type AudioMetadataRow = (
 
 use alexandria_ffi::{
     alexandria_enrichment_read_track, alexandria_enrichment_run, alexandria_file_edit_metadata,
-    alexandria_file_purge, alexandria_file_purge_on_disk, alexandria_file_rename,
-    alexandria_file_restore, alexandria_file_soft_delete, alexandria_free_string,
-    alexandria_index_cancel, alexandria_index_count_files, alexandria_index_count_missing,
-    alexandria_index_files_json, alexandria_index_init, alexandria_index_pause,
-    alexandria_index_refresh_start, alexandria_index_resume, alexandria_index_run_failures_json,
-    alexandria_index_run_status_json, alexandria_index_runs_active_json, alexandria_index_start,
-    alexandria_libraries_list, alexandria_library_browse, alexandria_library_move,
-    alexandria_library_register, alexandria_library_remove, alexandria_playlist_add_entries,
-    alexandria_playlist_create, alexandria_playlist_delete, alexandria_playlist_move_entry,
-    alexandria_playlist_read, alexandria_playlist_remove_entry, alexandria_playlist_rename,
-    alexandria_playlists_list, FileMetadataResult, IndexStartResult, PlaylistJsonResult,
+    alexandria_file_playback_source, alexandria_file_purge, alexandria_file_purge_on_disk,
+    alexandria_file_rename, alexandria_file_restore, alexandria_file_soft_delete,
+    alexandria_free_string, alexandria_index_cancel, alexandria_index_count_files,
+    alexandria_index_count_missing, alexandria_index_files_json, alexandria_index_init,
+    alexandria_index_pause, alexandria_index_refresh_start, alexandria_index_resume,
+    alexandria_index_run_failures_json, alexandria_index_run_status_json,
+    alexandria_index_runs_active_json, alexandria_index_start, alexandria_libraries_list,
+    alexandria_library_browse, alexandria_library_move, alexandria_library_register,
+    alexandria_library_remove, alexandria_playlist_add_entries, alexandria_playlist_create,
+    alexandria_playlist_delete, alexandria_playlist_move_entry, alexandria_playlist_read,
+    alexandria_playlist_remove_entry, alexandria_playlist_rename, alexandria_playlists_list,
+    FileMetadataResult, IndexStartResult, PlaylistJsonResult,
 };
 
 const STATUS_RUN_OK: i32 = alexandria_ffi::RUN_OK;
@@ -100,6 +101,8 @@ const STATUS_LIBRARY_OK: i32 = alexandria_ffi::LIBRARY_OK;
 const STATUS_LIBRARY_CONFLICT: i32 = alexandria_ffi::LIBRARY_ERR_CONFLICT;
 const STATUS_LIBRARY_INVALID_INPUT: i32 = alexandria_ffi::LIBRARY_ERR_INVALID_INPUT;
 const STATUS_LIBRARY_NOT_FOUND: i32 = alexandria_ffi::LIBRARY_ERR_NOT_FOUND;
+const STATUS_PLAYBACK_OK: i32 = alexandria_ffi::PLAYBACK_OK;
+const STATUS_PLAYBACK_INVALID_INPUT: i32 = alexandria_ffi::PLAYBACK_ERR_INVALID_INPUT;
 
 /// Bearer token every smoke test authenticates with. A valid UUID: the
 /// active auth mode is local (`init_temp_db` sets `ALEXANDRIA_AUTH_MODE`), so
@@ -437,13 +440,70 @@ fn given_not_initialized_when_ffi_index_start_then_returns_not_initialized() {
     // case: after init returns OK, the slot is Some; assert a NULL root yields
     // invalid input (covers the error path that does not hit the slot error).
     let _db = init_temp_db();
+    let token = c(TEST_TOKEN);
+    let result = alexandria_index_start(
+        std::ptr::null(),
+        token.as_ptr(),
+        std::ptr::null(),
+        std::ptr::null(),
+    );
+    assert_eq!(result.status, STATUS_INVALID_INPUT);
+}
+
+/// Authentication comes before any argument, the NULL root included: HTTP's
+/// `require_auth` answers `401` before it reads a body, and this used to
+/// answer an unauthenticated caller `INVALID_INPUT` instead (FR-AU-07).
+#[test]
+fn given_a_null_root_and_no_token_when_ffi_index_start_then_unauthorized_first() {
+    let _g = serial();
+    let _db = init_temp_db();
     let result = alexandria_index_start(
         std::ptr::null(),
         std::ptr::null(),
         std::ptr::null(),
         std::ptr::null(),
     );
+    assert_eq!(result.status, STATUS_UNAUTHORIZED);
+}
+
+/// A root that is not UTF-8 is refused rather than decoded lossily: the
+/// lossy form is a different folder, with U+FFFD where the bytes were.
+#[cfg(unix)]
+#[test]
+fn given_a_root_that_is_not_utf8_when_ffi_index_start_then_invalid_input() {
+    let _g = serial();
+    let _db = init_temp_db();
+    let root = CString::new(b"/tmp/caf\xe9".to_vec()).unwrap();
+    let token = c(TEST_TOKEN);
+    let result = alexandria_index_start(
+        root.as_ptr(),
+        token.as_ptr(),
+        std::ptr::null(),
+        std::ptr::null(),
+    );
     assert_eq!(result.status, STATUS_INVALID_INPUT);
+}
+
+/// Neither is a database path: decoded lossily it named a different file,
+/// and init created a new, empty catalog there instead of opening the
+/// owner's.
+#[cfg(unix)]
+#[test]
+fn given_a_db_path_that_is_not_utf8_when_ffi_init_then_invalid_input() {
+    let _g = serial();
+    let dir = tempdir().unwrap();
+    let mut bytes = dir.path().to_str().unwrap().as_bytes().to_vec();
+    bytes.extend_from_slice(b"/caf\xe9.sqlite");
+    let path = CString::new(bytes).unwrap();
+
+    let status = alexandria_index_init(path.as_ptr());
+
+    assert_eq!(status, STATUS_INVALID_INPUT);
+    assert_eq!(
+        std::fs::read_dir(dir.path()).unwrap().count(),
+        0,
+        "a database was created at the mangled path"
+    );
 }
 
 fn files_json_value() -> serde_json::Value {
@@ -3362,4 +3422,138 @@ fn given_no_running_run_when_the_core_is_re_initialized_then_it_replaces() {
         STATUS_OK,
         "an idle core refused to be re-initialized"
     );
+}
+
+// ---------------- the library-root bound on moves and playback (FR-FC-26) ----------------
+
+/// Initialize a fresh database with `filesystem.root` set to `library`.
+///
+/// The FFI reads configuration only from the `ALEXANDRIA_*` environment, and
+/// only at init, so the variable is removed again straight after: nothing
+/// that follows — an assertion that unwinds included — can leak the bound
+/// into the next test.
+fn init_bounded_db(library: &std::path::Path) -> (TempDir, String) {
+    std::env::set_var("ALEXANDRIA_FILESYSTEM_ROOT", library.to_str().unwrap());
+    let db = init_temp_db();
+    std::env::remove_var("ALEXANDRIA_FILESYSTEM_ROOT");
+    db
+}
+
+/// The move half of the review's D1 over FFI: refused with the invalid-input
+/// status, the class HTTP's 400 maps to (NFR-09), and nothing moves.
+#[test]
+fn given_a_configured_root_when_a_library_is_moved_outside_it_over_ffi_then_invalid_input() {
+    let _g = serial();
+    let parent = tempdir().unwrap();
+    let library = parent.path().join("library");
+    let outside = parent.path().join("secrets");
+    let course = library.join("course");
+    std::fs::create_dir_all(&course).unwrap();
+    std::fs::create_dir(&outside).unwrap();
+    let _db = init_bounded_db(&library);
+    let token = c(TEST_TOKEN);
+    let body = c(
+        &serde_json::json!({"name": "Course", "rootPath": course.to_str().unwrap()}).to_string(),
+    );
+    let registered = library_json_ok(alexandria_library_register(body.as_ptr(), token.as_ptr()));
+    let uuid = c(registered["uuid"].as_str().unwrap());
+
+    for destination in [
+        outside.to_str().unwrap().to_string(),
+        format!("{}/../secrets", library.to_str().unwrap()),
+        format!("{}/gone/../../secrets", library.to_str().unwrap()),
+    ] {
+        let moved = c(&serde_json::json!({ "rootPath": destination }).to_string());
+        assert_eq!(
+            alexandria_library_move(uuid.as_ptr(), moved.as_ptr(), token.as_ptr()).status,
+            STATUS_LIBRARY_INVALID_INPUT,
+            "{destination} escaped the root"
+        );
+    }
+
+    let listed = library_json_ok(alexandria_libraries_list(token.as_ptr()));
+    assert_eq!(listed[0]["rootPath"], course.to_str().unwrap());
+}
+
+/// The other half of the pair: a destination under the root that does not
+/// exist yet (an unplugged drive) is still recorded.
+#[test]
+fn given_a_configured_root_when_moved_to_a_missing_folder_under_it_over_ffi_then_ok() {
+    let _g = serial();
+    let library = tempdir().unwrap();
+    let course = library.path().join("course");
+    std::fs::create_dir(&course).unwrap();
+    let _db = init_bounded_db(library.path());
+    let token = c(TEST_TOKEN);
+    let body = c(
+        &serde_json::json!({"name": "Course", "rootPath": course.to_str().unwrap()}).to_string(),
+    );
+    let registered = library_json_ok(alexandria_library_register(body.as_ptr(), token.as_ptr()));
+    let uuid = c(registered["uuid"].as_str().unwrap());
+    let destination = library.path().join("usb-drive").join("rust");
+
+    let moved = c(&serde_json::json!({ "rootPath": destination.to_str().unwrap() }).to_string());
+    let value = library_json_ok(alexandria_library_move(
+        uuid.as_ptr(),
+        moved.as_ptr(),
+        token.as_ptr(),
+    ));
+
+    assert_eq!(value["rootPath"], destination.to_str().unwrap());
+}
+
+/// Put one active text file in the catalog at `path`, behind the FFI's back,
+/// the way a pre-bound index or move would have left it.
+fn seed_text_row(db_path: &str, path: &std::path::Path) -> String {
+    use alexandria_core::catalog::model::{FileType, NewFile};
+    use alexandria_core::catalog::repos::{CatalogRepository, SqliteCatalogRepository};
+    let uuid = uuid::Uuid::new_v4();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let pool = alexandria_core::migrate::migrate_database(db_path)
+            .await
+            .expect("open");
+        SqliteCatalogRepository::new(pool.clone())
+            .insert_file(NewFile {
+                uuid,
+                path: path.to_str().unwrap().to_string(),
+                name: path.file_name().unwrap().to_str().unwrap().to_string(),
+                file_type: FileType::Text,
+                content_hash: None,
+                size_bytes: None,
+                mtime: None,
+                indexed_at: chrono::Utc::now(),
+            })
+            .await
+            .expect("insert");
+        pool.close().await;
+    });
+    uuid.to_string()
+}
+
+/// Playback's defence in depth over FFI: a row already pointing outside the
+/// configured root gets no descriptor — the FFI hands back a path the
+/// client then opens itself, so this is the FFI's stream.
+#[test]
+fn given_a_row_outside_the_configured_root_when_its_playback_source_is_asked_then_invalid_input() {
+    let _g = serial();
+    let parent = tempdir().unwrap();
+    let library = parent.path().join("library");
+    let outside = parent.path().join("secrets");
+    std::fs::create_dir(&library).unwrap();
+    std::fs::create_dir(&outside).unwrap();
+    std::fs::write(outside.join("passwd.txt"), b"the secret").unwrap();
+    std::fs::write(library.join("song.txt"), b"inside").unwrap();
+    let (_dir, db_path) = init_bounded_db(&library);
+    let out_of_root = c(&seed_text_row(&db_path, &outside.join("passwd.txt")));
+    let in_root = c(&seed_text_row(&db_path, &library.join("song.txt")));
+    let token = c(TEST_TOKEN);
+
+    let refused = alexandria_file_playback_source(out_of_root.as_ptr(), token.as_ptr());
+    let served = alexandria_file_playback_source(in_root.as_ptr(), token.as_ptr());
+
+    assert_eq!(refused.status, STATUS_PLAYBACK_INVALID_INPUT);
+    assert!(refused.json.is_null());
+    assert_eq!(served.status, STATUS_PLAYBACK_OK);
+    unsafe { alexandria_free_string(served.json) };
 }

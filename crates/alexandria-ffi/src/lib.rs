@@ -222,6 +222,22 @@ fn cstr_lossy(ptr: *const c_char) -> Option<String> {
     Some(s)
 }
 
+/// A caller-supplied C string that must be valid UTF-8 as it stands — a
+/// filesystem path, where [`cstr_lossy`]'s replacement characters would turn
+/// one path into another. `None` for NULL and for bytes that do not decode,
+/// both of which the caller reports as invalid input.
+#[allow(unsafe_code)] // dereferences a caller-supplied raw pointer
+fn cstr_utf8(ptr: *const c_char) -> Option<String> {
+    if ptr.is_null() {
+        return None;
+    }
+    // SAFETY: the caller passes a valid NUL-terminated C string.
+    unsafe { CStr::from_ptr(ptr) }
+        .to_str()
+        .ok()
+        .map(str::to_string)
+}
+
 /// Parse a wire priority string into a [`RunPriority`].
 ///
 /// `"low"` maps to `RunPriority::Low`; anything else — NULL, `"normal"`, an
@@ -282,6 +298,12 @@ fn parse_resume_priority(raw: Option<String>) -> Option<RunPriority> {
     }
 }
 
+/// This core's version, as a NUL-terminated string such as `"0.4.0"`.
+///
+/// The pointer is to static storage owned by the library: it stays valid for
+/// the life of the process and must **not** be passed to
+/// `alexandria_free_string`, which would free memory this library never
+/// allocated.
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
 pub extern "C" fn alexandria_version() -> *const c_char {
@@ -320,7 +342,10 @@ pub extern "C" fn alexandria_health_status_code() -> i32 {
 #[no_mangle]
 pub extern "C" fn alexandria_index_init(db_path: *const c_char) -> c_int {
     ffi_guard(INDEX_ERR_OTHER, || {
-        let path = match cstr_lossy(db_path) {
+        // Strict UTF-8: decoded lossily, a path that did not decode named a
+        // different file, and the migration below created a new, empty
+        // database there rather than opening the owner's.
+        let path = match cstr_utf8(db_path) {
             Some(p) => p,
             None => return INDEX_ERR_INVALID_INPUT,
         };
@@ -361,13 +386,32 @@ pub extern "C" fn alexandria_index_init(db_path: *const c_char) -> c_int {
         let result = runtime().block_on(async {
             let pool = migrate_database(&path).await?;
             let services = Arc::new(build_services(&settings, pool).await);
-            *services_slot()
+            let mut slot = services_slot()
                 .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(services);
-            Ok::<(), DomainError>(())
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            // Asked again, under the lock, at the moment of the swap. The
+            // check above ran before the migration and the build, and a run
+            // started from another thread in between would otherwise be
+            // orphaned exactly as that check exists to prevent. Holding the
+            // lock here means no caller can fetch the old services between
+            // this answer and the replacement.
+            if slot
+                .as_ref()
+                .is_some_and(|existing| existing.run_registry.live_runs() > 0)
+            {
+                return Ok(false);
+            }
+            *slot = Some(services);
+            Ok::<bool, DomainError>(true)
         });
         match result {
-            Ok(()) => INDEX_OK,
+            Ok(true) => INDEX_OK,
+            Ok(false) => {
+                tracing::warn!(
+                    "a run started while re-initializing; keeping the services it runs on"
+                );
+                INDEX_ERR_BUSY
+            }
             Err(_) => INDEX_ERR_OTHER,
         }
     })
@@ -410,27 +454,23 @@ pub extern "C" fn alexandria_index_start(
             Some(s) => s,
             None => return IndexStartResult::err(INDEX_ERR_NOT_INITIALIZED),
         };
-        let root = match cstr_lossy(root) {
-            Some(r) => r,
-            None => return IndexStartResult::err(INDEX_ERR_INVALID_INPUT),
-        };
         let token = cstr_lossy(token).unwrap_or_default();
-        // Denied before the scope is looked at (see `authenticated`): `start`
-        // authenticates, but only after its arguments are parsed, and the HTTP
-        // surface's `require_auth` is a route layer that runs before its
-        // extractors. Without this gate an unauthenticated caller would learn
-        // from the FFI that its `types` did not parse where HTTP told it only
-        // `401` (FR-FC-24 / NFR-09).
-        //
-        // Not the full "deny before any payload is looked at" the collection
-        // entry points keep: the NULL-`root` check above still answers
-        // `INVALID_INPUT` to an unauthenticated caller, where HTTP answers
-        // `401`. That gap predates this argument and is left as it is rather
-        // than changed in passing — this gate covers the parameter it was added
-        // with.
+        // Denied before any argument is looked at (see `authenticated`):
+        // `start` authenticates, but only after its arguments are parsed, and
+        // the HTTP surface's `require_auth` is a route layer that runs before
+        // its extractors. Without this gate an unauthenticated caller would
+        // learn from the FFI that its `root` was missing or its `types` did not
+        // parse, where HTTP told it only `401` (FR-FC-24 / NFR-09).
         if !authenticated(&services, &token) {
             return IndexStartResult::err(INDEX_ERR_UNAUTHORIZED);
         }
+        // Strict UTF-8, unlike the other arguments: a root is a path, and a
+        // lossily decoded one names a different folder — one whose name has
+        // U+FFFD where the bytes that did not decode were.
+        let root = match cstr_utf8(root) {
+            Some(r) => r,
+            None => return IndexStartResult::err(INDEX_ERR_INVALID_INPUT),
+        };
         let priority = parse_priority(cstr_lossy(priority));
         // Parsed before `start`, so a misspelt type is refused without a run
         // record being opened — the same order the root check keeps (FR-FC-27).
@@ -962,7 +1002,9 @@ pub extern "C" fn alexandria_file_read_content(
 /// desktop, on the same machine as the file — opens that path directly.
 /// Zero bytes cross this boundary. Parity with HTTP is defined on this
 /// descriptor and on the authorization, state, and error decisions rather
-/// than on byte transfer (FR-MP-06).
+/// than on byte transfer (FR-MP-06). A file whose path resolves outside the
+/// configured `filesystem.root` gets `PLAYBACK_ERR_INVALID_INPUT` and no
+/// descriptor (FR-FC-26), as HTTP's `400`.
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
 pub extern "C" fn alexandria_file_playback_source(
@@ -3050,16 +3092,23 @@ pub extern "C" fn alexandria_index_files_json() -> *mut c_char {
             Some(s) => s,
             None => return std::ptr::null_mut(),
         };
-        let rows: Vec<FileRow> = runtime()
-            .block_on(async {
-                sqlx::query_as(
-                    "SELECT path, name, type, content_hash, missing_at \
-                     FROM files ORDER BY path",
-                )
-                .fetch_all(&services.pool)
-                .await
-            })
-            .unwrap_or_default();
+        // A failed read is the NULL the doc comment promises, not `[]`: an
+        // empty array is a real answer — "nothing is indexed" — and a
+        // database that could not be read is not that.
+        let rows: Vec<FileRow> = match runtime().block_on(async {
+            sqlx::query_as(
+                "SELECT path, name, type, content_hash, missing_at \
+                 FROM files ORDER BY path",
+            )
+            .fetch_all(&services.pool)
+            .await
+        }) {
+            Ok(rows) => rows,
+            Err(err) => {
+                tracing::error!(error = %err, "could not read the indexed files");
+                return std::ptr::null_mut();
+            }
+        };
 
         let arr: Vec<_> = rows
             .iter()
@@ -5896,7 +5945,8 @@ pub extern "C" fn alexandria_library_register(
 /// (`rootPath`). The library's files move with it, keeping their uuids and
 /// everything that points at them. Answers `LIBRARY_ERR_CONFLICT` when the
 /// destination overlaps another library, or when the catalog already holds
-/// files there.
+/// files there, and `LIBRARY_ERR_INVALID_INPUT` when `rootPath` is blank or
+/// lies outside the configured `filesystem.root` (FR-FC-26), as HTTP's `400`.
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
 pub extern "C" fn alexandria_library_move(

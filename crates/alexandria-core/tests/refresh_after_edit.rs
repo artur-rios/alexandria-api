@@ -80,6 +80,7 @@ async fn given_a_just_edited_text_file_when_refreshed_then_it_is_unchanged_and_i
         repo.clone(),
         StdFilesystem,
         SystemClock,
+        alexandria_core::catalog::library_root::LibraryRoot::unconfigured(),
     );
     let edited = editor
         .edit(

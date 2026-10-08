@@ -32,10 +32,12 @@ pub(crate) fn bearer_token(headers: &HeaderMap) -> String {
     headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
-        .and_then(|s| {
-            s.strip_prefix("Bearer ")
-                .or_else(|| s.strip_prefix("bearer "))
-        })
+        // The scheme is compared case-insensitively, as RFC 7235 has it and
+        // as this function's contract says; only `Bearer` and `bearer` were
+        // accepted, so `BEARER <token>` read as no token at all.
+        .and_then(|s| s.split_once(' '))
+        .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("bearer"))
+        .map(|(_, token)| token)
         .unwrap_or("")
         .to_string()
 }
@@ -104,4 +106,34 @@ where
         Some("normal") => Some(RunPriority::Normal),
         _ => None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::HeaderValue;
+
+    fn with_authorization(value: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            HeaderValue::from_str(value).expect("header value"),
+        );
+        headers
+    }
+
+    #[test]
+    fn given_the_scheme_in_any_case_when_extracted_then_the_token_is_read() {
+        for value in ["Bearer tok", "bearer tok", "BEARER tok", "BeArEr tok"] {
+            assert_eq!(bearer_token(&with_authorization(value)), "tok", "{value}");
+        }
+    }
+
+    #[test]
+    fn given_another_scheme_or_none_when_extracted_then_the_token_is_empty() {
+        for value in ["Basic dXNlcjpwYXNz", "Bearertok", "tok", ""] {
+            assert_eq!(bearer_token(&with_authorization(value)), "", "{value}");
+        }
+        assert_eq!(bearer_token(&HeaderMap::new()), "");
+    }
 }

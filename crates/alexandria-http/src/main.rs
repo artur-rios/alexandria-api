@@ -31,7 +31,7 @@ async fn main() -> Result<()> {
     // the credential, so a process running as anyone else must not serve the
     // catalog. Checked once, here, because a process cannot change the account
     // it runs as.
-    let bind_addr = settings.http.socket_addr();
+    let bind_addr = settings.http.socket_addr()?;
     let auth_mode = settings.auth.mode;
 
     if settings.auth.mode == AuthMode::Windows {

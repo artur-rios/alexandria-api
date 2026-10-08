@@ -292,3 +292,215 @@ async fn given_a_library_when_deleted_then_it_is_gone_from_the_listing() {
         .expect("list");
     assert_eq!(body_json(listed).await.as_array().map(|a| a.len()), Some(0));
 }
+
+// ---- FR-FC-26 applied to a move: the new root must sit inside `filesystem.root` ----
+//
+// A move rewrites every stored path under the library without walking the
+// disk, and `GET /v1/files/{uuid}/stream` serves whatever path the catalog
+// holds. Without the bound, an owner session could index `<root>/x/notes.txt`,
+// register `<root>/x`, move it to `/home/someone` and stream
+// `/home/someone/notes.txt` — any out-of-root file whose relative path matches
+// one already cataloged. These use real temp folders, because the bound
+// resolves paths on the real disk.
+
+/// A library root, a folder outside it, and a router whose `filesystem.root`
+/// is the library root.
+struct Bounded {
+    harness: common::TestApp,
+    app: axum::Router,
+    library: std::path::PathBuf,
+    outside: std::path::PathBuf,
+    _parent: tempfile::TempDir,
+}
+
+async fn bounded() -> Bounded {
+    let parent = tempfile::tempdir().expect("tempdir");
+    let library = parent.path().join("library");
+    let outside = parent.path().join("secrets");
+    std::fs::create_dir(&library).expect("library");
+    std::fs::create_dir(&outside).expect("outside");
+    let mut settings = Settings::default();
+    settings.filesystem.root = library.to_str().unwrap().to_string();
+    let harness = common::test_app_with_settings(settings.clone()).await;
+    let app = app(settings, harness.services.clone());
+    Bounded {
+        harness,
+        app,
+        library,
+        outside,
+        _parent: parent,
+    }
+}
+
+async fn patch_root(app: &axum::Router, uuid: &str, root: &str) -> axum::response::Response {
+    app.clone()
+        .oneshot(authed_request(
+            "PATCH",
+            &format!("/v1/libraries/{uuid}"),
+            Some(json!({ "rootPath": root })),
+        ))
+        .await
+        .expect("patch")
+}
+
+async fn library_root_of(app: &axum::Router, uuid: &str) -> String {
+    let listed = app
+        .clone()
+        .oneshot(authed_request("GET", "/v1/libraries", None))
+        .await
+        .expect("list");
+    body_json(listed)
+        .await
+        .as_array()
+        .expect("array")
+        .iter()
+        .find(|l| l["uuid"] == uuid)
+        .expect("library listed")["rootPath"]
+        .as_str()
+        .expect("rootPath")
+        .to_string()
+}
+
+/// The reproduction from the review (D1): the move is refused with the same
+/// 400 and message an out-of-root index gets, nothing moves, and the file
+/// still streams from inside the library — not from the folder the move
+/// named.
+#[tokio::test]
+async fn given_a_configured_root_when_a_library_is_moved_outside_it_then_400_and_nothing_moves() {
+    // Arrange
+    let b = bounded().await;
+    let x = b.library.join("x");
+    std::fs::create_dir(&x).unwrap();
+    std::fs::write(x.join("passwd.txt"), b"inside").unwrap();
+    std::fs::write(b.outside.join("passwd.txt"), b"the secret").unwrap();
+    let indexed = b
+        .app
+        .clone()
+        .oneshot(authed_request(
+            "POST",
+            "/v1/index",
+            Some(json!({ "root": x.to_str().unwrap() })),
+        ))
+        .await
+        .expect("index");
+    assert_eq!(indexed.status(), StatusCode::ACCEPTED);
+    let run_id = body_json(indexed).await["runId"]
+        .as_str()
+        .expect("runId")
+        .to_string();
+    common::wait_for_run_terminal(&b.harness.services, &run_id, common::TEST_TOKEN).await;
+    let uuid = register(&b.app, "X", x.to_str().unwrap()).await;
+
+    // Act
+    let response = patch_root(&b.app, &uuid, b.outside.to_str().unwrap()).await;
+
+    // Assert
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        body_json(response).await["error"],
+        "root path is outside the configured library root"
+    );
+    assert_eq!(library_root_of(&b.app, &uuid).await, x.to_str().unwrap());
+    let file_uuid = common::file_rows_with_uuid(&b.harness.pool).await[0]
+        .0
+        .clone();
+    let streamed = b
+        .app
+        .clone()
+        .oneshot(authed_request(
+            "GET",
+            &format!("/v1/files/{file_uuid}/stream"),
+            None,
+        ))
+        .await
+        .expect("stream");
+    assert_eq!(streamed.status(), StatusCode::OK);
+    let bytes = to_bytes(streamed.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(&bytes[..], b"inside");
+}
+
+/// The deliberate design survives the bound: a destination that does not
+/// exist yet — a drive not plugged in, whose mount point is inside the
+/// root — is still recorded, because its nearest existing ancestor is.
+#[tokio::test]
+async fn given_a_configured_root_when_moved_to_a_folder_under_it_that_does_not_exist_then_200() {
+    let b = bounded().await;
+    let course = b.library.join("course");
+    std::fs::create_dir(&course).unwrap();
+    let uuid = register(&b.app, "Course", course.to_str().unwrap()).await;
+    let destination = b.library.join("usb-drive").join("courses").join("rust");
+
+    let response = patch_root(&b.app, &uuid, destination.to_str().unwrap()).await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        body_json(response).await["rootPath"],
+        destination.to_str().unwrap()
+    );
+}
+
+/// A symbolic link inside the root that points out of it is judged by where
+/// it leads — including a destination below the link that does not exist.
+#[cfg(unix)]
+#[tokio::test]
+async fn given_a_symlink_inside_the_root_pointing_out_when_moved_through_it_then_400() {
+    let b = bounded().await;
+    let course = b.library.join("course");
+    std::fs::create_dir(&course).unwrap();
+    let uuid = register(&b.app, "Course", course.to_str().unwrap()).await;
+    let link = b.library.join("escape");
+    std::os::unix::fs::symlink(&b.outside, &link).unwrap();
+
+    for destination in [link.clone(), link.join("not-there-yet")] {
+        let response = patch_root(&b.app, &uuid, destination.to_str().unwrap()).await;
+
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "{destination:?} escaped through the link"
+        );
+    }
+    assert_eq!(
+        library_root_of(&b.app, &uuid).await,
+        course.to_str().unwrap()
+    );
+}
+
+/// `..` cannot climb out, whether the folders it climbs through exist or not:
+/// the existing part is canonicalized, the rest is normalised lexically.
+#[tokio::test]
+async fn given_a_traversal_climbing_out_of_the_root_when_moved_then_400() {
+    let b = bounded().await;
+    let course = b.library.join("course");
+    std::fs::create_dir(&course).unwrap();
+    let uuid = register(&b.app, "Course", course.to_str().unwrap()).await;
+    let library = b.library.to_str().unwrap();
+
+    for destination in [
+        format!("{library}/../secrets"),
+        format!("{library}/gone/../../secrets"),
+        format!("{library}/gone/deeper/../../../secrets/not-there"),
+        format!("{library}-evil/course"),
+    ] {
+        let response = patch_root(&b.app, &uuid, &destination).await;
+
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "{destination} escaped the root"
+        );
+    }
+}
+
+/// The bound is opt-in, like the index's: with `filesystem.root` unset a
+/// library may be moved to any folder, existing or not, exactly as before.
+#[tokio::test]
+async fn given_no_configured_root_when_a_library_is_moved_anywhere_then_200() {
+    let harness = test_app().await;
+    let app = app(Settings::default(), harness.services.clone());
+    let uuid = register(&app, "Course", "/library/course").await;
+
+    let response = patch_root(&app, &uuid, "/etc").await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+}

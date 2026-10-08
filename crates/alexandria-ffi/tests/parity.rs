@@ -1051,10 +1051,22 @@ async fn given_same_lib_when_files_listed_via_http_and_ffi_then_arrays_identical
             json!({ "root": http_lib.path().to_str().unwrap() }).to_string(),
         ))
         .unwrap();
-    let _ = app(Settings::default(), http_services.clone())
+    let index_resp = app(Settings::default(), http_services.clone())
         .oneshot(index_req)
         .await
         .expect("http index");
+    let index_body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(index_resp.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
+    let http_run_id = index_body["runId"]
+        .as_str()
+        .expect("http runId")
+        .to_string();
+    // The run's end, not the file count: a row is counted the moment it is
+    // inserted, and its extraction stamp (`metadataVersion`) lands after.
+    // Waiting on the count compared a half-indexed file with a finished one
+    // whenever the machine was slow enough to separate the two.
+    wait_for_http_run_terminal(&http_services, &http_run_id, TEST_TOKEN).await;
     wait_for_http_files(&http_pool, 4).await;
 
     // Soft-delete one record so we can exercise the default-excludes-deleted
@@ -1186,6 +1198,8 @@ async fn given_same_lib_when_files_listed_via_http_and_ffi_then_arrays_identical
                 std::ptr::null(),
             );
             assert_eq!(started.status, alexandria_ffi::INDEX_OK);
+            // As on the HTTP leg: the run's end, not the file count.
+            wait_for_ffi_run_terminal(&run_id_string(&started), &token);
             wait_for_ffi_files(4);
 
             // Soft-delete song.mp3 and write the same audio/image metadata

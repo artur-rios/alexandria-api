@@ -5,6 +5,7 @@ pub mod routes;
 
 use std::sync::Arc;
 
+use axum::extract::DefaultBodyLimit;
 use axum::middleware::from_fn_with_state;
 use axum::routing::{delete, get, patch, post, put};
 use axum::Router;
@@ -60,9 +61,15 @@ pub fn app(settings: Settings, services: Arc<Services>) -> Router {
             "/v1/files/{uuid}/content",
             get(routes::text_content::get_content),
         )
+        // No body limit on the one route whose body is a whole file. axum's
+        // default 2 MiB cap meant a text file the GET above served could not
+        // be saved back — refused as a "malformed body" — while the FFI
+        // surface saved it fine (FR-FC-24). The owner's own file is what is
+        // being written, and the gate above has authenticated them before
+        // a byte of it is buffered.
         .route(
             "/v1/files/{uuid}/content",
-            put(routes::text_content::edit_content),
+            put(routes::text_content::edit_content).layer(DefaultBodyLimit::disable()),
         )
         .route("/v1/files/{uuid}/stream", get(routes::playback::stream))
         .route(

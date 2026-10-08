@@ -1503,3 +1503,51 @@ async fn given_a_run_resumed_before_a_refreshs_cancel_lands_when_it_lands_then_i
         "nor written the stopped segment's tally over a run that is still working"
     );
 }
+
+#[tokio::test]
+async fn given_a_refresh_cancelled_before_its_walk_began_when_executed_then_nothing_is_walked() {
+    // The window between `start` and the spawned `execute` opening its cell:
+    // a cancel there writes the row itself. The walk used to go ahead anyway
+    // and close the run `complete` over the cancel.
+    let runs = FakeCatalogRunRepository::new();
+    let repo = FakeCatalogRepository::new();
+    repo.seed(a_cataloged_file_with_hash(
+        "/library/a.mp3",
+        4096,
+        Some(now()),
+        "old-hash",
+    ));
+    let fs = FakeFilesystem::builder()
+        .with_file("/lib", "/library/a.mp3", "a.mp3", "unused")
+        .with_stat("/library/a.mp3", 8192, Some(now()))
+        .build();
+    let handler = refresh_handler(
+        FakeAuth::Allowing,
+        repo,
+        fs,
+        fixed_clock(now()),
+        runs.clone(),
+    );
+    let control = RunControlHandler::new(
+        FakeAuth::Allowing,
+        runs.clone(),
+        fixed_clock(now()),
+        RunRegistry::new(),
+        TEST_CONCURRENCY,
+        TEST_LOW_PRIORITY_CONCURRENCY,
+    );
+
+    let started = handler
+        .start(RunPriority::Normal, TOKEN)
+        .await
+        .expect("start");
+    control.cancel(started.run_id, TOKEN).await.expect("cancel");
+    let outcome = handler.execute(started.run_id).await.expect("execute");
+
+    assert_eq!(
+        outcome.refreshed, 0,
+        "a cancelled refresh walked the catalog"
+    );
+    let recorded = runs.get_recorded(started.run_id).expect("run recorded");
+    assert_eq!(recorded.status, RunStatus::Cancelled);
+}

@@ -2,6 +2,7 @@ use uuid::Uuid;
 
 use crate::auth::AuthService;
 use crate::catalog::fs::Filesystem;
+use crate::catalog::library_root::LibraryRoot;
 use crate::catalog::model::{File, FileState};
 use crate::catalog::repos::CatalogRepository;
 use crate::errors::DomainError;
@@ -107,6 +108,9 @@ pub struct RenameFileHandler<A, R, F> {
     auth: A,
     repo: R,
     fs: F,
+    /// `filesystem.root` (FR-FC-26): a row pointing outside it has its
+    /// bytes neither read nor changed. See `LibraryRoot`.
+    library_root: LibraryRoot,
 }
 
 impl<A, R, F> RenameFileHandler<A, R, F>
@@ -115,8 +119,13 @@ where
     R: CatalogRepository,
     F: Filesystem,
 {
-    pub fn new(auth: A, repo: R, fs: F) -> Self {
-        Self { auth, repo, fs }
+    pub fn new(auth: A, repo: R, fs: F, library_root: LibraryRoot) -> Self {
+        Self {
+            auth,
+            repo,
+            fs,
+            library_root,
+        }
     }
 
     /// Rename `uuid` to `new_name`. Returns the updated `File` on success.
@@ -150,6 +159,12 @@ where
         if new_name == file.name {
             return Ok(file);
         }
+
+        // FR-FC-26, defence in depth: indexing and library moves are bounded
+        // by `filesystem.root`, but a row may still point outside it (indexed
+        // before the bound was configured, or through a symbolic link swapped
+        // in since). Refused before the disk is touched.
+        self.library_root.check_file(&file.path)?;
 
         let new_path = sibling_path(&file.path, &new_name);
 
