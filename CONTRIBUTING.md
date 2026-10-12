@@ -216,9 +216,11 @@ tells you which step above did not take effect.
 
 #### A note on ffmpeg licensing
 
-Alexandria is GPL-3.0-or-later (see [LICENSE](LICENSE)), so linking either
-ffmpeg variant is lawful. This note used to say the opposite, because the
-project was proprietary and only an LGPL build could be linked at all.
+Alexandria's source is under the Artur Rios Attribution License (see
+[LICENSE](LICENSE)), which places no restriction on linking either ffmpeg
+variant; a binary that links a GPL build is distributed as a combined work
+subject to the GPL. This note used to say only an LGPL build could be linked,
+because the project was proprietary.
 
 The distinction still matters for a different reason. ffmpeg is LGPL by
 default; builds configured with `--enable-gpl` — every BtbN `GPL` package
@@ -228,9 +230,9 @@ LGPL build gives the project every capability it actually uses. Prefer it for
 anything shipped, and treat a GPL build as a development convenience.
 
 What the desktop front end ships on Linux is a separate matter: it carries
-libmpv, which is copyleft wherever it comes from, so those packages are GPL
-regardless of which ffmpeg is in them. Flagging the distinction, not giving
-legal advice.
+libmpv, which is copyleft wherever it comes from, so those binary packages are
+distributed as a combined work under the GPL regardless of which ffmpeg is in
+them. Flagging the distinction, not giving legal advice.
 
 ## Building
 

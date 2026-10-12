@@ -411,34 +411,29 @@ the branching model and the versioning policy are described in
 
 Copyright (c) 2026 Artur Rios.
 
-Alexandria is free software: you can redistribute it and/or modify it under the
-terms of the GNU General Public License as published by the Free Software
-Foundation, either version 3 of the License, or (at your option) any later
-version. The full text is in [LICENSE](LICENSE).
+This project is licensed under the [Artur Rios Attribution License](LICENSE).
+It is free and open source: you may view, use, fork, modify, and extend it,
+provided you credit the author, Artur Rios, with a link to
+[artur-rios.tech](https://artur-rios.tech) or
+[github.com/artur-rios](https://github.com/artur-rios). The desktop front end
+([alexandria-ui](https://github.com/artur-rios/alexandria-ui)) is under the same
+licence.
 
-It is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
-without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
-PARTICULAR PURPOSE. See the GNU General Public License for more details.
+### Bundled libraries
 
-### Why this changed
+The Attribution License covers this repository's source code. The third-party
+libraries the program links are not part of it: each keeps its own licence.
 
-This project was proprietary and all rights were reserved. It is copyleft now
-because of what it links.
-
-The core links ffmpeg, and the desktop front end
-([alexandria-ui](https://github.com/artur-rios/alexandria-ui)) links this core
-in process and plays video through libmpv. Its Linux packages are meant to be
-plug and play: unpack one on a machine with a desktop and it runs, with nothing
-to install first. That means carrying those libraries rather than asking the
+The core links ffmpeg, and the desktop front end links this core in process and
+plays video through libmpv. Its Linux release packages are meant to be plug and
+play: unpack one on a machine with a desktop and it runs, with nothing to
+install first. That means carrying those libraries rather than asking the
 user's distribution for them, and libmpv is copyleft from every distribution
 that ships it, as are the x264 and x265 encoders ffmpeg links whether or not
 anything ever encodes with them.
 
-Distributing a program alongside those libraries puts the whole of it under the
-GPL. The front end and this core are one program in the sense the licence
-means, so they are licensed alike.
-
-The alternative was building LGPL versions of mpv and ffmpeg from source and
-staying closed. That was weighed and not chosen: it trades a licence change for
-a release pipeline that builds two large C projects every time and takes on
-their security patching.
+Each bundled library keeps its own licence: the packages carry those texts in
+`lib/licenses`, and the copyleft ones are listed in `lib/licenses/COPYLEFT.tsv`.
+A Linux binary package that bundles them is distributed as a combined work
+subject to those libraries' terms, which means the GPL, version 3. The Windows
+packages carry an LGPL build of ffmpeg and no mpv.
