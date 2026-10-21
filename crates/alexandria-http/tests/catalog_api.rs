@@ -1094,6 +1094,30 @@ async fn given_missing_uuid_when_get_file_then_404() {
 }
 
 #[tokio::test]
+async fn given_the_enrichment_routes_are_gone_when_called_then_not_found() {
+    let test = test_app().await;
+    let router = app(Settings::default(), test.services);
+    let uuid = uuid::Uuid::new_v4();
+    let authorization = format!("Bearer {}", common::TEST_TOKEN);
+
+    for (method, uri) in [
+        ("POST", "/v1/enrichment/runs".to_string()),
+        ("GET", format!("/v1/enrichment/tracks/{uuid}")),
+        ("GET", "/v1/enrichment/artist-image".to_string()),
+    ] {
+        let request = Request::builder()
+            .method(method)
+            .uri(&uri)
+            .header("authorization", authorization.as_str())
+            .header("content-type", "application/json")
+            .body(Body::from("{}"))
+            .unwrap();
+        let response = router.clone().oneshot(request).await.expect("one-shot");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{method} {uri}");
+    }
+}
+
+#[tokio::test]
 async fn given_no_bearer_when_get_file_by_uuid_then_401() {
     let test = test_app().await;
     let uuid = uuid::Uuid::new_v4().to_string();

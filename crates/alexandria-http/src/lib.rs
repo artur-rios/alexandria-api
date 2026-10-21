@@ -158,19 +158,6 @@ pub fn app(settings: Settings, services: Arc<Services>) -> Router {
                 .patch(routes::libraries::move_root)
                 .delete(routes::libraries::remove),
         )
-        // Music enrichment (music enrichment design). A run is a POST
-        // because it changes what the catalog holds; reading one track's
-        // stored result is a plain GET and stays available even when
-        // enrichment itself is switched off.
-        .route("/v1/enrichment/runs", post(routes::enrichment::run))
-        .route(
-            "/v1/enrichment/tracks/{uuid}",
-            get(routes::enrichment::read_track),
-        )
-        .route(
-            "/v1/enrichment/artist-image",
-            get(routes::enrichment::read_artist_image).post(routes::enrichment::fetch_artist_image),
-        )
         .route(
             "/v1/playlists",
             post(routes::playlists::create).get(routes::playlists::list),

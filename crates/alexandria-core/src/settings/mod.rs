@@ -10,7 +10,7 @@
 use serde::Serialize;
 
 use crate::auth::AuthService;
-use crate::config::{MetadataUnavailable, Settings};
+use crate::config::Settings;
 use crate::errors::DomainError;
 
 /// The deletion settings a client needs (FR-FC-30).
@@ -26,22 +26,6 @@ pub struct DeletionSettingsView {
     pub retention_days: u32,
 }
 
-/// Whether music enrichment can be used, and if not, why.
-///
-/// A client needs both halves. Told only that it is unavailable, an
-/// interface can offer the owner nothing but a dead menu item; told the
-/// reason, it can say "your administrator has not turned this on" or "it is
-/// on but needs a contact address configured" — two very different things to
-/// do about it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct MetadataSettingsView {
-    /// Whether an enrichment run would be accepted.
-    pub available: bool,
-    /// Why not, or `None` when it is available.
-    pub unavailable_reason: Option<MetadataUnavailable>,
-}
-
 /// What UC-47 answers (FR-FC-30).
 ///
 /// An object with one field rather than a bare number, so the next
@@ -50,9 +34,6 @@ pub struct MetadataSettingsView {
 #[serde(rename_all = "camelCase")]
 pub struct SettingsView {
     pub deletion: DeletionSettingsView,
-    /// Reported so a client can render the enrichment surfaces honestly
-    /// rather than offering them and watching every call fail.
-    pub metadata: MetadataSettingsView,
 }
 
 /// UC-47 — Report the retention window (FR-FC-30).
@@ -75,10 +56,6 @@ where
             settings: SettingsView {
                 deletion: DeletionSettingsView {
                     retention_days: settings.deletion.retention_days,
-                },
-                metadata: MetadataSettingsView {
-                    available: settings.metadata.is_available(),
-                    unavailable_reason: settings.metadata.unavailable_reason(),
                 },
             },
         }
