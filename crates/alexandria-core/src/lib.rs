@@ -10,7 +10,6 @@ pub mod libraries;
 pub mod migrate;
 pub mod playback;
 pub mod playlists;
-pub mod plays;
 pub mod reading_lists;
 pub mod retry;
 pub mod services;
