@@ -170,7 +170,7 @@ async fn given_unrecognised_kind_when_posted_then_400_and_nothing_persisted() {
 
     let response = router
         .oneshot(create_request(
-            json!({ "name": "Mixed bag", "kind": "playlist" }),
+            json!({ "name": "Mixed bag", "kind": "gallery" }),
         ))
         .await
         .expect("one-shot");

@@ -46,7 +46,7 @@ async fn given_fresh_in_memory_db_when_migrate_then_collections_table_exists() {
     let bad = sqlx::query("INSERT INTO collections (uuid, name, kind) VALUES (?, ?, ?)")
         .bind(uuid::Uuid::new_v4().to_string())
         .bind("mixed")
-        .bind("playlist")
+        .bind("gallery")
         .execute(&pool)
         .await;
     assert!(bad.is_err(), "kind outside ('file','bookmark') is rejected");

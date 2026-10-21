@@ -158,27 +158,6 @@ pub fn app(settings: Settings, services: Arc<Services>) -> Router {
                 .patch(routes::libraries::move_root)
                 .delete(routes::libraries::remove),
         )
-        .route(
-            "/v1/playlists",
-            post(routes::playlists::create).get(routes::playlists::list),
-        )
-        .route(
-            "/v1/playlists/{uuid}",
-            patch(routes::playlists::rename).get(routes::playlists::read),
-        )
-        .route("/v1/playlists/{uuid}", delete(routes::playlists::delete))
-        .route(
-            "/v1/playlists/{uuid}/entries",
-            post(routes::playlists::add_entries),
-        )
-        .route(
-            "/v1/playlists/{uuid}/entries/{entry_uuid}",
-            delete(routes::playlists::remove_entry),
-        )
-        .route(
-            "/v1/playlists/{uuid}/entries/{entry_uuid}/move",
-            post(routes::playlists::move_entry),
-        )
         .route_layer(from_fn_with_state(
             state.clone(),
             middleware::auth::require_auth,
