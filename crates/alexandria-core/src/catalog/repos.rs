@@ -303,27 +303,6 @@ pub trait CatalogRepository: Send + Sync {
     /// with `InvalidState`); the repository defends the `NotFound` invariant.
     async fn purge(&self, uuid: Uuid) -> Result<(), DomainError>;
 
-    /// Drop what was measured or fetched from a file's *bytes*, because those
-    /// bytes have changed (UC-02).
-    ///
-    /// The energy envelope (FR-MP-07) and the fetched lyrics are both keyed
-    /// by `files.id` and both describe one particular recording. Neither is
-    /// re-derived on its own: energy is measured once and answered from
-    /// storage ever after, and a settled lyrics row is never looked up again.
-    /// So a file re-encoded, retagged in place, or simply replaced at the
-    /// same path kept the previous recording's envelope and the previous
-    /// track's words — the player animating one song's spectrum over another,
-    /// which is exactly the hazard `purge` guards against for a reused row id
-    /// and which needs no purge to happen.
-    ///
-    /// Deliberately *not* the extracted tags: those are re-read and merged by
-    /// the refresh itself, and merging keeps the owner's own edits. These two
-    /// are not the owner's, and there is nothing in them to keep.
-    ///
-    /// A file with neither is the normal case, so removing nothing is
-    /// success, not `NotFound`.
-    async fn forget_derived_content(&self, uuid: Uuid) -> Result<(), DomainError>;
-
     /// Link the file identified by `uuid` to the collection identified by
     /// `collection_uuid` (UC-13 / FR-CO-05). The caller has already confirmed
     /// both exist and that the collection is `kind = file`.
@@ -2099,34 +2078,6 @@ impl CatalogRepository for SqliteCatalogRepository {
             .execute(&mut *tx)
             .await?;
 
-        // The same obligation for the lyrics fetched against this file
-        // (music enrichment design). `track_lyrics` carries no foreign key
-        // for the identical reason, so a purge that forgot this would leave
-        // a row holding lyrics for a `files.id` that no longer exists -- and
-        // a later file reusing that autoincrement id would inherit them,
-        // which is worse than an orphan: it is the wrong words shown
-        // confidently against the wrong track.
-        //
-        // `artist_images` is deliberately NOT touched here. It is keyed by
-        // artist name, not by file, and one purged track does not mean the
-        // artist has left the library -- deleting their photograph because
-        // one of their files was purged would throw away a lookup every
-        // other track by them still uses.
-        sqlx::query("DELETE FROM track_lyrics WHERE file_id = ?")
-            .bind(id)
-            .execute(&mut *tx)
-            .await?;
-
-        // And the same for the sound of it (UC-21). `track_energy` is keyed
-        // by `files.id` and carries no foreign key either, so the levels of a
-        // purged track would otherwise be drawn for whatever file inherited
-        // its autoincrement id -- one track's music, animated against
-        // another's.
-        sqlx::query("DELETE FROM track_energy WHERE file_id = ?")
-            .bind(id)
-            .execute(&mut *tx)
-            .await?;
-
         let affected = sqlx::query("DELETE FROM files WHERE id = ?")
             .bind(id)
             .execute(&mut *tx)
@@ -2137,36 +2088,6 @@ impl CatalogRepository for SqliteCatalogRepository {
                 "purge matched zero rows for uuid {uuid}"
             )));
         }
-
-        tx.commit().await?;
-        Ok(())
-    }
-
-    async fn forget_derived_content(&self, uuid: Uuid) -> Result<(), DomainError> {
-        // One transaction, because the two belong to the same fact: the
-        // bytes this row describes are not the bytes those rows were made
-        // from. Half of that applied would leave a track whose words are the
-        // old song's and whose envelope is the new one's.
-        //
-        // Both are `WHERE file_id = (SELECT id …)`, so a uuid naming no file
-        // deletes nothing and still succeeds — the caller is a refresh
-        // walking rows it has just read, and it has nothing to do with a
-        // `NotFound` here that a concurrent purge could produce.
-        let mut tx = self.pool.begin_with(WRITE_TX).await?;
-
-        sqlx::query(
-            "DELETE FROM track_lyrics WHERE file_id = (SELECT id FROM files WHERE uuid = ?)",
-        )
-        .bind(uuid.to_string())
-        .execute(&mut *tx)
-        .await?;
-
-        sqlx::query(
-            "DELETE FROM track_energy WHERE file_id = (SELECT id FROM files WHERE uuid = ?)",
-        )
-        .bind(uuid.to_string())
-        .execute(&mut *tx)
-        .await?;
 
         tx.commit().await?;
         Ok(())

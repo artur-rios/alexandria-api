@@ -62,7 +62,6 @@ use crate::libraries::commands::{
 use crate::libraries::queries::{BrowseLibraryHandler, ListLibrariesHandler};
 use crate::libraries::repos::SqliteLibraryRepository;
 use crate::playback::comic_page::{ComicPageHandler, ZipComicArchive};
-use crate::playback::energy::{EnergyHandler, FfmpegEnergyAnalyzer, SqliteEnergyStore};
 use crate::playback::source::PlaybackSourceHandler;
 use crate::playback::thumbnail::{DiskThumbnailCache, ImageThumbnailRenderer, ThumbnailHandler};
 use crate::playback::StdFileStat;
@@ -157,14 +156,6 @@ pub type DefaultPlaybackSourceHandler =
 
 pub type DefaultComicPageHandler =
     ComicPageHandler<RuntimeAuthService, SqliteCatalogRepository, ZipComicArchive>;
-
-/// UC-21 — a track's own sound, measured once and kept.
-pub type DefaultEnergyHandler = EnergyHandler<
-    RuntimeAuthService,
-    SqliteCatalogRepository,
-    SqliteEnergyStore,
-    FfmpegEnergyAnalyzer,
->;
 
 pub type DefaultThumbnailHandler = ThumbnailHandler<
     RuntimeAuthService,
@@ -339,7 +330,6 @@ pub struct Services {
     pub playback_source_handler: Arc<DefaultPlaybackSourceHandler>,
     pub comic_page_handler: Arc<DefaultComicPageHandler>,
     pub thumbnail_handler: Arc<DefaultThumbnailHandler>,
-    pub energy_handler: Arc<DefaultEnergyHandler>,
     pub create_collection_handler: Arc<DefaultCreateCollectionHandler>,
     pub rename_collection_handler: Arc<DefaultRenameCollectionHandler>,
     pub delete_collection_handler: Arc<DefaultDeleteCollectionHandler>,
@@ -616,13 +606,6 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         LoftyCoverArtReader,
         library_root.clone(),
     ));
-    let energy_handler = Arc::new(EnergyHandler::new(
-        auth.clone(),
-        repo.clone(),
-        SqliteEnergyStore::new(pool.clone()),
-        FfmpegEnergyAnalyzer,
-        library_root.clone(),
-    ));
     let create_collection_handler = Arc::new(CreateCollectionHandler::new(
         auth.clone(),
         SqliteCollectionRepository::new(pool.clone()),
@@ -822,7 +805,6 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         playback_source_handler,
         comic_page_handler,
         thumbnail_handler,
-        energy_handler,
         create_collection_handler,
         rename_collection_handler,
         delete_collection_handler,

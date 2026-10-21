@@ -1156,6 +1156,28 @@ async fn given_the_playlist_routes_are_gone_when_called_then_not_found() {
 }
 
 #[tokio::test]
+async fn given_the_energy_route_is_gone_when_called_then_not_found() {
+    // A file that exists, so a 404 can only mean the route is gone rather
+    // than that the uuid is unknown.
+    let lib = tempdir().unwrap();
+    let test = test_app().await;
+    index_library(&lib, &test.pool, &[("clip.mp4", b"x")]).await;
+    let uuid = uuid_for_name(&test.pool, "clip.mp4").await;
+    let router = app(Settings::default(), test.services);
+    let authorization = format!("Bearer {}", common::TEST_TOKEN);
+
+    let request = Request::builder()
+        .method("GET")
+        .uri(format!("/v1/files/{uuid}/energy"))
+        .header("authorization", authorization.as_str())
+        .body(Body::empty())
+        .unwrap();
+    let response = router.oneshot(request).await.expect("one-shot");
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
 async fn given_no_bearer_when_get_file_by_uuid_then_401() {
     let test = test_app().await;
     let uuid = uuid::Uuid::new_v4().to_string();
