@@ -7,25 +7,49 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
-No release has been tagged yet. The workspace version in `Cargo.toml` (currently 0.4.0) tracks client
+No release has been tagged yet. The workspace version in `Cargo.toml` (currently 0.5.0) tracks client
 compatibility with the desktop front-end, not a published release. What exists so far:
 
 ### Added
 
 - One Rust core library, `alexandria-core`, exposed over an HTTP REST/JSON server (`alexandria-http`) and a C ABI for
   the Flutter desktop front-end (`alexandria-ffi`), so both surfaces return identical results.
-- Indexing and re-indexing of on-disk audio, movies and series, HTML pages, Markdown and text files, PDFs and e-books,
+- Indexing and re-indexing of on-disk movies and series, HTML pages, Markdown and text files, PDFs and e-books,
   comic books, and images, with each run observable, pausable, resumable, and cancellable; folders can be grouped as
   libraries and browsed as their own tree.
 - Catalog browsing, metadata editing, renaming on disk, text file editing, and two-phase soft-delete, restore, and purge.
-- Collections, browser bookmarks, watchlists, reading lists, and playlists.
+- Collections, browser bookmarks, watchlists, and reading lists.
 - Pluggable authentication: an external Heimdall JWT, a local encrypted login with recovery codes, or the Windows
   account the server process runs as.
-- Media playback: byte-range streaming, comic book pages, thumbnails, and a track's energy envelope.
-- Lyrics and artist photography looked up from public services, and a play history with rankings of what was played
-  most.
+- Media playback: byte-range streaming, comic book pages, and thumbnails.
 - A health check, `config.toml` configuration with `ALEXANDRIA_*` environment overrides, and SQLite migrations applied
   on startup.
+
+### Removed
+
+Music and audio moved out of Alexandria, which is now a library for things you read and watch; music lives in Orpheus,
+a separate project.
+
+- The `audio` file type: audio files are no longer catalogued, and the tag reading (lofty) and the audio metadata
+  (title, artist, album, genre, track, album artist) that came with it are gone. Audio files in an indexed folder are
+  skipped silently like any other unrecognised extension. `audio` is rejected as a file type filter and as an index
+  scope.
+- Playlists and their entries.
+- Play history and the play statistics.
+- Music enrichment: lyrics and artist photography lookups, and the `[metadata]` configuration section with its
+  `ALEXANDRIA_METADATA_*` environment variables. A `config.toml` that still carries `[metadata]` starts cleanly.
+- The track energy envelope.
+- HTTP routes: `/v1/enrichment/*`, `/v1/plays`, `/v1/plays/stats`, `/v1/playlists*`, and `/v1/files/{uuid}/energy`.
+  They answer `404`.
+- FFI functions: `alexandria_enrichment_run`, `alexandria_enrichment_read_track`, `alexandria_artist_image`,
+  `alexandria_artist_image_fetch`, `alexandria_play_record`, `alexandria_music_stats`, every `alexandria_playlist*`
+  function, `alexandria_playlists_list`, and `alexandria_track_energy`.
+- Data, on upgrade: migration 25 deletes the stored music from the database. It drops the playlist, lyrics, energy,
+  play history, and artist image tables, removes every audio file and its tag record, and rebuilds `files` without the
+  `audio` type. Index runs scoped to audio alone are deleted, and `audio` is stripped from the scope of mixed runs.
+  Videos, documents, and every other file keep their records, ids, and progress. Files on disk and cached artist
+  images are never touched.
+- Breaking for clients: the core is version 0.5.0, so a client built against 0.4 is refused at startup.
 
 ### Fixed
 

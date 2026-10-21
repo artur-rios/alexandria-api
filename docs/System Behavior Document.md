@@ -214,7 +214,7 @@ API surface.
 ### 5.1 What a scan costs, and why
 
 Indexing **reads no file bytes to identify a file** (`FR-FC-09`). Per-file work
-is one `stat` plus, at first index only, a tag-header read. Re-index is one
+is one `stat` plus, at first index only, a read of the file's embedded metadata. Re-index is one
 `stat` and nothing else.
 
 This is the single most important behavioral fact about the system, because it
@@ -334,7 +334,7 @@ bounds the two other ways a path reaches the disk:
   correct it to `/home/someone`, and the stream serves
   `/home/someone/notes.txt`. The rejection is the index's, word for word.
 - **Serving or changing a cataloged file** — stream, comic page, thumbnail,
-  energy envelope, text read and edit, rename, purge-on-disk. A record can
+  text read and edit, rename, purge-on-disk. A record can
   still point outside: catalogued before the bound was configured, corrected
   before corrections were bounded, or reached through a symbolic link swapped
   in since. Such a record is refused with `file is outside the configured
@@ -706,7 +706,6 @@ counted in the run's `failed` tally.
 
 | Type | Read from | Fields |
 | --- | --- | --- |
-| Audio | embedded tags (`lofty`) | title, artist, album, year, genre, track, albumArtist |
 | Image | EXIF (`kamadak-exif`) | dimensions, title |
 | Document | PDF (`lopdf`) / EPUB (`epub`) | title, author, year, page count, `formatKind` |
 | Video | container (`ffmpeg-next`) | title, year, resolution, duration |
@@ -716,26 +715,17 @@ Two fields are never inferred: a video's `mediaKind` (nothing in the file
 distinguishes a movie from an episode) and an image's `caption`. Each type's
 writes are independent — one failing does not block the other.
 
-An audio file's `albumArtist` is read the same as its other six fields (issue
-#120) — `ALBUMARTIST` / `TPE2` / `aART`, whichever the file carries — but it is
-never derived from `artist` when the tag is absent. A file with no album
-artist tag reads `albumArtist: null`, not a copy of its track artist: an
-absent tag and a present one that happens to equal the track artist are
-different things, and the core reports what the file says rather than
-guessing on a client's behalf. Because extraction runs only at first index
-(FR-FC-25) and re-index never re-runs it, a library already indexed before
-this field existed gains no `albumArtist` values until it is indexed afresh
-— the same consequence `duration_seconds` had when that field was added.
-
 `formatKind` is set from the format itself: `book` for PDF, `ebook` for EPUB.
 
 ### 5.13 Classification
 
-By extension alone, matched case-insensitively. Anything else is skipped.
+By extension alone, matched case-insensitively. Anything else is skipped —
+including audio files such as `.mp3` or `.flac`, which Alexandria does not
+catalog (music lives in Orpheus): they are skipped silently, as any
+unrecognised extension is, and are not reported as failures.
 
 | Type | Extensions |
 | --- | --- |
-| Audio | mp3, flac, wav, ogg, oga, m4a, aac, opus, wma |
 | Video | mp4, m4v, mkv, avi, mov, webm, mpg, mpeg, wmv, flv |
 | Html | html, htm, mhtml |
 | Text | md, markdown, txt |
@@ -749,10 +739,10 @@ distinguish a comic PDF from a book PDF.
 ### 5.14 The run's scope
 
 A run records the file types its **scope** names (`FR-FC-01`), spelled the same
-way the catalog reads a type back — `audio`, `video`, `html`, `text`,
+way the catalog reads a type back — `video`, `html`, `text`,
 `document`, `comic`, `image`. HTTP takes them as an array
-(`{"types": ["audio"]}`), the FFI as one comma-separated string
-(`"audio,image"`); an absent key, an empty array, NULL, and the empty string
+(`{"types": ["video"]}`), the FFI as one comma-separated string
+(`"video,image"`); an absent key, an empty array, NULL, and the empty string
 all mean **every type**, so every caller predating the scope keeps its
 behaviour.
 
@@ -881,18 +871,9 @@ than letting them re-sniff the bytes.
 CBZ, or a page out of range is a `400`.
 
 **`GET /v1/files/{uuid}/thumbnail`** returns a downscaled JPEG for a video, image,
-comic, or audio File (`FR-MP-05`). A type with no thumbnail is a `400`. SVG is
+or comic File (`FR-MP-05`). A type with no thumbnail is a `400`. SVG is
 rejected explicitly: it is vector, the raster decoder cannot read it, and
 rasterizing it would mean a new dependency.
-
-For audio, the thumbnail is the picture the file's own tag calls the front
-cover (or, failing that, whichever picture the tag lists first). An audio File
-that parses fine but carries no picture at all is a `400`, the same "not
-supported for this file" shape SVG and non-CBZ comics get. An audio File that
-cannot be read or parsed as audio at all — missing on disk, corrupt, or a
-format `lofty` does not support (`.wma`) — is a `500` disk error instead: it is
-told apart from "no picture" deliberately, so an owner is never pointed at the
-wrong problem.
 
 The thumbnail cache is keyed on **uuid and mtime**, not on a content hash —
 hashing a multi-gigabyte video to decide whether its thumbnail is stale would

@@ -113,11 +113,11 @@ graph LR
 
 **Main Flow**
 
-1. The owner requests indexing with a root path, optionally a **priority** — `normal` or `low` (FR-FC-31), an absent or unrecognised priority meaning `normal` — and optionally a **scope**: the file types this run records (FR-FC-01), named with the same words the catalog reads a type back as. An absent or empty scope means every supported type, so a folder of albums can be indexed as audio alone rather than as an image library its cover art happened to fill.
+1. The owner requests indexing with a root path, optionally a **priority** — `normal` or `low` (FR-FC-31), an absent or unrecognised priority meaning `normal` — and optionally a **scope**: the file types this run records (FR-FC-01), named with the same words the catalog reads a type back as. An absent or empty scope means every supported type, so a folder of comics can be indexed as comics alone rather than as an image library its page art happened to fill.
 2. The system starts an asynchronous scan and returns immediately with the run's id.
 3. The system walks the tree to discover its entries. While it is counting them the run reports phase `discovering` and no total; once the count is known the total is fixed and the phase becomes `processing` (FR-FC-28).
 4. The system classifies each supported file **by extension**, skips the ones the run's scope excludes — counted in `skipped` alongside the unsupported extensions, since the run saw both and recorded neither — and creates a File record for the rest (with a row in the matching subtype table) carrying path, name, type, and the size and modification time taken from the directory entry. **Nothing reads the file's contents to identify it**, and no content hash is computed: size and modification time are the change signal a later re-index compares (UC-02), and the File's content hash is left unset (FR-FC-09). Files are processed **several at a time**, up to the width the run's priority resolved to (`indexing.concurrency` for `normal`, `indexing.low_priority_concurrency` for `low`); the order is therefore unspecified, but every scanned entry contributes exactly one outcome to the run's counts.
-5. For the subtypes that carry embedded metadata — audio, image, document, video, and comic — the system reads the file's own metadata and prefills the subtype row with it (FR-FC-25). Extraction is **best-effort**: an unreadable or metadata-less file simply leaves the fields empty, and the owner can set or correct any of them afterwards via UC-04. The row is stamped with the extraction that was applied to it, which is what lets UC-02 tell a row written by an older reading from a current one. A file that gave up nothing is stamped too: the stamp records which extraction has been applied, not which one succeeded, and re-opening an unreadable file on every later pass would buy only a retry that a later extraction — which moves the version, and so revisits every row — performs anyway.
+5. For the subtypes that carry embedded metadata — image, document, video, and comic — the system reads the file's own metadata and prefills the subtype row with it (FR-FC-25). Extraction is **best-effort**: an unreadable or metadata-less file simply leaves the fields empty, and the owner can set or correct any of them afterwards via UC-04. The row is stamped with the extraction that was applied to it, which is what lets UC-02 tell a row written by an older reading from a current one. A file that gave up nothing is stamped too: the stamp records which extraction has been applied, not which one succeeded, and re-opening an unreadable file on every later pass would buy only a retry that a later extraction — which moves the version, and so revisits every row — performs anyway.
 6. The system records the `indexedAt` timestamp and logs the run's outcome (scanned, indexed, skipped, alreadyCataloged, failed).
 
 The `runId` returned in step 2 is how the owner follows the run: UC-42 reports
@@ -212,7 +212,7 @@ its status and live progress, and UC-48 pauses, resumes, or cancels it.
 | **ID** | UC-04 |
 | **Name** | Edit file metadata |
 | **Actors** | Owner |
-| **Description** | Edit the type-specific metadata of a file (audio, video, document, comic-book, or image fields). |
+| **Description** | Edit the type-specific metadata of a file (video, document, comic-book, or image fields). |
 | **Preconditions** | The caller is authenticated; the target file exists and is `active`. |
 | **Postconditions** | The file's subtype metadata is updated. |
 | **Requirements** | FR-FC-14, FR-FC-15, FR-FC-16, FR-FC-17, FR-FC-18, FR-FC-24 |
@@ -227,7 +227,7 @@ its status and live progress, and UC-48 pauses, resumes, or cancels it.
 
 | ID | Condition | Outcome |
 | --- | --- | --- |
-| AF-01 | The fields do not match the file's subtype (e.g. audio fields on a video) | The system rejects with an invalid-input error. |
+| AF-01 | The fields do not match the file's subtype (e.g. image fields on a video) | The system rejects with an invalid-input error. |
 | AF-02 | The file UUID does not exist | The system responds with a not-found error. |
 | AF-03 | The caller is not authenticated | The system denies with an unauthorized error. |
 | AF-04 | The file is in `deleted` state | The system rejects with an invalid-state error (restore first via UC-07). |
@@ -1242,27 +1242,27 @@ UC-36's externally issued JWT.
 | **ID** | UC-40 |
 | **Name** | Get a file thumbnail |
 | **Actors** | Owner, Local Filesystem |
-| **Description** | Return a downscaled JPEG thumbnail for a video, image, comic, or audio File, cached on disk keyed by the file's UUID, modification time, and target dimension. For audio, the thumbnail is the front-cover picture embedded in the file's own tag. |
-| **Preconditions** | The caller is authenticated; the target file is `active`, present on disk, and of type video, image, comic, or audio. |
+| **Description** | Return a downscaled JPEG thumbnail for a video, image, or comic File, cached on disk keyed by the file's UUID, modification time, and target dimension. |
+| **Preconditions** | The caller is authenticated; the target file is `active`, present on disk, and of type video, image, or comic. |
 | **Postconditions** | The caller receives the thumbnail's bytes; on a cache miss, the generated thumbnail is written to the disk cache under that key. |
 | **Requirements** | FR-MP-05, FR-MP-06, FR-FC-26 |
 
 **Main Flow**
 
 1. The owner requests a thumbnail for a File UUID.
-2. The system verifies the file's type is video, image, comic, or audio.
+2. The system verifies the file's type is video, image, or comic.
 3. The system looks up the thumbnail cache by a key derived from the file's UUID, its recorded modification time, and the target dimension; on a hit, it returns the cached bytes without rendering anything. The UUID is unique and stable, and folding in the modification time is what invalidates the entry when the file changes — the same job the content hash used to do, without the whole-file read that keying on a hash would now force at browse time (FR-FC-09).
-4. On a cache miss, the system produces a source image — a video keyframe, the decoded image, the comic's first page, or an audio file's embedded front-cover picture — and downscales it to fit within 320 pixels on its longest side, preserving aspect ratio and never enlarging a source that is already smaller, then encodes it as JPEG. An audio File with no embedded picture is rejected as AF-01 rather than produced; nothing is read or extracted from an audio File at index time for this purpose (FR-FC-09, FR-FC-25).
+4. On a cache miss, the system produces a source image — a video keyframe, the decoded image, or the comic's first page — and downscales it to fit within 320 pixels on its longest side, preserving aspect ratio and never enlarging a source that is already smaller, then encodes it as JPEG.
 5. The system writes the encoded bytes to the cache and returns them.
 
 **Alternative Flows**
 
 | ID | Condition | Outcome |
 | --- | --- | --- |
-| AF-01 | The file's type has no thumbnail (text, HTML page, or document), or is an audio File with no embedded picture | The system rejects with an invalid-input error. |
+| AF-01 | The file's type has no thumbnail (text, HTML page, or document) | The system rejects with an invalid-input error. |
 | AF-02 | The file UUID does not exist | The system responds with a not-found error. |
 | AF-03 | The file is soft-deleted | The system rejects with an invalid-state error (restore via UC-07 first). |
-| AF-04 | The file is marked missing on disk, or its bytes cannot be read or decoded — for audio, this includes a file that cannot be opened or parsed as audio at all (missing at request time despite being marked present, corrupt, or an unsupported format such as `.wma`), told apart from AF-01's "parsed fine, but carries no picture" | The system responds with a disk-error. |
+| AF-04 | The file is marked missing on disk, or its bytes cannot be read or decoded | The system responds with a disk-error. |
 | AF-05 | The caller is not authenticated | The system denies with an unauthorized error. |
 | AF-06 | `filesystem.root` is configured and the file's recorded path resolves outside it (FR-FC-26) | The system rejects with an invalid-input error saying the file is outside the configured library root, and reads nothing. As UC-38 AF-06. |
 
@@ -1635,81 +1635,13 @@ have only one of.
 
 ### UC-49: Manage a playlist
 
-| Field | Value |
-| --- | --- |
-| **ID** | UC-49 |
-| **Name** | Manage a playlist |
-| **Actors** | Owner |
-| **Description** | Create, rename, and delete a named playlist of audio tracks; add tracks to it, remove one entry, and reorder its entries. |
-| **Preconditions** | The caller is authenticated; for every operation but creation, the playlist exists, and for remove/reorder the addressed entry exists in it. |
-| **Postconditions** | The playlist and its entries reflect the requested change. Entry positions remain contiguous `0..n-1`. The audio files a playlist references are never modified or deleted by a playlist operation — deleting a playlist removes only its entries. |
-| **Requirements** | FR-TR-01, FR-TR-02, FR-TR-03, FR-TR-04, FR-TR-05, FR-TR-06, FR-TR-08, FR-TR-09, FR-FC-24 |
-
-**Main Flow**
-
-1. The owner creates a playlist by submitting a name; the system validates the name is non-blank and creates the playlist, returning its UUID.
-2. The owner may rename the playlist by submitting a new name, validated the same way.
-3. The owner adds one or more audio files to the playlist by UUID; the system appends them, in order, at consecutive positions after whatever the playlist already holds. A track already on the playlist may be added again — it becomes a second, independent entry.
-4. The owner may remove one entry from the playlist by its entry id; the system deletes it and renumbers the remaining entries so positions stay contiguous.
-5. The owner may move one entry to a requested index; the system computes the playlist's full new order in one transaction, renumbers every entry, and returns the new order.
-6. The owner may delete the playlist; the system removes the playlist and every entry it holds, and returns the pre-delete record as confirmation. The referenced audio files are untouched.
-
-**Alternative Flows**
-
-| ID | Condition | Outcome |
-| --- | --- | --- |
-| AF-01 | The submitted name is blank, is whitespace-only, or has leading/trailing whitespace | The system rejects with an invalid-input error without creating or renaming anything. |
-| AF-02 | The playlist UUID, or an entry id addressed within it, does not exist | The system responds with a not-found error. |
-| AF-03 | A file submitted to be added is not an audio file | The system rejects the whole submitted batch with an invalid-input error and adds none of it. |
-| AF-04 | A file UUID submitted to be added does not resolve to any file | The system responds with a not-found error and adds none of the submitted batch — one unresolvable UUID among several means nothing from the batch is added, not just the one entry that failed to resolve. |
-| AF-05 | The requested move index is negative, or is not less than the playlist's current entry count | The system rejects with an invalid-input error; the playlist's order is unchanged. |
-| AF-06 | The caller is not authenticated | The system denies with an unauthorized error. |
-
-> An entry is addressed by its own id, not by the file it references (AF-02,
-> main flow steps 4-5): `playlist_entries` carries no `UNIQUE (playlistId,
-> fileId)`, so the same track may sit at two positions in the same playlist,
-> and only the entry's own id tells them apart.
->
-> Reordering (main flow step 5) is always "put entry X at index N": the
-> system computes the resulting order and renumbers every entry itself. A
-> caller never submits its own list of positions — that would be a second
-> implementation of the ordering rule, and the two would eventually drift.
+**Removed (moved out of scope, see Orpheus)**
 
 ---
 
 ### UC-50: Play a playlist
 
-| Field | Value |
-| --- | --- |
-| **ID** | UC-50 |
-| **Name** | Play a playlist |
-| **Actors** | Owner |
-| **Description** | Read a playlist's tracks in position order so they can be played in sequence. Playback itself — transport controls, the currently-playing track, and advancing to the next one — is implemented by the Alexandria UI, not by this repository; this use case is this core's contribution: the ordered, resolved read that playback consumes. |
-| **Preconditions** | The caller is authenticated; the playlist exists. |
-| **Postconditions** | The caller holds the playlist's tracks in position order, each resolved to its file (including its audio metadata), and each flagged whether its underlying file is currently missing on disk. |
-| **Requirements** | FR-TR-07, FR-TR-11, FR-FC-24 |
-
-**Main Flow**
-
-1. The owner requests a playlist by UUID to begin playback.
-2. The system reads the playlist's entries in position order and resolves each to its file, batched rather than one lookup per track.
-3. The system reports, for each entry, whether its file's `missingAt` is set, without dropping the entry from the list.
-4. The caller receives the ordered, resolved list and drives playback against it — starting at position 0 and advancing through the returned order, which already reflects any reordering (UC-49) applied earlier.
-
-**Alternative Flows**
-
-| ID | Condition | Outcome |
-| --- | --- | --- |
-| AF-01 | The playlist UUID does not exist | The system responds with a not-found error. |
-| AF-02 | The caller is not authenticated | The system denies with an unauthorized error. |
-| AF-03 | An entry's file has gone missing on disk | The entry is kept in the returned order and flagged `missing: true`, rather than dropped or skipped. A soft-deleted file is reported `missing: false`; whether to skip a flagged entry during playback, and how to tell trashed apart from missing, are UI decisions this use case does not make. |
-
-> This core never advances a "current track," never holds playback state,
-> and never decides what happens when a flagged entry is reached — those are
-> the Alexandria UI's responsibility. What this use case guarantees is that
-> the order the UI plays is exactly the order UC-49's reorder flow last
-> produced, and that a missing file surfaces as a flag the UI can act on
-> rather than as a silently shortened playlist.
+**Removed (moved out of scope, see Orpheus)**
 
 ### UC-51: Group a folder as a library
 
@@ -1897,20 +1829,19 @@ have only one of.
 | UC-47: Report the retention window | FR-FC-30, FR-FC-24 |
 | UC-48: Pause, resume, or cancel an index run | FR-FC-24, FR-FC-27, FR-FC-29, FR-FC-31, FR-FC-32, FR-FC-33, FR-FC-34 |
 | UC-52: Report which files a run could not record | FR-FC-42, FR-FC-24 |
-| UC-49: Manage a playlist | FR-TR-01, FR-TR-02, FR-TR-03, FR-TR-04, FR-TR-05, FR-TR-06, FR-TR-08, FR-TR-09, FR-FC-24 |
-| UC-50: Play a playlist | FR-TR-07, FR-TR-11, FR-FC-24 |
+| UC-49: Manage a playlist | Removed (moved out of scope, see Orpheus) |
+| UC-50: Play a playlist | Removed (moved out of scope, see Orpheus) |
 | UC-51: Group a folder as a library | FR-FC-36, FR-FC-37, FR-FC-38, FR-FC-39, FR-FC-40, FR-FC-41, FR-FC-24, FR-FC-26 |
 
 Every functional requirement in [System Requirements Document](System%20Requirements%20Document.md)
 §3 appears in at least one row above except FR-AU-12, FR-AU-18, FR-AU-21,
-FR-AU-23, FR-AU-24, and FR-TR-10, which are cross-cutting (the error envelope
-shape, the account query, the Windows startup account check, the
-Windows-mode refusal of local-mode operations, the loopback-bind warning,
-and the playlist-entry cleanup a file purge performs regardless of which
-playlist use case is or is not in play, respectively) rather than tied to
-one use case: FR-FC-01..40, FR-CO-01..07, FR-BM-01..06, FR-WL-01..08,
-FR-RL-01..08, FR-TX-01..03, FR-AU-01..11, FR-AU-13..17, FR-AU-19, FR-AU-20,
-FR-AU-22, FR-MP-01..06, FR-TR-01..09, FR-TR-11.
+FR-AU-23, and FR-AU-24, which are cross-cutting (the error envelope shape,
+the account query, the Windows startup account check, the Windows-mode
+refusal of local-mode operations, and the loopback-bind warning,
+respectively) rather than tied to one use case: FR-FC-01..40, FR-CO-01..07,
+FR-BM-01..06, FR-WL-01..08, FR-RL-01..08, FR-TX-01..03, FR-AU-01..11,
+FR-AU-13..17, FR-AU-19, FR-AU-20, FR-AU-22, FR-MP-01..06. The requirements
+of the removed UC-49 and UC-50 are removed with them.
 UC-37 (Health check) is specified in the
 [Operations & Infrastructure Document](Operations%20%26%20Infrastructure%20Document.md)
 §5.3, not here, since it is an operational concern rather than a catalog use case.
