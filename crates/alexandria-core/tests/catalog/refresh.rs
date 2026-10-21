@@ -3,25 +3,28 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use alexandria_core::auth::AuthService;
-use alexandria_core::catalog::audio_tags::AudioTags;
 use alexandria_core::catalog::clock::Clock;
 use alexandria_core::catalog::commands::refresh::{RefreshHandler, RefreshStarted};
 use alexandria_core::catalog::commands::run_control::RunControlHandler;
 use alexandria_core::catalog::fs::Filesystem;
-use alexandria_core::catalog::model::{SubtypeMetadata, METADATA_VERSION};
-use alexandria_core::catalog::repos::CatalogRepository;
+use alexandria_core::catalog::model::{
+    File, FileType, MediaKind, NewFile, SubtypeMetadata, METADATA_VERSION,
+};
+use alexandria_core::catalog::repos::{CatalogRepository, SqliteCatalogRepository};
 use alexandria_core::catalog::run_registry::{RunPhase, RunRegistry};
 use alexandria_core::catalog::runs::{
     CatalogRunRepository, RunCounts, RunKind, RunPriority, RunStatus,
 };
+use alexandria_core::catalog::video_tags::VideoTags;
 use alexandria_core::errors::DomainError;
+use alexandria_core::migrate::run_migrations;
+use sqlx::sqlite::SqlitePoolOptions;
 
 use crate::common::{
     a_cataloged_file, a_cataloged_file_with_hash, a_cataloged_missing_file, fixed_clock, interrupt,
-    now, FailingCatalogRepository, FailingCatalogRunRepository, FakeAudioMetadataReader, FakeAuth,
-    FakeCatalogRepository, FakeCatalogRunRepository, FakeComicMetadataReader,
-    FakeDocumentMetadataReader, FakeFilesystem, FakeImageMetadataReader, FakeVideoMetadataReader,
-    InterruptingFilesystem, Seam,
+    now, FailingCatalogRepository, FailingCatalogRunRepository, FakeAuth, FakeCatalogRepository,
+    FakeCatalogRunRepository, FakeComicMetadataReader, FakeDocumentMetadataReader, FakeFilesystem,
+    FakeImageMetadataReader, FakeVideoMetadataReader, InterruptingFilesystem, Seam,
 };
 
 const TOKEN: &str = "bearer-token";
@@ -34,7 +37,7 @@ const TEST_CONCURRENCY: u32 = 4;
 /// distinct from [`TEST_CONCURRENCY`], mirroring `tests/catalog/index.rs`.
 const TEST_LOW_PRIORITY_CONCURRENCY: u32 = 1;
 
-/// The five readers a refresh now holds, seeded with nothing.
+/// The four readers a refresh now holds, seeded with nothing.
 ///
 /// A reader that answers `None` for every path is a file whose tags will not
 /// parse, which is what these tests want: they are about stat comparison and
@@ -42,7 +45,6 @@ const TEST_LOW_PRIORITY_CONCURRENCY: u32 = 1;
 /// current extraction. The tests that *are* about that re-reading seed a
 /// reader of their own — see `metadata backfill`.
 type TestReaders = (
-    FakeAudioMetadataReader,
     FakeImageMetadataReader,
     FakeDocumentMetadataReader,
     FakeVideoMetadataReader,
@@ -51,7 +53,6 @@ type TestReaders = (
 
 fn no_readers() -> TestReaders {
     (
-        FakeAudioMetadataReader::new(),
         FakeImageMetadataReader::new(),
         FakeDocumentMetadataReader::new(),
         FakeVideoMetadataReader::new(),
@@ -71,7 +72,6 @@ fn refresh_handler<A, R, F, C, RR>(
     F,
     C,
     RR,
-    FakeAudioMetadataReader,
     FakeImageMetadataReader,
     FakeDocumentMetadataReader,
     FakeVideoMetadataReader,
@@ -84,13 +84,12 @@ where
     C: Clock,
     RR: CatalogRunRepository,
 {
-    let (audio, image, document, video, comic) = no_readers();
+    let (image, document, video, comic) = no_readers();
     RefreshHandler::new(
         auth,
         repo,
         fs,
         clock,
-        audio,
         image,
         document,
         video,
@@ -164,19 +163,18 @@ async fn given_unauthenticated_when_refresh_start_then_unauthorized() {
 
 // ---------------- Metadata backfill (UC-02) ----------------
 
-/// A handler whose audio reader is the caller's, so a test can say what the
+/// A handler whose video reader is the caller's, so a test can say what the
 /// file's tags are.
 fn refresh_handler_reading(
     repo: FakeCatalogRepository,
     fs: FakeFilesystem,
-    audio: FakeAudioMetadataReader,
+    video: FakeVideoMetadataReader,
 ) -> RefreshHandler<
     FakeAuth,
     FakeCatalogRepository,
     FakeFilesystem,
     impl Clock,
     FakeCatalogRunRepository,
-    FakeAudioMetadataReader,
     FakeImageMetadataReader,
     FakeDocumentMetadataReader,
     FakeVideoMetadataReader,
@@ -187,10 +185,9 @@ fn refresh_handler_reading(
         repo,
         fs,
         fixed_clock(now()),
-        audio,
         FakeImageMetadataReader::new(),
         FakeDocumentMetadataReader::new(),
-        FakeVideoMetadataReader::new(),
+        video,
         FakeComicMetadataReader::new(),
         TEST_CONCURRENCY,
         TEST_LOW_PRIORITY_CONCURRENCY,
@@ -199,40 +196,44 @@ fn refresh_handler_reading(
     )
 }
 
-fn tags_with_album_artist() -> AudioTags {
-    AudioTags {
-        title: Some("A Guest Spot".to_string()),
-        artist: Some("The Guest".to_string()),
-        album: Some("Their Record".to_string()),
-        year: None,
-        genre: None,
-        track: None,
-        album_artist: Some("The Host".to_string()),
+/// A catalogued video with explicit stats, behind the current extraction.
+fn a_cataloged_video(path: &str, size_bytes: i64) -> File {
+    File {
+        file_type: FileType::Video,
+        ..a_cataloged_file(path, size_bytes, Some(now()))
+    }
+}
+
+fn tags_with_a_year() -> VideoTags {
+    VideoTags {
+        title: Some("Stalker".to_string()),
+        year: Some(1979),
+        resolution: Some("1920x1080".to_string()),
         duration_seconds: None,
     }
 }
 
-/// The owner's report, at the level it is actually caused: a row written
-/// before the extractor could read `album_artist` keeps NULL there forever,
-/// because a re-index skips a catalogued path and a refresh only compares
-/// stat. The file has not changed — the catalog's reading of it has.
+/// A row written before the extractor could read a field keeps NULL there
+/// forever, because a re-index skips a catalogued path and a refresh only
+/// compares stat. The file has not changed — the catalog's reading of it
+/// has.
 #[tokio::test]
 async fn given_a_row_an_older_extraction_wrote_when_refreshed_then_its_metadata_is_filled() {
     let repo = FakeCatalogRepository::new();
-    let file = a_cataloged_file("/library/guest.flac", 4096, Some(now()));
+    let file = a_cataloged_video("/library/film.mkv", 4096);
     let uuid = file.uuid;
     repo.seed(file);
     let repo_handle = repo.clone();
 
-    let audio = FakeAudioMetadataReader::new();
-    audio.seed("/library/guest.flac", tags_with_album_artist());
+    let video = FakeVideoMetadataReader::new();
+    video.seed("/library/film.mkv", tags_with_a_year());
 
     let fs = FakeFilesystem::builder()
-        .with_file("/lib", "/library/guest.flac", "guest.flac", "unused")
-        .with_stat("/library/guest.flac", 4096, Some(now()))
+        .with_file("/lib", "/library/film.mkv", "film.mkv", "unused")
+        .with_stat("/library/film.mkv", 4096, Some(now()))
         .build();
 
-    let outcome = refresh_handler_reading(repo, fs, audio)
+    let outcome = refresh_handler_reading(repo, fs, video)
         .execute(Uuid::new_v4())
         .await
         .expect("execute");
@@ -246,10 +247,10 @@ async fn given_a_row_an_older_extraction_wrote_when_refreshed_then_its_metadata_
         repo_handle
             .metadata_for(uuid)
             .and_then(|metadata| match metadata {
-                SubtypeMetadata::Audio { album_artist, .. } => album_artist,
+                SubtypeMetadata::Video { year, .. } => year,
                 _ => None,
             }),
-        Some("The Host".to_string()),
+        Some(1979),
         "the tag was in the file all along; the catalog had never read it"
     );
 }
@@ -260,7 +261,7 @@ async fn given_a_row_an_older_extraction_wrote_when_refreshed_then_its_metadata_
 #[tokio::test]
 async fn given_a_changed_file_when_refreshed_then_its_metadata_is_read_as_well() {
     let repo = FakeCatalogRepository::new();
-    let mut file = a_cataloged_file("/library/retagged.flac", 4096, Some(now()));
+    let mut file = a_cataloged_video("/library/retagged.mkv", 4096);
     // Stamped current: the row is not behind, and the file is read anyway.
     // The stamp records which extraction last read a row, not which bytes it
     // read — a retagged file has new bytes and the same stamp.
@@ -269,16 +270,16 @@ async fn given_a_changed_file_when_refreshed_then_its_metadata_is_read_as_well()
     repo.seed(file);
     let repo_handle = repo.clone();
 
-    let audio = FakeAudioMetadataReader::new();
-    audio.seed("/library/retagged.flac", tags_with_album_artist());
+    let video = FakeVideoMetadataReader::new();
+    video.seed("/library/retagged.mkv", tags_with_a_year());
 
     // A different size: the stat comparison calls this changed.
     let fs = FakeFilesystem::builder()
-        .with_file("/lib", "/library/retagged.flac", "retagged.flac", "unused")
-        .with_stat("/library/retagged.flac", 8192, Some(now()))
+        .with_file("/lib", "/library/retagged.mkv", "retagged.mkv", "unused")
+        .with_stat("/library/retagged.mkv", 8192, Some(now()))
         .build();
 
-    let outcome = refresh_handler_reading(repo, fs, audio)
+    let outcome = refresh_handler_reading(repo, fs, video)
         .execute(Uuid::new_v4())
         .await
         .expect("execute");
@@ -299,20 +300,20 @@ async fn given_a_changed_file_when_refreshed_then_its_metadata_is_read_as_well()
 #[tokio::test]
 async fn given_a_row_at_the_current_version_when_refreshed_then_the_file_is_not_read() {
     let repo = FakeCatalogRepository::new();
-    let mut file = a_cataloged_file("/library/current.flac", 4096, Some(now()));
+    let mut file = a_cataloged_video("/library/current.mkv", 4096);
     file.metadata_version = METADATA_VERSION;
     repo.seed(file);
 
-    let audio = FakeAudioMetadataReader::new();
-    audio.seed("/library/current.flac", tags_with_album_artist());
-    let audio_handle = audio.clone();
+    let video = FakeVideoMetadataReader::new();
+    video.seed("/library/current.mkv", tags_with_a_year());
+    let video_handle = video.clone();
 
     let fs = FakeFilesystem::builder()
-        .with_file("/lib", "/library/current.flac", "current.flac", "unused")
-        .with_stat("/library/current.flac", 4096, Some(now()))
+        .with_file("/lib", "/library/current.mkv", "current.mkv", "unused")
+        .with_stat("/library/current.mkv", 4096, Some(now()))
         .build();
 
-    let outcome = refresh_handler_reading(repo, fs, audio)
+    let outcome = refresh_handler_reading(repo, fs, video)
         .execute(Uuid::new_v4())
         .await
         .expect("execute");
@@ -320,29 +321,30 @@ async fn given_a_row_at_the_current_version_when_refreshed_then_the_file_is_not_
     assert_eq!(outcome.unchanged, 1);
     assert_eq!(outcome.metadata_filled, 0);
     assert_eq!(
-        audio_handle.call_count(),
+        video_handle.call_count(),
         0,
         "a row already current must cost no read at all"
     );
 }
 
-/// A file whose tags will not parse stays behind the current version, so a
-/// later run — or a later build that can read it — tries again. Stamping it
-/// would be recording an extraction that never happened.
+/// A file whose tags will not parse is still stamped: the stamp records
+/// which extraction has been applied, and a file that gave up nothing has
+/// had this one applied as fully as it ever will be — so it is not opened
+/// again on every later pass.
 #[tokio::test]
 async fn given_tags_that_will_not_parse_when_refreshed_then_the_row_is_left_behind() {
     let repo = FakeCatalogRepository::new();
-    repo.seed(a_cataloged_file("/library/damaged.flac", 4096, Some(now())));
+    repo.seed(a_cataloged_video("/library/damaged.mkv", 4096));
     let repo_handle = repo.clone();
 
     // Nothing seeded: the reader answers `None`, exactly as the real one
     // does for a file it cannot parse.
     let fs = FakeFilesystem::builder()
-        .with_file("/lib", "/library/damaged.flac", "damaged.flac", "unused")
-        .with_stat("/library/damaged.flac", 4096, Some(now()))
+        .with_file("/lib", "/library/damaged.mkv", "damaged.mkv", "unused")
+        .with_stat("/library/damaged.mkv", 4096, Some(now()))
         .build();
 
-    let outcome = refresh_handler_reading(repo, fs, FakeAudioMetadataReader::new())
+    let outcome = refresh_handler_reading(repo, fs, FakeVideoMetadataReader::new())
         .execute(Uuid::new_v4())
         .await
         .expect("execute");
@@ -354,7 +356,7 @@ async fn given_tags_that_will_not_parse_when_refreshed_then_the_row_is_left_behi
     assert_eq!(outcome.metadata_filled, 0);
     assert_eq!(
         repo_handle
-            .file_for("/library/damaged.flac")
+            .file_for("/library/damaged.mkv")
             .unwrap()
             .metadata_version,
         METADATA_VERSION,
@@ -363,43 +365,35 @@ async fn given_tags_that_will_not_parse_when_refreshed_then_the_row_is_left_behi
 }
 
 /// The refresh fills; it does not replace. The repository enforces this
-/// column by column (`fill_missing_metadata`, pinned against real SQLite in
-/// `tests/metadata_backfill.rs`); what this pins is that the *command* asks
-/// for the filling one rather than the replacing one.
+/// column by column (`fill_missing_metadata`, pinned against real SQLite
+/// below); what this pins is that the *command* asks for the filling one
+/// rather than the replacing one.
 #[tokio::test]
 async fn given_metadata_the_owner_edited_when_refreshed_then_it_is_not_overwritten() {
     let repo = FakeCatalogRepository::new();
-    let file = a_cataloged_file("/library/corrected.flac", 4096, Some(now()));
+    let file = a_cataloged_video("/library/corrected.mkv", 4096);
     let uuid = file.uuid;
     repo.seed(file);
     repo.seed_metadata(
         uuid,
-        SubtypeMetadata::Audio {
+        SubtypeMetadata::Video {
             title: Some("The Owner's Title".to_string()),
-            artist: None,
-            album: None,
             year: None,
-            genre: None,
-            track: None,
-            album_artist: None,
+            resolution: None,
+            media_kind: None,
         },
     );
     let repo_handle = repo.clone();
 
-    let audio = FakeAudioMetadataReader::new();
-    audio.seed("/library/corrected.flac", tags_with_album_artist());
+    let video = FakeVideoMetadataReader::new();
+    video.seed("/library/corrected.mkv", tags_with_a_year());
 
     let fs = FakeFilesystem::builder()
-        .with_file(
-            "/lib",
-            "/library/corrected.flac",
-            "corrected.flac",
-            "unused",
-        )
-        .with_stat("/library/corrected.flac", 4096, Some(now()))
+        .with_file("/lib", "/library/corrected.mkv", "corrected.mkv", "unused")
+        .with_stat("/library/corrected.mkv", 4096, Some(now()))
         .build();
 
-    refresh_handler_reading(repo, fs, audio)
+    refresh_handler_reading(repo, fs, video)
         .execute(Uuid::new_v4())
         .await
         .expect("execute");
@@ -407,9 +401,72 @@ async fn given_metadata_the_owner_edited_when_refreshed_then_it_is_not_overwritt
     assert!(
         matches!(
             repo_handle.metadata_for(uuid),
-            Some(SubtypeMetadata::Audio { title: Some(title), .. }) if title == "The Owner's Title"
+            Some(SubtypeMetadata::Video { title: Some(title), .. }) if title == "The Owner's Title"
         ),
         "a title the owner corrected must outrank whatever the tag says"
+    );
+}
+
+/// A full replace writes `None` as NULL, which is why the repair cannot be
+/// one: no file carries a video's media kind, so a replace would blank the
+/// answer the owner gave (FR-ME-02). Pinned against a real migrated SQLite
+/// database, where `fill_missing_metadata`'s column-by-column `COALESCE`
+/// actually runs.
+#[tokio::test]
+async fn given_a_media_kind_the_owner_set_when_filled_then_it_survives() {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .expect("connect");
+    run_migrations(&pool).await.expect("migrate");
+    let repo = SqliteCatalogRepository::new(pool);
+    let uuid = Uuid::new_v4();
+    repo.insert_file(NewFile {
+        uuid,
+        path: "/library/film.mkv".to_string(),
+        name: "film.mkv".to_string(),
+        file_type: FileType::Video,
+        content_hash: None,
+        size_bytes: None,
+        mtime: None,
+        indexed_at: chrono::Utc::now(),
+    })
+    .await
+    .expect("insert file");
+    repo.update_metadata(
+        uuid,
+        &SubtypeMetadata::Video {
+            title: None,
+            year: None,
+            resolution: None,
+            media_kind: Some(MediaKind::Series),
+        },
+    )
+    .await
+    .expect("seed the owner's own answer");
+
+    repo.fill_missing_metadata(
+        uuid,
+        &SubtypeMetadata::Video {
+            title: Some("Stalker".to_string()),
+            year: Some(1979),
+            resolution: None,
+            media_kind: None,
+        },
+    )
+    .await
+    .expect("fill");
+
+    let view = repo.find_metadata_by_uuid(uuid).await.expect("read");
+    assert_eq!(
+        view,
+        Some(SubtypeMetadata::Video {
+            title: Some("Stalker".to_string()),
+            year: Some(1979),
+            resolution: None,
+            media_kind: Some(MediaKind::Series),
+        })
     );
 }
 
@@ -418,12 +475,12 @@ async fn given_metadata_the_owner_edited_when_refreshed_then_it_is_not_overwritt
 #[tokio::test]
 async fn given_an_unchanged_file_when_refreshed_then_it_is_unchanged_and_no_bytes_are_read() {
     let repo = FakeCatalogRepository::new();
-    repo.seed(a_cataloged_file("/library/song.flac", 4096, Some(now())));
+    repo.seed(a_cataloged_file("/library/notes.txt", 4096, Some(now())));
     let repo_handle = repo.clone();
 
     let fs = FakeFilesystem::builder()
-        .with_file("/lib", "/library/song.flac", "song.flac", "unused")
-        .with_stat("/library/song.flac", 4096, Some(now()))
+        .with_file("/lib", "/library/notes.txt", "notes.txt", "unused")
+        .with_stat("/library/notes.txt", 4096, Some(now()))
         .build();
     let handler = refresh_handler(
         FakeAuth::Allowing,
@@ -440,7 +497,7 @@ async fn given_an_unchanged_file_when_refreshed_then_it_is_unchanged_and_no_byte
     assert_eq!(fs.hash_calls(), 0, "refresh must not hash");
     assert!(
         repo_handle
-            .file_for("/library/song.flac")
+            .file_for("/library/notes.txt")
             .unwrap()
             .content_hash
             .is_none(),
@@ -453,7 +510,7 @@ async fn given_a_file_whose_size_changed_when_refreshed_then_it_is_refreshed_and
 ) {
     let repo = FakeCatalogRepository::new();
     repo.seed(a_cataloged_file_with_hash(
-        "/library/song.flac",
+        "/library/notes.txt",
         4096,
         Some(now()),
         "abc",
@@ -462,8 +519,8 @@ async fn given_a_file_whose_size_changed_when_refreshed_then_it_is_refreshed_and
 
     // Same mtime, different size on disk: either one differing is a change.
     let fs = FakeFilesystem::builder()
-        .with_file("/lib", "/library/song.flac", "song.flac", "unused")
-        .with_stat("/library/song.flac", 8192, Some(now()))
+        .with_file("/lib", "/library/notes.txt", "notes.txt", "unused")
+        .with_stat("/library/notes.txt", 8192, Some(now()))
         .build();
     let handler = refresh_handler(
         FakeAuth::Allowing,
@@ -476,7 +533,7 @@ async fn given_a_file_whose_size_changed_when_refreshed_then_it_is_refreshed_and
     let outcome = handler.execute(Uuid::new_v4()).await.expect("execute");
 
     assert_eq!(outcome.refreshed, 1);
-    let file = repo_handle.file_for("/library/song.flac").unwrap();
+    let file = repo_handle.file_for("/library/notes.txt").unwrap();
     assert_eq!(file.size_bytes, Some(8192));
     assert_eq!(
         file.content_hash, None,
@@ -489,7 +546,7 @@ async fn given_a_file_whose_size_changed_when_refreshed_then_it_is_refreshed_and
 async fn given_a_file_whose_mtime_changed_when_refreshed_then_it_is_refreshed() {
     let repo = FakeCatalogRepository::new();
     repo.seed(a_cataloged_file_with_hash(
-        "/library/song.flac",
+        "/library/notes.txt",
         4096,
         Some(now()),
         "abc",
@@ -499,8 +556,8 @@ async fn given_a_file_whose_mtime_changed_when_refreshed_then_it_is_refreshed() 
     // Same size, different mtime: either one differing is a change.
     let later = now() + chrono::Duration::seconds(1);
     let fs = FakeFilesystem::builder()
-        .with_file("/lib", "/library/song.flac", "song.flac", "unused")
-        .with_stat("/library/song.flac", 4096, Some(later))
+        .with_file("/lib", "/library/notes.txt", "notes.txt", "unused")
+        .with_stat("/library/notes.txt", 4096, Some(later))
         .build();
     let handler = refresh_handler(
         FakeAuth::Allowing,
@@ -513,7 +570,7 @@ async fn given_a_file_whose_mtime_changed_when_refreshed_then_it_is_refreshed() 
     let outcome = handler.execute(Uuid::new_v4()).await.expect("execute");
 
     assert_eq!(outcome.refreshed, 1);
-    let file = repo_handle.file_for("/library/song.flac").unwrap();
+    let file = repo_handle.file_for("/library/notes.txt").unwrap();
     assert_eq!(file.mtime, Some(later));
     assert_eq!(fs.hash_calls(), 0, "refresh must not hash");
 }
@@ -522,7 +579,7 @@ async fn given_a_file_whose_mtime_changed_when_refreshed_then_it_is_refreshed() 
 async fn given_disk_missing_path_when_execute_then_marked_missing_record_kept() {
     let repo = FakeCatalogRepository::new();
     repo.seed(a_cataloged_file_with_hash(
-        "/library/gone.mp3",
+        "/library/gone.txt",
         4096,
         Some(now()),
         "old-hash",
@@ -547,7 +604,7 @@ async fn given_disk_missing_path_when_execute_then_marked_missing_record_kept() 
     assert_eq!(fs.hash_calls(), 0, "refresh must not hash");
 
     let gone = repo_handle
-        .file_for("/library/gone.mp3")
+        .file_for("/library/gone.txt")
         .expect("record kept");
     assert!(gone.missing_at.is_some(), "missing marker set");
     assert_eq!(
@@ -571,7 +628,7 @@ async fn given_missing_file_returned_on_disk_with_matching_stat_when_execute_the
     // must count as `refreshed`, not `unchanged`.
     let repo = FakeCatalogRepository::new();
     repo.seed(a_cataloged_missing_file(
-        "/library/back.mp3",
+        "/library/back.txt",
         4096,
         Some(now()),
         "old-hash",
@@ -579,8 +636,8 @@ async fn given_missing_file_returned_on_disk_with_matching_stat_when_execute_the
     let repo_handle = repo.clone();
 
     let fs = FakeFilesystem::builder()
-        .with_file("/lib", "/library/back.mp3", "back.mp3", "unused")
-        .with_stat("/library/back.mp3", 4096, Some(now()))
+        .with_file("/lib", "/library/back.txt", "back.txt", "unused")
+        .with_stat("/library/back.txt", 4096, Some(now()))
         .build();
     let handler = refresh_handler(
         FakeAuth::Allowing,
@@ -597,7 +654,7 @@ async fn given_missing_file_returned_on_disk_with_matching_stat_when_execute_the
     assert_eq!(fs.hash_calls(), 0, "refresh must not hash");
 
     let back = repo_handle
-        .file_for("/library/back.mp3")
+        .file_for("/library/back.txt")
         .expect("record kept");
     assert_eq!(
         back.content_hash, None,
@@ -614,14 +671,14 @@ async fn given_missing_file_returned_on_disk_with_matching_stat_when_execute_the
 async fn given_already_missing_and_still_gone_when_execute_then_left_as_is() {
     let repo = FakeCatalogRepository::new();
     repo.seed(a_cataloged_missing_file(
-        "/library/stillgone.mp3",
+        "/library/stillgone.txt",
         4096,
         Some(now()),
         "old-hash",
     ));
     let repo_handle = repo.clone();
     let prior_missing = repo_handle
-        .file_for("/library/stillgone.mp3")
+        .file_for("/library/stillgone.txt")
         .unwrap()
         .missing_at;
 
@@ -638,7 +695,7 @@ async fn given_already_missing_and_still_gone_when_execute_then_left_as_is() {
 
     assert_eq!(outcome.marked_missing, 0, "no new missing write");
     assert_eq!(outcome.unchanged, 1, "idempotent — left as-is");
-    let gone = repo_handle.file_for("/library/stillgone.mp3").unwrap();
+    let gone = repo_handle.file_for("/library/stillgone.txt").unwrap();
     assert_eq!(
         gone.missing_at, prior_missing,
         "missing timestamp not bumped"
@@ -649,26 +706,26 @@ async fn given_already_missing_and_still_gone_when_execute_then_left_as_is() {
 async fn given_a_repository_write_failure_when_execute_then_refresh_continues_and_counts_failure() {
     let repo = FakeCatalogRepository::new();
     repo.seed(a_cataloged_file_with_hash(
-        "/library/a.mp3",
+        "/library/a.txt",
         4096,
         Some(now()),
         "a-old",
     ));
     repo.seed(a_cataloged_file_with_hash(
-        "/library/b.mp3",
+        "/library/b.txt",
         4096,
         Some(now()),
         "b-old",
     ));
-    let repo = repo.failing_for("/library/a.mp3");
+    let repo = repo.failing_for("/library/a.txt");
     let repo_handle = repo.clone();
 
     // Both files changed size on disk, so both would normally be refreshed.
     let fs = FakeFilesystem::builder()
-        .with_file("/lib", "/library/a.mp3", "a.mp3", "unused")
-        .with_stat("/library/a.mp3", 8192, Some(now()))
-        .with_file("/lib", "/library/b.mp3", "b.mp3", "unused")
-        .with_stat("/library/b.mp3", 8192, Some(now()))
+        .with_file("/lib", "/library/a.txt", "a.txt", "unused")
+        .with_stat("/library/a.txt", 8192, Some(now()))
+        .with_file("/lib", "/library/b.txt", "b.txt", "unused")
+        .with_stat("/library/b.txt", 8192, Some(now()))
         .build();
     let handler = refresh_handler(
         FakeAuth::Allowing,
@@ -686,11 +743,11 @@ async fn given_a_repository_write_failure_when_execute_then_refresh_continues_an
     assert_eq!(outcome.refreshed, 1);
     assert_eq!(outcome.failed, 1);
     assert_eq!(
-        repo_handle.file_for("/library/b.mp3").unwrap().size_bytes,
+        repo_handle.file_for("/library/b.txt").unwrap().size_bytes,
         Some(8192)
     );
     assert_eq!(
-        repo_handle.file_for("/library/a.mp3").unwrap().size_bytes,
+        repo_handle.file_for("/library/a.txt").unwrap().size_bytes,
         Some(4096),
         "the failed write leaves the prior stat in place"
     );
@@ -709,48 +766,47 @@ async fn given_any_concurrency_when_execute_then_same_outcome_tallies() {
         let repo = FakeCatalogRepository::new();
         // changed on disk -> refreshed
         repo.seed(a_cataloged_file_with_hash(
-            "/library/a.mp3",
+            "/library/a.txt",
             4096,
             Some(now()),
             "a-old",
         ));
         // same stat -> unchanged
         repo.seed(a_cataloged_file_with_hash(
-            "/library/b.mp3",
+            "/library/b.txt",
             4096,
             Some(now()),
             "b-same",
         ));
         // absent on disk -> marked missing
         repo.seed(a_cataloged_file_with_hash(
-            "/library/c.mp3",
+            "/library/c.txt",
             4096,
             Some(now()),
             "c-old",
         ));
         // present but the write fails -> failed
         repo.seed(a_cataloged_file_with_hash(
-            "/library/d.mp3",
+            "/library/d.txt",
             4096,
             Some(now()),
             "d-old",
         ));
-        let repo = repo.failing_for("/library/d.mp3");
+        let repo = repo.failing_for("/library/d.txt");
 
         let fs = FakeFilesystem::builder()
-            .with_file("/lib", "/library/a.mp3", "a.mp3", "unused")
-            .with_stat("/library/a.mp3", 8192, Some(now()))
-            .with_file("/lib", "/library/b.mp3", "b.mp3", "unused")
-            .with_stat("/library/b.mp3", 4096, Some(now()))
-            .with_file("/lib", "/library/d.mp3", "d.mp3", "unused")
-            .with_stat("/library/d.mp3", 8192, Some(now()))
+            .with_file("/lib", "/library/a.txt", "a.txt", "unused")
+            .with_stat("/library/a.txt", 8192, Some(now()))
+            .with_file("/lib", "/library/b.txt", "b.txt", "unused")
+            .with_stat("/library/b.txt", 4096, Some(now()))
+            .with_file("/lib", "/library/d.txt", "d.txt", "unused")
+            .with_stat("/library/d.txt", 8192, Some(now()))
             .build();
         let handler = RefreshHandler::new(
             FakeAuth::Allowing,
             repo,
             fs,
             fixed_clock(now()),
-            FakeAudioMetadataReader::new(),
             FakeImageMetadataReader::new(),
             FakeDocumentMetadataReader::new(),
             FakeVideoMetadataReader::new(),
@@ -775,21 +831,20 @@ async fn given_any_concurrency_when_execute_then_same_outcome_tallies() {
 async fn given_zero_concurrency_when_execute_then_runs_sequentially_rather_than_hanging() {
     let repo = FakeCatalogRepository::new();
     repo.seed(a_cataloged_file_with_hash(
-        "/library/a.mp3",
+        "/library/a.txt",
         4096,
         Some(now()),
         "a-old",
     ));
     let fs = FakeFilesystem::builder()
-        .with_file("/lib", "/library/a.mp3", "a.mp3", "unused")
-        .with_stat("/library/a.mp3", 8192, Some(now()))
+        .with_file("/lib", "/library/a.txt", "a.txt", "unused")
+        .with_stat("/library/a.txt", 8192, Some(now()))
         .build();
     let handler = RefreshHandler::new(
         FakeAuth::Allowing,
         repo,
         fs,
         fixed_clock(now()),
-        FakeAudioMetadataReader::new(),
         FakeImageMetadataReader::new(),
         FakeDocumentMetadataReader::new(),
         FakeVideoMetadataReader::new(),
@@ -828,7 +883,7 @@ async fn given_mixed_cataloged_files_when_execute_then_each_handled_correctly() 
     // A: changed -> refreshed; B: unchanged present; C: missing on disk.
     let repo = FakeCatalogRepository::new();
     repo.seed(a_cataloged_file_with_hash(
-        "/library/a.mp3",
+        "/library/a.txt",
         4096,
         Some(now()),
         "a-old",
@@ -848,8 +903,8 @@ async fn given_mixed_cataloged_files_when_execute_then_each_handled_correctly() 
     let repo_handle = repo.clone();
 
     let fs = FakeFilesystem::builder()
-        .with_file("/lib", "/library/a.mp3", "a.mp3", "unused")
-        .with_stat("/library/a.mp3", 8192, Some(now()))
+        .with_file("/lib", "/library/a.txt", "a.txt", "unused")
+        .with_stat("/library/a.txt", 8192, Some(now()))
         .with_file("/lib", "/library/b.md", "b.md", "unused")
         .with_stat("/library/b.md", 4096, Some(now()))
         // c.pdf absent on disk
@@ -869,7 +924,7 @@ async fn given_mixed_cataloged_files_when_execute_then_each_handled_correctly() 
     assert_eq!(outcome.unchanged, 1);
 
     assert_eq!(
-        repo_handle.file_for("/library/a.mp3").unwrap().content_hash,
+        repo_handle.file_for("/library/a.txt").unwrap().content_hash,
         None,
         "refreshed file's hash is cleared"
     );
@@ -916,14 +971,14 @@ async fn given_a_refresh_that_walks_when_executed_then_the_run_is_recorded_compl
     // file whose on-disk size changed.
     let repo = FakeCatalogRepository::new();
     repo.seed(a_cataloged_file_with_hash(
-        "/library/a.mp3",
+        "/library/a.txt",
         4096,
         Some(now()),
         "old-hash",
     ));
     let fs = FakeFilesystem::builder()
-        .with_file("/lib", "/library/a.mp3", "a.mp3", "unused")
-        .with_stat("/library/a.mp3", 8192, Some(now()))
+        .with_file("/lib", "/library/a.txt", "a.txt", "unused")
+        .with_stat("/library/a.txt", 8192, Some(now()))
         .build();
     let handler = refresh_handler(
         FakeAuth::Allowing,
@@ -994,14 +1049,14 @@ async fn given_run_completion_cannot_be_recorded_when_executed_then_the_outcome_
     // above.
     let repo = FakeCatalogRepository::new();
     repo.seed(a_cataloged_file_with_hash(
-        "/library/a.mp3",
+        "/library/a.txt",
         4096,
         Some(now()),
         "old-hash",
     ));
     let fs = FakeFilesystem::builder()
-        .with_file("/lib", "/library/a.mp3", "a.mp3", "unused")
-        .with_stat("/library/a.mp3", 8192, Some(now()))
+        .with_file("/lib", "/library/a.txt", "a.txt", "unused")
+        .with_stat("/library/a.txt", 8192, Some(now()))
         .build();
     let handler = refresh_handler(
         FakeAuth::Allowing,
@@ -1032,14 +1087,14 @@ async fn given_the_run_lookup_fails_when_executed_then_the_walk_still_completes_
 ) {
     let repo = FakeCatalogRepository::new();
     repo.seed(a_cataloged_file_with_hash(
-        "/library/a.mp3",
+        "/library/a.txt",
         4096,
         Some(now()),
         "old-hash",
     ));
     let fs = FakeFilesystem::builder()
-        .with_file("/lib", "/library/a.mp3", "a.mp3", "unused")
-        .with_stat("/library/a.mp3", 8192, Some(now()))
+        .with_file("/lib", "/library/a.txt", "a.txt", "unused")
+        .with_stat("/library/a.txt", 8192, Some(now()))
         .build();
     let handler = refresh_handler(
         FakeAuth::Allowing,
@@ -1089,12 +1144,12 @@ async fn given_a_completed_refresh_when_execute_then_the_final_progress_is_flush
     // FR-FC-28: a refresh's discovery is `list_all` rather than a filesystem
     // walk, but it publishes progress exactly as an index does.
     let repo = FakeCatalogRepository::new();
-    repo.seed(a_cataloged_file("/library/a.mp3", 8192, Some(now())));
+    repo.seed(a_cataloged_file("/library/a.txt", 8192, Some(now())));
     // Absent on disk: it is still an entry the run got through, so it counts
     // toward `processed` like any other.
-    repo.seed(a_cataloged_file("/library/b.mp3", 4096, Some(now())));
+    repo.seed(a_cataloged_file("/library/b.txt", 4096, Some(now())));
     let fs = FakeFilesystem::builder()
-        .with_stat("/library/a.mp3", 8192, Some(now()))
+        .with_stat("/library/a.txt", 8192, Some(now()))
         .build();
     let runs = FakeCatalogRunRepository::new();
     let registry = RunRegistry::new();
@@ -1103,7 +1158,6 @@ async fn given_a_completed_refresh_when_execute_then_the_final_progress_is_flush
         repo,
         fs,
         fixed_clock(now()),
-        FakeAudioMetadataReader::new(),
         FakeImageMetadataReader::new(),
         FakeDocumentMetadataReader::new(),
         FakeVideoMetadataReader::new(),
@@ -1145,9 +1199,9 @@ async fn given_a_progress_flush_that_fails_when_execute_then_the_refresh_still_c
     // A flush is best-effort: the cell is authoritative while the run runs,
     // so a failed write must not fail the run.
     let repo = FakeCatalogRepository::new();
-    repo.seed(a_cataloged_file("/library/a.mp3", 8192, Some(now())));
+    repo.seed(a_cataloged_file("/library/a.txt", 8192, Some(now())));
     let fs = FakeFilesystem::builder()
-        .with_stat("/library/a.mp3", 8192, Some(now()))
+        .with_stat("/library/a.txt", 8192, Some(now()))
         .build();
     let runs = FakeCatalogRunRepository::with_failing_progress();
     let handler = refresh_handler(
@@ -1195,7 +1249,7 @@ async fn given_a_refresh_walk_in_flight_when_paused_then_it_stops_with_paths_unp
     // pauses it.
     let repo = FakeCatalogRepository::new();
     for n in 0..HALT_WALK_PATHS {
-        repo.seed(a_cataloged_file(&format!("/library/{n}.mp3"), 1, None));
+        repo.seed(a_cataloged_file(&format!("/library/{n}.txt"), 1, None));
     }
     let runs = FakeCatalogRunRepository::new();
     let registry = RunRegistry::new();
@@ -1231,7 +1285,6 @@ async fn given_a_refresh_walk_in_flight_when_paused_then_it_stops_with_paths_unp
             pause_mid_walk,
         ),
         fixed_clock(now()),
-        FakeAudioMetadataReader::new(),
         FakeImageMetadataReader::new(),
         FakeDocumentMetadataReader::new(),
         FakeVideoMetadataReader::new(),
@@ -1287,7 +1340,7 @@ async fn given_a_run_resumed_before_a_refreshs_pause_lands_when_it_lands_then_th
     // `record_halt` gets there.
     let repo = FakeCatalogRepository::new();
     for n in 0..HALT_WALK_PATHS {
-        repo.seed(a_cataloged_file(&format!("/library/{n}.mp3"), 1, None));
+        repo.seed(a_cataloged_file(&format!("/library/{n}.txt"), 1, None));
     }
     let runs = FakeCatalogRunRepository::new();
     let registry = RunRegistry::new();
@@ -1323,7 +1376,6 @@ async fn given_a_run_resumed_before_a_refreshs_pause_lands_when_it_lands_then_th
             pause_mid_walk,
         ),
         fixed_clock(now()),
-        FakeAudioMetadataReader::new(),
         FakeImageMetadataReader::new(),
         FakeDocumentMetadataReader::new(),
         FakeVideoMetadataReader::new(),
@@ -1358,7 +1410,7 @@ async fn given_a_run_resumed_before_a_refreshs_cancel_lands_when_it_lands_then_i
     // index tests for why a late cancel is the worse of the two halt verbs.
     let repo = FakeCatalogRepository::new();
     for n in 0..HALT_WALK_PATHS {
-        repo.seed(a_cataloged_file(&format!("/library/{n}.mp3"), 1, None));
+        repo.seed(a_cataloged_file(&format!("/library/{n}.txt"), 1, None));
     }
     let runs = FakeCatalogRunRepository::new();
     let registry = RunRegistry::new();
@@ -1394,7 +1446,6 @@ async fn given_a_run_resumed_before_a_refreshs_cancel_lands_when_it_lands_then_i
             cancel_mid_walk,
         ),
         fixed_clock(now()),
-        FakeAudioMetadataReader::new(),
         FakeImageMetadataReader::new(),
         FakeDocumentMetadataReader::new(),
         FakeVideoMetadataReader::new(),
@@ -1434,14 +1485,14 @@ async fn given_a_refresh_cancelled_before_its_walk_began_when_executed_then_noth
     let runs = FakeCatalogRunRepository::new();
     let repo = FakeCatalogRepository::new();
     repo.seed(a_cataloged_file_with_hash(
-        "/library/a.mp3",
+        "/library/a.txt",
         4096,
         Some(now()),
         "old-hash",
     ));
     let fs = FakeFilesystem::builder()
-        .with_file("/lib", "/library/a.mp3", "a.mp3", "unused")
-        .with_stat("/library/a.mp3", 8192, Some(now()))
+        .with_file("/lib", "/library/a.txt", "a.txt", "unused")
+        .with_stat("/library/a.txt", 8192, Some(now()))
         .build();
     let handler = refresh_handler(
         FakeAuth::Allowing,

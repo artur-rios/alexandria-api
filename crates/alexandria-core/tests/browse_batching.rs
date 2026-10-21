@@ -129,17 +129,17 @@ async fn migrated_pool() -> SqlitePool {
     pool
 }
 
-/// Seed `count` audio files, each carrying stored title/artist metadata, so
+/// Seed `count` documents, each carrying stored title/author metadata, so
 /// a batch query has something to fetch. Returns nothing — the test only
 /// needs the count and the type, not individual uuids.
-async fn seed_audio_files(repo: &SqliteCatalogRepository, count: usize) {
+async fn seed_documents(repo: &SqliteCatalogRepository, count: usize) {
     for i in 0..count {
         let uuid = Uuid::new_v4();
         repo.insert_file(NewFile {
             uuid,
-            path: format!("/lib/track-{i:04}.mp3"),
-            name: format!("track-{i:04}.mp3"),
-            file_type: FileType::Audio,
+            path: format!("/lib/book-{i:04}.epub"),
+            name: format!("book-{i:04}.epub"),
+            file_type: FileType::Document,
             content_hash: Some("0".repeat(64)),
             size_bytes: None,
             mtime: None,
@@ -149,14 +149,11 @@ async fn seed_audio_files(repo: &SqliteCatalogRepository, count: usize) {
         .expect("insert file");
         repo.update_metadata(
             uuid,
-            &SubtypeMetadata::Audio {
-                title: Some(format!("Track {i}")),
-                artist: Some("Test Artist".into()),
-                album: None,
+            &SubtypeMetadata::Document {
+                title: Some(format!("Book {i}")),
+                author: Some("Test Author".into()),
                 year: None,
-                genre: None,
-                track: None,
-                album_artist: None,
+                format_kind: None,
             },
         )
         .await
@@ -179,11 +176,11 @@ async fn given_single_type_listing_when_listed_then_query_count_is_bounded_not_p
 
     let small_pool = migrated_pool().await;
     let small_repo = SqliteCatalogRepository::new(small_pool);
-    seed_audio_files(&small_repo, 5).await;
+    seed_documents(&small_repo, 5).await;
 
     let (small_views, small_queries) = count_queries(|| {
         small_repo.list_filtered_view(
-            Some(FileType::Audio),
+            Some(FileType::Document),
             StateFilter::Active,
             None,
             LibraryScope::OutsideLibraries,
@@ -195,11 +192,11 @@ async fn given_single_type_listing_when_listed_then_query_count_is_bounded_not_p
 
     let large_pool = migrated_pool().await;
     let large_repo = SqliteCatalogRepository::new(large_pool);
-    seed_audio_files(&large_repo, 200).await;
+    seed_documents(&large_repo, 200).await;
 
     let (large_views, large_queries) = count_queries(|| {
         large_repo.list_filtered_view(
-            Some(FileType::Audio),
+            Some(FileType::Document),
             StateFilter::Active,
             None,
             LibraryScope::OutsideLibraries,
@@ -225,7 +222,7 @@ async fn given_single_type_listing_when_listed_then_query_count_is_bounded_not_p
     // lost anything on the way to being cheap.
     assert!(large_views
         .iter()
-        .all(|v| matches!(v.metadata, Some(SubtypeMetadata::Audio { .. }))));
+        .all(|v| matches!(v.metadata, Some(SubtypeMetadata::Document { .. }))));
 }
 
 /// A mixed-type listing costs one further query per subtype the result
@@ -238,7 +235,7 @@ async fn given_mixed_type_listing_when_listed_then_query_count_scales_with_types
 
     let pool = migrated_pool().await;
     let repo = SqliteCatalogRepository::new(pool);
-    seed_audio_files(&repo, 50).await;
+    seed_documents(&repo, 50).await;
     // One video file: the result now contains two subtypes.
     let video_uuid = Uuid::new_v4();
     repo.insert_file(NewFile {
@@ -266,7 +263,7 @@ async fn given_mixed_type_listing_when_listed_then_query_count_scales_with_types
     let views = views.expect("list mixed");
     assert_eq!(views.len(), 51);
 
-    // Files query + audio batch + video batch = 3, regardless of the 50:1
+    // Files query + document batch + video batch = 3, regardless of the 50:1
     // skew between the two subtypes.
     assert_eq!(
         queries, 3,
@@ -284,7 +281,7 @@ async fn given_mixed_type_listing_when_listed_then_query_count_scales_with_types
 /// single-type library above that size would fail at runtime with nothing
 /// catching it.
 ///
-/// This seeds 901 audio files — one past the boundary — so the batch is
+/// This seeds 901 documents — one past the boundary — so the batch is
 /// forced to split into two `IN` chunks (900 + 1), and asserts three
 /// things at once: every one of the 901 ids is still covered (no id lost
 /// at the chunk seam), every row still carries its metadata (the second,
@@ -297,11 +294,11 @@ async fn given_a_listing_past_the_chunk_boundary_when_listed_then_every_id_is_st
 
     let pool = migrated_pool().await;
     let repo = SqliteCatalogRepository::new(pool);
-    seed_audio_files(&repo, 901).await;
+    seed_documents(&repo, 901).await;
 
     let (views, queries) = count_queries(|| {
         repo.list_filtered_view(
-            Some(FileType::Audio),
+            Some(FileType::Document),
             StateFilter::Active,
             None,
             LibraryScope::OutsideLibraries,
@@ -314,7 +311,7 @@ async fn given_a_listing_past_the_chunk_boundary_when_listed_then_every_id_is_st
     assert!(
         views
             .iter()
-            .all(|v| matches!(v.metadata, Some(SubtypeMetadata::Audio { .. }))),
+            .all(|v| matches!(v.metadata, Some(SubtypeMetadata::Document { .. }))),
         "every row, including those in the second one-id chunk, must \
          still carry its metadata"
     );

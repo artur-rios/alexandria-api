@@ -140,7 +140,6 @@ pub async fn get_file(
 
 fn parse_file_type(s: &str) -> Option<FileType> {
     match s {
-        "audio" => Some(FileType::Audio),
         "video" => Some(FileType::Video),
         "html" => Some(FileType::Html),
         "text" => Some(FileType::Text),

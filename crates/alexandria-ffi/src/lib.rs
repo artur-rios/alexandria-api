@@ -435,7 +435,7 @@ fn load_settings() -> Settings {
 /// rather than a rejected call.
 ///
 /// `types` is the run's scope: a comma-separated list of the wire names
-/// `FileType` reads back (`"audio,image"`), the same words the HTTP body's
+/// `FileType` reads back (`"video,image"`), the same words the HTTP body's
 /// `types` array carries (FR-FC-24). NULL and the empty string are the same
 /// absence and mean every type — see [`parse_scope`] for why an unrecognised
 /// name is `INDEX_ERR_INVALID_INPUT` here where an unrecognised priority is
@@ -806,7 +806,7 @@ impl FilesListFilter {
 
 /// List/query files filtered by type and lifecycle state (UC-03 / FR-FC-12).
 ///
-/// `json_filters` is a JSON string `{"type":"audio","state":"all"}` (empty
+/// `json_filters` is a JSON string `{"type":"video","state":"all"}` (empty
 /// string or NULL for defaults). `{"includeLibraries":true}` reaches into
 /// libraries, which is what a caller's search and deleted-items review need
 /// (libraries design / FR-FC-38); without it a library's files are absent,
@@ -2968,7 +2968,6 @@ pub extern "C" fn alexandria_watchlist_delete(
 fn parse_file_type(s: &str) -> Option<alexandria_core::catalog::model::FileType> {
     use alexandria_core::catalog::model::FileType;
     match s {
-        "audio" => Some(FileType::Audio),
         "video" => Some(FileType::Video),
         "html" => Some(FileType::Html),
         "text" => Some(FileType::Text),

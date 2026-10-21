@@ -91,7 +91,7 @@ async fn given_text_file_when_content_requested_then_200_with_content() {
 #[tokio::test]
 async fn given_non_text_file_when_content_requested_then_400() {
     let lib = tempdir().unwrap();
-    common::write_file(&lib, "song.mp3", b"audio bytes");
+    common::write_file(&lib, "photo.png", b"png bytes");
 
     let test = test_app().await;
     let router = app(Settings::default(), test.services.clone());

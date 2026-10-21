@@ -41,18 +41,9 @@ fn serial() -> std::sync::MutexGuard<'static, ()> {
 /// 5,000 for over thirty seconds, then completing with `failed: 0`.
 const ASYNC_RUN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
 
-/// The editable columns of an `audio_files` row, in the order every
-/// assertion here selects them: title, artist, album, year, genre, track,
-/// album_artist.
-type AudioMetadataRow = (
-    Option<String>,
-    Option<String>,
-    Option<String>,
-    Option<i64>,
-    Option<String>,
-    Option<i64>,
-    Option<String>,
-);
+/// The editable columns of a `video_files` row, in the order every
+/// assertion here selects them: title, year, resolution, media_kind.
+type VideoMetadataRow = (Option<String>, Option<i64>, Option<String>, Option<String>);
 
 use alexandria_ffi::{
     alexandria_file_edit_metadata, alexandria_file_playback_source, alexandria_file_purge,
@@ -296,7 +287,7 @@ fn given_supported_files_when_ffi_index_start_then_returns_ok_with_run_id_and_pe
     let _g = serial();
     let _db = init_temp_db();
     let lib = tempdir().unwrap();
-    std::fs::write(lib.path().join("a.mp3"), b"audio").unwrap();
+    std::fs::write(lib.path().join("a.mp4"), b"video").unwrap();
     std::fs::write(lib.path().join("b.md"), b"text").unwrap();
 
     let root = c(lib.path().to_str().unwrap());
@@ -323,7 +314,7 @@ fn given_supported_files_when_ffi_index_start_then_returns_ok_with_run_id_and_pe
     }
     let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
     assert_eq!(parsed.as_array().unwrap().len(), 2);
-    assert_eq!(parsed[0]["type"], "audio");
+    assert_eq!(parsed[0]["type"], "video");
     assert_eq!(parsed[1]["type"], "text");
 }
 
@@ -558,7 +549,7 @@ fn wait_for_missing(expected: i64) -> i64 {
 
 /// Task 4 rewrote what a re-index detects a change *by* — a `stat` call
 /// (size + mtime), not a recomputed SHA-256 — so this test's old premise
-/// (capture `a.mp3`'s pre-refresh hash, then wait for refresh to produce a
+/// (capture `a.txt`'s pre-refresh hash, then wait for refresh to produce a
 /// *different* hash) is dead twice over: Task 3 already stopped indexing
 /// from computing a hash at all (a freshly indexed file's `content_hash` is
 /// `null`), and Task 4's refresh never computes a new one either — a
@@ -566,18 +557,18 @@ fn wait_for_missing(expected: i64) -> i64 {
 /// replacing it (FR-FC-10), so there is neither an old hash to capture nor a
 /// new one to compare against.
 ///
-/// What refresh actually guarantees now: `a.mp3`'s changed size is detected
+/// What refresh actually guarantees now: `a.txt`'s changed size is detected
 /// via `stat` and counted in the run's `refreshed` tally, `b.md`'s absence
-/// is counted in `markedMissing`, and `a.mp3`'s `content_hash` comes back
+/// is counted in `markedMissing`, and `a.txt`'s `content_hash` comes back
 /// `null` (not a new hash) while its `missingAt` is cleared.
 #[test]
 fn given_changed_and_deleted_files_when_ffi_refresh_then_refreshes_and_marks_missing() {
     let _g = serial();
     let _db = init_temp_db();
     let lib = tempdir().unwrap();
-    let a_path = lib.path().join("a.mp3");
+    let a_path = lib.path().join("a.txt");
     let b_path = lib.path().join("b.md");
-    std::fs::write(&a_path, b"audio-v1").unwrap();
+    std::fs::write(&a_path, b"text-v1").unwrap();
     std::fs::write(&b_path, b"text-v1").unwrap();
 
     let root = c(lib.path().to_str().unwrap());
@@ -592,7 +583,7 @@ fn given_changed_and_deleted_files_when_ffi_refresh_then_refreshes_and_marks_mis
     assert_eq!(wait_for_files(2), 2);
 
     // Mutate on disk: change a's bytes — and with them its size — delete b.
-    std::fs::write(&a_path, b"audio-v2-CHANGED").unwrap();
+    std::fs::write(&a_path, b"text-v2-CHANGED").unwrap();
     std::fs::remove_file(&b_path).unwrap();
 
     let refresh = alexandria_index_refresh_start(token.as_ptr(), std::ptr::null());
@@ -618,7 +609,7 @@ fn given_changed_and_deleted_files_when_ffi_refresh_then_refreshes_and_marks_mis
         .as_array()
         .unwrap()
         .iter()
-        .find(|o| o["name"] == "a.mp3")
+        .find(|o| o["name"] == "a.txt")
         .unwrap();
     let b_row = after
         .as_array()
@@ -720,11 +711,11 @@ fn uuid_by_name(db_path: &str, name: &str) -> String {
 }
 
 #[test]
-fn given_indexed_audio_file_when_ffi_edit_metadata_then_ok_and_row_updated() {
+fn given_indexed_video_file_when_ffi_edit_metadata_then_ok_and_row_updated() {
     let _g = serial();
     let (_db_dir, db_path) = init_temp_db();
     let lib = tempdir().unwrap();
-    std::fs::write(lib.path().join("song.mp3"), b"audio bytes").unwrap();
+    std::fs::write(lib.path().join("clip.mkv"), b"video bytes").unwrap();
 
     let root = c(lib.path().to_str().unwrap());
     let token = c(TEST_TOKEN);
@@ -737,40 +728,35 @@ fn given_indexed_audio_file_when_ffi_edit_metadata_then_ok_and_row_updated() {
     assert_eq!(started.status, STATUS_OK);
     assert_eq!(wait_for_files(1), 1);
 
-    let uuid = uuid_by_name(&db_path, "song.mp3");
-    let patch = c(
-        r#"{"type":"audio","title":"New Title","artist":"Artist","year":2001,"track":3,"albumArtist":"New Album Artist"}"#,
-    );
+    let uuid = uuid_by_name(&db_path, "clip.mkv");
+    let patch = c(r#"{"type":"video","title":"New Title","year":2001,"mediaKind":"series"}"#);
     let result = alexandria_file_edit_metadata(c(&uuid).as_ptr(), patch.as_ptr(), token.as_ptr());
 
     let json = metadata_json(result);
     assert_eq!(json["file"]["uuid"], uuid);
-    assert_eq!(json["file"]["fileType"], "audio");
-    assert_eq!(json["metadata"]["type"], "audio");
+    assert_eq!(json["file"]["fileType"], "video");
+    assert_eq!(json["metadata"]["type"], "video");
     assert_eq!(json["metadata"]["title"], "New Title");
-    assert_eq!(json["metadata"]["track"], 3);
-    assert_eq!(json["metadata"]["albumArtist"], "New Album Artist");
+    assert_eq!(json["metadata"]["year"], 2001);
+    assert_eq!(json["metadata"]["mediaKind"], "series");
 
     // Persisted subtype row reflects the full-replace PATCH.
     let uuid_clone = uuid.clone();
     let row = with_db(&db_path, move |pool| async move {
-        let row: AudioMetadataRow = sqlx::query_as(
-            "SELECT title, artist, album, year, genre, track, album_artist FROM audio_files \
-             JOIN files ON files.id = audio_files.file_id WHERE files.uuid = ?",
+        let row: VideoMetadataRow = sqlx::query_as(
+            "SELECT title, year, resolution, media_kind FROM video_files \
+             JOIN files ON files.id = video_files.file_id WHERE files.uuid = ?",
         )
         .bind(uuid_clone)
         .fetch_one(&pool)
         .await
-        .expect("audio row");
+        .expect("video row");
         row
     });
     assert_eq!(row.0.as_deref(), Some("New Title"));
-    assert_eq!(row.1.as_deref(), Some("Artist"));
-    assert_eq!(row.2, None, "album absent in patch -> NULL");
-    assert_eq!(row.3, Some(2001));
-    assert_eq!(row.4, None, "genre absent -> NULL");
-    assert_eq!(row.5, Some(3));
-    assert_eq!(row.6.as_deref(), Some("New Album Artist"));
+    assert_eq!(row.1, Some(2001));
+    assert_eq!(row.2, None, "resolution absent in patch -> NULL");
+    assert_eq!(row.3.as_deref(), Some("series"));
 }
 
 #[test]
@@ -778,7 +764,7 @@ fn given_ffi_edit_metadata_variant_mismatch_then_invalid_input() {
     let _g = serial();
     let (_db_dir, db_path) = init_temp_db();
     let lib = tempdir().unwrap();
-    std::fs::write(lib.path().join("song.mp3"), b"audio").unwrap();
+    std::fs::write(lib.path().join("photo.png"), b"image").unwrap();
 
     let root = c(lib.path().to_str().unwrap());
     let token = c(TEST_TOKEN);
@@ -791,7 +777,7 @@ fn given_ffi_edit_metadata_variant_mismatch_then_invalid_input() {
     assert_eq!(started.status, STATUS_OK);
     assert_eq!(wait_for_files(1), 1);
 
-    let uuid = uuid_by_name(&db_path, "song.mp3");
+    let uuid = uuid_by_name(&db_path, "photo.png");
     let patch = c(r#"{"type":"video","title":"x"}"#);
     let result = alexandria_file_edit_metadata(c(&uuid).as_ptr(), patch.as_ptr(), token.as_ptr());
     assert_eq!(result.status, STATUS_FILE_INVALID_INPUT);
@@ -803,7 +789,7 @@ fn given_ffi_edit_metadata_bad_patch_json_then_invalid_input() {
     let _g = serial();
     let (_db_dir, db_path) = init_temp_db();
     let lib = tempdir().unwrap();
-    std::fs::write(lib.path().join("song.mp3"), b"audio").unwrap();
+    std::fs::write(lib.path().join("memo.txt"), b"text").unwrap();
     let root = c(lib.path().to_str().unwrap());
     let token = c(TEST_TOKEN);
     alexandria_index_start(
@@ -814,7 +800,7 @@ fn given_ffi_edit_metadata_bad_patch_json_then_invalid_input() {
     );
     assert_eq!(wait_for_files(1), 1);
 
-    let uuid = uuid_by_name(&db_path, "song.mp3");
+    let uuid = uuid_by_name(&db_path, "memo.txt");
     let patch = c("not-json-at-all");
     let result = alexandria_file_edit_metadata(c(&uuid).as_ptr(), patch.as_ptr(), token.as_ptr());
     assert_eq!(result.status, STATUS_FILE_INVALID_INPUT);
@@ -826,7 +812,7 @@ fn given_ffi_edit_metadata_missing_uuid_then_not_found() {
     let (_db_dir, _db_path) = init_temp_db();
     let token = c(TEST_TOKEN);
     let uuid = c("11111111-1111-1111-1111-111111111111");
-    let patch = c(r#"{"type":"audio","title":"x"}"#);
+    let patch = c(r#"{"type":"video","title":"x"}"#);
     let result = alexandria_file_edit_metadata(uuid.as_ptr(), patch.as_ptr(), token.as_ptr());
     assert_eq!(result.status, STATUS_FILE_NOT_FOUND);
 }
@@ -836,7 +822,7 @@ fn given_ffi_edit_metadata_no_token_then_unauthorized() {
     let _g = serial();
     let (_db_dir, db_path) = init_temp_db();
     let lib = tempdir().unwrap();
-    std::fs::write(lib.path().join("song.mp3"), b"audio").unwrap();
+    std::fs::write(lib.path().join("clip.mkv"), b"video").unwrap();
     let root = c(lib.path().to_str().unwrap());
     let token = c(TEST_TOKEN);
     alexandria_index_start(
@@ -847,8 +833,8 @@ fn given_ffi_edit_metadata_no_token_then_unauthorized() {
     );
     assert_eq!(wait_for_files(1), 1);
 
-    let uuid = uuid_by_name(&db_path, "song.mp3");
-    let patch = c(r#"{"type":"audio","title":"x"}"#);
+    let uuid = uuid_by_name(&db_path, "clip.mkv");
+    let patch = c(r#"{"type":"video","title":"x"}"#);
     let empty = c("");
     let result = alexandria_file_edit_metadata(c(&uuid).as_ptr(), patch.as_ptr(), empty.as_ptr());
     assert_eq!(result.status, STATUS_FILE_UNAUTHORIZED);
@@ -859,7 +845,7 @@ fn given_ffi_edit_metadata_deleted_file_then_invalid_state() {
     let _g = serial();
     let (_db_dir, db_path) = init_temp_db();
     let lib = tempdir().unwrap();
-    std::fs::write(lib.path().join("song.mp3"), b"audio").unwrap();
+    std::fs::write(lib.path().join("clip.mkv"), b"video").unwrap();
     let root = c(lib.path().to_str().unwrap());
     let token = c(TEST_TOKEN);
     alexandria_index_start(
@@ -870,7 +856,7 @@ fn given_ffi_edit_metadata_deleted_file_then_invalid_state() {
     );
     assert_eq!(wait_for_files(1), 1);
 
-    let uuid = uuid_by_name(&db_path, "song.mp3");
+    let uuid = uuid_by_name(&db_path, "clip.mkv");
     let uuid_for_seed = uuid.clone();
     with_db(&db_path, move |pool| async move {
         sqlx::query("UPDATE files SET state = 'deleted', deleted_at = ? WHERE uuid = ?")
@@ -881,7 +867,7 @@ fn given_ffi_edit_metadata_deleted_file_then_invalid_state() {
             .expect("soft-delete seed");
     });
 
-    let patch = c(r#"{"type":"audio","title":"x"}"#);
+    let patch = c(r#"{"type":"video","title":"x"}"#);
     let result = alexandria_file_edit_metadata(c(&uuid).as_ptr(), patch.as_ptr(), token.as_ptr());
     assert_eq!(result.status, STATUS_FILE_INVALID_STATE);
 }
@@ -928,7 +914,7 @@ fn given_indexed_file_when_ffi_rename_then_ok_and_disk_and_catalog_updated() {
     let _g = serial();
     let (_db_dir, db_path) = init_temp_db();
     let lib = tempdir().unwrap();
-    std::fs::write(lib.path().join("song.mp3"), b"audio bytes").unwrap();
+    std::fs::write(lib.path().join("memo.txt"), b"text bytes").unwrap();
 
     let root = c(lib.path().to_str().unwrap());
     let token = c(TEST_TOKEN);
@@ -940,26 +926,26 @@ fn given_indexed_file_when_ffi_rename_then_ok_and_disk_and_catalog_updated() {
     );
     wait_for_files(1);
 
-    let uuid = uuid_by_name(&db_path, "song.mp3");
-    let name = c("renamed.mp3");
+    let uuid = uuid_by_name(&db_path, "memo.txt");
+    let name = c("renamed.txt");
     let result = alexandria_file_rename(c(&uuid).as_ptr(), name.as_ptr(), token.as_ptr());
 
     let json = file_json_ok(result);
     assert_eq!(json["uuid"], uuid);
-    assert_eq!(json["name"], "renamed.mp3");
+    assert_eq!(json["name"], "renamed.txt");
     assert_eq!(json["state"], "active");
     let new_path = json["path"].as_str().expect("path string");
-    assert!(new_path.ends_with("renamed.mp3"));
+    assert!(new_path.ends_with("renamed.txt"));
 
     // On-disk file moved.
     assert!(
-        !lib.path().join("song.mp3").exists(),
+        !lib.path().join("memo.txt").exists(),
         "old path gone after rename"
     );
-    assert!(lib.path().join("renamed.mp3").exists(), "new path present");
+    assert!(lib.path().join("renamed.txt").exists(), "new path present");
     assert_eq!(
-        std::fs::read(lib.path().join("renamed.mp3")).unwrap(),
-        b"audio bytes"
+        std::fs::read(lib.path().join("renamed.txt")).unwrap(),
+        b"text bytes"
     );
 
     // Catalog row updated.
@@ -970,8 +956,8 @@ fn given_indexed_file_when_ffi_rename_then_ok_and_disk_and_catalog_updated() {
             .await
             .expect("catalog row")
     });
-    assert_eq!(name, "renamed.mp3");
-    assert!(path.ends_with("renamed.mp3"));
+    assert_eq!(name, "renamed.txt");
+    assert!(path.ends_with("renamed.txt"));
 }
 
 #[test]
@@ -979,7 +965,7 @@ fn given_ffi_rename_invalid_name_then_invalid_input() {
     let _g = serial();
     let (_db_dir, db_path) = init_temp_db();
     let lib = tempdir().unwrap();
-    std::fs::write(lib.path().join("song.mp3"), b"x").unwrap();
+    std::fs::write(lib.path().join("memo.txt"), b"x").unwrap();
     let root = c(lib.path().to_str().unwrap());
     let token = c(TEST_TOKEN);
     alexandria_index_start(
@@ -989,7 +975,7 @@ fn given_ffi_rename_invalid_name_then_invalid_input() {
         std::ptr::null(),
     );
     wait_for_files(1);
-    let uuid = uuid_by_name(&db_path, "song.mp3");
+    let uuid = uuid_by_name(&db_path, "memo.txt");
 
     for bad in ["/x", "..", "a:b"] {
         let bad = c(bad);
@@ -1008,7 +994,7 @@ fn given_ffi_rename_missing_uuid_then_not_found() {
     let (_db_dir, _db_path) = init_temp_db();
     let token = c(TEST_TOKEN);
     let uuid = c("11111111-1111-1111-1111-111111111111");
-    let name = c("new.mp3");
+    let name = c("new.txt");
     let result = alexandria_file_rename(uuid.as_ptr(), name.as_ptr(), token.as_ptr());
     assert_eq!(result.status, STATUS_FILE_NOT_FOUND);
 }
@@ -1018,7 +1004,7 @@ fn given_ffi_rename_no_token_then_unauthorized() {
     let _g = serial();
     let (_db_dir, db_path) = init_temp_db();
     let lib = tempdir().unwrap();
-    std::fs::write(lib.path().join("song.mp3"), b"x").unwrap();
+    std::fs::write(lib.path().join("memo.txt"), b"x").unwrap();
     let root = c(lib.path().to_str().unwrap());
     let token = c(TEST_TOKEN);
     alexandria_index_start(
@@ -1029,8 +1015,8 @@ fn given_ffi_rename_no_token_then_unauthorized() {
     );
     wait_for_files(1);
 
-    let uuid = uuid_by_name(&db_path, "song.mp3");
-    let name = c("renamed.mp3");
+    let uuid = uuid_by_name(&db_path, "memo.txt");
+    let name = c("renamed.txt");
     let empty = c("");
     let result = alexandria_file_rename(c(&uuid).as_ptr(), name.as_ptr(), empty.as_ptr());
     assert_eq!(result.status, STATUS_FILE_UNAUTHORIZED);
@@ -1041,7 +1027,7 @@ fn given_ffi_rename_deleted_file_then_invalid_state() {
     let _g = serial();
     let (_db_dir, db_path) = init_temp_db();
     let lib = tempdir().unwrap();
-    std::fs::write(lib.path().join("song.mp3"), b"x").unwrap();
+    std::fs::write(lib.path().join("memo.txt"), b"x").unwrap();
     let root = c(lib.path().to_str().unwrap());
     let token = c(TEST_TOKEN);
     alexandria_index_start(
@@ -1052,7 +1038,7 @@ fn given_ffi_rename_deleted_file_then_invalid_state() {
     );
     wait_for_files(1);
 
-    let uuid = uuid_by_name(&db_path, "song.mp3");
+    let uuid = uuid_by_name(&db_path, "memo.txt");
     let uuid_for_seed = uuid.clone();
     with_db(&db_path, move |pool| async move {
         sqlx::query("UPDATE files SET state = 'deleted', deleted_at = ? WHERE uuid = ?")
@@ -1063,7 +1049,7 @@ fn given_ffi_rename_deleted_file_then_invalid_state() {
             .expect("soft-delete seed");
     });
 
-    let name = c("renamed.mp3");
+    let name = c("renamed.txt");
     let result = alexandria_file_rename(c(&uuid).as_ptr(), name.as_ptr(), token.as_ptr());
     assert_eq!(result.status, STATUS_FILE_INVALID_STATE);
 }
@@ -1073,8 +1059,8 @@ fn given_ffi_rename_target_owned_by_other_file_then_disk_error() {
     let _g = serial();
     let (_db_dir, db_path) = init_temp_db();
     let lib = tempdir().unwrap();
-    std::fs::write(lib.path().join("a.mp3"), b"aaa").unwrap();
-    std::fs::write(lib.path().join("b.mp3"), b"bbb").unwrap();
+    std::fs::write(lib.path().join("a.txt"), b"aaa").unwrap();
+    std::fs::write(lib.path().join("b.txt"), b"bbb").unwrap();
     let root = c(lib.path().to_str().unwrap());
     let token = c(TEST_TOKEN);
     alexandria_index_start(
@@ -1085,8 +1071,8 @@ fn given_ffi_rename_target_owned_by_other_file_then_disk_error() {
     );
     wait_for_files(2);
 
-    let uuid_a = uuid_by_name(&db_path, "a.mp3");
-    let name = c("b.mp3");
+    let uuid_a = uuid_by_name(&db_path, "a.txt");
+    let name = c("b.txt");
     let result = alexandria_file_rename(c(&uuid_a).as_ptr(), name.as_ptr(), token.as_ptr());
     assert_eq!(
         result.status, STATUS_FILE_DISK,
@@ -1094,10 +1080,10 @@ fn given_ffi_rename_target_owned_by_other_file_then_disk_error() {
     );
     assert!(result.json.is_null());
 
-    // a.mp3 left untouched on disk.
+    // a.txt left untouched on disk.
     assert!(
-        lib.path().join("a.mp3").exists(),
-        "a.mp3 untouched after refusal"
+        lib.path().join("a.txt").exists(),
+        "a.txt untouched after refusal"
     );
 }
 
@@ -1110,7 +1096,7 @@ fn given_indexed_file_when_ffi_soft_delete_then_ok_and_catalog_deleted() {
     let _g = serial();
     let (_db_dir, db_path) = init_temp_db();
     let lib = tempdir().unwrap();
-    std::fs::write(lib.path().join("song.mp3"), b"audio bytes").unwrap();
+    std::fs::write(lib.path().join("memo.txt"), b"text bytes").unwrap();
 
     let root = c(lib.path().to_str().unwrap());
     let token = c(TEST_TOKEN);
@@ -1122,7 +1108,7 @@ fn given_indexed_file_when_ffi_soft_delete_then_ok_and_catalog_deleted() {
     );
     wait_for_files(1);
 
-    let uuid = uuid_by_name(&db_path, "song.mp3");
+    let uuid = uuid_by_name(&db_path, "memo.txt");
     let result = alexandria_file_soft_delete(c(&uuid).as_ptr(), token.as_ptr());
 
     let json = file_json_ok(result);
@@ -1135,7 +1121,7 @@ fn given_indexed_file_when_ffi_soft_delete_then_ok_and_catalog_deleted() {
 
     // The on-disk file is untouched (UC-06 leaves it; purge-on-disk is UC-09).
     assert!(
-        lib.path().join("song.mp3").exists(),
+        lib.path().join("memo.txt").exists(),
         "on-disk file preserved"
     );
 
@@ -1168,7 +1154,7 @@ fn given_ffi_soft_delete_no_token_then_unauthorized() {
     let _g = serial();
     let (_db_dir, db_path) = init_temp_db();
     let lib = tempdir().unwrap();
-    std::fs::write(lib.path().join("song.mp3"), b"x").unwrap();
+    std::fs::write(lib.path().join("memo.txt"), b"x").unwrap();
     let root = c(lib.path().to_str().unwrap());
     let token = c(TEST_TOKEN);
     alexandria_index_start(
@@ -1179,7 +1165,7 @@ fn given_ffi_soft_delete_no_token_then_unauthorized() {
     );
     wait_for_files(1);
 
-    let uuid = uuid_by_name(&db_path, "song.mp3");
+    let uuid = uuid_by_name(&db_path, "memo.txt");
     let empty = c("");
     let result = alexandria_file_soft_delete(c(&uuid).as_ptr(), empty.as_ptr());
     assert_eq!(result.status, STATUS_FILE_UNAUTHORIZED);
@@ -1191,7 +1177,7 @@ fn given_ffi_soft_delete_already_deleted_then_invalid_state() {
     let _g = serial();
     let (_db_dir, db_path) = init_temp_db();
     let lib = tempdir().unwrap();
-    std::fs::write(lib.path().join("song.mp3"), b"x").unwrap();
+    std::fs::write(lib.path().join("memo.txt"), b"x").unwrap();
     let root = c(lib.path().to_str().unwrap());
     let token = c(TEST_TOKEN);
     alexandria_index_start(
@@ -1202,7 +1188,7 @@ fn given_ffi_soft_delete_already_deleted_then_invalid_state() {
     );
     wait_for_files(1);
 
-    let uuid = uuid_by_name(&db_path, "song.mp3");
+    let uuid = uuid_by_name(&db_path, "memo.txt");
     let uuid_for_seed = uuid.clone();
     with_db(&db_path, move |pool| async move {
         sqlx::query("UPDATE files SET state = 'deleted', deleted_at = ? WHERE uuid = ?")
@@ -1226,7 +1212,7 @@ fn given_soft_deleted_file_when_ffi_restore_then_ok_and_catalog_active() {
     let _g = serial();
     let (_db_dir, db_path) = init_temp_db();
     let lib = tempdir().unwrap();
-    std::fs::write(lib.path().join("song.mp3"), b"audio bytes").unwrap();
+    std::fs::write(lib.path().join("memo.txt"), b"text bytes").unwrap();
 
     let root = c(lib.path().to_str().unwrap());
     let token = c(TEST_TOKEN);
@@ -1238,7 +1224,7 @@ fn given_soft_deleted_file_when_ffi_restore_then_ok_and_catalog_active() {
     );
     wait_for_files(1);
 
-    let uuid = uuid_by_name(&db_path, "song.mp3");
+    let uuid = uuid_by_name(&db_path, "memo.txt");
 
     // Seed a soft-deleted row whose `deleted_at` is comfortably within the
     // default 30-day retention window (one day ago). Exact-boundary coverage
@@ -1265,7 +1251,7 @@ fn given_soft_deleted_file_when_ffi_restore_then_ok_and_catalog_active() {
 
     // The on-disk file is untouched (UC-07 leaves it; purge-on-disk is UC-09).
     assert!(
-        lib.path().join("song.mp3").exists(),
+        lib.path().join("memo.txt").exists(),
         "on-disk file preserved"
     );
 
@@ -1298,7 +1284,7 @@ fn given_ffi_restore_no_token_then_unauthorized() {
     let _g = serial();
     let (_db_dir, db_path) = init_temp_db();
     let lib = tempdir().unwrap();
-    std::fs::write(lib.path().join("song.mp3"), b"x").unwrap();
+    std::fs::write(lib.path().join("memo.txt"), b"x").unwrap();
     let root = c(lib.path().to_str().unwrap());
     let token = c(TEST_TOKEN);
     alexandria_index_start(
@@ -1309,7 +1295,7 @@ fn given_ffi_restore_no_token_then_unauthorized() {
     );
     wait_for_files(1);
 
-    let uuid = uuid_by_name(&db_path, "song.mp3");
+    let uuid = uuid_by_name(&db_path, "memo.txt");
     let empty = c("");
     let result = alexandria_file_restore(c(&uuid).as_ptr(), empty.as_ptr());
     assert_eq!(result.status, STATUS_FILE_UNAUTHORIZED);
@@ -1321,7 +1307,7 @@ fn given_ffi_restore_active_file_then_invalid_state() {
     let _g = serial();
     let (_db_dir, db_path) = init_temp_db();
     let lib = tempdir().unwrap();
-    std::fs::write(lib.path().join("song.mp3"), b"x").unwrap();
+    std::fs::write(lib.path().join("memo.txt"), b"x").unwrap();
     let root = c(lib.path().to_str().unwrap());
     let token = c(TEST_TOKEN);
     alexandria_index_start(
@@ -1333,7 +1319,7 @@ fn given_ffi_restore_active_file_then_invalid_state() {
     wait_for_files(1);
 
     // Indexed but never soft-deleted — `state = 'active'` (AF-02 not-deleted).
-    let uuid = uuid_by_name(&db_path, "song.mp3");
+    let uuid = uuid_by_name(&db_path, "memo.txt");
     let result = alexandria_file_restore(c(&uuid).as_ptr(), token.as_ptr());
     assert_eq!(result.status, STATUS_FILE_INVALID_STATE);
 }
@@ -1347,7 +1333,7 @@ fn given_soft_deleted_file_past_retention_when_ffi_restore_then_not_found() {
     let _g = serial();
     let (_db_dir, db_path) = init_temp_db();
     let lib = tempdir().unwrap();
-    std::fs::write(lib.path().join("song.mp3"), b"x").unwrap();
+    std::fs::write(lib.path().join("memo.txt"), b"x").unwrap();
     let root = c(lib.path().to_str().unwrap());
     let token = c(TEST_TOKEN);
     alexandria_index_start(
@@ -1358,7 +1344,7 @@ fn given_soft_deleted_file_past_retention_when_ffi_restore_then_not_found() {
     );
     wait_for_files(1);
 
-    let uuid = uuid_by_name(&db_path, "song.mp3");
+    let uuid = uuid_by_name(&db_path, "memo.txt");
     let uuid_for_seed = uuid.clone();
     with_db(&db_path, move |pool| async move {
         sqlx::query("UPDATE files SET state = 'deleted', deleted_at = ? WHERE uuid = ?")
@@ -1382,7 +1368,7 @@ fn given_soft_deleted_file_past_retention_when_ffi_purge_then_ok_and_rows_remove
     let _g = serial();
     let (_db_dir, db_path) = init_temp_db();
     let lib = tempdir().unwrap();
-    std::fs::write(lib.path().join("song.mp3"), b"audio bytes").unwrap();
+    std::fs::write(lib.path().join("memo.txt"), b"text bytes").unwrap();
 
     let root = c(lib.path().to_str().unwrap());
     let token = c(TEST_TOKEN);
@@ -1394,7 +1380,7 @@ fn given_soft_deleted_file_past_retention_when_ffi_purge_then_ok_and_rows_remove
     );
     wait_for_files(1);
 
-    let uuid = uuid_by_name(&db_path, "song.mp3");
+    let uuid = uuid_by_name(&db_path, "memo.txt");
 
     // `deleted_at` well past the default 30-day retention window.
     let uuid_for_seed = uuid.clone();
@@ -1424,11 +1410,11 @@ fn given_soft_deleted_file_past_retention_when_ffi_purge_then_ok_and_rows_remove
 
     // The on-disk file is untouched (NFR-07; purge-on-disk is UC-09).
     assert!(
-        lib.path().join("song.mp3").exists(),
+        lib.path().join("memo.txt").exists(),
         "on-disk file preserved"
     );
 
-    // The `files` row and its subtype row (audio_files) are both gone.
+    // The `files` row and its subtype row (text_files) are both gone.
     let uuid_for_check = uuid.clone();
     let (files_remaining, subtype_remaining): (i64, i64) =
         with_db(&db_path, move |pool| async move {
@@ -1438,11 +1424,11 @@ fn given_soft_deleted_file_past_retention_when_ffi_purge_then_ok_and_rows_remove
                 .await
                 .expect("files count");
             let (subtype,): (i64,) =
-                sqlx::query_as("SELECT COUNT(*) FROM audio_files WHERE file_id = ?")
+                sqlx::query_as("SELECT COUNT(*) FROM text_files WHERE file_id = ?")
                     .bind(file_id)
                     .fetch_one(&pool)
                     .await
-                    .expect("audio_files count");
+                    .expect("text_files count");
             (files, subtype)
         });
     assert_eq!(files_remaining, 0, "files row removed by purge");
@@ -1465,7 +1451,7 @@ fn given_ffi_purge_no_token_then_unauthorized() {
     let _g = serial();
     let (_db_dir, db_path) = init_temp_db();
     let lib = tempdir().unwrap();
-    std::fs::write(lib.path().join("song.mp3"), b"x").unwrap();
+    std::fs::write(lib.path().join("memo.txt"), b"x").unwrap();
     let root = c(lib.path().to_str().unwrap());
     let token = c(TEST_TOKEN);
     alexandria_index_start(
@@ -1476,7 +1462,7 @@ fn given_ffi_purge_no_token_then_unauthorized() {
     );
     wait_for_files(1);
 
-    let uuid = uuid_by_name(&db_path, "song.mp3");
+    let uuid = uuid_by_name(&db_path, "memo.txt");
     let empty = c("");
     let result = alexandria_file_purge(c(&uuid).as_ptr(), empty.as_ptr());
     assert_eq!(result.status, STATUS_FILE_UNAUTHORIZED);
@@ -1499,7 +1485,7 @@ fn given_ffi_purge_active_file_then_invalid_state() {
     let _g = serial();
     let (_db_dir, db_path) = init_temp_db();
     let lib = tempdir().unwrap();
-    std::fs::write(lib.path().join("song.mp3"), b"x").unwrap();
+    std::fs::write(lib.path().join("memo.txt"), b"x").unwrap();
     let root = c(lib.path().to_str().unwrap());
     let token = c(TEST_TOKEN);
     alexandria_index_start(
@@ -1511,7 +1497,7 @@ fn given_ffi_purge_active_file_then_invalid_state() {
     wait_for_files(1);
 
     // Indexed but never soft-deleted — `state = 'active'` (AF-01 not-deleted).
-    let uuid = uuid_by_name(&db_path, "song.mp3");
+    let uuid = uuid_by_name(&db_path, "memo.txt");
     let result = alexandria_file_purge(c(&uuid).as_ptr(), token.as_ptr());
     assert_eq!(result.status, STATUS_FILE_INVALID_STATE);
     assert!(result.json.is_null());
@@ -1522,7 +1508,7 @@ fn given_ffi_purge_within_retention_then_invalid_state_and_row_kept() {
     let _g = serial();
     let (_db_dir, db_path) = init_temp_db();
     let lib = tempdir().unwrap();
-    std::fs::write(lib.path().join("song.mp3"), b"x").unwrap();
+    std::fs::write(lib.path().join("memo.txt"), b"x").unwrap();
     let root = c(lib.path().to_str().unwrap());
     let token = c(TEST_TOKEN);
     alexandria_index_start(
@@ -1533,7 +1519,7 @@ fn given_ffi_purge_within_retention_then_invalid_state_and_row_kept() {
     );
     wait_for_files(1);
 
-    let uuid = uuid_by_name(&db_path, "song.mp3");
+    let uuid = uuid_by_name(&db_path, "memo.txt");
 
     // `deleted_at` one day ago — comfortably within the default 30-day
     // retention window. Exact-boundary coverage is in the core unit tests
@@ -1573,7 +1559,7 @@ fn given_active_file_when_ffi_purge_on_disk_then_ok_and_disk_and_rows_removed() 
     let _g = serial();
     let (_db_dir, db_path) = init_temp_db();
     let lib = tempdir().unwrap();
-    std::fs::write(lib.path().join("song.mp3"), b"audio bytes").unwrap();
+    std::fs::write(lib.path().join("memo.txt"), b"text bytes").unwrap();
 
     let root = c(lib.path().to_str().unwrap());
     let token = c(TEST_TOKEN);
@@ -1587,7 +1573,7 @@ fn given_active_file_when_ffi_purge_on_disk_then_ok_and_disk_and_rows_removed() 
 
     // No retention gate for UC-09 — an `active` (never soft-deleted) record
     // is purgeable, unlike UC-08.
-    let uuid = uuid_by_name(&db_path, "song.mp3");
+    let uuid = uuid_by_name(&db_path, "memo.txt");
     let file_id: i64 = with_db(&db_path, {
         let uuid = uuid.clone();
         move |pool| async move {
@@ -1607,7 +1593,7 @@ fn given_active_file_when_ffi_purge_on_disk_then_ok_and_disk_and_rows_removed() 
     assert_eq!(json["diskFilePresent"], true);
 
     assert!(
-        !lib.path().join("song.mp3").exists(),
+        !lib.path().join("memo.txt").exists(),
         "on-disk file removed by purge-on-disk"
     );
 
@@ -1620,11 +1606,11 @@ fn given_active_file_when_ffi_purge_on_disk_then_ok_and_disk_and_rows_removed() 
                 .await
                 .expect("files count");
             let (subtype,): (i64,) =
-                sqlx::query_as("SELECT COUNT(*) FROM audio_files WHERE file_id = ?")
+                sqlx::query_as("SELECT COUNT(*) FROM text_files WHERE file_id = ?")
                     .bind(file_id)
                     .fetch_one(&pool)
                     .await
-                    .expect("audio_files count");
+                    .expect("text_files count");
             (files, subtype)
         });
     assert_eq!(files_remaining, 0, "files row removed by purge-on-disk");
@@ -1636,7 +1622,7 @@ fn given_missing_disk_file_when_ffi_purge_on_disk_then_ok_and_absence_reported()
     let _g = serial();
     let (_db_dir, db_path) = init_temp_db();
     let lib = tempdir().unwrap();
-    std::fs::write(lib.path().join("song.mp3"), b"audio bytes").unwrap();
+    std::fs::write(lib.path().join("memo.txt"), b"text bytes").unwrap();
 
     let root = c(lib.path().to_str().unwrap());
     let token = c(TEST_TOKEN);
@@ -1648,10 +1634,10 @@ fn given_missing_disk_file_when_ffi_purge_on_disk_then_ok_and_absence_reported()
     );
     wait_for_files(1);
 
-    let uuid = uuid_by_name(&db_path, "song.mp3");
+    let uuid = uuid_by_name(&db_path, "memo.txt");
 
     // The file vanishes from disk out from under the catalog (AF-01).
-    std::fs::remove_file(lib.path().join("song.mp3")).unwrap();
+    std::fs::remove_file(lib.path().join("memo.txt")).unwrap();
 
     let result = alexandria_file_purge_on_disk(c(&uuid).as_ptr(), token.as_ptr());
 
@@ -1682,7 +1668,7 @@ fn given_disk_delete_failure_when_ffi_purge_on_disk_then_disk_error_and_row_kept
     let _g = serial();
     let (_db_dir, db_path) = init_temp_db();
     let lib = tempdir().unwrap();
-    std::fs::write(lib.path().join("song.mp3"), b"audio bytes").unwrap();
+    std::fs::write(lib.path().join("memo.txt"), b"text bytes").unwrap();
 
     let root = c(lib.path().to_str().unwrap());
     let token = c(TEST_TOKEN);
@@ -1694,7 +1680,7 @@ fn given_disk_delete_failure_when_ffi_purge_on_disk_then_disk_error_and_row_kept
     );
     wait_for_files(1);
 
-    let uuid = uuid_by_name(&db_path, "song.mp3");
+    let uuid = uuid_by_name(&db_path, "memo.txt");
     let file_id: i64 = with_db(&db_path, {
         let uuid = uuid.clone();
         move |pool| async move {
@@ -1709,8 +1695,8 @@ fn given_disk_delete_failure_when_ffi_purge_on_disk_then_disk_error_and_row_kept
 
     // Replace the indexed file with a directory at the same path so the
     // disk delete fails with something other than `NotFound` (AF-02).
-    std::fs::remove_file(lib.path().join("song.mp3")).expect("pre-remove indexed file");
-    std::fs::create_dir(lib.path().join("song.mp3"))
+    std::fs::remove_file(lib.path().join("memo.txt")).expect("pre-remove indexed file");
+    std::fs::create_dir(lib.path().join("memo.txt"))
         .expect("create directory in place of indexed file");
 
     let result = alexandria_file_purge_on_disk(c(&uuid).as_ptr(), token.as_ptr());
@@ -1726,11 +1712,11 @@ fn given_disk_delete_failure_when_ffi_purge_on_disk_then_disk_error_and_row_kept
                 .await
                 .expect("files count");
             let (subtype,): (i64,) =
-                sqlx::query_as("SELECT COUNT(*) FROM audio_files WHERE file_id = ?")
+                sqlx::query_as("SELECT COUNT(*) FROM text_files WHERE file_id = ?")
                     .bind(file_id)
                     .fetch_one(&pool)
                     .await
-                    .expect("audio_files count");
+                    .expect("text_files count");
             (files, subtype)
         });
     assert_eq!(
@@ -1759,7 +1745,7 @@ fn given_ffi_purge_on_disk_no_token_then_unauthorized() {
     let _g = serial();
     let (_db_dir, db_path) = init_temp_db();
     let lib = tempdir().unwrap();
-    std::fs::write(lib.path().join("song.mp3"), b"x").unwrap();
+    std::fs::write(lib.path().join("memo.txt"), b"x").unwrap();
     let root = c(lib.path().to_str().unwrap());
     let token = c(TEST_TOKEN);
     alexandria_index_start(
@@ -1770,7 +1756,7 @@ fn given_ffi_purge_on_disk_no_token_then_unauthorized() {
     );
     wait_for_files(1);
 
-    let uuid = uuid_by_name(&db_path, "song.mp3");
+    let uuid = uuid_by_name(&db_path, "memo.txt");
     let empty = c("");
     let result = alexandria_file_purge_on_disk(c(&uuid).as_ptr(), empty.as_ptr());
     assert_eq!(result.status, STATUS_FILE_UNAUTHORIZED);
@@ -1778,7 +1764,7 @@ fn given_ffi_purge_on_disk_no_token_then_unauthorized() {
 
     // Auth ran before the disk was touched.
     assert!(
-        lib.path().join("song.mp3").exists(),
+        lib.path().join("memo.txt").exists(),
         "on-disk file untouched when auth is denied"
     );
 }
@@ -1932,7 +1918,7 @@ fn run_concurrency(db_path: &str, run_id: &str) -> Option<i64> {
 /// `alexandria-core/tests/catalog/index.rs` do.
 fn write_library(dir: &std::path::Path, count: usize) {
     for i in 0..count {
-        std::fs::write(dir.join(format!("track-{i}.mp3")), b"audio bytes").unwrap();
+        std::fs::write(dir.join(format!("track-{i}.txt")), b"text bytes").unwrap();
     }
 }
 
@@ -1976,7 +1962,7 @@ fn given_a_completed_run_when_paused_over_ffi_then_invalid_state() {
     let _g = serial();
     let (_db_dir, _db_path) = init_temp_db();
     let lib = tempdir().unwrap();
-    std::fs::write(lib.path().join("song.mp3"), b"audio").unwrap();
+    std::fs::write(lib.path().join("memo.txt"), b"text").unwrap();
 
     let root = c(lib.path().to_str().unwrap());
     let token = c(TEST_TOKEN);
@@ -2383,7 +2369,7 @@ fn given_low_priority_when_index_started_over_ffi_then_run_recorded_at_low_concu
     let _g = serial();
     let (_db_dir, db_path) = init_temp_db();
     let lib = tempdir().unwrap();
-    std::fs::write(lib.path().join("song.mp3"), b"audio").unwrap();
+    std::fs::write(lib.path().join("memo.txt"), b"text").unwrap();
 
     let root = c(lib.path().to_str().unwrap());
     let token = c(TEST_TOKEN);
@@ -2409,7 +2395,7 @@ fn given_garbage_priority_when_index_started_over_ffi_then_falls_back_to_normal_
     let _g = serial();
     let (_db_dir, db_path) = init_temp_db();
     let lib = tempdir().unwrap();
-    std::fs::write(lib.path().join("song.mp3"), b"audio").unwrap();
+    std::fs::write(lib.path().join("memo.txt"), b"text").unwrap();
 
     let root = c(lib.path().to_str().unwrap());
     let token = c(TEST_TOKEN);
@@ -2434,7 +2420,7 @@ fn given_null_priority_when_refresh_started_over_ffi_then_normal_concurrency() {
     let _g = serial();
     let (_db_dir, db_path) = init_temp_db();
     let lib = tempdir().unwrap();
-    std::fs::write(lib.path().join("song.mp3"), b"audio").unwrap();
+    std::fs::write(lib.path().join("memo.txt"), b"text").unwrap();
     let root = c(lib.path().to_str().unwrap());
     let token = c(TEST_TOKEN);
     alexandria_index_start(
@@ -2456,7 +2442,7 @@ fn given_low_priority_when_refresh_started_over_ffi_then_low_concurrency() {
     let _g = serial();
     let (_db_dir, db_path) = init_temp_db();
     let lib = tempdir().unwrap();
-    std::fs::write(lib.path().join("song.mp3"), b"audio").unwrap();
+    std::fs::write(lib.path().join("memo.txt"), b"text").unwrap();
     let root = c(lib.path().to_str().unwrap());
     let token = c(TEST_TOKEN);
     alexandria_index_start(
@@ -2637,16 +2623,16 @@ fn given_a_paused_index_run_with_no_stored_root_when_resumed_then_error() {
 /// file types the run records, comma-separated, in the same words the HTTP
 /// body's array carries (FR-FC-24).
 #[test]
-fn given_an_audio_scope_when_ffi_index_start_then_only_the_audio_is_recorded() {
+fn given_a_text_scope_when_ffi_index_start_then_only_the_text_is_recorded() {
     let _g = serial();
     let _db = init_temp_db();
     let lib = tempdir().unwrap();
-    std::fs::write(lib.path().join("song.flac"), b"audio").unwrap();
-    std::fs::write(lib.path().join("cover.jpg"), b"image").unwrap();
+    std::fs::write(lib.path().join("memo.txt"), b"text").unwrap();
+    std::fs::write(lib.path().join("cover.png"), b"image").unwrap();
 
     let root = c(lib.path().to_str().unwrap());
     let token = c(TEST_TOKEN);
-    let types = c("audio");
+    let types = c("text");
     let result = alexandria_index_start(
         root.as_ptr(),
         token.as_ptr(),
@@ -2659,13 +2645,13 @@ fn given_an_audio_scope_when_ffi_index_start_then_only_the_audio_is_recorded() {
     // anything — until then it only means the walk has not reached it yet.
     let run = wait_for_run_terminal(&run_id_string(&result), &token);
     assert_eq!(run["status"], "complete");
-    assert_eq!(run["skipped"], 1, "the cover art was skipped, not failed");
+    assert_eq!(run["skipped"], 1, "the picture was skipped, not failed");
     assert_eq!(run["failed"], 0);
 
     let files = files_json_value();
     let files = files.as_array().expect("array");
-    assert_eq!(files.len(), 1, "the cover art must not be catalogued");
-    assert_eq!(files[0]["type"], "audio");
+    assert_eq!(files.len(), 1, "the picture must not be catalogued");
+    assert_eq!(files[0]["type"], "text");
 }
 
 /// Two types, comma-separated: a scope is a set, and the separator is what
@@ -2675,13 +2661,13 @@ fn given_a_two_type_scope_when_ffi_index_start_then_both_are_recorded() {
     let _g = serial();
     let _db = init_temp_db();
     let lib = tempdir().unwrap();
-    std::fs::write(lib.path().join("song.flac"), b"audio").unwrap();
+    std::fs::write(lib.path().join("clip.mp4"), b"video").unwrap();
     std::fs::write(lib.path().join("notes.md"), b"text").unwrap();
-    std::fs::write(lib.path().join("cover.jpg"), b"image").unwrap();
+    std::fs::write(lib.path().join("cover.png"), b"image").unwrap();
 
     let root = c(lib.path().to_str().unwrap());
     let token = c(TEST_TOKEN);
-    let types = c("audio,text");
+    let types = c("video,text");
     let result = alexandria_index_start(
         root.as_ptr(),
         token.as_ptr(),
@@ -2704,8 +2690,8 @@ fn given_an_empty_types_string_when_ffi_index_start_then_every_type_is_recorded(
     let _g = serial();
     let _db = init_temp_db();
     let lib = tempdir().unwrap();
-    std::fs::write(lib.path().join("song.flac"), b"audio").unwrap();
-    std::fs::write(lib.path().join("cover.jpg"), b"image").unwrap();
+    std::fs::write(lib.path().join("memo.txt"), b"text").unwrap();
+    std::fs::write(lib.path().join("cover.png"), b"image").unwrap();
 
     let root = c(lib.path().to_str().unwrap());
     let token = c(TEST_TOKEN);
@@ -2729,7 +2715,7 @@ fn given_an_unknown_type_when_ffi_index_start_then_invalid_input() {
     let _g = serial();
     let (_dir, db_path) = init_temp_db();
     let lib = tempdir().unwrap();
-    std::fs::write(lib.path().join("song.flac"), b"audio").unwrap();
+    std::fs::write(lib.path().join("memo.txt"), b"text").unwrap();
 
     let root = c(lib.path().to_str().unwrap());
     let token = c(TEST_TOKEN);
@@ -2780,7 +2766,7 @@ fn given_a_bad_token_and_an_unknown_type_when_ffi_index_start_then_unauthorized(
     let _g = serial();
     let _db = init_temp_db();
     let lib = tempdir().unwrap();
-    std::fs::write(lib.path().join("song.flac"), b"audio").unwrap();
+    std::fs::write(lib.path().join("memo.txt"), b"text").unwrap();
 
     let root = c(lib.path().to_str().unwrap());
     let token = c("");

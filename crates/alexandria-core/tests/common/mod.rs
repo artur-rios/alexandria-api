@@ -24,7 +24,6 @@ use alexandria_core::auth::local::{
 use alexandria_core::auth::{AuthService, Principal};
 use alexandria_core::bookmarks::model::{Bookmark, BookmarkState, NewBookmark};
 use alexandria_core::bookmarks::repos::BookmarkRepository;
-use alexandria_core::catalog::audio_tags::{AudioMetadataReader, AudioTags};
 use alexandria_core::catalog::clock::{Clock, FixedClock};
 use alexandria_core::catalog::comic_tags::{ComicMetadataReader, ComicTags};
 use alexandria_core::catalog::document_tags::{DocumentMetadataReader, DocumentTags};
@@ -120,9 +119,6 @@ pub struct FakeCatalogRepository {
     /// Duration (seconds) last written for `uuid` via `set_video_duration`
     /// (issue #44 video slice).
     video_durations: Arc<Mutex<HashMap<Uuid, f64>>>,
-    /// Every audio duration written, so a test can assert indexing
-    /// actually extracted and stored one.
-    pub audio_durations: Arc<Mutex<HashMap<Uuid, f64>>>,
     /// Page count last written for `uuid` via `set_comic_page_count`
     /// (issue #44 comic slice).
     comic_page_counts: Arc<Mutex<HashMap<Uuid, i64>>>,
@@ -584,27 +580,6 @@ impl CatalogRepository for FakeCatalogRepository {
             .unwrap()
             .get(&uuid)
             .copied())
-    }
-
-    async fn set_audio_duration(
-        &self,
-        uuid: Uuid,
-        duration_seconds: f64,
-    ) -> Result<(), DomainError> {
-        let files = self.files.lock().unwrap();
-        let file = files
-            .values()
-            .find(|f| f.uuid == uuid)
-            .ok_or(DomainError::NotFound)?;
-        if file.file_type != alexandria_core::catalog::model::FileType::Audio {
-            return Err(DomainError::InvalidInput("file is not audio".into()));
-        }
-        drop(files);
-        self.audio_durations
-            .lock()
-            .unwrap()
-            .insert(uuid, duration_seconds);
-        Ok(())
     }
 
     async fn set_video_duration(
@@ -1470,7 +1445,7 @@ pub fn a_cataloged_file(path: &str, size_bytes: i64, mtime: Option<DateTime<Utc>
         uuid: Uuid::new_v4(),
         path: path.to_string(),
         name: path.rsplit('/').next().unwrap_or(path).to_string(),
-        file_type: FileType::Audio,
+        file_type: FileType::Text,
         content_hash: None,
         size_bytes: Some(size_bytes),
         mtime,
@@ -2221,43 +2196,6 @@ impl SessionRepository for FailingSessionRepository {
 
     async fn delete_all(&self) -> Result<(), DomainError> {
         Err(DomainError::Disk("session store unavailable".into()))
-    }
-}
-
-/// In-memory audio-tag reader (issue #44 pilot). `read()` answers `None`
-/// for any path with no seeded tags, mirroring "no tags found / couldn't
-/// parse" — the same outcome `LoftyAudioMetadataReader` produces for those
-/// cases. Also counts calls, so a test can assert the reader was never
-/// consulted at all (e.g. for a non-audio file) — `metadata_for` staying
-/// `None` alone can't distinguish "never called" from "called, but its
-/// result was rejected/discarded downstream."
-#[derive(Debug, Default, Clone)]
-pub struct FakeAudioMetadataReader {
-    tags: Arc<Mutex<HashMap<String, AudioTags>>>,
-    call_count: Arc<Mutex<usize>>,
-}
-
-impl FakeAudioMetadataReader {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Seed the tags `read()` returns for `path`.
-    pub fn seed(&self, path: &str, tags: AudioTags) -> &Self {
-        self.tags.lock().unwrap().insert(path.to_string(), tags);
-        self
-    }
-
-    /// How many times `read()` has been called.
-    pub fn call_count(&self) -> usize {
-        *self.call_count.lock().unwrap()
-    }
-}
-
-impl AudioMetadataReader for FakeAudioMetadataReader {
-    async fn read(&self, path: &str) -> Option<AudioTags> {
-        *self.call_count.lock().unwrap() += 1;
-        self.tags.lock().unwrap().get(path).cloned()
     }
 }
 
@@ -3016,14 +2954,6 @@ impl CatalogRepository for FailingCatalogRepository {
         unimplemented!("not reached by the run-fails-to-list path")
     }
 
-    async fn set_audio_duration(
-        &self,
-        _uuid: Uuid,
-        _duration_seconds: f64,
-    ) -> Result<(), DomainError> {
-        unimplemented!("not reached by the run-fails-to-list path")
-    }
-
     async fn set_video_duration(
         &self,
         _uuid: Uuid,
@@ -3396,19 +3326,19 @@ impl Filesystem for InterruptingFilesystem {
     }
 }
 
-/// Runs an [`Interrupt`] the first time it is asked to read audio tags, then
-/// answers `None` like an unseeded [`FakeAudioMetadataReader`] would.
+/// Runs an [`Interrupt`] the first time it is asked to read video tags, then
+/// answers `None` like an unseeded [`FakeVideoMetadataReader`] would.
 ///
 /// This is the index walk's counterpart to [`InterruptingFilesystem`]:
 /// indexing does not stat per entry, and `CatalogRepository` is far too wide
-/// to wrap, but every audio entry reaches the tag reader inside `index_entry`
-/// — so a walk of `.mp3` files has its seam here.
-pub struct InterruptingAudioMetadataReader {
+/// to wrap, but every video entry reaches the tag reader inside `index_entry`
+/// — so a walk of `.mp4` files has its seam here.
+pub struct InterruptingVideoMetadataReader {
     interrupt: Interrupt,
     fired: AtomicBool,
 }
 
-impl InterruptingAudioMetadataReader {
+impl InterruptingVideoMetadataReader {
     pub fn new(interrupt: Interrupt) -> Self {
         Self {
             interrupt,
@@ -3417,8 +3347,8 @@ impl InterruptingAudioMetadataReader {
     }
 }
 
-impl AudioMetadataReader for InterruptingAudioMetadataReader {
-    async fn read(&self, _path: &str) -> Option<AudioTags> {
+impl VideoMetadataReader for InterruptingVideoMetadataReader {
+    async fn read(&self, _path: &str) -> Option<VideoTags> {
         if !self.fired.swap(true, Ordering::Relaxed) {
             (self.interrupt)().await;
         }
@@ -3441,7 +3371,7 @@ impl AudioMetadataReader for InterruptingAudioMetadataReader {
 /// every future it has already started before any of them finishes, so
 /// `max_seen` reports how many were genuinely started together.
 #[derive(Debug, Default, Clone)]
-pub struct ConcurrencyTrackingAudioMetadataReader {
+pub struct ConcurrencyTrackingVideoMetadataReader {
     // Arc-wrapped, not plain fields: the test needs a handle that outlives
     // the handler's own copy to read `max_seen` afterward, mirroring how
     // `FakeCatalogRepository` shares its state — a cheap `Clone` of a shared
@@ -3450,7 +3380,7 @@ pub struct ConcurrencyTrackingAudioMetadataReader {
     max_seen: Arc<AtomicUsize>,
 }
 
-impl ConcurrencyTrackingAudioMetadataReader {
+impl ConcurrencyTrackingVideoMetadataReader {
     pub fn new() -> Self {
         Self::default()
     }
@@ -3461,8 +3391,8 @@ impl ConcurrencyTrackingAudioMetadataReader {
     }
 }
 
-impl AudioMetadataReader for ConcurrencyTrackingAudioMetadataReader {
-    async fn read(&self, _path: &str) -> Option<AudioTags> {
+impl VideoMetadataReader for ConcurrencyTrackingVideoMetadataReader {
+    async fn read(&self, _path: &str) -> Option<VideoTags> {
         let now_in_flight = self.current.fetch_add(1, Ordering::SeqCst) + 1;
         self.max_seen.fetch_max(now_in_flight, Ordering::SeqCst);
         tokio::task::yield_now().await;

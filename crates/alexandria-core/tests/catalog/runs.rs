@@ -96,13 +96,13 @@ async fn given_a_scoped_run_when_read_then_the_scope_round_trips() {
         Some("/library"),
         t(1),
         4,
-        Some("audio,image"),
+        Some("text,image"),
     )
     .await
     .expect("start");
 
     let run = repo.get(id).await.expect("get").expect("run exists");
-    assert!(run.scope.includes(FileType::Audio));
+    assert!(run.scope.includes(FileType::Text));
     assert!(run.scope.includes(FileType::Image));
     assert!(
         !run.scope.includes(FileType::Video),

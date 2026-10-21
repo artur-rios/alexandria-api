@@ -292,7 +292,7 @@ mod tests {
     fn given_an_unresolvable_configured_root_when_checked_then_it_fails_closed() {
         let root = LibraryRoot::new("/nonexistent-library-root-for-alexandria");
 
-        let result = root.check_file("/nonexistent-library-root-for-alexandria/a.mp3");
+        let result = root.check_file("/nonexistent-library-root-for-alexandria/a.txt");
 
         assert!(
             matches!(result, Err(DomainError::InvalidInput(ref m)) if m == LIBRARY_ROOT_UNRESOLVABLE)

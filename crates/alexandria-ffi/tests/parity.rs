@@ -95,18 +95,9 @@ fn take_json(json: *mut std::os::raw::c_char) -> String {
 /// its condition holds.
 const ASYNC_RUN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
 
-/// The editable columns of an `audio_files` row, in the order every
-/// assertion here selects them: title, artist, album, year, genre, track,
-/// album_artist.
-type AudioMetadataRow = (
-    Option<String>,
-    Option<String>,
-    Option<String>,
-    Option<i64>,
-    Option<String>,
-    Option<i64>,
-    Option<String>,
-);
+/// The editable columns of a `video_files` row, in the order every
+/// assertion here selects them: title, year, resolution, media_kind.
+type VideoMetadataRow = (Option<String>, Option<i64>, Option<String>, Option<String>);
 
 /// The shape a `GET /v1/files` / `alexandria_files_list` array is reduced
 /// to whenever the two legs' listings are compared: each `FileView`
@@ -184,7 +175,7 @@ async fn given_same_lib_when_indexed_via_http_and_ffi_then_files_rows_identical(
 
     // Shared library under test.
     let lib = tempdir().unwrap();
-    std::fs::write(lib.path().join("song.mp3"), b"audio-bytes").unwrap();
+    std::fs::write(lib.path().join("memo.txt"), b"text-bytes").unwrap();
     std::fs::write(lib.path().join("notes.md"), b"# title").unwrap();
     std::fs::write(lib.path().join("book.pdf"), b"%PDF-1.4...").unwrap();
     let lib_path = lib.path().to_str().unwrap().to_string();
@@ -315,12 +306,12 @@ async fn given_same_lib_when_refreshed_via_http_and_ffi_then_rows_and_missing_ma
 
     fn seed_lib() -> TempDir {
         let lib = tempdir().unwrap();
-        std::fs::write(lib.path().join("a.mp3"), b"audio-v1").unwrap();
+        std::fs::write(lib.path().join("a.txt"), b"text-v1").unwrap();
         std::fs::write(lib.path().join("b.md"), b"text-v1").unwrap();
         lib
     }
     fn mutate(lib: &TempDir) {
-        std::fs::write(lib.path().join("a.mp3"), b"audio-v2-CHANGED").unwrap();
+        std::fs::write(lib.path().join("a.txt"), b"text-v2-CHANGED").unwrap();
         std::fs::remove_file(lib.path().join("b.md")).unwrap();
     }
 
@@ -414,7 +405,7 @@ async fn given_same_lib_when_refreshed_via_http_and_ffi_then_rows_and_missing_ma
             wait_for_ffi_files(2);
 
             // identical mutation on disk
-            std::fs::write(ffi_lib.path().join("a.mp3"), b"audio-v2-CHANGED").unwrap();
+            std::fs::write(ffi_lib.path().join("a.txt"), b"text-v2-CHANGED").unwrap();
             std::fs::remove_file(ffi_lib.path().join("b.md")).unwrap();
 
             let refresh = alexandria_index_refresh_start(token.as_ptr(), std::ptr::null());
@@ -481,9 +472,9 @@ async fn given_same_lib_when_refreshed_via_http_and_ffi_then_rows_and_missing_ma
         };
     let h = by_name(&http_rows);
     let f = by_name(&ffi_rows);
-    assert!(!h["a.mp3"].1 && !f["a.mp3"].1, "a missingAt null on both");
+    assert!(!h["a.txt"].1 && !f["a.txt"].1, "a missingAt null on both");
     assert!(h["b.md"].1 && f["b.md"].1, "b missingAt set on both");
-    assert_eq!(h["a.mp3"].0, f["a.mp3"].0, "a refreshed hash parity");
+    assert_eq!(h["a.txt"].0, f["a.txt"].0, "a refreshed hash parity");
 }
 
 /// UC-01/UC-42 parity — `content_hash` is nullable and, since Task 3/4, is
@@ -507,7 +498,7 @@ async fn given_a_freshly_indexed_file_when_hash_read_via_http_and_ffi_then_both_
 
     // ---- HTTP leg: the real GET /v1/files response body ----
     let http_lib = tempdir().unwrap();
-    std::fs::write(http_lib.path().join("song.mp3"), b"audio").unwrap();
+    std::fs::write(http_lib.path().join("memo.txt"), b"text").unwrap();
 
     let http_dir = tempdir().unwrap();
     let http_db = db_path(&http_dir, "http.sqlite");
@@ -548,13 +539,13 @@ async fn given_a_freshly_indexed_file_when_hash_read_via_http_and_ffi_then_both_
         .as_array()
         .unwrap()
         .iter()
-        .find(|f| f["file"]["name"] == "song.mp3")
-        .expect("song.mp3 in http listing")["file"]["contentHash"]
+        .find(|f| f["file"]["name"] == "memo.txt")
+        .expect("memo.txt in http listing")["file"]["contentHash"]
         .clone();
 
     // ---- FFI leg: the real alexandria_index_files_json accessor ----
     let ffi_lib = tempdir().unwrap();
-    std::fs::write(ffi_lib.path().join("song.mp3"), b"audio").unwrap();
+    std::fs::write(ffi_lib.path().join("memo.txt"), b"text").unwrap();
     let ffi_dir = tempdir().unwrap();
     let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
     let ffi_lib_path = ffi_lib.path().to_str().unwrap().to_string();
@@ -600,8 +591,8 @@ async fn given_a_freshly_indexed_file_when_hash_read_via_http_and_ffi_then_both_
             .as_array()
             .unwrap()
             .iter()
-            .find(|f| f["name"] == "song.mp3")
-            .expect("song.mp3 in ffi listing")["hash"]
+            .find(|f| f["name"] == "memo.txt")
+            .expect("memo.txt in ffi listing")["hash"]
             .clone()
     })
     .await
@@ -638,36 +629,6 @@ fn wait_for_http_files(
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
     })
-}
-
-/// Indexing is two steps: `insert_file` commits the `files` row in its own
-/// transaction first, and only then does `index_entry` call the audio-tag
-/// reader and persist the extracted metadata via a separate `update_metadata`
-/// call. Waiting only on the `files` row (as `wait_for_http_files` does) can
-/// therefore race ahead of extraction — poll the `audio_files` row itself so
-/// callers only proceed once the title has actually landed.
-async fn wait_for_http_audio_title(pool: &sqlx::sqlite::SqlitePool, expected_title: &str) {
-    let dl = std::time::Instant::now() + ASYNC_RUN_DEADLINE;
-    loop {
-        let row: Option<(Option<String>,)> = sqlx::query_as(
-            "SELECT audio_files.title FROM audio_files \
-             JOIN files ON files.id = audio_files.file_id \
-             WHERE files.name = ?",
-        )
-        .bind("song.wav")
-        .fetch_optional(pool)
-        .await
-        .unwrap();
-        if let Some((Some(title),)) = &row {
-            if title == expected_title {
-                return;
-            }
-        }
-        if std::time::Instant::now() > dl {
-            panic!("http never wrote extracted audio title");
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-    }
 }
 
 /// Poll `GET /v1/index/runs/{runId}` (UC-42) until the run leaves `running`.
@@ -760,19 +721,19 @@ fn wait_for_ffi_files(expected: i64) {
 
 /// UC-04 parity — edit metadata over both transports with identical patch
 /// JSON and assert the returned `FileMetadata` bodies agree (modulo the
-/// file's UUID, which is per-database) and the persisted `audio_files` rows
+/// file's UUID, which is per-database) and the persisted `video_files` rows
 /// match across both databases (Testing Specification §7.3, FR-FC-24).
 #[tokio::test]
-async fn given_same_audio_file_when_metadata_edited_via_http_and_ffi_then_responses_and_rows_identical(
+async fn given_same_video_file_when_metadata_edited_via_http_and_ffi_then_responses_and_rows_identical(
 ) {
     let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
-    let patch_json = r#"{"type":"audio","title":"Parity Title","artist":"Artist","album":"Album","year":2001,"genre":"Rock","track":3,"albumArtist":"Parity Album Artist"}"#;
+    let patch_json = r#"{"type":"video","title":"Parity Title","year":2001,"resolution":"1080p","mediaKind":"movie"}"#;
     let patch_value: serde_json::Value = serde_json::from_str(patch_json).unwrap();
 
     // ---- HTTP leg ----
     let http_lib = tempdir().unwrap();
-    std::fs::write(http_lib.path().join("song.mp3"), b"parity-audio").unwrap();
+    std::fs::write(http_lib.path().join("clip.mkv"), b"parity-video").unwrap();
 
     let http_dir = tempdir().unwrap();
     let http_db = db_path(&http_dir, "http.sqlite");
@@ -797,7 +758,7 @@ async fn given_same_audio_file_when_metadata_edited_via_http_and_ffi_then_respon
     wait_for_http_files(&http_pool, 1).await;
 
     let (http_uuid,): (String,) = sqlx::query_as("SELECT uuid FROM files WHERE name = ?")
-        .bind("song.mp3")
+        .bind("clip.mkv")
         .fetch_one(&http_pool)
         .await
         .unwrap();
@@ -818,9 +779,9 @@ async fn given_same_audio_file_when_metadata_edited_via_http_and_ffi_then_respon
         serde_json::from_slice(&to_bytes(http_resp.into_body(), usize::MAX).await.unwrap())
             .unwrap();
 
-    let http_audio_row: AudioMetadataRow = sqlx::query_as(
-        "SELECT title, artist, album, year, genre, track, album_artist FROM audio_files \
-         JOIN files ON files.id = audio_files.file_id WHERE files.uuid = ?",
+    let http_video_row: VideoMetadataRow = sqlx::query_as(
+        "SELECT title, year, resolution, media_kind FROM video_files \
+         JOIN files ON files.id = video_files.file_id WHERE files.uuid = ?",
     )
     .bind(&http_uuid)
     .fetch_one(&http_pool)
@@ -829,12 +790,12 @@ async fn given_same_audio_file_when_metadata_edited_via_http_and_ffi_then_respon
 
     // ---- FFI leg (own identical lib + db) ----
     let ffi_lib = tempdir().unwrap();
-    std::fs::write(ffi_lib.path().join("song.mp3"), b"parity-audio").unwrap();
+    std::fs::write(ffi_lib.path().join("clip.mkv"), b"parity-video").unwrap();
     let ffi_dir = tempdir().unwrap();
     let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
     let ffi_lib_path = ffi_lib.path().to_str().unwrap().to_string();
     let patch_for_ffi = patch_json.to_string();
-    let ffi_payload: (String, serde_json::Value, AudioMetadataRow) =
+    let ffi_payload: (String, serde_json::Value, VideoMetadataRow) =
         tokio::task::spawn_blocking(move || {
             let cdb = CString::new(ffi_db).unwrap();
             assert_eq!(
@@ -871,7 +832,7 @@ async fn given_same_audio_file_when_metadata_edited_via_http_and_ffi_then_respon
                             .unwrap();
                         let (uuid,): (String,) =
                             sqlx::query_as("SELECT uuid FROM files WHERE name = ?")
-                                .bind("song.mp3")
+                                .bind("clip.mkv")
                                 .fetch_one(&pool)
                                 .await
                                 .unwrap();
@@ -901,11 +862,11 @@ async fn given_same_audio_file_when_metadata_edited_via_http_and_ffi_then_respon
             }
             let ffi_value: serde_json::Value = serde_json::from_str(&json_str).unwrap();
 
-            // Persisted audio row from the FFI db.
-            let ffi_audio_row = std::thread::spawn({
+            // Persisted video row from the FFI db.
+            let ffi_video_row = std::thread::spawn({
                 let ffi_dir = ffi_dir.path().to_path_buf();
                 let ffi_uuid = ffi_uuid.clone();
-                move || -> AudioMetadataRow {
+                move || -> VideoMetadataRow {
                     let rt = tokio::runtime::Builder::new_current_thread()
                         .enable_all()
                         .build()
@@ -918,9 +879,9 @@ async fn given_same_audio_file_when_metadata_edited_via_http_and_ffi_then_respon
                             .connect(&format!("{url}?mode=rw"))
                             .await
                             .unwrap();
-                        let row: AudioMetadataRow = sqlx::query_as(
-                            "SELECT title, artist, album, year, genre, track, album_artist \
-                                 FROM audio_files JOIN files ON files.id = audio_files.file_id \
+                        let row: VideoMetadataRow = sqlx::query_as(
+                            "SELECT title, year, resolution, media_kind \
+                                 FROM video_files JOIN files ON files.id = video_files.file_id \
                                  WHERE files.uuid = ?",
                         )
                         .bind(ffi_uuid)
@@ -934,12 +895,12 @@ async fn given_same_audio_file_when_metadata_edited_via_http_and_ffi_then_respon
             .join()
             .unwrap();
 
-            (ffi_uuid, ffi_value, ffi_audio_row)
+            (ffi_uuid, ffi_value, ffi_video_row)
         })
         .await
         .unwrap();
 
-    let (_ffi_uuid, ffi_body, ffi_audio_row) = ffi_payload;
+    let (_ffi_uuid, ffi_body, ffi_video_row) = ffi_payload;
 
     // ---- compare ----
     // The `metadata` sub-object is fully server-derived from the patch and
@@ -972,7 +933,7 @@ async fn given_same_audio_file_when_metadata_edited_via_http_and_ffi_then_respon
     );
 
     // Persisted subtype rows must agree across databases.
-    assert_eq!(http_audio_row, ffi_audio_row, "audio_files row diverges");
+    assert_eq!(http_video_row, ffi_video_row, "video_files row diverges");
 
     // Also confirm the patch we sent equals the metadata we got back (the
     // handler echoes the written metadata).
@@ -1028,7 +989,7 @@ async fn given_same_lib_when_files_listed_via_http_and_ffi_then_arrays_identical
 
     // ---- HTTP leg ----
     let http_lib = tempdir().unwrap();
-    std::fs::write(http_lib.path().join("song.mp3"), b"audio").unwrap();
+    std::fs::write(http_lib.path().join("book.epub"), b"document").unwrap();
     std::fs::write(http_lib.path().join("notes.md"), b"# h").unwrap();
     std::fs::write(http_lib.path().join("clip.mkv"), b"video").unwrap();
     std::fs::write(http_lib.path().join("photo.jpg"), b"image").unwrap();
@@ -1070,7 +1031,7 @@ async fn given_same_lib_when_files_listed_via_http_and_ffi_then_arrays_identical
     // Soft-delete one record so we can exercise the default-excludes-deleted
     // behavior and the state=all filter on both surfaces.
     let (del_uuid,): (String,) = sqlx::query_as("SELECT uuid FROM files WHERE name = ?")
-        .bind("song.mp3")
+        .bind("book.epub")
         .fetch_one(&http_pool)
         .await
         .unwrap();
@@ -1081,20 +1042,20 @@ async fn given_same_lib_when_files_listed_via_http_and_ffi_then_arrays_identical
         .await
         .expect("soft-delete");
 
-    // Write real metadata to one audio and one image file on this leg — the
+    // Write real metadata to one document and one image file on this leg — the
     // way the UC-04 edit-metadata parity test does — so the comparison
     // below actually exercises `metadata` and the extracted scalars rather
     // than comparing two `null`s (code-review Finding 2: a vacuous parity
     // assertion is worse than none, since it reads as coverage that isn't
     // there).
     sqlx::query(
-        "UPDATE audio_files SET title='Airbag', artist='Radiohead', album=NULL, year=1997, \
-         genre=NULL, track=NULL FROM files WHERE audio_files.file_id = files.id AND files.uuid = ?",
+        "UPDATE documents SET title='The Dispossessed', author='Ursula K. Le Guin', \
+         year=1974 FROM files WHERE documents.file_id = files.id AND files.uuid = ?",
     )
     .bind(&del_uuid)
     .execute(&http_pool)
     .await
-    .expect("http audio metadata");
+    .expect("http document metadata");
 
     let (http_photo_uuid,): (String,) = sqlx::query_as("SELECT uuid FROM files WHERE name = ?")
         .bind("photo.jpg")
@@ -1148,30 +1109,36 @@ async fn given_same_lib_when_files_listed_via_http_and_ffi_then_arrays_identical
     let http_all_n = norm(http_all);
     assert_eq!(http_all_n.len(), 4, "state=all returns everything (http)");
 
-    // type=audio + state=all filter: HTTP returns only the soft-deleted song
+    // type=document + state=all filter: HTTP returns only the soft-deleted book
     // — with its metadata, since the filter has nothing to do with it.
-    let audio_req = Request::builder()
+    let document_req = Request::builder()
         .method("GET")
-        .uri("/v1/files?type=audio&state=all")
+        .uri("/v1/files?type=document&state=all")
         .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .body(Body::empty())
         .unwrap();
-    let audio_resp = app(Settings::default(), http_services.clone())
-        .oneshot(audio_req)
+    let document_resp = app(Settings::default(), http_services.clone())
+        .oneshot(document_req)
         .await
-        .expect("http list audio");
-    let http_audio: serde_json::Value =
-        serde_json::from_slice(&to_bytes(audio_resp.into_body(), usize::MAX).await.unwrap())
-            .unwrap();
-    let http_audio_n = norm(http_audio);
-    assert_eq!(http_audio_n.len(), 1);
-    assert_eq!(http_audio_n[0]["file"]["name"], "song.mp3");
-    assert_eq!(http_audio_n[0]["file"]["state"], "deleted");
-    assert_eq!(http_audio_n[0]["metadata"]["artist"], "Radiohead");
+        .expect("http list document");
+    let http_document: serde_json::Value = serde_json::from_slice(
+        &to_bytes(document_resp.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let http_document_n = norm(http_document);
+    assert_eq!(http_document_n.len(), 1);
+    assert_eq!(http_document_n[0]["file"]["name"], "book.epub");
+    assert_eq!(http_document_n[0]["file"]["state"], "deleted");
+    assert_eq!(
+        http_document_n[0]["metadata"]["author"],
+        "Ursula K. Le Guin"
+    );
 
     // ---- FFI leg (own identical lib + db) ----
     let ffi_lib = tempdir().unwrap();
-    std::fs::write(ffi_lib.path().join("song.mp3"), b"audio").unwrap();
+    std::fs::write(ffi_lib.path().join("book.epub"), b"document").unwrap();
     std::fs::write(ffi_lib.path().join("notes.md"), b"# h").unwrap();
     std::fs::write(ffi_lib.path().join("clip.mkv"), b"video").unwrap();
     std::fs::write(ffi_lib.path().join("photo.jpg"), b"image").unwrap();
@@ -1179,7 +1146,7 @@ async fn given_same_lib_when_files_listed_via_http_and_ffi_then_arrays_identical
     let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
     let ffi_lib_path = ffi_lib.path().to_str().unwrap().to_string();
 
-    let (ffi_default_n, ffi_all_n, ffi_audio_n) =
+    let (ffi_default_n, ffi_all_n, ffi_document_n) =
         tokio::task::spawn_blocking(move || -> (FileViews, FileViews, FileViews) {
             let cdb = CString::new(ffi_db).unwrap();
             assert_eq!(
@@ -1200,7 +1167,7 @@ async fn given_same_lib_when_files_listed_via_http_and_ffi_then_arrays_identical
             wait_for_ffi_run_terminal(&run_id_string(&started), &token);
             wait_for_ffi_files(4);
 
-            // Soft-delete song.mp3 and write the same audio/image metadata
+            // Soft-delete book.epub and write the same document/image metadata
             // as the HTTP leg, via a direct connection to the FFI db, so
             // the data state matches the HTTP leg exactly.
             let ffi_db_path = std::path::PathBuf::from(ffi_dir.path()).join("ffi.sqlite");
@@ -1220,16 +1187,16 @@ async fn given_same_lib_when_files_listed_via_http_and_ffi_then_arrays_identical
                             .unwrap();
                         sqlx::query("UPDATE files SET state='deleted', deleted_at=? WHERE name=?")
                             .bind("2024-01-01T00:00:00Z")
-                            .bind("song.mp3")
+                            .bind("book.epub")
                             .execute(&pool)
                             .await
                             .unwrap();
                         sqlx::query(
-                            "UPDATE audio_files SET title='Airbag', artist='Radiohead', \
-                             album=NULL, year=1997, genre=NULL, track=NULL \
-                             FROM files WHERE audio_files.file_id = files.id AND files.name = ?",
+                            "UPDATE documents SET title='The Dispossessed', \
+                             author='Ursula K. Le Guin', year=1974 \
+                             FROM files WHERE documents.file_id = files.id AND files.name = ?",
                         )
-                        .bind("song.mp3")
+                        .bind("book.epub")
                         .execute(&pool)
                         .await
                         .unwrap();
@@ -1266,8 +1233,8 @@ async fn given_same_lib_when_files_listed_via_http_and_ffi_then_arrays_identical
 
             let ffi_default_n = norm(ffi_list(""));
             let ffi_all_n = norm(ffi_list(r#"{"state":"all"}"#));
-            let ffi_audio_n = norm(ffi_list(r#"{"type":"audio","state":"all"}"#));
-            (ffi_default_n, ffi_all_n, ffi_audio_n)
+            let ffi_document_n = norm(ffi_list(r#"{"type":"document","state":"all"}"#));
+            (ffi_default_n, ffi_all_n, ffi_document_n)
         })
         .await
         .unwrap();
@@ -1286,7 +1253,7 @@ async fn given_same_lib_when_files_listed_via_http_and_ffi_then_arrays_identical
         "state=all list diverges across surfaces"
     );
     assert_eq!(
-        http_audio_n, ffi_audio_n,
+        http_document_n, ffi_document_n,
         "type+state list diverges across surfaces"
     );
 }
@@ -1301,7 +1268,7 @@ async fn given_same_file_when_fetched_via_http_and_ffi_then_file_view_bodies_ide
 
     // ---- HTTP leg ----
     let http_lib = tempdir().unwrap();
-    std::fs::write(http_lib.path().join("song.mp3"), b"parity-audio").unwrap();
+    std::fs::write(http_lib.path().join("clip.mkv"), b"parity-video").unwrap();
 
     let http_dir = tempdir().unwrap();
     let http_db = db_path(&http_dir, "http.sqlite");
@@ -1328,21 +1295,21 @@ async fn given_same_file_when_fetched_via_http_and_ffi_then_file_view_bodies_ide
     // Write subtype metadata so the FileView's `metadata` is non-null and
     // can be compared across surfaces.
     let (http_uuid,): (String,) = sqlx::query_as("SELECT uuid FROM files WHERE name=?")
-        .bind("song.mp3")
+        .bind("clip.mkv")
         .fetch_one(&http_pool)
         .await
         .unwrap();
     sqlx::query(
-        "UPDATE audio_files SET title=?, artist=?, year=? \
-         FROM files WHERE audio_files.file_id = files.id AND files.uuid = ?",
+        "UPDATE video_files SET title=?, resolution=?, year=? \
+         FROM files WHERE video_files.file_id = files.id AND files.uuid = ?",
     )
     .bind("T")
-    .bind("A")
+    .bind("720p")
     .bind(2001i64)
     .bind(&http_uuid)
     .execute(&http_pool)
     .await
-    .expect("audio metadata update");
+    .expect("video metadata update");
 
     let get_req = Request::builder()
         .method("GET")
@@ -1360,7 +1327,7 @@ async fn given_same_file_when_fetched_via_http_and_ffi_then_file_view_bodies_ide
 
     // ---- FFI leg (own identical lib + db) ----
     let ffi_lib = tempdir().unwrap();
-    std::fs::write(ffi_lib.path().join("song.mp3"), b"parity-audio").unwrap();
+    std::fs::write(ffi_lib.path().join("clip.mkv"), b"parity-video").unwrap();
     let ffi_dir = tempdir().unwrap();
     let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
     let ffi_lib_path = ffi_lib.path().to_str().unwrap().to_string();
@@ -1401,18 +1368,18 @@ async fn given_same_file_when_fetched_via_http_and_ffi_then_file_view_bodies_ide
                         .await
                         .unwrap();
                     sqlx::query(
-                        "UPDATE audio_files SET title=?, artist=?, year=? \
-                             FROM files WHERE audio_files.file_id = files.id AND files.name = ?",
+                        "UPDATE video_files SET title=?, resolution=?, year=? \
+                             FROM files WHERE video_files.file_id = files.id AND files.name = ?",
                     )
                     .bind("T")
-                    .bind("A")
+                    .bind("720p")
                     .bind(2001i64)
-                    .bind("song.mp3")
+                    .bind("clip.mkv")
                     .execute(&pool)
                     .await
                     .unwrap();
                     let (uuid,): (String,) = sqlx::query_as("SELECT uuid FROM files WHERE name=?")
-                        .bind("song.mp3")
+                        .bind("clip.mkv")
                         .fetch_one(&pool)
                         .await
                         .unwrap();
@@ -1527,7 +1494,7 @@ async fn given_unknown_filter_values_when_listed_via_http_and_ffi_then_both_reje
     // ---- HTTP leg: index a file so a silently-dropped filter would show up
     // as a non-empty 200 rather than an error. ----
     let http_lib = tempdir().unwrap();
-    std::fs::write(http_lib.path().join("song.mp3"), b"audio").unwrap();
+    std::fs::write(http_lib.path().join("memo.txt"), b"text").unwrap();
 
     let http_dir = tempdir().unwrap();
     let http_db = db_path(&http_dir, "http.sqlite");
@@ -1579,7 +1546,7 @@ async fn given_unknown_filter_values_when_listed_via_http_and_ffi_then_both_reje
 
     // ---- FFI leg ----
     let ffi_lib = tempdir().unwrap();
-    std::fs::write(ffi_lib.path().join("song.mp3"), b"audio").unwrap();
+    std::fs::write(ffi_lib.path().join("memo.txt"), b"text").unwrap();
     let ffi_dir = tempdir().unwrap();
     let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
     let ffi_lib_path = ffi_lib.path().to_str().unwrap().to_string();
@@ -1792,11 +1759,11 @@ async fn given_no_token_and_malformed_payload_when_edited_via_http_and_ffi_then_
 async fn given_same_file_when_renamed_via_http_and_ffi_then_file_bodies_and_disk_state_identical() {
     let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
-    let new_name = "renamed.mp3";
+    let new_name = "renamed.txt";
 
     // ---- HTTP leg ----
     let http_lib = tempdir().unwrap();
-    std::fs::write(http_lib.path().join("song.mp3"), b"parity-audio").unwrap();
+    std::fs::write(http_lib.path().join("memo.txt"), b"parity-text").unwrap();
 
     let http_dir = tempdir().unwrap();
     let http_db = db_path(&http_dir, "http.sqlite");
@@ -1821,7 +1788,7 @@ async fn given_same_file_when_renamed_via_http_and_ffi_then_file_bodies_and_disk
     wait_for_http_files(&http_pool, 1).await;
 
     let (http_uuid,): (String,) = sqlx::query_as("SELECT uuid FROM files WHERE name = ?")
-        .bind("song.mp3")
+        .bind("memo.txt")
         .fetch_one(&http_pool)
         .await
         .unwrap();
@@ -1844,7 +1811,7 @@ async fn given_same_file_when_renamed_via_http_and_ffi_then_file_bodies_and_disk
 
     // ---- FFI leg (own identical lib + db) ----
     let ffi_lib = tempdir().unwrap();
-    std::fs::write(ffi_lib.path().join("song.mp3"), b"parity-audio").unwrap();
+    std::fs::write(ffi_lib.path().join("memo.txt"), b"parity-text").unwrap();
     let ffi_dir = tempdir().unwrap();
     let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
     let ffi_lib_path = ffi_lib.path().to_str().unwrap().to_string();
@@ -1887,7 +1854,7 @@ async fn given_same_file_when_renamed_via_http_and_ffi_then_file_bodies_and_disk
                             .unwrap();
                         let (uuid,): (String,) =
                             sqlx::query_as("SELECT uuid FROM files WHERE name=?")
-                                .bind("song.mp3")
+                                .bind("memo.txt")
                                 .fetch_one(&pool)
                                 .await
                                 .unwrap();
@@ -1951,11 +1918,11 @@ async fn given_same_file_when_renamed_via_http_and_ffi_then_file_bodies_and_disk
     );
     // And the old path is gone on both.
     assert!(
-        !http_lib.path().join("song.mp3").exists(),
+        !http_lib.path().join("memo.txt").exists(),
         "http old path gone"
     );
     assert!(
-        !ffi_lib.path().join("song.mp3").exists(),
+        !ffi_lib.path().join("memo.txt").exists(),
         "ffi old path gone"
     );
 
@@ -1982,7 +1949,7 @@ async fn given_no_token_when_renamed_via_http_and_ffi_then_both_unauthorized() {
         .method("POST")
         .uri(format!("/v1/files/{}/rename", uuid::Uuid::new_v4()))
         .header("content-type", "application/json")
-        .body(Body::from(json!({ "name": "x.mp3" }).to_string()))
+        .body(Body::from(json!({ "name": "x.txt" }).to_string()))
         .unwrap();
     let resp = app(Settings::default(), http_services)
         .oneshot(req)
@@ -2015,7 +1982,7 @@ async fn given_no_token_when_renamed_via_http_and_ffi_then_both_unauthorized() {
         let clean_status = alexandria_ffi::FILE_ERR_UNAUTHORIZED;
         // A second call with a clean uuid but no token still denies.
         let ok_uuid = CString::new("11111111-1111-1111-1111-111111111111").unwrap();
-        let name = CString::new("new.mp3").unwrap();
+        let name = CString::new("new.txt").unwrap();
         let r2 = alexandria_file_rename(ok_uuid.as_ptr(), name.as_ptr(), std::ptr::null());
         if !r2.json.is_null() {
             unsafe {
@@ -2051,7 +2018,7 @@ async fn given_same_file_when_soft_deleted_via_http_and_ffi_then_file_bodies_ide
 
     // ---- HTTP leg ----
     let http_lib = tempdir().unwrap();
-    std::fs::write(http_lib.path().join("song.mp3"), b"parity-audio").unwrap();
+    std::fs::write(http_lib.path().join("memo.txt"), b"parity-text").unwrap();
 
     let http_dir = tempdir().unwrap();
     let http_db = db_path(&http_dir, "http.sqlite");
@@ -2076,7 +2043,7 @@ async fn given_same_file_when_soft_deleted_via_http_and_ffi_then_file_bodies_ide
     wait_for_http_files(&http_pool, 1).await;
 
     let (http_uuid,): (String,) = sqlx::query_as("SELECT uuid FROM files WHERE name = ?")
-        .bind("song.mp3")
+        .bind("memo.txt")
         .fetch_one(&http_pool)
         .await
         .unwrap();
@@ -2098,7 +2065,7 @@ async fn given_same_file_when_soft_deleted_via_http_and_ffi_then_file_bodies_ide
 
     // ---- FFI leg (own identical lib + db) ----
     let ffi_lib = tempdir().unwrap();
-    std::fs::write(ffi_lib.path().join("song.mp3"), b"parity-audio").unwrap();
+    std::fs::write(ffi_lib.path().join("memo.txt"), b"parity-text").unwrap();
     let ffi_dir = tempdir().unwrap();
     let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
     let ffi_lib_path = ffi_lib.path().to_str().unwrap().to_string();
@@ -2140,7 +2107,7 @@ async fn given_same_file_when_soft_deleted_via_http_and_ffi_then_file_bodies_ide
                             .unwrap();
                         let (uuid,): (String,) =
                             sqlx::query_as("SELECT uuid FROM files WHERE name=?")
-                                .bind("song.mp3")
+                                .bind("memo.txt")
                                 .fetch_one(&pool)
                                 .await
                                 .unwrap();
@@ -2214,16 +2181,16 @@ async fn given_same_file_when_soft_deleted_via_http_and_ffi_then_file_bodies_ide
     // On-disk parity: the file is untouched on both legs (UC-06 does not
     // remove the on-disk file; purge-on-disk is UC-09).
     assert!(
-        http_lib.path().join("song.mp3").exists(),
+        http_lib.path().join("memo.txt").exists(),
         "http on-disk file preserved"
     );
     assert!(
-        ffi_lib.path().join("song.mp3").exists(),
+        ffi_lib.path().join("memo.txt").exists(),
         "ffi on-disk file preserved"
     );
     assert_eq!(
-        std::fs::read(http_lib.path().join("song.mp3")).unwrap(),
-        std::fs::read(ffi_lib.path().join("song.mp3")).unwrap(),
+        std::fs::read(http_lib.path().join("memo.txt")).unwrap(),
+        std::fs::read(ffi_lib.path().join("memo.txt")).unwrap(),
         "on-disk files agree byte-for-byte across surfaces"
     );
 
@@ -2322,7 +2289,7 @@ async fn given_soft_deleted_file_when_restored_via_http_and_ffi_then_file_bodies
 
     // ---- HTTP leg ----
     let http_lib = tempdir().unwrap();
-    std::fs::write(http_lib.path().join("song.mp3"), b"parity-audio").unwrap();
+    std::fs::write(http_lib.path().join("memo.txt"), b"parity-text").unwrap();
 
     let http_dir = tempdir().unwrap();
     let http_db = db_path(&http_dir, "http.sqlite");
@@ -2347,7 +2314,7 @@ async fn given_soft_deleted_file_when_restored_via_http_and_ffi_then_file_bodies
     wait_for_http_files(&http_pool, 1).await;
 
     let (http_uuid,): (String,) = sqlx::query_as("SELECT uuid FROM files WHERE name = ?")
-        .bind("song.mp3")
+        .bind("memo.txt")
         .fetch_one(&http_pool)
         .await
         .unwrap();
@@ -2377,7 +2344,7 @@ async fn given_soft_deleted_file_when_restored_via_http_and_ffi_then_file_bodies
 
     // ---- FFI leg (own identical lib + db) ----
     let ffi_lib = tempdir().unwrap();
-    std::fs::write(ffi_lib.path().join("song.mp3"), b"parity-audio").unwrap();
+    std::fs::write(ffi_lib.path().join("memo.txt"), b"parity-text").unwrap();
     let ffi_dir = tempdir().unwrap();
     let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
     let ffi_lib_path = ffi_lib.path().to_str().unwrap().to_string();
@@ -2422,7 +2389,7 @@ async fn given_soft_deleted_file_when_restored_via_http_and_ffi_then_file_bodies
                             .unwrap();
                         let (uuid,): (String,) =
                             sqlx::query_as("SELECT uuid FROM files WHERE name=?")
-                                .bind("song.mp3")
+                                .bind("memo.txt")
                                 .fetch_one(&pool)
                                 .await
                                 .unwrap();
@@ -2500,11 +2467,11 @@ async fn given_soft_deleted_file_when_restored_via_http_and_ffi_then_file_bodies
     // On-disk parity: the file is untouched on both legs (UC-07 does not
     // remove the on-disk file; purge-on-disk is UC-09).
     assert!(
-        http_lib.path().join("song.mp3").exists(),
+        http_lib.path().join("memo.txt").exists(),
         "http on-disk file preserved"
     );
     assert!(
-        ffi_lib.path().join("song.mp3").exists(),
+        ffi_lib.path().join("memo.txt").exists(),
         "ffi on-disk file preserved"
     );
 
@@ -2600,7 +2567,7 @@ async fn given_purgeable_file_when_purged_via_http_and_ffi_then_file_bodies_iden
 
     // ---- HTTP leg ----
     let http_lib = tempdir().unwrap();
-    std::fs::write(http_lib.path().join("song.mp3"), b"parity-audio").unwrap();
+    std::fs::write(http_lib.path().join("memo.txt"), b"parity-text").unwrap();
 
     let http_dir = tempdir().unwrap();
     let http_db = db_path(&http_dir, "http.sqlite");
@@ -2626,7 +2593,7 @@ async fn given_purgeable_file_when_purged_via_http_and_ffi_then_file_bodies_iden
 
     let (http_uuid, http_file_id): (String, i64) =
         sqlx::query_as("SELECT uuid, id FROM files WHERE name = ?")
-            .bind("song.mp3")
+            .bind("memo.txt")
             .fetch_one(&http_pool)
             .await
             .unwrap();
@@ -2659,7 +2626,7 @@ async fn given_purgeable_file_when_purged_via_http_and_ffi_then_file_bodies_iden
         .await
         .unwrap();
     let http_subtype_remaining: (i64,) =
-        sqlx::query_as("SELECT COUNT(*) FROM audio_files WHERE file_id = ?")
+        sqlx::query_as("SELECT COUNT(*) FROM text_files WHERE file_id = ?")
             .bind(http_file_id)
             .fetch_one(&http_pool)
             .await
@@ -2667,7 +2634,7 @@ async fn given_purgeable_file_when_purged_via_http_and_ffi_then_file_bodies_iden
 
     // ---- FFI leg (own identical lib + db) ----
     let ffi_lib = tempdir().unwrap();
-    std::fs::write(ffi_lib.path().join("song.mp3"), b"parity-audio").unwrap();
+    std::fs::write(ffi_lib.path().join("memo.txt"), b"parity-text").unwrap();
     let ffi_dir = tempdir().unwrap();
     let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
     let ffi_lib_path = ffi_lib.path().to_str().unwrap().to_string();
@@ -2708,7 +2675,7 @@ async fn given_purgeable_file_when_purged_via_http_and_ffi_then_file_bodies_iden
                             .unwrap();
                         let (uuid, id): (String, i64) =
                             sqlx::query_as("SELECT uuid, id FROM files WHERE name=?")
-                                .bind("song.mp3")
+                                .bind("memo.txt")
                                 .fetch_one(&pool)
                                 .await
                                 .unwrap();
@@ -2764,7 +2731,7 @@ async fn given_purgeable_file_when_purged_via_http_and_ffi_then_file_bodies_iden
                                 .await
                                 .unwrap();
                         let (subtype,): (i64,) =
-                            sqlx::query_as("SELECT COUNT(*) FROM audio_files WHERE file_id = ?")
+                            sqlx::query_as("SELECT COUNT(*) FROM text_files WHERE file_id = ?")
                                 .bind(ffi_file_id)
                                 .fetch_one(&pool)
                                 .await
@@ -2819,11 +2786,11 @@ async fn given_purgeable_file_when_purged_via_http_and_ffi_then_file_bodies_iden
     // On-disk parity: the file is untouched on both legs (NFR-07;
     // purge-on-disk is UC-09).
     assert!(
-        http_lib.path().join("song.mp3").exists(),
+        http_lib.path().join("memo.txt").exists(),
         "http on-disk file preserved"
     );
     assert!(
-        ffi_lib.path().join("song.mp3").exists(),
+        ffi_lib.path().join("memo.txt").exists(),
         "ffi on-disk file preserved"
     );
 }
@@ -2914,7 +2881,7 @@ async fn given_active_file_when_purged_on_disk_via_http_and_ffi_then_file_bodies
 
     // ---- HTTP leg ----
     let http_lib = tempdir().unwrap();
-    std::fs::write(http_lib.path().join("song.mp3"), b"parity-audio").unwrap();
+    std::fs::write(http_lib.path().join("memo.txt"), b"parity-text").unwrap();
 
     let http_dir = tempdir().unwrap();
     let http_db = db_path(&http_dir, "http.sqlite");
@@ -2940,7 +2907,7 @@ async fn given_active_file_when_purged_on_disk_via_http_and_ffi_then_file_bodies
 
     let (http_uuid, http_file_id): (String, i64) =
         sqlx::query_as("SELECT uuid, id FROM files WHERE name = ?")
-            .bind("song.mp3")
+            .bind("memo.txt")
             .fetch_one(&http_pool)
             .await
             .unwrap();
@@ -2966,7 +2933,7 @@ async fn given_active_file_when_purged_on_disk_via_http_and_ffi_then_file_bodies
         .await
         .unwrap();
     let http_subtype_remaining: (i64,) =
-        sqlx::query_as("SELECT COUNT(*) FROM audio_files WHERE file_id = ?")
+        sqlx::query_as("SELECT COUNT(*) FROM text_files WHERE file_id = ?")
             .bind(http_file_id)
             .fetch_one(&http_pool)
             .await
@@ -2974,7 +2941,7 @@ async fn given_active_file_when_purged_on_disk_via_http_and_ffi_then_file_bodies
 
     // ---- FFI leg (own identical lib + db) ----
     let ffi_lib = tempdir().unwrap();
-    std::fs::write(ffi_lib.path().join("song.mp3"), b"parity-audio").unwrap();
+    std::fs::write(ffi_lib.path().join("memo.txt"), b"parity-text").unwrap();
     let ffi_dir = tempdir().unwrap();
     let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
     let ffi_lib_path = ffi_lib.path().to_str().unwrap().to_string();
@@ -3015,7 +2982,7 @@ async fn given_active_file_when_purged_on_disk_via_http_and_ffi_then_file_bodies
                             .unwrap();
                         let (uuid, id): (String, i64) =
                             sqlx::query_as("SELECT uuid, id FROM files WHERE name=?")
-                                .bind("song.mp3")
+                                .bind("memo.txt")
                                 .fetch_one(&pool)
                                 .await
                                 .unwrap();
@@ -3067,7 +3034,7 @@ async fn given_active_file_when_purged_on_disk_via_http_and_ffi_then_file_bodies
                                 .await
                                 .unwrap();
                         let (subtype,): (i64,) =
-                            sqlx::query_as("SELECT COUNT(*) FROM audio_files WHERE file_id = ?")
+                            sqlx::query_as("SELECT COUNT(*) FROM text_files WHERE file_id = ?")
                                 .bind(ffi_file_id)
                                 .fetch_one(&pool)
                                 .await
@@ -3137,11 +3104,11 @@ async fn given_active_file_when_purged_on_disk_via_http_and_ffi_then_file_bodies
 
     // On-disk parity: the file is gone on both legs.
     assert!(
-        !http_lib.path().join("song.mp3").exists(),
+        !http_lib.path().join("memo.txt").exists(),
         "http on-disk file removed"
     );
     assert!(
-        !ffi_lib.path().join("song.mp3").exists(),
+        !ffi_lib.path().join("memo.txt").exists(),
         "ffi on-disk file removed"
     );
 }
@@ -3232,7 +3199,7 @@ async fn given_missing_disk_file_when_purged_on_disk_via_http_and_ffi_then_both_
 
     // ---- HTTP leg ----
     let http_lib = tempdir().unwrap();
-    std::fs::write(http_lib.path().join("song.mp3"), b"parity-audio").unwrap();
+    std::fs::write(http_lib.path().join("memo.txt"), b"parity-text").unwrap();
 
     let http_dir = tempdir().unwrap();
     let http_db = db_path(&http_dir, "http.sqlite");
@@ -3258,14 +3225,14 @@ async fn given_missing_disk_file_when_purged_on_disk_via_http_and_ffi_then_both_
 
     let (http_uuid, http_file_id): (String, i64) =
         sqlx::query_as("SELECT uuid, id FROM files WHERE name = ?")
-            .bind("song.mp3")
+            .bind("memo.txt")
             .fetch_one(&http_pool)
             .await
             .unwrap();
 
     // The file is deleted out from under the catalog, exactly as AF-01
     // describes, *after* indexing so the row still points at the path.
-    std::fs::remove_file(http_lib.path().join("song.mp3")).expect("http pre-remove");
+    std::fs::remove_file(http_lib.path().join("memo.txt")).expect("http pre-remove");
 
     let purge_req = Request::builder()
         .method("DELETE")
@@ -3288,7 +3255,7 @@ async fn given_missing_disk_file_when_purged_on_disk_via_http_and_ffi_then_both_
         .await
         .unwrap();
     let http_subtype_remaining: (i64,) =
-        sqlx::query_as("SELECT COUNT(*) FROM audio_files WHERE file_id = ?")
+        sqlx::query_as("SELECT COUNT(*) FROM text_files WHERE file_id = ?")
             .bind(http_file_id)
             .fetch_one(&http_pool)
             .await
@@ -3296,11 +3263,11 @@ async fn given_missing_disk_file_when_purged_on_disk_via_http_and_ffi_then_both_
 
     // ---- FFI leg (own identical lib + db) ----
     let ffi_lib = tempdir().unwrap();
-    std::fs::write(ffi_lib.path().join("song.mp3"), b"parity-audio").unwrap();
+    std::fs::write(ffi_lib.path().join("memo.txt"), b"parity-text").unwrap();
     let ffi_dir = tempdir().unwrap();
     let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
     let ffi_lib_path = ffi_lib.path().to_str().unwrap().to_string();
-    let ffi_disk_file = ffi_lib.path().join("song.mp3");
+    let ffi_disk_file = ffi_lib.path().join("memo.txt");
 
     let (ffi_body, ffi_files_remaining, ffi_subtype_remaining) =
         tokio::task::spawn_blocking(move || -> (serde_json::Value, i64, i64) {
@@ -3338,7 +3305,7 @@ async fn given_missing_disk_file_when_purged_on_disk_via_http_and_ffi_then_both_
                             .unwrap();
                         let (uuid, id): (String, i64) =
                             sqlx::query_as("SELECT uuid, id FROM files WHERE name=?")
-                                .bind("song.mp3")
+                                .bind("memo.txt")
                                 .fetch_one(&pool)
                                 .await
                                 .unwrap();
@@ -3393,7 +3360,7 @@ async fn given_missing_disk_file_when_purged_on_disk_via_http_and_ffi_then_both_
                                 .await
                                 .unwrap();
                         let (subtype,): (i64,) =
-                            sqlx::query_as("SELECT COUNT(*) FROM audio_files WHERE file_id = ?")
+                            sqlx::query_as("SELECT COUNT(*) FROM text_files WHERE file_id = ?")
                                 .bind(ffi_file_id)
                                 .fetch_one(&pool)
                                 .await
@@ -3540,7 +3507,7 @@ async fn given_active_file_when_purged_via_http_and_ffi_then_both_invalid_state(
 
     // ---- HTTP leg ----
     let http_lib = tempdir().unwrap();
-    std::fs::write(http_lib.path().join("song.mp3"), b"parity-audio").unwrap();
+    std::fs::write(http_lib.path().join("memo.txt"), b"parity-text").unwrap();
 
     let http_dir = tempdir().unwrap();
     let http_db = db_path(&http_dir, "http.sqlite");
@@ -3565,7 +3532,7 @@ async fn given_active_file_when_purged_via_http_and_ffi_then_both_invalid_state(
     wait_for_http_files(&http_pool, 1).await;
 
     let (http_uuid,): (String,) = sqlx::query_as("SELECT uuid FROM files WHERE name = ?")
-        .bind("song.mp3")
+        .bind("memo.txt")
         .fetch_one(&http_pool)
         .await
         .unwrap();
@@ -3592,7 +3559,7 @@ async fn given_active_file_when_purged_via_http_and_ffi_then_both_invalid_state(
 
     // ---- FFI leg (own identical lib + db) ----
     let ffi_lib = tempdir().unwrap();
-    std::fs::write(ffi_lib.path().join("song.mp3"), b"parity-audio").unwrap();
+    std::fs::write(ffi_lib.path().join("memo.txt"), b"parity-text").unwrap();
     let ffi_dir = tempdir().unwrap();
     let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
     let ffi_lib_path = ffi_lib.path().to_str().unwrap().to_string();
@@ -3631,7 +3598,7 @@ async fn given_active_file_when_purged_via_http_and_ffi_then_both_invalid_state(
                         .await
                         .unwrap();
                     let (uuid,): (String,) = sqlx::query_as("SELECT uuid FROM files WHERE name=?")
-                        .bind("song.mp3")
+                        .bind("memo.txt")
                         .fetch_one(&pool)
                         .await
                         .unwrap();
@@ -8799,8 +8766,8 @@ async fn given_non_text_file_when_read_via_http_and_ffi_then_both_invalid_input(
     let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
     let lib = tempdir().unwrap();
-    let file_path = lib.path().join("song.mp3");
-    std::fs::write(&file_path, b"audio bytes").unwrap();
+    let file_path = lib.path().join("photo.png");
+    std::fs::write(&file_path, b"png bytes").unwrap();
     let file_path = file_path.to_str().unwrap().to_string();
 
     // ---- HTTP leg ----
@@ -8811,7 +8778,7 @@ async fn given_non_text_file_when_read_via_http_and_ffi_then_both_invalid_input(
     let http_services =
         std::sync::Arc::new(build_services(&local_settings(), http_pool.clone()).await);
 
-    let http_uuid = seed_file_at_path(&http_pool, "audio", &file_path).await;
+    let http_uuid = seed_file_at_path(&http_pool, "image", &file_path).await;
 
     let req = Request::builder()
         .method("GET")
@@ -8829,7 +8796,7 @@ async fn given_non_text_file_when_read_via_http_and_ffi_then_both_invalid_input(
     let ffi_dir = tempdir().unwrap();
     let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
     let ffi_pool = migrate_database(&ffi_db).await.expect("ffi migrate");
-    let ffi_uuid = seed_file_at_path(&ffi_pool, "audio", &file_path).await;
+    let ffi_uuid = seed_file_at_path(&ffi_pool, "image", &file_path).await;
     ffi_pool.close().await;
 
     let ffi_status = tokio::task::spawn_blocking(move || -> i32 {
@@ -8958,8 +8925,8 @@ async fn given_non_text_file_when_edited_via_http_and_ffi_then_both_invalid_inpu
     let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
     let lib = tempdir().unwrap();
-    let file_path = lib.path().join("song.mp3");
-    std::fs::write(&file_path, b"audio bytes").unwrap();
+    let file_path = lib.path().join("photo.png");
+    std::fs::write(&file_path, b"png bytes").unwrap();
     let file_path = file_path.to_str().unwrap().to_string();
 
     // ---- HTTP leg ----
@@ -8970,7 +8937,7 @@ async fn given_non_text_file_when_edited_via_http_and_ffi_then_both_invalid_inpu
     let http_services =
         std::sync::Arc::new(build_services(&local_settings(), http_pool.clone()).await);
 
-    let http_uuid = seed_file_at_path(&http_pool, "audio", &file_path).await;
+    let http_uuid = seed_file_at_path(&http_pool, "image", &file_path).await;
 
     let req = Request::builder()
         .method("PUT")
@@ -8989,7 +8956,7 @@ async fn given_non_text_file_when_edited_via_http_and_ffi_then_both_invalid_inpu
     let ffi_dir = tempdir().unwrap();
     let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
     let ffi_pool = migrate_database(&ffi_db).await.expect("ffi migrate");
-    let ffi_uuid = seed_file_at_path(&ffi_pool, "audio", &file_path).await;
+    let ffi_uuid = seed_file_at_path(&ffi_pool, "image", &file_path).await;
     ffi_pool.close().await;
 
     let ffi_status = tokio::task::spawn_blocking(move || -> i32 {
@@ -9385,435 +9352,6 @@ async fn given_local_mode_when_windows_login_attempted_via_http_and_ffi_then_bot
     );
 }
 
-/// Write a minimal valid single-channel 8-bit PCM WAV file (see
-/// `alexandria-core`'s `catalog::audio_tags` unit tests for the same
-/// helper) — just enough of a real RIFF/WAVE container for `lofty` to
-/// recognize the format and accept a written tag.
-fn write_minimal_wav(path: &std::path::Path) {
-    let sample_data: [u8; 8] = [0x80; 8];
-    let mut bytes = Vec::new();
-    bytes.extend_from_slice(b"RIFF");
-    bytes.extend_from_slice(&(36u32 + sample_data.len() as u32).to_le_bytes());
-    bytes.extend_from_slice(b"WAVE");
-    bytes.extend_from_slice(b"fmt ");
-    bytes.extend_from_slice(&16u32.to_le_bytes());
-    bytes.extend_from_slice(&1u16.to_le_bytes());
-    bytes.extend_from_slice(&1u16.to_le_bytes());
-    bytes.extend_from_slice(&8000u32.to_le_bytes());
-    bytes.extend_from_slice(&8000u32.to_le_bytes());
-    bytes.extend_from_slice(&1u16.to_le_bytes());
-    bytes.extend_from_slice(&8u16.to_le_bytes());
-    bytes.extend_from_slice(b"data");
-    bytes.extend_from_slice(&(sample_data.len() as u32).to_le_bytes());
-    bytes.extend_from_slice(&sample_data);
-    std::fs::write(path, bytes).expect("write wav");
-}
-
-fn write_test_tags(path: &std::path::Path) {
-    use lofty::config::WriteOptions;
-    use lofty::tag::{Accessor, Tag, TagExt, TagType};
-
-    let mut tag = Tag::new(TagType::Id3v2);
-    tag.set_title("Parity Title".to_string());
-    tag.set_artist("Parity Artist".to_string());
-    tag.set_album("Parity Album".to_string());
-    tag.set_genre("Parity Genre".to_string());
-    // ID3v2 maps no dedicated `Year` item, so this is where lofty's own
-    // `set_year` put it before 0.25 removed that method.
-    tag.insert_text(lofty::tag::ItemKey::RecordingDate, "2015".to_string());
-    tag.set_track(2);
-    // `TPE2` — no `Accessor` convenience exists for it (issue #120), so it
-    // is written the same way `LoftyAudioMetadataReader` reads it: a direct
-    // item key.
-    tag.insert_text(
-        lofty::tag::ItemKey::AlbumArtist,
-        "Parity Album Artist".to_string(),
-    );
-    tag.save_to_path(path, WriteOptions::default())
-        .expect("save tag");
-}
-
-/// Issue #44 pilot parity — index a tagged audio file through both
-/// transports and assert the extracted subtype metadata (written by the
-/// indexer itself, not by a manual PATCH) is byte-for-byte identical.
-#[tokio::test]
-async fn given_tagged_audio_file_when_indexed_via_http_and_ffi_then_extracted_metadata_matches() {
-    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-
-    // ---- HTTP leg ----
-    let http_lib = tempdir().unwrap();
-    let http_track = http_lib.path().join("song.wav");
-    write_minimal_wav(&http_track);
-    write_test_tags(&http_track);
-
-    let http_dir = tempdir().unwrap();
-    let http_db = db_path(&http_dir, "http.sqlite");
-    let http_pool = migrate_database(&http_db).await.expect("http migrate");
-    seed_session(&http_pool, TEST_TOKEN).await;
-    let http_services =
-        std::sync::Arc::new(build_services(&local_settings(), http_pool.clone()).await);
-
-    let index_req = Request::builder()
-        .method("POST")
-        .uri("/v1/index")
-        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
-        .header("content-type", "application/json")
-        .body(Body::from(
-            json!({ "root": http_lib.path().to_str().unwrap() }).to_string(),
-        ))
-        .unwrap();
-    let _ = app(Settings::default(), http_services.clone())
-        .oneshot(index_req)
-        .await
-        .expect("http index");
-    wait_for_http_files(&http_pool, 1).await;
-    // Wait on the extracted metadata itself, not just the file row —
-    // `insert_file` commits the `files` row before `index_entry` reads the
-    // audio tags and writes `audio_files` in a separate transaction.
-    wait_for_http_audio_title(&http_pool, "Parity Title").await;
-
-    let (http_uuid,): (String,) = sqlx::query_as("SELECT uuid FROM files WHERE name = ?")
-        .bind("song.wav")
-        .fetch_one(&http_pool)
-        .await
-        .unwrap();
-
-    let get_req = Request::builder()
-        .method("GET")
-        .uri(format!("/v1/files/{http_uuid}"))
-        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
-        .body(Body::empty())
-        .unwrap();
-    let get_resp = app(Settings::default(), http_services)
-        .oneshot(get_req)
-        .await
-        .expect("http get");
-    assert_eq!(get_resp.status(), axum::http::StatusCode::OK);
-    let http_body: serde_json::Value =
-        serde_json::from_slice(&to_bytes(get_resp.into_body(), usize::MAX).await.unwrap()).unwrap();
-
-    // ---- FFI leg ----
-    let ffi_dir = tempdir().unwrap();
-    let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
-    let ffi_lib = tempdir().unwrap();
-    let ffi_track = ffi_lib.path().join("song.wav");
-    write_minimal_wav(&ffi_track);
-    write_test_tags(&ffi_track);
-    let ffi_lib_path = ffi_lib.path().to_str().unwrap().to_string();
-
-    let ffi_db_for_uuid_lookup = ffi_db.clone();
-    let ffi_body: String = tokio::task::spawn_blocking(move || -> String {
-        let cdb = CString::new(ffi_db).unwrap();
-        assert_eq!(
-            alexandria_index_init(cdb.as_ptr()),
-            alexandria_ffi::INDEX_OK
-        );
-
-        let root = CString::new(ffi_lib_path).unwrap();
-        let token = CString::new(TEST_TOKEN).unwrap();
-        let started = alexandria_index_start(
-            root.as_ptr(),
-            token.as_ptr(),
-            std::ptr::null(),
-            std::ptr::null(),
-        );
-        assert_eq!(started.status, alexandria_ffi::INDEX_OK);
-
-        let dl = std::time::Instant::now() + ASYNC_RUN_DEADLINE;
-        loop {
-            if alexandria_index_count_files() >= 1 {
-                break;
-            }
-            if std::time::Instant::now() > dl {
-                panic!("ffi never persisted 1 file");
-            }
-            std::thread::sleep(std::time::Duration::from_millis(25));
-        }
-
-        // `alexandria_index_files_json` deliberately doesn't expose `uuid`
-        // (only path/name/type/hash/missingAt), so look the uuid up
-        // directly the same way the HTTP leg does — via a fresh connection
-        // on its own current-thread runtime, mirroring the established
-        // pattern used elsewhere in this file for querying the FFI db from
-        // inside a `spawn_blocking` closure.
-        //
-        // The `files` row above is committed by `insert_file` before
-        // `index_entry` extracts audio tags and writes `audio_files` in a
-        // separate transaction, so also poll the `audio_files` row itself —
-        // otherwise this leg can race ahead of extraction just like the
-        // HTTP leg can.
-        let ffi_uuid = std::thread::spawn(move || -> String {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();
-            rt.block_on(async move {
-                let url = format!("sqlite://{ffi_db_for_uuid_lookup}");
-                let pool = sqlx::sqlite::SqlitePoolOptions::new()
-                    .max_connections(1)
-                    .connect(&format!("{url}?mode=rw"))
-                    .await
-                    .unwrap();
-
-                let dl = std::time::Instant::now() + ASYNC_RUN_DEADLINE;
-                loop {
-                    let row: Option<(Option<String>,)> = sqlx::query_as(
-                        "SELECT audio_files.title FROM audio_files \
-                         JOIN files ON files.id = audio_files.file_id \
-                         WHERE files.name = ?",
-                    )
-                    .bind("song.wav")
-                    .fetch_optional(&pool)
-                    .await
-                    .unwrap();
-                    if let Some((Some(title),)) = &row {
-                        if title == "Parity Title" {
-                            break;
-                        }
-                    }
-                    if std::time::Instant::now() > dl {
-                        panic!("ffi never wrote extracted audio title");
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-                }
-
-                let (uuid,): (String,) = sqlx::query_as("SELECT uuid FROM files WHERE name = ?")
-                    .bind("song.wav")
-                    .fetch_one(&pool)
-                    .await
-                    .unwrap();
-                uuid
-            })
-        })
-        .join()
-        .unwrap();
-
-        let uuid_c = CString::new(ffi_uuid).unwrap();
-        let result = alexandria_file_get_by_uuid(uuid_c.as_ptr(), token.as_ptr());
-        assert_eq!(result.status, alexandria_ffi::FILE_OK);
-        assert!(!result.json.is_null());
-        let json = unsafe { CStr::from_ptr(result.json) }
-            .to_str()
-            .unwrap()
-            .to_string();
-        unsafe {
-            alexandria_free_string(result.json);
-        }
-        json
-    })
-    .await
-    .unwrap();
-
-    let ffi_body: serde_json::Value = serde_json::from_str(&ffi_body).unwrap();
-
-    // ---- compare ----
-    assert_eq!(
-        http_body["metadata"], ffi_body["metadata"],
-        "extracted audio metadata must match across surfaces"
-    );
-    assert_eq!(http_body["metadata"]["title"], "Parity Title");
-    assert_eq!(http_body["metadata"]["artist"], "Parity Artist");
-    assert_eq!(http_body["metadata"]["album"], "Parity Album");
-    assert_eq!(http_body["metadata"]["genre"], "Parity Genre");
-    assert_eq!(http_body["metadata"]["year"], 2015);
-    assert_eq!(http_body["metadata"]["track"], 2);
-    // Explicit, not just the whole-body `assert_eq!` above (review finding
-    // #120): a field both legs happened to omit would pass that check
-    // silently, which is exactly how an unextracted `albumArtist` slipped
-    // through the first version of this test.
-    assert_eq!(http_body["metadata"]["albumArtist"], "Parity Album Artist");
-    assert_eq!(ffi_body["metadata"]["albumArtist"], "Parity Album Artist");
-}
-
-/// `write_test_tags` minus the album artist item, so the fixture's other
-/// six fields still extract normally. Mirrors `alexandria-core`'s
-/// `audio_tags` unit test fixture of the same shape.
-fn write_test_tags_without_album_artist(path: &std::path::Path) {
-    use lofty::config::WriteOptions;
-    use lofty::tag::{Accessor, Tag, TagExt, TagType};
-
-    let mut tag = Tag::new(TagType::Id3v2);
-    tag.set_title("Parity Title".to_string());
-    tag.set_artist("Parity Artist".to_string());
-    tag.set_album("Parity Album".to_string());
-    tag.set_genre("Parity Genre".to_string());
-    tag.insert_text(lofty::tag::ItemKey::RecordingDate, "2015".to_string());
-    tag.set_track(2);
-    tag.save_to_path(path, WriteOptions::default())
-        .expect("save tag");
-}
-
-/// The other half of the design's parity requirement (issue #120): HTTP
-/// and FFI must answer identically for a file that has an album artist
-/// (the test above) and a file that does not. This covers "does not" -- a
-/// file whose other six tags extract normally but which carries no
-/// ALBUMARTIST/TPE2/aART item at all, asserting both surfaces agree it is
-/// absent (never a copy of `artist`) rather than just asserting two
-/// `null`s happen to be equal.
-#[tokio::test]
-async fn given_untagged_album_artist_when_indexed_via_http_and_ffi_then_both_report_null() {
-    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-
-    // ---- HTTP leg ----
-    let http_lib = tempdir().unwrap();
-    let http_track = http_lib.path().join("song.wav");
-    write_minimal_wav(&http_track);
-    write_test_tags_without_album_artist(&http_track);
-
-    let http_dir = tempdir().unwrap();
-    let http_db = db_path(&http_dir, "http.sqlite");
-    let http_pool = migrate_database(&http_db).await.expect("http migrate");
-    seed_session(&http_pool, TEST_TOKEN).await;
-    let http_services =
-        std::sync::Arc::new(build_services(&local_settings(), http_pool.clone()).await);
-
-    let index_req = Request::builder()
-        .method("POST")
-        .uri("/v1/index")
-        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
-        .header("content-type", "application/json")
-        .body(Body::from(
-            json!({ "root": http_lib.path().to_str().unwrap() }).to_string(),
-        ))
-        .unwrap();
-    let _ = app(Settings::default(), http_services.clone())
-        .oneshot(index_req)
-        .await
-        .expect("http index");
-    wait_for_http_files(&http_pool, 1).await;
-    wait_for_http_audio_title(&http_pool, "Parity Title").await;
-
-    let (http_uuid,): (String,) = sqlx::query_as("SELECT uuid FROM files WHERE name = ?")
-        .bind("song.wav")
-        .fetch_one(&http_pool)
-        .await
-        .unwrap();
-
-    let get_req = Request::builder()
-        .method("GET")
-        .uri(format!("/v1/files/{http_uuid}"))
-        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
-        .body(Body::empty())
-        .unwrap();
-    let get_resp = app(Settings::default(), http_services)
-        .oneshot(get_req)
-        .await
-        .expect("http get");
-    assert_eq!(get_resp.status(), axum::http::StatusCode::OK);
-    let http_body: serde_json::Value =
-        serde_json::from_slice(&to_bytes(get_resp.into_body(), usize::MAX).await.unwrap()).unwrap();
-
-    // ---- FFI leg ----
-    let ffi_dir = tempdir().unwrap();
-    let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
-    let ffi_lib = tempdir().unwrap();
-    let ffi_track = ffi_lib.path().join("song.wav");
-    write_minimal_wav(&ffi_track);
-    write_test_tags_without_album_artist(&ffi_track);
-    let ffi_lib_path = ffi_lib.path().to_str().unwrap().to_string();
-
-    let ffi_db_for_uuid_lookup = ffi_db.clone();
-    let ffi_body: String = tokio::task::spawn_blocking(move || -> String {
-        let cdb = CString::new(ffi_db).unwrap();
-        assert_eq!(
-            alexandria_index_init(cdb.as_ptr()),
-            alexandria_ffi::INDEX_OK
-        );
-
-        let root = CString::new(ffi_lib_path).unwrap();
-        let token = CString::new(TEST_TOKEN).unwrap();
-        let started = alexandria_index_start(root.as_ptr(), token.as_ptr(), std::ptr::null(), std::ptr::null());
-        assert_eq!(started.status, alexandria_ffi::INDEX_OK);
-
-        let dl = std::time::Instant::now() + ASYNC_RUN_DEADLINE;
-        loop {
-            if alexandria_index_count_files() >= 1 {
-                break;
-            }
-            if std::time::Instant::now() > dl {
-                panic!("ffi never persisted 1 file");
-            }
-            std::thread::sleep(std::time::Duration::from_millis(25));
-        }
-
-        let ffi_uuid = std::thread::spawn(move || -> String {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();
-            rt.block_on(async move {
-                let url = format!("sqlite://{ffi_db_for_uuid_lookup}");
-                let pool = sqlx::sqlite::SqlitePoolOptions::new()
-                    .max_connections(1)
-                    .connect(&format!("{url}?mode=rw"))
-                    .await
-                    .unwrap();
-
-                let dl = std::time::Instant::now() + ASYNC_RUN_DEADLINE;
-                loop {
-                    let row: Option<(Option<String>,)> = sqlx::query_as(
-                        "SELECT audio_files.title FROM audio_files                          JOIN files ON files.id = audio_files.file_id                          WHERE files.name = ?",
-                    )
-                    .bind("song.wav")
-                    .fetch_optional(&pool)
-                    .await
-                    .unwrap();
-                    if let Some((Some(title),)) = &row {
-                        if title == "Parity Title" {
-                            break;
-                        }
-                    }
-                    if std::time::Instant::now() > dl {
-                        panic!("ffi never wrote extracted audio title");
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-                }
-
-                let (uuid,): (String,) = sqlx::query_as("SELECT uuid FROM files WHERE name = ?")
-                    .bind("song.wav")
-                    .fetch_one(&pool)
-                    .await
-                    .unwrap();
-                uuid
-            })
-        })
-        .join()
-        .unwrap();
-
-        let uuid_c = CString::new(ffi_uuid).unwrap();
-        let result = alexandria_file_get_by_uuid(uuid_c.as_ptr(), token.as_ptr());
-        assert_eq!(result.status, alexandria_ffi::FILE_OK);
-        assert!(!result.json.is_null());
-        let json = unsafe { CStr::from_ptr(result.json) }
-            .to_str()
-            .unwrap()
-            .to_string();
-        unsafe {
-            alexandria_free_string(result.json);
-        }
-        json
-    })
-    .await
-    .unwrap();
-
-    let ffi_body: serde_json::Value = serde_json::from_str(&ffi_body).unwrap();
-
-    // ---- compare ----
-    // The six other fields still extracted and still agree...
-    assert_eq!(http_body["metadata"]["title"], "Parity Title");
-    assert_eq!(ffi_body["metadata"]["title"], "Parity Title");
-    // ...but neither surface has an albumArtist to report: omitted by
-    // `skip_serializing_if`, not present as an explicit `null`.
-    assert!(
-        http_body["metadata"].get("albumArtist").is_none(),
-        "no ALBUMARTIST/TPE2/aART tag written, http must report none"
-    );
-    assert!(
-        ffi_body["metadata"].get("albumArtist").is_none(),
-        "no ALBUMARTIST/TPE2/aART tag written, ffi must report none"
-    );
-}
-
 /// Encode a tiny real JPEG (4x3 pixels) using the `image` crate — a real,
 /// valid JPEG file, not hand-crafted bytes. Mirrors the identical helper in
 /// `alexandria-core`'s `catalog::image_tags` unit tests.
@@ -9844,9 +9382,7 @@ fn write_test_exif(path: &std::path::Path, width: u32, height: u32, description:
 /// non-NULL for the named file — proves both extraction writes landed
 /// (`IndexHandler`'s image branch commits dimensions and title as two
 /// separate sequential transactions), not just the first of the two, and
-/// not just that the file row exists (the audio slice's final review found
-/// and fixed exactly this race for its own parity test; this test extends
-/// that fix to cover every write it asserts on).
+/// not just that the file row exists.
 async fn wait_for_http_image_extraction(pool: &sqlx::sqlite::SqlitePool, name: &str) {
     let deadline = std::time::Instant::now() + ASYNC_RUN_DEADLINE;
     loop {
@@ -11055,126 +10591,6 @@ async fn given_same_image_when_thumbnailed_then_bytes_identical_across_surfaces(
     assert_eq!(std::fs::read_dir(ffi_cache.path()).unwrap().count(), 1);
 }
 
-/// Write a real, front-cover-typed JPEG picture onto an ID3v2 tag and save
-/// it to `path`. Mirrors `write_test_tags` above; a separate helper because
-/// that one writes the six textual tag fields and nothing else.
-fn write_cover_art(path: &std::path::Path, jpeg: &[u8]) {
-    use lofty::config::WriteOptions;
-    use lofty::picture::{MimeType, Picture, PictureType};
-    use lofty::tag::{Tag, TagExt, TagType};
-
-    let mut tag = Tag::new(TagType::Id3v2);
-    let picture = Picture::unchecked(jpeg.to_vec())
-        .pic_type(PictureType::CoverFront)
-        .mime_type(MimeType::Jpeg)
-        .build();
-    tag.push_picture(picture);
-    tag.save_to_path(path, WriteOptions::default())
-        .expect("save cover art tag");
-}
-
-/// UC-40 parity, issue #117 - thumbnail the same tagged audio file over both
-/// transports and assert the JPEG bytes are identical, HTTP raw against FFI
-/// base64 (Testing Specification section 7.3, FR-MP-05, FR-MP-06, NFR-09).
-/// Shares its shape with the image thumbnail parity test above; the only
-/// difference is the fixture and the file's catalog type, which is seeded
-/// directly (`seed_file_at_path`) rather than produced by indexing, the same
-/// shortcut the audio-tag-extraction parity test above it takes.
-#[tokio::test]
-async fn given_same_audio_file_when_thumbnailed_then_bytes_identical_across_surfaces() {
-    // Arrange — each leg gets its own cache directory: the default is the
-    // relative path "thumbnails", which would land in the repository.
-    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-
-    let cover = jpeg_bytes_for("audio-cover");
-
-    let http_lib = tempdir().unwrap();
-    let http_track = http_lib.path().join("song.wav");
-    write_minimal_wav(&http_track);
-    write_cover_art(&http_track, &cover);
-    let http_track = http_track.to_str().unwrap().to_string();
-
-    let ffi_lib = tempdir().unwrap();
-    let ffi_track = ffi_lib.path().join("song.wav");
-    write_minimal_wav(&ffi_track);
-    write_cover_art(&ffi_track, &cover);
-    let ffi_track = ffi_track.to_str().unwrap().to_string();
-
-    let http_cache = tempdir().unwrap();
-    let http_dir = tempdir().unwrap();
-    let http_pool = migrate_database(&db_path(&http_dir, "http.sqlite"))
-        .await
-        .expect("http migrate");
-    seed_session(&http_pool, TEST_TOKEN).await;
-    let settings = playback_settings(&http_cache);
-    let http_services = std::sync::Arc::new(build_services(&settings, http_pool.clone()).await);
-    let http_uuid = seed_file_at_path(&http_pool, "audio", &http_track).await;
-
-    let ffi_cache = tempdir().unwrap();
-    let _thumbnail_cache_guard = ThumbnailCacheGuard::new(&ffi_cache);
-    let ffi_dir = tempdir().unwrap();
-    let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
-    let ffi_pool = migrate_database(&ffi_db).await.expect("ffi migrate");
-    let ffi_uuid = seed_file_at_path(&ffi_pool, "audio", &ffi_track).await;
-    ffi_pool.close().await;
-
-    // Act
-    let req = Request::builder()
-        .method("GET")
-        .uri(format!("/v1/files/{http_uuid}/thumbnail"))
-        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
-        .body(Body::empty())
-        .unwrap();
-    let resp = app(settings.clone(), http_services)
-        .oneshot(req)
-        .await
-        .expect("http thumbnail");
-    assert_eq!(resp.status(), axum::http::StatusCode::OK);
-    let http_content_type = header_string(&resp, "content-type");
-    let http_body = to_bytes(resp.into_body(), usize::MAX)
-        .await
-        .unwrap()
-        .to_vec();
-
-    let ffi_thumb: serde_json::Value = tokio::task::spawn_blocking(move || -> serde_json::Value {
-        let cdb = CString::new(ffi_db).unwrap();
-        assert_eq!(
-            alexandria_index_init(cdb.as_ptr()),
-            alexandria_ffi::INDEX_OK
-        );
-
-        let token = CString::new(TEST_TOKEN).unwrap();
-        let uuid_c = CString::new(ffi_uuid).unwrap();
-        let r = alexandria_file_thumbnail(uuid_c.as_ptr(), token.as_ptr());
-        assert_eq!(r.status, alexandria_ffi::PLAYBACK_OK, "ffi thumbnail");
-        assert!(!r.json.is_null());
-        let s = unsafe { CStr::from_ptr(r.json) }
-            .to_string_lossy()
-            .into_owned();
-        unsafe {
-            alexandria_free_string(r.json);
-        }
-        serde_json::from_str(&s).unwrap()
-    })
-    .await
-    .unwrap();
-
-    // Assert — both surfaces read the same embedded picture through the
-    // same `LoftyCoverArtReader`, so the JPEG bytes must agree exactly.
-    use base64::Engine;
-    let ffi_bytes = base64::engine::general_purpose::STANDARD
-        .decode(ffi_thumb["bytesBase64"].as_str().expect("bytesBase64"))
-        .expect("decode base64");
-    assert_eq!(ffi_bytes, http_body, "audio thumbnail bytes identical");
-    assert_eq!(ffi_thumb["mimeType"], http_content_type);
-    assert_eq!(ffi_thumb["mimeType"], "image/jpeg");
-    // The re-encoded thumbnail decodes back to the same 4x4 pixels the
-    // embedded cover was built from — the downscale-and-encode pipeline ran
-    // on the actual extracted picture, not on some other source.
-    let decoded = image::load_from_memory(&http_body).expect("valid jpeg");
-    assert_eq!((decoded.width(), decoded.height()), (4, 4));
-}
-
 /// Playback error parity - every row of F-10's error table decides the same
 /// way on both surfaces (Testing Specification section 7.3, FR-MP-06,
 /// NFR-09).
@@ -12130,7 +11546,7 @@ async fn given_the_same_settings_when_read_via_http_and_ffi_then_bodies_identica
 /// `alexandria-ffi/tests/smoke.rs`'s `write_library`.
 fn write_library(dir: &std::path::Path, count: usize) {
     for i in 0..count {
-        std::fs::write(dir.join(format!("track-{i}.mp3")), b"audio bytes").unwrap();
+        std::fs::write(dir.join(format!("track-{i}.txt")), b"text bytes").unwrap();
     }
 }
 
@@ -13069,7 +12485,7 @@ async fn given_low_priority_when_started_via_http_and_ffi_then_both_spell_it_the
         std::sync::Arc::new(build_services(&local_settings(), http_pool.clone()).await);
 
     let http_lib = tempdir().unwrap();
-    std::fs::write(http_lib.path().join("song.mp3"), b"audio bytes").unwrap();
+    std::fs::write(http_lib.path().join("memo.txt"), b"text bytes").unwrap();
 
     let request = Request::builder()
         .method("POST")
@@ -13100,7 +12516,7 @@ async fn given_low_priority_when_started_via_http_and_ffi_then_both_spell_it_the
     let ffi_dir = tempdir().unwrap();
     let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
     let ffi_lib = tempdir().unwrap();
-    std::fs::write(ffi_lib.path().join("song.mp3"), b"audio bytes").unwrap();
+    std::fs::write(ffi_lib.path().join("memo.txt"), b"text bytes").unwrap();
     let ffi_lib_path = ffi_lib.path().to_str().unwrap().to_string();
     let ffi_db_for_check = ffi_db.clone();
 
@@ -13162,15 +12578,15 @@ async fn given_low_priority_when_started_via_http_and_ffi_then_both_spell_it_the
 /// string on the FFI — so the only thing that can be compared is what each
 /// one *did* with it, which is the set of files it catalogued.
 ///
-/// Both legs index the same two-file library (a FLAC and its cover art)
-/// scoped to `audio`. The payload deliberately carries a type each leg must
+/// Both legs index the same two-file library (a note and a picture) scoped
+/// to `text`. The payload deliberately carries a type each leg must
 /// exclude: a transport that dropped the scope on the floor would catalogue
-/// `cover.jpg` and fail here, which a scope naming every present type could
+/// `cover.png` and fail here, which a scope naming every present type could
 /// never detect. Each leg's own list is asserted as well as the two against
 /// each other, so a run that indexed nothing at all cannot pass by agreeing
 /// with a run that did the same.
 #[tokio::test]
-async fn given_an_audio_scope_when_started_via_http_and_ffi_then_both_catalog_only_the_audio() {
+async fn given_a_text_scope_when_started_via_http_and_ffi_then_both_catalog_only_the_text() {
     let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
     // ---- HTTP leg ----
@@ -13182,8 +12598,8 @@ async fn given_an_audio_scope_when_started_via_http_and_ffi_then_both_catalog_on
         std::sync::Arc::new(build_services(&local_settings(), http_pool.clone()).await);
 
     let http_lib = tempdir().unwrap();
-    std::fs::write(http_lib.path().join("song.flac"), b"audio-bytes").unwrap();
-    std::fs::write(http_lib.path().join("cover.jpg"), b"image-bytes").unwrap();
+    std::fs::write(http_lib.path().join("memo.txt"), b"text-bytes").unwrap();
+    std::fs::write(http_lib.path().join("cover.png"), b"image-bytes").unwrap();
 
     let request = Request::builder()
         .method("POST")
@@ -13191,7 +12607,7 @@ async fn given_an_audio_scope_when_started_via_http_and_ffi_then_both_catalog_on
         .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .header("content-type", "application/json")
         .body(Body::from(
-            json!({ "root": http_lib.path().to_str().unwrap(), "types": ["audio"] }).to_string(),
+            json!({ "root": http_lib.path().to_str().unwrap(), "types": ["text"] }).to_string(),
         ))
         .unwrap();
     let response = app(Settings::default(), http_services.clone())
@@ -13220,8 +12636,8 @@ async fn given_an_audio_scope_when_started_via_http_and_ffi_then_both_catalog_on
     let ffi_dir = tempdir().unwrap();
     let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
     let ffi_lib = tempdir().unwrap();
-    std::fs::write(ffi_lib.path().join("song.flac"), b"audio-bytes").unwrap();
-    std::fs::write(ffi_lib.path().join("cover.jpg"), b"image-bytes").unwrap();
+    std::fs::write(ffi_lib.path().join("memo.txt"), b"text-bytes").unwrap();
+    std::fs::write(ffi_lib.path().join("cover.png"), b"image-bytes").unwrap();
     let ffi_lib_path = ffi_lib.path().to_str().unwrap().to_string();
 
     let ffi_json = tokio::task::spawn_blocking(move || -> String {
@@ -13233,7 +12649,7 @@ async fn given_an_audio_scope_when_started_via_http_and_ffi_then_both_catalog_on
 
         let root = CString::new(ffi_lib_path).unwrap();
         let token = CString::new(TEST_TOKEN).unwrap();
-        let types = CString::new("audio").unwrap();
+        let types = CString::new("text").unwrap();
         let started = alexandria_index_start(
             root.as_ptr(),
             token.as_ptr(),
@@ -13268,13 +12684,13 @@ async fn given_an_audio_scope_when_started_via_http_and_ffi_then_both_catalog_on
     // ---- compare (two independent legs, same scope) ----
     assert_eq!(
         http_names,
-        vec!["song.flac".to_string()],
-        "http scoped to audio must catalog the FLAC and not the cover art"
+        vec!["memo.txt".to_string()],
+        "http scoped to text must catalog the note and not the picture"
     );
     assert_eq!(
         ffi_names,
-        vec!["song.flac".to_string()],
-        "ffi scoped to audio must catalog the FLAC and not the cover art"
+        vec!["memo.txt".to_string()],
+        "ffi scoped to text must catalog the note and not the picture"
     );
     assert_eq!(
         http_names, ffi_names,

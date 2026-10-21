@@ -8,7 +8,6 @@ use crate::catalog::model::FileType;
 ///
 /// | type     | extensions |
 /// | ---     | --- |
-/// | audio   | mp3, flac, wav, ogg, oga, m4a, aac, opus, wma |
 /// | video   | mp4, m4v, mkv, avi, mov, webm, mpg, mpeg, wmv, flv |
 /// | html    | html, htm, mhtml |
 /// | text    | md, markdown, txt |
@@ -22,7 +21,6 @@ pub fn classify_by_extension(name: &str) -> Option<FileType> {
         .map(|e| e.to_ascii_lowercase())?;
 
     Some(match ext.as_str() {
-        "mp3" | "flac" | "wav" | "ogg" | "oga" | "m4a" | "aac" | "opus" | "wma" => FileType::Audio,
         "mp4" | "m4v" | "mkv" | "avi" | "mov" | "webm" | "mpg" | "mpeg" | "wmv" | "flv" => {
             FileType::Video
         }
@@ -40,15 +38,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn given_audio_extension_when_classify_then_audio_case_insensitive() {
-        assert_eq!(classify_by_extension("song.mp3"), Some(FileType::Audio));
-        assert_eq!(classify_by_extension("song.FLAC"), Some(FileType::Audio));
-        assert_eq!(classify_by_extension("track.WAV"), Some(FileType::Audio));
-    }
-
-    #[test]
     fn given_all_supported_types_when_classify_then_mapped() {
-        assert_eq!(classify_by_extension("a.mp3"), Some(FileType::Audio));
         assert_eq!(classify_by_extension("a.mp4"), Some(FileType::Video));
         assert_eq!(classify_by_extension("a.html"), Some(FileType::Html));
         assert_eq!(classify_by_extension("a.md"), Some(FileType::Text));
@@ -61,6 +51,15 @@ mod tests {
     fn given_pdf_cbr_mapping_when_classify_then_pdf_is_document_and_cbr_is_comic() {
         assert_eq!(classify_by_extension("book.pdf"), Some(FileType::Document));
         assert_eq!(classify_by_extension("comic.cbr"), Some(FileType::Comic));
+    }
+
+    #[test]
+    fn given_an_audio_extension_when_classified_then_it_is_unrecognised() {
+        for ext in [
+            "mp3", "flac", "wav", "ogg", "oga", "m4a", "aac", "opus", "wma",
+        ] {
+            assert_eq!(classify_by_extension(&format!("a.{ext}")), None);
+        }
     }
 
     #[test]

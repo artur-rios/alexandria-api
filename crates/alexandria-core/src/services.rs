@@ -21,7 +21,6 @@ use crate::bookmarks::commands::purge::PurgeBookmarkHandler;
 use crate::bookmarks::commands::update::UpdateBookmarkHandler;
 use crate::bookmarks::queries::browse::BrowseBookmarksHandler;
 use crate::bookmarks::repos::SqliteBookmarkRepository;
-use crate::catalog::audio_tags::{LoftyAudioMetadataReader, LoftyCoverArtReader};
 use crate::catalog::clock::{Clock, SystemClock};
 use crate::catalog::comic_tags::CbzComicMetadataReader;
 use crate::catalog::commands::edit_content::EditTextFileContentHandler;
@@ -90,7 +89,6 @@ pub type DefaultIndexHandler = IndexHandler<
     SqliteCatalogRepository,
     StdFilesystem,
     SystemClock,
-    LoftyAudioMetadataReader,
     ExifImageMetadataReader,
     PdfEpubMetadataReader,
     FfmpegVideoMetadataReader,
@@ -104,7 +102,6 @@ pub type DefaultRefreshHandler = RefreshHandler<
     StdFilesystem,
     SystemClock,
     SqliteCatalogRunRepository,
-    LoftyAudioMetadataReader,
     ExifImageMetadataReader,
     PdfEpubMetadataReader,
     FfmpegVideoMetadataReader,
@@ -163,7 +160,6 @@ pub type DefaultThumbnailHandler = ThumbnailHandler<
     ZipComicArchive,
     ImageThumbnailRenderer,
     DiskThumbnailCache,
-    LoftyCoverArtReader,
 >;
 
 pub type DefaultCreateCollectionHandler =
@@ -435,7 +431,6 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
             RuntimeAuthService::Windows(LocalAuthService::new(session_repo.clone(), clock))
         }
     };
-    let audio_tags = LoftyAudioMetadataReader;
     let image_tags = ExifImageMetadataReader;
     let document_tags = PdfEpubMetadataReader;
     let video_tags = FfmpegVideoMetadataReader;
@@ -478,7 +473,6 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         repo.clone(),
         fs,
         clock,
-        audio_tags,
         image_tags,
         document_tags,
         video_tags,
@@ -497,7 +491,6 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         // The same readers the index uses: a refresh that re-read a file
         // differently from the run that first catalogued it would fill the
         // gaps with a second opinion.
-        audio_tags,
         image_tags,
         document_tags,
         video_tags,
@@ -599,11 +592,6 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         ZipComicArchive,
         ImageThumbnailRenderer,
         DiskThumbnailCache::new(settings.playback.thumbnail_cache_dir.clone()),
-        // Beside `audio_tags` (`LoftyAudioMetadataReader`), the reader it
-        // sits next to: both are lofty-backed reads of the same tagged
-        // file, at two different times for two different reasons (see
-        // `CoverArtReader`'s own doc comment).
-        LoftyCoverArtReader,
         library_root.clone(),
     ));
     let create_collection_handler = Arc::new(CreateCollectionHandler::new(

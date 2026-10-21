@@ -23,8 +23,8 @@ use sqlx::sqlite::SqlitePool;
 use uuid::Uuid;
 
 use crate::common::{
-    FakeAudioMetadataReader, FakeAuth, FakeComicMetadataReader, FakeDocumentMetadataReader,
-    FakeImageMetadataReader, FakeVideoMetadataReader,
+    FakeAuth, FakeComicMetadataReader, FakeDocumentMetadataReader, FakeImageMetadataReader,
+    FakeVideoMetadataReader,
 };
 
 /// A course on disk: files at the top, files a level down, and one deeper
@@ -36,7 +36,7 @@ fn course(dir: &std::path::Path) -> std::path::PathBuf {
     std::fs::create_dir_all(root.join("class-02")).expect("mkdir");
 
     for (path, bytes) in [
-        (root.join("intro.mp3"), &b"audio"[..]),
+        (root.join("intro.txt"), &b"notes"[..]),
         (root.join("syllabus.pdf"), &b"%PDF-1.4"[..]),
         (root.join("class-01/lecture.mp4"), &b"video"[..]),
         (root.join("class-01/handout.pdf"), &b"%PDF-1.4"[..]),
@@ -64,7 +64,6 @@ async fn index(pool: &SqlitePool, root: &str) {
         SqliteCatalogRepository::new(pool.clone()),
         StdFilesystem,
         SystemClock,
-        FakeAudioMetadataReader::new(),
         FakeImageMetadataReader::new(),
         FakeDocumentMetadataReader::new(),
         FakeVideoMetadataReader::new(),
@@ -128,7 +127,7 @@ async fn given_a_library_made_before_the_walk_when_browsed_then_it_holds_what_wa
     );
     assert_eq!(
         names(&top),
-        vec!["intro.mp3", "syllabus.pdf"],
+        vec!["intro.txt", "syllabus.pdf"],
         "the files at the top, and only those"
     );
 
@@ -168,7 +167,7 @@ async fn given_a_library_made_after_the_walk_when_browsed_then_it_claims_what_is
     let uuid = register(&pool, root).await;
 
     let top = browse(&pool, uuid, "").await;
-    assert_eq!(names(&top), vec!["intro.mp3", "syllabus.pdf"]);
+    assert_eq!(names(&top), vec!["intro.txt", "syllabus.pdf"]);
     assert_eq!(browse(&pool, uuid, "class-01").await.files.len(), 2);
 }
 

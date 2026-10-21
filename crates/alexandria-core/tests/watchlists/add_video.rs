@@ -86,12 +86,12 @@ async fn given_non_video_file_when_add_then_invalid_input() {
     let watchlist_repo = FakeWatchlistRepository::new();
     let catalog_repo = FakeCatalogRepository::new();
     let watchlist_uuid = seeded_watchlist(&watchlist_repo).await;
-    let audio = existing_file("/audio/a.mp3", FileType::Audio);
-    let audio_uuid = audio.uuid;
-    catalog_repo.seed(audio);
+    let notes = existing_file("/notes/a.txt", FileType::Text);
+    let notes_uuid = notes.uuid;
+    catalog_repo.seed(notes);
     let h = handler(FakeAuth::Allowing, watchlist_repo, catalog_repo);
 
-    let result = h.add(watchlist_uuid, audio_uuid, TOKEN).await;
+    let result = h.add(watchlist_uuid, notes_uuid, TOKEN).await;
 
     assert!(matches!(result, Err(DomainError::InvalidInput(_))));
 }

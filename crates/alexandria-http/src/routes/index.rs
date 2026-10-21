@@ -22,7 +22,7 @@ pub struct IndexBody {
     #[serde(default, deserialize_with = "deserialize_priority")]
     pub priority: RunPriority,
     /// The file types this run records — the wire names `FileType` reads back
-    /// (`"audio"`, `"video"`, …) — the same words the FFI surface's
+    /// (`"video"`, `"text"`, …) — the same words the FFI surface's
     /// comma-separated `types` list carries (FR-FC-24). Absent and `[]` both
     /// mean every type; an unrecognised name is a `400`.
     ///

@@ -27,8 +27,8 @@ async fn given_known_vectors_when_hashed_then_matches_published_sha256() {
         "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
     );
     assert_eq!(
-        hash_of(b"audio bytes").await,
-        "ef71589075ccf9332917b0d8d711d1a8d205560f96842f9221de70e6c29454e0"
+        hash_of(b"text bytes").await,
+        "048d5a746847ce7ea63d01d9891d3e00aaf1becc7ed1d325e5a4c8cf48bfa485"
     );
 }
 

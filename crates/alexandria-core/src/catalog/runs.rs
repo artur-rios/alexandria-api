@@ -276,7 +276,7 @@ pub trait CatalogRunRepository: Send + Sync {
     /// instead of falling back to whatever the configuration says later.
     ///
     /// `scope` is the run's file types as one comma-separated list of wire
-    /// names (`"audio,image"`) — exactly what [`IndexScope::to_wire`]
+    /// names (`"video,image"`) — exactly what [`IndexScope::to_wire`]
     /// produces, and exactly what `row_to_run` reads back. `None` is every
     /// type, and is also what a refresh passes: it discovers through the
     /// catalog rather than through a walk, so it has nothing to scope.

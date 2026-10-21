@@ -19,7 +19,7 @@ pub struct IndexScope {
     /// `None` is every type, not an empty selection — see the type's own doc
     /// comment. `Vec` rather than a set: a scope holds at most one entry per
     /// `FileType` and is read once per scanned file, so the linear scan is
-    /// over seven elements at worst and needs no hashing to beat.
+    /// over six elements at worst and needs no hashing to beat.
     types: Option<Vec<FileType>>,
 }
 
@@ -38,7 +38,7 @@ impl IndexScope {
     /// *opposite* of what a caller asking for a narrower scope wants, and it
     /// fails in the direction of cataloguing exactly the files the owner
     /// meant to exclude. Better the caller learns at the call than discovers
-    /// it in a library full of cover art.
+    /// it in a library full of files it never asked for.
     ///
     /// An empty list is [`IndexScope::all`], for the reason absent is. Blank
     /// names are dropped rather than refused: they are what a trailing
@@ -57,8 +57,8 @@ impl IndexScope {
             }
             let file_type = FileType::from_wire(name).ok_or_else(|| {
                 DomainError::InvalidInput(format!(
-                    "unknown file type {name:?}; expected one of audio, video, html, text, \
-                     document, comic, image"
+                    "unknown file type {name:?}; expected one of video, html, text, document, \
+                     comic, image"
                 ))
             })?;
             // Deduplicated so a scope that names a type twice reads the same
@@ -86,7 +86,7 @@ impl IndexScope {
     }
 
     /// The scope as the one comma-separated string `catalog_runs.scope`
-    /// stores — `"audio"`, `"audio,image"` — or `None` for every type, which
+    /// stores — `"video"`, `"video,image"` — or `None` for every type, which
     /// is that column's NULL.
     ///
     /// `None` rather than an empty string on purpose: NULL is what a row
@@ -121,15 +121,15 @@ mod tests {
         let scope = IndexScope::parse(Vec::<String>::new()).expect("parse");
 
         assert_eq!(scope, IndexScope::all());
-        assert!(scope.includes(FileType::Audio));
+        assert!(scope.includes(FileType::Video));
         assert!(scope.includes(FileType::Image));
     }
 
     #[test]
     fn given_one_name_when_parsed_then_only_that_type_is_included() {
-        let scope = IndexScope::parse(["audio"]).expect("parse");
+        let scope = IndexScope::parse(["text"]).expect("parse");
 
-        assert!(scope.includes(FileType::Audio));
+        assert!(scope.includes(FileType::Text));
         assert!(!scope.includes(FileType::Image));
         assert!(!scope.includes(FileType::Video));
     }
@@ -137,7 +137,6 @@ mod tests {
     #[test]
     fn given_every_wire_name_when_parsed_then_it_maps_to_its_type() {
         for file_type in [
-            FileType::Audio,
             FileType::Video,
             FileType::Html,
             FileType::Text,
@@ -156,17 +155,25 @@ mod tests {
 
     #[test]
     fn given_an_unknown_name_when_parsed_then_invalid_input() {
-        let result = IndexScope::parse(["audio", "sculpture"]);
+        let result = IndexScope::parse(["text", "sculpture"]);
 
         assert!(matches!(result, Err(DomainError::InvalidInput(_))));
     }
 
     #[test]
-    fn given_blank_names_when_parsed_then_they_are_dropped() {
-        let scope = IndexScope::parse(["audio", "", "  "]).expect("parse");
+    fn given_audio_in_a_scope_when_parsed_then_it_is_rejected() {
+        assert!(matches!(
+            IndexScope::parse_list("audio"),
+            Err(DomainError::InvalidInput(_))
+        ));
+    }
 
-        assert!(scope.includes(FileType::Audio));
-        assert!(!scope.includes(FileType::Text));
+    #[test]
+    fn given_blank_names_when_parsed_then_they_are_dropped() {
+        let scope = IndexScope::parse(["text", "", "  "]).expect("parse");
+
+        assert!(scope.includes(FileType::Text));
+        assert!(!scope.includes(FileType::Image));
     }
 
     /// The column and the FFI argument share one encoding, so what is written
@@ -174,11 +181,11 @@ mod tests {
     /// start never asked for.
     #[test]
     fn given_a_scope_when_written_to_wire_then_it_parses_back_the_same() {
-        let scope = IndexScope::parse(["audio", "image"]).expect("parse");
+        let scope = IndexScope::parse(["text", "image"]).expect("parse");
 
         let wire = scope.to_wire().expect("a narrowed scope has a wire form");
 
-        assert_eq!(wire, "audio,image");
+        assert_eq!(wire, "text,image");
         assert_eq!(IndexScope::parse_list(&wire).expect("parse back"), scope);
     }
 
@@ -189,8 +196,8 @@ mod tests {
 
     #[test]
     fn given_a_repeated_name_when_parsed_then_it_reads_as_one() {
-        let scope = IndexScope::parse(["audio", "audio"]).expect("parse");
+        let scope = IndexScope::parse(["image", "image"]).expect("parse");
 
-        assert_eq!(scope, IndexScope::parse(["audio"]).expect("parse"));
+        assert_eq!(scope, IndexScope::parse(["image"]).expect("parse"));
     }
 }

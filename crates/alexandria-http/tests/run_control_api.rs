@@ -131,7 +131,7 @@ async fn run_status_json(router: &axum::Router, run_id: &str) -> (StatusCode, Va
 /// Mirrors `alexandria-ffi/tests/smoke.rs`'s `write_library`.
 fn write_library(dir: &tempfile::TempDir, count: usize) {
     for i in 0..count {
-        write_file(dir, &format!("track-{i}.mp3"), b"audio bytes");
+        write_file(dir, &format!("track-{i}.txt"), b"text bytes");
     }
 }
 
@@ -395,7 +395,7 @@ async fn given_a_completed_run_when_paused_then_409() {
     let test = test_app().await;
     let router = app(Settings::default(), test.services.clone());
     let lib = tempfile::tempdir().unwrap();
-    write_file(&lib, "song.mp3", b"audio");
+    write_file(&lib, "memo.txt", b"text");
 
     let run_id = start_index(&router, lib.path().to_str().unwrap()).await;
     let body = wait_for_run_terminal(&test.services, &run_id, TEST_TOKEN).await;
@@ -591,7 +591,7 @@ async fn given_runs_in_every_state_when_active_ones_are_requested_then_only_thos
 
     // complete
     let complete_lib = tempfile::tempdir().unwrap();
-    write_file(&complete_lib, "song.mp3", b"audio");
+    write_file(&complete_lib, "memo.txt", b"text");
     let complete_id = start_index(&router, complete_lib.path().to_str().unwrap()).await;
     assert_eq!(
         wait_for_run_terminal(&test.services, &complete_id, TEST_TOKEN)
@@ -758,7 +758,7 @@ async fn given_low_priority_when_index_started_then_run_recorded_at_low_concurre
     let test = test_app().await;
     let router = app(Settings::default(), test.services.clone());
     let lib = tempfile::tempdir().unwrap();
-    write_file(&lib, "song.mp3", b"audio");
+    write_file(&lib, "memo.txt", b"text");
 
     let response = router
         .oneshot(index_request(lib.path().to_str().unwrap(), Some("low")))
@@ -787,7 +787,7 @@ async fn given_garbage_priority_when_index_started_then_falls_back_to_normal_con
     let test = test_app().await;
     let router = app(Settings::default(), test.services.clone());
     let lib = tempfile::tempdir().unwrap();
-    write_file(&lib, "song.mp3", b"audio");
+    write_file(&lib, "memo.txt", b"text");
 
     let response = router
         .oneshot(index_request(
