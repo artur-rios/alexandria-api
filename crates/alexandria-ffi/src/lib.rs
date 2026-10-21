@@ -4422,9 +4422,7 @@ fn map_auth_err(err: DomainError) -> AuthJsonResult {
         DomainError::Config(_) => AUTH_ERR_CONFIG,
         DomainError::Conflict(_) => AUTH_ERR_CONFLICT,
         DomainError::TooManyRequests(_) => AUTH_ERR_RATE_LIMITED,
-        DomainError::ServiceUnavailable(_) | DomainError::Unavailable(_) => {
-            AUTH_ERR_SERVICE_UNAVAILABLE
-        }
+        DomainError::Unavailable(_) => AUTH_ERR_SERVICE_UNAVAILABLE,
         _ => AUTH_ERR_OTHER,
     };
     let (_, body) = error_body(&err);

@@ -62,14 +62,8 @@ pub enum DomainError {
     /// submitted bytes, even after one retry (UC-33 AF-03).
     #[error("integrity error: {0}")]
     Integrity(String),
-    /// A required external dependency could not be reached. Carries no reason
-    /// code, and its message is deliberately not echoed — which of an
-    /// installation's dependencies is down is not a caller's business.
-    #[error("service unavailable: {0}")]
-    ServiceUnavailable(String),
-    /// A dependency is unavailable for a reason the caller *does* need to
-    /// know. Stands to `ServiceUnavailable` exactly as `Rejected` stands to
-    /// `InvalidInput`: same class, plus a stable code.
+    /// A required external dependency is unavailable for a reason the caller
+    /// needs to know, carried as a stable code.
     #[error("service unavailable: {0}")]
     Unavailable(Rejection),
     /// A request refused because it came too soon after some earlier one —
@@ -269,10 +263,6 @@ pub fn error_body(err: &DomainError) -> (ErrorClass, ErrorBody) {
         DomainError::Conflict(msg) => (ErrorClass::Conflict, ErrorBody::plain(msg)),
         DomainError::Disk(_) => (ErrorClass::Internal, ErrorBody::plain("disk error")),
         DomainError::Integrity(_) => (ErrorClass::Internal, ErrorBody::plain("integrity error")),
-        DomainError::ServiceUnavailable(_) => (
-            ErrorClass::ServiceUnavailable,
-            ErrorBody::plain("service unavailable"),
-        ),
         DomainError::Unavailable(rejection) => (
             ErrorClass::ServiceUnavailable,
             ErrorBody {
