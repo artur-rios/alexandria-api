@@ -470,6 +470,45 @@ async fn given_a_media_kind_the_owner_set_when_filled_then_it_survives() {
     );
 }
 
+/// The stamp is what stops the repair from running for the life of the
+/// library: a row is re-read once, and then never again. Pinned against a
+/// real migrated SQLite database, so the `metadata_version` column and its
+/// mapping in the row reader are exercised rather than a fake's field.
+#[tokio::test]
+async fn given_a_stamped_row_when_read_back_then_it_carries_the_version() {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .expect("connect");
+    run_migrations(&pool).await.expect("migrate");
+    let repo = SqliteCatalogRepository::new(pool);
+    let uuid = Uuid::new_v4();
+    repo.insert_file(NewFile {
+        uuid,
+        path: "/library/stamped.mkv".to_string(),
+        name: "stamped.mkv".to_string(),
+        file_type: FileType::Video,
+        content_hash: None,
+        size_bytes: None,
+        mtime: None,
+        indexed_at: chrono::Utc::now(),
+    })
+    .await
+    .expect("insert file");
+
+    let before = repo.find_by_uuid(uuid).await.expect("read").expect("file");
+    assert_eq!(
+        before.metadata_version, 0,
+        "a fresh row is behind until extraction has actually run"
+    );
+
+    repo.set_metadata_version(uuid, 7).await.expect("stamp");
+
+    let after = repo.find_by_uuid(uuid).await.expect("read").expect("file");
+    assert_eq!(after.metadata_version, 7);
+}
+
 // ---------------- Stat comparison (Task 4 / FR-FC-10) ----------------
 
 #[tokio::test]
