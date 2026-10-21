@@ -297,7 +297,7 @@ fn parse_resume_priority(raw: Option<String>) -> Option<RunPriority> {
     }
 }
 
-/// This core's version, as a NUL-terminated string such as `"0.4.0"`.
+/// This core's version, as a NUL-terminated string such as `"0.5.0"`.
 ///
 /// The pointer is to static storage owned by the library: it stays valid for
 /// the life of the process and must **not** be passed to

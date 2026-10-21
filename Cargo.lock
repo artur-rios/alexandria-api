@@ -30,7 +30,7 @@ dependencies = [
 
 [[package]]
 name = "alexandria-core"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "argon2",
@@ -63,7 +63,7 @@ dependencies = [
 
 [[package]]
 name = "alexandria-ffi"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "alexandria-core",
  "alexandria-http",
@@ -87,7 +87,7 @@ dependencies = [
 
 [[package]]
 name = "alexandria-http"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "alexandria-core",
  "anyhow",
