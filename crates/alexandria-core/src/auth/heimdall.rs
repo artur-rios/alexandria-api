@@ -1,19 +1,26 @@
 //! External-mode authentication against Heimdall (UC-36 / FR-AU-02, FR-AU-03).
 //!
-//! Heimdall signs its tokens HS256 with a secret held in its own environment,
-//! publishes no key set and no introspection endpoint, and deliberately writes
-//! no `kid`. Verification is therefore offline, against the same secret,
-//! configured here — which means no network call on any request path, and no
-//! dependency on Heimdall being reachable for Alexandria to authenticate.
+//! Heimdall signs its tokens ES256 and publishes the public keys at
+//! `/.well-known/jwks.json`, naming the signing key in each token's `kid`.
+//! Alexandria verifies against that key set (`auth::jwks`), fetched and cached
+//! rather than asked for per request: a cached key verifies with no network
+//! call, and Heimdall being briefly unreachable does not stop authentication.
+//!
+//! Heimdall used to sign HS256 with a shared secret, and accepts tokens signed
+//! that way for an overlap after it moves. Alexandria does the same while the
+//! secret is still configured here, and refuses them once it is removed — no
+//! code change, only configuration.
 //!
 //! See `docs/superpowers/specs/2026-08-17-heimdall-external-auth-design.md`.
 
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
 use serde::Deserialize;
 use uuid::Uuid;
 
+use crate::auth::jwks::JwksCache;
 use crate::auth::{AuthService, Principal};
 use crate::config::{AuthMode, AuthSettings};
 use crate::errors::DomainError;
@@ -41,19 +48,20 @@ struct HeimdallClaims {
     mfa_pending: Option<String>,
 }
 
-/// Verifies Heimdall-issued JWTs offline and authenticates their holder as the
-/// owner when they belong to the configured scope.
+/// Verifies Heimdall-issued JWTs and authenticates their holder as the owner
+/// when they belong to the configured scope.
 ///
-/// Holds everything the decision needs, resolved once at startup. There is no
-/// type parameter and no collaborator because there is nothing to call: the
-/// whole decision is a function of the token and this configuration, which is
-/// what makes it testable without a double.
+/// Holds everything the decision needs, resolved once at startup, apart from
+/// Heimdall's public keys, which the key set cache fetches when it needs to.
 #[derive(Clone)]
 pub struct HeimdallAuthService {
-    /// The keys a signature may verify against: the current secret, then the
-    /// previous one while a rotation is in flight. Empty when unconfigured,
-    /// in which case nothing verifies.
-    keys: Vec<DecodingKey>,
+    /// Heimdall's ES256 keys. `None` when no key set URL is configured, in
+    /// which case no ES256 token verifies.
+    key_set: Option<Arc<JwksCache>>,
+    /// The HS256 secrets of the overlap: the current one, then the previous
+    /// one while a rotation was in flight. Empty once they are removed from
+    /// the configuration, in which case no HS256 token verifies.
+    secrets: Vec<DecodingKey>,
     /// The scope a token must name. `None` when unconfigured or unparseable,
     /// in which case no token is accepted.
     scope_id: Option<Uuid>,
@@ -70,28 +78,39 @@ impl HeimdallAuthService {
     /// `Settings::default()`, say — gets a service with no key and no scope,
     /// which refuses every token. Defence in depth; never a silent pass.
     pub fn from_settings(settings: &AuthSettings) -> Self {
-        let mut keys = Vec::new();
+        let url = settings.heimdall_jwks_url.trim();
+        let key_set = (!url.is_empty()).then(|| JwksCache::over_http(url));
+        Self::with_key_set(settings, key_set)
+    }
+
+    /// As [`HeimdallAuthService::from_settings`], with the key set given
+    /// rather than fetched from the configured URL — how the tests supply
+    /// Heimdall's keys.
+    pub(crate) fn with_key_set(settings: &AuthSettings, key_set: Option<JwksCache>) -> Self {
+        let mut secrets = Vec::new();
         let current = settings.heimdall_token_secret.expose().trim();
         if !current.is_empty() {
-            keys.push(DecodingKey::from_secret(current.as_bytes()));
+            secrets.push(DecodingKey::from_secret(current.as_bytes()));
         }
         let previous = settings.heimdall_token_secret_previous.expose().trim();
         // Heimdall ignores a previous secret equal to the current one, and so
         // does this: the same value under two names is not a rotation.
         if !previous.is_empty() && previous != current {
-            keys.push(DecodingKey::from_secret(previous.as_bytes()));
+            secrets.push(DecodingKey::from_secret(previous.as_bytes()));
         }
 
         Self {
-            keys,
+            key_set: key_set.map(Arc::new),
+            secrets,
             scope_id: Uuid::parse_str(settings.heimdall_scope_id.trim()).ok(),
             issuer: non_empty(&settings.heimdall_issuer),
             audience: non_empty(&settings.heimdall_audience),
         }
     }
 
-    /// The validation rules, built per call because `Validation` is not
-    /// `Clone` and building it is a handful of field writes.
+    /// The validation rules for one algorithm, built per call because
+    /// `Validation` is not `Clone` and building it is a handful of field
+    /// writes.
     ///
     /// Every field is set explicitly rather than left to the library's
     /// defaults. `validate_nbf` in particular is *off* by default, and the
@@ -104,8 +123,8 @@ impl HeimdallAuthService {
     /// `required_spec_claims` would let a token that omits it slip past
     /// unchecked, which defeats the point of configuring it at all. So each
     /// claim is required exactly when the matching setting is configured.
-    fn validation(&self) -> Validation {
-        let mut validation = Validation::new(Algorithm::HS256);
+    fn validation(&self, algorithm: Algorithm) -> Validation {
+        let mut validation = Validation::new(algorithm);
         validation.validate_exp = true;
         validation.validate_nbf = true;
         // `exp` is always required. `iss`/`aud` join it only when configured,
@@ -207,26 +226,35 @@ impl AuthService for HeimdallAuthService {
             return Err(DomainError::Unauthorized);
         }
 
-        // The algorithm comes from configuration, never from the token's own
-        // header. Trusting the header is the JWT algorithm-confusion attack:
-        // `none` asks to skip verification, and an asymmetric `alg` invites a
-        // public key to be accepted as an HMAC secret. Heimdall writes no
-        // `kid`, so there is no key selection to attack on top of that.
+        // The header picks which of two fixed paths a token takes, and each
+        // path pins both its algorithm and where its keys come from: an ES256
+        // token verifies only against Heimdall's published EC keys, an HS256
+        // one only against a configured secret. So the header can never choose
+        // the key type — the JWT algorithm-confusion attack, in which a public
+        // key is accepted as an HMAC secret, has no key to work with. Any
+        // other algorithm, `none` included, is refused outright.
         let header = decode_header(token).map_err(|_| DomainError::Unauthorized)?;
-        if header.alg != Algorithm::HS256 {
-            return Err(DomainError::Unauthorized);
-        }
-
-        // Each configured key in turn: the current secret, then the previous
-        // one while Heimdall is mid-rotation. No key configured means nothing
-        // verifies and every token is refused.
-        let validation = self.validation();
-        let claims = self
-            .keys
-            .iter()
-            .find_map(|key| decode::<HeimdallClaims>(token, key, &validation).ok())
-            .map(|data| data.claims)
-            .ok_or(DomainError::Unauthorized)?;
+        let claims = match header.alg {
+            Algorithm::ES256 => {
+                let key_set = self.key_set.as_ref().ok_or(DomainError::Unauthorized)?;
+                let kid = header.kid.ok_or(DomainError::Unauthorized)?;
+                let key = key_set.key(&kid).await.ok_or(DomainError::Unauthorized)?;
+                decode::<HeimdallClaims>(token, &key, &self.validation(Algorithm::ES256))
+                    .map_err(|_| DomainError::Unauthorized)?
+                    .claims
+            }
+            // The overlap: each configured secret in turn, the current one
+            // first. None configured means no HS256 token verifies.
+            Algorithm::HS256 => {
+                let validation = self.validation(Algorithm::HS256);
+                self.secrets
+                    .iter()
+                    .find_map(|key| decode::<HeimdallClaims>(token, key, &validation).ok())
+                    .map(|data| data.claims)
+                    .ok_or(DomainError::Unauthorized)?
+            }
+            _ => return Err(DomainError::Unauthorized),
+        };
 
         // Only now are claims read for a decision: nothing below this line
         // acts on a token that has not been shown to be authentic.
@@ -294,9 +322,9 @@ mod tests {
         }
     }
 
-    /// A token signed with `secret`, carrying `claims` merged over the
-    /// defaults of a valid `User` token from the configured scope.
-    fn token_with(secret: &str, alg: Algorithm, claims: serde_json::Value) -> String {
+    /// The claims of a valid `User` token from the configured scope, with
+    /// `claims` merged over them; a `null` removes the claim.
+    fn body_with(claims: serde_json::Value) -> serde_json::Value {
         let mut body = json!({
             "id": PERSON,
             "role": "3",
@@ -312,6 +340,13 @@ mod tests {
                 map.insert(key.clone(), value.clone());
             }
         }
+        body
+    }
+
+    /// A token signed with `secret`, carrying `claims` merged over the
+    /// defaults of a valid `User` token from the configured scope.
+    fn token_with(secret: &str, alg: Algorithm, claims: serde_json::Value) -> String {
+        let body = body_with(claims);
         encode(
             &Header::new(alg),
             &body,
@@ -654,5 +689,343 @@ mod tests {
             HeimdallAuthService::from_settings(&settings()).mode(),
             AuthMode::External
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // ES256, verified through Heimdall's published key set.
+    // -----------------------------------------------------------------------
+
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex as StdMutex;
+    use std::time::{Duration, Instant};
+
+    use crate::auth::jwks::JwksSource;
+
+    /// Two P-256 keys made for these tests and nothing else, with the public
+    /// halves Heimdall would publish for them.
+    const KEY_A_PEM: &str = include_str!("testdata/es256_a.pem");
+    const KEY_B_PEM: &str = include_str!("testdata/es256_b.pem");
+    const KEY_A_JWK: &str = r#"{"kty":"EC","crv":"P-256","x":"xNYqHxZs5guFNq5tp_QAZDmyzd-rfqKOFuiH_X5XUOc","y":"Kj34xYASE06sFgLfB1lUbvGKeM7Z-p7ktA82965vYdU","kid":"key-a","use":"sig","alg":"ES256"}"#;
+    const KEY_B_JWK: &str = r#"{"kty":"EC","crv":"P-256","x":"F4-xfRljkHlfypeJn4cR7z4fl6A1T1uNyDKPEnzsqj8","y":"KSeCGuR2MlWqBMa91gYSGF6mfmEJJuONSca67gKWyV8","kid":"key-b","use":"sig","alg":"ES256"}"#;
+
+    /// Heimdall's key set endpoint: answers whatever set it currently
+    /// publishes, and counts how often it was asked.
+    struct Heimdall {
+        published: StdMutex<String>,
+        fetches: AtomicUsize,
+    }
+
+    impl Heimdall {
+        fn publishing(keys: &[&str]) -> Arc<Self> {
+            Arc::new(Self {
+                published: StdMutex::new(key_set(keys)),
+                fetches: AtomicUsize::new(0),
+            })
+        }
+
+        fn publish(&self, keys: &[&str]) {
+            *self.published.lock().unwrap() = key_set(keys);
+        }
+
+        fn fetches(&self) -> usize {
+            self.fetches.load(Ordering::SeqCst)
+        }
+    }
+
+    impl JwksSource for Arc<Heimdall> {
+        fn fetch(&self) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + '_>> {
+            self.fetches.fetch_add(1, Ordering::SeqCst);
+            let body = self.published.lock().unwrap().clone();
+            Box::pin(async move { Ok(body) })
+        }
+    }
+
+    fn key_set(keys: &[&str]) -> String {
+        format!(r#"{{"keys":[{}]}}"#, keys.join(","))
+    }
+
+    /// A clock the test moves by hand.
+    #[derive(Clone)]
+    struct Clock {
+        start: Instant,
+        elapsed: Arc<StdMutex<Duration>>,
+    }
+
+    impl Clock {
+        fn new() -> Self {
+            Self {
+                start: Instant::now(),
+                elapsed: Arc::new(StdMutex::new(Duration::ZERO)),
+            }
+        }
+
+        fn advance(&self, by: Duration) {
+            *self.elapsed.lock().unwrap() += by;
+        }
+    }
+
+    /// Settings once the overlap is over: the key set and no secret.
+    fn key_set_settings() -> AuthSettings {
+        AuthSettings {
+            mode: AuthMode::External,
+            heimdall_jwks_url: "http://heimdall-api.test:8080/.well-known/jwks.json".to_string(),
+            heimdall_scope_id: SCOPE.to_string(),
+            ..AuthSettings::default()
+        }
+    }
+
+    /// Settings during the overlap: the key set and the HS256 secret.
+    fn overlap_settings() -> AuthSettings {
+        AuthSettings {
+            heimdall_token_secret: Secret::new(SECRET),
+            ..key_set_settings()
+        }
+    }
+
+    fn service_over(
+        settings: &AuthSettings,
+        heimdall: &Arc<Heimdall>,
+        clock: &Clock,
+    ) -> HeimdallAuthService {
+        let clock = clock.clone();
+        let key_set = JwksCache::new(
+            Box::new(heimdall.clone()),
+            Arc::new(move || clock.start + *clock.elapsed.lock().unwrap()),
+        );
+        HeimdallAuthService::with_key_set(settings, Some(key_set))
+    }
+
+    /// A valid `User` token signed ES256 with the key in `pem`, naming `kid`.
+    fn es256_token(pem: &str, kid: Option<&str>, claims: serde_json::Value) -> String {
+        let mut header = Header::new(Algorithm::ES256);
+        header.kid = kid.map(str::to_string);
+        encode(
+            &header,
+            &body_with(claims),
+            &EncodingKey::from_ec_pem(pem.as_bytes()).expect("test key"),
+        )
+        .expect("encode")
+    }
+
+    async fn refused(service: &HeimdallAuthService, token: &str) -> bool {
+        matches!(
+            service.authenticate(token).await,
+            Err(DomainError::Unauthorized)
+        )
+    }
+
+    #[tokio::test]
+    async fn given_es256_token_signed_with_a_published_key_when_authenticated_then_principal_is_the_id_claim(
+    ) {
+        let heimdall = Heimdall::publishing(&[KEY_A_JWK]);
+        let service = service_over(&key_set_settings(), &heimdall, &Clock::new());
+
+        let principal = service
+            .authenticate(&es256_token(KEY_A_PEM, Some("key-a"), json!({})))
+            .await
+            .expect("accepted");
+
+        assert_eq!(principal.user_id, PERSON);
+        assert_eq!(heimdall.fetches(), 1);
+    }
+
+    #[tokio::test]
+    async fn given_es256_token_signed_with_another_key_under_a_published_kid_when_authenticated_then_unauthorized(
+    ) {
+        let heimdall = Heimdall::publishing(&[KEY_A_JWK]);
+        let service = service_over(&key_set_settings(), &heimdall, &Clock::new());
+
+        assert!(refused(&service, &es256_token(KEY_B_PEM, Some("key-a"), json!({}))).await);
+    }
+
+    /// Every other check still applies to an ES256 token: here, the scope.
+    #[tokio::test]
+    async fn given_es256_token_from_another_scope_when_authenticated_then_unauthorized() {
+        let heimdall = Heimdall::publishing(&[KEY_A_JWK]);
+        let service = service_over(&key_set_settings(), &heimdall, &Clock::new());
+
+        let token = es256_token(KEY_A_PEM, Some("key-a"), json!({ "scopeId": OTHER_SCOPE }));
+
+        assert!(refused(&service, &token).await);
+    }
+
+    #[tokio::test]
+    async fn given_es256_token_without_a_kid_when_authenticated_then_unauthorized_without_a_fetch()
+    {
+        let heimdall = Heimdall::publishing(&[KEY_A_JWK]);
+        let service = service_over(&key_set_settings(), &heimdall, &Clock::new());
+
+        assert!(refused(&service, &es256_token(KEY_A_PEM, None, json!({}))).await);
+        assert_eq!(heimdall.fetches(), 0);
+    }
+
+    /// The algorithm-confusion attack against an asymmetric key: an HS256
+    /// token whose HMAC secret is Heimdall's *public* key, which anyone can
+    /// read from the key set. Its header names HS256, and the HS256 path
+    /// verifies only against configured secrets — never a published key.
+    #[tokio::test]
+    async fn given_hs256_token_keyed_with_the_published_public_key_when_authenticated_then_unauthorized(
+    ) {
+        let heimdall = Heimdall::publishing(&[KEY_A_JWK]);
+        let public_pem = "-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAExNYqHxZs5guFNq5tp/QAZDmyzd+r\nfqKOFuiH/X5XUOcqPfjFgBITTqwWAt8HWVRu8Yp4ztn6nuS0Dzb3rm9h1Q==\n-----END PUBLIC KEY-----\n";
+
+        for settings in [key_set_settings(), overlap_settings()] {
+            let service = service_over(&settings, &heimdall, &Clock::new());
+            for forged_secret in [public_pem, KEY_A_JWK] {
+                let mut header = Header::new(Algorithm::HS256);
+                header.kid = Some("key-a".to_string());
+                let token = encode(
+                    &header,
+                    &body_with(json!({})),
+                    &EncodingKey::from_secret(forged_secret.as_bytes()),
+                )
+                .unwrap();
+
+                assert!(refused(&service, &token).await);
+            }
+        }
+    }
+
+    /// An ES256 key under a header naming another asymmetric algorithm is
+    /// refused rather than tried: only ES256 has a path.
+    #[tokio::test]
+    async fn given_a_token_naming_another_asymmetric_algorithm_when_authenticated_then_unauthorized(
+    ) {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine;
+
+        let heimdall = Heimdall::publishing(&[KEY_A_JWK]);
+        let service = service_over(&key_set_settings(), &heimdall, &Clock::new());
+        let genuine = es256_token(KEY_A_PEM, Some("key-a"), json!({}));
+        let (_, rest) = genuine.split_once('.').unwrap();
+
+        for alg in ["ES384", "RS256", "PS256", "EdDSA"] {
+            let header =
+                URL_SAFE_NO_PAD.encode(format!(r#"{{"alg":"{alg}","kid":"key-a","typ":"JWT"}}"#));
+            assert!(
+                refused(&service, &format!("{header}.{rest}")).await,
+                "{alg}"
+            );
+        }
+        assert_eq!(
+            heimdall.fetches(),
+            0,
+            "no other algorithm reaches the key set"
+        );
+    }
+
+    /// A rotation: Heimdall starts signing with a key the cache has never
+    /// seen. The unknown `kid` is what makes the cache fetch again.
+    #[tokio::test]
+    async fn given_a_token_naming_an_unknown_kid_when_authenticated_then_the_key_set_is_refetched()
+    {
+        let heimdall = Heimdall::publishing(&[KEY_A_JWK]);
+        let clock = Clock::new();
+        let service = service_over(&key_set_settings(), &heimdall, &clock);
+        service
+            .authenticate(&es256_token(KEY_A_PEM, Some("key-a"), json!({})))
+            .await
+            .expect("key A verifies");
+
+        heimdall.publish(&[KEY_B_JWK, KEY_A_JWK]);
+        clock.advance(Duration::from_secs(61));
+        let principal = service
+            .authenticate(&es256_token(KEY_B_PEM, Some("key-b"), json!({})))
+            .await
+            .expect("key B verifies once it is fetched");
+
+        assert_eq!(principal.user_id, PERSON);
+        assert_eq!(heimdall.fetches(), 2);
+    }
+
+    /// Made-up `kid`s cannot turn into a stream of requests to Heimdall: an
+    /// unknown key is fetched for at most once a minute.
+    #[tokio::test]
+    async fn given_unknown_kids_within_a_minute_when_authenticated_then_the_key_set_is_fetched_once(
+    ) {
+        let heimdall = Heimdall::publishing(&[KEY_A_JWK]);
+        let clock = Clock::new();
+        let service = service_over(&key_set_settings(), &heimdall, &clock);
+
+        for kid in ["made-up-1", "made-up-2", "made-up-3"] {
+            assert!(refused(&service, &es256_token(KEY_A_PEM, Some(kid), json!({}))).await);
+            clock.advance(Duration::from_secs(10));
+        }
+        assert_eq!(heimdall.fetches(), 1);
+
+        clock.advance(Duration::from_secs(60));
+        assert!(
+            refused(
+                &service,
+                &es256_token(KEY_A_PEM, Some("made-up-4"), json!({}))
+            )
+            .await
+        );
+        assert_eq!(
+            heimdall.fetches(),
+            2,
+            "a minute on, an unknown kid fetches again"
+        );
+    }
+
+    /// A key Heimdall has withdrawn stops verifying once the cached set
+    /// expires and is fetched again.
+    #[tokio::test]
+    async fn given_a_key_withdrawn_from_the_set_when_the_cache_expires_then_its_tokens_are_refused()
+    {
+        let heimdall = Heimdall::publishing(&[KEY_B_JWK, KEY_A_JWK]);
+        let clock = Clock::new();
+        let service = service_over(&key_set_settings(), &heimdall, &clock);
+        let token_a = es256_token(KEY_A_PEM, Some("key-a"), json!({}));
+        service
+            .authenticate(&token_a)
+            .await
+            .expect("key A verifies");
+
+        heimdall.publish(&[KEY_B_JWK]);
+        clock.advance(crate::auth::jwks::MAX_AGE);
+
+        assert!(refused(&service, &token_a).await);
+        assert_eq!(heimdall.fetches(), 2);
+    }
+
+    /// The overlap: while the secret is configured, a token Heimdall signed
+    /// HS256 before it moved is accepted alongside the ES256 ones.
+    #[tokio::test]
+    async fn given_the_overlap_when_hs256_and_es256_tokens_arrive_then_both_are_accepted() {
+        let heimdall = Heimdall::publishing(&[KEY_A_JWK]);
+        let service = service_over(&overlap_settings(), &heimdall, &Clock::new());
+
+        assert!(service.authenticate(&valid_token()).await.is_ok());
+        assert!(service
+            .authenticate(&es256_token(KEY_A_PEM, Some("key-a"), json!({})))
+            .await
+            .is_ok());
+    }
+
+    /// After the overlap the secret is removed from the configuration, and a
+    /// token signed with it is refused — the change needs no code.
+    #[tokio::test]
+    async fn given_the_overlap_is_over_when_an_hs256_token_arrives_then_unauthorized() {
+        let heimdall = Heimdall::publishing(&[KEY_A_JWK]);
+        let service = service_over(&key_set_settings(), &heimdall, &Clock::new());
+
+        assert!(refused(&service, &valid_token()).await);
+        assert_eq!(
+            heimdall.fetches(),
+            0,
+            "an HS256 token never reaches the key set"
+        );
+    }
+
+    /// With no key set configured — a Heimdall still on HS256 — an ES256 token
+    /// has nothing to verify against.
+    #[tokio::test]
+    async fn given_no_key_set_configured_when_an_es256_token_arrives_then_unauthorized() {
+        let service = HeimdallAuthService::from_settings(&settings());
+
+        assert!(refused(&service, &es256_token(KEY_A_PEM, Some("key-a"), json!({}))).await);
     }
 }

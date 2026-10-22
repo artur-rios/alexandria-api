@@ -92,18 +92,24 @@ impl fmt::Debug for Secret {
 pub struct AuthSettings {
     #[serde(default = "default_auth_mode")]
     pub mode: AuthMode,
-    /// External mode only: the HS256 secret Heimdall signs its tokens with
-    /// (its `HEIMDALL_AUTH_TOKEN_SECRET`). Required in external mode —
-    /// Heimdall publishes no keys, so this is the only way to verify one of
-    /// its tokens.
+    /// External mode only: where Heimdall publishes the public keys it signs
+    /// its ES256 tokens with, its `/.well-known/jwks.json`. Inside the
+    /// platform this is the internal address,
+    /// `http://heimdall-api.<env>:8080/.well-known/jwks.json`.
+    #[serde(default)]
+    pub heimdall_jwks_url: String,
+    /// External mode only, and only for the overlap: the HS256 secret
+    /// Heimdall signed its tokens with before it moved to ES256 (its
+    /// `HEIMDALL_AUTH_TOKEN_SECRET`). Tokens signed with it are accepted while
+    /// it is set; once Heimdall stops accepting them, remove it and they are
+    /// refused here too.
     #[serde(default)]
     pub heimdall_token_secret: Secret,
-    /// External mode only: the secret Heimdall is rotating away from (its
-    /// `HEIMDALL_AUTH_TOKEN_SECRET_PREVIOUS`). Accepted alongside the current
-    /// one, mirroring Heimdall's own two-key scheme, so a rotation there does
-    /// not black out Alexandria until this file is edited and the process
-    /// restarted. Ignored when equal to the current secret: the same value
-    /// under two names is not a rotation.
+    /// External mode only, and only for the overlap: the secret Heimdall was
+    /// rotating away from (its `HEIMDALL_AUTH_TOKEN_SECRET_PREVIOUS`).
+    /// Accepted alongside the current one, mirroring Heimdall's own two-key
+    /// scheme. Ignored when equal to the current secret: the same value under
+    /// two names is not a rotation.
     #[serde(default)]
     pub heimdall_token_secret_previous: Secret,
     /// External mode only: the UUID of the Heimdall scope Alexandria is
@@ -145,6 +151,7 @@ impl Default for AuthSettings {
     fn default() -> Self {
         Self {
             mode: default_auth_mode(),
+            heimdall_jwks_url: String::new(),
             heimdall_token_secret: Secret::default(),
             heimdall_token_secret_previous: Secret::default(),
             heimdall_scope_id: String::new(),
@@ -168,13 +175,22 @@ impl AuthSettings {
         match self.mode {
             AuthMode::Local => Ok(()),
             AuthMode::External => {
-                if self.heimdall_token_secret.is_empty() {
+                let jwks_url = self.heimdall_jwks_url.trim();
+                if jwks_url.is_empty() && self.heimdall_token_secret.is_empty() {
                     return Err(DomainError::Config(
-                        "auth.heimdall_token_secret is unset: external mode verifies \
-                         Heimdall's tokens against the secret it signs them with, and \
-                         Heimdall publishes no keys to fetch instead"
+                        "auth.heimdall_jwks_url is unset: external mode verifies Heimdall's \
+                         tokens against the key set it publishes at \
+                         /.well-known/jwks.json (or, during the move off HS256, against \
+                         auth.heimdall_token_secret), so it must name one"
                             .to_string(),
                     ));
+                }
+                if !jwks_url.is_empty()
+                    && !(jwks_url.starts_with("http://") || jwks_url.starts_with("https://"))
+                {
+                    return Err(DomainError::Config(format!(
+                        "auth.heimdall_jwks_url is not an http or https URL: {jwks_url:?}"
+                    )));
                 }
 
                 let scope_id = Uuid::parse_str(self.heimdall_scope_id.trim()).map_err(|_| {
@@ -459,10 +475,13 @@ impl Settings {
             self.auth.windows_owner_sid = sid;
         }
         // The external-mode keys take the same overrides as everything else,
-        // and the two secrets especially: a deployment must be able to hand
-        // Alexandria the shared signing key through the environment rather
-        // than write to disk the one value that can mint a token every
+        // and the two overlap secrets especially: a deployment must be able to
+        // hand Alexandria the shared signing key through the environment
+        // rather than write to disk the one value that can mint a token every
         // Heimdall-backed application will accept.
+        if let Ok(url) = env::var("ALEXANDRIA_AUTH_HEIMDALL_JWKS_URL") {
+            self.auth.heimdall_jwks_url = url;
+        }
         if let Ok(secret) = env::var("ALEXANDRIA_AUTH_HEIMDALL_TOKEN_SECRET") {
             self.auth.heimdall_token_secret = Secret::new(secret);
         }

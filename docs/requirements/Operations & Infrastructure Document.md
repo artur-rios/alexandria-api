@@ -174,8 +174,9 @@ keys — a key not listed here does not exist, and only the keys showing an
 | Concern | Mechanism | Notes |
 | --- | --- | --- |
 | `auth.mode` | config / `ALEXANDRIA_AUTH_MODE` | one of `external`, `local`, `windows`; selects the single active auth mode (FR-AU-01). |
-| `auth.heimdall_token_secret` | config / `ALEXANDRIA_AUTH_HEIMDALL_TOKEN_SECRET` | external mode only; the HS256 secret Heimdall signs with. Required — startup fails without it. Prefer the environment variable; never commit it. |
-| `auth.heimdall_token_secret_previous` | config / `ALEXANDRIA_AUTH_HEIMDALL_TOKEN_SECRET_PREVIOUS` | external mode only; the secret Heimdall is rotating away from. Both are accepted, so a rotation there causes no outage here. |
+| `auth.heimdall_jwks_url` | config / `ALEXANDRIA_AUTH_HEIMDALL_JWKS_URL` | external mode only; Heimdall's key set, `http://heimdall-api.<env>:8080/.well-known/jwks.json` inside the platform. ES256 tokens verify against the key their `kid` names. Required unless `auth.heimdall_token_secret` is set — startup fails with neither, or with a value that is not an `http`/`https` URL. |
+| `auth.heimdall_token_secret` | config / `ALEXANDRIA_AUTH_HEIMDALL_TOKEN_SECRET` | external mode only, during the move off HS256; the shared secret Heimdall signed with. HS256 tokens are accepted while it is set and refused once it is removed. Prefer the environment variable; never commit it. |
+| `auth.heimdall_token_secret_previous` | config / `ALEXANDRIA_AUTH_HEIMDALL_TOKEN_SECRET_PREVIOUS` | external mode only, during the same overlap; the secret Heimdall was rotating away from. |
 | `auth.heimdall_scope_id` | config / `ALEXANDRIA_AUTH_HEIMDALL_SCOPE_ID` | external mode only; UUID of the Heimdall scope whose members are accepted as the owner. Required — startup fails without it. |
 | `auth.heimdall_issuer` | config / `ALEXANDRIA_AUTH_HEIMDALL_ISSUER` | external mode only; checked only when set. |
 | `auth.heimdall_audience` | config / `ALEXANDRIA_AUTH_HEIMDALL_AUDIENCE` | external mode only; checked only when set. |
@@ -194,17 +195,19 @@ keys — a key not listed here does not exist, and only the keys showing an
 **Secrets:** local-login credentials live only in the SQLite credential row
 (never in config or env), and the password is held there only as a one-way
 salted Argon2 hash — the row cannot be reversed back to the plaintext. In
-external mode, Alexandria verifies JWTs offline against the Heimdall signing
-secret configured in `auth.heimdall_token_secret` (and, during rotation,
-`auth.heimdall_token_secret_previous`) — the secret is shared configuration,
-not fetched from Heimdall at request time.
+external mode, Alexandria verifies Heimdall's ES256 tokens against the public
+keys Heimdall publishes, fetched from `auth.heimdall_jwks_url` and cached —
+there is no shared signing secret to hold. During the move off HS256 it also
+accepts tokens signed with the old secret in `auth.heimdall_token_secret`
+(and `auth.heimdall_token_secret_previous`), until that secret is removed.
 
 #### Registering Alexandria with Heimdall (external mode)
 
 1. In Heimdall, as a Scope Admin who owns the scope, `POST /api/scopes/{scopeId}/applications` with Alexandria's name. This records the relationship; it issues no credential, and Alexandria needs none.
-2. Copy Heimdall's `HEIMDALL_AUTH_TOKEN_SECRET` into Alexandria's `ALEXANDRIA_AUTH_HEIMDALL_TOKEN_SECRET`, and the scope's UUID into `ALEXANDRIA_AUTH_HEIMDALL_SCOPE_ID`.
-3. Smoke-check the pair: log in to Heimdall as a person in that scope (`POST /api/auth/login`, completing two-factor if enabled) and call any authenticated Alexandria endpoint with the returned token. A `200` confirms the claim names and the secret match; a `401` means one of them does not.
-4. To rotate the secret: set `ALEXANDRIA_AUTH_HEIMDALL_TOKEN_SECRET_PREVIOUS` to the secret in use, set the current one to the new value on both sides, restart both, and clear the previous variable after one token lifetime.
+2. Point `ALEXANDRIA_AUTH_HEIMDALL_JWKS_URL` at Heimdall's key set — inside the platform, `http://heimdall-api.<env>:8080/.well-known/jwks.json` — and put the scope's UUID in `ALEXANDRIA_AUTH_HEIMDALL_SCOPE_ID`.
+3. Smoke-check the pair: log in to Heimdall as a person in that scope (`POST /api/auth/login`, completing two-factor if enabled) and call any authenticated Alexandria endpoint with the returned token. A `200` confirms the key set is reachable and the claim names match; a `401` means one of them does not.
+4. Key rotation needs nothing here: Heimdall publishes the new key beside the old one, and the first token naming it makes Alexandria fetch the set again (at most once a minute).
+5. While Heimdall still accepts HS256 tokens, also copy its `HEIMDALL_AUTH_TOKEN_SECRET` into `ALEXANDRIA_AUTH_HEIMDALL_TOKEN_SECRET` so those tokens keep working. When Heimdall removes the secret, unset it here too, and restart.
 
 #### Recovery codes (local mode)
 

@@ -187,7 +187,7 @@ graph LR
 | ID | Requirement |
 | --- | --- |
 | FR-AU-01 | The system shall read the active authentication mode from startup configuration; exactly one mode (external JWT, local login, or Windows account) shall be active at runtime. |
-| FR-AU-02 | In external mode, the system shall verify each caller's JWT against a configured signing secret shared with the external authentication service, and shall accept the caller as the owner only when the token names the configured scope. |
+| FR-AU-02 | In external mode, the system shall verify each caller's JWT against the public signing keys the external authentication service publishes (ES256, selected by the token's `kid`, with the algorithm pinned), and shall accept the caller as the owner only when the token names the configured scope. While a shared HS256 secret is still configured, tokens signed with it are accepted too. |
 | FR-AU-03 | The system shall accept only the active auth mode and shall reject credentials presented via the inactive mode. |
 | FR-AU-04 | In local mode, the system shall verify the caller's email and password against the salted Argon2 password hash stored in the SQLite credential row. |
 | FR-AU-05 | The system shall provide a local setup operation to set or change local-login credentials (email and password). |

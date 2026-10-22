@@ -63,12 +63,16 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png",
 # verification unless exactly one of `rust_crypto` and `aws_lc_rs` is
 # enabled. `rust_crypto` is the one that fits here — it is pure Rust, where
 # `aws_lc_rs` builds C and would make this the project's second system
-# dependency after ffmpeg. HS256 is all Alexandria verifies, so `hmac` and
-# `sha2` out of that feature are what actually get used.
+# dependency after ffmpeg. Alexandria verifies Heimdall's ES256 tokens (`p256`
+# out of that feature) and, during the overlap, its old HS256 ones (`hmac`).
 jsonwebtoken = { version = "11", features = ["rust_crypto"] }
 kamadak-exif = "0.6"
 lopdf = "0.45"
 quick-xml = "0.42"
+# Fetches Heimdall's key set (`auth::jwks`) in external mode, the only call
+# Alexandria makes to another service. rustls rather than the platform's TLS,
+# for the same reason as `rust_crypto` above: no further system dependency.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.11"

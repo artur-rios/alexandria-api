@@ -55,7 +55,8 @@ choices instead of restating them, so that:
 | **anyhow** | latest stable at implementation time | all crates | error propagation across crate boundaries |
 | **thiserror** | latest stable at implementation time | alexandria-core | typed domain error enums per command/query |
 | **argon2** | latest stable at implementation time | alexandria-core (auth) | salted password hashing for local-login mode |
-| **jsonwebtoken** | latest stable at implementation time | alexandria-core (auth) | HS256 decode/verification of Heimdall-issued JWTs for external-auth mode |
+| **jsonwebtoken** | latest stable at implementation time | alexandria-core (auth) | ES256 verification of Heimdall-issued JWTs against its published key set for external-auth mode, and HS256 during the move off the shared secret |
+| **reqwest** | latest stable at implementation time | alexandria-core (auth) | fetching Heimdall's key set (`/.well-known/jwks.json`) in external-auth mode; rustls, so it adds no system TLS dependency |
 | **windows-sys** | latest stable at implementation time | alexandria-core (auth) | reading the process token needs the Win32 bindings; this is the thinnest available — raw FFI declarations with no wrapper layer — and it is declared under `[target.'cfg(windows)'.dependencies]`, so it enters the graph only on Windows targets and no other platform's build is affected |
 | **toml** | latest stable at implementation time | all crates | `config.toml` parsing with env-var overrides |
 | **cbindgen** | latest stable at implementation time | alexandria-ffi (build) | generates the C header consumed by Flutter FFI |
