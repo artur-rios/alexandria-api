@@ -86,7 +86,7 @@ walkdir = "2"
 # (UC-45). The thinnest binding available — raw FFI declarations, no wrapper
 # layer — and it enters the graph only on Windows targets.
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Threading"] }
-zip = "8"
+zip = "9"
 
 # dev-only
 little_exif = "0.6"
