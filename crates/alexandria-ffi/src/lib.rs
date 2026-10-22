@@ -614,7 +614,7 @@ impl FileMetadataResult {
     }
 }
 
-/// Edit a file's type-specific metadata (UC-04 / FR-FC-14..18).
+/// Edit a file's type-specific metadata (UC-04 / FR-FC-15..18).
 ///
 /// `uuid` is the file's public UUID string; `json_patch` is the JSON body
 /// (the `SubtypeMetadata` enum, internally tagged by `type`) that HTTP would
@@ -846,7 +846,7 @@ pub extern "C" fn alexandria_files_list(
         // filter — HTTP answers `400` for these and the two surfaces must agree
         // (FR-FC-24 / NFR-09). An empty string means "no filter", as on HTTP.
         let file_type = match parsed.file_type.as_deref().filter(|s| !s.is_empty()) {
-            Some(t) => match parse_file_type(t) {
+            Some(t) => match alexandria_core::catalog::model::FileType::from_wire(t) {
                 Some(ft) => Some(ft),
                 None => return FileJsonResult::err(FILE_ERR_INVALID_INPUT),
             },
@@ -2963,19 +2963,6 @@ pub extern "C" fn alexandria_watchlist_delete(
             Err(err) => map_watchlist_err(err),
         }
     })
-}
-
-fn parse_file_type(s: &str) -> Option<alexandria_core::catalog::model::FileType> {
-    use alexandria_core::catalog::model::FileType;
-    match s {
-        "video" => Some(FileType::Video),
-        "html" => Some(FileType::Html),
-        "text" => Some(FileType::Text),
-        "document" => Some(FileType::Document),
-        "comic" => Some(FileType::Comic),
-        "image" => Some(FileType::Image),
-        _ => None,
-    }
 }
 
 fn map_file_err(err: DomainError) -> FileJsonResult {

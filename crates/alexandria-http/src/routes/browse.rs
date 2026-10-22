@@ -83,7 +83,7 @@ pub async fn list_files(
 
     let mut filter = FileFilter::new().with_state(parse_state(params.state.as_deref())?);
     if let Some(t) = params.file_type.as_deref().filter(|s| !s.is_empty()) {
-        let file_type = parse_file_type(t).ok_or_else(|| {
+        let file_type = FileType::from_wire(t).ok_or_else(|| {
             ApiError(alexandria_core::errors::DomainError::InvalidInput(format!(
                 "unknown file type: {t}"
             )))
@@ -136,16 +136,4 @@ pub async fn get_file(
         .map_err(ApiError)?;
 
     Ok((StatusCode::OK, Json(view)))
-}
-
-fn parse_file_type(s: &str) -> Option<FileType> {
-    match s {
-        "video" => Some(FileType::Video),
-        "html" => Some(FileType::Html),
-        "text" => Some(FileType::Text),
-        "document" => Some(FileType::Document),
-        "comic" => Some(FileType::Comic),
-        "image" => Some(FileType::Image),
-        _ => None,
-    }
 }
