@@ -35,9 +35,9 @@ where
 async fn given_mixed_files_when_list_default_then_active_only_excludes_deleted() {
     let repo = FakeCatalogRepository::new();
     repo.seed(existing_file_with_hash(
-        "/lib/a.mp3",
+        "/lib/a.txt",
         "a",
-        FileType::Audio,
+        FileType::Text,
         "h-a",
     ));
     repo.seed(existing_file_with_hash(
@@ -46,12 +46,12 @@ async fn given_mixed_files_when_list_default_then_active_only_excludes_deleted()
         FileType::Text,
         "h-b",
     ));
-    repo.seed(deleted_file("/lib/c.mp3", "c", FileType::Audio));
+    repo.seed(deleted_file("/lib/c.txt", "c", FileType::Text));
 
     let h = handler(FakeAuth::Allowing, repo.clone());
     let files = h.list(FileFilter::new(), TOKEN).await.expect("list");
 
-    // Default state filter is Active → c.mp3 (deleted) is excluded.
+    // Default state filter is Active → c.txt (deleted) is excluded.
     let names: Vec<&str> = files.iter().map(|f| f.file.name.as_str()).collect();
     assert_eq!(
         names,
@@ -65,9 +65,9 @@ async fn given_mixed_files_when_list_default_then_active_only_excludes_deleted()
 async fn given_files_when_list_filtered_by_type_then_only_matching_type_returned() {
     let repo = FakeCatalogRepository::new();
     repo.seed(existing_file_with_hash(
-        "/lib/a.mp3",
+        "/lib/a.png",
         "a",
-        FileType::Audio,
+        FileType::Image,
         "h",
     ));
     repo.seed(existing_file_with_hash(
@@ -84,11 +84,11 @@ async fn given_files_when_list_filtered_by_type_then_only_matching_type_returned
     ));
 
     let h = handler(FakeAuth::Allowing, repo);
-    let filter = FileFilter::new().with_type(FileType::Audio);
+    let filter = FileFilter::new().with_type(FileType::Image);
     let files = h.list(filter, TOKEN).await.expect("list");
 
     assert_eq!(files.len(), 1);
-    assert_eq!(files[0].file.file_type, FileType::Audio);
+    assert_eq!(files[0].file.file_type, FileType::Image);
 }
 
 // issue #116 / FR-FC-12: the listing answers the same FileView shape
@@ -98,47 +98,41 @@ async fn given_files_when_list_filtered_by_type_then_only_matching_type_returned
 #[tokio::test]
 async fn given_listing_of_one_type_when_list_then_each_row_carries_its_metadata() {
     let repo = FakeCatalogRepository::new();
-    let a = existing_file_with_hash("/lib/a.mp3", "a", FileType::Audio, "h");
-    let b = existing_file_with_hash("/lib/b.mp3", "b", FileType::Audio, "h");
+    let a = existing_file_with_hash("/lib/a.epub", "a", FileType::Document, "h");
+    let b = existing_file_with_hash("/lib/b.epub", "b", FileType::Document, "h");
     let (a_uuid, b_uuid) = (a.uuid, b.uuid);
     repo.seed(a);
     repo.seed(b);
     repo.seed_metadata(
         a_uuid,
-        SubtypeMetadata::Audio {
-            title: Some("Airbag".into()),
-            artist: Some("Radiohead".into()),
-            album: None,
+        SubtypeMetadata::Document {
+            title: Some("The Dispossessed".into()),
+            author: Some("Ursula K. Le Guin".into()),
             year: None,
-            genre: None,
-            track: None,
-            album_artist: None,
+            format_kind: None,
         },
     );
     repo.seed_metadata(
         b_uuid,
-        SubtypeMetadata::Audio {
-            title: Some("Karma Police".into()),
-            artist: Some("Radiohead".into()),
-            album: None,
+        SubtypeMetadata::Document {
+            title: Some("The Lathe of Heaven".into()),
+            author: Some("Ursula K. Le Guin".into()),
             year: None,
-            genre: None,
-            track: None,
-            album_artist: None,
+            format_kind: None,
         },
     );
 
     let h = handler(FakeAuth::Allowing, repo);
-    let filter = FileFilter::new().with_type(FileType::Audio);
+    let filter = FileFilter::new().with_type(FileType::Document);
     let files = h.list(filter, TOKEN).await.expect("list");
 
     assert_eq!(files.len(), 2);
     for view in &files {
         match &view.metadata {
-            Some(SubtypeMetadata::Audio { artist, .. }) => {
-                assert_eq!(artist.as_deref(), Some("Radiohead"));
+            Some(SubtypeMetadata::Document { author, .. }) => {
+                assert_eq!(author.as_deref(), Some("Ursula K. Le Guin"));
             }
-            other => panic!("expected audio metadata, got {other:?}"),
+            other => panic!("expected document metadata, got {other:?}"),
         }
     }
 }
@@ -146,21 +140,18 @@ async fn given_listing_of_one_type_when_list_then_each_row_carries_its_metadata(
 #[tokio::test]
 async fn given_mixed_type_listing_when_list_then_each_row_carries_its_own_metadata() {
     let repo = FakeCatalogRepository::new();
-    let song = existing_file_with_hash("/lib/song.mp3", "song", FileType::Audio, "h");
+    let book = existing_file_with_hash("/lib/book.epub", "book", FileType::Document, "h");
     let movie = existing_file_with_hash("/lib/movie.mp4", "movie", FileType::Video, "h");
-    let (song_uuid, movie_uuid) = (song.uuid, movie.uuid);
-    repo.seed(song);
+    let (book_uuid, movie_uuid) = (book.uuid, movie.uuid);
+    repo.seed(book);
     repo.seed(movie);
     repo.seed_metadata(
-        song_uuid,
-        SubtypeMetadata::Audio {
-            title: Some("Song".into()),
-            artist: None,
-            album: None,
+        book_uuid,
+        SubtypeMetadata::Document {
+            title: Some("Book".into()),
+            author: None,
             year: None,
-            genre: None,
-            track: None,
-            album_artist: None,
+            format_kind: None,
         },
     );
     repo.seed_metadata(
@@ -180,17 +171,17 @@ async fn given_mixed_type_listing_when_list_then_each_row_carries_its_own_metada
         .expect("list");
 
     assert_eq!(files.len(), 2);
-    let song_view = files
+    let book_view = files
         .iter()
-        .find(|v| v.file.uuid == song_uuid)
-        .expect("song present");
+        .find(|v| v.file.uuid == book_uuid)
+        .expect("book present");
     let movie_view = files
         .iter()
         .find(|v| v.file.uuid == movie_uuid)
         .expect("movie present");
-    match &song_view.metadata {
-        Some(SubtypeMetadata::Audio { title, .. }) => assert_eq!(title.as_deref(), Some("Song")),
-        other => panic!("expected audio metadata, got {other:?}"),
+    match &book_view.metadata {
+        Some(SubtypeMetadata::Document { title, .. }) => assert_eq!(title.as_deref(), Some("Book")),
+        other => panic!("expected document metadata, got {other:?}"),
     }
     match &movie_view.metadata {
         Some(SubtypeMetadata::Video { title, .. }) => assert_eq!(title.as_deref(), Some("Movie")),
@@ -202,9 +193,9 @@ async fn given_mixed_type_listing_when_list_then_each_row_carries_its_own_metada
 async fn given_file_with_no_stored_metadata_when_list_then_metadata_is_none_not_error() {
     let repo = FakeCatalogRepository::new();
     repo.seed(existing_file_with_hash(
-        "/lib/a.mp3",
+        "/lib/a.txt",
         "a",
-        FileType::Audio,
+        FileType::Text,
         "h",
     ));
 
@@ -222,12 +213,12 @@ async fn given_file_with_no_stored_metadata_when_list_then_metadata_is_none_not_
 async fn given_mixed_files_when_list_state_deleted_then_only_deleted_returned() {
     let repo = FakeCatalogRepository::new();
     repo.seed(existing_file_with_hash(
-        "/lib/a.mp3",
+        "/lib/a.txt",
         "a",
-        FileType::Audio,
+        FileType::Text,
         "h",
     ));
-    repo.seed(deleted_file("/lib/b.mp3", "b", FileType::Audio));
+    repo.seed(deleted_file("/lib/b.txt", "b", FileType::Text));
 
     let h = handler(FakeAuth::Allowing, repo);
     let filter = FileFilter::new().with_state(StateFilter::Deleted);
@@ -242,12 +233,12 @@ async fn given_mixed_files_when_list_state_deleted_then_only_deleted_returned() 
 async fn given_mixed_files_when_list_state_all_then_both_active_and_deleted_returned() {
     let repo = FakeCatalogRepository::new();
     repo.seed(existing_file_with_hash(
-        "/lib/a.mp3",
+        "/lib/a.txt",
         "a",
-        FileType::Audio,
+        FileType::Text,
         "h",
     ));
-    repo.seed(deleted_file("/lib/b.mp3", "b", FileType::Audio));
+    repo.seed(deleted_file("/lib/b.txt", "b", FileType::Text));
 
     let h = handler(FakeAuth::Allowing, repo);
     let filter = FileFilter::new().with_state(StateFilter::All);
@@ -260,17 +251,17 @@ async fn given_mixed_files_when_list_state_all_then_both_active_and_deleted_retu
 async fn given_files_when_list_type_and_state_combined_then_filter_applied() {
     let repo = FakeCatalogRepository::new();
     repo.seed(existing_file_with_hash(
-        "/lib/a.mp3",
+        "/lib/a.txt",
         "a",
-        FileType::Audio,
+        FileType::Text,
         "h",
     ));
-    repo.seed(deleted_file("/lib/b.mp3", "b", FileType::Audio));
+    repo.seed(deleted_file("/lib/b.txt", "b", FileType::Text));
     repo.seed(deleted_file("/lib/c.mp4", "c", FileType::Video));
 
     let h = handler(FakeAuth::Allowing, repo);
     let filter = FileFilter::new()
-        .with_type(FileType::Audio)
+        .with_type(FileType::Text)
         .with_state(StateFilter::Deleted);
     let files = h.list(filter, TOKEN).await.expect("list");
 
@@ -284,8 +275,8 @@ async fn given_files_when_list_type_and_state_combined_then_filter_applied() {
 #[tokio::test]
 async fn given_files_when_list_filtered_by_collection_then_only_linked_files_returned() {
     let repo = FakeCatalogRepository::new();
-    let a = existing_file_with_hash("/lib/a.mp3", "a", FileType::Audio, "h");
-    let b = existing_file_with_hash("/lib/b.mp3", "b", FileType::Audio, "h");
+    let a = existing_file_with_hash("/lib/a.txt", "a", FileType::Text, "h");
+    let b = existing_file_with_hash("/lib/b.txt", "b", FileType::Text, "h");
     let a_uuid = a.uuid;
     repo.seed(a);
     repo.seed(b);
@@ -307,9 +298,9 @@ async fn given_files_when_list_filtered_by_collection_then_only_linked_files_ret
 async fn given_unknown_collection_uuid_when_list_filtered_then_empty_list_not_error() {
     let repo = FakeCatalogRepository::new();
     repo.seed(existing_file_with_hash(
-        "/lib/a.mp3",
+        "/lib/a.txt",
         "a",
-        FileType::Audio,
+        FileType::Text,
         "h",
     ));
 
@@ -345,7 +336,7 @@ async fn given_unauthenticated_when_list_then_unauthorized() {
 #[tokio::test]
 async fn given_existing_file_when_get_by_uuid_then_file_view_returned() {
     let repo = FakeCatalogRepository::new();
-    let file = existing_file_with_hash("/lib/song.mp3", "song", FileType::Audio, "h");
+    let file = existing_file_with_hash("/lib/memo.txt", "memo", FileType::Text, "h");
     let uuid = file.uuid;
     repo.seed(file);
 
@@ -353,7 +344,7 @@ async fn given_existing_file_when_get_by_uuid_then_file_view_returned() {
     let view = h.get_by_uuid(uuid, TOKEN).await.expect("get");
 
     assert_eq!(view.file.uuid, uuid);
-    assert_eq!(view.file.name, "song");
+    assert_eq!(view.file.name, "memo");
     // No metadata written yet → None.
     assert!(view.metadata.is_none());
 }
@@ -361,19 +352,16 @@ async fn given_existing_file_when_get_by_uuid_then_file_view_returned() {
 #[tokio::test]
 async fn given_file_with_written_metadata_when_get_by_uuid_then_metadata_echoed() {
     let repo = FakeCatalogRepository::new();
-    let file = existing_file_with_hash("/lib/song.mp3", "song", FileType::Audio, "h");
+    let file = existing_file_with_hash("/lib/book.epub", "book", FileType::Document, "h");
     let uuid = file.uuid;
     repo.seed(file);
 
     // Seed stored metadata as if UC-04 had written it.
-    let metadata = SubtypeMetadata::Audio {
+    let metadata = SubtypeMetadata::Document {
         title: Some("Title".into()),
-        artist: Some("Artist".into()),
-        album: None,
+        author: Some("Author".into()),
         year: Some(2001),
-        genre: None,
-        track: None,
-        album_artist: None,
+        format_kind: None,
     };
     repo.seed_metadata(uuid, metadata.clone());
 
@@ -429,7 +417,7 @@ async fn given_image_with_no_extracted_dimensions_when_get_by_uuid_then_width_an
 #[tokio::test]
 async fn given_non_image_file_when_get_by_uuid_then_width_and_height_none() {
     let repo = FakeCatalogRepository::new();
-    let file = existing_file_with_hash("/lib/song.mp3", "song", FileType::Audio, "h");
+    let file = existing_file_with_hash("/lib/memo.txt", "memo", FileType::Text, "h");
     let uuid = file.uuid;
     repo.seed(file);
 
@@ -470,7 +458,7 @@ async fn given_document_with_no_extracted_page_count_when_get_by_uuid_then_page_
 #[tokio::test]
 async fn given_non_document_file_when_get_by_uuid_then_page_count_none() {
     let repo = FakeCatalogRepository::new();
-    let file = existing_file_with_hash("/lib/song.mp3", "song", FileType::Audio, "h");
+    let file = existing_file_with_hash("/lib/memo.txt", "memo", FileType::Text, "h");
     let uuid = file.uuid;
     repo.seed(file);
 
@@ -510,7 +498,7 @@ async fn given_video_with_no_extracted_duration_when_get_by_uuid_then_duration_n
 #[tokio::test]
 async fn given_non_video_file_when_get_by_uuid_then_duration_none() {
     let repo = FakeCatalogRepository::new();
-    let file = existing_file_with_hash("/lib/song.mp3", "song", FileType::Audio, "h");
+    let file = existing_file_with_hash("/lib/memo.txt", "memo", FileType::Text, "h");
     let uuid = file.uuid;
     repo.seed(file);
 
@@ -550,7 +538,7 @@ async fn given_comic_with_no_extracted_page_count_when_get_by_uuid_then_page_cou
 #[tokio::test]
 async fn given_non_comic_file_when_get_by_uuid_then_comic_page_count_none() {
     let repo = FakeCatalogRepository::new();
-    let file = existing_file_with_hash("/lib/song.mp3", "song", FileType::Audio, "h");
+    let file = existing_file_with_hash("/lib/memo.txt", "memo", FileType::Text, "h");
     let uuid = file.uuid;
     repo.seed(file);
 
@@ -587,7 +575,7 @@ async fn given_unauthenticated_when_get_by_uuid_then_unauthorized() {
 #[tokio::test]
 async fn given_deleted_file_when_get_by_uuid_then_file_returned() {
     let repo = FakeCatalogRepository::new();
-    let file = deleted_file("/lib/d.mp3", "d", FileType::Audio);
+    let file = deleted_file("/lib/d.txt", "d", FileType::Text);
     let uuid = file.uuid;
     repo.seed(file);
 

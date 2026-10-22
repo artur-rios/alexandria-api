@@ -5,7 +5,6 @@ use uuid::Uuid;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum FileType {
-    Audio,
     Video,
     Html,
     Text,
@@ -17,7 +16,6 @@ pub enum FileType {
 impl FileType {
     pub fn as_str(&self) -> &'static str {
         match self {
-            FileType::Audio => "audio",
             FileType::Video => "video",
             FileType::Html => "html",
             FileType::Text => "text",
@@ -29,12 +27,11 @@ impl FileType {
 
     /// The inverse of [`FileType::as_str`]: the wire name a client reads back
     /// is the one it may spell, so a caller never has to learn a second
-    /// vocabulary for the same seven types. `None` for anything else — the
+    /// vocabulary for the same six types. `None` for anything else — the
     /// caller decides whether that is a rejection (`IndexScope`) or a
     /// filter that matches nothing.
     pub fn from_wire(name: &str) -> Option<Self> {
         Some(match name {
-            "audio" => FileType::Audio,
             "video" => FileType::Video,
             "html" => FileType::Html,
             "text" => FileType::Text,
@@ -47,7 +44,6 @@ impl FileType {
 
     pub fn subtype_table(&self) -> &'static str {
         match self {
-            FileType::Audio => "audio_files",
             FileType::Video => "video_files",
             FileType::Html => "html_pages",
             FileType::Text => "text_files",
@@ -156,7 +152,7 @@ impl FormatKind {
 
 /// Type-specific metadata for an editable subtype (UC-04 / FR-FC-14..18).
 ///
-/// Only the five subtypes with editable metadata have a variant. Audio/Video/
+/// Only the four subtypes with editable metadata have a variant. Video/
 /// Document/Comic/Image map one-to-one to their subtype table; Text and Html
 /// have no editable subtype metadata, so a PATCH against them is rejected
 /// (AF-01) at the handler — there is no variant to (de)serialize.
@@ -168,30 +164,11 @@ impl FormatKind {
 /// are never touched.
 ///
 /// The enum is internally tagged by `type` so the REST/FFI JSON body carries
-/// the discriminator (`{"type":"audio","title":…}`), which the handler checks
+/// the discriminator (`{"type":"video","title":…}`), which the handler checks
 /// against the file's actual `FileType` (AF-01).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum SubtypeMetadata {
-    Audio {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        title: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        artist: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        album: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        year: Option<i64>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        genre: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        track: Option<i64>,
-        /// The artist of the record, distinct from `artist` (the artist of
-        /// the track) — see `AudioTags::album_artist`'s doc comment for why
-        /// the core never derives one from the other.
-        #[serde(rename = "albumArtist", skip_serializing_if = "Option::is_none")]
-        album_artist: Option<String>,
-    },
     Video {
         #[serde(skip_serializing_if = "Option::is_none")]
         title: Option<String>,
@@ -233,7 +210,6 @@ impl SubtypeMetadata {
     /// to validate the variant matches the file's actual subtype (AF-01).
     pub fn file_type(&self) -> FileType {
         match self {
-            SubtypeMetadata::Audio { .. } => FileType::Audio,
             SubtypeMetadata::Video { .. } => FileType::Video,
             SubtypeMetadata::Document { .. } => FileType::Document,
             SubtypeMetadata::Comic { .. } => FileType::Comic,
@@ -416,10 +392,9 @@ pub struct File {
 /// number's only job is to tell a row written by an older extraction from one
 /// written by this one, so that the first can be revisited exactly once.
 ///
-/// 1 — the album artist. Files indexed before migration 15 carry no
-/// `album_artist`, which is why the artists list showed a compilation's
-/// performers instead of the records' own artists: the tag was in the file
-/// and never in the catalog, and nothing revisited a row once it was written.
+/// 1 — the first stamp, added for a music tag the catalog no longer reads.
+/// It stays at 1 rather than going back to 0: rows already stamped have
+/// nothing left to fill, and the next field extraction learns bumps it to 2.
 pub const METADATA_VERSION: i64 = 1;
 
 /// Response of UC-09 purge-on-disk (FR-FC-23): the pre-delete snapshot of the

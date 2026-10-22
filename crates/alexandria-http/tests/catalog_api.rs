@@ -13,19 +13,6 @@ use crate::common::{
     wait_for_run_terminal,
 };
 
-/// The editable columns of an `audio_files` row, in the order every
-/// assertion here selects them: title, artist, album, year, genre, track,
-/// album_artist.
-type AudioMetadataRow = (
-    Option<String>,
-    Option<String>,
-    Option<String>,
-    Option<i64>,
-    Option<String>,
-    Option<i64>,
-    Option<String>,
-);
-
 fn index_request(root: &str) -> Request<Body> {
     Request::builder()
         .method("POST")
@@ -54,7 +41,7 @@ fn refresh_request() -> Request<Body> {
 #[tokio::test]
 async fn given_supported_files_when_index_posted_then_returns_202_with_run_id() {
     let lib = tempdir().unwrap();
-    common::write_file(&lib, "song.mp3", b"audio bytes");
+    common::write_file(&lib, "clip.mp4", b"video bytes");
     common::write_file(&lib, "notes.md", b"# title\n");
 
     let test = test_app().await;
@@ -77,10 +64,10 @@ async fn given_supported_files_when_index_posted_then_returns_202_with_run_id() 
     wait_for_files(&test.pool, 2).await;
     let rows = file_rows(&test.pool).await;
     assert_eq!(rows.len(), 2);
-    assert_eq!(rows[0].1, "notes.md");
-    assert_eq!(rows[0].2, "text");
-    assert_eq!(rows[1].1, "song.mp3");
-    assert_eq!(rows[1].2, "audio");
+    assert_eq!(rows[0].1, "clip.mp4");
+    assert_eq!(rows[0].2, "video");
+    assert_eq!(rows[1].1, "notes.md");
+    assert_eq!(rows[1].2, "text");
     // FR-FC-09 (Task 3): indexing never reads file bytes, so content_hash
     // stays unset — `None`, the column's own NULL, and not an empty string
     // standing in for one.
@@ -93,7 +80,7 @@ async fn given_supported_files_when_index_posted_then_returns_202_with_run_id() 
 #[tokio::test]
 async fn given_indexed_path_when_reindex_posted_then_existing_path_skipped_no_duplicate() {
     let lib = tempdir().unwrap();
-    common::write_file(&lib, "track.mp3", b"audio");
+    common::write_file(&lib, "track.txt", b"text");
 
     let test = test_app().await;
     let router = app(Settings::default(), test.services.clone());
@@ -183,7 +170,7 @@ async fn given_no_bearer_when_index_posted_then_returns_401() {
 #[tokio::test]
 async fn given_subtype_rows_when_indexed_then_each_file_has_subtype_row() {
     let lib = tempdir().unwrap();
-    common::write_file(&lib, "a.mp3", b"x");
+    common::write_file(&lib, "a.txt", b"x");
     common::write_file(&lib, "v.mp4", b"y");
     common::write_file(&lib, "p.pdf", b"z");
 
@@ -196,10 +183,10 @@ async fn given_subtype_rows_when_indexed_then_each_file_has_subtype_row() {
 
     wait_for_files(&test.pool, 3).await;
 
-    let audio: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM audio_files")
+    let text: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM text_files")
         .fetch_one(&test.pool)
         .await
-        .expect("audio");
+        .expect("text");
     let video: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM video_files")
         .fetch_one(&test.pool)
         .await
@@ -208,14 +195,14 @@ async fn given_subtype_rows_when_indexed_then_each_file_has_subtype_row() {
         .fetch_one(&test.pool)
         .await
         .expect("document");
-    assert_eq!(audio.0, 1);
+    assert_eq!(text.0, 1);
     assert_eq!(video.0, 1);
     assert_eq!(document.0, 1);
 }
 
 /// Task 4 rewrote what a re-index detects a change *by* — a `stat` call
 /// (size + mtime), not a recomputed SHA-256 — so this test's old premise
-/// (capture `a.mp3`'s pre-refresh hash, then poll rows until refresh
+/// (capture `a.txt`'s pre-refresh hash, then poll rows until refresh
 /// produces a *different* hash) is dead twice over: Task 3 already stopped
 /// indexing from computing a hash at all (a freshly indexed file's
 /// `content_hash` is `null`), and Task 4's refresh never computes a new one
@@ -223,14 +210,14 @@ async fn given_subtype_rows_when_indexed_then_each_file_has_subtype_row() {
 /// replacing it (FR-FC-10), so there is neither an old hash to capture nor a
 /// new one to compare against.
 ///
-/// What refresh actually guarantees now: `a.mp3`'s changed size is detected
+/// What refresh actually guarantees now: `a.txt`'s changed size is detected
 /// via `stat` and counted in the run's `refreshed` tally, `b.md`'s absence
-/// is counted in `markedMissing`, and `a.mp3`'s `content_hash` comes back
+/// is counted in `markedMissing`, and `a.txt`'s `content_hash` comes back
 /// cleared (not a new hash) while its `missingAt` is cleared.
 #[tokio::test]
 async fn given_changed_and_deleted_files_when_refresh_posted_then_refreshes_and_marks_missing() {
     let lib = tempdir().unwrap();
-    let a = common::write_file(&lib, "a.mp3", b"audio-v1");
+    let a = common::write_file(&lib, "a.txt", b"text-v1");
     let _b = common::write_file(&lib, "b.md", b"text-v1");
 
     let test = test_app().await;
@@ -242,7 +229,7 @@ async fn given_changed_and_deleted_files_when_refresh_posted_then_refreshes_and_
     wait_for_files(&test.pool, 2).await;
 
     // Mutate: change a's bytes — and with them its size — on disk, delete b.
-    std::fs::write(&a, b"audio-v2-CHANGED").unwrap();
+    std::fs::write(&a, b"text-v2-CHANGED").unwrap();
     std::fs::remove_file(lib.path().join("b.md")).unwrap();
 
     let router2 = app(Settings::default(), test.services.clone());
@@ -268,7 +255,7 @@ async fn given_changed_and_deleted_files_when_refresh_posted_then_refreshes_and_
     assert_eq!(run["failed"], 0);
 
     let rows = file_rows_with_missing(&test.pool).await;
-    let a_row = rows.iter().find(|r| r.1 == "a.mp3").expect("a");
+    let a_row = rows.iter().find(|r| r.1 == "a.txt").expect("a");
     let b_row = rows.iter().find(|r| r.1 == "b.md").expect("b");
     assert_eq!(
         a_row.3, None,
@@ -316,130 +303,6 @@ async fn uuid_for_name(pool: &sqlx::sqlite::SqlitePool, name: &str) -> String {
         .find(|r| r.2 == name)
         .map(|r| r.0.clone())
         .unwrap_or_else(|| panic!("no cataloged file named {name}"))
-}
-
-#[tokio::test]
-async fn given_indexed_audio_file_when_patch_audio_metadata_then_200_and_row_updated() {
-    let lib = tempdir().unwrap();
-    common::write_file(&lib, "song.mp3", b"audio bytes");
-
-    let test = test_app().await;
-    let router = app(Settings::default(), test.services.clone());
-    let _ = router
-        .oneshot(index_request(lib.path().to_str().unwrap()))
-        .await
-        .expect("index one-shot");
-    wait_for_files(&test.pool, 1).await;
-
-    let uuid = uuid_for_name(&test.pool, "song.mp3").await;
-    let body = json!({
-        "type": "audio",
-        "title": "New Title",
-        "artist": "New Artist",
-        "album": "New Album",
-        "year": 2001,
-        "genre": "Rock",
-        "track": 3,
-        "albumArtist": "New Album Artist"
-    });
-
-    let response = app(Settings::default(), test.services)
-        .oneshot(patch_metadata(&uuid, body))
-        .await
-        .expect("patch one-shot");
-    assert_eq!(response.status(), StatusCode::OK);
-
-    let bytes = to_bytes(response.into_body(), usize::MAX)
-        .await
-        .expect("body");
-    let json: Value = serde_json::from_slice(&bytes).expect("json");
-    assert_eq!(json["file"]["uuid"], uuid);
-    assert_eq!(json["file"]["fileType"], "audio");
-    assert_eq!(json["file"]["state"], "active");
-    assert_eq!(json["metadata"]["type"], "audio");
-    assert_eq!(json["metadata"]["title"], "New Title");
-    assert_eq!(json["metadata"]["track"], 3);
-    assert_eq!(json["metadata"]["albumArtist"], "New Album Artist");
-
-    // Persisted subtype row reflects the full-replace PATCH.
-    let row: AudioMetadataRow = sqlx::query_as(
-        "SELECT title, artist, album, year, genre, track, album_artist FROM audio_files \
-             JOIN files ON files.id = audio_files.file_id WHERE files.uuid = ?",
-    )
-    .bind(&uuid)
-    .fetch_one(&test.pool)
-    .await
-    .expect("audio row");
-    assert_eq!(row.0.as_deref(), Some("New Title"));
-    assert_eq!(row.1.as_deref(), Some("New Artist"));
-    assert_eq!(row.2.as_deref(), Some("New Album"));
-    assert_eq!(row.3, Some(2001));
-    assert_eq!(row.4.as_deref(), Some("Rock"));
-    assert_eq!(row.5, Some(3));
-    assert_eq!(row.6.as_deref(), Some("New Album Artist"));
-}
-
-/// FR-FC-14 / issue #120: a subsequent PATCH that omits `albumArtist`
-/// clears it — a PATCH is a full replace (AudioMetadataRow's own doc
-/// comment), so the field's absence in the body must write `NULL`, not
-/// leave the previous value in place.
-#[tokio::test]
-async fn given_album_artist_set_when_patched_without_it_then_cleared_to_null() {
-    let lib = tempdir().unwrap();
-    common::write_file(&lib, "song.mp3", b"audio bytes");
-
-    let test = test_app().await;
-    let router = app(Settings::default(), test.services.clone());
-    let _ = router
-        .oneshot(index_request(lib.path().to_str().unwrap()))
-        .await
-        .expect("index one-shot");
-    wait_for_files(&test.pool, 1).await;
-
-    let uuid = uuid_for_name(&test.pool, "song.mp3").await;
-
-    let with_album_artist = json!({
-        "type": "audio",
-        "title": "Title",
-        "albumArtist": "Various Artists"
-    });
-    let response = app(Settings::default(), test.services.clone())
-        .oneshot(patch_metadata(&uuid, with_album_artist))
-        .await
-        .expect("first patch one-shot");
-    assert_eq!(response.status(), StatusCode::OK);
-
-    let without_album_artist = json!({
-        "type": "audio",
-        "title": "Title"
-    });
-    let response = app(Settings::default(), test.services)
-        .oneshot(patch_metadata(&uuid, without_album_artist))
-        .await
-        .expect("second patch one-shot");
-    assert_eq!(response.status(), StatusCode::OK);
-
-    let bytes = to_bytes(response.into_body(), usize::MAX)
-        .await
-        .expect("body");
-    let json: Value = serde_json::from_slice(&bytes).expect("json");
-    assert!(
-        json["metadata"].get("albumArtist").is_none(),
-        "cleared field is omitted (skip_serializing_if), not written as null"
-    );
-
-    let row: AudioMetadataRow = sqlx::query_as(
-        "SELECT title, artist, album, year, genre, track, album_artist FROM audio_files \
-             JOIN files ON files.id = audio_files.file_id WHERE files.uuid = ?",
-    )
-    .bind(&uuid)
-    .fetch_one(&test.pool)
-    .await
-    .expect("audio row");
-    assert_eq!(
-        row.6, None,
-        "second PATCH must overwrite the stored value with NULL"
-    );
 }
 
 #[tokio::test]
@@ -503,7 +366,7 @@ async fn given_indexed_text_file_when_patch_any_metadata_then_400() {
     let uuid = uuid_for_name(&test.pool, "notes.md").await;
     // Text has no editable subtype metadata; any PATCH body's variant
     // mismatches the file's `text` type → AF-01 invalid input.
-    let body = json!({ "type": "audio", "title": "x" });
+    let body = json!({ "type": "video", "title": "x" });
 
     let response = app(Settings::default(), test.services)
         .oneshot(patch_metadata(&uuid, body))
@@ -513,9 +376,9 @@ async fn given_indexed_text_file_when_patch_any_metadata_then_400() {
 }
 
 #[tokio::test]
-async fn given_indexed_audio_file_when_patch_with_video_body_then_400() {
+async fn given_indexed_image_file_when_patch_with_video_body_then_400() {
     let lib = tempdir().unwrap();
-    common::write_file(&lib, "song.mp3", b"audio bytes");
+    common::write_file(&lib, "photo.png", b"png bytes");
 
     let test = test_app().await;
     let router = app(Settings::default(), test.services.clone());
@@ -525,7 +388,7 @@ async fn given_indexed_audio_file_when_patch_with_video_body_then_400() {
         .expect("index one-shot");
     wait_for_files(&test.pool, 1).await;
 
-    let uuid = uuid_for_name(&test.pool, "song.mp3").await;
+    let uuid = uuid_for_name(&test.pool, "photo.png").await;
     let body = json!({ "type": "video", "title": "x" });
 
     let response = app(Settings::default(), test.services)
@@ -540,7 +403,7 @@ async fn given_missing_uuid_when_patch_then_404() {
     let test = test_app().await;
     let router = app(Settings::default(), test.services);
     let missing = uuid::Uuid::new_v4().to_string();
-    let body = json!({ "type": "audio", "title": "x" });
+    let body = json!({ "type": "video", "title": "x" });
 
     let response = router
         .oneshot(patch_metadata(&missing, body))
@@ -554,7 +417,7 @@ async fn given_no_bearer_when_patch_then_401() {
     let test = test_app().await;
     let router = app(Settings::default(), test.services);
     let uuid = uuid::Uuid::new_v4().to_string();
-    let body = json!({ "type": "audio", "title": "x" });
+    let body = json!({ "type": "video", "title": "x" });
 
     let request = Request::builder()
         .method("PATCH")
@@ -617,7 +480,7 @@ fn get_files_no_auth(uri: &str) -> Request<Body> {
 async fn given_indexed_files_when_get_files_then_200_array_excluding_deleted_by_default() {
     let lib = tempdir().unwrap();
     let test = test_app().await;
-    index_library(&lib, &test.pool, &[("a.mp3", b"x"), ("b.md", b"y")]).await;
+    index_library(&lib, &test.pool, &[("a.txt", b"x"), ("b.md", b"y")]).await;
 
     let response = app(Settings::default(), test.services)
         .oneshot(get_files("/v1/files"))
@@ -637,10 +500,10 @@ async fn given_indexed_files_when_get_files_then_200_array_excluding_deleted_by_
 async fn given_indexed_files_when_get_files_with_type_filter_then_only_matching_type_returned() {
     let lib = tempdir().unwrap();
     let test = test_app().await;
-    index_library(&lib, &test.pool, &[("a.mp3", b"x"), ("b.mp4", b"y")]).await;
+    index_library(&lib, &test.pool, &[("a.txt", b"x"), ("b.mp4", b"y")]).await;
 
     let response = app(Settings::default(), test.services)
-        .oneshot(get_files("/v1/files?type=audio"))
+        .oneshot(get_files("/v1/files?type=text"))
         .await
         .expect("list one-shot");
     assert_eq!(response.status(), StatusCode::OK);
@@ -648,14 +511,14 @@ async fn given_indexed_files_when_get_files_with_type_filter_then_only_matching_
         serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
     let arr = body.as_array().expect("array");
     assert_eq!(arr.len(), 1);
-    assert_eq!(arr[0]["file"]["fileType"], "audio");
+    assert_eq!(arr[0]["file"]["fileType"], "text");
 }
 
 #[tokio::test]
 async fn given_indexed_files_when_get_files_with_collection_filter_then_only_linked_returned() {
     let lib = tempdir().unwrap();
     let test = test_app().await;
-    index_library(&lib, &test.pool, &[("a.mp3", b"x"), ("b.mp4", b"y")]).await;
+    index_library(&lib, &test.pool, &[("a.txt", b"x"), ("b.mp4", b"y")]).await;
     let router = app(Settings::default(), test.services.clone());
 
     let create_resp = router
@@ -683,7 +546,7 @@ async fn given_indexed_files_when_get_files_with_collection_filter_then_only_lin
         body["uuid"].as_str().unwrap().to_string()
     };
 
-    let (a_uuid,): (String,) = sqlx::query_as("SELECT uuid FROM files WHERE name = 'a.mp3'")
+    let (a_uuid,): (String,) = sqlx::query_as("SELECT uuid FROM files WHERE name = 'a.txt'")
         .fetch_one(&test.pool)
         .await
         .unwrap();
@@ -726,7 +589,7 @@ async fn given_indexed_files_when_get_files_with_collection_filter_then_only_lin
 async fn given_unknown_collection_uuid_when_get_files_filtered_then_empty_array_not_error() {
     let lib = tempdir().unwrap();
     let test = test_app().await;
-    index_library(&lib, &test.pool, &[("a.mp3", b"x")]).await;
+    index_library(&lib, &test.pool, &[("a.txt", b"x")]).await;
 
     let response = app(Settings::default(), test.services)
         .oneshot(get_files(&format!(
@@ -768,7 +631,7 @@ async fn given_a_query_that_cannot_be_read_when_get_files_then_400_in_the_error_
     // a client could not parse as `{"error": …}`.
     let test = test_app().await;
     let response = app(Settings::default(), test.services)
-        .oneshot(get_files("/v1/files?type=audio&type=video"))
+        .oneshot(get_files("/v1/files?type=text&type=video"))
         .await
         .expect("list one-shot");
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
@@ -797,7 +660,7 @@ async fn given_unknown_state_when_get_files_then_400() {
 async fn given_empty_type_and_state_when_get_files_then_treated_as_no_filter() {
     let lib = tempdir().unwrap();
     let test = test_app().await;
-    index_library(&lib, &test.pool, &[("song.mp3", b"x")]).await;
+    index_library(&lib, &test.pool, &[("memo.txt", b"x")]).await;
 
     let response = app(Settings::default(), test.services)
         .oneshot(get_files("/v1/files?type=&state="))
@@ -813,9 +676,9 @@ async fn given_empty_type_and_state_when_get_files_then_treated_as_no_filter() {
 async fn given_deleted_file_when_get_files_default_then_excluded() {
     let lib = tempdir().unwrap();
     let test = test_app().await;
-    index_library(&lib, &test.pool, &[("song.mp3", b"x")]).await;
+    index_library(&lib, &test.pool, &[("memo.txt", b"x")]).await;
 
-    let uuid = uuid_for_name(&test.pool, "song.mp3").await;
+    let uuid = uuid_for_name(&test.pool, "memo.txt").await;
     // Seed a soft-delete directly.
     sqlx::query("UPDATE files SET state='deleted', deleted_at=? WHERE uuid=?")
         .bind("2024-01-01T00:00:00Z")
@@ -841,8 +704,8 @@ async fn given_deleted_file_when_get_files_default_then_excluded() {
 async fn given_deleted_file_when_get_files_state_deleted_then_only_deleted_returned() {
     let lib = tempdir().unwrap();
     let test = test_app().await;
-    index_library(&lib, &test.pool, &[("a.mp3", b"x"), ("b.md", b"y")]).await;
-    let uuid_a = uuid_for_name(&test.pool, "a.mp3").await;
+    index_library(&lib, &test.pool, &[("a.txt", b"x"), ("b.md", b"y")]).await;
+    let uuid_a = uuid_for_name(&test.pool, "a.txt").await;
     sqlx::query("UPDATE files SET state='deleted', deleted_at=? WHERE uuid=?")
         .bind("2024-01-01T00:00:00Z")
         .bind(&uuid_a)
@@ -859,15 +722,15 @@ async fn given_deleted_file_when_get_files_state_deleted_then_only_deleted_retur
     let arr = body.as_array().unwrap();
     assert_eq!(arr.len(), 1);
     assert_eq!(arr[0]["file"]["state"], "deleted");
-    assert_eq!(arr[0]["file"]["name"], "a.mp3");
+    assert_eq!(arr[0]["file"]["name"], "a.txt");
 }
 
 #[tokio::test]
 async fn given_deleted_file_when_get_files_state_all_then_both_returned() {
     let lib = tempdir().unwrap();
     let test = test_app().await;
-    index_library(&lib, &test.pool, &[("a.mp3", b"x"), ("b.md", b"y")]).await;
-    let uuid_a = uuid_for_name(&test.pool, "a.mp3").await;
+    index_library(&lib, &test.pool, &[("a.txt", b"x"), ("b.md", b"y")]).await;
+    let uuid_a = uuid_for_name(&test.pool, "a.txt").await;
     sqlx::query("UPDATE files SET state='deleted', deleted_at=? WHERE uuid=?")
         .bind("2024-01-01T00:00:00Z")
         .bind(&uuid_a)
@@ -884,20 +747,21 @@ async fn given_deleted_file_when_get_files_state_all_then_both_returned() {
     assert_eq!(body.as_array().unwrap().len(), 2);
 }
 
-/// issue #116 / FR-FC-12, code-review Finding 1: the five combined
+/// issue #116 / FR-FC-12, code-review Finding 1: the four combined
 /// metadata+scalar batch `SELECT`s in `SqliteCatalogRepository::
-/// batch_{audio,video,document,comic,image}` are new code with hard-coded
+/// batch_{video,document,comic,image}` are new code with hard-coded
 /// column names — `comic_books.page_count` even maps to a `FileView` field
 /// named `comicPageCount`, not `pageCount` (that name is document's) — and
 /// a wrong column name in any one of them is a 500 on every listing
 /// containing that type, caught by nothing until this test existed:
-/// `browse_batching.rs`'s SQLite integration tests only seed audio (plus
-/// one metadata-less video), the unit tests in `tests/catalog/browse.rs`
-/// go through a fake that serves scalars from in-memory maps rather than
-/// SQL, and the pre-existing single-type test here covered audio alone.
-/// This table drives all five metadata-bearing subtypes through the real
-/// batch queries, each asserting both the type's `metadata` and its own
-/// extracted-scalar field, so a wrong column name in any of the five
+/// `browse_batching.rs`'s SQLite integration tests only seed documents
+/// (plus one metadata-less video), the unit tests in
+/// `tests/catalog/browse.rs` go through a fake that serves scalars from
+/// in-memory maps rather than SQL, and the pre-existing single-type test
+/// here covered one type alone. This table drives all four
+/// metadata-bearing subtypes through the real batch queries, each
+/// asserting both the type's `metadata` and its own extracted-scalar
+/// field, so a wrong column name in any of the four
 /// fails here rather than in production.
 #[tokio::test]
 async fn given_each_metadata_bearing_type_when_get_files_then_element_carries_metadata_and_its_own_scalar(
@@ -910,19 +774,6 @@ async fn given_each_metadata_bearing_type_when_get_files_then_element_carries_me
     }
 
     let cases = [
-        Case {
-            file_name: "song.mp3",
-            update_sql: "UPDATE audio_files SET title='Title', artist='Artist', album=NULL, \
-                          year=2001, genre=NULL, track=NULL, album_artist='Album Artist' \
-                          FROM files WHERE audio_files.file_id = files.id AND files.uuid = ?",
-            expected_type: "audio",
-            assert_view: |el| {
-                assert_eq!(el["metadata"]["type"], "audio");
-                assert_eq!(el["metadata"]["title"], "Title");
-                assert_eq!(el["metadata"]["artist"], "Artist");
-                assert_eq!(el["metadata"]["albumArtist"], "Album Artist");
-            },
-        },
         Case {
             file_name: "clip.mp4",
             update_sql: "UPDATE video_files SET title='Clip', year=NULL, resolution='1080p', \
@@ -1038,8 +889,8 @@ async fn given_no_bearer_when_get_files_then_401() {
 async fn given_indexed_file_when_get_file_by_uuid_then_200_with_file_view() {
     let lib = tempdir().unwrap();
     let test = test_app().await;
-    index_library(&lib, &test.pool, &[("song.mp3", b"x")]).await;
-    let uuid = uuid_for_name(&test.pool, "song.mp3").await;
+    index_library(&lib, &test.pool, &[("memo.txt", b"x")]).await;
+    let uuid = uuid_for_name(&test.pool, "memo.txt").await;
 
     let response = app(Settings::default(), test.services)
         .oneshot(get_files(&format!("/v1/files/{uuid}")))
@@ -1049,7 +900,7 @@ async fn given_indexed_file_when_get_file_by_uuid_then_200_with_file_view() {
     let body: Value =
         serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
     assert_eq!(body["file"]["uuid"], uuid);
-    assert_eq!(body["file"]["fileType"], "audio");
+    assert_eq!(body["file"]["fileType"], "text");
     assert_eq!(body["file"]["state"], "active");
     // No metadata written yet → null.
     assert!(body["metadata"].is_null());
@@ -1059,16 +910,16 @@ async fn given_indexed_file_when_get_file_by_uuid_then_200_with_file_view() {
 async fn given_indexed_file_with_written_metadata_when_get_file_by_uuid_then_metadata_echoed() {
     let lib = tempdir().unwrap();
     let test = test_app().await;
-    index_library(&lib, &test.pool, &[("song.mp3", b"x")]).await;
-    let uuid = uuid_for_name(&test.pool, "song.mp3").await;
+    index_library(&lib, &test.pool, &[("clip.mkv", b"x")]).await;
+    let uuid = uuid_for_name(&test.pool, "clip.mkv").await;
     sqlx::query(
-        "UPDATE audio_files SET title='T', artist='A', album=NULL, year=2001, genre=NULL, \
-         track=NULL FROM files WHERE audio_files.file_id = files.id AND files.uuid = ?",
+        "UPDATE video_files SET title='T', year=2001, resolution='720p', media_kind=NULL \
+         FROM files WHERE video_files.file_id = files.id AND files.uuid = ?",
     )
     .bind(&uuid)
     .execute(&test.pool)
     .await
-    .expect("audio metadata");
+    .expect("video metadata");
 
     let response = app(Settings::default(), test.services)
         .oneshot(get_files(&format!("/v1/files/{uuid}")))
@@ -1076,9 +927,9 @@ async fn given_indexed_file_with_written_metadata_when_get_file_by_uuid_then_met
         .expect("get one-shot");
     let body: Value =
         serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
-    assert_eq!(body["metadata"]["type"], "audio");
+    assert_eq!(body["metadata"]["type"], "video");
     assert_eq!(body["metadata"]["title"], "T");
-    assert_eq!(body["metadata"]["artist"], "A");
+    assert_eq!(body["metadata"]["resolution"], "720p");
     assert_eq!(body["metadata"]["year"], 2001);
 }
 
@@ -1090,6 +941,90 @@ async fn given_missing_uuid_when_get_file_then_404() {
         .oneshot(get_files(&format!("/v1/files/{missing}")))
         .await
         .expect("get one-shot");
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn given_the_enrichment_routes_are_gone_when_called_then_not_found() {
+    let test = test_app().await;
+    let router = app(Settings::default(), test.services);
+    let uuid = uuid::Uuid::new_v4();
+    let authorization = format!("Bearer {}", common::TEST_TOKEN);
+
+    for (method, uri) in [
+        ("POST", "/v1/enrichment/runs".to_string()),
+        ("GET", format!("/v1/enrichment/tracks/{uuid}")),
+        ("GET", "/v1/enrichment/artist-image".to_string()),
+    ] {
+        let request = Request::builder()
+            .method(method)
+            .uri(&uri)
+            .header("authorization", authorization.as_str())
+            .header("content-type", "application/json")
+            .body(Body::from("{}"))
+            .unwrap();
+        let response = router.clone().oneshot(request).await.expect("one-shot");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{method} {uri}");
+    }
+}
+
+#[tokio::test]
+async fn given_the_plays_routes_are_gone_when_called_then_not_found() {
+    let test = test_app().await;
+    let router = app(Settings::default(), test.services);
+    let authorization = format!("Bearer {}", common::TEST_TOKEN);
+
+    for (method, uri) in [("POST", "/v1/plays"), ("GET", "/v1/plays/stats")] {
+        let request = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("authorization", authorization.as_str())
+            .header("content-type", "application/json")
+            .body(Body::from("{}"))
+            .unwrap();
+        let response = router.clone().oneshot(request).await.expect("one-shot");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{method} {uri}");
+    }
+}
+
+#[tokio::test]
+async fn given_the_playlist_routes_are_gone_when_called_then_not_found() {
+    let test = test_app().await;
+    let router = app(Settings::default(), test.services);
+    let authorization = format!("Bearer {}", common::TEST_TOKEN);
+
+    for (method, uri) in [("GET", "/v1/playlists"), ("POST", "/v1/playlists")] {
+        let request = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("authorization", authorization.as_str())
+            .header("content-type", "application/json")
+            .body(Body::from("{}"))
+            .unwrap();
+        let response = router.clone().oneshot(request).await.expect("one-shot");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{method} {uri}");
+    }
+}
+
+#[tokio::test]
+async fn given_the_energy_route_is_gone_when_called_then_not_found() {
+    // A file that exists, so a 404 can only mean the route is gone rather
+    // than that the uuid is unknown.
+    let lib = tempdir().unwrap();
+    let test = test_app().await;
+    index_library(&lib, &test.pool, &[("clip.mp4", b"x")]).await;
+    let uuid = uuid_for_name(&test.pool, "clip.mp4").await;
+    let router = app(Settings::default(), test.services);
+    let authorization = format!("Bearer {}", common::TEST_TOKEN);
+
+    let request = Request::builder()
+        .method("GET")
+        .uri(format!("/v1/files/{uuid}/energy"))
+        .header("authorization", authorization.as_str())
+        .body(Body::empty())
+        .unwrap();
+    let response = router.oneshot(request).await.expect("one-shot");
+
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }
 
@@ -1124,7 +1059,7 @@ async fn given_indexed_text_file_when_get_file_by_uuid_then_metadata_is_null() {
 #[tokio::test]
 async fn given_soft_deleted_file_when_patch_then_409() {
     let lib = tempdir().unwrap();
-    common::write_file(&lib, "song.mp3", b"audio bytes");
+    common::write_file(&lib, "clip.mkv", b"video bytes");
 
     let test = test_app().await;
     let router = app(Settings::default(), test.services.clone());
@@ -1134,7 +1069,7 @@ async fn given_soft_deleted_file_when_patch_then_409() {
         .expect("index one-shot");
     wait_for_files(&test.pool, 1).await;
 
-    let uuid = uuid_for_name(&test.pool, "song.mp3").await;
+    let uuid = uuid_for_name(&test.pool, "clip.mkv").await;
     // Seed a soft-delete directly (UC-06 is not implemented yet) so the
     // record is in `deleted` state with `deleted_at` set.
     sqlx::query("UPDATE files SET state = 'deleted', deleted_at = ? WHERE uuid = ?")
@@ -1144,7 +1079,7 @@ async fn given_soft_deleted_file_when_patch_then_409() {
         .await
         .expect("soft-delete seed");
 
-    let body = json!({ "type": "audio", "title": "x" });
+    let body = json!({ "type": "video", "title": "x" });
     let response = app(Settings::default(), test.services)
         .oneshot(patch_metadata(&uuid, body))
         .await
@@ -1186,7 +1121,7 @@ async fn given_no_bearer_and_invalid_uuid_when_patch_then_401_not_400() {
         .method("PATCH")
         .uri("/v1/files/not-a-uuid/metadata")
         .header("content-type", "application/json")
-        .body(Body::from(json!({ "type": "audio" }).to_string()))
+        .body(Body::from(json!({ "type": "video" }).to_string()))
         .unwrap();
 
     let response = app(Settings::default(), test.services)
@@ -1265,10 +1200,10 @@ async fn given_missing_subtype_row_when_patch_then_error_not_silent_success() {
     // succeeded and handed back metadata the database never stored.
     let lib = tempdir().unwrap();
     let test = test_app().await;
-    index_library(&lib, &test.pool, &[("song.mp3", b"audio")]).await;
-    let uuid = uuid_for_name(&test.pool, "song.mp3").await;
+    index_library(&lib, &test.pool, &[("clip.mkv", b"video bytes")]).await;
+    let uuid = uuid_for_name(&test.pool, "clip.mkv").await;
 
-    sqlx::query("DELETE FROM audio_files WHERE file_id = (SELECT id FROM files WHERE uuid = ?)")
+    sqlx::query("DELETE FROM video_files WHERE file_id = (SELECT id FROM files WHERE uuid = ?)")
         .bind(&uuid)
         .execute(&test.pool)
         .await
@@ -1277,7 +1212,7 @@ async fn given_missing_subtype_row_when_patch_then_error_not_silent_success() {
     let response = app(Settings::default(), test.services)
         .oneshot(patch_metadata(
             &uuid,
-            json!({ "type": "audio", "title": "T" }),
+            json!({ "type": "video", "title": "T" }),
         ))
         .await
         .expect("patch one-shot");
@@ -1295,9 +1230,9 @@ async fn given_corrupt_uuid_row_when_get_files_then_error_not_nil_uuid() {
     // served as though it were real.
     let lib = tempdir().unwrap();
     let test = test_app().await;
-    index_library(&lib, &test.pool, &[("song.mp3", b"audio")]).await;
+    index_library(&lib, &test.pool, &[("memo.txt", b"text")]).await;
 
-    sqlx::query("UPDATE files SET uuid = 'definitely-not-a-uuid' WHERE name = 'song.mp3'")
+    sqlx::query("UPDATE files SET uuid = 'definitely-not-a-uuid' WHERE name = 'memo.txt'")
         .execute(&test.pool)
         .await
         .expect("corrupt the uuid");
@@ -1334,14 +1269,14 @@ fn rename_request(uuid: &str, body: Value) -> Request<Body> {
 #[tokio::test]
 async fn given_indexed_file_when_post_rename_then_200_and_on_disk_and_catalog_updated() {
     let lib = tempdir().unwrap();
-    let a_path = common::write_file(&lib, "song.mp3", b"audio bytes");
+    let a_path = common::write_file(&lib, "memo.txt", b"text bytes");
     let test = test_app().await;
-    index_library(&lib, &test.pool, &[("song.mp3", b"audio bytes")]).await;
+    index_library(&lib, &test.pool, &[("memo.txt", b"text bytes")]).await;
 
-    let uuid = uuid_for_name(&test.pool, "song.mp3").await;
+    let uuid = uuid_for_name(&test.pool, "memo.txt").await;
 
     let response = app(Settings::default(), test.services)
-        .oneshot(rename_request(&uuid, json!({ "name": "renamed.mp3" })))
+        .oneshot(rename_request(&uuid, json!({ "name": "renamed.txt" })))
         .await
         .expect("rename one-shot");
     assert_eq!(response.status(), StatusCode::OK);
@@ -1349,16 +1284,16 @@ async fn given_indexed_file_when_post_rename_then_200_and_on_disk_and_catalog_up
     let body: Value =
         serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
     assert_eq!(body["uuid"], uuid);
-    assert_eq!(body["name"], "renamed.mp3");
+    assert_eq!(body["name"], "renamed.txt");
     assert_eq!(body["state"], "active");
     let new_path = body["path"].as_str().expect("path string");
-    assert!(new_path.ends_with("renamed.mp3"), "path {new_path}");
+    assert!(new_path.ends_with("renamed.txt"), "path {new_path}");
 
     // On-disk file moved (old path gone, new path present with same bytes).
     assert!(!a_path.exists(), "old on-disk path no longer exists");
-    let renamed_path = a_path.with_file_name("renamed.mp3");
+    let renamed_path = a_path.with_file_name("renamed.txt");
     assert!(renamed_path.exists(), "renamed on-disk file exists");
-    assert_eq!(std::fs::read(&renamed_path).unwrap(), b"audio bytes");
+    assert_eq!(std::fs::read(&renamed_path).unwrap(), b"text bytes");
 
     // Catalog row carries the new name + path.
     let row: (String, String) = sqlx::query_as("SELECT name, path FROM files WHERE uuid = ?")
@@ -1366,17 +1301,17 @@ async fn given_indexed_file_when_post_rename_then_200_and_on_disk_and_catalog_up
         .fetch_one(&test.pool)
         .await
         .expect("catalog row");
-    assert_eq!(row.0, "renamed.mp3");
-    assert!(row.1.ends_with("renamed.mp3"));
+    assert_eq!(row.0, "renamed.txt");
+    assert!(row.1.ends_with("renamed.txt"));
 }
 
 #[tokio::test]
 async fn given_invalid_name_when_post_rename_then_400() {
     let lib = tempdir().unwrap();
-    common::write_file(&lib, "song.mp3", b"x");
+    common::write_file(&lib, "memo.txt", b"x");
     let test = test_app().await;
-    index_library(&lib, &test.pool, &[("song.mp3", b"x")]).await;
-    let uuid = uuid_for_name(&test.pool, "song.mp3").await;
+    index_library(&lib, &test.pool, &[("memo.txt", b"x")]).await;
+    let uuid = uuid_for_name(&test.pool, "memo.txt").await;
 
     for bad in ["/slash", "..", "a:b", "name."] {
         let response = app(Settings::default(), test.services.clone())
@@ -1394,10 +1329,10 @@ async fn given_invalid_name_when_post_rename_then_400() {
 #[tokio::test]
 async fn given_missing_body_when_post_rename_then_400() {
     let lib = tempdir().unwrap();
-    common::write_file(&lib, "song.mp3", b"x");
+    common::write_file(&lib, "memo.txt", b"x");
     let test = test_app().await;
-    index_library(&lib, &test.pool, &[("song.mp3", b"x")]).await;
-    let uuid = uuid_for_name(&test.pool, "song.mp3").await;
+    index_library(&lib, &test.pool, &[("memo.txt", b"x")]).await;
+    let uuid = uuid_for_name(&test.pool, "memo.txt").await;
 
     let request = Request::builder()
         .method("POST")
@@ -1420,7 +1355,7 @@ async fn given_missing_uuid_when_post_rename_then_404() {
     let test = test_app().await;
     let missing = uuid::Uuid::new_v4().to_string();
     let response = app(Settings::default(), test.services)
-        .oneshot(rename_request(&missing, json!({ "name": "x.mp3" })))
+        .oneshot(rename_request(&missing, json!({ "name": "x.txt" })))
         .await
         .expect("rename one-shot");
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
@@ -1434,7 +1369,7 @@ async fn given_no_bearer_when_post_rename_then_401() {
         .method("POST")
         .uri(format!("/v1/files/{uuid}/rename"))
         .header("content-type", "application/json")
-        .body(Body::from(json!({ "name": "x.mp3" }).to_string()))
+        .body(Body::from(json!({ "name": "x.txt" }).to_string()))
         .unwrap();
     let response = app(Settings::default(), test.services)
         .oneshot(request)
@@ -1446,10 +1381,10 @@ async fn given_no_bearer_when_post_rename_then_401() {
 #[tokio::test]
 async fn given_soft_deleted_file_when_post_rename_then_409() {
     let lib = tempdir().unwrap();
-    common::write_file(&lib, "song.mp3", b"x");
+    common::write_file(&lib, "memo.txt", b"x");
     let test = test_app().await;
-    index_library(&lib, &test.pool, &[("song.mp3", b"x")]).await;
-    let uuid = uuid_for_name(&test.pool, "song.mp3").await;
+    index_library(&lib, &test.pool, &[("memo.txt", b"x")]).await;
+    let uuid = uuid_for_name(&test.pool, "memo.txt").await;
 
     sqlx::query("UPDATE files SET state = 'deleted', deleted_at = ? WHERE uuid = ?")
         .bind("2024-01-01T00:00:00Z")
@@ -1459,7 +1394,7 @@ async fn given_soft_deleted_file_when_post_rename_then_409() {
         .expect("soft-delete seed");
 
     let response = app(Settings::default(), test.services)
-        .oneshot(rename_request(&uuid, json!({ "name": "renamed.mp3" })))
+        .oneshot(rename_request(&uuid, json!({ "name": "renamed.txt" })))
         .await
         .expect("rename one-shot");
     assert_eq!(response.status(), StatusCode::CONFLICT);
@@ -1468,15 +1403,15 @@ async fn given_soft_deleted_file_when_post_rename_then_409() {
 #[tokio::test]
 async fn given_target_path_owned_by_other_file_when_post_rename_then_500_disk_error() {
     let lib = tempdir().unwrap();
-    common::write_file(&lib, "a.mp3", b"aaa");
-    common::write_file(&lib, "b.mp3", b"bbb");
+    common::write_file(&lib, "a.txt", b"aaa");
+    common::write_file(&lib, "b.txt", b"bbb");
     let test = test_app().await;
-    index_library(&lib, &test.pool, &[("a.mp3", b"aaa"), ("b.mp3", b"bbb")]).await;
+    index_library(&lib, &test.pool, &[("a.txt", b"aaa"), ("b.txt", b"bbb")]).await;
 
-    let uuid_a = uuid_for_name(&test.pool, "a.mp3").await;
+    let uuid_a = uuid_for_name(&test.pool, "a.txt").await;
 
     let response = app(Settings::default(), test.services)
-        .oneshot(rename_request(&uuid_a, json!({ "name": "b.mp3" })))
+        .oneshot(rename_request(&uuid_a, json!({ "name": "b.txt" })))
         .await
         .expect("rename one-shot");
     assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
@@ -1484,8 +1419,8 @@ async fn given_target_path_owned_by_other_file_when_post_rename_then_500_disk_er
         serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
     assert_eq!(body["error"], "disk error");
 
-    let a_path = lib.path().join("a.mp3");
-    assert!(a_path.exists(), "a.mp3 left untouched on disk");
+    let a_path = lib.path().join("a.txt");
+    assert!(a_path.exists(), "a.txt left untouched on disk");
 }
 
 #[tokio::test]
@@ -1527,10 +1462,10 @@ fn delete_file_request(uuid: &str) -> Request<Body> {
 #[tokio::test]
 async fn given_indexed_file_when_delete_file_then_200_and_state_deleted_in_catalog() {
     let lib = tempdir().unwrap();
-    let on_disk = common::write_file(&lib, "song.mp3", b"audio bytes");
+    let on_disk = common::write_file(&lib, "memo.txt", b"text bytes");
     let test = test_app().await;
-    index_library(&lib, &test.pool, &[("song.mp3", b"audio bytes")]).await;
-    let uuid = uuid_for_name(&test.pool, "song.mp3").await;
+    index_library(&lib, &test.pool, &[("memo.txt", b"text bytes")]).await;
+    let uuid = uuid_for_name(&test.pool, "memo.txt").await;
 
     let response = app(Settings::default(), test.services)
         .oneshot(delete_file_request(&uuid))
@@ -1608,10 +1543,10 @@ async fn given_no_bearer_and_malformed_uuid_when_delete_file_then_401_not_400() 
 #[tokio::test]
 async fn given_soft_deleted_file_when_delete_file_then_409() {
     let lib = tempdir().unwrap();
-    common::write_file(&lib, "song.mp3", b"x");
+    common::write_file(&lib, "memo.txt", b"x");
     let test = test_app().await;
-    index_library(&lib, &test.pool, &[("song.mp3", b"x")]).await;
-    let uuid = uuid_for_name(&test.pool, "song.mp3").await;
+    index_library(&lib, &test.pool, &[("memo.txt", b"x")]).await;
+    let uuid = uuid_for_name(&test.pool, "memo.txt").await;
 
     sqlx::query("UPDATE files SET state = 'deleted', deleted_at = ? WHERE uuid = ?")
         .bind("2024-01-01T00:00:00Z")
@@ -1646,10 +1581,10 @@ fn restore_file_request(uuid: &str) -> Request<Body> {
 #[tokio::test]
 async fn given_soft_deleted_file_when_restore_file_then_200_and_state_active_in_catalog() {
     let lib = tempdir().unwrap();
-    let on_disk = common::write_file(&lib, "song.mp3", b"audio bytes");
+    let on_disk = common::write_file(&lib, "memo.txt", b"text bytes");
     let test = test_app().await;
-    index_library(&lib, &test.pool, &[("song.mp3", b"audio bytes")]).await;
-    let uuid = uuid_for_name(&test.pool, "song.mp3").await;
+    index_library(&lib, &test.pool, &[("memo.txt", b"text bytes")]).await;
+    let uuid = uuid_for_name(&test.pool, "memo.txt").await;
 
     // Seed a soft-deleted row whose `deleted_at` is comfortably within the
     // default 30-day retention window (one day ago). The handler must accept
@@ -1737,10 +1672,10 @@ async fn given_no_bearer_and_malformed_uuid_when_restore_file_then_401_not_400()
 #[tokio::test]
 async fn given_active_file_when_restore_file_then_409() {
     let lib = tempdir().unwrap();
-    common::write_file(&lib, "song.mp3", b"x");
+    common::write_file(&lib, "memo.txt", b"x");
     let test = test_app().await;
-    index_library(&lib, &test.pool, &[("song.mp3", b"x")]).await;
-    let uuid = uuid_for_name(&test.pool, "song.mp3").await;
+    index_library(&lib, &test.pool, &[("memo.txt", b"x")]).await;
+    let uuid = uuid_for_name(&test.pool, "memo.txt").await;
 
     // Indexed but never soft-deleted — `state = 'active'` (AF-02 not-deleted).
     let response = app(Settings::default(), test.services)
@@ -1756,10 +1691,10 @@ async fn given_soft_deleted_file_past_retention_when_restore_file_then_404() {
     // not-found (UC-08 owns the actual hard purge; before it runs the row
     // still exists, so the elapsed check is what UC-07 surfaces as 404).
     let lib = tempdir().unwrap();
-    common::write_file(&lib, "song.mp3", b"x");
+    common::write_file(&lib, "memo.txt", b"x");
     let test = test_app().await;
-    index_library(&lib, &test.pool, &[("song.mp3", b"x")]).await;
-    let uuid = uuid_for_name(&test.pool, "song.mp3").await;
+    index_library(&lib, &test.pool, &[("memo.txt", b"x")]).await;
+    let uuid = uuid_for_name(&test.pool, "memo.txt").await;
 
     // `deleted_at` well before the 30-day default retention window.
     sqlx::query("UPDATE files SET state = 'deleted', deleted_at = ? WHERE uuid = ?")
@@ -1809,10 +1744,10 @@ fn purge_file_request(uuid: &str) -> Request<Body> {
 async fn given_soft_deleted_file_past_retention_when_purged_then_200_and_rows_removed_and_disk_preserved(
 ) {
     let lib = tempdir().unwrap();
-    let on_disk = common::write_file(&lib, "song.mp3", b"audio bytes");
+    let on_disk = common::write_file(&lib, "memo.txt", b"text bytes");
     let test = test_app().await;
-    index_library(&lib, &test.pool, &[("song.mp3", b"audio bytes")]).await;
-    let uuid = uuid_for_name(&test.pool, "song.mp3").await;
+    index_library(&lib, &test.pool, &[("memo.txt", b"text bytes")]).await;
+    let uuid = uuid_for_name(&test.pool, "memo.txt").await;
 
     // `deleted_at` well past the default 30-day retention window.
     sqlx::query("UPDATE files SET state = 'deleted', deleted_at = ? WHERE uuid = ?")
@@ -1850,13 +1785,13 @@ async fn given_soft_deleted_file_past_retention_when_purged_then_200_and_rows_re
         .expect("files count");
     assert_eq!(remaining.0, 0, "files row removed by purge");
 
-    // The subtype row (audio_files) is also gone.
+    // The subtype row (text_files) is also gone.
     let subtype_remaining: (i64,) =
-        sqlx::query_as("SELECT COUNT(*) FROM audio_files WHERE file_id = ?")
+        sqlx::query_as("SELECT COUNT(*) FROM text_files WHERE file_id = ?")
             .bind(file_id.0)
             .fetch_one(&test.pool)
             .await
-            .expect("audio_files count");
+            .expect("text_files count");
     assert_eq!(subtype_remaining.0, 0, "subtype row removed by purge");
 
     // The on-disk file is untouched (NFR-07; purge-on-disk is UC-09).
@@ -1866,10 +1801,10 @@ async fn given_soft_deleted_file_past_retention_when_purged_then_200_and_rows_re
 #[tokio::test]
 async fn given_soft_deleted_file_within_retention_when_purged_then_409_and_row_kept() {
     let lib = tempdir().unwrap();
-    common::write_file(&lib, "song.mp3", b"x");
+    common::write_file(&lib, "memo.txt", b"x");
     let test = test_app().await;
-    index_library(&lib, &test.pool, &[("song.mp3", b"x")]).await;
-    let uuid = uuid_for_name(&test.pool, "song.mp3").await;
+    index_library(&lib, &test.pool, &[("memo.txt", b"x")]).await;
+    let uuid = uuid_for_name(&test.pool, "memo.txt").await;
 
     // `deleted_at` comfortably within the default 30-day retention window.
     sqlx::query("UPDATE files SET state = 'deleted', deleted_at = ? WHERE uuid = ?")
@@ -1901,10 +1836,10 @@ async fn given_soft_deleted_file_within_retention_when_purged_then_409_and_row_k
 #[tokio::test]
 async fn given_active_file_when_purged_then_409() {
     let lib = tempdir().unwrap();
-    common::write_file(&lib, "song.mp3", b"x");
+    common::write_file(&lib, "memo.txt", b"x");
     let test = test_app().await;
-    index_library(&lib, &test.pool, &[("song.mp3", b"x")]).await;
-    let uuid = uuid_for_name(&test.pool, "song.mp3").await;
+    index_library(&lib, &test.pool, &[("memo.txt", b"x")]).await;
+    let uuid = uuid_for_name(&test.pool, "memo.txt").await;
 
     // Indexed but never soft-deleted — `state = 'active'` (AF-01: never
     // started a retention window).
@@ -1988,10 +1923,10 @@ async fn given_no_purge_param_when_delete_then_still_soft_deletes() {
     // Regression guard for UC-06: the bare `DELETE /v1/files/{uuid}` form
     // (no `purge` query param) must still soft-delete, not hard-purge.
     let lib = tempdir().unwrap();
-    let on_disk = common::write_file(&lib, "song.mp3", b"audio bytes");
+    let on_disk = common::write_file(&lib, "memo.txt", b"text bytes");
     let test = test_app().await;
-    index_library(&lib, &test.pool, &[("song.mp3", b"audio bytes")]).await;
-    let uuid = uuid_for_name(&test.pool, "song.mp3").await;
+    index_library(&lib, &test.pool, &[("memo.txt", b"text bytes")]).await;
+    let uuid = uuid_for_name(&test.pool, "memo.txt").await;
 
     let response = app(Settings::default(), test.services)
         .oneshot(delete_file_request(&uuid))
@@ -2032,10 +1967,10 @@ fn purge_on_disk_request(uuid: &str) -> Request<Body> {
 #[tokio::test]
 async fn given_active_file_when_purge_on_disk_then_200_and_rows_and_disk_file_removed() {
     let lib = tempdir().unwrap();
-    let on_disk = common::write_file(&lib, "song.mp3", b"audio bytes");
+    let on_disk = common::write_file(&lib, "memo.txt", b"text bytes");
     let test = test_app().await;
-    index_library(&lib, &test.pool, &[("song.mp3", b"audio bytes")]).await;
-    let uuid = uuid_for_name(&test.pool, "song.mp3").await;
+    index_library(&lib, &test.pool, &[("memo.txt", b"text bytes")]).await;
+    let uuid = uuid_for_name(&test.pool, "memo.txt").await;
 
     // Never soft-deleted (`state = 'active'`) — UC-09 has no retention gate,
     // unlike UC-08.
@@ -2068,11 +2003,11 @@ async fn given_active_file_when_purge_on_disk_then_200_and_rows_and_disk_file_re
     assert_eq!(remaining.0, 0, "files row removed by purge-on-disk");
 
     let subtype_remaining: (i64,) =
-        sqlx::query_as("SELECT COUNT(*) FROM audio_files WHERE file_id = ?")
+        sqlx::query_as("SELECT COUNT(*) FROM text_files WHERE file_id = ?")
             .bind(file_id.0)
             .fetch_one(&test.pool)
             .await
-            .expect("audio_files count");
+            .expect("text_files count");
     assert_eq!(
         subtype_remaining.0, 0,
         "subtype row removed by purge-on-disk"
@@ -2085,10 +2020,10 @@ async fn given_active_file_when_purge_on_disk_then_200_and_rows_and_disk_file_re
 async fn given_missing_disk_file_when_purge_on_disk_then_200_disk_file_present_false_and_row_removed(
 ) {
     let lib = tempdir().unwrap();
-    let on_disk = common::write_file(&lib, "song.mp3", b"audio bytes");
+    let on_disk = common::write_file(&lib, "memo.txt", b"text bytes");
     let test = test_app().await;
-    index_library(&lib, &test.pool, &[("song.mp3", b"audio bytes")]).await;
-    let uuid = uuid_for_name(&test.pool, "song.mp3").await;
+    index_library(&lib, &test.pool, &[("memo.txt", b"text bytes")]).await;
+    let uuid = uuid_for_name(&test.pool, "memo.txt").await;
 
     // The file was deleted out from under the catalog (AF-01).
     std::fs::remove_file(&on_disk).expect("pre-remove on-disk file");
@@ -2120,10 +2055,10 @@ async fn given_missing_disk_file_when_purge_on_disk_then_200_disk_file_present_f
 #[tokio::test]
 async fn given_disk_delete_failure_when_purge_on_disk_then_500_disk_error_and_row_kept() {
     let lib = tempdir().unwrap();
-    let on_disk = common::write_file(&lib, "song.mp3", b"audio bytes");
+    let on_disk = common::write_file(&lib, "memo.txt", b"text bytes");
     let test = test_app().await;
-    index_library(&lib, &test.pool, &[("song.mp3", b"audio bytes")]).await;
-    let uuid = uuid_for_name(&test.pool, "song.mp3").await;
+    index_library(&lib, &test.pool, &[("memo.txt", b"text bytes")]).await;
+    let uuid = uuid_for_name(&test.pool, "memo.txt").await;
 
     let file_id: (i64,) = sqlx::query_as("SELECT id FROM files WHERE uuid = ?")
         .bind(&uuid)
@@ -2158,11 +2093,11 @@ async fn given_disk_delete_failure_when_purge_on_disk_then_500_disk_error_and_ro
     );
 
     let subtype_remaining: (i64,) =
-        sqlx::query_as("SELECT COUNT(*) FROM audio_files WHERE file_id = ?")
+        sqlx::query_as("SELECT COUNT(*) FROM text_files WHERE file_id = ?")
             .bind(file_id.0)
             .fetch_one(&test.pool)
             .await
-            .expect("audio_files count");
+            .expect("text_files count");
     assert_eq!(
         subtype_remaining.0, 1,
         "AF-02: subtype row kept when the disk delete fails"
@@ -2261,13 +2196,13 @@ fn index_request_with_types(root: &str, types: &[&str]) -> Request<Body> {
         .unwrap()
 }
 
-/// The owner's symptom over HTTP: a music folder whose cover art would
+/// The owner's symptom over HTTP: a folder of notes whose picture would
 /// otherwise make it an image library too.
 #[tokio::test]
-async fn given_an_audio_scope_when_index_posted_then_only_the_audio_is_recorded() {
+async fn given_a_text_scope_when_index_posted_then_only_the_text_is_recorded() {
     let lib = tempdir().unwrap();
-    common::write_file(&lib, "song.flac", b"audio bytes");
-    common::write_file(&lib, "cover.jpg", b"image bytes");
+    common::write_file(&lib, "memo.txt", b"text bytes");
+    common::write_file(&lib, "cover.png", b"image bytes");
 
     let test = test_app().await;
     let router = app(Settings::default(), test.services.clone());
@@ -2275,7 +2210,7 @@ async fn given_an_audio_scope_when_index_posted_then_only_the_audio_is_recorded(
     let response = router
         .oneshot(index_request_with_types(
             lib.path().to_str().unwrap(),
-            &["audio"],
+            &["text"],
         ))
         .await
         .expect("one-shot");
@@ -2288,14 +2223,14 @@ async fn given_an_audio_scope_when_index_posted_then_only_the_audio_is_recorded(
     // anything — until then it only means the walk has not reached it yet.
     let run = wait_for_run_terminal(&test.services, &run_id, common::TEST_TOKEN).await;
     assert_eq!(run["status"], "complete");
-    assert_eq!(run["skipped"], 1, "the cover art was skipped, not failed");
+    assert_eq!(run["skipped"], 1, "the picture was skipped, not failed");
     assert_eq!(run["failed"], 0);
 
     let rows = file_rows(&test.pool).await;
     assert_eq!(
         rows.iter().map(|r| r.1.as_str()).collect::<Vec<_>>(),
-        vec!["song.flac"],
-        "the cover art is out of scope and must not be catalogued"
+        vec!["memo.txt"],
+        "the picture is out of scope and must not be catalogued"
     );
 }
 
@@ -2304,8 +2239,8 @@ async fn given_an_audio_scope_when_index_posted_then_only_the_audio_is_recorded(
 #[tokio::test]
 async fn given_no_types_when_index_posted_then_every_type_is_recorded() {
     let lib = tempdir().unwrap();
-    common::write_file(&lib, "song.flac", b"audio bytes");
-    common::write_file(&lib, "cover.jpg", b"image bytes");
+    common::write_file(&lib, "memo.txt", b"text bytes");
+    common::write_file(&lib, "cover.png", b"image bytes");
 
     let test = test_app().await;
     let router = app(Settings::default(), test.services);
@@ -2326,8 +2261,8 @@ async fn given_no_types_when_index_posted_then_every_type_is_recorded() {
 #[tokio::test]
 async fn given_an_empty_types_array_when_index_posted_then_every_type_is_recorded() {
     let lib = tempdir().unwrap();
-    common::write_file(&lib, "song.flac", b"audio bytes");
-    common::write_file(&lib, "cover.jpg", b"image bytes");
+    common::write_file(&lib, "memo.txt", b"text bytes");
+    common::write_file(&lib, "cover.png", b"image bytes");
 
     let test = test_app().await;
     let router = app(Settings::default(), test.services);
@@ -2350,7 +2285,7 @@ async fn given_an_empty_types_array_when_index_posted_then_every_type_is_recorde
 #[tokio::test]
 async fn given_an_unknown_type_when_index_posted_then_400_and_no_run_started() {
     let lib = tempdir().unwrap();
-    common::write_file(&lib, "song.flac", b"audio bytes");
+    common::write_file(&lib, "memo.txt", b"text bytes");
 
     let test = test_app().await;
     let router = app(Settings::default(), test.services);
@@ -2384,7 +2319,7 @@ async fn given_an_unknown_type_when_index_posted_then_400_and_no_run_started() {
 #[tokio::test]
 async fn given_no_bearer_and_an_unknown_type_when_index_posted_then_401_not_400() {
     let lib = tempdir().unwrap();
-    common::write_file(&lib, "song.flac", b"audio bytes");
+    common::write_file(&lib, "memo.txt", b"text bytes");
 
     let test = test_app().await;
     let request = Request::builder()

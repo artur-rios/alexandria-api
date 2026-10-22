@@ -7,8 +7,13 @@ members = [
 resolver = "2"
 
 [workspace.package]
-# 0.4.0 — an artist's picture asked for by name, so the name a client shows
-# and the name a picture is stored under are the same one.
+# 0.5.0 — music and audio removed (migration 25): the `audio` file type,
+# playlists, play history, enrichment and the energy envelope are gone, and
+# music now lives in Orpheus. Routes and FFI exports that served them are
+# removed, so a client built against 0.4 is refused.
+#
+# Previously 0.4.0 — an artist's picture asked for by name, so the name a
+# client shows and the name a picture is stored under are the same one.
 #
 # Previously 0.3.0 — the energy envelope (migration 23, FR-MP-07): the sound of
 # a track, measured once and read back at the position playing.
@@ -22,7 +27,7 @@ resolver = "2"
 # between an owner running a stale library and a feature that quietly does
 # nothing — which is exactly what a schema this release adds to, and a lookup
 # this release changes the shape of, would otherwise look like.
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 # Floor set by sqlx 0.9, the highest MSRV in the dependency graph.
 rust-version = "1.94"
@@ -62,10 +67,8 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png",
 # `sha2` out of that feature are what actually get used.
 jsonwebtoken = { version = "11", features = ["rust_crypto"] }
 kamadak-exif = "0.6"
-lofty = "0.25"
 lopdf = "0.45"
 quick-xml = "0.42"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.11"

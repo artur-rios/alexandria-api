@@ -1,4 +1,3 @@
-pub mod audio_tags;
 pub mod classify;
 pub mod clock;
 pub mod comic_tags;
@@ -18,8 +17,8 @@ pub mod video_tags;
 
 /// Run a blocking best-effort metadata read on Tokio's blocking pool.
 ///
-/// Every real `*MetadataReader` parses the file synchronously — lofty probes,
-/// EXIF reads, PDF and ZIP parsing, ffmpeg container probes. Called straight
+/// Every real `*MetadataReader` parses the file synchronously — EXIF reads,
+/// PDF and ZIP parsing, ffmpeg container probes. Called straight
 /// from `async fn read`, each one parks a runtime worker for as long as the
 /// parse takes, and the indexer now has several files in flight at once
 /// (`IndexHandler`'s `concurrency`), so those stalls would compound into

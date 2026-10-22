@@ -41,89 +41,6 @@ fn seeded(
     (uuid, repo, h)
 }
 
-// ---------- Audio (FR-FC-14) ----------
-
-#[tokio::test]
-async fn given_active_audio_file_when_edit_audio_metadata_then_metadata_replaced() {
-    let (uuid, repo, h) = seeded(FileType::Audio);
-    let metadata = SubtypeMetadata::Audio {
-        title: Some("Song".into()),
-        artist: Some("Artist".into()),
-        album: None,
-        year: Some(2001),
-        genre: Some("Rock".into()),
-        track: Some(3),
-        album_artist: Some("Various Artists".into()),
-    };
-
-    let result = h.edit(uuid, metadata.clone(), TOKEN).await.expect("edit");
-
-    assert_eq!(result.file.uuid, uuid);
-    assert_eq!(result.file.file_type, FileType::Audio);
-    assert_eq!(result.file.state, FileState::Active);
-    assert_eq!(
-        result.metadata, metadata,
-        "handler echoes the written metadata"
-    );
-    assert_eq!(
-        repo.metadata_for(uuid),
-        Some(metadata),
-        "repo got the metadata"
-    );
-}
-
-/// FR-FC-14 / the design (issue #120): `album_artist` is settable and, on a
-/// later PATCH that omits it, clearable — and clearing it must actually
-/// write `None` back to the repo, not merely skip an already-absent field,
-/// since a PATCH is a full replace (every other field's own tests already
-/// establish this; this one pins it for the field this branch adds).
-#[tokio::test]
-async fn given_audio_file_with_album_artist_when_cleared_then_none_persisted() {
-    let (uuid, repo, h) = seeded(FileType::Audio);
-    let with_album_artist = SubtypeMetadata::Audio {
-        title: Some("Song".into()),
-        artist: Some("Artist".into()),
-        album: None,
-        year: None,
-        genre: None,
-        track: None,
-        album_artist: Some("Various Artists".into()),
-    };
-    h.edit(uuid, with_album_artist, TOKEN)
-        .await
-        .expect("first edit sets album_artist");
-    assert_eq!(
-        repo.metadata_for(uuid).and_then(|m| match m {
-            SubtypeMetadata::Audio { album_artist, .. } => album_artist,
-            _ => None,
-        }),
-        Some("Various Artists".to_string())
-    );
-
-    let cleared = SubtypeMetadata::Audio {
-        title: Some("Song".into()),
-        artist: Some("Artist".into()),
-        album: None,
-        year: None,
-        genre: None,
-        track: None,
-        album_artist: None,
-    };
-    h.edit(uuid, cleared, TOKEN)
-        .await
-        .expect("second edit clears album_artist");
-
-    match repo.metadata_for(uuid) {
-        Some(SubtypeMetadata::Audio { album_artist, .. }) => {
-            assert_eq!(
-                album_artist, None,
-                "clearing must overwrite the previously-set value, not leave it stale"
-            );
-        }
-        other => panic!("expected audio metadata, got {other:?}"),
-    }
-}
-
 // ---------- Video (FR-FC-15) ----------
 
 #[tokio::test]
@@ -212,8 +129,8 @@ async fn given_active_image_file_when_edit_image_metadata_then_metadata_replaced
 // ---------- AF-01: fields don't match the file's subtype ----------
 
 #[tokio::test]
-async fn given_audio_file_when_edit_with_video_metadata_then_invalid_input() {
-    let (uuid, _repo, h) = seeded(FileType::Audio);
+async fn given_document_file_when_edit_with_video_metadata_then_invalid_input() {
+    let (uuid, _repo, h) = seeded(FileType::Document);
     let video = SubtypeMetadata::Video {
         title: Some("x".into()),
         year: None,
@@ -248,19 +165,16 @@ async fn given_image_file_when_edit_with_document_metadata_then_invalid_input() 
 async fn given_text_file_when_edit_with_any_metadata_then_invalid_input() {
     // Text files have no editable subtype metadata via UC-04; any PATCH is
     // rejected at the handler because no SubtypeMetadata variant matches
-    // Text. We pass an Audio body — the type check rejects it.
+    // Text. We pass a Video body — the type check rejects it.
     let (uuid, _repo, h) = seeded(FileType::Text);
-    let audio = SubtypeMetadata::Audio {
+    let video = SubtypeMetadata::Video {
         title: None,
-        artist: None,
-        album: None,
         year: None,
-        genre: None,
-        track: None,
-        album_artist: None,
+        resolution: None,
+        media_kind: None,
     };
 
-    let result = h.edit(uuid, audio, TOKEN).await;
+    let result = h.edit(uuid, video, TOKEN).await;
     assert!(
         matches!(result, Err(DomainError::InvalidInput(_))),
         "text has no editable subtype metadata"
@@ -286,17 +200,14 @@ async fn given_missing_uuid_when_edit_then_not_found() {
     let repo = FakeCatalogRepository::new();
     let h = handler(FakeAuth::Allowing, repo);
     let uuid = Uuid::new_v4();
-    let audio = SubtypeMetadata::Audio {
+    let video = SubtypeMetadata::Video {
         title: Some("x".into()),
-        artist: None,
-        album: None,
         year: None,
-        genre: None,
-        track: None,
-        album_artist: None,
+        resolution: None,
+        media_kind: None,
     };
 
-    let result = h.edit(uuid, audio, TOKEN).await;
+    let result = h.edit(uuid, video, TOKEN).await;
     assert!(matches!(result, Err(DomainError::NotFound)));
 }
 
@@ -306,17 +217,14 @@ async fn given_missing_uuid_when_edit_then_not_found() {
 async fn given_unauthenticated_when_edit_then_unauthorized() {
     let repo = FakeCatalogRepository::new();
     let h = handler(FakeAuth::Denying, repo);
-    let audio = SubtypeMetadata::Audio {
+    let video = SubtypeMetadata::Video {
         title: None,
-        artist: None,
-        album: None,
         year: None,
-        genre: None,
-        track: None,
-        album_artist: None,
+        resolution: None,
+        media_kind: None,
     };
 
-    let result = h.edit(Uuid::new_v4(), audio, "").await;
+    let result = h.edit(Uuid::new_v4(), video, "").await;
     assert!(matches!(result, Err(DomainError::Unauthorized)));
 }
 
@@ -325,22 +233,19 @@ async fn given_unauthenticated_when_edit_then_unauthorized() {
 #[tokio::test]
 async fn given_deleted_file_when_edit_then_invalid_state() {
     let repo = FakeCatalogRepository::new();
-    let file = deleted_file("/lib/d", "d", FileType::Audio);
+    let file = deleted_file("/lib/d", "d", FileType::Video);
     let uuid = file.uuid;
     repo.seed(file);
     let h = handler(FakeAuth::Allowing, repo);
 
-    let audio = SubtypeMetadata::Audio {
+    let video = SubtypeMetadata::Video {
         title: Some("x".into()),
-        artist: None,
-        album: None,
         year: None,
-        genre: None,
-        track: None,
-        album_artist: None,
+        resolution: None,
+        media_kind: None,
     };
 
-    let result = h.edit(uuid, audio, TOKEN).await;
+    let result = h.edit(uuid, video, TOKEN).await;
     assert!(
         matches!(result, Err(DomainError::InvalidState)),
         "editing a deleted file's metadata must require restore (UC-07)"

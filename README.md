@@ -1,10 +1,11 @@
 # Alexandria API
 
 A fast, type-aware personal library back-end written in Rust. Alexandria indexes,
-organizes, and surfaces a single user's on-disk media and documents — audio,
+organizes, and surfaces a single user's on-disk things to read and watch —
 movies and series, HTML pages, Markdown and text files, PDFs and e-books, comic
 books, images, and browser bookmarks — without re-encoding, duplicating, or
-relocating them. The domain logic lives in a reusable Rust core library exposed
+relocating them. Music is not part of Alexandria; it lives in Orpheus, a
+separate project. The domain logic lives in a reusable Rust core library exposed
 over both an HTTP/REST-JSON API and a Flutter FFI surface, so any client in any
 language can drive it and the Flutter desktop front-end can call it in-process.
 
@@ -33,17 +34,14 @@ its open/closed state, so the tables stay in sync with the board automatically.
 | [F-07 Watchlists](https://github.com/artur-rios/alexandria-api/milestone/8) | UC-20 … UC-25 | 6 / 6 |
 | [F-08 Reading lists](https://github.com/artur-rios/alexandria-api/milestone/9) | UC-26 … UC-31 | 6 / 6 |
 | [F-09 Pluggable authentication](https://github.com/artur-rios/alexandria-api/milestone/10) | UC-34 … UC-36, UC-41 | 4 / 4 |
-| [F-10 Media playback](https://github.com/artur-rios/alexandria-api/milestone/11) | UC-38 … UC-40, and the energy envelope | 4 / 4 |
-| F-11 Playlists | UC-49 … UC-50 | 2 / 2 |
+| [F-10 Media playback](https://github.com/artur-rios/alexandria-api/milestone/11) | UC-38 … UC-40 | 3 / 3 |
 | F-12 Libraries | UC-51 | 1 / 1 |
-| F-13 Music enrichment | Lyrics and artist photography | 1 / 1 |
-| F-14 Play history | Recording a play, and the rankings | 1 / 1 |
-| **Total** | | **50 / 50** |
+| **Total** | | **46 / 46** |
 
-The last four carry no milestone links and no issue numbers, and that is
-honest rather than an omission: they were built from design documents in
+The last one carries no milestone link and no issue number, and that is
+honest rather than an omission: it was built from a design document in
 `docs/superpowers/specs/` rather than from the issue-per-use-case backlog the
-first eleven follow. What they are not is undocumented — each has its
+first eleven follow. What it is not is undocumented — it has its
 requirements in
 [System Requirements Document §3](docs/requirements/System%20Requirements%20Document.md)
 and its routes in §5, which is what the tables below trace against.
@@ -78,7 +76,7 @@ Read the catalog and edit type-specific metadata.
 | Issue | Use case | Status | Title | Requirements |
 | --- | --- | :---: | --- | --- |
 | [#4](https://github.com/artur-rios/alexandria-api/issues/4) | UC-03 | &#9745; | Browse and view file metadata | FR-FC-12, FR-FC-13, FR-FC-24 |
-| [#5](https://github.com/artur-rios/alexandria-api/issues/5) | UC-04 | &#9745; | Edit file metadata | FR-FC-14 … FR-FC-18, FR-FC-24 |
+| [#5](https://github.com/artur-rios/alexandria-api/issues/5) | UC-04 | &#9745; | Edit file metadata | FR-FC-15 … FR-FC-18, FR-FC-24 |
 
 ### F-03 — Renaming & lifecycle management
 
@@ -176,17 +174,6 @@ Serve file bytes to the front-end, plus comic pages and thumbnails.
 | [#90](https://github.com/artur-rios/alexandria-api/issues/90) | UC-38 | &#9745; | Stream file content | FR-MP-01, FR-MP-02, FR-MP-03, FR-MP-06 |
 | [#91](https://github.com/artur-rios/alexandria-api/issues/91) | UC-39 | &#9745; | Read a comic book page | FR-MP-03, FR-MP-04, FR-MP-06 |
 | [#92](https://github.com/artur-rios/alexandria-api/issues/92) | UC-40 | &#9745; | Get a file thumbnail | FR-MP-05, FR-MP-06 |
-| — | — | &#9745; | Measure a track's energy envelope | FR-MP-07 |
-
-### F-11 — Playlists
-
-Named, ordered groupings of audio tracks — audio's counterpart to watchlists
-and reading lists.
-
-| Issue | Use case | Status | Title | Requirements |
-| --- | --- | :---: | --- | --- |
-| — | UC-49 | &#9745; | Manage a playlist | FR-TR-01 … FR-TR-11 |
-| — | UC-50 | &#9745; | Play a playlist | FR-TR-07, FR-TR-11 |
 
 ### F-12 — Libraries
 
@@ -196,23 +183,6 @@ type panels.
 | Issue | Use case | Status | Title | Requirements |
 | --- | --- | :---: | --- | --- |
 | — | UC-51 | &#9745; | Group a folder as a library | FR-FC-36 … FR-FC-41 |
-
-### F-13 — Music enrichment
-
-The one area that reaches services outside this machine: a track's words and
-an artist's photograph, looked up once and kept.
-
-| Issue | Use case | Status | Title | Requirements |
-| --- | --- | :---: | --- | --- |
-| — | — | &#9745; | Look up lyrics and artist photography | FR-EN-01 … FR-EN-09 |
-
-### F-14 — Play history
-
-What was played, and the rankings built from it.
-
-| Issue | Use case | Status | Title | Requirements |
-| --- | --- | :---: | --- | --- |
-| — | — | &#9745; | Record a play and rank what was played most | FR-PH-01 … FR-PH-10 |
 
 To update the tables: when an issue closes, flip its marker from **&#9744;** to
 **&#9745;** and bump the milestone's progress count. The issue number references
@@ -354,6 +324,7 @@ progress, and local-auth accounts. Export or note whatever you need first.
 | Change | Effect |
 | --- | --- |
 | `size_bytes`/`mtime` change detection replaced full-file hashing (FR-FC-09), and the run record gained progress, pause, priority, and segment columns (UC-42) | Both baselines amended. Delete the database and re-index. |
+| Music and audio removed (0.5.0): Alexandria no longer catalogs audio files, and music now lives in Orpheus, a separate project. Migration 25 deletes the stored music — audio files, tags, lyrics, artist photography records, play history, playlists, and track energy — and removes `audio` from any recorded index run | No database deletion needed; the migration runs on startup. Files on disk are never touched. The `[metadata]` config section is ignored if still present. |
 
 ### Health check
 

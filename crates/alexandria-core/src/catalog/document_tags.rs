@@ -34,8 +34,8 @@ pub trait DocumentMetadataReader: Send + Sync {
 /// `epub` crate) — 2 of the 5 extensions `classify_by_extension` maps to
 /// `FileType::Document`. `.mobi`/`.azw`/`.azw3` (proprietary Amazon Kindle
 /// formats) have no workable pure-Rust library and always yield `None` —
-/// the same graceful degradation the audio and image slices established
-/// for `.wma` and non-EXIF image formats.
+/// the same graceful degradation the image slice established for non-EXIF
+/// image formats.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct PdfEpubMetadataReader;
 

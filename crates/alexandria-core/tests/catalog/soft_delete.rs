@@ -36,7 +36,7 @@ fn seeded(
     SoftDeleteFileHandler<FakeAuth, FakeCatalogRepository, FixedClock>,
 ) {
     let repo = FakeCatalogRepository::new();
-    let file = existing_file(path, alexandria_core::catalog::model::FileType::Audio);
+    let file = existing_file(path, alexandria_core::catalog::model::FileType::Text);
     let uuid = file.uuid;
     repo.seed(file);
     let clock = fixed_clock(now());
@@ -58,7 +58,7 @@ fn seeded_deleted(
     let file = deleted_file(
         path,
         "seedy",
-        alexandria_core::catalog::model::FileType::Audio,
+        alexandria_core::catalog::model::FileType::Text,
     );
     let uuid = file.uuid;
     repo.seed(file);
@@ -71,7 +71,7 @@ fn seeded_deleted(
 
 #[tokio::test]
 async fn given_active_file_when_soft_delete_then_state_deleted_deleted_at_set_and_returned() {
-    let (uuid, repo, clock, h) = seeded("/lib/song.mp3");
+    let (uuid, repo, clock, h) = seeded("/lib/memo.txt");
 
     let result = h.soft_delete(uuid, TOKEN).await.expect("soft_delete");
 
@@ -88,7 +88,7 @@ async fn given_active_file_when_soft_delete_then_clock_value_taken_as_deleted_at
     // A distinct, obviously-different timestamp confirms the handler uses the
     // clock rather than (e.g.) `Utc::now()` or the file's `indexed_at`.
     let stamp = DateTime::from_timestamp(1_700_000_500, 0).unwrap();
-    let (uuid, repo, _clock, _h) = seeded("/lib/song.mp3");
+    let (uuid, repo, _clock, _h) = seeded("/lib/memo.txt");
     let h = SoftDeleteFileHandler::new(FakeAuth::Allowing, repo.clone(), fixed_clock(stamp));
 
     let result = h.soft_delete(uuid, TOKEN).await.expect("soft_delete");
@@ -101,7 +101,7 @@ async fn given_active_file_when_soft_delete_then_clock_value_taken_as_deleted_at
 
 #[tokio::test]
 async fn given_missing_uuid_when_soft_delete_then_not_found() {
-    let (_uuid, _repo, _clock, h) = seeded("/lib/song.mp3");
+    let (_uuid, _repo, _clock, h) = seeded("/lib/memo.txt");
     let other_uuid = uuid::Uuid::new_v4();
 
     let result = h.soft_delete(other_uuid, TOKEN).await;
@@ -113,7 +113,7 @@ async fn given_missing_uuid_when_soft_delete_then_not_found() {
 
 #[tokio::test]
 async fn given_unauthenticated_when_soft_delete_then_unauthorized_and_no_state_change() {
-    let (uuid, repo, _clock, _h) = seeded("/lib/song.mp3");
+    let (uuid, repo, _clock, _h) = seeded("/lib/memo.txt");
     let h = handler(FakeAuth::Denying, repo.clone(), fixed_clock(now()));
 
     let result = h.soft_delete(uuid, "").await;
@@ -128,7 +128,7 @@ async fn given_unauthenticated_when_soft_delete_then_unauthorized_and_no_state_c
 
 #[tokio::test]
 async fn given_deleted_file_when_soft_delete_then_invalid_state() {
-    let (uuid, repo, _clock, h) = seeded_deleted("/lib/song.mp3");
+    let (uuid, repo, _clock, h) = seeded_deleted("/lib/memo.txt");
 
     let result = h.soft_delete(uuid, TOKEN).await;
 
@@ -148,7 +148,7 @@ async fn given_deleted_file_when_soft_delete_then_invalid_state() {
 
 #[tokio::test]
 async fn given_soft_delete_when_repo_write_fails_then_error_propagated_and_state_unchanged() {
-    let (uuid, repo, _clock, _h) = seeded("/lib/song.mp3");
+    let (uuid, repo, _clock, _h) = seeded("/lib/memo.txt");
     repo.fail_soft_delete(uuid);
     let h = handler(FakeAuth::Allowing, repo.clone(), fixed_clock(now()));
 

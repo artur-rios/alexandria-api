@@ -327,8 +327,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let odd = dir.path().join(OsStr::from_bytes(b"caf\xe9"));
         std::fs::create_dir(&odd).expect("non-UTF-8 folder");
-        std::fs::write(odd.join("song.mp3"), b"x").expect("write");
-        std::fs::write(dir.path().join("plain.mp3"), b"x").expect("write");
+        std::fs::write(odd.join("notes.txt"), b"x").expect("write");
+        std::fs::write(dir.path().join("plain.txt"), b"x").expect("write");
 
         let entries = StdFilesystem
             .list_files(dir.path().to_str().expect("utf-8 root"))
@@ -336,7 +336,7 @@ mod tests {
             .expect("walk");
 
         let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
-        assert_eq!(names, vec!["plain.mp3"]);
+        assert_eq!(names, vec!["plain.txt"]);
         assert!(
             entries.iter().all(|e| !e.path.contains('\u{FFFD}')),
             "a path was stored lossily"

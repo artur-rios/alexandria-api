@@ -47,7 +47,7 @@ fn seeded_deleted_at(
     let file = deleted_file_at(
         path,
         "seedy",
-        alexandria_core::catalog::model::FileType::Audio,
+        alexandria_core::catalog::model::FileType::Text,
         deleted_at,
     );
     let uuid = file.uuid;
@@ -70,7 +70,7 @@ fn seeded_deleted_at(
 async fn given_deleted_file_within_retention_when_restore_then_state_active_deleted_at_cleared_in_result_and_persisted(
 ) {
     let (uuid, repo, _clock, h) =
-        seeded_deleted_at("/lib/song.mp3", RETENTION - Duration::seconds(1000));
+        seeded_deleted_at("/lib/memo.txt", RETENTION - Duration::seconds(1000));
 
     let result = h.restore(uuid, TOKEN).await.expect("restore");
 
@@ -87,7 +87,7 @@ async fn given_deleted_file_within_retention_when_restore_then_state_active_dele
 #[tokio::test]
 async fn given_deleted_file_past_retention_when_restore_then_not_found() {
     let (uuid, repo, _clock, h) =
-        seeded_deleted_at("/lib/song.mp3", RETENTION + Duration::seconds(1));
+        seeded_deleted_at("/lib/memo.txt", RETENTION + Duration::seconds(1));
 
     let result = h.restore(uuid, TOKEN).await;
 
@@ -101,7 +101,7 @@ async fn given_deleted_file_past_retention_when_restore_then_not_found() {
 async fn given_deleted_file_exactly_on_retention_boundary_when_restore_then_restored() {
     // Boundary is inclusive: exactly retention_days ago is the last
     // restorable moment, one tick more is past retention (AF-01).
-    let (uuid, _repo, _clock, h) = seeded_deleted_at("/lib/song.mp3", RETENTION);
+    let (uuid, _repo, _clock, h) = seeded_deleted_at("/lib/memo.txt", RETENTION);
 
     let result = h.restore(uuid, TOKEN).await;
 
@@ -118,7 +118,7 @@ async fn given_deleted_file_exactly_on_retention_boundary_when_restore_then_rest
 #[tokio::test]
 async fn given_missing_uuid_when_restore_then_not_found() {
     let (_uuid, _repo, _clock, h) =
-        seeded_deleted_at("/lib/song.mp3", RETENTION - Duration::seconds(1000));
+        seeded_deleted_at("/lib/memo.txt", RETENTION - Duration::seconds(1000));
     let other_uuid = uuid::Uuid::new_v4();
 
     let result = h.restore(other_uuid, TOKEN).await;
@@ -130,8 +130,8 @@ async fn given_missing_uuid_when_restore_then_not_found() {
 async fn given_active_file_when_restore_then_invalid_state_and_state_unchanged() {
     let repo = FakeCatalogRepository::new();
     let file = existing_file(
-        "/lib/song.mp3",
-        alexandria_core::catalog::model::FileType::Audio,
+        "/lib/memo.txt",
+        alexandria_core::catalog::model::FileType::Text,
     );
     let uuid = file.uuid;
     repo.seed(file);
@@ -155,7 +155,7 @@ async fn given_active_file_when_restore_then_invalid_state_and_state_unchanged()
 #[tokio::test]
 async fn given_unauthenticated_when_restore_then_unauthorized_and_no_state_change() {
     let (uuid, repo, _clock, _h) =
-        seeded_deleted_at("/lib/song.mp3", RETENTION - Duration::seconds(1000));
+        seeded_deleted_at("/lib/memo.txt", RETENTION - Duration::seconds(1000));
     let h = handler(
         FakeAuth::Denying,
         repo.clone(),
@@ -176,7 +176,7 @@ async fn given_unauthenticated_when_restore_then_unauthorized_and_no_state_chang
 #[tokio::test]
 async fn given_restore_when_repo_write_fails_then_error_propagated_and_state_unchanged() {
     let (uuid, repo, _clock, _h) =
-        seeded_deleted_at("/lib/song.mp3", RETENTION - Duration::seconds(1000));
+        seeded_deleted_at("/lib/memo.txt", RETENTION - Duration::seconds(1000));
     repo.fail_restore(uuid);
     let h = handler(
         FakeAuth::Allowing,

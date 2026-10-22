@@ -2,7 +2,7 @@
 //!
 //! One table, shared by UC-38's stream, UC-39's comic page, and UC-40's
 //! thumbnail. It covers the formats `catalog::classify` already recognizes
-//! for each of the seven file types. An extension absent from the table
+//! for each of the six file types. An extension absent from the table
 //! yields `application/octet-stream` rather than an error: the bytes are
 //! still perfectly streamable, and refusing to serve a file the catalog
 //! happily indexed would be inconsistent.
@@ -15,15 +15,6 @@ pub fn mime_for_path(path: &str) -> &'static str {
         .unwrap_or_default();
 
     match ext.as_str() {
-        // audio
-        "mp3" => "audio/mpeg",
-        "flac" => "audio/flac",
-        "wav" => "audio/wav",
-        "ogg" | "oga" => "audio/ogg",
-        "opus" => "audio/opus",
-        "m4a" => "audio/mp4",
-        "aac" => "audio/aac",
-        "wma" => "audio/x-ms-wma",
         // video
         "mp4" | "m4v" => "video/mp4",
         "mkv" => "video/x-matroska",
@@ -66,9 +57,6 @@ mod tests {
     fn given_known_extensions_when_resolved_then_expected_mime_returned() {
         // Arrange — one representative extension per cataloged file type.
         let cases = [
-            ("/lib/song.mp3", "audio/mpeg"),
-            ("/lib/song.flac", "audio/flac"),
-            ("/lib/song.wma", "audio/x-ms-wma"),
             ("/lib/movie.mp4", "video/mp4"),
             ("/lib/movie.mkv", "video/x-matroska"),
             ("/lib/movie.mpg", "video/mpeg"),

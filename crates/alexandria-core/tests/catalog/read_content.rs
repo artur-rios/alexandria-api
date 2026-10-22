@@ -52,7 +52,7 @@ async fn given_text_file_when_read_then_content_returned() {
 #[tokio::test]
 async fn given_non_text_file_when_read_then_invalid_input() {
     let repo = FakeCatalogRepository::new();
-    let file = existing_file("/lib/song.mp3", FileType::Audio);
+    let file = existing_file("/lib/photo.png", FileType::Image);
     let uuid = file.uuid;
     repo.seed(file);
     let fs = FakeFilesystem::builder().build();

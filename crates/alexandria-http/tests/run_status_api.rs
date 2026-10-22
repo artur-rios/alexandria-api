@@ -70,7 +70,7 @@ async fn given_a_started_run_when_polled_to_completion_then_it_reports_complete_
     // just some of them, has actually landed.
     let test = test_app().await;
     let lib = tempfile::tempdir().expect("lib tempdir");
-    write_file(&lib, "a.mp3", b"audio-v1");
+    write_file(&lib, "a.txt", b"text-v1");
     write_file(&lib, "b.md", b"text-v1");
     let router = app(Settings::default(), test.services.clone());
 
@@ -87,7 +87,7 @@ async fn given_a_started_run_when_polled_to_completion_then_it_reports_complete_
     assert_eq!(index_resp.status(), StatusCode::ACCEPTED);
     wait_for_files(&test.pool, 2).await;
 
-    write_file(&lib, "a.mp3", b"audio-v2-CHANGED");
+    write_file(&lib, "a.txt", b"text-v2-CHANGED");
     std::fs::remove_file(lib.path().join("b.md")).expect("remove b.md");
 
     let run_id = start_refresh(&router).await;
@@ -142,15 +142,15 @@ async fn given_a_started_run_when_polled_to_completion_then_it_reports_complete_
     //
     // Task 3 stopped indexing from computing a hash at all, and Task 4's
     // refresh never computes a new one either: a detected change clears
-    // `content_hash` rather than replacing it (FR-FC-10), so a.mp3's hash
+    // `content_hash` rather than replacing it (FR-FC-10), so a.txt's hash
     // here is asserted absent, not equal to some freshly recomputed SHA-256.
     let rows = file_rows_with_missing(&test.pool).await;
     let by_name: std::collections::BTreeMap<String, (Option<String>, Option<String>)> = rows
         .into_iter()
         .map(|(_, name, _, hash, missing_at)| (name, (hash, missing_at)))
         .collect();
-    let (a_hash, a_missing) = by_name.get("a.mp3").expect("a.mp3 row");
-    assert!(a_missing.is_none(), "a.mp3 is still on disk");
+    let (a_hash, a_missing) = by_name.get("a.txt").expect("a.txt row");
+    assert!(a_missing.is_none(), "a.txt is still on disk");
     assert_eq!(
         a_hash, &None,
         "refresh clears the hash rather than recomputing one"
@@ -216,7 +216,7 @@ async fn given_a_run_that_failed_on_a_file_when_its_failures_are_read_then_it_is
     SqliteCatalogRunRepository::new(test.pool.clone())
         .record_failure(
             uuid::Uuid::parse_str(&run_id).expect("uuid"),
-            "/library/locked.mp3",
+            "/library/locked.txt",
             "permission denied",
             chrono::Utc::now(),
         )
@@ -230,7 +230,7 @@ async fn given_a_run_that_failed_on_a_file_when_its_failures_are_read_then_it_is
 
     assert_eq!(response.status(), StatusCode::OK);
     let body = body_json(response).await;
-    assert_eq!(body[0]["path"], "/library/locked.mp3");
+    assert_eq!(body[0]["path"], "/library/locked.txt");
     assert_eq!(body[0]["reason"], "permission denied");
 }
 

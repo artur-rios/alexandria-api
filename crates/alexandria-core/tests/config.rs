@@ -155,6 +155,25 @@ fn given_shipped_example_config_when_parsed_then_values_land_in_settings() {
     assert_eq!(settings.logging.level.as_str(), "info");
 }
 
+/// Installs that enabled music enrichment still carry a `[metadata]` section.
+/// The feature is gone, but the file must keep loading: unknown sections are
+/// ignored rather than refused.
+#[test]
+fn given_a_config_with_a_legacy_metadata_section_when_parsed_then_it_loads_and_ignores_it() {
+    let raw = "[metadata]
+enabled = true
+contact = \"me@example.com\"
+image_cache_dir = \"artist-images\"
+";
+
+    let settings: Settings = toml::from_str(raw).expect("legacy section is ignored");
+
+    assert_eq!(
+        settings.playback.thumbnail_cache_dir,
+        Settings::default().playback.thumbnail_cache_dir
+    );
+}
+
 #[test]
 fn given_default_settings_when_socket_addr_built_then_is_loopback() {
     let settings = Settings::default();

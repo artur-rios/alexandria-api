@@ -3,11 +3,9 @@
 //! Extraction used to live inside `IndexHandler::index_entry`, and only
 //! there — the comment above it said so: *"Extraction only ever runs here, at
 //! first index — refresh never touches metadata."* That is what left a
-//! library indexed by an older build carrying gaps nothing could close. The
-//! artists list is the case that surfaced it: `album_artist` arrived in
-//! migration 15, every row written before it holds NULL, and a list grouped
-//! by the album's artist fell back to each track's performer for all of
-//! them — so a record with guests on it showed up once per guest.
+//! library indexed by an older build carrying gaps nothing could close: a
+//! column added by a later migration held NULL on every row written before
+//! it, and no run would ever revisit those rows to fill it.
 //!
 //! So the reading lives here now, in one place both commands use: an index
 //! writes what it reads into a fresh row, and a refresh fills what an older
@@ -19,7 +17,6 @@
 
 use uuid::Uuid;
 
-use crate::catalog::audio_tags::{AudioDuration, AudioMetadataReader};
 use crate::catalog::comic_tags::ComicMetadataReader;
 use crate::catalog::document_tags::DocumentMetadataReader;
 use crate::catalog::image_tags::ImageMetadataReader;
@@ -48,31 +45,28 @@ pub enum MetadataWrite {
     FillGaps,
 }
 
-/// The five readers, held together so a command takes one collaborator
-/// rather than five.
+/// The four readers, held together so a command takes one collaborator
+/// rather than four.
 ///
-/// `IndexHandler` still names all five in its own constructor — its callers
+/// `IndexHandler` still names all four in its own constructor — its callers
 /// and its tests were written that way — and builds this from them.
-pub struct MetadataExtractor<M, N, O, P, Q> {
-    audio: M,
+pub struct MetadataExtractor<N, O, P, Q> {
     image: N,
     document: O,
     video: P,
     comic: Q,
 }
 
-impl<M, N, O, P, Q> MetadataExtractor<M, N, O, P, Q>
+impl<N, O, P, Q> MetadataExtractor<N, O, P, Q>
 where
-    M: AudioMetadataReader,
     N: ImageMetadataReader,
     O: DocumentMetadataReader,
     P: VideoMetadataReader,
     Q: ComicMetadataReader,
 {
-    /// Holds the five readers.
-    pub fn new(audio: M, image: N, document: O, video: P, comic: Q) -> Self {
+    /// Holds the four readers.
+    pub fn new(image: N, document: O, video: P, comic: Q) -> Self {
         Self {
-            audio,
             image,
             document,
             video,
@@ -99,7 +93,6 @@ where
         write: MetadataWrite,
     ) -> bool {
         match file_type {
-            FileType::Audio => self.audio_into(repo, uuid, path, write).await,
             FileType::Image => self.image_into(repo, uuid, path, write).await,
             FileType::Document => self.document_into(repo, uuid, path, write).await,
             FileType::Video => self.video_into(repo, uuid, path, write).await,
@@ -132,38 +125,6 @@ where
                 "read the file's metadata but failed to write it"
             );
         }
-    }
-
-    async fn audio_into<R: CatalogRepository>(
-        &self,
-        repo: &R,
-        uuid: Uuid,
-        path: &str,
-        write: MetadataWrite,
-    ) -> bool {
-        let Some(tags) = self.audio.read(path).await else {
-            return false;
-        };
-
-        // Two independent writes: the duration, which sits outside
-        // `SubtypeMetadata` because it is not owner-editable, and the tags
-        // themselves. Neither failure blocks the other.
-        if let Some(AudioDuration(duration_seconds)) = tags.duration_seconds {
-            if let Err(err) = repo.set_audio_duration(uuid, duration_seconds).await {
-                tracing::warn!(
-                    path = %path,
-                    error = %err,
-                    "read the audio duration but failed to write it"
-                );
-            }
-        }
-
-        if let Some(metadata) = tags.into_subtype_metadata() {
-            self.write_metadata(repo, uuid, path, &metadata, write)
-                .await;
-        }
-
-        true
     }
 
     async fn image_into<R: CatalogRepository>(

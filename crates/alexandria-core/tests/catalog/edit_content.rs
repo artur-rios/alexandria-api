@@ -101,7 +101,7 @@ async fn given_a_file_with_no_stored_hash_when_content_is_edited_then_the_hash_i
 #[tokio::test]
 async fn given_non_text_file_when_edited_then_invalid_input() {
     let repo = FakeCatalogRepository::new();
-    let file = existing_file("/lib/song.mp3", FileType::Audio);
+    let file = existing_file("/lib/photo.png", FileType::Image);
     let uuid = file.uuid;
     repo.seed(file);
     let fs = FakeFilesystem::builder().build();

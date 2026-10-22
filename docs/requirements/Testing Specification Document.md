@@ -282,7 +282,7 @@ absorbs what a process pays exactly once — the first migration on a cold page
 cache, the first touch of the sqlite and ffmpeg code paths, and on Windows the
 anti-malware scan of a newly written binary. Those landed on `text`, the row
 every other row is divided by, and the `vs text` column consequently reported
-audio and document as *faster* than extracting nothing at all. That is
+image and document as *faster* than extracting nothing at all. That is
 impossible: extraction is strictly extra work on the same pipeline. If that
 column ever shows a figure above 100% again, suspect the harness before the
 extractor.
@@ -335,7 +335,6 @@ in flight: **p95 12.0 ms**, worst 29.4 ms, against a target of < 200 ms.
 | format | files | files/sec | ms/file | vs text |
 | --- | ---: | ---: | ---: | ---: |
 | text (baseline) | 150 | 722 | 1.38 | 100% |
-| audio (wav/id3) | 150 | 339 | 2.95 | 47% |
 | image (jpeg/exif) | 150 | 315 | 3.18 | 44% |
 | document (pdf) | 150 | 267 | 3.74 | 37% |
 | comic (cbz) | 150 | 336 | 2.98 | 46% |

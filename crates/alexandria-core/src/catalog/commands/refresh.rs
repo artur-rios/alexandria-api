@@ -4,7 +4,6 @@ use serde::Serialize;
 use uuid::Uuid;
 
 use crate::auth::AuthService;
-use crate::catalog::audio_tags::AudioMetadataReader;
 use crate::catalog::clock::Clock;
 use crate::catalog::comic_tags::ComicMetadataReader;
 use crate::catalog::commands::{flush_progress, record_halt, PROGRESS_FLUSH_SECONDS};
@@ -81,7 +80,7 @@ pub struct RefreshOutcome {
 ///
 /// Generic over collaborators so the decision logic is unit-tested against
 /// trait fakes with no real DB / filesystem / auth service (Testing Spec §6.2).
-pub struct RefreshHandler<A, R, F, C, RR, M, N, O, P, Q> {
+pub struct RefreshHandler<A, R, F, C, RR, N, O, P, Q> {
     auth: A,
     repo: R,
     fs: F,
@@ -90,7 +89,7 @@ pub struct RefreshHandler<A, R, F, C, RR, M, N, O, P, Q> {
     /// through the same collaborator: a row written by an older extraction
     /// is re-read here, and it must be read exactly as a first index would
     /// read it (`MetadataExtractor`).
-    extractor: MetadataExtractor<M, N, O, P, Q>,
+    extractor: MetadataExtractor<N, O, P, Q>,
     concurrency: usize,
     /// The width a `RunPriority::Low` run refreshes at
     /// (`indexing.low_priority_concurrency`). See `concurrency` for the
@@ -102,14 +101,13 @@ pub struct RefreshHandler<A, R, F, C, RR, M, N, O, P, Q> {
     registry: RunRegistry,
 }
 
-impl<A, R, F, C, RR, M, N, O, P, Q> RefreshHandler<A, R, F, C, RR, M, N, O, P, Q>
+impl<A, R, F, C, RR, N, O, P, Q> RefreshHandler<A, R, F, C, RR, N, O, P, Q>
 where
     A: AuthService,
     R: CatalogRepository,
     F: Filesystem,
     C: Clock,
     RR: CatalogRunRepository,
-    M: AudioMetadataReader,
     N: ImageMetadataReader,
     O: DocumentMetadataReader,
     P: VideoMetadataReader,
@@ -125,7 +123,6 @@ where
         repo: R,
         fs: F,
         clock: C,
-        audio_tags: M,
         image_tags: N,
         document_tags: O,
         video_tags: P,
@@ -140,13 +137,7 @@ where
             repo,
             fs,
             clock,
-            extractor: MetadataExtractor::new(
-                audio_tags,
-                image_tags,
-                document_tags,
-                video_tags,
-                comic_tags,
-            ),
+            extractor: MetadataExtractor::new(image_tags, document_tags, video_tags, comic_tags),
             concurrency: concurrency.max(1) as usize,
             low_priority_concurrency: low_priority_concurrency.max(1) as usize,
             runs,
@@ -542,20 +533,6 @@ where
         })
         .await?;
 
-        // The bytes moved on, so anything measured or fetched from the old
-        // ones is now describing a recording this file no longer holds. Both
-        // are re-derived on demand and neither is the owner's own work, so
-        // dropping them costs a re-measure the next time the track is played
-        // and buys back the guarantee that what is drawn is what is heard.
-        //
-        // Before the tags are re-read rather than after: `fill_metadata` can
-        // fail on a file the extractor cannot open, and a stale envelope must
-        // not survive on the strength of that.
-        retry_on_busy(BUSY_ATTEMPTS, || {
-            self.repo.forget_derived_content(file.uuid)
-        })
-        .await?;
-
         // A changed file is read whatever its stamp says: its bytes are new,
         // so its tags may be new too, and the stamp only records which
         // extraction last read them — not which bytes it read. Filling still
@@ -572,11 +549,9 @@ where
     /// Re-reads an unchanged file's own metadata when an older extraction
     /// wrote its row, and fills what the catalog is missing (UC-02).
     ///
-    /// The gap this closes is a real library's: `album_artist` arrived in
-    /// migration 15, every row indexed before it holds NULL there, and
-    /// nothing revisited a row once it was written — so an artists list
-    /// grouped by the record's own artist fell back to each track's
-    /// performer, and a record with guests on it appeared once per guest.
+    /// The gap this closes is a real library's: a column extraction learns
+    /// to fill arrives in a later migration, every row indexed before it
+    /// holds NULL there, and nothing revisited a row once it was written.
     ///
     /// Three things keep this cheap and safe. It reads a file only while the
     /// row is behind [`METADATA_VERSION`], so a library pays for it once and
@@ -606,7 +581,7 @@ where
         // The stamp says which extraction has been *applied* to the row, not
         // which one succeeded, and a file that gave up nothing has had this
         // one applied as fully as it ever will be. Stamping only a successful
-        // read looked more careful and was not: a text file named `.flac`, a
+        // read looked more careful and was not: a text file named `.mp4`, a
         // truncated download, an encrypted document — every one of them would
         // be opened again on every pass for the life of the library, and the
         // retry that bought would only ever pay off when the extractor

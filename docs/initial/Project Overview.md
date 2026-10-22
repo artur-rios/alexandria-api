@@ -3,14 +3,15 @@
 ## What This Is
 
 Alexandria is a back-end API that indexes, organizes, and surfaces the user's
-personal library of media and documents living on disk. It is written in Rust
+personal library of things to read and watch living on disk. Music is not
+part of it; that lives in Orpheus, a separate project. It is written in Rust
 and exposes a JSON-over-HTTP API that any client in any language can call, while
 keeping its domain logic in a reusable core library that a Flutter desktop
 front-end can also consume directly via FFI.
 
 ## The Problem
 
-Files accumulate across a single user's machine — music, movies and series, HTML
+Files accumulate across a single user's machine — movies and series, HTML
 pages, Markdown and text notes, PDFs and e-books, images, and browser bookmarks
 — with no unified way to browse, search, edit metadata, or track consumption
 progress. Scattered files and disconnected browser-managed bookmarks make
@@ -32,7 +33,6 @@ already on disk, without re-encoding, duplicating, or relocating the files.
 
 - Indexes thousands of files from disk and keeps catalog metadata up to date.
 - Lets the user view, edit metadata of, rename, and delete:
-  - Music (audio files)
   - Movies and series (video files)
   - HTML pages
   - Markdown and text files
@@ -55,7 +55,7 @@ already on disk, without re-encoding, duplicating, or relocating the files.
 ## What It Doesn't Do
 
 - No multi-user accounts or shared libraries — single owner only.
-- No complex media editing — no audio or video re-encoding, no image
+- No complex media editing — no video re-encoding, no image
   manipulation. The API manages metadata, names, organization, and (for text)
   content; it does not transform media.
 - No duplicating or relocating source files — files stay on disk where they are.

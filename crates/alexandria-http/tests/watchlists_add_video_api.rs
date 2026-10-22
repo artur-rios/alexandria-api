@@ -184,12 +184,12 @@ async fn given_non_video_file_when_posted_then_400_and_nothing_persisted() {
         .as_str()
         .expect("uuid")
         .to_string();
-    let audio_uuid = seed_file(&test.pool, "audio").await;
+    let text_uuid = seed_file(&test.pool, "text").await;
 
     let response = router
         .oneshot(add_video_request(
             &watchlist_uuid,
-            json!({ "videoUuid": audio_uuid }),
+            json!({ "videoUuid": text_uuid }),
         ))
         .await
         .expect("one-shot");

@@ -9,10 +9,10 @@
 //!   move rewrites every stored path under it without walking the disk, and
 //!   streaming then serves whatever the catalog holds;
 //! - **serving or changing a cataloged file's bytes** (UC-05, UC-09, UC-32,
-//!   UC-33, UC-38 – UC-40, the energy envelope) — the file's resolved path
-//!   must sit inside, so a row that already points outside (indexed before
-//!   the bound was configured, moved before the move was bounded, or reached
-//!   through a symbolic link swapped in since) is refused rather than served.
+//!   UC-33, UC-38 – UC-40) — the file's resolved path must sit inside, so a
+//!   row that already points outside (indexed before the bound was
+//!   configured, moved before the move was bounded, or reached through a
+//!   symbolic link swapped in since) is refused rather than served.
 //!
 //! One function decides all three — [`LibraryRoot::contains`] — so the
 //! canonicalisation and symbolic-link rules cannot drift apart.
@@ -292,7 +292,7 @@ mod tests {
     fn given_an_unresolvable_configured_root_when_checked_then_it_fails_closed() {
         let root = LibraryRoot::new("/nonexistent-library-root-for-alexandria");
 
-        let result = root.check_file("/nonexistent-library-root-for-alexandria/a.mp3");
+        let result = root.check_file("/nonexistent-library-root-for-alexandria/a.txt");
 
         assert!(
             matches!(result, Err(DomainError::InvalidInput(ref m)) if m == LIBRARY_ROOT_UNRESOLVABLE)

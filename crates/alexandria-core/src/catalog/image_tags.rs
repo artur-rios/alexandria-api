@@ -28,8 +28,8 @@ pub trait ImageMetadataReader: Send + Sync {
 /// HEIC, and PNG's `eXIf` chunk — 4 of the 9 extensions
 /// `classify_by_extension` maps to `FileType::Image` (jpg/jpeg/tif/tiff, and
 /// PNG when it carries an `eXIf` chunk). gif/webp/bmp/svg have no EXIF to
-/// extract and always yield no metadata — the same graceful degradation the
-/// audio slice established for `.wma`.
+/// extract and always yield no metadata — a file that gives up nothing is
+/// catalogued all the same, just without metadata.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ExifImageMetadataReader;
 

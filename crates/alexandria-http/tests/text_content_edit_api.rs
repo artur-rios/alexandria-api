@@ -135,7 +135,7 @@ async fn given_content_larger_than_axums_default_body_limit_when_edited_then_it_
 #[tokio::test]
 async fn given_non_text_file_when_content_edited_then_400_and_disk_unchanged() {
     let lib = tempdir().unwrap();
-    let path = common::write_file(&lib, "song.mp3", b"audio bytes");
+    let path = common::write_file(&lib, "photo.png", b"png bytes");
 
     let test = test_app().await;
     let router = app(Settings::default(), test.services.clone());
@@ -157,7 +157,7 @@ async fn given_non_text_file_when_content_edited_then_400_and_disk_unchanged() {
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert!(body_json(response).await["error"].is_string());
     let on_disk = std::fs::read(&path).expect("read back");
-    assert_eq!(on_disk, b"audio bytes");
+    assert_eq!(on_disk, b"png bytes");
 }
 
 // ---------------- AF-04: not found ----------------

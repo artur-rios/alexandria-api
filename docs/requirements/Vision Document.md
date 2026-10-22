@@ -14,15 +14,16 @@ no endpoints, and no field types — those live in the
 
 ### 1.2 Scope
 
-Alexandria catalogs a single owner's files already living on disk: audio,
-movies, series, HTML pages, Markdown and text files, PDFs and e-books, comic
+Alexandria catalogs a single owner's files to read and watch that already live
+on disk: movies, series, HTML pages, Markdown and text files, PDFs and e-books, comic
 books, images, and browser bookmarks. It lets the owner browse, edit metadata,
 rename, organize into collections, build watchlists and reading lists to track
 consumption, and edit the content of Markdown and text files in place. It exposes
 the same domain operations over an HTTP/REST-JSON API and a Flutter FFI surface.
+Music is not part of Alexandria; it lives in Orpheus, a separate project.
 
 It is explicitly **out of scope** to: support multiple users or shared
-libraries; perform complex media editing (audio/video re-encoding, image
+libraries; perform complex media editing (video re-encoding, image
 manipulation); store or duplicate file bytes; automatically remove files from
 disk; or issue its own JWTs in external-auth mode.
 
@@ -46,7 +47,7 @@ unmodified, which is not the media editing excluded above.
 
 ## 2. Problem Statement
 
-Files accumulate across a single user's machine — music, movies and series,
+Files accumulate across a single user's machine — movies and series,
 HTML pages, Markdown and text notes, PDFs and e-books, comic books, images, and
 browser bookmarks — with no unified way to browse, search, edit metadata, or
 track consumption progress. Scattered files and disconnected, browser-managed
@@ -112,7 +113,7 @@ database instead.
 | ID | Feature | Description |
 | --- | --- | --- |
 | **F-01** | File indexing | Scan a directory tree and create type-aware catalog records for supported file types, recording each file's path, size, and modification time without reading its contents. Runs asynchronously without blocking reads, report their progress while they go, and can be started at a chosen priority, paused, resumed — optionally at a new priority — and cancelled. |
-| **F-02** | Catalog browsing and metadata editing | List, query, view, and edit the metadata of any supported file type; edit comic-book, video, audio, document, and image metadata; browse by type and collection. |
+| **F-02** | Catalog browsing and metadata editing | List, query, view, and edit the metadata of any supported file type; edit comic-book, video, document, and image metadata; browse by type and collection. |
 | **F-03** | Renaming and lifecycle management | Rename files (which renames them on disk), soft-delete records with restore, hard-purge records, and explicitly purge a file on disk. |
 | **F-04** | Text file content editing | Read Markdown and text file content and write edited content back to the file on disk. |
 | **F-05** | Collections | Create, rename, and delete flat file collections and bookmark collections; add and remove items of the matching kind. |
@@ -131,7 +132,6 @@ These `F-xx` IDs are traced to requirement ranges in
 
 ```mermaid
 erDiagram
-    File ||--o{ AudioFile : "subtype"
     File ||--o{ VideoFile : "subtype"
     File ||--o{ HtmlPage : "subtype"
     File ||--o{ TextFile : "subtype"
@@ -171,7 +171,7 @@ Alexandria has exactly one kind of actor, so no role hierarchy diagram applies.
 - The platform is **Rust**, with `#![deny(unsafe_code)]` applied project-wide; concrete versions are pinned in the [Technology Stack Document](Technology%20Stack%20Document.md).
 - The relational store is **SQLite**, embedded and bundled with the desktop app; additional databases may be introduced later but SQLite is the starting point (see [Technology Stack Document](Technology%20Stack%20Document.md) §4).
 - The API stores **metadata and a reference to the file on disk only** — its path, size, and modification time — never file bytes.
-- The API performs **no complex media editing** — no audio or video re-encoding, no image manipulation.
+- The API performs **no complex media editing** — no video re-encoding, no image manipulation.
 - **Exactly one auth mode** is active at runtime, selected by startup configuration; JWTs are never issued by Alexandria.
 - Deletion is **two-phase**: soft delete (restorable) then hard purge after a configurable retention window; on-disk files are removed only by an explicit purge-on-disk operation.
 - Indexing runs **asynchronously** and must not block read/query operations.
