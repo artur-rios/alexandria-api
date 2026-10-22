@@ -289,8 +289,8 @@ impl Default for DatabaseSettings {
 #[derive(Debug, Clone, Deserialize)]
 pub struct IndexingSettings {
     /// How many files UC-01's index walk and UC-02's re-index walk process at
-    /// a time. The per-file cost is a stat plus, for a supported extension, a
-    /// tag-header read — no file bytes are hashed (FR-FC-09/FR-FC-10) — and
+    /// a time. The per-file cost is a stat plus, for a supported extension, an
+    /// embedded-metadata read — no file bytes are hashed (FR-FC-09/FR-FC-10) — and
     /// both run on Tokio's blocking pool, so this is a real parallelism knob.
     /// The database half of each file's work still serializes behind SQLite's
     /// single writer and the pool's 8 connections, so values far above that

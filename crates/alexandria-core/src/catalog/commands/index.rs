@@ -79,7 +79,7 @@ pub struct IndexOutcome {
 /// field, so a resumed run walks at whatever width the run currently carries
 /// — the one it was started with, or the one a resume re-paced it to
 /// (`RunControlHandler::resume`). The per-file work is a stat plus, for a
-/// supported extension, a tag-header read — never a full-file hash
+/// supported extension, an embedded-metadata read — never a full-file hash
 /// (FR-FC-09/FR-FC-10) — and `StdFilesystem` runs both on Tokio's blocking
 /// pool, so the concurrency still buys real parallelism rather than
 /// interleaved waiting. NFR-02's throughput target rests on the per-file cost
@@ -101,7 +101,7 @@ pub struct IndexHandler<A, R, F, C, N, O, P, Q, RR> {
     repo: R,
     fs: F,
     clock: C,
-    /// The five readers, held together (`MetadataExtractor`) because the
+    /// The four readers, held together (`MetadataExtractor`) because the
     /// refresh reads the same files with the same readers and this is the
     /// one description of how a file's own metadata reaches the catalog.
     extractor: MetadataExtractor<N, O, P, Q>,

@@ -82,8 +82,8 @@ root = ""
 
 [indexing]
 # How many files the index (UC-01) and re-index (UC-02) walks process at a
-# time. Per-file work is a stat plus, at first index, a tag-header read — never
-# a full-file hash (FR-FC-09, FR-FC-10) — and both run on a blocking thread
+# time. Per-file work is a stat plus, at first index, an embedded-metadata
+# read — never a full-file hash (FR-FC-09, FR-FC-10) — and both run on a blocking thread
 # pool, so this is real parallelism. The database half of each file's work
 # still serializes behind SQLite's single writer and the pool's 8 connections,
 # so raising this far above that only lengthens the queue. 0 is treated as 1

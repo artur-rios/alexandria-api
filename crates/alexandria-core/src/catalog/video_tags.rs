@@ -40,7 +40,7 @@ pub struct FfmpegVideoMetadataReader;
 
 impl FfmpegVideoMetadataReader {
     /// The synchronous container probe. `read` runs it on the blocking pool —
-    /// see [`crate::catalog::read_blocking`]. This is the slowest of the five
+    /// see [`crate::catalog::read_blocking`]. This is the slowest of the four
     /// readers: ffmpeg may read a long way into a file to find the best video
     /// stream, so it is the one that most needs to stay off the runtime.
     fn parse(path: &str) -> Option<VideoTags> {

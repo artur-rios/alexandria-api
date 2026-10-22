@@ -85,7 +85,7 @@ pub struct RefreshHandler<A, R, F, C, RR, N, O, P, Q> {
     repo: R,
     fs: F,
     clock: C,
-    /// The same five readers `IndexHandler` holds, for the same reason and
+    /// The same four readers `IndexHandler` holds, for the same reason and
     /// through the same collaborator: a row written by an older extraction
     /// is re-read here, and it must be read exactly as a first index would
     /// read it (`MetadataExtractor`).

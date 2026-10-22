@@ -7,10 +7,10 @@ members = [
 resolver = "2"
 
 [workspace.package]
-# 0.5.0 — music and audio removed (migration 25): the `audio` file type,
+# 0.5.0 — music and audio removed (migrations 25, 26): the `audio` file type,
 # playlists, play history, enrichment and the energy envelope are gone, and
 # music now lives in Orpheus. Routes and FFI exports that served them are
-# removed, so a client built against 0.4 is refused.
+# removed, so a client built against 0.4 refuses this core at startup.
 #
 # Previously 0.4.0 — an artist's picture asked for by name, so the name a
 # client shows and the name a picture is stored under are the same one.

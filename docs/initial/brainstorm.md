@@ -2,7 +2,8 @@
 
 This is the brainstorm for a API that aims to be the back-end for a big library for the user, that's why the name "Alexandria".  
 
-Alexandria is for things to read and watch. Music lives in Orpheus, a separate project.
+Alexandria is for things to read and watch. Music lives in Orpheus, a separate
+project.
 
 ## Features
 
@@ -20,7 +21,8 @@ What the user can edit?
 - Markdown and text files
 - Every file name
 
-So I don't want any complex operation, like video editing. I just want a software that can be used to organize and show those files from disk.  
+So I don't want any complex operation, like video editing. I just want a
+software that can be used to organize and show those files from disk.  
 
 How the files can be organized?
 
