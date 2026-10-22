@@ -518,7 +518,7 @@ async fn given_any_concurrency_when_execute_then_same_counts_and_same_catalog() 
         assert_eq!(outcome.scanned, 4, "concurrency {concurrency}");
         assert_eq!(
             outcome.indexed, 3,
-            "the unreadable mp3 is indexed too — its bytes are never read (concurrency {concurrency})"
+            "the unreadable c.txt is indexed too — its bytes are never read (concurrency {concurrency})"
         );
         assert_eq!(
             outcome.skipped, 1,

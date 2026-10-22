@@ -332,7 +332,7 @@ async fn given_a_row_at_the_current_version_when_refreshed_then_the_file_is_not_
 /// had this one applied as fully as it ever will be — so it is not opened
 /// again on every later pass.
 #[tokio::test]
-async fn given_tags_that_will_not_parse_when_refreshed_then_the_row_is_left_behind() {
+async fn given_tags_that_will_not_parse_when_refreshed_then_the_row_is_stamped() {
     let repo = FakeCatalogRepository::new();
     repo.seed(a_cataloged_video("/library/damaged.mkv", 4096));
     let repo_handle = repo.clone();
