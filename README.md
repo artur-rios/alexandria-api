@@ -268,10 +268,13 @@ absolute paths, where the drive letter parses as a URL authority.
 Both surfaces read the same configuration: `ALEXANDRIA_CONFIG` (default
 `config.toml`) plus `ALEXANDRIA_*` environment overrides.
 
-In external auth mode, set `ALEXANDRIA_AUTH_MODE=external` and
-`ALEXANDRIA_AUTH_HEIMDALL_TOKEN_SECRET` to the HS256 secret Heimdall signs
-with, and `ALEXANDRIA_AUTH_HEIMDALL_SCOPE_ID` to the UUID of the Heimdall
-scope whose members are accepted as the owner. In
+In external auth mode, set `ALEXANDRIA_AUTH_MODE=external`,
+`ALEXANDRIA_AUTH_HEIMDALL_JWKS_URL` to Heimdall's key set
+(`http://heimdall-api.<env>:8080/.well-known/jwks.json` inside the platform),
+and `ALEXANDRIA_AUTH_HEIMDALL_SCOPE_ID` to the UUID of the Heimdall scope whose
+members are accepted as the owner. While Heimdall still accepts its old HS256
+tokens, `ALEXANDRIA_AUTH_HEIMDALL_TOKEN_SECRET` accepts them here too; unset it
+when Heimdall drops the secret. In
 local login mode (`ALEXANDRIA_AUTH_MODE=local`),
 create the owner's account once via `POST /v1/auth/local/register` (UC-41) —
 it takes `email`, `password`, and `passwordConfirmation`, succeeds only once,

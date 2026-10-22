@@ -75,6 +75,13 @@ a separate project.
 
 ### Security
 
+- External mode verifies Heimdall's ES256 tokens against the key set Heimdall publishes, set with
+  `auth.heimdall_jwks_url` (`ALEXANDRIA_AUTH_HEIMDALL_JWKS_URL`), instead of a shared HS256 secret. The set is cached
+  and fetched again when a token names an unknown `kid` or the set is five minutes old, at most once a minute; a
+  failed fetch keeps the known keys. The algorithm is pinned, so a token's `alg` header cannot select the key type.
+  `auth.heimdall_token_secret` is now optional: HS256 tokens are accepted while it is set, for the overlap while
+  Heimdall still accepts them, and refused once it is removed. Startup requires the key set URL or the secret
+  (`alexandria-core`).
 - Local login always verifies the password, so a wrong email no longer answers measurably faster than a wrong
   password and the account's email cannot be learned by timing.
 - Correcting a library's root (`PATCH /v1/libraries/{uuid}`, `alexandria_library_move`) is now bounded by

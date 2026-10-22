@@ -10,18 +10,27 @@
 # The single active authentication mode. One of: "external", "local", "windows".
 mode = "external"
 
-# External mode only: the HS256 secret Heimdall signs its tokens with — the
-# same value as Heimdall's own HEIMDALL_AUTH_TOKEN_SECRET. Required in external
-# mode: Heimdall publishes no key set, so this is the only way to verify one of
-# its tokens. Prefer the ALEXANDRIA_AUTH_HEIMDALL_TOKEN_SECRET environment
-# variable, so a signing key need never be written to disk. Ignored when
-# mode = "local".
+# External mode only: where Heimdall publishes the public keys it signs its
+# ES256 tokens with. Inside the platform, the internal address:
+# http://heimdall-api.<env>:8080/.well-known/jwks.json. The key set is fetched
+# when first needed and cached; it is fetched again when a token names a key
+# not yet seen (a rotation) or the cached set is five minutes old, at most
+# once a minute. A failed fetch keeps the keys already known. Required in
+# external mode unless heimdall_token_secret is set.
+heimdall_jwks_url = ""
+
+# External mode only, and only while Heimdall still accepts tokens signed with
+# its old shared secret: that HS256 secret, the same value as Heimdall's own
+# HEIMDALL_AUTH_TOKEN_SECRET. Tokens signed with it are accepted while it is
+# set. Leave it empty — or remove it — once Heimdall has dropped the secret,
+# and they are refused here too; no other change is needed. Prefer the
+# ALEXANDRIA_AUTH_HEIMDALL_TOKEN_SECRET environment variable, so a signing key
+# need never be written to disk.
 heimdall_token_secret = ""
 
-# External mode only: the secret Heimdall is rotating away from (its
-# HEIMDALL_AUTH_TOKEN_SECRET_PREVIOUS). Tokens signed with either secret are
-# accepted, so a rotation on the Heimdall side does not black out Alexandria.
-# Ignored when equal to heimdall_token_secret.
+# External mode only, for the same overlap: the secret Heimdall was rotating
+# away from (its HEIMDALL_AUTH_TOKEN_SECRET_PREVIOUS). Ignored when equal to
+# heimdall_token_secret.
 heimdall_token_secret_previous = ""
 
 # External mode only: the UUID of the Heimdall scope Alexandria is registered

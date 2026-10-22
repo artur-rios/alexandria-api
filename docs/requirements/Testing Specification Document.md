@@ -165,7 +165,7 @@ state.
 | --- | --- |
 | SQLite | in-memory (or on-disk temp) SQLite via sqlx; migrations run at setup. |
 | Filesystem | a per-test temp directory (the `tempfile` crate) holding sample files. |
-| External auth service | a fake auth-service implementation with a fixed HS256 test secret; no network. |
+| External auth service | fixed ES256 test keys and an in-memory key set standing in for Heimdall's `/.well-known/jwks.json`, plus a fixed HS256 test secret for the overlap; no network beyond a loopback server for the key set fetch itself. |
 | Local-login credentials | seeded into the test DB with an Argon2 hash of a known password. |
 
 ### 7.3 HTTP / FFI parity

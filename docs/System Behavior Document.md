@@ -963,13 +963,24 @@ Credentials presented for an inactive mode are rejected.
 
 The client logs in against [Heimdall](https://github.com/artur-rios/heimdall-api)
 directly — completing two-factor there if asked — and presents the resulting JWT.
-Alexandria verifies the HS256 signature against a shared secret and accepts the
+Alexandria verifies the ES256 signature against the key the token's `kid` names
+in Heimdall's published key set (`/.well-known/jwks.json`), and accepts the
 caller as the owner only when the token names the configured scope, as the
 holder's scope or as one they own.
 
-A previous secret is accepted alongside the current one, so a rotation on the
-Heimdall side does not black out Alexandria. Issuer and audience are each checked
-only when configured, because Heimdall signs tokens carrying neither by default.
+The key set is fetched when first needed and cached, so a verification costs no
+network call. It is fetched again when a token names a key not yet seen — how a
+rotation on the Heimdall side arrives — or when the cached set is five minutes
+old, so a withdrawn key stops verifying; either at most once a minute, and a
+failed fetch keeps the keys already known. The algorithm is pinned: an ES256
+token verifies only against a published EC key, and nothing in a token's header
+can make a public key serve as an HMAC secret.
+
+While Heimdall still accepts the HS256 tokens it signed with its old shared
+secret, Alexandria accepts them too, as long as that secret (and, mid-rotation,
+the previous one) is configured; removing it refuses them. Issuer and audience
+are each checked only when configured, because Heimdall signs tokens carrying
+neither by default.
 
 Alexandria never sees a password, proxies no login, and gains no endpoints of its
 own. Everyone Heimdall places in the scope acts as the same single owner:
