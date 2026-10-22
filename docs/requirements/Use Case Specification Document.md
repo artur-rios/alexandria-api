@@ -215,7 +215,7 @@ its status and live progress, and UC-48 pauses, resumes, or cancels it.
 | **Description** | Edit the type-specific metadata of a file (video, document, comic-book, or image fields). |
 | **Preconditions** | The caller is authenticated; the target file exists and is `active`. |
 | **Postconditions** | The file's subtype metadata is updated. |
-| **Requirements** | FR-FC-14, FR-FC-15, FR-FC-16, FR-FC-17, FR-FC-18, FR-FC-24 |
+| **Requirements** | FR-FC-15, FR-FC-16, FR-FC-17, FR-FC-18, FR-FC-24 |
 
 **Main Flow**
 
@@ -1784,7 +1784,7 @@ have only one of.
 | UC-01: Index library files | FR-FC-01, FR-FC-02, FR-FC-03, FR-FC-04, FR-FC-05, FR-FC-06, FR-FC-07, FR-FC-08, FR-FC-09, FR-FC-24, FR-FC-25, FR-FC-26, FR-FC-27, FR-FC-31 |
 | UC-02: Re-index and refresh the catalog | FR-FC-08, FR-FC-10, FR-FC-11, FR-FC-24, FR-FC-27, FR-FC-31 |
 | UC-03: Browse and view file metadata | FR-FC-12, FR-FC-13, FR-FC-24 |
-| UC-04: Edit file metadata | FR-FC-14, FR-FC-15, FR-FC-16, FR-FC-17, FR-FC-18, FR-FC-24 |
+| UC-04: Edit file metadata | FR-FC-15, FR-FC-16, FR-FC-17, FR-FC-18, FR-FC-24 |
 | UC-05: Rename a file | FR-FC-19, FR-FC-24, FR-FC-26 |
 | UC-06: Soft-delete a file | FR-FC-20, FR-FC-24 |
 | UC-07: Restore a soft-deleted file | FR-FC-21, FR-FC-24 |

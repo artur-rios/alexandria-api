@@ -331,7 +331,7 @@ async fn given_an_unknown_kind_when_listed_then_400_invalid_input() {
     let router = app(Settings::default(), test.services);
 
     let response = router
-        .oneshot(list_request("?kind=gallery"))
+        .oneshot(list_request("?kind=not-a-kind"))
         .await
         .expect("one-shot");
 

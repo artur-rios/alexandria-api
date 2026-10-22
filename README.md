@@ -5,9 +5,10 @@ organizes, and surfaces a single user's on-disk things to read and watch —
 movies and series, HTML pages, Markdown and text files, PDFs and e-books, comic
 books, images, and browser bookmarks — without re-encoding, duplicating, or
 relocating them. Music is not part of Alexandria; it lives in Orpheus, a
-separate project. The domain logic lives in a reusable Rust core library exposed
-over both an HTTP/REST-JSON API and a Flutter FFI surface, so any client in any
-language can drive it and the Flutter desktop front-end can call it in-process.
+separate project. The domain logic lives in a reusable Rust core library
+exposed over both an HTTP/REST-JSON API and a Flutter FFI surface, so any client
+in any language can drive it and the Flutter desktop front-end can call it
+in-process.
 
 > Single-user. Metadata + path only, never the bytes. No complex media editing.
 > Two-phase soft/hard deletion. Pluggable auth (external JWT, local encrypted
@@ -324,7 +325,7 @@ progress, and local-auth accounts. Export or note whatever you need first.
 | Change | Effect |
 | --- | --- |
 | `size_bytes`/`mtime` change detection replaced full-file hashing (FR-FC-09), and the run record gained progress, pause, priority, and segment columns (UC-42) | Both baselines amended. Delete the database and re-index. |
-| Music and audio removed (0.5.0): Alexandria no longer catalogs audio files, and music now lives in Orpheus, a separate project. Migration 25 deletes the stored music — audio files, tags, lyrics, artist photography records, play history, playlists, and track energy — and removes `audio` from any recorded index run | No database deletion needed; the migration runs on startup. Files on disk are never touched. The `[metadata]` config section is ignored if still present. |
+| Music and audio removed (0.5.0): Alexandria no longer catalogs audio files, and music now lives in Orpheus, a separate project. Migration 25 deletes the stored music — audio files, tags, lyrics, artist photography records, play history, playlists, and track energy — and removes `audio` from any recorded index run; migration 26 deletes the run failures recorded on audio files | No database deletion needed; the migration runs on startup. Files on disk are never touched. The `[metadata]` config section is ignored if still present. |
 
 ### Health check
 

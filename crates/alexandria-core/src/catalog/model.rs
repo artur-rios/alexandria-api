@@ -27,9 +27,9 @@ impl FileType {
 
     /// The inverse of [`FileType::as_str`]: the wire name a client reads back
     /// is the one it may spell, so a caller never has to learn a second
-    /// vocabulary for the same six types. `None` for anything else — the
-    /// caller decides whether that is a rejection (`IndexScope`) or a
-    /// filter that matches nothing.
+    /// vocabulary for the same six types. `None` for anything else, which
+    /// every caller (an index scope, a listing's type filter on either
+    /// surface) refuses as invalid input.
     pub fn from_wire(name: &str) -> Option<Self> {
         Some(match name {
             "video" => FileType::Video,
@@ -40,17 +40,6 @@ impl FileType {
             "image" => FileType::Image,
             _ => return None,
         })
-    }
-
-    pub fn subtype_table(&self) -> &'static str {
-        match self {
-            FileType::Video => "video_files",
-            FileType::Html => "html_pages",
-            FileType::Text => "text_files",
-            FileType::Document => "documents",
-            FileType::Comic => "comic_books",
-            FileType::Image => "images",
-        }
     }
 }
 
@@ -150,7 +139,7 @@ impl FormatKind {
     }
 }
 
-/// Type-specific metadata for an editable subtype (UC-04 / FR-FC-14..18).
+/// Type-specific metadata for an editable subtype (UC-04 / FR-FC-15..18).
 ///
 /// Only the four subtypes with editable metadata have a variant. Video/
 /// Document/Comic/Image map one-to-one to their subtype table; Text and Html

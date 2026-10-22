@@ -751,10 +751,20 @@ async fn given_same_video_file_when_metadata_edited_via_http_and_ffi_then_respon
             json!({ "root": http_lib.path().to_str().unwrap() }).to_string(),
         ))
         .unwrap();
-    let _ = app(Settings::default(), http_services.clone())
+    let index_resp = app(Settings::default(), http_services.clone())
         .oneshot(index_req)
         .await
         .expect("http index");
+    let index_body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(index_resp.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
+    let http_run_id = index_body["runId"]
+        .as_str()
+        .expect("http runId")
+        .to_string();
+    // The run's end, not the file count: a row is counted the moment it is
+    // inserted, and its extraction stamp (`metadataVersion`) lands after.
+    wait_for_http_run_terminal(&http_services, &http_run_id, TEST_TOKEN).await;
     wait_for_http_files(&http_pool, 1).await;
 
     let (http_uuid,): (String,) = sqlx::query_as("SELECT uuid FROM files WHERE name = ?")
@@ -812,6 +822,8 @@ async fn given_same_video_file_when_metadata_edited_via_http_and_ffi_then_respon
                 std::ptr::null(),
             );
             assert_eq!(started.status, alexandria_ffi::INDEX_OK);
+            // As on the HTTP leg: the run's end, not the file count.
+            wait_for_ffi_run_terminal(&run_id_string(&started), &token);
             wait_for_ffi_files(1);
 
             // Resolve the file's uuid via a read connection to the FFI db file.
@@ -1286,10 +1298,20 @@ async fn given_same_file_when_fetched_via_http_and_ffi_then_file_view_bodies_ide
             json!({ "root": http_lib.path().to_str().unwrap() }).to_string(),
         ))
         .unwrap();
-    let _ = app(Settings::default(), http_services.clone())
+    let index_resp = app(Settings::default(), http_services.clone())
         .oneshot(index_req)
         .await
         .expect("http index");
+    let index_body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(index_resp.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
+    let http_run_id = index_body["runId"]
+        .as_str()
+        .expect("http runId")
+        .to_string();
+    // The run's end, not the file count: a row is counted the moment it is
+    // inserted, and its extraction stamp (`metadataVersion`) lands after.
+    wait_for_http_run_terminal(&http_services, &http_run_id, TEST_TOKEN).await;
     wait_for_http_files(&http_pool, 1).await;
 
     // Write subtype metadata so the FileView's `metadata` is non-null and
@@ -1348,6 +1370,8 @@ async fn given_same_file_when_fetched_via_http_and_ffi_then_file_view_bodies_ide
             std::ptr::null(),
         );
         assert_eq!(started.status, alexandria_ffi::INDEX_OK);
+        // As on the HTTP leg: the run's end, not the file count.
+        wait_for_ffi_run_terminal(&run_id_string(&started), &token);
         wait_for_ffi_files(1);
 
         // Write the same metadata on the FFI db via a direct SQL update.
@@ -1540,6 +1564,11 @@ async fn given_unknown_filter_values_when_listed_via_http_and_ffi_then_both_reje
         axum::http::StatusCode::BAD_REQUEST
     );
     assert_eq!(
+        http_status("/v1/files?type=audio").await,
+        axum::http::StatusCode::BAD_REQUEST,
+        "audio was removed in 0.5 and is now an unknown type"
+    );
+    assert_eq!(
         http_status("/v1/files?state=delted").await,
         axum::http::StatusCode::BAD_REQUEST
     );
@@ -1551,8 +1580,8 @@ async fn given_unknown_filter_values_when_listed_via_http_and_ffi_then_both_reje
     let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
     let ffi_lib_path = ffi_lib.path().to_str().unwrap().to_string();
 
-    let (bad_type, bad_state, empty_values) =
-        tokio::task::spawn_blocking(move || -> (i32, i32, i32) {
+    let (bad_type, removed_type, bad_state, empty_values) =
+        tokio::task::spawn_blocking(move || -> (i32, i32, i32, i32) {
             let cdb = CString::new(ffi_db).unwrap();
             assert_eq!(
                 alexandria_index_init(cdb.as_ptr()),
@@ -1584,6 +1613,7 @@ async fn given_unknown_filter_values_when_listed_via_http_and_ffi_then_both_reje
 
             (
                 status_for(r#"{"type":"banana"}"#),
+                status_for(r#"{"type":"audio"}"#),
                 status_for(r#"{"state":"delted"}"#),
                 // Empty strings mean "no filter" on both surfaces, not an error.
                 status_for(r#"{"type":"","state":""}"#),
@@ -1596,6 +1626,11 @@ async fn given_unknown_filter_values_when_listed_via_http_and_ffi_then_both_reje
         bad_type,
         alexandria_ffi::FILE_ERR_INVALID_INPUT,
         "FFI must reject an unknown type like HTTP does, not drop the filter"
+    );
+    assert_eq!(
+        removed_type,
+        alexandria_ffi::FILE_ERR_INVALID_INPUT,
+        "FFI must reject the removed audio type like HTTP does"
     );
     assert_eq!(
         bad_state,
@@ -3794,7 +3829,7 @@ async fn given_unrecognised_kind_when_created_via_http_and_ffi_then_both_reject(
         .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .header("content-type", "application/json")
         .body(Body::from(
-            json!({ "name": "Mixed bag", "kind": "gallery" }).to_string(),
+            json!({ "name": "Mixed bag", "kind": "not-a-kind" }).to_string(),
         ))
         .unwrap();
     let resp = app(Settings::default(), http_services)
@@ -3819,7 +3854,7 @@ async fn given_unrecognised_kind_when_created_via_http_and_ffi_then_both_reject(
         );
 
         let body =
-            CString::new(json!({ "name": "Mixed bag", "kind": "gallery" }).to_string()).unwrap();
+            CString::new(json!({ "name": "Mixed bag", "kind": "not-a-kind" }).to_string()).unwrap();
         let token = CString::new(TEST_TOKEN).unwrap();
         let r = alexandria_collection_create(body.as_ptr(), token.as_ptr());
         assert!(r.json.is_null(), "a rejected create returns no body");
@@ -11358,7 +11393,7 @@ async fn given_same_collections_when_listed_via_http_and_ffi_then_bodies_identic
 
     let bad = Request::builder()
         .method("GET")
-        .uri("/v1/collections?kind=gallery")
+        .uri("/v1/collections?kind=not-a-kind")
         .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .body(Body::empty())
         .unwrap();
@@ -11396,7 +11431,7 @@ async fn given_same_collections_when_listed_via_http_and_ffi_then_bodies_identic
                 alexandria_free_string(r.json);
             }
 
-            let bad = CString::new(json!({ "kind": "gallery" }).to_string()).unwrap();
+            let bad = CString::new(json!({ "kind": "not-a-kind" }).to_string()).unwrap();
             let bad_result = alexandria_collections_list(bad.as_ptr(), token.as_ptr());
             assert!(bad_result.json.is_null(), "a refusal carries no body");
 

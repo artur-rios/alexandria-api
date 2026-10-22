@@ -15,12 +15,13 @@ no endpoints, and no field types — those live in the
 ### 1.2 Scope
 
 Alexandria catalogs a single owner's files to read and watch that already live
-on disk: movies, series, HTML pages, Markdown and text files, PDFs and e-books, comic
-books, images, and browser bookmarks. It lets the owner browse, edit metadata,
-rename, organize into collections, build watchlists and reading lists to track
-consumption, and edit the content of Markdown and text files in place. It exposes
-the same domain operations over an HTTP/REST-JSON API and a Flutter FFI surface.
-Music is not part of Alexandria; it lives in Orpheus, a separate project.
+on disk: movies, series, HTML pages, Markdown and text files, PDFs and e-books,
+comic books, images, and browser bookmarks. It lets the owner browse, edit
+metadata, rename, organize into collections, build watchlists and reading lists
+to track consumption, and edit the content of Markdown and text files in place.
+It exposes the same domain operations over an HTTP/REST-JSON API and a Flutter
+FFI surface. Music is not part of Alexandria; it lives in Orpheus, a separate
+project.
 
 It is explicitly **out of scope** to: support multiple users or shared
 libraries; perform complex media editing (video re-encoding, image

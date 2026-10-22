@@ -44,7 +44,7 @@ async fn given_fresh_in_memory_db_when_migrate_then_collections_table_exists() {
     let bad = sqlx::query("INSERT INTO collections (uuid, name, kind) VALUES (?, ?, ?)")
         .bind(uuid::Uuid::new_v4().to_string())
         .bind("mixed")
-        .bind("gallery")
+        .bind("not-a-kind")
         .execute(&pool)
         .await;
     assert!(bad.is_err(), "kind outside ('file','bookmark') is rejected");
@@ -230,6 +230,7 @@ const RUN_AUDIO_IMAGE: &str = "00000000-0000-0000-0000-000000000002";
 const RUN_IMAGE_AUDIO_VIDEO: &str = "00000000-0000-0000-0000-000000000003";
 const RUN_VIDEO: &str = "00000000-0000-0000-0000-000000000004";
 const RUN_EVERY_TYPE: &str = "00000000-0000-0000-0000-000000000005";
+const RUN_IMAGE_AUDIO: &str = "00000000-0000-0000-0000-000000000006";
 
 /// The ids the seed gives its files. The two audio files sit on either side
 /// of a surviving one, and the higher one is not the high-water mark either:
@@ -276,8 +277,9 @@ async fn pool_at_version_24() -> sqlx::SqlitePool {
 
 /// A library that held music: two audio files with every kind of row music
 /// owned, a video with watch progress, a text file, a document with reading
-/// progress, and index runs whose scopes name audio alone, alongside other
-/// types, and not at all.
+/// progress, and index runs whose scopes name audio alone, first, in the
+/// middle, last, and not at all. The runs that survive recorded failures on
+/// audio files as well as on others.
 ///
 /// The audio file also carries a stray row in each of the six surviving
 /// subtype tables and a progress row in each progress table. No code path
@@ -361,12 +363,20 @@ async fn seed_music_library(pool: &sqlx::SqlitePool) {
            ('00000000-0000-0000-0000-000000000004', 'index', 'complete', '/media',
             '2026-05-04T00:00:00+00:00', NULL, 'video'),
            ('00000000-0000-0000-0000-000000000005', 'index', 'complete', '/media',
-            '2026-05-05T00:00:00+00:00', NULL, NULL);
+            '2026-05-05T00:00:00+00:00', NULL, NULL),
+           ('00000000-0000-0000-0000-000000000006', 'index', 'complete', '/media',
+            '2026-05-06T00:00:00+00:00', NULL, 'image,audio');
          INSERT INTO catalog_run_failures (id, run_id, path, reason, failed_at)
          VALUES (1, '00000000-0000-0000-0000-000000000001', '/music/bad.mp3', 'unreadable',
                  '2026-05-01T00:05:00+00:00'),
                 (2, '00000000-0000-0000-0000-000000000002', '/media/bad.png', 'unreadable',
-                 '2026-05-02T00:05:00+00:00');",
+                 '2026-05-02T00:05:00+00:00'),
+                (3, '00000000-0000-0000-0000-000000000005', '/media/song.MP3', 'unreadable',
+                 '2026-05-05T00:05:00+00:00'),
+                (4, '00000000-0000-0000-0000-000000000003', '/media/album/track.flac',
+                 'unreadable', '2026-05-03T00:05:00+00:00'),
+                (5, '00000000-0000-0000-0000-000000000005', '/media/mp3s.txt', 'unreadable',
+                 '2026-05-05T00:06:00+00:00');",
     )
     .execute(pool)
     .await
@@ -433,6 +443,21 @@ async fn ids(pool: &sqlx::SqlitePool, sql: &'static str) -> Vec<i64> {
         .fetch_all(pool)
         .await
         .expect("read ids")
+}
+
+/// Every run's id, scope and failures, in id order: what migration 25
+/// rewrites and migration 26 trims.
+async fn run_rows(pool: &sqlx::SqlitePool) -> Vec<(String, Option<String>, Option<String>)> {
+    sqlx::query_as(
+        "SELECT r.id, r.scope, GROUP_CONCAT(f.path, '|')
+           FROM catalog_runs AS r
+           LEFT JOIN catalog_run_failures AS f ON f.run_id = r.id
+          GROUP BY r.id
+          ORDER BY r.id",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("read runs")
 }
 
 async fn foreign_keys_pragma(pool: &sqlx::SqlitePool) -> i64 {
@@ -550,14 +575,23 @@ async fn given_a_database_with_music_when_migrated_then_music_is_gone_and_everyt
             ),
             (RUN_VIDEO.to_owned(), Some("video".to_owned())),
             (RUN_EVERY_TYPE.to_owned(), None),
+            (RUN_IMAGE_AUDIO.to_owned(), Some("image".to_owned())),
         ]
     );
+    // The audio-only run's failure goes with it (25), and so do the
+    // surviving runs' failures on audio files (26).
     let failures: Vec<(i64, String)> =
         sqlx::query_as("SELECT id, run_id FROM catalog_run_failures ORDER BY id")
             .fetch_all(&pool)
             .await
             .expect("catalog_run_failures");
-    assert_eq!(failures, vec![(2, RUN_AUDIO_IMAGE.to_owned())]);
+    assert_eq!(
+        failures,
+        vec![
+            (2, RUN_AUDIO_IMAGE.to_owned()),
+            (5, RUN_EVERY_TYPE.to_owned())
+        ]
+    );
 
     // Referential integrity holds, and the connection the migration ran on
     // has foreign keys back on.
@@ -627,6 +661,7 @@ async fn given_a_migrated_database_with_mixed_scope_runs_when_runs_are_listed_th
     let runs = SqliteCatalogRunRepository::new(pool.clone());
     let audio_image = Uuid::parse_str(RUN_AUDIO_IMAGE).expect("uuid");
     let image_audio_video = Uuid::parse_str(RUN_IMAGE_AUDIO_VIDEO).expect("uuid");
+    let image_audio = Uuid::parse_str(RUN_IMAGE_AUDIO).expect("uuid");
 
     let first = runs
         .get(audio_image)
@@ -646,6 +681,16 @@ async fn given_a_migrated_database_with_mixed_scope_runs_when_runs_are_listed_th
     assert_eq!(
         second.scope,
         IndexScope::parse([FileType::Image.as_str(), FileType::Video.as_str()]).expect("scope")
+    );
+
+    let third = runs
+        .get(image_audio)
+        .await
+        .expect("an 'image,audio' run reads back")
+        .expect("and still exists");
+    assert_eq!(
+        third.scope,
+        IndexScope::parse([FileType::Image.as_str()]).expect("scope")
     );
 
     // The audio-only run is gone rather than widened to every type.
@@ -713,6 +758,17 @@ async fn given_migration_25_applied_but_unrecorded_when_migrated_again_then_it_s
     seed_music_library(&pool).await;
     run_migrations(&pool).await.expect("migrate to head");
     let surviving = file_rows(&pool, "1 = 1").await;
+    let runs = run_rows(&pool).await;
+    let watch = ids(
+        &pool,
+        "SELECT video_file_id FROM watch_progress ORDER BY id",
+    )
+    .await;
+    let reading = ids(
+        &pool,
+        "SELECT item_file_id FROM reading_progress ORDER BY id",
+    )
+    .await;
 
     sqlx::query("DELETE FROM _sqlx_migrations WHERE version = 25")
         .execute(&pool)
@@ -722,6 +778,25 @@ async fn given_migration_25_applied_but_unrecorded_when_migrated_again_then_it_s
 
     assert_eq!(file_rows(&pool, "1 = 1").await, surviving);
     assert_eq!(foreign_keys_pragma(&pool).await, 1);
+    // The scope rewrite finds nothing left to strip, rather than mangling a
+    // scope it already rewrote, and the progress tables lose nothing more.
+    assert_eq!(run_rows(&pool).await, runs);
+    assert_eq!(
+        ids(
+            &pool,
+            "SELECT video_file_id FROM watch_progress ORDER BY id"
+        )
+        .await,
+        watch
+    );
+    assert_eq!(
+        ids(
+            &pool,
+            "SELECT item_file_id FROM reading_progress ORDER BY id"
+        )
+        .await,
+        reading
+    );
 
     pool.close().await;
 }
@@ -744,9 +819,59 @@ async fn given_fresh_in_memory_db_when_migrate_then_files_refuses_audio() {
          VALUES ('audio-uuid', '/music/a.mp3', 'a.mp3', 'audio', '2026-06-01T00:00:00Z')",
     )
     .execute(&pool)
-    .await;
-    assert!(audio.is_err(), "type 'audio' is refused on a fresh install");
+    .await
+    .expect_err("type 'audio' is refused on a fresh install");
+    assert!(
+        audio.to_string().contains("CHECK constraint failed"),
+        "refused by the type CHECK, not something else: {audio}"
+    );
     assert_eq!(foreign_keys_pragma(&pool).await, 1);
+
+    pool.close().await;
+}
+
+/// Migration 26: a surviving run keeps the failures it recorded on files
+/// Alexandria still catalogs, and loses those on audio files, whatever the
+/// case of the extension. A path that merely mentions an audio format is not
+/// an audio file.
+#[tokio::test]
+async fn given_runs_with_failures_on_audio_files_when_migrated_then_only_those_failures_are_gone() {
+    let pool = pool_at_version_24().await;
+    seed_music_library(&pool).await;
+    sqlx::query("UPDATE catalog_runs SET failed = 2 WHERE id = ?")
+        .bind(RUN_EVERY_TYPE)
+        .execute(&pool)
+        .await
+        .expect("tally the run's two failures");
+    let tallies_before: Vec<(String, Option<i64>)> = sqlx::query_as(
+        "SELECT id, failed FROM catalog_runs WHERE scope IS NOT 'audio' ORDER BY id",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("tallies");
+
+    run_migrations(&pool).await.expect("migrate to head");
+
+    let failures: Vec<(String, String)> =
+        sqlx::query_as("SELECT run_id, path FROM catalog_run_failures ORDER BY id")
+            .fetch_all(&pool)
+            .await
+            .expect("catalog_run_failures");
+    assert_eq!(
+        failures,
+        vec![
+            (RUN_AUDIO_IMAGE.to_owned(), "/media/bad.png".to_owned()),
+            (RUN_EVERY_TYPE.to_owned(), "/media/mp3s.txt".to_owned()),
+        ]
+    );
+
+    // The tallies record what each run met at the time, and stay.
+    let tallies_after: Vec<(String, Option<i64>)> =
+        sqlx::query_as("SELECT id, failed FROM catalog_runs ORDER BY id")
+            .fetch_all(&pool)
+            .await
+            .expect("tallies");
+    assert_eq!(tallies_after, tallies_before);
 
     pool.close().await;
 }

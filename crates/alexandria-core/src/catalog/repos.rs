@@ -68,7 +68,7 @@ pub trait CatalogRepository: Send + Sync {
     /// `missing_at`; leaves `state` (soft-delete is UC-06) and `deleted_at`.
     async fn mark_missing(&self, path: &str, missing_at: DateTime<Utc>) -> Result<(), DomainError>;
     /// Replace the editable subtype columns of the file identified by `uuid`
-    /// (UC-04 / FR-FC-14..18). Full replace: every editable column listed in
+    /// (UC-04 / FR-FC-15..18). Full replace: every editable column listed in
     /// `SubtypeMetadata` is written, `None` writes `NULL`. Non-editable
     /// columns (`episodeCount`, `pageCount`, `width`, `height`, `sourceUrl`,
     /// `savedAt`) are left untouched. Returns `NotFound` when no file row
@@ -142,7 +142,7 @@ pub trait CatalogRepository: Send + Sync {
     /// memory. A listing filtered to one type costs two queries (the files
     /// query plus one subtype batch) whatever its size, or more only when
     /// chunking splits that one batch across several `IN` lists; a mixed
-    /// listing costs one query per subtype present, bounded by the five
+    /// listing costs one query per subtype present, bounded by the four
     /// subtypes that carry `SubtypeMetadata` (Text/Html never register).
     async fn list_filtered_view(
         &self,

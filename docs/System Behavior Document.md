@@ -214,8 +214,8 @@ API surface.
 ### 5.1 What a scan costs, and why
 
 Indexing **reads no file bytes to identify a file** (`FR-FC-09`). Per-file work
-is one `stat` plus, at first index only, a read of the file's embedded metadata. Re-index is one
-`stat` and nothing else.
+is one `stat` plus, at first index only, a read of the file's embedded
+metadata. Re-index is one `stat` and nothing else.
 
 This is the single most important behavioral fact about the system, because it
 inverts the cost model:
@@ -334,12 +334,12 @@ bounds the two other ways a path reaches the disk:
   correct it to `/home/someone`, and the stream serves
   `/home/someone/notes.txt`. The rejection is the index's, word for word.
 - **Serving or changing a cataloged file** — stream, comic page, thumbnail,
-  text read and edit, rename, purge-on-disk. A record can
-  still point outside: catalogued before the bound was configured, corrected
-  before corrections were bounded, or reached through a symbolic link swapped
-  in since. Such a record is refused with `file is outside the configured
-  library root`. Purging only the record (UC-08) never touches the disk, so it
-  stays the way to drop one.
+  text read and edit, rename, purge-on-disk. A record can still point outside:
+  catalogued before the bound was configured, corrected before corrections
+  were bounded, or reached through a symbolic link swapped in since. Such a
+  record is refused with `file is outside the configured library root`.
+  Purging only the record (UC-08) never touches the disk, so it stays the way
+  to drop one.
 
 Both sides are **canonicalized** before comparison, which is what
 holds the bound against `<root>/../../etc`, against `<root>` vs `<root>/` vs
@@ -518,7 +518,7 @@ sequenceDiagram
     RC->>RC: does this status permit pause?
     RC->>REG: cell.raise(Pause)
     RC-->>CL: 202 Accepted
-    Note over W: the in-flight window drains —<br/>milliseconds, since per-file work is<br/>a stat and a header read
+    Note over W: the in-flight window drains —<br/>milliseconds, since per-file work is<br/>a stat and a metadata read
     W->>W: read the signal once, after draining
     W->>R: flush the final progress
     W->>R: pause(run_id, now, segment)

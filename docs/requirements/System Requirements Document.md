@@ -514,7 +514,7 @@ was given — a resume continues a run, it does not mint a new one.
 | --- | --- | --- | --- |
 | GET | /v1/files | List/query files by type and state, optionally reaching into libraries with `includeLibraries=true` (collection filter ships with Collections), each returned as the same record `GET /v1/files/{uuid}` answers for one file. An unrecognised filter value is rejected as invalid input. | FR-FC-12, FR-FC-38 |
 | GET | /v1/files/{uuid} | Get one file's metadata. | FR-FC-13 |
-| PATCH | /v1/files/{uuid}/metadata | Edit type-specific metadata. | FR-FC-14..18 |
+| PATCH | /v1/files/{uuid}/metadata | Edit type-specific metadata. | FR-FC-15..18 |
 | POST | /v1/files/{uuid}/rename | Rename the file (and on-disk file). | FR-FC-19 |
 | DELETE | /v1/files/{uuid} | Soft-delete the record. | FR-FC-20 |
 | POST | /v1/files/{uuid}/restore | Restore a soft-deleted record. | FR-FC-21 |
@@ -740,7 +740,7 @@ The feature identifiers are the milestones the
 | --- | --- |
 | F-00 Foundation and operations | IR-01 through IR-06 (Operations & Infrastructure Document §2) |
 | F-01 File indexing | FR-FC-01 through FR-FC-11, FR-FC-25 through FR-FC-29, FR-FC-31 through FR-FC-35 |
-| F-02 Catalog browsing and metadata editing | FR-FC-12 through FR-FC-18 |
+| F-02 Catalog browsing and metadata editing | FR-FC-12, FR-FC-13, FR-FC-15 through FR-FC-18 |
 | F-03 Renaming and lifecycle management | FR-FC-19 through FR-FC-23 |
 | F-04 Text file content editing | FR-TX-01 through FR-TX-03 |
 | F-05 Collections | FR-CO-01 through FR-CO-08 |
@@ -748,7 +748,7 @@ The feature identifiers are the milestones the
 | F-07 Watchlists | FR-WL-01 through FR-WL-08 |
 | F-08 Reading lists | FR-RL-01 through FR-RL-08 |
 | F-09 Pluggable authentication | FR-AU-01 through FR-AU-24 |
-| F-10 Media playback | FR-MP-01 through FR-MP-07 |
+| F-10 Media playback | FR-MP-01 through FR-MP-06 |
 | F-11 Playlists | **Removed (moved out of scope, see Orpheus)** |
 | F-12 Libraries | FR-FC-36 through FR-FC-41 |
 | F-13 Music enrichment | **Removed (moved out of scope, see Orpheus)** |

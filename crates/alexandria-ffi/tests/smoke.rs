@@ -643,7 +643,7 @@ fn _unused(c: *const c_char, s: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// UC-04: alexandria_file_edit_metadata (FR-FC-14..18, FR-FC-24)
+// UC-04: alexandria_file_edit_metadata (FR-FC-15..18, FR-FC-24)
 // ---------------------------------------------------------------------------
 
 /// Result JSON of a `FileMetadataResult` on success, parsed. Asserts `FILE_OK`.
@@ -2740,6 +2740,37 @@ fn given_an_unknown_type_when_ffi_index_start_then_invalid_input() {
     );
     // The claim the HTTP twin makes too: the scope is parsed ahead of
     // `start`, so a refused request leaves no run record behind (FR-FC-27).
+    let runs = with_db(&db_path, |pool| async move {
+        let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM catalog_runs")
+            .fetch_one(&pool)
+            .await
+            .expect("count runs");
+        count
+    });
+    assert_eq!(runs, 0, "a refused start must not open a run record");
+}
+
+/// The removed `audio` type is refused like any unknown one, through the
+/// same parse, so it opens no run either.
+#[test]
+fn given_the_removed_audio_type_when_ffi_index_start_then_invalid_input() {
+    let _g = serial();
+    let (_dir, db_path) = init_temp_db();
+    let lib = tempdir().unwrap();
+    std::fs::write(lib.path().join("memo.txt"), b"text").unwrap();
+
+    let root = c(lib.path().to_str().unwrap());
+    let token = c(TEST_TOKEN);
+    let types = c("audio");
+    let result = alexandria_index_start(
+        root.as_ptr(),
+        token.as_ptr(),
+        std::ptr::null(),
+        types.as_ptr(),
+    );
+
+    assert_eq!(result.status, STATUS_INVALID_INPUT);
+    assert_eq!(run_id_string(&result), "");
     let runs = with_db(&db_path, |pool| async move {
         let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM catalog_runs")
             .fetch_one(&pool)

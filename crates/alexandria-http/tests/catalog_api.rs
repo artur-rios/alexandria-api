@@ -280,7 +280,7 @@ async fn given_no_bearer_when_refresh_posted_then_returns_401() {
 }
 
 // ---------------------------------------------------------------------------
-// UC-04: PATCH /v1/files/{uuid}/metadata (FR-FC-14..18, FR-FC-24)
+// UC-04: PATCH /v1/files/{uuid}/metadata (FR-FC-15..18, FR-FC-24)
 // ---------------------------------------------------------------------------
 
 fn patch_metadata(uuid: &str, body: Value) -> Request<Body> {
@@ -327,27 +327,68 @@ async fn given_indexed_video_file_when_patch_video_metadata_then_200_and_row_upd
         "mediaKind": "movie"
     });
 
-    let response = app(Settings::default(), test.services)
+    let response = app(Settings::default(), test.services.clone())
         .oneshot(patch_metadata(&uuid, body))
         .await
         .expect("patch one-shot");
     assert_eq!(response.status(), StatusCode::OK);
     let json: Value =
         serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(json["file"]["uuid"], uuid);
+    assert_eq!(json["file"]["fileType"], "video");
+    assert_eq!(json["file"]["state"], "active");
+    assert_eq!(json["metadata"]["type"], "video");
+    assert_eq!(json["metadata"]["title"], "A Film");
     assert_eq!(json["metadata"]["mediaKind"], "movie");
 
-    let row: (Option<String>, Option<i64>, Option<String>, Option<String>) = sqlx::query_as(
-        "SELECT title, year, resolution, media_kind FROM video_files \
-         JOIN files ON files.id = video_files.file_id WHERE files.uuid = ?",
-    )
-    .bind(&uuid)
-    .fetch_one(&test.pool)
-    .await
-    .expect("video row");
+    let row = video_row(&test.pool, &uuid).await;
     assert_eq!(row.0.as_deref(), Some("A Film"));
     assert_eq!(row.1, Some(1999));
     assert_eq!(row.2.as_deref(), Some("1080p"));
     assert_eq!(row.3.as_deref(), Some("movie"));
+
+    // A PATCH is a full replace: a field the next body omits is cleared to
+    // NULL, not left at its previous value.
+    let without_resolution = json!({
+        "type": "video",
+        "title": "A Film",
+        "year": 1999,
+        "mediaKind": "movie"
+    });
+    let response = app(Settings::default(), test.services)
+        .oneshot(patch_metadata(&uuid, without_resolution))
+        .await
+        .expect("second patch one-shot");
+    assert_eq!(response.status(), StatusCode::OK);
+    let json: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert!(
+        json["metadata"].get("resolution").is_none(),
+        "cleared field is omitted (skip_serializing_if), not written as null"
+    );
+
+    let row = video_row(&test.pool, &uuid).await;
+    assert_eq!(
+        row.2, None,
+        "second PATCH must overwrite the stored value with NULL"
+    );
+    assert_eq!(row.0.as_deref(), Some("A Film"));
+}
+
+/// The editable columns of the `video_files` row of the file `uuid`: title,
+/// year, resolution and media kind.
+async fn video_row(
+    pool: &sqlx::sqlite::SqlitePool,
+    uuid: &str,
+) -> (Option<String>, Option<i64>, Option<String>, Option<String>) {
+    sqlx::query_as(
+        "SELECT title, year, resolution, media_kind FROM video_files \
+         JOIN files ON files.id = video_files.file_id WHERE files.uuid = ?",
+    )
+    .bind(uuid)
+    .fetch_one(pool)
+    .await
+    .expect("video row")
 }
 
 #[tokio::test]
@@ -619,6 +660,19 @@ async fn given_unknown_type_when_get_files_then_400() {
     let test = test_app().await;
     let response = app(Settings::default(), test.services)
         .oneshot(get_files("/v1/files?type=banana"))
+        .await
+        .expect("list one-shot");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+/// `audio` was a file type until 0.5; it is now as unknown as any other name,
+/// so a client still asking for it is told so rather than handed an empty
+/// listing.
+#[tokio::test]
+async fn given_the_removed_audio_type_when_get_files_then_400() {
+    let test = test_app().await;
+    let response = app(Settings::default(), test.services)
+        .oneshot(get_files("/v1/files?type=audio"))
         .await
         .expect("list one-shot");
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
@@ -944,21 +998,15 @@ async fn given_missing_uuid_when_get_file_then_404() {
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }
 
-#[tokio::test]
-async fn given_the_enrichment_routes_are_gone_when_called_then_not_found() {
-    let test = test_app().await;
-    let router = app(Settings::default(), test.services);
-    let uuid = uuid::Uuid::new_v4();
+/// Call each removed `(method, uri)` with a valid bearer and a JSON body, and
+/// assert every one answers `404`: the route is gone, not merely refusing the
+/// caller or the body.
+async fn assert_routes_gone(router: axum::Router, routes: &[(&str, &str)]) {
     let authorization = format!("Bearer {}", common::TEST_TOKEN);
-
-    for (method, uri) in [
-        ("POST", "/v1/enrichment/runs".to_string()),
-        ("GET", format!("/v1/enrichment/tracks/{uuid}")),
-        ("GET", "/v1/enrichment/artist-image".to_string()),
-    ] {
+    for (method, uri) in routes {
         let request = Request::builder()
-            .method(method)
-            .uri(&uri)
+            .method(*method)
+            .uri(*uri)
             .header("authorization", authorization.as_str())
             .header("content-type", "application/json")
             .body(Body::from("{}"))
@@ -966,44 +1014,44 @@ async fn given_the_enrichment_routes_are_gone_when_called_then_not_found() {
         let response = router.clone().oneshot(request).await.expect("one-shot");
         assert_eq!(response.status(), StatusCode::NOT_FOUND, "{method} {uri}");
     }
+}
+
+#[tokio::test]
+async fn given_the_enrichment_routes_are_gone_when_called_then_not_found() {
+    let test = test_app().await;
+    let tracks = format!("/v1/enrichment/tracks/{}", uuid::Uuid::new_v4());
+
+    assert_routes_gone(
+        app(Settings::default(), test.services),
+        &[
+            ("POST", "/v1/enrichment/runs"),
+            ("GET", &tracks),
+            ("GET", "/v1/enrichment/artist-image"),
+        ],
+    )
+    .await;
 }
 
 #[tokio::test]
 async fn given_the_plays_routes_are_gone_when_called_then_not_found() {
     let test = test_app().await;
-    let router = app(Settings::default(), test.services);
-    let authorization = format!("Bearer {}", common::TEST_TOKEN);
 
-    for (method, uri) in [("POST", "/v1/plays"), ("GET", "/v1/plays/stats")] {
-        let request = Request::builder()
-            .method(method)
-            .uri(uri)
-            .header("authorization", authorization.as_str())
-            .header("content-type", "application/json")
-            .body(Body::from("{}"))
-            .unwrap();
-        let response = router.clone().oneshot(request).await.expect("one-shot");
-        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{method} {uri}");
-    }
+    assert_routes_gone(
+        app(Settings::default(), test.services),
+        &[("POST", "/v1/plays"), ("GET", "/v1/plays/stats")],
+    )
+    .await;
 }
 
 #[tokio::test]
 async fn given_the_playlist_routes_are_gone_when_called_then_not_found() {
     let test = test_app().await;
-    let router = app(Settings::default(), test.services);
-    let authorization = format!("Bearer {}", common::TEST_TOKEN);
 
-    for (method, uri) in [("GET", "/v1/playlists"), ("POST", "/v1/playlists")] {
-        let request = Request::builder()
-            .method(method)
-            .uri(uri)
-            .header("authorization", authorization.as_str())
-            .header("content-type", "application/json")
-            .body(Body::from("{}"))
-            .unwrap();
-        let response = router.clone().oneshot(request).await.expect("one-shot");
-        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{method} {uri}");
-    }
+    assert_routes_gone(
+        app(Settings::default(), test.services),
+        &[("GET", "/v1/playlists"), ("POST", "/v1/playlists")],
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -1014,18 +1062,9 @@ async fn given_the_energy_route_is_gone_when_called_then_not_found() {
     let test = test_app().await;
     index_library(&lib, &test.pool, &[("clip.mp4", b"x")]).await;
     let uuid = uuid_for_name(&test.pool, "clip.mp4").await;
-    let router = app(Settings::default(), test.services);
-    let authorization = format!("Bearer {}", common::TEST_TOKEN);
+    let energy = format!("/v1/files/{uuid}/energy");
 
-    let request = Request::builder()
-        .method("GET")
-        .uri(format!("/v1/files/{uuid}/energy"))
-        .header("authorization", authorization.as_str())
-        .body(Body::empty())
-        .unwrap();
-    let response = router.oneshot(request).await.expect("one-shot");
-
-    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_routes_gone(app(Settings::default(), test.services), &[("GET", &energy)]).await;
 }
 
 #[tokio::test]
@@ -2303,6 +2342,33 @@ async fn given_an_unknown_type_when_index_posted_then_400_and_no_run_started() {
         serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
     assert!(body["error"].as_str().is_some(), "error envelope present");
 
+    let runs: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM catalog_runs")
+        .fetch_one(&test.pool)
+        .await
+        .expect("count");
+    assert_eq!(runs.0, 0, "a rejected start must not open a run record");
+}
+
+/// The removed `audio` type is refused like any unknown one: a run scoped to
+/// it would have nothing to cover, and widening it to every type is the
+/// opposite of what was asked.
+#[tokio::test]
+async fn given_the_removed_audio_type_when_index_posted_then_400_and_no_run_started() {
+    let lib = tempdir().unwrap();
+    common::write_file(&lib, "memo.txt", b"text bytes");
+
+    let test = test_app().await;
+    let router = app(Settings::default(), test.services);
+
+    let response = router
+        .oneshot(index_request_with_types(
+            lib.path().to_str().unwrap(),
+            &["audio"],
+        ))
+        .await
+        .expect("one-shot");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let runs: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM catalog_runs")
         .fetch_one(&test.pool)
         .await

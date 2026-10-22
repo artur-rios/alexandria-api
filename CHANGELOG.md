@@ -47,9 +47,10 @@ a separate project.
 - Data, on upgrade: migration 25 deletes the stored music from the database. It drops the playlist, lyrics, energy,
   play history, and artist image tables, removes every audio file and its tag record, and rebuilds `files` without the
   `audio` type. Index runs scoped to audio alone are deleted, and `audio` is stripped from the scope of mixed runs.
-  Videos, documents, and every other file keep their records, ids, and progress. Files on disk and cached artist
-  images are never touched.
-- Breaking for clients: the core is version 0.5.0, so a client built against 0.4 is refused at startup.
+  Migration 26 then deletes the failures that surviving runs recorded on audio files, keeping each run's failure
+  count as it was. Videos, documents, and every other file keep their records, ids, and progress. Files on disk and
+  cached artist images are never touched.
+- Breaking for clients: the core is version 0.5.0, and a client built against 0.4 refuses it at startup.
 
 ### Fixed
 

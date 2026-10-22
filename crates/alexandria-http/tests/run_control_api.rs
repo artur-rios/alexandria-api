@@ -179,7 +179,7 @@ async fn start_index(router: &axum::Router, root: &str) -> String {
 /// returning its id — the fixture every resume test below needs. Factored
 /// out of `given_a_paused_run_when_resumed_then_202_same_run_id_and_it_finishes`
 /// unchanged, including the 500-file library: that is what gives an *index*
-/// walk (which parses tags per file, unlike a refresh) time to still be
+/// walk (which writes a row per file, unlike a refresh) time to still be
 /// running when the pause lands, and `wait_for_run_cell_live` panics with a
 /// pointed message rather than flaking if it ever stops being enough.
 async fn paused_index_run(
