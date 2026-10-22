@@ -83,7 +83,12 @@ impl ComicArchive for ZipComicArchive {
                 let entry = archive
                     .by_index(i)
                     .map_err(|e| DomainError::disk(format!("cannot read entry {i}: {e}")))?;
-                let name = entry.name().to_string();
+                // zip 9 decodes the name on demand, and a name it cannot
+                // decode fails here rather than in `by_index` as it did before.
+                let name = entry
+                    .name()
+                    .map_err(|e| DomainError::disk(format!("cannot read entry {i}: {e}")))?
+                    .into_owned();
                 if is_page_entry(&name) {
                     names.push(name);
                     indices.push(i);
