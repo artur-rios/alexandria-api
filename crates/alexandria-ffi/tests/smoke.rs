@@ -213,7 +213,7 @@ fn wait_for_files(expected: i64) -> i64 {
 /// the mode as it found it, and never reaches the global services slot: the
 /// gate runs before the slot is touched.
 #[test]
-fn given_external_mode_without_a_secret_when_ffi_init_then_refuses_to_start() {
+fn given_external_mode_without_a_key_set_or_secret_when_ffi_init_then_refuses_to_start() {
     // Arrange
     let _g = serial();
     let previous_mode = std::env::var("ALEXANDRIA_AUTH_MODE").ok();
@@ -221,6 +221,7 @@ fn given_external_mode_without_a_secret_when_ffi_init_then_refuses_to_start() {
     // The overrides an ambient environment might carry would configure the
     // very thing this test asserts is missing.
     for key in [
+        "ALEXANDRIA_AUTH_HEIMDALL_JWKS_URL",
         "ALEXANDRIA_AUTH_HEIMDALL_TOKEN_SECRET",
         "ALEXANDRIA_AUTH_HEIMDALL_TOKEN_SECRET_PREVIOUS",
         "ALEXANDRIA_AUTH_HEIMDALL_SCOPE_ID",

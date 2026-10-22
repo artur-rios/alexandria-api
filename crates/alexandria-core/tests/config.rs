@@ -226,6 +226,7 @@ fn given_heimdall_keys_when_parsed_then_external_settings_match() {
     let toml = r#"
 [auth]
 mode = "external"
+heimdall_jwks_url = "http://heimdall-api.prod:8080/.well-known/jwks.json"
 heimdall_token_secret = "current-secret"
 heimdall_token_secret_previous = "previous-secret"
 heimdall_scope_id = "0b8d3a6e-4a1f-4c2b-9f1e-7c5d2a9b3e40"
@@ -235,6 +236,10 @@ heimdall_audience = "alexandria"
     let settings: Settings = toml::from_str(toml).unwrap();
 
     assert_eq!(settings.auth.mode, AuthMode::External);
+    assert_eq!(
+        settings.auth.heimdall_jwks_url,
+        "http://heimdall-api.prod:8080/.well-known/jwks.json"
+    );
     assert_eq!(
         settings.auth.heimdall_token_secret.expose(),
         "current-secret"
@@ -258,6 +263,7 @@ heimdall_audience = "alexandria"
 fn given_no_heimdall_keys_when_parsed_then_empty() {
     let settings: Settings = toml::from_str("[auth]\nmode = \"local\"\n").unwrap();
 
+    assert_eq!(settings.auth.heimdall_jwks_url, "");
     assert!(settings.auth.heimdall_token_secret.is_empty());
     assert!(settings.auth.heimdall_token_secret_previous.is_empty());
     assert_eq!(settings.auth.heimdall_scope_id, "");
@@ -296,7 +302,7 @@ fn given_local_mode_when_validated_then_ok_without_heimdall_keys() {
 /// A process that cannot verify a token must refuse to start, rather than
 /// answer 401 to every request forever with no indication why.
 #[test]
-fn given_external_mode_without_secret_when_validated_then_error_names_the_key() {
+fn given_external_mode_without_key_set_or_secret_when_validated_then_error_names_both() {
     let auth = AuthSettings {
         mode: AuthMode::External,
         heimdall_scope_id: "0b8d3a6e-4a1f-4c2b-9f1e-7c5d2a9b3e40".to_string(),
@@ -305,7 +311,39 @@ fn given_external_mode_without_secret_when_validated_then_error_names_the_key() 
 
     let message = auth.validate().unwrap_err().to_string();
 
+    assert!(message.contains("auth.heimdall_jwks_url"), "{message}");
     assert!(message.contains("auth.heimdall_token_secret"), "{message}");
+}
+
+/// After the overlap the secrets are removed and the key set alone verifies,
+/// so a configuration with no secret at all has to start.
+#[test]
+fn given_external_mode_with_only_a_key_set_url_when_validated_then_ok() {
+    let auth = AuthSettings {
+        mode: AuthMode::External,
+        heimdall_jwks_url: "http://heimdall-api.prod:8080/.well-known/jwks.json".to_string(),
+        heimdall_scope_id: "0b8d3a6e-4a1f-4c2b-9f1e-7c5d2a9b3e40".to_string(),
+        ..AuthSettings::default()
+    };
+
+    assert!(auth.validate().is_ok());
+}
+
+/// A key set URL that is not http(s) would fail at the first token, on a
+/// request path, with nothing to say why. It is refused at startup instead.
+#[test]
+fn given_external_mode_with_a_key_set_path_rather_than_url_when_validated_then_error_names_the_key()
+{
+    let auth = AuthSettings {
+        mode: AuthMode::External,
+        heimdall_jwks_url: "heimdall-api/.well-known/jwks.json".to_string(),
+        heimdall_scope_id: "0b8d3a6e-4a1f-4c2b-9f1e-7c5d2a9b3e40".to_string(),
+        ..AuthSettings::default()
+    };
+
+    let message = auth.validate().unwrap_err().to_string();
+
+    assert!(message.contains("auth.heimdall_jwks_url"), "{message}");
 }
 
 /// External mode accepts a token on membership of a named scope, so the
@@ -331,12 +369,16 @@ fn given_external_mode_with_non_uuid_scope_when_validated_then_error_names_the_k
 /// these the only way to configure external mode is a file holding the one
 /// value that can mint a token every Heimdall-backed application accepts.
 ///
-/// All five are exercised in one test, under one lock, because they share the
+/// All six are exercised in one test, under one lock, because they share the
 /// process-global environment; see `EnvGuard`.
 #[test]
 fn given_heimdall_environment_variables_when_settings_loaded_then_they_override_the_file() {
     let _env = EnvGuard::set(&[
         ("ALEXANDRIA_AUTH_MODE", "external"),
+        (
+            "ALEXANDRIA_AUTH_HEIMDALL_JWKS_URL",
+            "http://heimdall-api.test:8080/.well-known/jwks.json",
+        ),
         ("ALEXANDRIA_AUTH_HEIMDALL_TOKEN_SECRET", "env-secret"),
         (
             "ALEXANDRIA_AUTH_HEIMDALL_TOKEN_SECRET_PREVIOUS",
@@ -357,6 +399,10 @@ fn given_heimdall_environment_variables_when_settings_loaded_then_they_override_
     ));
 
     assert_eq!(settings.auth.mode, AuthMode::External);
+    assert_eq!(
+        settings.auth.heimdall_jwks_url,
+        "http://heimdall-api.test:8080/.well-known/jwks.json"
+    );
     assert_eq!(settings.auth.heimdall_token_secret.expose(), "env-secret");
     assert_eq!(
         settings.auth.heimdall_token_secret_previous.expose(),
