@@ -143,7 +143,7 @@ With all tests passing, push the branch and open a pull request into the
 `develop` branch. The description references the use case and its issue (e.g.
 `Closes #<issue-number>`). Hand off to a human for review; do not merge.
 
-The pull request cannot be merged until CI's `fmt, clippy, test` check and the
+The pull request cannot be merged until CI's `lint-and-test` check and the
 `branch-policy` check are green. The latter refuses a branch that is not named
 `feature/<name>` or `fix/<name>`, or that was cut from `main` instead of
 `develop`.
