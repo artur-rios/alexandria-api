@@ -1,0 +1,14 @@
+# What Jenkins checks for this repository, read by the pipeline of the yggdrasil installation that deploys it
+# (yggdrasil's docs/catalog.md, "Repository pipeline file", has every field). It is data, never code: images
+# (pinned by version and digest, which Renovate keeps up to date: the owner merges those changes), commands, globs and
+# the names of Jenkins credentials. The command is a script under ci/, which runs from the repository's root, so you
+# can run it on your machine too. Check it where the catalog is, in the yggdrasil checkout:
+#   python3 scripts/pipeline_config.py describe alexandria-api <this repository's checkout>
+#
+# The check is ci.yml's `check` job (its GitHub status was "fmt, clippy, test"). The workflow's `performance` job
+# stays a GitHub Actions workflow on the mirror (push to develop and main, never gating), so it is not a check here.
+
+checks:
+  lint-and-test:                         # ci.yml / check: rustfmt, clippy with -D warnings, the workspace's tests
+    image: rust:1.99.1-bookworm@sha256:48b7f435b8fc6378ce43b44f15e3a47fd8919b2825f835c39bd4bd3da50af5b8
+    run: ci/lint-and-test.sh
