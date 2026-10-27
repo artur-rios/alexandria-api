@@ -1,0 +1,20 @@
+{
+  "extends": ["local>artur-rios/yggdrasil//renovate/default"],
+  "enabledManagers": ["cargo", "github-actions", "dockerfile", "docker-compose", "custom.regex"],
+  "packageRules": [
+    {
+      "description": "Dependabot's cargo group: one pull request for the minor and patch updates of the workspace's crates. The shared preset does not enable cargo, so it is enabled above; weekly, like Dependabot.",
+      "matchManagers": ["cargo"],
+      "matchUpdateTypes": ["minor", "patch"],
+      "groupName": "cargo-minor-and-patch",
+      "schedule": ["on monday"]
+    },
+    {
+      "description": "Dependabot proposed workflow action updates weekly, all in one pull request, for the performance workflow that stays on GitHub.",
+      "matchManagers": ["github-actions"],
+      "groupName": "github-actions",
+      "semanticCommitType": "ci",
+      "schedule": ["on monday"]
+    }
+  ]
+}

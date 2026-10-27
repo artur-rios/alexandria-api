@@ -1,5 +1,8 @@
 # Contributing
 
+This repository lives at <https://git.techcraftsmen.net/artur-rios/alexandria-api>; the GitHub repository is a
+read-only mirror of it. Open pull requests on the git server.
+
 Reading order for a new contributor: `docs/initial/Project Overview.md` →
 `docs/requirements/Vision Document.md` →
 `docs/requirements/Use Case Specification Document.md` →
@@ -38,7 +41,7 @@ workspace, not just the video code, so install them first.
 
 Any ffmpeg from **3.0 to 9.0** works — `ffmpeg-sys-next 9` gates its bindings
 by version and covers that whole range — so on a platform with a system package
-you can install whatever it offers. CI builds against Ubuntu's 6.1.
+you can install whatever it offers. CI builds against Debian 12's 5.1.
 
 ### Debian/Ubuntu
 
@@ -278,7 +281,8 @@ Every use case is delivered with its tests in the same change, per the
 [Development Workflow Document](docs/requirements/Development%20Workflow%20Document.md).
 
 CI also checks formatting and lints with every warning treated as an error, so
-run these before opening a pull request:
+run these before opening a pull request (`ci/lint-and-test.sh` runs them, then the
+tests, the way CI does):
 
 ```bash
 cargo fmt --all -- --check
@@ -323,9 +327,10 @@ one pull request. The full flow — issue status transitions, the testing gate,
 and the Definition of Done — is in the
 [Development Workflow Document](docs/requirements/Development%20Workflow%20Document.md).
 
-A pull request into `develop` or `main` needs a green `fmt, clippy, test` check
-and a green `branch-policy` check before it can be merged. The **Branch Policy**
-workflow ([`branch-policy.yml`](.github/workflows/branch-policy.yml)) enforces
+A pull request into `develop` or `main` needs a green `lint-and-test` check
+and a green `branch-policy` check before it can be merged. Jenkins runs both
+(`lint-and-test` is [`ci/lint-and-test.sh`](ci/lint-and-test.sh), configured in
+[`yggdrasil.yml`](yggdrasil.yml)), and the `branch-policy` check enforces
 the model above: into `develop` only from `feature/` or `fix/` branches cut from
 `develop`, into `main` only from a `release/<major>.<minor>.<patch>` branch whose
 every commit is already on `develop` and whose version has no tag yet. Tags

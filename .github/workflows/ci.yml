@@ -1,9 +1,12 @@
 name: CI
 
+# What is left of the CI workflow on the GitHub mirror. The checks (fmt, clippy, test) moved to Jenkins
+# (ci/lint-and-test.sh, yggdrasil.yml); only the measurement stays here, on the GitHub copy of the repository.
+# The mirror pushes the branches, and this runs on the ones that have been merged: develop and main.
+
 on:
   push:
     branches: [develop, main]
-  pull_request:
   workflow_dispatch:
 
 env:
@@ -13,49 +16,11 @@ env:
   RUSTFLAGS: -D warnings
 
 jobs:
-  check:
-    name: fmt, clippy, test
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-
-      # ffmpeg-next's underlying ffmpeg-sys-next crate needs the ffmpeg C
-      # dev libraries at build time (issue #44 video slice) — the first
-      # system dependency this workspace has needed.
-      - name: Install ffmpeg dev libraries
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libavformat-dev libavcodec-dev libavutil-dev \
-            libavfilter-dev libavdevice-dev libswscale-dev \
-            libswresample-dev pkg-config clang
-
-      - name: Install the toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-
-      - name: Cache cargo registry and build output
-        uses: Swatinem/rust-cache@v2
-
-      # Formatting first: it is the cheapest gate and its failures are the
-      # least interesting to read past.
-      - name: Check formatting
-        run: cargo fmt --all -- --check
-
-      # `--all-targets` so the lint pass covers tests and benches, not just
-      # the libraries — most of the workspace's code lives in its tests.
-      - name: Lint
-        run: cargo clippy --workspace --all-targets -- -D warnings
-
-      - name: Test
-        run: cargo test --workspace
-
   # NFR-02 (indexing throughput) and NFR-01's read latency under load are
   # measurements, not assertions, so they are deliberately not part of the gate
-  # above: a shared runner's throughput says more about the runner than about
-  # the commit. This job exists so the harness cannot rot unnoticed and so the
-  # figures are recorded run over run — read them in the log.
+  # (Jenkins' lint-and-test): a shared runner's throughput says more about the
+  # runner than about the commit. This job exists so the harness cannot rot
+  # unnoticed and so the figures are recorded run over run — read them in the log.
   #
   # It runs without ALEXANDRIA_NFR_STRICT, so the throughput and latency
   # assertions are the loose floors (see the Testing Specification Document §9):
@@ -76,15 +41,15 @@ jobs:
   # prompt to read the log and compare the figures against the previous run,
   # not a broken build — and if the figures are normal but a count assertion
   # failed, that is contention, which the indexer now retries through.
+  #
+  # It stays a GitHub Actions job on purpose and is neither a check nor an
+  # actionsCheck of the catalog: it is not required anywhere, so it need not
+  # run on every branch. Only after a merge, on develop and main: on a pull
+  # request this would double CI time to report a number nobody reviews.
   performance:
     name: performance (non-gating)
     runs-on: ubuntu-latest
     continue-on-error: true
-    # Only after a merge, on develop and main: on a pull request this would
-    # double CI time to report a number nobody reviews — and now that the job
-    # cannot gate, running it earlier would buy nothing a post-merge reading
-    # does not already give.
-    if: github.event_name == 'push'
     steps:
       - uses: actions/checkout@v7
 

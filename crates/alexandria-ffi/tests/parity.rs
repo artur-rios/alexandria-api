@@ -2934,10 +2934,20 @@ async fn given_active_file_when_purged_on_disk_via_http_and_ffi_then_file_bodies
             json!({ "root": http_lib.path().to_str().unwrap() }).to_string(),
         ))
         .unwrap();
-    let _ = app(Settings::default(), http_services.clone())
+    let index_resp = app(Settings::default(), http_services.clone())
         .oneshot(index_req)
         .await
         .expect("http index");
+    let index_body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(index_resp.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
+    let http_run_id = index_body["runId"]
+        .as_str()
+        .expect("http runId")
+        .to_string();
+    // The run's end, not the file count: a row is counted the moment it is
+    // inserted, and its extraction stamp (`metadataVersion`) lands after.
+    wait_for_http_run_terminal(&http_services, &http_run_id, TEST_TOKEN).await;
     wait_for_http_files(&http_pool, 1).await;
 
     let (http_uuid, http_file_id): (String, i64) =
@@ -2998,6 +3008,7 @@ async fn given_active_file_when_purged_on_disk_via_http_and_ffi_then_file_bodies
                 std::ptr::null(),
             );
             assert_eq!(started.status, alexandria_ffi::INDEX_OK);
+            wait_for_ffi_run_terminal(&run_id_string(&started), &token);
             wait_for_ffi_files(1);
 
             let ffi_db_path = std::path::PathBuf::from(ffi_dir.path()).join("ffi.sqlite");

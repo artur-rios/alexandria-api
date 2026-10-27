@@ -20,6 +20,10 @@ in-process.
 > Two-phase soft/hard deletion. Pluggable auth (external JWT, local encrypted
 > login, **or** the Windows account the server process runs as).
 
+> **Where this lives:** the repository is at
+> <https://git.techcraftsmen.net/artur-rios/alexandria-api>. The GitHub
+> repository is a read-only mirror of it.
+
 ## Project status
 
 Issues are tracked in the [Alexandria API project board](https://github.com/users/artur-rios/projects/8)
