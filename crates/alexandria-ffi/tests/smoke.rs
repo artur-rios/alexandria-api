@@ -39,6 +39,14 @@ fn serial() -> std::sync::MutexGuard<'static, ()> {
 /// land, so "no progress for N seconds" fires on a run that is perfectly
 /// healthy and about to finish. Observed directly: a run sitting at 4,998 of
 /// 5,000 for over thirty seconds, then completing with `failed: 0`.
+///
+/// The run-status waits are the exception, because they have a better
+/// measure than the count: the run's own `processed`, the live per-entry
+/// counter, which does not land in bursts. For them this bounds a *stall* —
+/// see [`wait_for_run_terminal_or_paused`]. As a total it failed a healthy
+/// run on CI: the 5,000-file index, slower since every file gained a
+/// metadata-stamp write, was at 4,922 of 5,000 and still advancing when two
+/// minutes ran out.
 const ASYNC_RUN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// The editable columns of a `video_files` row, in the order every
@@ -509,38 +517,7 @@ fn files_json_value() -> serde_json::Value {
 /// individual row effects, so they poll the run record directly rather than
 /// racing it via `files_json_value()`.
 fn wait_for_run_terminal(run_id: &str, token: &CString) -> serde_json::Value {
-    let run_id_c = CString::new(run_id).unwrap();
-    let deadline = std::time::Instant::now() + ASYNC_RUN_DEADLINE;
-    loop {
-        let result = alexandria_index_run_status_json(run_id_c.as_ptr(), token.as_ptr());
-        assert_eq!(
-            result.status,
-            alexandria_ffi::RUN_OK,
-            "ffi run status failed"
-        );
-        assert!(!result.json.is_null());
-        // SAFETY: `json` is a NUL-terminated string owned by this call.
-        let body = unsafe { CStr::from_ptr(result.json) }
-            .to_str()
-            .unwrap()
-            .to_string();
-        // SAFETY: pointer came from this library and is freed exactly once,
-        // every iteration (not just the last).
-        unsafe {
-            alexandria_free_string(result.json);
-        }
-        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
-        if value["status"] != "running" {
-            return value;
-        }
-        if std::time::Instant::now() > deadline {
-            panic!(
-                "run {run_id} never left running after {ASYNC_RUN_DEADLINE:?}; {}",
-                run_progress(&value)
-            );
-        }
-        std::thread::sleep(std::time::Duration::from_millis(25));
-    }
+    wait_for_run_terminal_or_paused(run_id, token)
 }
 
 /// Wait until `missing_at IS NOT NULL` count reaches `expected` missing files.
@@ -1805,8 +1782,6 @@ fn run_status(run_id: &str, token: &CString) -> serde_json::Value {
     serde_json::from_str(&json).expect("CatalogRun json")
 }
 
-/// Poll `alexandria_index_run_status_json` until the run leaves "running",
-/// mirroring `wait_for_files`'s poll-with-deadline shape.
 /// How far a run had got, for a panic message.
 ///
 /// A wait that gives up says nothing useful without this. "Never left
@@ -1821,18 +1796,27 @@ fn run_progress(body: &serde_json::Value) -> String {
     )
 }
 
+/// Poll `alexandria_index_run_status_json` until the run leaves "running".
+///
+/// Gives up only once the run has made no progress — no change of phase,
+/// total or `processed` — for [`ASYNC_RUN_DEADLINE`]. A run still advancing
+/// on a loaded runner is slow, not wrong; one whose counter has not moved in
+/// two minutes is stuck, whether its walk hangs or its terminal write never
+/// landed and the row is left `running` with its last flushed tally.
 fn wait_for_run_terminal_or_paused(run_id: &str, token: &CString) -> serde_json::Value {
-    let deadline = std::time::Instant::now() + ASYNC_RUN_DEADLINE;
+    let mut last = String::new();
+    let mut since = std::time::Instant::now();
     loop {
         let body = run_status(run_id, token);
         if body["status"] != "running" {
             return body;
         }
-        if std::time::Instant::now() > deadline {
-            panic!(
-                "run {run_id} never left running after {ASYNC_RUN_DEADLINE:?}; {}",
-                run_progress(&body)
-            );
+        let progress = run_progress(&body);
+        if progress != last {
+            last = progress;
+            since = std::time::Instant::now();
+        } else if since.elapsed() > ASYNC_RUN_DEADLINE {
+            panic!("run {run_id} made no progress for {ASYNC_RUN_DEADLINE:?}; {progress}");
         }
         std::thread::sleep(std::time::Duration::from_millis(25));
     }
