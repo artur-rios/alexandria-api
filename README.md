@@ -1,11 +1,5 @@
 # Alexandria API
 
-> [!NOTE]
-> This is the real, open-source code of alexandria-api. Its home is Forgejo, at
-> https://git.techcraftsmen.net/artur-rios/alexandria-api; the copy on GitHub is a read-only mirror, for viewing only, and
-> its issues and pull requests are not followed. If you want to contribute, email me at
-> arturdev@duck.com.
-
 A fast, type-aware personal library back-end written in Rust. Alexandria indexes,
 organizes, and surfaces a single user's on-disk things to read and watch —
 movies and series, HTML pages, Markdown and text files, PDFs and e-books, comic
@@ -19,10 +13,6 @@ in-process.
 > Single-user. Metadata + path only, never the bytes. No complex media editing.
 > Two-phase soft/hard deletion. Pluggable auth (external JWT, local encrypted
 > login, **or** the Windows account the server process runs as).
-
-> **Where this lives:** the repository is at
-> <https://git.techcraftsmen.net/artur-rios/alexandria-api>. The GitHub
-> repository is a read-only mirror of it.
 
 ## Project status
 
@@ -391,6 +381,9 @@ been tagged yet.
 The repository layout, building from source, running the tests, migrations,
 the branching model and the versioning policy are described in
 [CONTRIBUTING.md](./CONTRIBUTING.md).
+
+The GitHub repository is a read-only mirror for the real, open-source code of alexandria-api. Its home is Forgejo, at
+https://git.techcraftsmen.net/artur-rios/alexandria-api. If you want to contribute, e-mail me at arturdev@duck.com.
 
 ## Legal details
 
