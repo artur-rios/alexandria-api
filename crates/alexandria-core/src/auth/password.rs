@@ -1,15 +1,18 @@
-use argon2::password_hash::rand_core::OsRng;
-use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
-use argon2::Argon2;
+use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
 
 use crate::errors::DomainError;
 
 /// Salt and hash `password` with Argon2 (UC-35 / FR-AU-05, FR-AU-06). The
 /// plaintext is never stored — only this hash is persisted.
+///
+/// The salt is 16 bytes from the operating system's generator, drawn by
+/// `hash_password` itself, and the parameters are Argon2's defaults (Argon2id,
+/// v19, m=19456, t=2, p=1): the same salt length and parameters argon2 0.5
+/// produced, so a hash stored before the upgrade and one stored after it are
+/// the same shape.
 pub fn hash_password(password: &str) -> Result<String, DomainError> {
-    let salt = SaltString::generate(&mut OsRng);
     Argon2::default()
-        .hash_password(password.as_bytes(), &salt)
+        .hash_password(password.as_bytes())
         .map(|hash| hash.to_string())
         .map_err(|err| DomainError::internal(format!("password hashing failed: {err}")))
 }

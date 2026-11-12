@@ -39,7 +39,7 @@ repository = "https://github.com/artur-rios/alexandria-api"
 alexandria-core = { path = "crates/alexandria-core" }
 
 anyhow = "1"
-argon2 = { version = "0.5", features = ["std"] }
+argon2 = "0.6"
 axum = "0.8"
 base64 = "0.23"
 cbindgen = "0.29"
@@ -50,6 +50,11 @@ ffmpeg-next = "9"
 # Already in the dependency graph via sqlx, so this adds no new transitive
 # weight — only a direct, declared use of it.
 futures-util = { version = "0.3", default-features = false, features = ["std", "async-await"] }
+# Recovery codes (`auth::recovery`) draw their bytes from the operating
+# system's generator. argon2 0.5 lent its `OsRng` for this; 0.6 no longer
+# exposes one by default, and this is the crate it now salts with itself, at
+# the version already in the graph.
+getrandom = "0.4"
 # UC-40 thumbnails decode and re-encode stills, so this is no longer dev-only.
 # The feature list mirrors `catalog::classify`'s `FileType::Image` extension
 # table exactly, so every still the indexer admits has a decoder: jpg/jpeg,
@@ -67,12 +72,21 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png",
 # out of that feature) and, during the overlap, its old HS256 ones (`hmac`).
 jsonwebtoken = { version = "11", features = ["rust_crypto"] }
 kamadak-exif = "0.6"
-lopdf = "0.45"
+lopdf = "0.47"
 quick-xml = "0.42"
 # Fetches Heimdall's key set (`auth::jwks`) in external mode, the only call
 # Alexandria makes to another service. rustls rather than the platform's TLS,
 # for the same reason as `rust_crypto` above: no further system dependency.
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+#
+# 0.13's `rustls` feature (what 0.12 called `rustls-tls`) now means aws-lc-rs,
+# which builds C, and the operating system's certificate store. So this takes
+# `rustls-no-provider` and hands reqwest a client configuration built here
+# from the two pieces 0.12's `rustls-tls` used: ring and the bundled Mozilla
+# roots (`webpki-roots`). Same crates, same trust as before, and no aws-lc.
+# `rustls` must stay on the 0.x line reqwest itself uses, or reqwest will not
+# recognise the configuration; a test in `auth::jwks` fails if it does not.
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.11"
@@ -86,6 +100,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 walkdir = "2"
+# The roots `rustls` above trusts — see `reqwest`.
+webpki-roots = "1"
 # Windows-only: reading this process's token to learn which account it runs as
 # (UC-45). The thinnest binding available — raw FFI declarations, no wrapper
 # layer — and it enters the graph only on Windows targets.

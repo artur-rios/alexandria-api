@@ -44,30 +44,53 @@ pub trait JwksSource: Send + Sync {
 
 /// Fetches the key set from Heimdall's `/.well-known/jwks.json`.
 pub struct HttpJwksSource {
-    client: reqwest::Client,
+    /// The client, or why one could not be built. A client that cannot be
+    /// built makes every fetch fail with that reason, the way an unreachable
+    /// Heimdall does, rather than taking the process down at startup.
+    client: Result<reqwest::Client, String>,
     url: String,
 }
 
 impl HttpJwksSource {
     pub fn new(url: impl Into<String>) -> Self {
-        let client = reqwest::Client::builder()
-            .timeout(FETCH_TIMEOUT)
-            .build()
-            // Only a TLS backend that cannot initialise fails here, and the
-            // default client fails the same way on its first request instead.
-            .unwrap_or_default();
         Self {
-            client,
+            client: build_client().map_err(|e| format!("no HTTP client: {e}")),
             url: url.into(),
         }
     }
 }
 
+/// The client every fetch goes through, on the TLS configuration from
+/// [`tls_config`].
+fn build_client() -> reqwest::Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .timeout(FETCH_TIMEOUT)
+        .tls_backend_preconfigured(tls_config())
+        .build()
+}
+
+/// rustls on ring, trusting the bundled Mozilla roots: what reqwest 0.12's
+/// `rustls-tls` feature configured by itself. 0.13 would otherwise reach for
+/// aws-lc-rs and the operating system's certificate store (see the root
+/// `Cargo.toml`). Built per client rather than installed as the process-wide
+/// rustls default, because the core is a library loaded into the desktop
+/// front-end's process, and that default is not the core's to set.
+fn tls_config() -> rustls::ClientConfig {
+    let roots = rustls::RootCertStore {
+        roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+    };
+    rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+        .with_safe_default_protocol_versions()
+        .expect("ring supports rustls's default protocol versions")
+        .with_root_certificates(roots)
+        .with_no_client_auth()
+}
+
 impl JwksSource for HttpJwksSource {
     fn fetch(&self) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + '_>> {
         Box::pin(async move {
-            let response = self
-                .client
+            let client = self.client.as_ref().map_err(Clone::clone)?;
+            let response = client
                 .get(&self.url)
                 .send()
                 .await
@@ -372,5 +395,37 @@ mod tests {
             .expect_err("an error status is a failure");
 
         assert!(error.contains("429"), "{error}");
+    }
+
+    /// reqwest takes a preconfigured rustls configuration only from the
+    /// rustls version it was itself built against, and refuses anything else
+    /// when the client is built. Without this, a `rustls` that drifted from
+    /// reqwest's would surface only as every HTTPS fetch of Heimdall failing.
+    #[test]
+    fn given_the_tls_configuration_when_the_client_is_built_then_reqwest_accepts_it() {
+        build_client().expect("reqwest recognises the rustls configuration");
+    }
+
+    #[tokio::test]
+    async fn given_a_server_that_is_not_tls_when_fetched_over_https_then_it_is_a_failure() {
+        use tokio::io::AsyncWriteExt;
+
+        // Proves a TLS handshake is attempted with the configured provider,
+        // rather than reqwest panicking for want of one, without leaving the
+        // machine: the "server" answers plain HTTP to a ClientHello.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let _ = socket
+                .write_all(b"HTTP/1.1 400 Bad Request\r\nconnection: close\r\n\r\n")
+                .await;
+        });
+
+        let source = HttpJwksSource::new(format!("https://{address}/.well-known/jwks.json"));
+        source
+            .fetch()
+            .await
+            .expect_err("a server that does not speak TLS is a failure");
     }
 }
