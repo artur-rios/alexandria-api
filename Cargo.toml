@@ -44,7 +44,10 @@ axum = "0.8"
 base64 = "0.23"
 cbindgen = "0.29"
 chrono = { version = "0.4", features = ["serde"] }
-epub = "2"
+# 2.1.6 is the first release on zip 9; 2.1.5 brought zip 3 in alongside the
+# workspace's own zip 9, with four advisories against it (RUSTSEC-2026-0367,
+# -0368, -0369, -0429).
+epub = "2.1.6"
 ffmpeg-next = "9"
 # Bounded-concurrency stream combinators (`buffer_unordered`) for the indexer.
 # Already in the dependency graph via sqlx, so this adds no new transitive
