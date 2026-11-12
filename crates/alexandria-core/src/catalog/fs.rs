@@ -309,7 +309,11 @@ impl FileEntry {
     }
 }
 
-#[cfg(test)]
+// Unix only: the one case here builds a non-UTF-8 file name from raw bytes,
+// which only `std::os::unix::ffi::OsStrExt` can do. Gating the module rather
+// than the test keeps `use super::*` from being an unused import elsewhere,
+// which `clippy -D warnings` refuses on Windows.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
@@ -317,7 +321,6 @@ mod tests {
     /// used to put its files in the catalog under a lossy path full of
     /// U+FFFD, a file that does not exist. They are passed over instead, and
     /// the rest of the walk is unaffected.
-    #[cfg(unix)]
     #[tokio::test]
     async fn given_a_folder_whose_name_is_not_utf8_when_walked_then_its_files_are_skipped_not_mangled(
     ) {
