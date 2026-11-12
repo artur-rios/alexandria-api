@@ -1,9 +1,10 @@
 //! Unit tests for the FR-AU-11 password strength policy (UC-41 AF-04,
 //! UC-35). Pure function, no fakes needed — a table of boundary cases per
-//! rule.
+//! rule. Also the hashes it guards: what is stored must keep verifying across
+//! upgrades of the argon2 crate.
 
 use alexandria_core::auth::password::{
-    validate_strength, MAX_PASSWORD_LENGTH, MIN_PASSWORD_LENGTH,
+    hash_password, validate_strength, verify_password, MAX_PASSWORD_LENGTH, MIN_PASSWORD_LENGTH,
 };
 use alexandria_core::errors::{DomainError, Rejection};
 
@@ -143,4 +144,51 @@ fn given_a_rejection_when_read_then_the_password_is_never_echoed() {
         !message.contains(password),
         "the message must never echo the password: {message}"
     );
+}
+
+/// A hash `hash_password` stored before the upgrade to argon2 0.6: produced
+/// by argon2 0.5.3 with `SaltString::generate(&mut OsRng)` and
+/// `Argon2::default()`, exactly the code this module ran then. Every local
+/// account registered before the upgrade holds a hash of this shape, so this
+/// literal must never be regenerated — it is the evidence.
+const ARGON2_0_5_HASH: &str = "$argon2id$v=19$m=19456,t=2,p=1$ZC7aeybsNGBY5eG4qIPayA$/37Ly4ZdE6vzEjFl7Yqkpa63fQnRKhAxCJBqWjL1e3Q";
+const ARGON2_0_5_PASSWORD: &str = "correct horse battery staple";
+
+#[test]
+fn given_a_hash_stored_by_argon2_0_5_when_verified_then_the_password_matches() {
+    assert!(verify_password(ARGON2_0_5_PASSWORD, ARGON2_0_5_HASH));
+}
+
+#[test]
+fn given_a_hash_stored_by_argon2_0_5_when_verified_with_another_password_then_refused() {
+    assert!(!verify_password(
+        "correct horse battery stapler",
+        ARGON2_0_5_HASH
+    ));
+}
+
+#[test]
+fn given_a_password_when_hashed_then_the_parameters_and_salt_length_are_unchanged() {
+    let hash = hash_password(ARGON2_0_5_PASSWORD).unwrap();
+
+    // `$argon2id$v=19$m=19456,t=2,p=1$<salt>$<hash>`: the algorithm, version
+    // and costs the 0.5 hashes carry, a 16-byte salt (22 characters of
+    // unpadded base64) and a 32-byte output (43 characters).
+    let fields: Vec<&str> = hash.split('$').collect();
+    assert_eq!(fields.len(), 6, "{hash}");
+    let fixed: Vec<&str> = ARGON2_0_5_HASH.split('$').collect();
+    assert_eq!(fields[..4], fixed[..4], "{hash}");
+    assert_eq!(fields[4].len(), 22, "{hash}");
+    assert_eq!(fields[5].len(), 43, "{hash}");
+    assert_ne!(fields[4], fixed[4], "every hash draws a fresh salt");
+
+    assert!(verify_password(ARGON2_0_5_PASSWORD, &hash));
+}
+
+#[test]
+fn given_a_corrupt_stored_hash_when_verified_then_refused() {
+    assert!(!verify_password(
+        ARGON2_0_5_PASSWORD,
+        "$argon2id$not-a-hash"
+    ));
 }

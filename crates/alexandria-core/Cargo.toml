@@ -14,12 +14,14 @@ chrono.workspace = true
 epub.workspace = true
 ffmpeg-next.workspace = true
 futures-util.workspace = true
+getrandom.workspace = true
 image.workspace = true
 jsonwebtoken.workspace = true
 kamadak-exif.workspace = true
 lopdf.workspace = true
 quick-xml.workspace = true
 reqwest.workspace = true
+rustls.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
@@ -30,6 +32,7 @@ toml.workspace = true
 tracing.workspace = true
 uuid.workspace = true
 walkdir.workspace = true
+webpki-roots.workspace = true
 zip.workspace = true
 
 [target.'cfg(windows)'.dependencies]
