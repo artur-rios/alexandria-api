@@ -289,6 +289,10 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
+CI does not run `cargo audit` ([cargo-audit](https://crates.io/crates/cargo-audit)), but the tree is kept clean
+against it. The advisories it ignores are listed in [`.cargo/audit.toml`](.cargo/audit.toml), each with why it does
+not apply and the upstream release that will let it be removed; check those conditions when you touch a dependency.
+
 ## Migrations
 
 Migrations live in `crates/alexandria-core/migrations` and are applied on
