@@ -31,8 +31,12 @@ rustup component add clippy rustfmt
 # Formatting first: it is the cheapest gate and its failures are the least interesting to read past.
 cargo fmt --all -- --check
 
+# `--locked` on every step that resolves dependencies: build with Cargo.lock as committed and fail if it does not
+# match Cargo.toml, rather than quietly resolving a new one. Otherwise a pull request that changes only the manifest
+# passes here and leaves the lock stale on develop.
+#
 # `--all-targets` so the lint pass covers tests and benches, not just the libraries: most of the workspace's
 # code lives in its tests.
-cargo clippy --workspace --all-targets -- -D warnings
+cargo clippy --locked --workspace --all-targets -- -D warnings
 
-cargo test --workspace
+cargo test --locked --workspace

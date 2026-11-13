@@ -69,5 +69,5 @@ jobs:
 
       - name: Measure indexing throughput and read latency
         run: |
-          cargo test -p alexandria-core --test throughput \
+          cargo test --locked -p alexandria-core --test throughput \
             -- --ignored --nocapture --test-threads=1

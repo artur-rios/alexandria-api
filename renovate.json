@@ -3,10 +3,26 @@
   "enabledManagers": ["cargo", "github-actions", "dockerfile", "docker-compose", "custom.regex"],
   "packageRules": [
     {
-      "description": "Dependabot's cargo group: one pull request for the minor and patch updates of the workspace's crates. The shared preset does not enable cargo, so it is enabled above; weekly, like Dependabot.",
+      "description": "Dependabot's cargo group: one pull request for the minor and patch updates of the workspace's crates from 1.0 up. The shared preset does not enable cargo, so it is enabled above; weekly, like Dependabot. A regex matchCurrentVersion is read against the version in Cargo.lock (the manifest's range when there is none), which shares the range's major: \"0.5\" locks a 0.5.x, so a 0.x crate is left to the two rules below, while \"1\" and \"9\" are not 0.x.",
       "matchManagers": ["cargo"],
       "matchUpdateTypes": ["minor", "patch"],
+      "matchCurrentVersion": "!/^0\\./",
       "groupName": "cargo-minor-and-patch",
+      "schedule": ["on monday"]
+    },
+    {
+      "description": "A 0.x crate's patch updates are compatible under Cargo semver, so they stay in the group.",
+      "matchManagers": ["cargo"],
+      "matchCurrentVersion": "/^0\\./",
+      "matchUpdateTypes": ["patch"],
+      "groupName": "cargo-minor-and-patch",
+      "schedule": ["on monday"]
+    },
+    {
+      "description": "A 0.x minor (0.5 -> 0.6) is breaking under Cargo semver: one pull request per crate, so one migration does not hold back the rest.",
+      "matchManagers": ["cargo"],
+      "matchCurrentVersion": "/^0\\./",
+      "matchUpdateTypes": ["minor"],
       "schedule": ["on monday"]
     },
     {
