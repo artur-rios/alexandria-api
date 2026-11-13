@@ -87,16 +87,20 @@ impl HeimdallAuthService {
     /// rather than fetched from the configured URL — how the tests supply
     /// Heimdall's keys.
     pub(crate) fn with_key_set(settings: &AuthSettings, key_set: Option<JwksCache>) -> Self {
+        // `DecodingKey::from_secret` fails only on an empty secret, which the
+        // checks below never pass it. `.ok()` rather than a panic all the
+        // same: were it ever to fail, the secret is left out and its tokens
+        // are refused, as the paragraph above promises.
         let mut secrets = Vec::new();
         let current = settings.heimdall_token_secret.expose().trim();
         if !current.is_empty() {
-            secrets.push(DecodingKey::from_secret(current.as_bytes()));
+            secrets.extend(DecodingKey::from_secret(current.as_bytes()).ok());
         }
         let previous = settings.heimdall_token_secret_previous.expose().trim();
         // Heimdall ignores a previous secret equal to the current one, and so
         // does this: the same value under two names is not a rotation.
         if !previous.is_empty() && previous != current {
-            secrets.push(DecodingKey::from_secret(previous.as_bytes()));
+            secrets.extend(DecodingKey::from_secret(previous.as_bytes()).ok());
         }
 
         Self {
@@ -350,7 +354,7 @@ mod tests {
         encode(
             &Header::new(alg),
             &body,
-            &EncodingKey::from_secret(secret.as_bytes()),
+            &EncodingKey::from_secret(secret.as_bytes()).unwrap(),
         )
         .unwrap()
     }
@@ -879,7 +883,7 @@ mod tests {
                 let token = encode(
                     &header,
                     &body_with(json!({})),
-                    &EncodingKey::from_secret(forged_secret.as_bytes()),
+                    &EncodingKey::from_secret(forged_secret.as_bytes()).unwrap(),
                 )
                 .unwrap();
 
