@@ -73,7 +73,7 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png",
 # `aws_lc_rs` builds C and would make this the project's second system
 # dependency after ffmpeg. Alexandria verifies Heimdall's ES256 tokens (`p256`
 # out of that feature) and, during the overlap, its old HS256 ones (`hmac`).
-jsonwebtoken = { version = "11", features = ["rust_crypto"] }
+jsonwebtoken = { version = "12", features = ["rust_crypto"] }
 kamadak-exif = "0.6"
 lopdf = "0.47"
 quick-xml = "0.42"
