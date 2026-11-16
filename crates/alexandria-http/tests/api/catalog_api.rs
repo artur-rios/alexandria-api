@@ -77,6 +77,13 @@ async fn given_supported_files_when_index_posted_then_returns_202_with_run_id() 
     );
 }
 
+/// The run id a `202 Accepted` start answered with.
+async fn run_id_of(response: axum::response::Response) -> String {
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    body["runId"].as_str().expect("runId").to_string()
+}
+
 #[tokio::test]
 async fn given_indexed_path_when_reindex_posted_then_existing_path_skipped_no_duplicate() {
     let lib = tempdir().unwrap();
@@ -90,16 +97,27 @@ async fn given_indexed_path_when_reindex_posted_then_existing_path_skipped_no_du
         .await
         .expect("one-shot");
     assert_eq!(first.status(), StatusCode::ACCEPTED);
-    wait_for_files(&test.pool, 1).await;
+    let first_run = run_id_of(first).await;
+    let run = wait_for_run_terminal(&test.services, &first_run, common::TEST_TOKEN).await;
+    assert_eq!(run["status"], "complete");
+    assert_eq!(run["indexed"], 1);
 
     // A second index run over the same root must not duplicate the path.
-    let router2 = app(Settings::default(), test.services);
+    let router2 = app(Settings::default(), test.services.clone());
     let second = router2
         .oneshot(index_request(lib.path().to_str().unwrap()))
         .await
         .expect("one-shot");
     assert_eq!(second.status(), StatusCode::ACCEPTED);
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let second_run = run_id_of(second).await;
+
+    // Wait for the second run to finish, not for a fixed time: a count read
+    // before the run has reached the file proves nothing, and a sleep shorter
+    // than the run (a loaded runner makes it so) passed without proving it.
+    let run = wait_for_run_terminal(&test.services, &second_run, common::TEST_TOKEN).await;
+    assert_eq!(run["status"], "complete");
+    assert_eq!(run["alreadyCataloged"], 1, "the path is recognised");
+    assert_eq!(run["indexed"], 0, "and not added a second time");
 
     let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM files")
         .fetch_one(&test.pool)

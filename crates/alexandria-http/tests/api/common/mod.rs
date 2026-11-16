@@ -93,8 +93,13 @@ async fn seed_session(pool: &SqlitePool, token: &str) {
 }
 
 /// Poll the `files` table until it contains `expected` rows, or time out.
+///
+/// Waits as long as [`ASYNC_RUN_DEADLINE`], for the reason given there: an
+/// index run that takes 100 ms alone can take seconds on a loaded runner, and
+/// this deadline was a five-second literal that a slow machine would trip
+/// before the run it waits for had done anything wrong.
 pub async fn wait_for_files(pool: &SqlitePool, expected: i64) {
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + ASYNC_RUN_DEADLINE;
     loop {
         let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM files")
             .fetch_one(pool)
