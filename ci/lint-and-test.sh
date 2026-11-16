@@ -19,6 +19,17 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 export CARGO_TERM_COLOR=always
 export RUSTFLAGS="-D warnings"
 
+# Every run builds from scratch (see above), so incremental compilation only costs here: it writes a cache of
+# every workspace crate's query results that no later run reads back.
+export CARGO_INCREMENTAL=0
+
+# The dev profile (which `cargo test`'s test profile inherits) emits full debuginfo, which nothing here reads: a
+# failing test's backtrace needs only file and line, and line tables keep those. Full debuginfo is most of the
+# bytes of every test binary, each of which carries the whole dependency graph, so it is what their links spend
+# their time on. Set here rather than in Cargo.toml so a debugger on a developer's machine keeps its variables;
+# clippy's pass does no code generation, so only the test build is affected.
+export CARGO_PROFILE_DEV_DEBUG=line-tables-only
+
 # ffmpeg-next's underlying ffmpeg-sys-next crate needs the ffmpeg C development libraries at build time (and clang
 # for bindgen): the first system dependency this workspace has needed.
 ensure_packages \
