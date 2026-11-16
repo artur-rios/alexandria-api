@@ -12,9 +12,9 @@
 //!
 //! This is exercised against a real file on disk and a real migrated SQLite
 //! database rather than the trait fakes, because the bug only shows up when
-//! an actual write actually changes an actual mtime — `repos_integrity.rs` is
+//! an actual write actually changes an actual mtime — `catalog/repos_integrity.rs` is
 //! this crate's precedent for a real SQLite pool in an integration test,
-//! `hashing.rs` for touching the real filesystem directly.
+//! `catalog/hashing.rs` for touching the real filesystem directly.
 
 use alexandria_core::auth::BearerAuthService;
 use alexandria_core::catalog::clock::SystemClock;

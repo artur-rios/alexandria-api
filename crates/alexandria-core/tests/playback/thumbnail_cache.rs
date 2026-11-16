@@ -7,7 +7,7 @@
 //! never fail the request" (its own doc comment), so an unsanitized key
 //! would not error there — it would just never populate the cache, on
 //! Windows, silently, forever. This pins the round trip against a key shaped
-//! exactly like the real one, on a real temp directory (`hashing.rs` is the
+//! exactly like the real one, on a real temp directory (`catalog/hashing.rs` is the
 //! precedent for touching the filesystem directly in this crate's
 //! integration tests), so a regression here shows up as a failing test
 //! rather than a quiet no-op cache.

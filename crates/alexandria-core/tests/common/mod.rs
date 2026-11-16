@@ -3,13 +3,6 @@
 //! collections collaborators with no real database, filesystem, or auth
 //! service.
 
-// This module is included by more than one test target (`catalog.rs`,
-// `collections.rs`), and each uses only the fakes for its own feature area —
-// so every helper is dead code as far as the *other* target's compilation is
-// concerned. The allow is module-wide rather than per item because the set of
-// "unused here" helpers changes with every target that includes the file.
-#![allow(dead_code)]
-
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};

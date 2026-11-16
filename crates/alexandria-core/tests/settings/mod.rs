@@ -3,9 +3,6 @@
 //! follows §6.3: the happy path, the configured value rather than the default,
 //! and AF-01 (unauthorized).
 
-#[path = "common/mod.rs"]
-mod common;
-
 use alexandria_core::config::Settings;
 use alexandria_core::errors::DomainError;
 use alexandria_core::settings::GetSettingsHandler;

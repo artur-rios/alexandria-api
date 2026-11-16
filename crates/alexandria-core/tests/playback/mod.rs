@@ -1,7 +1,7 @@
 //! F-10 integration — the playback handlers wired with real collaborators.
 //!
 //! `build_services` is exercised the same way every other integration test
-//! exercises it (see `alexandria-http/tests/common/mod.rs`): a real on-disk
+//! exercises it (see `alexandria-http/tests/api/common/mod.rs`): a real on-disk
 //! SQLite database created and migrated by `migrate_database`, then
 //! `Settings::default()`. There is no `alexandria-core`-local pool helper —
 //! `tests/common` in this crate only holds hand-written repository fakes for
@@ -82,3 +82,5 @@ async fn given_built_services_when_inspected_then_playback_handlers_present() {
         .await;
     assert!(matches!(thumbnail_result, Err(DomainError::NotFound)));
 }
+
+mod thumbnail_cache;
