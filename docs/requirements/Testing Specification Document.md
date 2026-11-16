@@ -49,7 +49,7 @@ in the delivery flow is defined in the
 | FFI function | Integration | `alexandria-ffi/tests/` |
 | HTTP ↔ FFI parity for an operation | Parity (contract) | `alexandria-ffi/tests/parity.rs` |
 | Filesystem interactions (indexing, rename, text content) | Integration | integration tests using a temp dir |
-| Auth service (local + external + Windows) | Unit + integration | `alexandria-core/tests/auth.rs` |
+| Auth service (local + external + Windows) | Unit + integration | `alexandria-core/tests/auth/` |
 
 **Deliberately untested:** plain data-holder structs with no behavior, generated
 OpenAPI scaffolding, and the cbindgen-produced C header (validated at build time
@@ -61,25 +61,40 @@ in isolation.
 The test tree mirrors the source tree of each crate. Integration tests live in
 each crate's top-level `tests/` directory.
 
+Each crate's integration tests build into **one test binary** wherever they
+can share a process: every top-level `tests/*.rs` file (and every
+`tests/*/main.rs`) is a separate crate that Cargo compiles and links on its
+own, with the whole dependency graph in each, so a new area is a module of the
+existing binary, not a new file at the top. A suite gets its own top-level
+file only when it needs a process to itself — it sets environment variables,
+installs a global subscriber, or is the ignored performance harness — and says
+why in its header.
+
 ```
 alexandria-core/
   src/
     catalog/
       commands/
       queries/
-      repos/        # repository traits + sqlx impl
+      repos.rs      # repository traits + sqlx impl
     auth/
-    text/
+    playback/
   tests/
-    catalog/        # mirrors src/catalog
-    auth.rs
-    text.rs
+    integration.rs  # the one binary: declares common and every area below
     common/mod.rs   # shared fixtures: temp db, temp fs, factories
+    catalog/        # mirrors src/catalog (mod.rs lists its files)
+    auth/
+    playback/
+    config.rs           # own process: sets ALEXANDRIA_* environment variables
+    browse_batching.rs  # own process: a global subscriber counts every query
+    throughput.rs       # own process: the ignored NFR harness (§9)
 alexandria-http/
   tests/
-    catalog_api.rs
-    auth_api.rs
-    common/mod.rs
+    api/
+      main.rs       # the one binary: declares common and every file below
+      catalog_api.rs
+      auth_api.rs
+      common/mod.rs
 alexandria-ffi/
   tests/
     parity.rs       # HTTP vs FFI parity
@@ -359,10 +374,10 @@ cargo test
 | Unit tests only | `cargo test --lib` |
 | Integration tests | `cargo test --test '*'` |
 | Parity tests | `cargo test --package alexandria-ffi --test parity` |
-| Auth tests | `cargo test --package alexandria-core --test auth` |
+| Auth tests | `cargo test --package alexandria-core --test integration auth::` |
 | Performance (§9) | `cargo test -p alexandria-core --test throughput -- --ignored --nocapture` |
 | With coverage | `cargo tarpaulin` (optional) |
 
-Categories are separated by crate and test file; parity tests live in their own
-test target so they can be run in isolation, and auth tests are grouped in
-`alexandria-core/tests/auth.rs`.
+Categories are separated by crate and test target; parity tests live in their
+own test target so they can be run in isolation, and auth tests are grouped in
+`alexandria-core/tests/auth/`, run on their own by the `auth::` filter.

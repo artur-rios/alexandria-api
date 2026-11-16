@@ -199,7 +199,7 @@ Then confirm the libraries also resolve at run time, which a build alone does
 not prove:
 
 ```bash
-cargo test -p alexandria-core --test hashing
+cargo test -p alexandria-core --test integration catalog::hashing
 ```
 
 #### When it still fails
