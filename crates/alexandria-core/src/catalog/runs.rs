@@ -1217,3 +1217,67 @@ impl CatalogRunRepository for SqliteCatalogRunRepository {
         Ok(result.rows_affected())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn wire_name<T: Serialize>(value: T) -> String {
+        serde_json::to_value(value)
+            .expect("serialize")
+            .as_str()
+            .expect("a string")
+            .to_string()
+    }
+
+    #[test]
+    fn given_each_run_status_when_stored_and_read_back_then_it_round_trips_as_its_wire_name() {
+        for status in [
+            RunStatus::Running,
+            RunStatus::Complete,
+            RunStatus::Failed,
+            RunStatus::Paused,
+            RunStatus::Cancelled,
+        ] {
+            // Act
+            let stored = status.as_str();
+
+            // Assert — the column holds the same name a client reads.
+            assert_eq!(wire_name(status), stored, "{status:?}");
+            assert_eq!(RunStatus::parse(stored).expect("parse"), status);
+        }
+    }
+
+    #[test]
+    fn given_an_unknown_stored_status_when_read_then_it_is_an_internal_error_naming_it() {
+        // Act — `interrupted` is the status FR-FC-29 retired.
+        let result = RunStatus::parse("interrupted");
+
+        // Assert
+        match result {
+            Err(DomainError::Internal(message)) => assert!(message.contains("interrupted")),
+            other => panic!("expected an internal error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn given_each_run_kind_when_stored_and_read_back_then_it_round_trips_as_its_wire_name() {
+        for kind in [RunKind::Index, RunKind::Refresh] {
+            assert_eq!(wire_name(kind), kind.as_str(), "{kind:?}");
+            assert_eq!(RunKind::parse(kind.as_str()).expect("parse"), kind);
+        }
+        assert!(matches!(
+            RunKind::parse("Index"),
+            Err(DomainError::Internal(_))
+        ));
+    }
+
+    #[test]
+    fn given_a_run_priority_when_serialized_then_it_is_lowercase_and_defaults_to_normal() {
+        assert_eq!(wire_name(RunPriority::Normal), "normal");
+        assert_eq!(wire_name(RunPriority::Low), "low");
+        assert_eq!(RunPriority::default(), RunPriority::Normal);
+        let parsed: RunPriority = serde_json::from_str("\"low\"").expect("deserialize");
+        assert_eq!(parsed, RunPriority::Low);
+    }
+}
