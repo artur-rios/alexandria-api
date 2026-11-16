@@ -5,7 +5,7 @@
 //! — but covering the whole surface, because until now this one had no HTTP
 //! tests at all and the FFI half was the only place any of it ran.
 
-mod common;
+use crate::common;
 
 use alexandria_core::catalog::model::{FileType, NewFile};
 use alexandria_core::catalog::repos::{CatalogRepository, SqliteCatalogRepository};

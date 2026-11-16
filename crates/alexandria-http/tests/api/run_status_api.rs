@@ -1,8 +1,6 @@
 //! UC-42 integration tests for `GET /v1/index/runs/{runId}` (Testing
 //! Specification §7): the real axum router over a real temp SQLite database.
 
-mod common;
-
 use alexandria_core::catalog::runs::{CatalogRunRepository, SqliteCatalogRunRepository};
 use alexandria_core::config::Settings;
 use alexandria_http::app;

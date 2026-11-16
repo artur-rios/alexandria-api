@@ -4,8 +4,6 @@
 //! wrong-mode branch is unit-tested instead — there is no way to flip the
 //! active mode mid-suite here.
 
-mod common;
-
 use alexandria_core::config::Settings;
 use alexandria_http::app;
 use axum::body::{to_bytes, Body};

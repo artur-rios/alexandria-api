@@ -4,7 +4,7 @@
 //! alternative flow (AF-01 nothing to list, AF-02 unrecognised kind, AF-03
 //! unauthorized).
 
-mod common;
+use crate::common;
 
 use alexandria_core::config::Settings;
 use alexandria_http::app;

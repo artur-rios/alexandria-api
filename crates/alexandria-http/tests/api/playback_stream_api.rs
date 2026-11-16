@@ -4,7 +4,7 @@
 //! the response, covering the main flow (full read, byte-range reads) plus
 //! the alternative flows (unauthenticated, soft-deleted, missing on disk).
 
-mod common;
+use crate::common;
 
 use alexandria_core::config::Settings;
 use alexandria_http::app;

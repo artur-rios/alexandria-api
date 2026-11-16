@@ -4,7 +4,7 @@
 //! asserts the response, and covers the main flow plus every alternative
 //! flow (AF-01 wrong file type, AF-03 not found, AF-04 unauthorized).
 
-mod common;
+use crate::common;
 
 use alexandria_core::config::Settings;
 use alexandria_http::app;

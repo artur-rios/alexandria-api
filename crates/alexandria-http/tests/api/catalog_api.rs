@@ -1,4 +1,4 @@
-mod common;
+use crate::common;
 
 use alexandria_core::config::Settings;
 use alexandria_http::app;

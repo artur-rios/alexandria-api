@@ -1,10 +1,10 @@
-//! UC-20 integration tests for `POST /v1/watchlists` (Testing Specification
-//! §7): the real axum router over a real temp SQLite database. Each test
-//! asserts both the response and the resulting persisted state, and covers
-//! the main flow plus every alternative flow (AF-01 invalid input, AF-02
-//! unauthorized).
+//! UC-26 integration tests for `POST /v1/reading-lists` (Testing
+//! Specification §7): the real axum router over a real temp SQLite
+//! database. Each test asserts both the response and the resulting
+//! persisted state, and covers the main flow plus every alternative flow
+//! (AF-01 invalid input, AF-02 unauthorized).
 
-mod common;
+use crate::common;
 
 use alexandria_core::config::Settings;
 use alexandria_http::app;
@@ -16,9 +16,9 @@ use tower::ServiceExt;
 
 use crate::common::test_app;
 
-/// `(uuid, name)` for every persisted watchlist, ordered by name.
-async fn watchlist_rows(pool: &SqlitePool) -> Vec<(String, String)> {
-    sqlx::query_as("SELECT uuid, name FROM watchlists ORDER BY name")
+/// `(uuid, name)` for every persisted reading list, ordered by name.
+async fn reading_list_rows(pool: &SqlitePool) -> Vec<(String, String)> {
+    sqlx::query_as("SELECT uuid, name FROM reading_lists ORDER BY name")
         .fetch_all(pool)
         .await
         .expect("rows")
@@ -27,7 +27,7 @@ async fn watchlist_rows(pool: &SqlitePool) -> Vec<(String, String)> {
 fn create_request(body: Value) -> Request<Body> {
     Request::builder()
         .method("POST")
-        .uri("/v1/watchlists")
+        .uri("/v1/reading-lists")
         .header(
             "authorization",
             format!("Bearer {}", common::TEST_TOKEN).as_str(),
@@ -40,7 +40,7 @@ fn create_request(body: Value) -> Request<Body> {
 fn unauthenticated_request(body: Value) -> Request<Body> {
     Request::builder()
         .method("POST")
-        .uri("/v1/watchlists")
+        .uri("/v1/reading-lists")
         .header("content-type", "application/json")
         .body(Body::from(body.to_string()))
         .unwrap()
@@ -56,25 +56,25 @@ async fn body_json(response: axum::response::Response) -> Value {
 // ---------------- Main flow ----------------
 
 #[tokio::test]
-async fn given_valid_name_when_posted_then_201_with_watchlist_and_row_persisted() {
+async fn given_valid_name_when_posted_then_201_with_reading_list_and_row_persisted() {
     let test = test_app().await;
     let router = app(Settings::default(), test.services);
 
     let response = router
-        .oneshot(create_request(json!({ "name": "Weekend movies" })))
+        .oneshot(create_request(json!({ "name": "Summer reads" })))
         .await
         .expect("one-shot");
 
     assert_eq!(response.status(), StatusCode::CREATED);
     let body = body_json(response).await;
-    assert_eq!(body["name"], "Weekend movies");
+    assert_eq!(body["name"], "Summer reads");
     let uuid = body["uuid"].as_str().expect("uuid string");
     assert!(uuid::Uuid::parse_str(uuid).is_ok(), "uuid is a valid UUID");
 
-    let rows = watchlist_rows(&test.pool).await;
+    let rows = reading_list_rows(&test.pool).await;
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].0, uuid);
-    assert_eq!(rows[0].1, "Weekend movies");
+    assert_eq!(rows[0].1, "Summer reads");
 }
 
 #[tokio::test]
@@ -94,7 +94,7 @@ async fn given_same_name_twice_when_posted_then_both_created_with_distinct_uuids
         .expect("second");
     assert_eq!(second.status(), StatusCode::CREATED);
 
-    assert_eq!(watchlist_rows(&test.pool).await.len(), 2);
+    assert_eq!(reading_list_rows(&test.pool).await.len(), 2);
 }
 
 // ---------------- AF-01: invalid input ----------------
@@ -111,7 +111,7 @@ async fn given_empty_name_when_posted_then_400_and_nothing_persisted() {
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert!(body_json(response).await["error"].is_string());
-    assert!(watchlist_rows(&test.pool).await.is_empty());
+    assert!(reading_list_rows(&test.pool).await.is_empty());
 }
 
 #[tokio::test]
@@ -125,7 +125,7 @@ async fn given_missing_name_when_posted_then_400_and_nothing_persisted() {
         .expect("one-shot");
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    assert!(watchlist_rows(&test.pool).await.is_empty());
+    assert!(reading_list_rows(&test.pool).await.is_empty());
 }
 
 #[tokio::test]
@@ -135,7 +135,7 @@ async fn given_malformed_json_body_when_posted_then_400_with_error_envelope() {
 
     let request = Request::builder()
         .method("POST")
-        .uri("/v1/watchlists")
+        .uri("/v1/reading-lists")
         .header(
             "authorization",
             format!("Bearer {}", common::TEST_TOKEN).as_str(),
@@ -150,7 +150,7 @@ async fn given_malformed_json_body_when_posted_then_400_with_error_envelope() {
         body_json(response).await["error"].is_string(),
         "a parse failure uses this surface's error envelope, not axum's bare text"
     );
-    assert!(watchlist_rows(&test.pool).await.is_empty());
+    assert!(reading_list_rows(&test.pool).await.is_empty());
 }
 
 // ---------------- AF-02: unauthorized ----------------
@@ -161,12 +161,12 @@ async fn given_no_token_when_posted_then_401_and_nothing_persisted() {
     let router = app(Settings::default(), test.services);
 
     let response = router
-        .oneshot(unauthenticated_request(json!({ "name": "Weekend movies" })))
+        .oneshot(unauthenticated_request(json!({ "name": "Summer reads" })))
         .await
         .expect("one-shot");
 
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-    assert!(watchlist_rows(&test.pool).await.is_empty());
+    assert!(reading_list_rows(&test.pool).await.is_empty());
 }
 
 #[tokio::test]
@@ -179,12 +179,12 @@ async fn given_no_token_and_malformed_body_when_posted_then_401_not_400() {
 
     let request = Request::builder()
         .method("POST")
-        .uri("/v1/watchlists")
+        .uri("/v1/reading-lists")
         .header("content-type", "application/json")
         .body(Body::from("{ not json"))
         .unwrap();
     let response = router.oneshot(request).await.expect("one-shot");
 
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-    assert!(watchlist_rows(&test.pool).await.is_empty());
+    assert!(reading_list_rows(&test.pool).await.is_empty());
 }

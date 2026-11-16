@@ -9,7 +9,7 @@
 //! routes it into its own `TempDir` via `common::test_app_with_settings`,
 //! held alive for the whole test.
 
-mod common;
+use crate::common;
 
 use alexandria_core::config::Settings;
 use alexandria_http::app;

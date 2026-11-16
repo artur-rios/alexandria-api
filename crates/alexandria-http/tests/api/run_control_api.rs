@@ -4,8 +4,6 @@
 //! control coverage (Task 11), against the real axum router over a real temp
 //! SQLite database.
 
-mod common;
-
 use std::time::{Duration, Instant};
 
 use alexandria_core::config::Settings;

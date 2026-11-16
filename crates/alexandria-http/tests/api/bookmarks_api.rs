@@ -4,7 +4,7 @@
 //! the main flow plus every alternative flow (AF-01 invalid input, AF-02
 //! referenced collection, AF-03 unauthorized).
 
-mod common;
+use crate::common;
 
 use alexandria_core::config::Settings;
 use alexandria_http::app;

@@ -4,7 +4,7 @@
 //! and covers the main flow plus every alternative flow (AF-01 wrong file
 //! type, AF-02 watchlist/video not found, AF-03 unauthorized).
 
-mod common;
+use crate::common;
 
 use alexandria_core::config::Settings;
 use alexandria_http::app;

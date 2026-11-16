@@ -5,7 +5,7 @@
 //! catalog state, and covers the main flow plus every alternative flow
 //! (AF-01 wrong file type, AF-04 not found, AF-05 unauthorized).
 
-mod common;
+use crate::common;
 
 use alexandria_core::config::Settings;
 use alexandria_http::app;

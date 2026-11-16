@@ -1,10 +1,10 @@
-//! UC-31 integration tests for `DELETE /v1/reading-lists/{uuid}` (Testing
+//! UC-27 integration tests for `GET /v1/reading-lists` (Testing
 //! Specification §7): the real axum router over a real temp SQLite
-//! database. Each test asserts both the response and the resulting
-//! persisted state, and covers the main flow plus every alternative flow
+//! database. Each test asserts the response body, and covers the main flow
+//! (all reading lists, single reading list) plus every alternative flow
 //! (AF-01 not found, AF-02 unauthorized).
 
-mod common;
+use crate::common;
 
 use alexandria_core::config::Settings;
 use alexandria_http::app;
@@ -42,10 +42,10 @@ fn add_item_request(reading_list_uuid: &str, item_uuid: &str) -> Request<Body> {
         .unwrap()
 }
 
-fn delete_request(reading_list_uuid: &str) -> Request<Body> {
+fn list_request(query: &str) -> Request<Body> {
     Request::builder()
-        .method("DELETE")
-        .uri(format!("/v1/reading-lists/{reading_list_uuid}"))
+        .method("GET")
+        .uri(format!("/v1/reading-lists{query}"))
         .header(
             "authorization",
             format!("Bearer {}", common::TEST_TOKEN).as_str(),
@@ -54,10 +54,10 @@ fn delete_request(reading_list_uuid: &str) -> Request<Body> {
         .unwrap()
 }
 
-fn unauthenticated_delete_request(reading_list_uuid: &str) -> Request<Body> {
+fn unauthenticated_list_request() -> Request<Body> {
     Request::builder()
-        .method("DELETE")
-        .uri(format!("/v1/reading-lists/{reading_list_uuid}"))
+        .method("GET")
+        .uri("/v1/reading-lists")
         .body(Body::empty())
         .unwrap()
 }
@@ -85,102 +85,115 @@ async fn seed_document(pool: &SqlitePool) -> String {
     file_uuid
 }
 
-async fn reading_list_count(pool: &SqlitePool) -> i64 {
-    let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM reading_lists")
-        .fetch_one(pool)
-        .await
-        .expect("count");
-    row.0
-}
-
-async fn progress_count(pool: &SqlitePool) -> i64 {
-    let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM reading_progress")
-        .fetch_one(pool)
-        .await
-        .expect("count");
-    row.0
-}
-
 // ---------------- Main flow ----------------
 
 #[tokio::test]
-async fn given_empty_reading_list_when_deleted_then_200_with_predelete_body_and_row_removed() {
+async fn given_no_filter_when_listed_then_200_with_every_reading_list_and_progress() {
     let test = test_app().await;
     let router = app(Settings::default(), test.services.clone());
 
-    let create_resp = router
+    let create_a = router
         .clone()
-        .oneshot(create_reading_list_request("Summer reads"))
+        .oneshot(create_reading_list_request("A list"))
         .await
-        .expect("create reading list");
-    let reading_list_uuid = body_json(create_resp).await["uuid"]
+        .expect("create a");
+    let a_uuid = body_json(create_a).await["uuid"]
         .as_str()
         .expect("uuid")
         .to_string();
-
-    let response = router
-        .oneshot(delete_request(&reading_list_uuid))
-        .await
-        .expect("one-shot");
-
-    assert_eq!(response.status(), StatusCode::OK);
-    let body = body_json(response).await;
-    assert_eq!(body["uuid"], reading_list_uuid);
-    assert_eq!(body["name"], "Summer reads");
-
-    assert_eq!(reading_list_count(&test.pool).await, 0);
-}
-
-#[tokio::test]
-async fn given_reading_list_with_linked_item_when_deleted_then_progress_gone_and_item_preserved() {
-    let test = test_app().await;
-    let router = app(Settings::default(), test.services.clone());
-
-    let create_resp = router
+    router
         .clone()
-        .oneshot(create_reading_list_request("Summer reads"))
+        .oneshot(create_reading_list_request("B list"))
         .await
-        .expect("create reading list");
-    let reading_list_uuid = body_json(create_resp).await["uuid"]
-        .as_str()
-        .expect("uuid")
-        .to_string();
+        .expect("create b");
+
     let item_uuid = seed_document(&test.pool).await;
     let add_resp = router
         .clone()
-        .oneshot(add_item_request(&reading_list_uuid, &item_uuid))
+        .oneshot(add_item_request(&a_uuid, &item_uuid))
         .await
         .expect("add item");
     assert_eq!(add_resp.status(), StatusCode::OK);
 
-    let response = router
-        .oneshot(delete_request(&reading_list_uuid))
-        .await
-        .expect("one-shot");
+    let response = router.oneshot(list_request("")).await.expect("list");
 
     assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(reading_list_count(&test.pool).await, 0);
-    assert_eq!(progress_count(&test.pool).await, 0);
-    let file_rows: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM files WHERE uuid = ?")
-        .bind(&item_uuid)
-        .fetch_one(&test.pool)
+    let body = body_json(response).await;
+    let reading_lists = body.as_array().expect("array");
+    assert_eq!(reading_lists.len(), 2);
+
+    let a = reading_lists
+        .iter()
+        .find(|w| w["uuid"] == a_uuid)
+        .expect("a list present");
+    let items = a["items"].as_array().expect("items array");
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["itemUuid"], item_uuid);
+    assert_eq!(items[0]["targetKind"], "document");
+    assert_eq!(items[0]["state"], "pending");
+
+    let b = reading_lists
+        .iter()
+        .find(|w| w["name"] == "B list")
+        .expect("b list present");
+    assert!(b["items"].as_array().expect("items array").is_empty());
+}
+
+#[tokio::test]
+async fn given_reading_list_uuid_filter_when_listed_then_200_with_only_that_reading_list() {
+    let test = test_app().await;
+    let router = app(Settings::default(), test.services.clone());
+
+    let create_a = router
+        .clone()
+        .oneshot(create_reading_list_request("A list"))
         .await
-        .expect("file row");
-    assert_eq!(file_rows.0, 1, "the file itself is preserved");
+        .expect("create a");
+    let a_uuid = body_json(create_a).await["uuid"]
+        .as_str()
+        .expect("uuid")
+        .to_string();
+    router
+        .clone()
+        .oneshot(create_reading_list_request("B list"))
+        .await
+        .expect("create b");
+
+    let response = router
+        .oneshot(list_request(&format!("?readingListUuid={a_uuid}")))
+        .await
+        .expect("list");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_json(response).await;
+    let reading_lists = body.as_array().expect("array");
+    assert_eq!(reading_lists.len(), 1);
+    assert_eq!(reading_lists[0]["uuid"], a_uuid);
+}
+
+#[tokio::test]
+async fn given_no_reading_lists_when_listed_then_200_with_empty_array() {
+    let test = test_app().await;
+    let router = app(Settings::default(), test.services);
+
+    let response = router.oneshot(list_request("")).await.expect("list");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(body_json(response).await.as_array().unwrap().len(), 0);
 }
 
 // ---------------- AF-01: not found ----------------
 
 #[tokio::test]
-async fn given_unknown_uuid_when_deleted_then_404() {
+async fn given_unknown_reading_list_uuid_when_listed_then_404() {
     let test = test_app().await;
     let router = app(Settings::default(), test.services);
 
     let unknown = uuid::Uuid::new_v4().to_string();
     let response = router
-        .oneshot(delete_request(&unknown))
+        .oneshot(list_request(&format!("?readingListUuid={unknown}")))
         .await
-        .expect("one-shot");
+        .expect("list");
 
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }
@@ -188,25 +201,14 @@ async fn given_unknown_uuid_when_deleted_then_404() {
 // ---------------- AF-02: unauthorized ----------------
 
 #[tokio::test]
-async fn given_no_token_when_deleted_then_401_and_reading_list_kept() {
+async fn given_no_token_when_listed_then_401() {
     let test = test_app().await;
-    let router = app(Settings::default(), test.services.clone());
-
-    let create_resp = router
-        .clone()
-        .oneshot(create_reading_list_request("Summer reads"))
-        .await
-        .expect("create reading list");
-    let reading_list_uuid = body_json(create_resp).await["uuid"]
-        .as_str()
-        .expect("uuid")
-        .to_string();
+    let router = app(Settings::default(), test.services);
 
     let response = router
-        .oneshot(unauthenticated_delete_request(&reading_list_uuid))
+        .oneshot(unauthenticated_list_request())
         .await
-        .expect("one-shot");
+        .expect("list");
 
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-    assert_eq!(reading_list_count(&test.pool).await, 1);
 }

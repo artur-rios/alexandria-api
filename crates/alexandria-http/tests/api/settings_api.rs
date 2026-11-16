@@ -2,7 +2,7 @@
 //! the real axum router over a real temp SQLite database. Covers the main flow,
 //! the configured value rather than the default, and AF-01 (unauthorized).
 
-mod common;
+use crate::common;
 
 use alexandria_core::config::Settings;
 use alexandria_http::app;

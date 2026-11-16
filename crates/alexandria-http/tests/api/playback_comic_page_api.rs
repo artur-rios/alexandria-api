@@ -3,7 +3,7 @@
 //! database, and a real on-disk CBZ (built with the `zip` and `image`
 //! crates) indexed through `POST /v1/index`.
 
-mod common;
+use crate::common;
 
 use alexandria_core::config::Settings;
 use alexandria_http::app;

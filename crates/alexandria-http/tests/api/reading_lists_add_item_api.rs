@@ -5,7 +5,7 @@
 //! (AF-01 ineligible type, AF-02 reading list/item not found, AF-03
 //! unauthorized).
 
-mod common;
+use crate::common;
 
 use alexandria_core::config::Settings;
 use alexandria_http::app;
