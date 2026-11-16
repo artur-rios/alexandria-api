@@ -198,11 +198,16 @@ async fn given_a_populated_pre_14_database_when_migrated_then_the_credential_row
 /// percent-decodes — so `a%41b.sqlite` opened `aAb.sqlite`, and a folder named
 /// with a `?` lost everything after it. The FFI embedder passes its path
 /// through verbatim, so either spelling is one an owner's data folder can have.
+///
+/// Windows refuses `?` in a file name, so there the folder carries `#`
+/// instead: a URL's fragment marker, which a URL parser cuts off the same way.
 #[tokio::test]
 async fn given_a_path_with_url_metacharacters_when_migrated_then_that_exact_file_is_used() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let folder = dir.path().join("what?");
-    std::fs::create_dir(&folder).expect("folder with a question mark");
+    let folder = dir
+        .path()
+        .join(if cfg!(windows) { "what#" } else { "what?" });
+    std::fs::create_dir(&folder).expect("folder with a URL metacharacter");
     let path = folder.join("a%41b.sqlite");
 
     let pool = alexandria_core::migrate::migrate_database(path.to_str().expect("utf-8 path"))
