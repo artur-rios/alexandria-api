@@ -15,13 +15,13 @@
 //! `SqliteCatalogRepository` against real SQLite can pin that.
 //!
 //! **Why this lives in its own top-level test file, not folded into the
-//! `catalog` binary** (`tests/catalog.rs`, alongside `tests/catalog/browse.rs`
-//! and friends): `cargo test` compiles each top-level file under `tests/`
-//! into its own process, but runs every `#[tokio::test]` *within* one
-//! process concurrently by default. The counting mechanism below installs a
+//! `integration` binary** (`tests/integration.rs`, which holds
+//! `tests/catalog/browse.rs` and friends): `cargo test` compiles each
+//! top-level file under `tests/` into its own process, but runs every
+//! `#[tokio::test]` *within* one process concurrently by default. The counting mechanism below installs a
 //! **process-global** tracing subscriber (see the next paragraph for why it
 //! has to be global) that counts every SQL statement sqlx executes anywhere
-//! in the process. Sharing a process with `catalog.rs`'s ~300 other tests —
+//! in the process. Sharing a process with `integration.rs`'s ~650 other tests —
 //! most of which also hit SQLite — would make the count include whatever
 //! those tests happened to be doing at the same moment: noise, not a proof.
 //! Its own process, with its own two tests serialized against each other

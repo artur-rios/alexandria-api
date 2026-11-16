@@ -404,3 +404,99 @@ pub struct FileContent {
     pub uuid: Uuid,
     pub content: String,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The name serde writes on the wire, without the JSON quotes.
+    fn wire_name<T: Serialize>(value: T) -> String {
+        serde_json::to_value(value)
+            .expect("serialize")
+            .as_str()
+            .expect("a string")
+            .to_string()
+    }
+
+    const FILE_TYPES: [FileType; 6] = [
+        FileType::Video,
+        FileType::Html,
+        FileType::Text,
+        FileType::Document,
+        FileType::Comic,
+        FileType::Image,
+    ];
+
+    #[test]
+    fn given_each_file_type_when_named_then_as_str_display_and_serde_agree_and_round_trip() {
+        for file_type in FILE_TYPES {
+            // Act
+            let name = file_type.as_str();
+
+            // Assert
+            assert_eq!(wire_name(file_type), name, "{file_type:?}");
+            assert_eq!(file_type.to_string(), name, "{file_type:?}");
+            assert_eq!(FileType::from_wire(name), Some(file_type), "{name}");
+        }
+    }
+
+    #[test]
+    fn given_an_unknown_or_differently_cased_name_when_read_from_the_wire_then_it_is_none() {
+        for name in ["", "audio", "Video", "VIDEO", " video", "videos"] {
+            assert_eq!(FileType::from_wire(name), None, "{name:?}");
+        }
+    }
+
+    #[test]
+    fn given_each_file_state_when_named_then_as_str_matches_serde() {
+        for state in [FileState::Active, FileState::Deleted] {
+            assert_eq!(wire_name(state), state.as_str(), "{state:?}");
+        }
+    }
+
+    #[test]
+    fn given_each_media_kind_when_named_then_it_round_trips_and_matches_serde() {
+        for kind in [MediaKind::Movie, MediaKind::Series] {
+            assert_eq!(wire_name(kind), kind.as_str(), "{kind:?}");
+            assert_eq!(MediaKind::parse(kind.as_str()), Some(kind), "{kind:?}");
+        }
+        for name in ["", "Movie", "episode"] {
+            assert_eq!(MediaKind::parse(name), None, "{name:?}");
+        }
+    }
+
+    #[test]
+    fn given_each_format_kind_when_named_then_it_round_trips_and_matches_serde() {
+        for kind in [FormatKind::Book, FormatKind::Ebook] {
+            assert_eq!(wire_name(kind), kind.as_str(), "{kind:?}");
+            assert_eq!(FormatKind::parse(kind.as_str()), Some(kind), "{kind:?}");
+        }
+        for name in ["", "Book", "e-book"] {
+            assert_eq!(FormatKind::parse(name), None, "{name:?}");
+        }
+    }
+
+    #[test]
+    fn given_each_library_scope_when_named_then_as_str_matches_serde_and_default_is_outside() {
+        for scope in [LibraryScope::OutsideLibraries, LibraryScope::Everywhere] {
+            assert_eq!(wire_name(scope), scope.as_str(), "{scope:?}");
+        }
+        assert_eq!(LibraryScope::default(), LibraryScope::OutsideLibraries);
+    }
+
+    #[test]
+    fn given_each_state_filter_when_named_then_it_round_trips_and_default_is_active() {
+        for filter in [StateFilter::Active, StateFilter::Deleted, StateFilter::All] {
+            assert_eq!(wire_name(filter), filter.as_str(), "{filter:?}");
+            assert_eq!(
+                StateFilter::parse(filter.as_str()),
+                Some(filter),
+                "{filter:?}"
+            );
+        }
+        for name in ["", "Active", "both", "deleted "] {
+            assert_eq!(StateFilter::parse(name), None, "{name:?}");
+        }
+        assert_eq!(StateFilter::default(), StateFilter::Active);
+    }
+}

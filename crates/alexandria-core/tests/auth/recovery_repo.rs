@@ -6,7 +6,7 @@ use alexandria_core::migrate::migrate_database;
 use chrono::Utc;
 
 /// A migrated database in a fresh temporary directory, the way
-/// `tests/playback.rs` does it. The `TempDir` is returned so the caller holds
+/// `tests/playback/mod.rs` does it. The `TempDir` is returned so the caller holds
 /// it: dropping it deletes the database out from under the pool.
 async fn repo() -> (SqliteRecoveryCodeRepository, tempfile::TempDir) {
     let dir = tempfile::tempdir().expect("temp dir");
