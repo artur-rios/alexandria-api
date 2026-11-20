@@ -62,9 +62,10 @@ async fn body_json(response: axum::response::Response) -> Value {
 /// Insert a minimal `files` row of the given `file_type` and return its uuid.
 async fn seed_file(pool: &SqlitePool, file_type: &str) -> String {
     let file_uuid = uuid::Uuid::new_v4().to_string();
+    crate::common::seeded_library(pool).await;
     sqlx::query(
-        "INSERT INTO files (uuid, path, name, type, content_hash, indexed_at) \
-         VALUES (?, ?, ?, ?, 'hash', ?)",
+        "INSERT INTO files (uuid, path, name, type, content_hash, indexed_at, library_id) \
+         VALUES (?, ?, ?, ?, 'hash', ?, (SELECT id FROM libraries WHERE uuid = 'seeded-library'))",
     )
     .bind(&file_uuid)
     .bind(format!("/lib/{file_uuid}"))

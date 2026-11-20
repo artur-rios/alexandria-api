@@ -358,3 +358,15 @@ pub fn count_dir_entries(dir: &std::path::Path) -> usize {
         Err(_) => 0,
     }
 }
+
+/// The library a test's hand-written file rows belong to — every file is in
+/// one. Created once per database; its folder overlaps no test folder.
+pub async fn seeded_library(pool: &sqlx::sqlite::SqlitePool) {
+    sqlx::query(
+        "INSERT OR IGNORE INTO libraries (uuid, name, root_path) \
+         VALUES ('seeded-library', 'Seeded', '/seeded-library')",
+    )
+    .execute(pool)
+    .await
+    .expect("seed library");
+}

@@ -64,9 +64,10 @@ async fn seed_collection(pool: &SqlitePool, uuid: &str, name: &str, kind: &str) 
 
 /// Insert a file row in `state`, optionally filed in `collection_id`.
 async fn seed_file(pool: &SqlitePool, uuid: &str, collection_id: Option<i64>, state: &str) {
+    crate::common::seeded_library(pool).await;
     sqlx::query(
-        "INSERT INTO files (uuid, path, name, type, content_hash, state, indexed_at, collection_id) \
-         VALUES (?, ?, ?, 'text', 'hash', ?, ?, ?)",
+        "INSERT INTO files (uuid, path, name, type, content_hash, state, indexed_at, collection_id, library_id) \
+         VALUES (?, ?, ?, 'text', 'hash', ?, ?, ?, (SELECT id FROM libraries WHERE uuid = 'seeded-library'))",
     )
     .bind(uuid)
     .bind(format!("/lib/{uuid}.txt"))

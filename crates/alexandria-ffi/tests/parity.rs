@@ -4495,9 +4495,10 @@ async fn given_same_file_when_added_to_collection_via_http_and_ffi_then_bodies_a
     let http_pool = migrate_database(&http_db).await.expect("http migrate");
     seed_session(&http_pool, TEST_TOKEN).await;
     let http_file_uuid = uuid::Uuid::new_v4().to_string();
+    seeded_library(&http_pool).await;
     sqlx::query(
-        "INSERT INTO files (uuid, path, name, type, content_hash, indexed_at) \
-         VALUES (?, ?, ?, 'text', 'hash', ?)",
+        "INSERT INTO files (uuid, path, name, type, content_hash, indexed_at, library_id) \
+         VALUES (?, ?, ?, 'text', 'hash', ?, (SELECT id FROM libraries WHERE uuid = 'seeded-library'))",
     )
     .bind(&http_file_uuid)
     .bind(format!("/lib/{http_file_uuid}.txt"))
@@ -4556,9 +4557,10 @@ async fn given_same_file_when_added_to_collection_via_http_and_ffi_then_bodies_a
     let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
     let ffi_pool_pre = migrate_database(&ffi_db).await.expect("ffi pre-migrate");
     let ffi_file_uuid = uuid::Uuid::new_v4().to_string();
+    seeded_library(&ffi_pool_pre).await;
     sqlx::query(
-        "INSERT INTO files (uuid, path, name, type, content_hash, indexed_at) \
-         VALUES (?, ?, ?, 'text', 'hash', ?)",
+        "INSERT INTO files (uuid, path, name, type, content_hash, indexed_at, library_id) \
+         VALUES (?, ?, ?, 'text', 'hash', ?, (SELECT id FROM libraries WHERE uuid = 'seeded-library'))",
     )
     .bind(&ffi_file_uuid)
     .bind(format!("/lib/{ffi_file_uuid}.txt"))
@@ -4752,9 +4754,10 @@ async fn given_same_linked_file_when_removed_via_http_and_ffi_then_bodies_and_li
     let http_pool = migrate_database(&http_db).await.expect("http migrate");
     seed_session(&http_pool, TEST_TOKEN).await;
     let http_file_uuid = uuid::Uuid::new_v4().to_string();
+    seeded_library(&http_pool).await;
     sqlx::query(
-        "INSERT INTO files (uuid, path, name, type, content_hash, indexed_at) \
-         VALUES (?, ?, ?, 'text', 'hash', ?)",
+        "INSERT INTO files (uuid, path, name, type, content_hash, indexed_at, library_id) \
+         VALUES (?, ?, ?, 'text', 'hash', ?, (SELECT id FROM libraries WHERE uuid = 'seeded-library'))",
     )
     .bind(&http_file_uuid)
     .bind(format!("/lib/{http_file_uuid}.txt"))
@@ -4830,9 +4833,10 @@ async fn given_same_linked_file_when_removed_via_http_and_ffi_then_bodies_and_li
     let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
     let ffi_pool_pre = migrate_database(&ffi_db).await.expect("ffi pre-migrate");
     let ffi_file_uuid = uuid::Uuid::new_v4().to_string();
+    seeded_library(&ffi_pool_pre).await;
     sqlx::query(
-        "INSERT INTO files (uuid, path, name, type, content_hash, indexed_at) \
-         VALUES (?, ?, ?, 'text', 'hash', ?)",
+        "INSERT INTO files (uuid, path, name, type, content_hash, indexed_at, library_id) \
+         VALUES (?, ?, ?, 'text', 'hash', ?, (SELECT id FROM libraries WHERE uuid = 'seeded-library'))",
     )
     .bind(&ffi_file_uuid)
     .bind(format!("/lib/{ffi_file_uuid}.txt"))
@@ -5025,9 +5029,10 @@ async fn given_same_collection_when_items_listed_via_http_and_ffi_then_bodies_id
     let http_pool = migrate_database(&http_db).await.expect("http migrate");
     seed_session(&http_pool, TEST_TOKEN).await;
     let http_file_uuid = uuid::Uuid::new_v4().to_string();
+    seeded_library(&http_pool).await;
     sqlx::query(
-        "INSERT INTO files (uuid, path, name, type, content_hash, indexed_at) \
-         VALUES (?, ?, ?, 'text', 'hash', ?)",
+        "INSERT INTO files (uuid, path, name, type, content_hash, indexed_at, library_id) \
+         VALUES (?, ?, ?, 'text', 'hash', ?, (SELECT id FROM libraries WHERE uuid = 'seeded-library'))",
     )
     .bind(&http_file_uuid)
     .bind(format!("/lib/{http_file_uuid}.txt"))
@@ -5096,9 +5101,10 @@ async fn given_same_collection_when_items_listed_via_http_and_ffi_then_bodies_id
     let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
     let ffi_pool_pre = migrate_database(&ffi_db).await.expect("ffi pre-migrate");
     let ffi_file_uuid = uuid::Uuid::new_v4().to_string();
+    seeded_library(&ffi_pool_pre).await;
     sqlx::query(
-        "INSERT INTO files (uuid, path, name, type, content_hash, indexed_at) \
-         VALUES (?, ?, ?, 'text', 'hash', ?)",
+        "INSERT INTO files (uuid, path, name, type, content_hash, indexed_at, library_id) \
+         VALUES (?, ?, ?, 'text', 'hash', ?, (SELECT id FROM libraries WHERE uuid = 'seeded-library'))",
     )
     .bind(&ffi_file_uuid)
     .bind(format!("/lib/{ffi_file_uuid}.txt"))
@@ -6050,9 +6056,10 @@ async fn given_no_token_when_watchlist_created_via_http_and_ffi_then_both_unauth
 /// the watchlist handler to look up, not a full index run.
 async fn seed_file(pool: &sqlx::sqlite::SqlitePool, file_type: &str) -> String {
     let file_uuid = uuid::Uuid::new_v4().to_string();
+    seeded_library(pool).await;
     sqlx::query(
-        "INSERT INTO files (uuid, path, name, type, content_hash, indexed_at) \
-         VALUES (?, ?, ?, ?, 'hash', ?)",
+        "INSERT INTO files (uuid, path, name, type, content_hash, indexed_at, library_id) \
+         VALUES (?, ?, ?, ?, 'hash', ?, (SELECT id FROM libraries WHERE uuid = 'seeded-library'))",
     )
     .bind(&file_uuid)
     .bind(format!("/lib/{file_uuid}"))
@@ -8698,9 +8705,10 @@ async fn given_unknown_reading_list_when_deleted_via_http_and_ffi_then_both_not_
 /// bypasses the indexer for handlers that never touch the filesystem.
 async fn seed_file_at_path(pool: &sqlx::sqlite::SqlitePool, file_type: &str, path: &str) -> String {
     let file_uuid = uuid::Uuid::new_v4().to_string();
+    seeded_library(pool).await;
     sqlx::query(
-        "INSERT INTO files (uuid, path, name, type, content_hash, indexed_at) \
-         VALUES (?, ?, ?, ?, 'hash', ?)",
+        "INSERT INTO files (uuid, path, name, type, content_hash, indexed_at, library_id) \
+         VALUES (?, ?, ?, ?, 'hash', ?, (SELECT id FROM libraries WHERE uuid = 'seeded-library'))",
     )
     .bind(&file_uuid)
     .bind(path)
@@ -11328,9 +11336,10 @@ async fn given_same_collections_when_listed_via_http_and_ffi_then_bodies_identic
             ("aaaaaaaa-0000-4000-8000-000000000001", "active"),
             ("aaaaaaaa-0000-4000-8000-000000000002", "deleted"),
         ] {
+            seeded_library(pool).await;
             sqlx::query(
-                "INSERT INTO files (uuid, path, name, type, content_hash, state, indexed_at, collection_id) \
-                 VALUES (?, ?, ?, 'text', 'hash', ?, ?, ?)",
+                "INSERT INTO files (uuid, path, name, type, content_hash, state, indexed_at, collection_id, library_id) \
+                 VALUES (?, ?, ?, 'text', 'hash', ?, ?, ?, (SELECT id FROM libraries WHERE uuid = 'seeded-library'))",
             )
             .bind(uuid)
             .bind(format!("/lib/{uuid}.txt"))
@@ -12634,4 +12643,16 @@ async fn given_the_same_folder_when_registered_on_both_surfaces_then_the_json_ma
     };
     assert_eq!(norm(&http_body), norm(&ffi_body));
     assert_eq!(http_body["rootPath"], root);
+}
+
+/// The library a test's hand-written file rows belong to — every file is in
+/// one. Created once per database; its folder overlaps no test folder.
+async fn seeded_library(pool: &sqlx::sqlite::SqlitePool) {
+    sqlx::query(
+        "INSERT OR IGNORE INTO libraries (uuid, name, root_path) \
+         VALUES ('seeded-library', 'Seeded', '/seeded-library')",
+    )
+    .execute(pool)
+    .await
+    .expect("seed library");
 }
