@@ -650,6 +650,7 @@ struct FilesListFilter {
     file_type: Option<String>,
     state: Option<String>,
     collection_uuid: Option<String>,
+    library_uuid: Option<String>,
 }
 
 impl FilesListFilter {
@@ -675,6 +676,10 @@ impl FilesListFilter {
                 .get("collectionUuid")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string()),
+            library_uuid: obj
+                .get("libraryUuid")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
         })
     }
 }
@@ -682,7 +687,8 @@ impl FilesListFilter {
 /// List/query files filtered by type and lifecycle state (UC-03 / FR-FC-12).
 ///
 /// `json_filters` is a JSON string `{"type":"video","state":"all"}` (empty
-/// string or NULL for defaults), answered across every library. The
+/// string or NULL for defaults), answered across every library unless
+/// `"libraryUuid"` names one. The
 /// function deserializes it, calls the same
 /// `BrowseFilesHandler` the HTTP route uses, and on success serializes the
 /// returned `Vec<FileView>` back to a JSON array — each element the same
@@ -744,6 +750,15 @@ pub extern "C" fn alexandria_files_list(
                 Err(_) => return FileJsonResult::err(FILE_ERR_INVALID_INPUT),
             };
             filter = filter.with_collection(collection_uuid);
+        }
+        // One library's files, parsed as `collectionUuid` is (FR-FC-24):
+        // malformed is invalid input, unknown answers `[]`.
+        if let Some(l) = parsed.library_uuid.as_deref().filter(|s| !s.is_empty()) {
+            let library_uuid = match uuid::Uuid::parse_str(l) {
+                Ok(u) => u,
+                Err(_) => return FileJsonResult::err(FILE_ERR_INVALID_INPUT),
+            };
+            filter = filter.with_library(library_uuid);
         }
 
         let result =

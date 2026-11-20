@@ -2315,3 +2315,89 @@ async fn given_the_old_index_route_when_posted_then_it_is_not_found() {
         response.status()
     );
 }
+
+async fn listed_paths(router: &axum::Router, query: &str) -> (StatusCode, Value) {
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/v1/files{query}"))
+                .header(
+                    "authorization",
+                    format!("Bearer {}", common::TEST_TOKEN).as_str(),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("list");
+    let status = response.status();
+    let body =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    (status, body)
+}
+
+#[tokio::test]
+async fn given_a_library_uuid_when_listed_then_only_its_files() {
+    let test = test_app().await;
+    let router = app(Settings::default(), test.services.clone());
+    let mut libraries = Vec::new();
+    for (name, file) in [("first", "a.md"), ("second", "b.md")] {
+        let root = test.folder(&format!("/{name}"));
+        std::fs::write(format!("{root}/{file}"), b"x").unwrap();
+        let response = router
+            .clone()
+            .oneshot(index_request(&root))
+            .await
+            .expect("register");
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        wait_for_run_terminal(
+            &test.services,
+            body["runId"].as_str().unwrap(),
+            common::TEST_TOKEN,
+        )
+        .await;
+        libraries.push(body["uuid"].as_str().unwrap().to_string());
+    }
+
+    let (status, body) = listed_paths(&router, &format!("?libraryUuid={}", libraries[0])).await;
+
+    assert_eq!(status, StatusCode::OK);
+    let names: Vec<&str> = body
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|view| view["file"]["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, vec!["a.md"]);
+    assert_eq!(body[0]["libraryUuid"], libraries[0]);
+    let (_, everything) = listed_paths(&router, "").await;
+    assert_eq!(everything.as_array().map(|a| a.len()), Some(2));
+}
+
+#[tokio::test]
+async fn given_a_malformed_library_uuid_when_listed_then_invalid_input() {
+    let test = test_app().await;
+    let router = app(Settings::default(), test.services.clone());
+
+    let (status, body) = listed_paths(&router, "?libraryUuid=not-a-uuid").await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"], "invalid libraryUuid: not-a-uuid");
+}
+
+#[tokio::test]
+async fn given_an_unknown_library_uuid_when_listed_then_empty() {
+    let test = test_app().await;
+    let router = app(Settings::default(), test.services.clone());
+
+    let (status, body) =
+        listed_paths(&router, &format!("?libraryUuid={}", uuid::Uuid::new_v4())).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body.as_array().map(|a| a.len()), Some(0));
+}

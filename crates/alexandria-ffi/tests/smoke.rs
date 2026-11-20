@@ -3036,3 +3036,42 @@ fn given_a_library_when_removed_over_ffi_then_ok_and_its_files_are_gone() {
     assert_eq!(alexandria_index_count_files(), 0);
     assert_eq!(std::fs::read(format!("{root}/a.md")).unwrap(), b"# a");
 }
+
+#[test]
+fn given_a_library_uuid_when_listed_over_ffi_then_only_its_files() {
+    let _g = serial();
+    let db = init_temp_db();
+    let token = c(TEST_TOKEN);
+    let first = folder(&db, "/first");
+    std::fs::write(format!("{first}/a.md"), b"x").unwrap();
+    let second = folder(&db, "/second");
+    std::fs::write(format!("{second}/b.md"), b"x").unwrap();
+    let library = register_library("First", &first, &token);
+    register_library("Second", &second, &token);
+    let filter = c(&serde_json::json!({ "libraryUuid": library["uuid"] }).to_string());
+
+    let listed = file_json_ok(alexandria_ffi::alexandria_files_list(
+        filter.as_ptr(),
+        token.as_ptr(),
+    ));
+
+    let names: Vec<&str> = listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|view| view["file"]["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, vec!["a.md"]);
+}
+
+#[test]
+fn given_a_malformed_library_uuid_when_listed_over_ffi_then_invalid_input() {
+    let _g = serial();
+    let _db = init_temp_db();
+    let token = c(TEST_TOKEN);
+    let filter = c(r#"{"libraryUuid":"not-a-uuid"}"#);
+
+    let result = alexandria_ffi::alexandria_files_list(filter.as_ptr(), token.as_ptr());
+
+    assert_eq!(result.status, STATUS_FILE_INVALID_INPUT);
+}

@@ -12656,3 +12656,119 @@ async fn seeded_library(pool: &sqlx::sqlite::SqlitePool) {
     .await
     .expect("seed library");
 }
+
+/// FR-FC-12 parity — a listing narrowed to one library answers the same
+/// files on both surfaces, and both refuse a malformed library uuid
+/// (FR-FC-24).
+#[tokio::test]
+async fn given_a_library_filter_when_listed_on_both_surfaces_then_the_json_matches() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let folders = tempdir().unwrap();
+    let first = folders.path().join("first");
+    let second = folders.path().join("second");
+    for (dir, name) in [(&first, "a.md"), (&second, "b.md")] {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join(name), b"x").unwrap();
+    }
+    let roots = [
+        first.to_str().unwrap().to_string(),
+        second.to_str().unwrap().to_string(),
+    ];
+
+    // ---- HTTP leg ----
+    let http_dir = tempdir().unwrap();
+    let http_pool = migrate_database(&db_path(&http_dir, "http.sqlite"))
+        .await
+        .expect("http migrate");
+    seed_session(&http_pool, TEST_TOKEN).await;
+    let http_services =
+        std::sync::Arc::new(build_services(&local_settings(), http_pool.clone()).await);
+    let request = |method: &str, uri: String, body: Option<serde_json::Value>| {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("authorization", &format!("Bearer {TEST_TOKEN}"))
+            .header("content-type", "application/json")
+            .body(body.map_or_else(Body::empty, |b| Body::from(b.to_string())))
+            .unwrap()
+    };
+    let mut http_first = String::new();
+    for (i, root) in roots.iter().enumerate() {
+        let resp = app(Settings::default(), http_services.clone())
+            .oneshot(request(
+                "POST",
+                "/v1/libraries".into(),
+                Some(json!({ "name": "Lib", "rootPath": root })),
+            ))
+            .await
+            .unwrap();
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
+        wait_for_http_run_terminal(&http_services, body["runId"].as_str().unwrap(), TEST_TOKEN)
+            .await;
+        if i == 0 {
+            http_first = body["uuid"].as_str().unwrap().to_string();
+        }
+    }
+    let listed = app(Settings::default(), http_services.clone())
+        .oneshot(request(
+            "GET",
+            format!("/v1/files?libraryUuid={http_first}"),
+            None,
+        ))
+        .await
+        .unwrap();
+    let http_listing: serde_json::Value =
+        serde_json::from_slice(&to_bytes(listed.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let malformed = app(Settings::default(), http_services.clone())
+        .oneshot(request("GET", "/v1/files?libraryUuid=nope".into(), None))
+        .await
+        .unwrap();
+    assert_eq!(malformed.status(), axum::http::StatusCode::BAD_REQUEST);
+
+    // ---- FFI leg ----
+    let ffi_dir = tempdir().unwrap();
+    let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
+    let ffi_listing: serde_json::Value = tokio::task::spawn_blocking(move || {
+        let cdb = CString::new(ffi_db).unwrap();
+        assert_eq!(
+            alexandria_index_init(cdb.as_ptr()),
+            alexandria_ffi::INDEX_OK
+        );
+        let token = CString::new(TEST_TOKEN).unwrap();
+        let take = |json: *mut std::os::raw::c_char| -> serde_json::Value {
+            let s = unsafe { CStr::from_ptr(json) }
+                .to_string_lossy()
+                .into_owned();
+            unsafe { alexandria_free_string(json) };
+            serde_json::from_str(&s).unwrap()
+        };
+        let mut first = String::new();
+        for (i, root) in roots.iter().enumerate() {
+            let body =
+                CString::new(json!({ "name": "Lib", "rootPath": root }).to_string()).unwrap();
+            let r = alexandria_library_register(body.as_ptr(), token.as_ptr());
+            assert_eq!(r.status, alexandria_ffi::LIBRARY_OK);
+            let value = take(r.json);
+            wait_for_ffi_run_terminal(value["runId"].as_str().unwrap(), &token);
+            if i == 0 {
+                first = value["uuid"].as_str().unwrap().to_string();
+            }
+        }
+        let malformed = CString::new(r#"{"libraryUuid":"nope"}"#).unwrap();
+        assert_eq!(
+            alexandria_files_list(malformed.as_ptr(), token.as_ptr()).status,
+            alexandria_ffi::FILE_ERR_INVALID_INPUT
+        );
+        let filter = CString::new(json!({ "libraryUuid": first }).to_string()).unwrap();
+        let r = alexandria_files_list(filter.as_ptr(), token.as_ptr());
+        assert_eq!(r.status, alexandria_ffi::FILE_OK);
+        take(r.json)
+    })
+    .await
+    .unwrap();
+
+    // ---- compare ----
+    assert_eq!(http_listing.as_array().map(|a| a.len()), Some(1));
+    assert_eq!(norm(http_listing), norm(ffi_listing));
+}
