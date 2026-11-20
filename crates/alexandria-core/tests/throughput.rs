@@ -49,6 +49,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use alexandria_core::auth::BearerAuthService;
+use alexandria_core::catalog::audio_tags::LoftyAudioMetadataReader;
 use alexandria_core::catalog::clock::SystemClock;
 use alexandria_core::catalog::comic_tags::CbzComicMetadataReader;
 use alexandria_core::catalog::commands::index::IndexHandler;
@@ -70,6 +71,7 @@ type BenchIndexHandler = IndexHandler<
     SqliteCatalogRepository,
     StdFilesystem,
     SystemClock,
+    LoftyAudioMetadataReader,
     ExifImageMetadataReader,
     PdfEpubMetadataReader,
     FfmpegVideoMetadataReader,
@@ -369,6 +371,7 @@ async fn build(
         repo.clone(),
         StdFilesystem,
         SystemClock,
+        LoftyAudioMetadataReader,
         ExifImageMetadataReader,
         PdfEpubMetadataReader,
         FfmpegVideoMetadataReader,

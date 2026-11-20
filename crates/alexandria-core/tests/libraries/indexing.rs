@@ -30,8 +30,8 @@ use sqlx::sqlite::SqlitePool;
 use uuid::Uuid;
 
 use crate::common::{
-    FakeAuth, FakeComicMetadataReader, FakeDocumentMetadataReader, FakeImageMetadataReader,
-    FakeVideoMetadataReader,
+    FakeAudioMetadataReader, FakeAuth, FakeComicMetadataReader, FakeDocumentMetadataReader,
+    FakeImageMetadataReader, FakeVideoMetadataReader,
 };
 
 /// A course on disk: files at the top, files a level down, and one deeper
@@ -82,6 +82,7 @@ type TestIndex = IndexHandler<
     SqliteCatalogRepository,
     StdFilesystem,
     SystemClock,
+    FakeAudioMetadataReader,
     FakeImageMetadataReader,
     FakeDocumentMetadataReader,
     FakeVideoMetadataReader,
@@ -95,6 +96,7 @@ fn index_handler(pool: &SqlitePool, filesystem_root: &str) -> Arc<TestIndex> {
         SqliteCatalogRepository::new(pool.clone()),
         StdFilesystem,
         SystemClock,
+        FakeAudioMetadataReader::new(),
         FakeImageMetadataReader::new(),
         FakeDocumentMetadataReader::new(),
         FakeVideoMetadataReader::new(),

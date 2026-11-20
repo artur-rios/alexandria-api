@@ -18,6 +18,7 @@ getrandom.workspace = true
 image.workspace = true
 jsonwebtoken.workspace = true
 kamadak-exif.workspace = true
+lofty.workspace = true
 lopdf.workspace = true
 quick-xml.workspace = true
 reqwest.workspace = true

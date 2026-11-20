@@ -1590,8 +1590,8 @@ async fn given_unknown_filter_values_when_listed_via_http_and_ffi_then_both_reje
     );
     assert_eq!(
         http_status("/v1/files?type=audio").await,
-        axum::http::StatusCode::BAD_REQUEST,
-        "audio was removed in 0.5 and is now an unknown type"
+        axum::http::StatusCode::OK,
+        "audio is a catalog type again"
     );
     assert_eq!(
         http_status("/v1/files?state=delted").await,
@@ -1605,7 +1605,7 @@ async fn given_unknown_filter_values_when_listed_via_http_and_ffi_then_both_reje
     let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
     let ffi_lib_path = ffi_lib.path().to_str().unwrap().to_string();
 
-    let (bad_type, removed_type, bad_state, empty_values) =
+    let (bad_type, audio_type, bad_state, empty_values) =
         tokio::task::spawn_blocking(move || -> (i32, i32, i32, i32) {
             let cdb = CString::new(ffi_db).unwrap();
             assert_eq!(
@@ -1648,9 +1648,9 @@ async fn given_unknown_filter_values_when_listed_via_http_and_ffi_then_both_reje
         "FFI must reject an unknown type like HTTP does, not drop the filter"
     );
     assert_eq!(
-        removed_type,
-        alexandria_ffi::FILE_ERR_INVALID_INPUT,
-        "FFI must reject the removed audio type like HTTP does"
+        audio_type,
+        alexandria_ffi::FILE_OK,
+        "FFI must accept audio as a type like HTTP does"
     );
     assert_eq!(
         bad_state,

@@ -3075,3 +3075,29 @@ fn given_a_malformed_library_uuid_when_listed_over_ffi_then_invalid_input() {
 
     assert_eq!(result.status, STATUS_FILE_INVALID_INPUT);
 }
+
+#[test]
+fn given_audio_as_a_type_filter_when_listed_over_ffi_then_only_audio() {
+    let _g = serial();
+    let db = init_temp_db();
+    let token = c(TEST_TOKEN);
+    let root = folder(&db, "/music");
+    std::fs::write(format!("{root}/song.mp3"), [0u8; 64]).unwrap();
+    std::fs::write(format!("{root}/notes.md"), b"# notes").unwrap();
+    register_library("Music", &root, &token);
+    let filter = c(r#"{"type":"audio"}"#);
+
+    let listed = file_json_ok(alexandria_ffi::alexandria_files_list(
+        filter.as_ptr(),
+        token.as_ptr(),
+    ));
+
+    let names: Vec<&str> = listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|view| view["file"]["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, vec!["song.mp3"]);
+    assert_eq!(listed[0]["file"]["fileType"], "audio");
+}

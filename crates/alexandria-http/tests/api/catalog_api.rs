@@ -702,19 +702,6 @@ async fn given_unknown_type_when_get_files_then_400() {
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
 
-/// `audio` was a file type until 0.5; it is now as unknown as any other name,
-/// so a client still asking for it is told so rather than handed an empty
-/// listing.
-#[tokio::test]
-async fn given_the_removed_audio_type_when_get_files_then_400() {
-    let test = test_app().await;
-    let response = app(Settings::default(), test.services)
-        .oneshot(get_files("/v1/files?type=audio"))
-        .await
-        .expect("list one-shot");
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-}
-
 #[tokio::test]
 async fn given_a_query_that_cannot_be_read_when_get_files_then_400_in_the_error_envelope() {
     // A repeated key is a query the extractor itself refuses. It used to

@@ -30,6 +30,11 @@ chrono.workspace = true
 # system dependency, so this adds nothing new to the build environment.
 ffmpeg-next.workspace = true
 image.workspace = true
+# UC-40's audio thumbnail is the front-cover picture embedded in the file's
+# own tag, so testing it end to end needs a genuine tagged audio fixture
+# built at test time — `lofty` both writes it here and reads it in the
+# handler under test.
+lofty.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 sqlx.workspace = true

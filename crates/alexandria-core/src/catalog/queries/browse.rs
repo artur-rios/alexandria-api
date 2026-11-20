@@ -153,10 +153,11 @@ where
         // Issue #44 video slice: duration_seconds lives outside
         // `SubtypeMetadata` (see `find_video_duration`'s doc comment), so
         // it's fetched separately and only for video files.
-        let duration_seconds = if file.file_type == FileType::Video {
-            self.repo.find_video_duration(uuid).await?
-        } else {
-            None
+        // Audio's is read the same way, for the same reason.
+        let duration_seconds = match file.file_type {
+            FileType::Video => self.repo.find_video_duration(uuid).await?,
+            FileType::Audio => self.repo.find_audio_duration(uuid).await?,
+            _ => None,
         };
 
         // Issue #44 comic slice: comic_page_count lives outside

@@ -4,6 +4,7 @@ use serde::Serialize;
 use uuid::Uuid;
 
 use crate::auth::AuthService;
+use crate::catalog::audio_tags::AudioMetadataReader;
 use crate::catalog::classify::classify_by_extension;
 use crate::catalog::clock::Clock;
 use crate::catalog::comic_tags::ComicMetadataReader;
@@ -89,12 +90,14 @@ impl<T: LibraryRunStarter> LibraryRunStarter for std::sync::Arc<T> {
     }
 }
 
-impl<A, R, F, C, N, O, P, Q, RR> LibraryRunStarter for IndexHandler<A, R, F, C, N, O, P, Q, RR>
+impl<A, R, F, C, M, N, O, P, Q, RR> LibraryRunStarter
+    for IndexHandler<A, R, F, C, M, N, O, P, Q, RR>
 where
     A: AuthService,
     R: CatalogRepository,
     F: Filesystem,
     C: Clock,
+    M: AudioMetadataReader,
     N: ImageMetadataReader,
     O: DocumentMetadataReader,
     P: VideoMetadataReader,
@@ -154,15 +157,15 @@ where
 /// against trait fakes (no real DB, filesystem, or auth service in unit
 /// tests), then wired with the concrete Sqlite/StdFilesystem/Bearer/services
 /// at runtime.
-pub struct IndexHandler<A, R, F, C, N, O, P, Q, RR> {
+pub struct IndexHandler<A, R, F, C, M, N, O, P, Q, RR> {
     auth: A,
     repo: R,
     fs: F,
     clock: C,
-    /// The four readers, held together (`MetadataExtractor`) because the
+    /// The five readers, held together (`MetadataExtractor`) because the
     /// refresh reads the same files with the same readers and this is the
     /// one description of how a file's own metadata reaches the catalog.
-    extractor: MetadataExtractor<N, O, P, Q>,
+    extractor: MetadataExtractor<M, N, O, P, Q>,
     concurrency: usize,
     /// The width a `RunPriority::Low` run processes at
     /// (`indexing.low_priority_concurrency`). See `concurrency` for the
@@ -234,12 +237,13 @@ impl IndexTally {
     }
 }
 
-impl<A, R, F, C, N, O, P, Q, RR> IndexHandler<A, R, F, C, N, O, P, Q, RR>
+impl<A, R, F, C, M, N, O, P, Q, RR> IndexHandler<A, R, F, C, M, N, O, P, Q, RR>
 where
     A: AuthService,
     R: CatalogRepository,
     F: Filesystem,
     C: Clock,
+    M: AudioMetadataReader,
     N: ImageMetadataReader,
     O: DocumentMetadataReader,
     P: VideoMetadataReader,
@@ -265,6 +269,7 @@ where
         repo: R,
         fs: F,
         clock: C,
+        audio_tags: M,
         image_tags: N,
         document_tags: O,
         video_tags: P,
@@ -281,7 +286,13 @@ where
             repo,
             fs,
             clock,
-            extractor: MetadataExtractor::new(image_tags, document_tags, video_tags, comic_tags),
+            extractor: MetadataExtractor::new(
+                audio_tags,
+                image_tags,
+                document_tags,
+                video_tags,
+                comic_tags,
+            ),
             concurrency: concurrency.max(1) as usize,
             low_priority_concurrency: low_priority_concurrency.max(1) as usize,
             library_root,

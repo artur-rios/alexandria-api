@@ -16,6 +16,7 @@
 //! this crate's precedent for a real SQLite pool in an integration test,
 //! `catalog/hashing.rs` for touching the real filesystem directly.
 
+use crate::common::FakeAudioMetadataReader;
 use alexandria_core::auth::BearerAuthService;
 use alexandria_core::catalog::clock::SystemClock;
 use alexandria_core::catalog::comic_tags::CbzComicMetadataReader;
@@ -103,6 +104,7 @@ async fn given_a_just_edited_text_file_when_refreshed_then_it_is_unchanged_and_i
         repo.clone(),
         StdFilesystem,
         SystemClock,
+        FakeAudioMetadataReader::new(),
         ExifImageMetadataReader,
         PdfEpubMetadataReader,
         FfmpegVideoMetadataReader,

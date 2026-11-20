@@ -22,10 +22,10 @@ use alexandria_core::errors::DomainError;
 
 use crate::common::{
     existing_file, fixed_clock, interrupt, now, ConcurrencyTrackingVideoMetadataReader,
-    FailingCatalogRunRepository, FailingListFilesystem, FakeAuth, FakeCatalogRepository,
-    FakeCatalogRunRepository, FakeComicMetadataReader, FakeDocumentMetadataReader, FakeFilesystem,
-    FakeImageMetadataReader, FakeVideoMetadataReader, Interrupt, InterruptingFilesystem,
-    InterruptingVideoMetadataReader, Seam, SteppingClock,
+    FailingCatalogRunRepository, FailingListFilesystem, FakeAudioMetadataReader, FakeAuth,
+    FakeCatalogRepository, FakeCatalogRunRepository, FakeComicMetadataReader,
+    FakeDocumentMetadataReader, FakeFilesystem, FakeImageMetadataReader, FakeVideoMetadataReader,
+    Interrupt, InterruptingFilesystem, InterruptingVideoMetadataReader, Seam, SteppingClock,
 };
 
 const ROOT: &str = "/library";
@@ -53,7 +53,7 @@ fn handler<A, R, F, C, N, O, P, Q, RR>(
     video_tags: P,
     comic_tags: Q,
     runs: RR,
-) -> IndexHandler<A, R, F, C, N, O, P, Q, RR>
+) -> IndexHandler<A, R, F, C, FakeAudioMetadataReader, N, O, P, Q, RR>
 where
     A: AuthService,
     R: CatalogRepository,
@@ -95,7 +95,7 @@ fn handler_with_library_root<A, R, F, C, N, O, P, Q, RR>(
     comic_tags: Q,
     library_root: String,
     runs: RR,
-) -> IndexHandler<A, R, F, C, N, O, P, Q, RR>
+) -> IndexHandler<A, R, F, C, FakeAudioMetadataReader, N, O, P, Q, RR>
 where
     A: AuthService,
     R: CatalogRepository,
@@ -112,6 +112,7 @@ where
         repo,
         fs,
         clock,
+        FakeAudioMetadataReader::new(),
         image_tags,
         document_tags,
         video_tags,
@@ -140,7 +141,7 @@ fn handler_with_registry<A, R, F, C, N, O, P, Q, RR>(
     comic_tags: Q,
     runs: RR,
     registry: RunRegistry,
-) -> IndexHandler<A, R, F, C, N, O, P, Q, RR>
+) -> IndexHandler<A, R, F, C, FakeAudioMetadataReader, N, O, P, Q, RR>
 where
     A: AuthService,
     R: CatalogRepository,
@@ -157,6 +158,7 @@ where
         repo,
         fs,
         clock,
+        FakeAudioMetadataReader::new(),
         image_tags,
         document_tags,
         video_tags,
@@ -492,6 +494,7 @@ async fn given_any_concurrency_when_execute_then_same_counts_and_same_catalog() 
             repo,
             fs,
             fixed_clock(now()),
+            FakeAudioMetadataReader::new(),
             FakeImageMetadataReader::new(),
             FakeDocumentMetadataReader::new(),
             FakeVideoMetadataReader::new(),
@@ -539,6 +542,7 @@ async fn given_zero_concurrency_when_execute_then_runs_sequentially_rather_than_
         FakeCatalogRepository::new(),
         fs,
         fixed_clock(now()),
+        FakeAudioMetadataReader::new(),
         FakeImageMetadataReader::new(),
         FakeDocumentMetadataReader::new(),
         FakeVideoMetadataReader::new(),
@@ -575,6 +579,7 @@ async fn given_zero_low_priority_concurrency_when_a_low_priority_run_executes_th
         FakeCatalogRepository::new(),
         fs,
         fixed_clock(now()),
+        FakeAudioMetadataReader::new(),
         FakeImageMetadataReader::new(),
         FakeDocumentMetadataReader::new(),
         FakeVideoMetadataReader::new(),
@@ -830,13 +835,10 @@ async fn given_a_run_that_indexed_everything_when_it_ends_then_nothing_is_named(
     assert!(runs_handle.recorded_failures(run_id).is_empty());
 }
 
-/// Audio is no longer a catalogued type: a folder that still holds music
-/// next to videos and notes catalogs the videos and notes, and skips the
-/// music the way it skips any unrecognised extension — silently, and without
-/// naming a single audio file as a failure.
+/// Audio is a catalogued type again: a folder holding music next to videos
+/// and notes catalogs all of it, each as its own type.
 #[tokio::test]
-async fn given_a_folder_mixing_audio_video_and_text_when_indexed_then_only_video_and_text_are_cataloged(
-) {
+async fn given_a_folder_mixing_audio_video_and_text_when_indexed_then_all_are_cataloged() {
     let fs = FakeFilesystem::builder()
         .with_root(ROOT)
         .with_file(ROOT, "/library/song.mp3", "song.mp3", "h-song")
@@ -877,8 +879,8 @@ async fn given_a_folder_mixing_audio_video_and_text_when_indexed_then_only_video
 
     assert_eq!(
         repo_handle.count(),
-        2,
-        "only the video and the text are cataloged"
+        4,
+        "the music is cataloged with the video and the text"
     );
     assert_eq!(
         repo_handle
@@ -892,16 +894,21 @@ async fn given_a_folder_mixing_audio_video_and_text_when_indexed_then_only_video
             .map(|f| f.file_type),
         Some(FileType::Text)
     );
-    assert!(!repo_handle.has_path("/library/song.mp3"));
-    assert!(!repo_handle.has_path("/library/track.flac"));
-    assert_eq!(outcome.skipped, 2, "the audio files are skipped");
-    assert_eq!(outcome.failed, 0, "skipping audio is not a failure");
+    for path in ["/library/song.mp3", "/library/track.flac"] {
+        assert_eq!(
+            repo_handle.file_for(path).map(|f| f.file_type),
+            Some(FileType::Audio),
+            "{path}"
+        );
+    }
+    assert_eq!(outcome.skipped, 0);
+    assert_eq!(outcome.failed, 0);
 
     let recorded = runs.get_recorded(started.run_id).expect("run recorded");
     assert_eq!(recorded.status, RunStatus::Complete);
     assert!(
         runs.recorded_failures(started.run_id).is_empty(),
-        "no audio file is named as a failure"
+        "no file is named as a failure"
     );
 }
 
@@ -3483,4 +3490,103 @@ async fn given_a_run_paused_before_its_walk_began_when_executed_then_it_stays_pa
     assert_eq!(walked, 0, "a paused run's library was walked");
     let recorded = runs.get_recorded(run_id).expect("recorded run");
     assert_eq!(recorded.status, RunStatus::Paused);
+}
+
+/// An index walk with `audio` as its tag reader, over `fs`.
+fn handler_reading_audio(
+    repo: FakeCatalogRepository,
+    fs: FakeFilesystem,
+    audio: FakeAudioMetadataReader,
+) -> IndexHandler<
+    FakeAuth,
+    FakeCatalogRepository,
+    FakeFilesystem,
+    impl Clock,
+    FakeAudioMetadataReader,
+    FakeImageMetadataReader,
+    FakeDocumentMetadataReader,
+    FakeVideoMetadataReader,
+    FakeComicMetadataReader,
+    FakeCatalogRunRepository,
+> {
+    IndexHandler::new(
+        FakeAuth::Allowing,
+        repo,
+        fs,
+        fixed_clock(now()),
+        audio,
+        FakeImageMetadataReader::new(),
+        FakeDocumentMetadataReader::new(),
+        FakeVideoMetadataReader::new(),
+        FakeComicMetadataReader::new(),
+        TEST_CONCURRENCY,
+        TEST_LOW_PRIORITY_CONCURRENCY,
+        String::new(),
+        FakeCatalogRunRepository::new(),
+        RunRegistry::new(),
+    )
+}
+
+#[tokio::test]
+async fn given_a_tagged_audio_file_when_indexed_then_its_tags_and_duration_are_recorded() {
+    let fs = FakeFilesystem::builder()
+        .with_file(ROOT, "/library/song.flac", "song.flac", "h")
+        .build();
+    let repo = FakeCatalogRepository::new();
+    let audio = FakeAudioMetadataReader::new();
+    audio.seed(
+        "/library/song.flac",
+        alexandria_core::catalog::audio_tags::AudioTags {
+            title: Some("Song".into()),
+            artist: Some("Band".into()),
+            album: Some("Record".into()),
+            duration_seconds: Some(alexandria_core::catalog::audio_tags::AudioDuration(212.5)),
+            ..Default::default()
+        },
+    );
+
+    let outcome = handler_reading_audio(repo.clone(), fs, audio)
+        .execute(ROOT, Uuid::new_v4(), Uuid::new_v4())
+        .await
+        .expect("walk");
+
+    assert_eq!(outcome.indexed, 1);
+    let file = repo.file_for("/library/song.flac").expect("catalogued");
+    assert_eq!(file.file_type, FileType::Audio);
+    match repo.metadata_for(file.uuid) {
+        Some(SubtypeMetadata::Audio {
+            title,
+            artist,
+            album,
+            ..
+        }) => {
+            assert_eq!(title.as_deref(), Some("Song"));
+            assert_eq!(artist.as_deref(), Some("Band"));
+            assert_eq!(album.as_deref(), Some("Record"));
+        }
+        other => panic!("expected audio metadata, got {other:?}"),
+    }
+    assert_eq!(
+        repo.audio_durations
+            .lock()
+            .unwrap()
+            .get(&file.uuid)
+            .copied(),
+        Some(212.5)
+    );
+}
+
+#[tokio::test]
+async fn given_a_file_that_is_not_audio_when_indexed_then_the_audio_reader_is_not_consulted() {
+    let fs = FakeFilesystem::builder()
+        .with_file(ROOT, "/library/notes.md", "notes.md", "h")
+        .build();
+    let audio = FakeAudioMetadataReader::new();
+
+    handler_reading_audio(FakeCatalogRepository::new(), fs, audio.clone())
+        .execute(ROOT, Uuid::new_v4(), Uuid::new_v4())
+        .await
+        .expect("walk");
+
+    assert_eq!(audio.call_count(), 0);
 }

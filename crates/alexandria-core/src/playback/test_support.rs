@@ -201,7 +201,19 @@ impl CatalogRepository for FakeRepo {
         unimplemented!()
     }
 
+    async fn set_audio_duration(
+        &self,
+        _uuid: Uuid,
+        _duration_seconds: f64,
+    ) -> Result<(), DomainError> {
+        Ok(())
+    }
+
     async fn find_video_duration(&self, _uuid: Uuid) -> Result<Option<f64>, DomainError> {
+        unimplemented!()
+    }
+
+    async fn find_audio_duration(&self, _uuid: Uuid) -> Result<Option<f64>, DomainError> {
         unimplemented!()
     }
 

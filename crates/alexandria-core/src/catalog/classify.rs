@@ -8,6 +8,7 @@ use crate::catalog::model::FileType;
 ///
 /// | type     | extensions |
 /// | ---     | --- |
+/// | audio   | mp3, flac, wav, ogg, oga, m4a, aac, opus, wma |
 /// | video   | mp4, m4v, mkv, avi, mov, webm, mpg, mpeg, wmv, flv |
 /// | html    | html, htm, mhtml |
 /// | text    | md, markdown, txt |
@@ -21,6 +22,7 @@ pub fn classify_by_extension(name: &str) -> Option<FileType> {
         .map(|e| e.to_ascii_lowercase())?;
 
     Some(match ext.as_str() {
+        "mp3" | "flac" | "wav" | "ogg" | "oga" | "m4a" | "aac" | "opus" | "wma" => FileType::Audio,
         "mp4" | "m4v" | "mkv" | "avi" | "mov" | "webm" | "mpg" | "mpeg" | "wmv" | "flv" => {
             FileType::Video
         }
@@ -54,11 +56,15 @@ mod tests {
     }
 
     #[test]
-    fn given_an_audio_extension_when_classified_then_it_is_unrecognised() {
+    fn given_an_audio_extension_when_classified_then_audio() {
         for ext in [
-            "mp3", "flac", "wav", "ogg", "oga", "m4a", "aac", "opus", "wma",
+            "mp3", "flac", "wav", "ogg", "oga", "m4a", "aac", "opus", "wma", "MP3",
         ] {
-            assert_eq!(classify_by_extension(&format!("a.{ext}")), None);
+            assert_eq!(
+                classify_by_extension(&format!("a.{ext}")),
+                Some(FileType::Audio),
+                "{ext}"
+            );
         }
     }
 

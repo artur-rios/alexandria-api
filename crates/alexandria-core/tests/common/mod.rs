@@ -17,6 +17,7 @@ use alexandria_core::auth::local::{
 use alexandria_core::auth::{AuthService, Principal};
 use alexandria_core::bookmarks::model::{Bookmark, BookmarkState, NewBookmark};
 use alexandria_core::bookmarks::repos::BookmarkRepository;
+use alexandria_core::catalog::audio_tags::{AudioMetadataReader, AudioTags};
 use alexandria_core::catalog::clock::{Clock, FixedClock};
 use alexandria_core::catalog::comic_tags::{ComicMetadataReader, ComicTags};
 use alexandria_core::catalog::document_tags::{DocumentMetadataReader, DocumentTags};
@@ -111,6 +112,9 @@ pub struct FakeCatalogRepository {
     /// Duration (seconds) last written for `uuid` via `set_video_duration`
     /// (issue #44 video slice).
     video_durations: Arc<Mutex<HashMap<Uuid, f64>>>,
+    /// Every audio duration written, so a test can assert indexing
+    /// actually extracted and stored one.
+    pub audio_durations: Arc<Mutex<HashMap<Uuid, f64>>>,
     /// Page count last written for `uuid` via `set_comic_page_count`
     /// (issue #44 comic slice).
     comic_page_counts: Arc<Mutex<HashMap<Uuid, i64>>>,
@@ -235,6 +239,27 @@ impl FakeCatalogRepository {
 }
 
 impl CatalogRepository for FakeCatalogRepository {
+    async fn set_audio_duration(
+        &self,
+        uuid: Uuid,
+        duration_seconds: f64,
+    ) -> Result<(), DomainError> {
+        let files = self.files.lock().unwrap();
+        let file = files
+            .values()
+            .find(|f| f.uuid == uuid)
+            .ok_or(DomainError::NotFound)?;
+        if file.file_type != alexandria_core::catalog::model::FileType::Audio {
+            return Err(DomainError::InvalidInput("file is not audio".into()));
+        }
+        drop(files);
+        self.audio_durations
+            .lock()
+            .unwrap()
+            .insert(uuid, duration_seconds);
+        Ok(())
+    }
+
     async fn find_by_path(&self, path: &str) -> Result<Option<File>, DomainError> {
         Ok(self.files.lock().unwrap().get(path).cloned())
     }
@@ -591,6 +616,10 @@ impl CatalogRepository for FakeCatalogRepository {
             .unwrap()
             .insert(uuid, duration_seconds);
         Ok(())
+    }
+
+    async fn find_audio_duration(&self, uuid: Uuid) -> Result<Option<f64>, DomainError> {
+        Ok(self.audio_durations.lock().unwrap().get(&uuid).copied())
     }
 
     async fn find_video_duration(&self, uuid: Uuid) -> Result<Option<f64>, DomainError> {
@@ -2189,6 +2218,43 @@ impl SessionRepository for FailingSessionRepository {
     }
 }
 
+/// In-memory audio-tag reader (issue #44 pilot). `read()` answers `None`
+/// for any path with no seeded tags, mirroring "no tags found / couldn't
+/// parse" — the same outcome `LoftyAudioMetadataReader` produces for those
+/// cases. Also counts calls, so a test can assert the reader was never
+/// consulted at all (e.g. for a non-audio file) — `metadata_for` staying
+/// `None` alone can't distinguish "never called" from "called, but its
+/// result was rejected/discarded downstream."
+#[derive(Debug, Default, Clone)]
+pub struct FakeAudioMetadataReader {
+    tags: Arc<Mutex<HashMap<String, AudioTags>>>,
+    call_count: Arc<Mutex<usize>>,
+}
+
+impl FakeAudioMetadataReader {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Seed the tags `read()` returns for `path`.
+    pub fn seed(&self, path: &str, tags: AudioTags) -> &Self {
+        self.tags.lock().unwrap().insert(path.to_string(), tags);
+        self
+    }
+
+    /// How many times `read()` has been called.
+    pub fn call_count(&self) -> usize {
+        *self.call_count.lock().unwrap()
+    }
+}
+
+impl AudioMetadataReader for FakeAudioMetadataReader {
+    async fn read(&self, path: &str) -> Option<AudioTags> {
+        *self.call_count.lock().unwrap() += 1;
+        self.tags.lock().unwrap().get(path).cloned()
+    }
+}
+
 /// In-memory image-EXIF reader (issue #44 image slice). `read()` answers
 /// `None` for any path with no seeded tags, mirroring "no EXIF found /
 /// couldn't parse" — the same outcome `ExifImageMetadataReader` produces
@@ -2811,6 +2877,14 @@ impl CatalogRunRepository for FakeCatalogRunRepository {
 pub struct FailingCatalogRepository;
 
 impl CatalogRepository for FailingCatalogRepository {
+    async fn set_audio_duration(
+        &self,
+        _uuid: Uuid,
+        _duration_seconds: f64,
+    ) -> Result<(), DomainError> {
+        unimplemented!("not reached by the run-fails-to-list path")
+    }
+
     async fn find_by_path(&self, _path: &str) -> Result<Option<File>, DomainError> {
         unimplemented!("not reached by the run-fails-to-list path")
     }
@@ -2945,6 +3019,10 @@ impl CatalogRepository for FailingCatalogRepository {
     }
 
     async fn find_video_duration(&self, _uuid: Uuid) -> Result<Option<f64>, DomainError> {
+        unimplemented!("not reached by the run-fails-to-list path")
+    }
+
+    async fn find_audio_duration(&self, _uuid: Uuid) -> Result<Option<f64>, DomainError> {
         unimplemented!("not reached by the run-fails-to-list path")
     }
 

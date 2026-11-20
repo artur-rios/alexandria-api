@@ -17,6 +17,7 @@
 
 mod common;
 
+mod audio_api;
 mod auth_api;
 mod auth_register_api;
 mod bookmarks_api;

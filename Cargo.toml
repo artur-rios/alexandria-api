@@ -75,6 +75,7 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png",
 # out of that feature) and, during the overlap, its old HS256 ones (`hmac`).
 jsonwebtoken = { version = "12", features = ["rust_crypto"] }
 kamadak-exif = "0.6"
+lofty = "0.25"
 lopdf = "0.47"
 quick-xml = "0.42"
 # Fetches Heimdall's key set (`auth::jwks`) in external mode, the only call
