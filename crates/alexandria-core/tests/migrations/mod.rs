@@ -1053,3 +1053,36 @@ async fn given_the_upgraded_schema_when_new_rows_are_inserted_then_ids_continue_
     );
     pool.close().await;
 }
+
+#[tokio::test]
+async fn given_a_library_with_two_unfinished_runs_when_upgraded_then_the_newest_stays_and_the_rest_are_cancelled(
+) {
+    let pool = pool_at_version(28).await;
+    sqlx::raw_sql(
+        "INSERT INTO libraries (id, uuid, name, root_path) VALUES (1, 'lib', 'Lib', '/lib');
+         INSERT INTO catalog_runs (id, kind, status, root, started_at, library_id)
+              VALUES ('old', 'index', 'paused', '/lib/sub', '2026-01-01T00:00:00Z', 1),
+                     ('new', 'index', 'paused', '/lib', '2026-02-01T00:00:00Z', 1),
+                     ('done', 'index', 'complete', '/lib', '2025-12-01T00:00:00Z', 1);",
+    )
+    .execute(&pool)
+    .await
+    .expect("seed");
+
+    run_migrations(&pool).await.expect("migrate to head");
+
+    let runs: Vec<(String, String, Option<String>)> =
+        sqlx::query_as("SELECT id, status, finished_at FROM catalog_runs ORDER BY id")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(runs[0].0, "done");
+    assert_eq!(runs[0].1, "complete");
+    assert_eq!((runs[1].0.as_str(), runs[1].1.as_str()), ("new", "paused"));
+    assert_eq!(
+        (runs[2].0.as_str(), runs[2].1.as_str()),
+        ("old", "cancelled")
+    );
+    assert!(runs[2].2.is_some(), "a cancelled run is finished");
+    pool.close().await;
+}

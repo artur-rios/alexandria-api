@@ -103,6 +103,10 @@ where
         }
 
         self.library_root.check_root(root_path)?;
+        // Before overlap, so the owner hears what is wrong with the folder
+        // they typed rather than about the library beside it; and before the
+        // insert, so a folder no run could walk stores nothing at all.
+        self.starter.check_folder(root_path).await?;
 
         // Refused rather than allowed to overlap, and the existing one is
         // named: "that folder is already inside Photography" is something
@@ -336,5 +340,29 @@ where
         }
 
         self.repo.delete(uuid).await.map(|_removed| ())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_root;
+
+    #[test]
+    fn given_trailing_separators_and_padding_when_normalized_then_they_are_dropped() {
+        assert_eq!(normalize_root("  /media/course/  "), "/media/course");
+        assert_eq!(normalize_root(r"D:\course\"), r"D:\course");
+        assert_eq!(normalize_root("/media/course//"), "/media/course");
+    }
+
+    #[test]
+    fn given_a_drive_or_filesystem_root_when_normalized_then_its_separator_stays() {
+        assert_eq!(normalize_root(r"D:\"), r"D:\");
+        assert_eq!(normalize_root("D:/"), "D:/");
+        assert_eq!(normalize_root("/"), "/");
+    }
+
+    #[test]
+    fn given_a_blank_root_when_normalized_then_it_is_empty() {
+        assert_eq!(normalize_root("   "), "");
     }
 }

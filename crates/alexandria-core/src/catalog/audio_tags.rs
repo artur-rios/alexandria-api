@@ -313,7 +313,9 @@ impl LoftyCoverArtReader {
                     cap,
                     "audio file exceeds the playback read cap; refusing before parsing"
                 );
-                return CoverArtRead::Unreadable;
+                // The file is fine — only too large to read a picture out
+                // of — so it has no thumbnail, rather than a disk error.
+                return CoverArtRead::NoPicture;
             }
             Ok(_) => {}
             Err(err) => {
@@ -324,6 +326,14 @@ impl LoftyCoverArtReader {
 
         let tagged_file = match Probe::open(path).and_then(|probe| probe.read()) {
             Ok(f) => f,
+            // `.wma` is catalogued as audio but lofty has no ASF reader: such a
+            // file has no cover this server can read, which is not the same as
+            // a broken one. Any other unknown format is a file that is not
+            // what its extension says, and stays unreadable.
+            Err(err) if err.is_unknown_format() && Self::is_wma(path) => {
+                tracing::debug!(path, "audio format has no tag reader; no cover art");
+                return CoverArtRead::NoPicture;
+            }
             Err(err) => {
                 tracing::debug!(path, error = %err, "could not parse audio file for cover art");
                 return CoverArtRead::Unreadable;
@@ -365,6 +375,15 @@ impl LoftyCoverArtReader {
         }
 
         CoverArtRead::Found(data.to_vec())
+    }
+
+    /// Whether `path` names a Windows Media Audio file — the one catalogued
+    /// audio format lofty cannot read tags from.
+    fn is_wma(path: &str) -> bool {
+        std::path::Path::new(path)
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("wma"))
     }
 
     /// The picture-length comparison the post-parse check above runs, split
@@ -839,7 +858,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn given_file_larger_than_cap_when_parsed_then_unreadable_before_parsing() {
+    async fn given_a_format_the_reader_does_not_know_when_cover_read_then_no_picture() {
+        // A `.wma` is catalogued as audio, but lofty has no ASF reader: the
+        // file is fine, it simply has no cover this server can read — which
+        // is "no thumbnail", not a disk error on every tree view.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("song.wma");
+        std::fs::write(&path, [0x30, 0x26, 0xB2, 0x75, 0x8E, 0x66, 0xCF, 0x11]).expect("write");
+
+        let outcome = LoftyCoverArtReader.read(path.to_str().unwrap()).await;
+
+        assert_eq!(outcome, CoverArtRead::NoPicture);
+    }
+
+    #[tokio::test]
+    async fn given_file_larger_than_cap_when_parsed_then_no_picture_before_parsing() {
         // Arrange — a real, validly tagged file, rejected purely on its own
         // size before `Probe::read` ever runs. Proves the precheck bounds the
         // *file*, independent of whether it would otherwise parse cleanly —
@@ -858,8 +891,9 @@ mod tests {
         // Act — a cap one byte under the fixture's real size.
         let outcome = LoftyCoverArtReader::parse_capped(path.to_str().unwrap(), actual_size - 1);
 
-        // Assert
-        assert_eq!(outcome, CoverArtRead::Unreadable);
+        // Assert — the file is fine, it is only too large to read a picture
+        // out of: no thumbnail, not a disk error.
+        assert_eq!(outcome, CoverArtRead::NoPicture);
     }
 
     #[tokio::test]

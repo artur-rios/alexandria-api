@@ -366,6 +366,42 @@ mod moving {
         .await
     }
 
+    #[tokio::test]
+    async fn given_a_library_when_moved_to_the_root_of_a_drive_then_the_root_keeps_its_separator() {
+        // `E:` is not the root of drive E on Windows — it is the current
+        // directory there — so a walk of a library stored as `E:` would find
+        // `E:music`, not `E:\music`, and re-catalogue everything beside the
+        // moved records. The paths below are rewritten without doubling it.
+        let (pool, catalog, _dir) = fixtures().await;
+        let uuid = registered(&pool, r"D:\courses").await;
+        insert(&catalog, r"D:\courses\a.mp3", FileType::Audio).await;
+
+        let moved = move_to(&pool, uuid, r"E:\").await.expect("move");
+
+        assert_eq!(moved.root_path, r"E:\");
+        let path: String = sqlx::query_scalar("SELECT path FROM files")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(path, r"E:\a.mp3");
+    }
+
+    #[tokio::test]
+    async fn given_a_library_when_moved_to_the_filesystem_root_then_it_is_stored_as_slash() {
+        let (pool, catalog, _dir) = fixtures().await;
+        let uuid = registered(&pool, "/media/course").await;
+        insert(&catalog, "/media/course/a.md", FileType::Text).await;
+
+        let moved = move_to(&pool, uuid, "/").await.expect("move");
+
+        assert_eq!(moved.root_path, "/");
+        let path: String = sqlx::query_scalar("SELECT path FROM files")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(path, "/a.md");
+    }
+
     async fn browse_at(pool: &sqlx::sqlite::SqlitePool, uuid: Uuid, path: &str) -> LibraryListing {
         BrowseLibraryHandler::new(
             FakeAuth::Allowing,

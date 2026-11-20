@@ -69,6 +69,10 @@ pub struct IndexOutcome {
 /// the one index handler the application already builds.
 #[allow(async_fn_in_trait)]
 pub trait LibraryRunStarter: Send + Sync {
+    /// Refuse a folder no run could walk — missing, or not a folder — before
+    /// anything about the library is stored.
+    async fn check_folder(&self, root: &str) -> Result<(), DomainError>;
+
     /// Validate the library's folder and open a run of it. The caller spawns
     /// the walk (`IndexHandler::execute`), as for every run.
     async fn start_library_run(
@@ -80,6 +84,10 @@ pub trait LibraryRunStarter: Send + Sync {
 }
 
 impl<T: LibraryRunStarter> LibraryRunStarter for std::sync::Arc<T> {
+    async fn check_folder(&self, root: &str) -> Result<(), DomainError> {
+        (**self).check_folder(root).await
+    }
+
     async fn start_library_run(
         &self,
         library: &Library,
@@ -104,6 +112,10 @@ where
     Q: ComicMetadataReader,
     RR: CatalogRunRepository,
 {
+    async fn check_folder(&self, root: &str) -> Result<(), DomainError> {
+        IndexHandler::check_folder(self, root).await
+    }
+
     async fn start_library_run(
         &self,
         library: &Library,
@@ -301,6 +313,19 @@ where
         }
     }
 
+    /// A root a run can walk: one that exists and is a folder.
+    async fn check_folder(&self, root: &str) -> Result<(), DomainError> {
+        if !self.fs.path_exists(root).await {
+            return Err(DomainError::InvalidInput("root path does not exist".into()));
+        }
+        if !self.fs.is_folder(root).await {
+            return Err(DomainError::InvalidInput(
+                "root path is not a folder".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// The width a run at `priority` should be walked at — `Normal` maps to
     /// `concurrency`, `Low` to `low_priority_concurrency`. See `RunPriority`
     /// for why this is a match on a semantic enum rather than a number the
@@ -325,9 +350,7 @@ where
         token: &str,
     ) -> Result<IndexStarted, DomainError> {
         self.auth.authenticate(token).await?;
-        if !self.fs.path_exists(&request.root).await {
-            return Err(DomainError::InvalidInput("root path does not exist".into()));
-        }
+        self.check_folder(&request.root).await?;
         // FR-FC-26 — see `LibraryRoot::contains` for how both sides are
         // resolved. The same check bounds a library move (UC-51), so the two
         // ways a root reaches the catalog cannot disagree about it.

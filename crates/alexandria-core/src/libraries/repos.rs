@@ -3,6 +3,7 @@ use sqlx::Row;
 use uuid::Uuid;
 
 use crate::errors::{DomainError, WRITE_TX};
+use crate::libraries::commands::normalize_root;
 use crate::libraries::model::{Library, NewLibrary};
 
 /// Libraries repository port.
@@ -231,13 +232,20 @@ impl LibraryRepository for SqliteLibraryRepository {
         // letter in the root (`/media/Música`) and cuts the head off every
         // path below it — the separator first.
         let old_len = Self::as_prefix(&old_root).chars().count() - 1;
-        let new_root = new_root.trim_end_matches(['/', '\\']).to_string();
+        // Two spellings of the new root. The paths below it are rewritten
+        // from the separator onward, so they take the root without its
+        // trailing one (`E:` + `\\a.mp3`); the library itself is stored as
+        // registration stores a root, separator kept where it is the root of
+        // a drive or of the filesystem (`E:\\`, `/`) — `E:` alone is not the
+        // root of drive E, and an empty root would overlap every library.
+        let path_root = new_root.trim_end_matches(['/', '\\']).to_string();
+        let new_root = normalize_root(new_root).to_string();
 
         let moved = sqlx::query(
             "UPDATE files SET path = ? || substr(path, ?) WHERE library_id =
              (SELECT id FROM libraries WHERE uuid = ?)",
         )
-        .bind(&new_root)
+        .bind(&path_root)
         .bind(i64::try_from(old_len).unwrap_or(i64::MAX) + 1)
         .bind(uuid.to_string())
         .execute(&mut *tx)

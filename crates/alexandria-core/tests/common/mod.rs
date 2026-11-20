@@ -3536,6 +3536,10 @@ impl RecoveryCodeRepository for FakeRecoveryCodeRepository {
 pub struct AlwaysStartsRun;
 
 impl alexandria_core::catalog::commands::index::LibraryRunStarter for AlwaysStartsRun {
+    async fn check_folder(&self, _root: &str) -> Result<(), DomainError> {
+        Ok(())
+    }
+
     async fn start_library_run(
         &self,
         _library: &alexandria_core::libraries::model::Library,

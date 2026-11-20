@@ -554,3 +554,117 @@ async fn assert_nothing_stored(pool: &SqlitePool) {
         .expect("runs");
     assert!(runs.is_empty(), "{runs:?}");
 }
+
+#[tokio::test]
+async fn given_a_file_instead_of_a_folder_when_registered_then_invalid_input_and_nothing_is_stored()
+{
+    // walkdir answers a file as a one-entry walk, so a library made of a file
+    // would hold one file its tree cannot show — and block its folder.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = mixed(dir.path());
+    let pool = migrated(dir.path()).await;
+
+    let result = registrar(&pool, "")
+        .register(
+            "One file",
+            root.join("a.md").to_str().unwrap(),
+            RunPriority::Normal,
+            "token",
+        )
+        .await;
+
+    assert!(
+        matches!(result, Err(DomainError::InvalidInput(_))),
+        "{result:?}"
+    );
+    assert_nothing_stored(&pool).await;
+}
+
+#[tokio::test]
+async fn given_a_missing_folder_inside_a_library_when_registered_then_invalid_input_not_conflict() {
+    // The folder is checked before overlap, so the owner hears what is wrong
+    // with what they typed rather than about the library beside it.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = mixed(dir.path());
+    let pool = migrated(dir.path()).await;
+    register(&pool, root.to_str().unwrap()).await;
+
+    let result = registrar(&pool, "")
+        .register(
+            "Gone",
+            root.join("nowhere").to_str().unwrap(),
+            RunPriority::Normal,
+            "token",
+        )
+        .await;
+
+    assert!(
+        matches!(result, Err(DomainError::InvalidInput(_))),
+        "{result:?}"
+    );
+}
+
+#[tokio::test]
+async fn given_an_unfinished_run_when_a_second_run_of_the_library_is_started_then_conflict_naming_it(
+) {
+    // The handler checks first, but two requests can both pass the check (a
+    // double click, or HTTP and FFI at once): the store itself refuses the
+    // second.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let pool = migrated(dir.path()).await;
+    let library = crate::common::seed_library(&pool, "/a").await;
+    let runs = SqliteCatalogRunRepository::new(pool.clone());
+    let first = Uuid::new_v4();
+    runs.start(
+        first,
+        RunKind::Index,
+        Some("/a"),
+        chrono::Utc::now(),
+        1,
+        Some(library),
+    )
+    .await
+    .expect("first");
+
+    let second = runs
+        .start(
+            Uuid::new_v4(),
+            RunKind::Index,
+            Some("/a"),
+            chrono::Utc::now(),
+            1,
+            Some(library),
+        )
+        .await;
+
+    match second {
+        Err(DomainError::Conflict(message)) => {
+            assert!(message.contains(&first.to_string()), "{message}")
+        }
+        other => panic!("expected a conflict, got {other:?}"),
+    }
+    assert_eq!(runs.list_active().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn given_a_library_that_does_not_exist_when_its_run_is_started_then_not_found() {
+    // Removed between the handler's lookup and the insert: the run must not
+    // be written as nobody's.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let pool = migrated(dir.path()).await;
+    let runs = SqliteCatalogRunRepository::new(pool.clone());
+
+    let result = runs
+        .start(
+            Uuid::new_v4(),
+            RunKind::Index,
+            Some("/a"),
+            chrono::Utc::now(),
+            1,
+            Some(Uuid::new_v4()),
+        )
+        .await;
+
+    assert!(matches!(result, Err(DomainError::NotFound)), "{result:?}");
+    assert!(runs.list_active().await.unwrap().is_empty());
+}

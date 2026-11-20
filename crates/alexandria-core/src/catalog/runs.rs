@@ -919,10 +919,23 @@ impl CatalogRunRepository for SqliteCatalogRunRepository {
         concurrency: u32,
         library_uuid: Option<Uuid>,
     ) -> Result<(), DomainError> {
-        sqlx::query(
+        // The library an index run walks, resolved here so a library removed
+        // since the caller looked it up is reported rather than written as
+        // nobody's run.
+        let library_id: Option<i64> = match library_uuid {
+            Some(uuid) => Some(
+                sqlx::query_scalar("SELECT id FROM libraries WHERE uuid = ?")
+                    .bind(uuid.to_string())
+                    .fetch_optional(&self.pool)
+                    .await?
+                    .ok_or(DomainError::NotFound)?,
+            ),
+            None => None,
+        };
+        let inserted = sqlx::query(
             "INSERT INTO catalog_runs \
              (id, kind, status, root, started_at, concurrency, library_id) \
-             VALUES (?, ?, ?, ?, ?, ?, (SELECT id FROM libraries WHERE uuid = ?))",
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(id.to_string())
         .bind(kind.as_str())
@@ -932,11 +945,29 @@ impl CatalogRunRepository for SqliteCatalogRunRepository {
         // Narrowed to i64 for the column; the reverse narrowing happens in
         // `get`, which is safe for the reason documented there.
         .bind(concurrency as i64)
-        // The library this run walks, or NULL for a refresh (which has none).
-        .bind(library_uuid.map(|uuid| uuid.to_string()))
+        .bind(library_id)
         .execute(&self.pool)
-        .await?;
-        Ok(())
+        .await;
+        match inserted {
+            Ok(_) => Ok(()),
+            // Migration 29's index: the library already has an unfinished run
+            // (FR-FC-43). Named, as the handlers name it, so the owner knows
+            // which run to cancel.
+            Err(sqlx::Error::Database(db)) if db.is_unique_violation() && library_id.is_some() => {
+                let existing: Option<String> = sqlx::query_scalar(
+                    "SELECT id FROM catalog_runs \
+                     WHERE library_id = ? AND status IN ('running', 'paused')",
+                )
+                .bind(library_id)
+                .fetch_optional(&self.pool)
+                .await?;
+                Err(DomainError::Conflict(format!(
+                    "the library has an unfinished run {}; cancel it first",
+                    existing.unwrap_or_default()
+                )))
+            }
+            Err(err) => Err(err.into()),
+        }
     }
 
     async fn record_failure(

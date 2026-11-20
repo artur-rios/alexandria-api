@@ -51,8 +51,9 @@ every file belongs to exactly one.
 ### Upgrade
 
 Starting 0.6.0 deletes every catalog record outside a library, with its progress and collection membership (migration
-28); index runs over roots no library holds are deleted with their failures, and refresh runs are kept. Files on disk
-are untouched. Back up the database file (`database.path`, `alexandria.sqlite` by default) first to keep them, then add
+28); index runs over roots no library holds are deleted with their failures, and refresh runs are kept. A library left
+with more than one unfinished run keeps the newest and the rest are cancelled (migration 29), since a library may have
+only one. Files on disk are untouched. Back up the database file (`database.path`, `alexandria.sqlite` by default) first to keep them, then add
 your folders as libraries to index them again.
 
 ### Removed

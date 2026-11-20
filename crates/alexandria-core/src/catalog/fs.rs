@@ -63,6 +63,14 @@ pub struct FileStat {
 #[allow(async_fn_in_trait)]
 pub trait Filesystem: Send + Sync {
     async fn path_exists(&self, root: &str) -> bool;
+    /// Whether `path` is a folder — what a library's root has to be. A file
+    /// would walk as a one-entry tree its library could never show.
+    ///
+    /// Defaults to `path_exists`, which is what an in-memory double holding
+    /// only roots and files can answer.
+    async fn is_folder(&self, path: &str) -> bool {
+        self.path_exists(path).await
+    }
     async fn list_files(&self, root: &str) -> Result<Vec<FileEntry>, DomainError>;
     async fn content_hash(&self, path: &str) -> Result<String, DomainError>;
     /// The file's size and modification time, or `None` when it is gone
@@ -223,6 +231,13 @@ impl Filesystem for StdFilesystem {
         // to distinguish the two (UC-01 `start`) get their real error from the
         // subsequent `list_files`.
         blocking(move || Ok(Path::new(&root).exists()))
+            .await
+            .unwrap_or(false)
+    }
+
+    async fn is_folder(&self, path: &str) -> bool {
+        let path = path.to_string();
+        blocking(move || Ok(Path::new(&path).is_dir()))
             .await
             .unwrap_or(false)
     }

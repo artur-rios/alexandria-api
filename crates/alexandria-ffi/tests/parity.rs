@@ -12772,3 +12772,206 @@ async fn given_a_library_filter_when_listed_on_both_surfaces_then_the_json_match
     assert_eq!(http_listing.as_array().map(|a| a.len()), Some(1));
     assert_eq!(norm(http_listing), norm(ffi_listing));
 }
+
+/// One leg's view of the library calls: status codes as both surfaces
+/// spell them, so they can be compared.
+#[derive(Debug, PartialEq)]
+struct LibraryCalls {
+    reindex_ok: bool,
+    reindex_unknown: &'static str,
+    reindex_while_paused: &'static str,
+    remove_while_running: &'static str,
+    remove_ok: bool,
+    files_after_remove: i64,
+}
+
+/// FR-FC-24 parity for re-indexing one library and for removing one: both
+/// surfaces start a run, refuse an unknown library and an unfinished run the
+/// same way, and remove a library's records the same way.
+#[tokio::test]
+async fn given_a_library_when_reindexed_and_removed_on_both_surfaces_then_they_agree() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let folder = tempdir().unwrap();
+    std::fs::write(folder.path().join("a.md"), b"# a").unwrap();
+    let root = folder.path().to_str().unwrap().to_string();
+
+    // ---- HTTP leg ----
+    let http_dir = tempdir().unwrap();
+    let http_pool = migrate_database(&db_path(&http_dir, "http.sqlite"))
+        .await
+        .expect("http migrate");
+    seed_session(&http_pool, TEST_TOKEN).await;
+    let services = std::sync::Arc::new(build_services(&local_settings(), http_pool.clone()).await);
+    let call = |method: &'static str, uri: String, body: Option<serde_json::Value>| {
+        let services = services.clone();
+        async move {
+            let req = Request::builder()
+                .method(method)
+                .uri(uri)
+                .header("authorization", &format!("Bearer {TEST_TOKEN}"))
+                .header("content-type", "application/json")
+                .body(body.map_or_else(Body::empty, |b| Body::from(b.to_string())))
+                .unwrap();
+            let resp = app(Settings::default(), services)
+                .oneshot(req)
+                .await
+                .unwrap();
+            let status = resp.status();
+            let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            (
+                status,
+                serde_json::from_slice::<serde_json::Value>(&bytes).unwrap_or_default(),
+            )
+        }
+    };
+    let set_status = |pool: sqlx::SqlitePool, status: &'static str| async move {
+        sqlx::query(
+            "UPDATE catalog_runs SET status = ? \
+                 WHERE id = (SELECT id FROM catalog_runs ORDER BY started_at DESC LIMIT 1)",
+        )
+        .bind(status)
+        .execute(&pool)
+        .await
+        .unwrap();
+    };
+    let named = |status: axum::http::StatusCode| match status.as_u16() {
+        404 => "not found",
+        409 => "conflict",
+        _ => "other",
+    };
+
+    let (_, library) = call(
+        "POST",
+        "/v1/libraries".into(),
+        Some(json!({ "name": "Notes", "rootPath": root })),
+    )
+    .await;
+    let uuid = library["uuid"].as_str().unwrap().to_string();
+    wait_for_http_run_terminal(&services, library["runId"].as_str().unwrap(), TEST_TOKEN).await;
+    let (status, started) = call("POST", format!("/v1/libraries/{uuid}/index"), None).await;
+    let reindex_ok = status == axum::http::StatusCode::ACCEPTED && started["runId"].is_string();
+    wait_for_http_run_terminal(&services, started["runId"].as_str().unwrap(), TEST_TOKEN).await;
+    let (unknown, _) = call(
+        "POST",
+        format!("/v1/libraries/{}/index", uuid::Uuid::new_v4()),
+        None,
+    )
+    .await;
+    set_status(http_pool.clone(), "paused").await;
+    let (paused, _) = call("POST", format!("/v1/libraries/{uuid}/index"), None).await;
+    set_status(http_pool.clone(), "running").await;
+    let (running, _) = call("DELETE", format!("/v1/libraries/{uuid}"), None).await;
+    set_status(http_pool.clone(), "complete").await;
+    let (removed, _) = call("DELETE", format!("/v1/libraries/{uuid}"), None).await;
+    let http_files: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM files")
+        .fetch_one(&http_pool)
+        .await
+        .unwrap();
+    let http = LibraryCalls {
+        reindex_ok,
+        reindex_unknown: named(unknown),
+        reindex_while_paused: named(paused),
+        remove_while_running: named(running),
+        remove_ok: removed == axum::http::StatusCode::NO_CONTENT,
+        files_after_remove: http_files,
+    };
+
+    // ---- FFI leg ----
+    let ffi_dir = tempdir().unwrap();
+    let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
+    let ffi_db_path = ffi_db.clone();
+    let ffi = tokio::task::spawn_blocking(move || {
+        let cdb = CString::new(ffi_db).unwrap();
+        assert_eq!(
+            alexandria_index_init(cdb.as_ptr()),
+            alexandria_ffi::INDEX_OK
+        );
+        let token = CString::new(TEST_TOKEN).unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let pool = rt.block_on(migrate_database(&ffi_db_path)).unwrap();
+        let set_status = |status: &str| {
+            rt.block_on(
+                sqlx::query(
+                    "UPDATE catalog_runs SET status = ? \
+                 WHERE id = (SELECT id FROM catalog_runs ORDER BY started_at DESC LIMIT 1)",
+                )
+                .bind(status)
+                .execute(&pool),
+            )
+            .unwrap();
+        };
+        let index_named = |status: i32| match status {
+            alexandria_ffi::INDEX_ERR_NOT_FOUND => "not found",
+            alexandria_ffi::INDEX_ERR_CONFLICT => "conflict",
+            _ => "other",
+        };
+
+        let body = CString::new(json!({ "name": "Notes", "rootPath": root }).to_string()).unwrap();
+        let r = alexandria_library_register(body.as_ptr(), token.as_ptr());
+        assert_eq!(r.status, alexandria_ffi::LIBRARY_OK);
+        let library: serde_json::Value =
+            serde_json::from_str(&unsafe { CStr::from_ptr(r.json) }.to_string_lossy()).unwrap();
+        unsafe { alexandria_free_string(r.json) };
+        wait_for_ffi_run_terminal(library["runId"].as_str().unwrap(), &token);
+        let uuid = CString::new(library["uuid"].as_str().unwrap()).unwrap();
+
+        let started = alexandria_ffi::alexandria_library_index_start(
+            uuid.as_ptr(),
+            token.as_ptr(),
+            std::ptr::null(),
+        );
+        let reindex_ok = started.status == alexandria_ffi::INDEX_OK;
+        wait_for_ffi_run_terminal(&run_id_string(&started), &token);
+        let stranger = CString::new(uuid::Uuid::new_v4().to_string()).unwrap();
+        let unknown = alexandria_ffi::alexandria_library_index_start(
+            stranger.as_ptr(),
+            token.as_ptr(),
+            std::ptr::null(),
+        )
+        .status;
+        set_status("paused");
+        let paused = alexandria_ffi::alexandria_library_index_start(
+            uuid.as_ptr(),
+            token.as_ptr(),
+            std::ptr::null(),
+        )
+        .status;
+        set_status("running");
+        let running =
+            alexandria_ffi::alexandria_library_remove(uuid.as_ptr(), token.as_ptr()).status;
+        set_status("complete");
+        let removed =
+            alexandria_ffi::alexandria_library_remove(uuid.as_ptr(), token.as_ptr()).status;
+        let files: i64 = rt
+            .block_on(sqlx::query_scalar("SELECT COUNT(*) FROM files").fetch_one(&pool))
+            .unwrap();
+        LibraryCalls {
+            reindex_ok,
+            reindex_unknown: index_named(unknown),
+            reindex_while_paused: index_named(paused),
+            remove_while_running: if running == alexandria_ffi::LIBRARY_ERR_CONFLICT {
+                "conflict"
+            } else {
+                "other"
+            },
+            remove_ok: removed == alexandria_ffi::LIBRARY_OK,
+            files_after_remove: files,
+        }
+    })
+    .await
+    .unwrap();
+
+    // ---- compare ----
+    assert_eq!(
+        http,
+        LibraryCalls {
+            reindex_ok: true,
+            reindex_unknown: "not found",
+            reindex_while_paused: "conflict",
+            remove_while_running: "conflict",
+            remove_ok: true,
+            files_after_remove: 0,
+        }
+    );
+    assert_eq!(ffi, http);
+}

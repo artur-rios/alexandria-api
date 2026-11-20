@@ -4649,12 +4649,6 @@ fn map_library_err(err: DomainError) -> LibraryJsonResult {
     }
 }
 
-/// Treat a folder as a library (libraries design).
-///
-/// `json_body` is the JSON body `POST /v1/libraries` takes (`name`,
-/// `rootPath`). Whatever is already indexed beneath the folder is claimed by
-/// this call. Answers `LIBRARY_ERR_CONFLICT` when the folder overlaps an
-/// existing library.
 /// Walk `library`'s folder for the run `run_id` on the runtime, as
 /// HTTP's `spawn_walk` does — the call that opened the run has answered.
 fn spawn_library_walk(
@@ -4721,6 +4715,16 @@ pub extern "C" fn alexandria_library_index_start(
     })
 }
 
+/// Add a folder as a library and start indexing it (FR-FC-36).
+///
+/// `json_body` is the JSON body `POST /v1/libraries` takes: `name`,
+/// `rootPath`, and an optional `priority` (`"low"`; anything else is normal)
+/// for the first run. On success `json` is the library with the `runId` of
+/// its first index run beside its fields; follow it with
+/// `alexandria_index_run_status_json`. Answers `LIBRARY_ERR_INVALID_INPUT` for
+/// a blank name or folder, a folder that does not exist or is not a folder,
+/// or one outside `filesystem.root`; `LIBRARY_ERR_CONFLICT` when the folder
+/// overlaps an existing library. A refusal stores nothing.
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
 pub extern "C" fn alexandria_library_register(
