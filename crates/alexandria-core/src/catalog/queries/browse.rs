@@ -1,7 +1,7 @@
 use uuid::Uuid;
 
 use crate::auth::AuthService;
-use crate::catalog::model::{FileType, FileView, LibraryScope, StateFilter};
+use crate::catalog::model::{FileType, FileView, StateFilter};
 use crate::catalog::repos::CatalogRepository;
 use crate::errors::DomainError;
 
@@ -22,10 +22,9 @@ pub struct FileFilter {
     pub file_type: Option<FileType>,
     pub state: StateFilter,
     pub collection_uuid: Option<Uuid>,
-    /// Whether the listing reaches into libraries (libraries design). The
-    /// default excludes them, which is what a type panel wants; a search or
-    /// a deleted-items review asks for [`LibraryScope::Everywhere`].
-    pub scope: LibraryScope,
+    /// One library's files, for a search or a trash review within it.
+    /// `None` is every library.
+    pub library_uuid: Option<Uuid>,
 }
 
 impl FileFilter {
@@ -48,13 +47,10 @@ impl FileFilter {
         self
     }
 
-    /// Reach into libraries too — every file the rest of the filter matches.
-    ///
-    /// For the callers that are not browsing by type: a search that must
-    /// find a lecture recording by name, and a deleted-items review that
-    /// must be able to offer it back (FR-FC-38).
-    pub fn everywhere(mut self) -> Self {
-        self.scope = LibraryScope::Everywhere;
+    /// Only the files of one library — a search, or a trash review, within
+    /// it. A uuid that names no library matches nothing.
+    pub fn with_library(mut self, library_uuid: Uuid) -> Self {
+        self.library_uuid = Some(library_uuid);
         self
     }
 }
@@ -108,7 +104,7 @@ where
                 filter.file_type,
                 filter.state,
                 filter.collection_uuid,
-                filter.scope,
+                filter.library_uuid,
             )
             .await
     }

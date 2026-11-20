@@ -12,7 +12,6 @@ use std::sync::Arc;
 
 use alexandria_core::catalog::commands::index::{IndexHandler, IndexOutcome};
 use alexandria_core::catalog::fs::StdFilesystem;
-use alexandria_core::catalog::index_scope::IndexScope;
 use alexandria_core::catalog::library_root::LibraryRoot;
 use alexandria_core::catalog::repos::SqliteCatalogRepository;
 use alexandria_core::catalog::run_registry::RunRegistry;
@@ -63,31 +62,6 @@ async fn migrated(dir: &std::path::Path) -> SqlitePool {
     migrate_database(dir.join("alexandria.sqlite").to_str().expect("path"))
         .await
         .expect("migrate")
-}
-
-/// Index `root` the way a registration does, with the real walk.
-async fn index(pool: &SqlitePool, root: &str) {
-    let handler = IndexHandler::new(
-        FakeAuth::Allowing,
-        SqliteCatalogRepository::new(pool.clone()),
-        StdFilesystem,
-        SystemClock,
-        FakeImageMetadataReader::new(),
-        FakeDocumentMetadataReader::new(),
-        FakeVideoMetadataReader::new(),
-        FakeComicMetadataReader::new(),
-        4,
-        1,
-        String::new(),
-        SqliteCatalogRunRepository::new(pool.clone()),
-        RunRegistry::new(),
-    );
-
-    let outcome = handler
-        .execute(root, Uuid::new_v4(), &IndexScope::all())
-        .await
-        .expect("index run");
-    assert_eq!(outcome.indexed, 6, "six supported files, one zip skipped");
 }
 
 async fn browse(pool: &SqlitePool, uuid: Uuid, path: &str) -> LibraryListing {
@@ -189,11 +163,7 @@ async fn register_and_walk(pool: &SqlitePool, root: &str) -> (RegisteredLibrary,
         .await
         .expect("register");
     let outcome = index_handler(pool, "")
-        .execute(
-            &registered.library.root_path,
-            registered.run_id,
-            &IndexScope::all(),
-        )
+        .execute(&registered.library.root_path, registered.run_id)
         .await
         .expect("walk");
     (registered, outcome)
@@ -261,24 +231,6 @@ async fn given_a_library_made_before_the_walk_when_browsed_then_it_holds_what_wa
         vec!["lecture.mp4"],
         "the unsupported zip is not in the catalog, so not in the library"
     );
-}
-
-#[tokio::test]
-async fn given_a_library_made_after_the_walk_when_browsed_then_it_claims_what_is_there() {
-    // The other order, which is what marking an already-indexed folder does:
-    // the files are in the catalog before the library exists, and
-    // registration claims them.
-    let dir = tempfile::tempdir().expect("tempdir");
-    let root = course(dir.path());
-    let root = root.to_str().expect("root");
-    let pool = migrated(dir.path()).await;
-
-    index(&pool, root).await;
-    let uuid = register(&pool, root).await;
-
-    let top = browse(&pool, uuid, "").await;
-    assert_eq!(names(&top), vec!["intro.txt", "syllabus.pdf"]);
-    assert_eq!(browse(&pool, uuid, "class-01").await.files.len(), 2);
 }
 
 #[tokio::test]
@@ -451,7 +403,7 @@ async fn given_an_indexed_library_when_reindexed_then_existing_files_count_as_al
         .await
         .expect("reindex");
     let outcome = index_handler(&pool, "")
-        .execute(&library.root_path, started.run_id, &IndexScope::all())
+        .execute(&library.root_path, started.run_id)
         .await
         .expect("walk");
 
@@ -573,17 +525,9 @@ async fn given_a_refresh_run_when_its_status_is_read_then_it_has_no_library() {
     let pool = migrated(dir.path()).await;
     let runs = SqliteCatalogRunRepository::new(pool.clone());
     let id = Uuid::new_v4();
-    runs.start(
-        id,
-        RunKind::Refresh,
-        None,
-        chrono::Utc::now(),
-        1,
-        None,
-        None,
-    )
-    .await
-    .expect("start");
+    runs.start(id, RunKind::Refresh, None, chrono::Utc::now(), 1, None)
+        .await
+        .expect("start");
 
     let run = runs.get(id).await.expect("get").expect("run");
 

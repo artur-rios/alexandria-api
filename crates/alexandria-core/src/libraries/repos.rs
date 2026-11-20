@@ -51,14 +51,6 @@ pub trait LibraryRepository: Send + Sync {
     /// Returns the moved library and how many files came with it.
     async fn move_root(&self, uuid: Uuid, new_root: &str) -> Result<(Library, u32), DomainError>;
 
-    /// Attach every active file under the library's root to it.
-    ///
-    /// Run after an index rather than during it: the walk records files
-    /// through the catalog's own path, which knows nothing of libraries, and
-    /// teaching it would thread a concept through every insert for the sake
-    /// of one column. Returns how many files it claimed.
-    async fn claim_files(&self, uuid: Uuid) -> Result<u32, DomainError>;
-
     /// Delete the library and return its files to the type panels.
     ///
     /// The files themselves are untouched: what goes is the grouping. There
@@ -285,51 +277,6 @@ impl LibraryRepository for SqliteLibraryRepository {
             },
             u32::try_from(moved).unwrap_or(u32::MAX),
         ))
-    }
-
-    async fn claim_files(&self, uuid: Uuid) -> Result<u32, DomainError> {
-        let mut tx = self
-            .pool
-            .begin_with(WRITE_TX)
-            .await
-            .map_err(|e| DomainError::Disk(e.to_string()))?;
-
-        let library: Option<(i64, String)> =
-            sqlx::query_as("SELECT id, root_path FROM libraries WHERE uuid = ?")
-                .bind(uuid.to_string())
-                .fetch_optional(&mut *tx)
-                .await
-                .map_err(|e| DomainError::Disk(e.to_string()))?;
-        let Some((id, root_path)) = library else {
-            return Err(DomainError::NotFound);
-        };
-
-        // `substr(…) = ?` rather than `LIKE`: see `find_overlapping` for why.
-        // The short version is that `LIKE` is case-insensitive over ASCII, so
-        // this claimed every file under `/media/Photos` for a library rooted
-        // at `/media/photos` — and `BrowseLibraryHandler` then dropped every
-        // one of them from the tree, because its `strip_prefix` is not. A
-        // file claimed by a library that cannot list it is reachable from
-        // nowhere but search.
-        let prefix = Self::as_prefix(&root_path);
-        let claimed = sqlx::query(
-            "UPDATE files SET library_id = ?
-             WHERE library_id IS NULL
-               AND substr(replace(path, '\\', '/'), 1, length(?)) = ?",
-        )
-        .bind(id)
-        .bind(&prefix)
-        .bind(&prefix)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| DomainError::Disk(e.to_string()))?
-        .rows_affected();
-
-        tx.commit()
-            .await
-            .map_err(|e| DomainError::Disk(e.to_string()))?;
-
-        Ok(u32::try_from(claimed).unwrap_or(u32::MAX))
     }
 
     async fn delete(&self, uuid: Uuid) -> Result<(), DomainError> {

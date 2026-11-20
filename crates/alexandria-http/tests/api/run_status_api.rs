@@ -74,15 +74,16 @@ async fn given_a_started_run_when_polled_to_completion_then_it_reports_complete_
 
     let index_req = Request::builder()
         .method("POST")
-        .uri("/v1/index")
+        .uri("/v1/libraries")
         .header("authorization", format!("Bearer {TEST_TOKEN}"))
         .header("content-type", "application/json")
         .body(Body::from(
-            serde_json::json!({ "root": lib.path().to_str().unwrap() }).to_string(),
+            serde_json::json!({ "name": "Library", "rootPath": lib.path().to_str().unwrap() })
+                .to_string(),
         ))
         .unwrap();
     let index_resp = router.clone().oneshot(index_req).await.expect("index");
-    assert_eq!(index_resp.status(), StatusCode::ACCEPTED);
+    assert_eq!(index_resp.status(), StatusCode::CREATED);
     wait_for_files(&test.pool, 2).await;
 
     write_file(&lib, "a.txt", b"text-v2-CHANGED");

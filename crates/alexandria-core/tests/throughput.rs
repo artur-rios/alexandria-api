@@ -55,7 +55,6 @@ use alexandria_core::catalog::commands::index::IndexHandler;
 use alexandria_core::catalog::document_tags::PdfEpubMetadataReader;
 use alexandria_core::catalog::fs::StdFilesystem;
 use alexandria_core::catalog::image_tags::ExifImageMetadataReader;
-use alexandria_core::catalog::index_scope::IndexScope;
 use alexandria_core::catalog::queries::browse::{BrowseFilesHandler, FileFilter};
 use alexandria_core::catalog::repos::SqliteCatalogRepository;
 use alexandria_core::catalog::run_registry::RunRegistry;
@@ -395,11 +394,7 @@ async fn measure(format: Format, count: usize, concurrency: u32) -> (f64, f64) {
 
     let started = Instant::now();
     let outcome = handler
-        .execute(
-            lib.path().to_str().expect("utf-8 lib path"),
-            Uuid::new_v4(),
-            &IndexScope::all(),
-        )
+        .execute(lib.path().to_str().expect("utf-8 lib path"), Uuid::new_v4())
         .await
         .expect("index run");
     let elapsed = started.elapsed();
@@ -435,11 +430,7 @@ async fn measure_rate(count: usize, bytes: usize) -> f64 {
 
     let started = Instant::now();
     let outcome = handler
-        .execute(
-            lib.path().to_str().expect("utf-8 lib path"),
-            Uuid::new_v4(),
-            &IndexScope::all(),
-        )
+        .execute(lib.path().to_str().expect("utf-8 lib path"), Uuid::new_v4())
         .await
         .expect("index run");
     let elapsed = started.elapsed();
@@ -511,11 +502,7 @@ async fn given_a_generated_library_when_indexed_then_throughput_is_measured() {
     // Fixture generation is outside the measurement; only the run is timed.
     let started = Instant::now();
     let outcome = handler
-        .execute(
-            lib.path().to_str().expect("utf-8 lib path"),
-            Uuid::new_v4(),
-            &IndexScope::all(),
-        )
+        .execute(lib.path().to_str().expect("utf-8 lib path"), Uuid::new_v4())
         .await
         .expect("index run");
     let elapsed = started.elapsed();
@@ -589,9 +576,7 @@ async fn given_an_index_run_in_flight_when_reads_are_issued_then_they_are_not_bl
 
     let done = indexing.clone();
     let index_task = tokio::spawn(async move {
-        let outcome = handler
-            .execute(&root, Uuid::new_v4(), &IndexScope::all())
-            .await;
+        let outcome = handler.execute(&root, Uuid::new_v4()).await;
         done.store(false, Ordering::SeqCst);
         outcome
     });

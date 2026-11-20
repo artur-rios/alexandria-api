@@ -13,16 +13,20 @@ use crate::common::{
     wait_for_run_terminal,
 };
 
+/// Add `root` as a library, which starts its first index run: the only way
+/// files enter the catalog.
 fn index_request(root: &str) -> Request<Body> {
     Request::builder()
         .method("POST")
-        .uri("/v1/index")
+        .uri("/v1/libraries")
         .header(
             "authorization",
             format!("Bearer {}", common::TEST_TOKEN).as_str(),
         )
         .header("content-type", "application/json")
-        .body(Body::from(json!({ "root": root }).to_string()))
+        .body(Body::from(
+            json!({ "name": "Library", "rootPath": root }).to_string(),
+        ))
         .unwrap()
 }
 
@@ -39,7 +43,7 @@ fn refresh_request() -> Request<Body> {
 }
 
 #[tokio::test]
-async fn given_supported_files_when_index_posted_then_returns_202_with_run_id() {
+async fn given_supported_files_when_library_posted_then_returns_202_with_run_id() {
     let lib = tempdir().unwrap();
     common::write_file(&lib, "clip.mp4", b"video bytes");
     common::write_file(&lib, "notes.md", b"# title\n");
@@ -52,7 +56,7 @@ async fn given_supported_files_when_index_posted_then_returns_202_with_run_id() 
         .await
         .expect("one-shot");
 
-    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    assert_eq!(response.status(), StatusCode::CREATED);
 
     let bytes = to_bytes(response.into_body(), usize::MAX)
         .await
@@ -96,16 +100,31 @@ async fn given_indexed_path_when_reindex_posted_then_existing_path_skipped_no_du
         .oneshot(index_request(lib.path().to_str().unwrap()))
         .await
         .expect("one-shot");
-    assert_eq!(first.status(), StatusCode::ACCEPTED);
-    let first_run = run_id_of(first).await;
+    assert_eq!(first.status(), StatusCode::CREATED);
+    let first: Value =
+        serde_json::from_slice(&to_bytes(first.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let first_run = first["runId"].as_str().expect("runId").to_string();
     let run = wait_for_run_terminal(&test.services, &first_run, common::TEST_TOKEN).await;
     assert_eq!(run["status"], "complete");
     assert_eq!(run["indexed"], 1);
 
-    // A second index run over the same root must not duplicate the path.
+    // A second index run of the same library must not duplicate the path.
     let router2 = app(Settings::default(), test.services.clone());
     let second = router2
-        .oneshot(index_request(lib.path().to_str().unwrap()))
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/v1/libraries/{}/index",
+                    first["uuid"].as_str().expect("uuid")
+                ))
+                .header(
+                    "authorization",
+                    format!("Bearer {}", common::TEST_TOKEN).as_str(),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .expect("one-shot");
     assert_eq!(second.status(), StatusCode::ACCEPTED);
@@ -127,7 +146,7 @@ async fn given_indexed_path_when_reindex_posted_then_existing_path_skipped_no_du
 }
 
 #[tokio::test]
-async fn given_missing_root_when_index_posted_then_returns_400() {
+async fn given_missing_root_when_library_posted_then_returns_400() {
     let test = test_app().await;
     let router = app(Settings::default(), test.services);
 
@@ -143,7 +162,7 @@ async fn given_missing_root_when_index_posted_then_returns_400() {
 /// transport maps its `InvalidInput` to 400, so the constraint is observable
 /// on the surface that made `GET /v1/files/{uuid}/stream` reachable.
 #[tokio::test]
-async fn given_root_outside_configured_library_root_when_index_posted_then_returns_400() {
+async fn given_root_outside_configured_library_root_when_library_posted_then_returns_400() {
     // Arrange
     let parent = tempdir().unwrap();
     let library = parent.path().join("library");
@@ -166,7 +185,7 @@ async fn given_root_outside_configured_library_root_when_index_posted_then_retur
 }
 
 #[tokio::test]
-async fn given_no_bearer_when_index_posted_then_returns_401() {
+async fn given_no_bearer_when_library_posted_then_returns_401() {
     let lib = tempdir().unwrap();
 
     let test = test_app().await;
@@ -174,10 +193,10 @@ async fn given_no_bearer_when_index_posted_then_returns_401() {
 
     let request = Request::builder()
         .method("POST")
-        .uri("/v1/index")
+        .uri("/v1/libraries")
         .header("content-type", "application/json")
         .body(Body::from(
-            json!({ "root": lib.path().to_str().unwrap() }).to_string(),
+            json!({ "name": "Library", "rootPath": lib.path().to_str().unwrap() }).to_string(),
         ))
         .unwrap();
 
@@ -2236,65 +2255,10 @@ async fn given_non_boolean_purge_on_disk_query_when_delete_then_400_with_error_e
     assert!(body["error"].as_str().is_some(), "error envelope present");
 }
 
-/// `POST /v1/index` with a scope (issue #122): the `types` array names the
-/// file types the run records, spelled the way `FileType` reads back.
-fn index_request_with_types(root: &str, types: &[&str]) -> Request<Body> {
-    Request::builder()
-        .method("POST")
-        .uri("/v1/index")
-        .header(
-            "authorization",
-            format!("Bearer {}", common::TEST_TOKEN).as_str(),
-        )
-        .header("content-type", "application/json")
-        .body(Body::from(
-            json!({ "root": root, "types": types }).to_string(),
-        ))
-        .unwrap()
-}
-
-/// The owner's symptom over HTTP: a folder of notes whose picture would
-/// otherwise make it an image library too.
-#[tokio::test]
-async fn given_a_text_scope_when_index_posted_then_only_the_text_is_recorded() {
-    let lib = tempdir().unwrap();
-    common::write_file(&lib, "memo.txt", b"text bytes");
-    common::write_file(&lib, "cover.png", b"image bytes");
-
-    let test = test_app().await;
-    let router = app(Settings::default(), test.services.clone());
-
-    let response = router
-        .oneshot(index_request_with_types(
-            lib.path().to_str().unwrap(),
-            &["text"],
-        ))
-        .await
-        .expect("one-shot");
-    assert_eq!(response.status(), StatusCode::ACCEPTED);
-    let started: Value =
-        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
-    let run_id = started["runId"].as_str().expect("runId").to_string();
-
-    // The run has to be over before the absence of a second row means
-    // anything — until then it only means the walk has not reached it yet.
-    let run = wait_for_run_terminal(&test.services, &run_id, common::TEST_TOKEN).await;
-    assert_eq!(run["status"], "complete");
-    assert_eq!(run["skipped"], 1, "the picture was skipped, not failed");
-    assert_eq!(run["failed"], 0);
-
-    let rows = file_rows(&test.pool).await;
-    assert_eq!(
-        rows.iter().map(|r| r.1.as_str()).collect::<Vec<_>>(),
-        vec!["memo.txt"],
-        "the picture is out of scope and must not be catalogued"
-    );
-}
-
 /// An absent `types` is every type — what every client predating the field
 /// sends, and what `index_request` above still sends.
 #[tokio::test]
-async fn given_no_types_when_index_posted_then_every_type_is_recorded() {
+async fn given_no_types_when_library_posted_then_every_type_is_recorded() {
     let lib = tempdir().unwrap();
     common::write_file(&lib, "memo.txt", b"text bytes");
     common::write_file(&lib, "cover.png", b"image bytes");
@@ -2306,123 +2270,48 @@ async fn given_no_types_when_index_posted_then_every_type_is_recorded() {
         .oneshot(index_request(lib.path().to_str().unwrap()))
         .await
         .expect("one-shot");
-    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    assert_eq!(response.status(), StatusCode::CREATED);
 
     wait_for_files(&test.pool, 2).await;
     let rows = file_rows(&test.pool).await;
     assert_eq!(rows.len(), 2);
 }
 
-/// An empty `types` array is the same absence an omitted one is — never
-/// "index nothing".
+/// Files enter the catalog only through a library now: the free-form index
+/// route is gone rather than left answering something.
 #[tokio::test]
-async fn given_an_empty_types_array_when_index_posted_then_every_type_is_recorded() {
-    let lib = tempdir().unwrap();
-    common::write_file(&lib, "memo.txt", b"text bytes");
-    common::write_file(&lib, "cover.png", b"image bytes");
+async fn given_the_old_index_route_when_posted_then_it_is_not_found() {
+    let harness = crate::common::test_app().await;
+    let app = alexandria_http::app(
+        alexandria_core::config::Settings::default(),
+        harness.services.clone(),
+    );
+    let root = harness.folder("/library/course");
 
-    let test = test_app().await;
-    let router = app(Settings::default(), test.services);
-
-    let response = router
-        .oneshot(index_request_with_types(lib.path().to_str().unwrap(), &[]))
+    let response = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/v1/index")
+                .header(
+                    "authorization",
+                    format!("Bearer {}", crate::common::TEST_TOKEN),
+                )
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({ "root": root }).to_string(),
+                ))
+                .unwrap(),
+        )
         .await
-        .expect("one-shot");
-    assert_eq!(response.status(), StatusCode::ACCEPTED);
+        .expect("post");
 
-    wait_for_files(&test.pool, 2).await;
-    let rows = file_rows(&test.pool).await;
-    assert_eq!(rows.len(), 2);
-}
-
-/// Unlike an unrecognised `priority`, an unrecognised type is refused: the
-/// only fallback available is "every type", which is the opposite of what the
-/// caller asked for. The run must not start either — a rejected request
-/// leaves no record behind (FR-FC-27).
-#[tokio::test]
-async fn given_an_unknown_type_when_index_posted_then_400_and_no_run_started() {
-    let lib = tempdir().unwrap();
-    common::write_file(&lib, "memo.txt", b"text bytes");
-
-    let test = test_app().await;
-    let router = app(Settings::default(), test.services);
-
-    let response = router
-        .oneshot(index_request_with_types(
-            lib.path().to_str().unwrap(),
-            &["sculpture"],
-        ))
-        .await
-        .expect("one-shot");
-
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    let body: Value =
-        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
-    assert!(body["error"].as_str().is_some(), "error envelope present");
-
-    let runs: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM catalog_runs")
-        .fetch_one(&test.pool)
-        .await
-        .expect("count");
-    assert_eq!(runs.0, 0, "a rejected start must not open a run record");
-}
-
-/// The removed `audio` type is refused like any unknown one: a run scoped to
-/// it would have nothing to cover, and widening it to every type is the
-/// opposite of what was asked.
-#[tokio::test]
-async fn given_the_removed_audio_type_when_index_posted_then_400_and_no_run_started() {
-    let lib = tempdir().unwrap();
-    common::write_file(&lib, "memo.txt", b"text bytes");
-
-    let test = test_app().await;
-    let router = app(Settings::default(), test.services);
-
-    let response = router
-        .oneshot(index_request_with_types(
-            lib.path().to_str().unwrap(),
-            &["audio"],
-        ))
-        .await
-        .expect("one-shot");
-
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    let runs: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM catalog_runs")
-        .fetch_one(&test.pool)
-        .await
-        .expect("count");
-    assert_eq!(runs.0, 0, "a rejected start must not open a run record");
-}
-
-/// The HTTP twin of the FFI's
-/// `given_a_bad_token_and_an_unknown_type_when_ffi_index_start_then_unauthorized`:
-/// with both faults present, the caller learns only that it is
-/// unauthenticated. `require_auth` is a route layer, so it runs before the
-/// body is extracted at all and the unspellable scope is never reached — the
-/// FFI gates by hand to reach the same answer (FR-FC-24 / NFR-09).
-#[tokio::test]
-async fn given_no_bearer_and_an_unknown_type_when_index_posted_then_401_not_400() {
-    let lib = tempdir().unwrap();
-    common::write_file(&lib, "memo.txt", b"text bytes");
-
-    let test = test_app().await;
-    let request = Request::builder()
-        .method("POST")
-        .uri("/v1/index")
-        .header("content-type", "application/json")
-        .body(Body::from(
-            json!({ "root": lib.path().to_str().unwrap(), "types": ["sculpture"] }).to_string(),
-        ))
-        .unwrap();
-
-    let response = app(Settings::default(), test.services)
-        .oneshot(request)
-        .await
-        .expect("one-shot");
-
-    assert_eq!(
-        response.status(),
-        StatusCode::UNAUTHORIZED,
-        "an unauthenticated caller must not learn that its scope failed to parse"
+    assert!(
+        matches!(
+            response.status(),
+            axum::http::StatusCode::NOT_FOUND | axum::http::StatusCode::METHOD_NOT_ALLOWED
+        ),
+        "{}",
+        response.status()
     );
 }

@@ -26,16 +26,20 @@ fn settings_with_cache_dir(cache_dir: &std::path::Path) -> Settings {
     settings
 }
 
+/// Add `root` as a library, which starts its first index run: the only way
+/// files enter the catalog.
 fn index_request(root: &str) -> Request<Body> {
     Request::builder()
         .method("POST")
-        .uri("/v1/index")
+        .uri("/v1/libraries")
         .header(
             "authorization",
             format!("Bearer {}", common::TEST_TOKEN).as_str(),
         )
         .header("content-type", "application/json")
-        .body(Body::from(serde_json::json!({ "root": root }).to_string()))
+        .body(Body::from(
+            serde_json::json!({ "name": "Library", "rootPath": root }).to_string(),
+        ))
         .unwrap()
 }
 

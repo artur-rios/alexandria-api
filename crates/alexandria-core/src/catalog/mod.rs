@@ -6,7 +6,6 @@ pub mod document_tags;
 pub mod extraction;
 pub mod fs;
 pub mod image_tags;
-pub mod index_scope;
 pub mod library_root;
 pub mod model;
 pub mod queries;

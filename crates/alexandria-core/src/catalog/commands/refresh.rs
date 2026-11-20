@@ -181,7 +181,6 @@ where
                 None,
                 started_at,
                 concurrency,
-                None,
                 // Nor a library: it re-checks every library at once.
                 None,
             )

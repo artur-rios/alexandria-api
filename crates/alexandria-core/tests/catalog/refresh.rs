@@ -1214,7 +1214,6 @@ async fn given_a_completed_refresh_when_execute_then_the_final_progress_is_flush
         now(),
         TEST_CONCURRENCY,
         None,
-        None,
     )
     .await
     .unwrap();
@@ -1259,7 +1258,6 @@ async fn given_a_progress_flush_that_fails_when_execute_then_the_refresh_still_c
         now(),
         TEST_CONCURRENCY,
         None,
-        None,
     )
     .await
     .unwrap();
@@ -1301,7 +1299,6 @@ async fn given_a_refresh_walk_in_flight_when_paused_then_it_stops_with_paths_unp
         None,
         now(),
         TEST_CONCURRENCY,
-        None,
         None,
     )
     .await
@@ -1394,7 +1391,6 @@ async fn given_a_run_resumed_before_a_refreshs_pause_lands_when_it_lands_then_th
         now(),
         TEST_CONCURRENCY,
         None,
-        None,
     )
     .await
     .unwrap();
@@ -1464,7 +1460,6 @@ async fn given_a_run_resumed_before_a_refreshs_cancel_lands_when_it_lands_then_i
         None,
         now(),
         TEST_CONCURRENCY,
-        None,
         None,
     )
     .await

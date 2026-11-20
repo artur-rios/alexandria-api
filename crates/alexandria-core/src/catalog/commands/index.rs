@@ -12,7 +12,6 @@ use crate::catalog::document_tags::DocumentMetadataReader;
 use crate::catalog::extraction::{MetadataExtractor, MetadataWrite};
 use crate::catalog::fs::{FileEntry, Filesystem};
 use crate::catalog::image_tags::ImageMetadataReader;
-use crate::catalog::index_scope::IndexScope;
 use crate::catalog::library_root::LibraryRoot;
 use crate::catalog::model::{FileType, NewFile, METADATA_VERSION};
 use crate::catalog::repos::CatalogRepository;
@@ -23,22 +22,17 @@ use crate::errors::DomainError;
 use crate::libraries::model::Library;
 use crate::retry::{retry_on_busy, BUSY_ATTEMPTS};
 
+/// One index run of one library: a library is the only thing a run walks.
 #[derive(Debug, Clone)]
 pub struct IndexRequest {
-    pub root: String,
-    /// How hard this run should push (FR-FC-08). See `RunPriority`.
-    pub priority: RunPriority,
-    /// The file types this run records. Default is every supported type, so a
-    /// caller that says nothing indexes what it always did.
-    ///
-    /// `start` writes it to the run's row beside the root, and a resume reads
-    /// it back (`RunResumed::scope`), so a run paused mid-library continues
-    /// under the scope it began with rather than widening to every type.
-    pub scope: IndexScope,
     /// The library this run walks. Recorded on the run (FR-FC-42), so its
     /// status can name the library and a second unfinished run of the same
     /// library can be refused.
-    pub library_uuid: Option<Uuid>,
+    pub library_uuid: Uuid,
+    /// The library's folder, which is what the run walks.
+    pub root: String,
+    /// How hard this run should push (FR-FC-08). See `RunPriority`.
+    pub priority: RunPriority,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -115,10 +109,9 @@ where
     ) -> Result<IndexStarted, DomainError> {
         self.start(
             IndexRequest {
+                library_uuid: library.uuid,
                 root: library.root_path.clone(),
                 priority,
-                scope: IndexScope::all(),
-                library_uuid: Some(library.uuid),
             },
             token,
         )
@@ -331,11 +324,6 @@ where
         let run_id = Uuid::new_v4();
         let started_at = self.clock.now();
         let concurrency = self.concurrency_for(request.priority) as u32;
-        // The scope is recorded here, beside the root, for the reason the
-        // root is: both are what the run was told to cover, and a resume
-        // that could not read the scope back would walk the very types the
-        // owner excluded (FR-FC-33).
-        let scope = request.scope.to_wire();
         retry_on_busy(BUSY_ATTEMPTS, || {
             self.runs.start(
                 run_id,
@@ -343,8 +331,7 @@ where
                 Some(&request.root),
                 started_at,
                 concurrency,
-                scope.as_deref(),
-                request.library_uuid,
+                Some(request.library_uuid),
             )
         })
         .await?;
@@ -367,16 +354,9 @@ where
     /// `warn`, and the walk continues. One locked file must not abandon the
     /// rest of the library. Only a failure to list the root at all aborts.
     ///
-    /// `scope` is an argument for the same reason `root` is: both say what
-    /// this walk is to cover, and both are handed in by whoever spawned it —
-    /// `IndexRequest::scope` for a fresh run, and `RunResumed::scope`, read
-    /// back off the run's row, for a resumed one.
-    pub async fn execute(
-        &self,
-        root: &str,
-        run_id: Uuid,
-        scope: &IndexScope,
-    ) -> Result<IndexOutcome, DomainError> {
+    /// Every file Alexandria can read is recorded: a library is the folder as
+    /// it is, so there is no per-run type filter.
+    pub async fn execute(&self, root: &str, run_id: Uuid) -> Result<IndexOutcome, DomainError> {
         let now = self.clock.now();
         // Read from the run's own row rather than carried in as a parameter
         // or held in a field: `IndexHandler` is long-lived (built once at
@@ -560,15 +540,6 @@ where
                 let Some(file_type) = classify_by_extension(&entry.name) else {
                     return EntryOutcome::Skipped;
                 };
-                // Filtered after classification because the type is what is
-                // being filtered on, and only the classifier knows it. The
-                // outcome is the same `Skipped` an unsupported extension
-                // takes: in both cases the run saw the file and chose not to
-                // record it, and a second counter would split one fact across
-                // two numbers every reader would then have to add up.
-                if !scope.includes(file_type) {
-                    return EntryOutcome::Skipped;
-                }
                 let path = entry.path.clone();
                 match self.index_entry(entry, file_type, now).await {
                     Ok(outcome) => outcome,

@@ -8,7 +8,6 @@ use serde::Deserialize;
 use uuid::Uuid;
 
 use alexandria_core::catalog::commands::index::IndexStarted;
-use alexandria_core::catalog::index_scope::IndexScope;
 use alexandria_core::catalog::runs::RunPriority;
 use alexandria_core::libraries::model::{Library, LibraryListing, RegisteredLibrary};
 
@@ -26,7 +25,7 @@ fn spawn_walk(state: &AppState, library: &Library, run_id: uuid::Uuid) {
         // `execute` writes the run's `failed` record on its own error path
         // (UC-42), so a failure here is recorded, not lost; this line is for
         // the operator.
-        if let Err(err) = handler.execute(&root, run_id, &IndexScope::all()).await {
+        if let Err(err) = handler.execute(&root, run_id).await {
             tracing::error!(%run_id, error = %err, "index run aborted");
         }
     });

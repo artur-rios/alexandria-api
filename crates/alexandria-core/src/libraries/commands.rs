@@ -123,10 +123,6 @@ where
             })
             .await?;
 
-        // Claimed for files indexed before this library existed. Removed with
-        // free-form indexing, after which nothing outside a library exists.
-        self.repo.claim_files(library.uuid).await?;
-
         match self
             .starter
             .start_library_run(&library, priority, token)
@@ -292,12 +288,6 @@ where
         }
 
         let (library, _moved) = self.repo.move_root(uuid, new_root).await?;
-
-        // Claimed afterwards as well as moved: the destination may already
-        // hold files the owner indexed before correcting the record, and they
-        // belong to this library now for the same reason registering claims
-        // what is already there.
-        self.repo.claim_files(uuid).await?;
 
         Ok(library)
     }

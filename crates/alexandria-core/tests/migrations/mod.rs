@@ -653,8 +653,6 @@ async fn given_a_database_with_music_when_migrated_then_music_is_gone_and_everyt
 #[tokio::test]
 async fn given_a_migrated_database_with_mixed_scope_runs_when_runs_are_listed_then_none_is_corrupt()
 {
-    use alexandria_core::catalog::index_scope::IndexScope;
-    use alexandria_core::catalog::model::FileType;
     use alexandria_core::catalog::runs::{CatalogRunRepository, SqliteCatalogRunRepository};
     use uuid::Uuid;
 
@@ -664,39 +662,28 @@ async fn given_a_migrated_database_with_mixed_scope_runs_when_runs_are_listed_th
     run_migrations(&pool).await.expect("migrate to head");
 
     let runs = SqliteCatalogRunRepository::new(pool.clone());
-    let audio_image = Uuid::parse_str(RUN_AUDIO_IMAGE).expect("uuid");
-    let image_audio_video = Uuid::parse_str(RUN_IMAGE_AUDIO_VIDEO).expect("uuid");
-    let image_audio = Uuid::parse_str(RUN_IMAGE_AUDIO).expect("uuid");
-
-    let first = runs
-        .get(audio_image)
-        .await
-        .expect("an 'audio,image' run reads back")
-        .expect("and still exists");
+    // The column is no longer read into a run (a library is walked whole),
+    // so what migration 25 left in it is read straight off the rows.
+    let scope = |id: &'static str| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, Option<String>>("SELECT scope FROM catalog_runs WHERE id = ?")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .expect("the run still exists")
+        }
+    };
+    assert_eq!(scope(RUN_AUDIO_IMAGE).await.as_deref(), Some("image"));
     assert_eq!(
-        first.scope,
-        IndexScope::parse([FileType::Image.as_str()]).expect("scope")
+        scope(RUN_IMAGE_AUDIO_VIDEO).await.as_deref(),
+        Some("image,video")
     );
-
-    let second = runs
-        .get(image_audio_video)
-        .await
-        .expect("an 'image,audio,video' run reads back")
-        .expect("and still exists");
-    assert_eq!(
-        second.scope,
-        IndexScope::parse([FileType::Image.as_str(), FileType::Video.as_str()]).expect("scope")
-    );
-
-    let third = runs
-        .get(image_audio)
-        .await
-        .expect("an 'image,audio' run reads back")
-        .expect("and still exists");
-    assert_eq!(
-        third.scope,
-        IndexScope::parse([FileType::Image.as_str()]).expect("scope")
-    );
+    assert_eq!(scope(RUN_IMAGE_AUDIO).await.as_deref(), Some("image"));
+    for id in [RUN_AUDIO_IMAGE, RUN_IMAGE_AUDIO_VIDEO, RUN_IMAGE_AUDIO] {
+        let id = Uuid::parse_str(id).expect("uuid");
+        assert!(runs.get(id).await.expect("reads back").is_some());
+    }
 
     // The audio-only run is gone rather than widened to every type.
     let audio_only = Uuid::parse_str(RUN_AUDIO_ONLY).expect("uuid");
@@ -706,7 +693,13 @@ async fn given_a_migrated_database_with_mixed_scope_runs_when_runs_are_listed_th
     // row through the same parser and must not trip on any of them.
     let active = runs.list_active().await.expect("no run is corrupt");
     let active_ids: Vec<Uuid> = active.iter().map(|run| run.id).collect();
-    assert_eq!(active_ids, vec![image_audio_video, audio_image]);
+    assert_eq!(
+        active_ids,
+        vec![
+            Uuid::parse_str(RUN_IMAGE_AUDIO_VIDEO).expect("uuid"),
+            Uuid::parse_str(RUN_AUDIO_IMAGE).expect("uuid"),
+        ]
+    );
 
     pool.close().await;
 }

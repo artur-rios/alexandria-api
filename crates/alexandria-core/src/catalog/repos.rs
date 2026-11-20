@@ -5,7 +5,7 @@ use sqlx::sqlite::SqlitePool;
 use uuid::Uuid;
 
 use crate::catalog::model::{
-    File, FileState, FileType, FileView, FormatKind, LibraryScope, MediaKind, NewFile, StateFilter,
+    File, FileState, FileType, FileView, FormatKind, MediaKind, NewFile, StateFilter,
     SubtypeMetadata,
 };
 use crate::errors::{DomainError, WRITE_TX};
@@ -123,7 +123,7 @@ pub trait CatalogRepository: Send + Sync {
         file_type: Option<FileType>,
         state: StateFilter,
         collection_uuid: Option<Uuid>,
-        scope: LibraryScope,
+        library_uuid: Option<Uuid>,
     ) -> Result<Vec<File>, DomainError>;
 
     /// List files filtered exactly as `list_filtered`, but answering the
@@ -149,7 +149,7 @@ pub trait CatalogRepository: Send + Sync {
         file_type: Option<FileType>,
         state: StateFilter,
         collection_uuid: Option<Uuid>,
-        scope: LibraryScope,
+        library_uuid: Option<Uuid>,
     ) -> Result<Vec<FileView>, DomainError>;
 
     /// The uuid of the library the file `uuid` identifies belongs to, or
@@ -508,15 +508,15 @@ impl SqliteCatalogRepository {
     /// FR-CO-07's real collection filter, when it lands, edits this once
     /// rather than two call sites that happen to agree today.
     ///
-    /// `file_type` and `collection_uuid` only need to be checked for
-    /// presence here — the caller binds their actual values in the same
-    /// order this appends the placeholders (`type = ?` before the
-    /// collection subquery's `?`).
+    /// `file_type`, `collection_uuid` and `library_uuid` only need to be
+    /// checked for presence here — the caller binds their actual values in
+    /// the same order this appends the placeholders (`type = ?`, then the
+    /// collection subquery's `?`, then the library's).
     fn list_filter_where_clause(
         file_type: Option<FileType>,
         state: StateFilter,
         collection_uuid: Option<Uuid>,
-        scope: LibraryScope,
+        library_uuid: Option<Uuid>,
     ) -> String {
         // The filters are enumerated (not user strings), so there is no SQL
         // injection surface here — every value below is still bound as a
@@ -547,21 +547,11 @@ impl SqliteCatalogRepository {
             conj = " AND ";
         }
 
-        // Files in a library are browsed as that library's tree and nowhere
-        // else (libraries design section 3) — unless the caller has asked
-        // for everything the catalog holds.
-        //
-        // Carried by the filter rather than by which function was called,
-        // and defaulting to the exclusion, so that forgetting to say
-        // anything gives the type-panel behaviour rather than leaking a
-        // course into it. What the exclusion must NOT do is hide these files
-        // from callers that are not browsing: this application's search and
-        // its deleted-items review are both built from this listing, and an
-        // unconditional exclusion made a library's files unfindable and a
-        // deleted one unrestorable (FR-FC-38).
-        if matches!(scope, LibraryScope::OutsideLibraries) {
+        // One library's files, for a search or a trash review within it. A
+        // uuid that names no library matches no files, as a collection's does.
+        if library_uuid.is_some() {
             sql.push_str(conj);
-            sql.push_str("library_id IS NULL");
+            sql.push_str("library_id = (SELECT id FROM libraries WHERE uuid = ?)");
         }
 
         sql.push_str(" ORDER BY path");
@@ -1241,7 +1231,7 @@ impl CatalogRepository for SqliteCatalogRepository {
         file_type: Option<FileType>,
         state: StateFilter,
         collection_uuid: Option<Uuid>,
-        scope: LibraryScope,
+        library_uuid: Option<Uuid>,
     ) -> Result<Vec<File>, DomainError> {
         // Build the query dynamically based on which filters are active —
         // see `list_filter_where_clause`.
@@ -1253,7 +1243,7 @@ impl CatalogRepository for SqliteCatalogRepository {
             file_type,
             state,
             collection_uuid,
-            scope,
+            library_uuid,
         ));
 
         // sqlx 0.9 refuses a runtime-built SQL string unless the caller asserts
@@ -1270,6 +1260,10 @@ impl CatalogRepository for SqliteCatalogRepository {
             Some(u) => query.bind(u.to_string()),
             None => query,
         };
+        let query = match library_uuid {
+            Some(u) => query.bind(u.to_string()),
+            None => query,
+        };
 
         let rows = query.fetch_all(&self.pool).await?;
         rows.into_iter().map(parse_file_row).collect()
@@ -1280,7 +1274,7 @@ impl CatalogRepository for SqliteCatalogRepository {
         file_type: Option<FileType>,
         state: StateFilter,
         collection_uuid: Option<Uuid>,
-        scope: LibraryScope,
+        library_uuid: Option<Uuid>,
     ) -> Result<Vec<FileView>, DomainError> {
         // Same filter, built by the same helper `list_filtered` uses, with
         // `id` selected alongside the public columns — the subtype batches
@@ -1298,7 +1292,7 @@ impl CatalogRepository for SqliteCatalogRepository {
             file_type,
             state,
             collection_uuid,
-            scope,
+            library_uuid,
         ));
 
         // See `list_filtered`'s matching comment: `sql` is assembled only
@@ -1309,6 +1303,10 @@ impl CatalogRepository for SqliteCatalogRepository {
             None => query,
         };
         let query = match collection_uuid {
+            Some(u) => query.bind(u.to_string()),
+            None => query,
+        };
+        let query = match library_uuid {
             Some(u) => query.bind(u.to_string()),
             None => query,
         };

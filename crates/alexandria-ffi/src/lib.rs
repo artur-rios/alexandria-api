@@ -8,8 +8,6 @@ use tokio::runtime::{Builder, Runtime};
 
 use alexandria_core::auth::windows_identity::{verify_owner, ProcessWindowsIdentity};
 use alexandria_core::auth::AuthService;
-use alexandria_core::catalog::commands::index::IndexRequest;
-use alexandria_core::catalog::index_scope::IndexScope;
 use alexandria_core::catalog::runs::{RunKind, RunPriority};
 use alexandria_core::config::AuthMode;
 use alexandria_core::config::Settings;
@@ -166,7 +164,7 @@ fn authenticated(services: &Services, token: &str) -> bool {
 ///
 /// Shared with `alexandria_index_resume` (UC-48), which reuses this same
 /// struct shape for a call that is not starting anything new. That reuse
-/// changes what `status` means: from `alexandria_index_start` and
+/// changes what `status` means: from `alexandria_library_index_start` and
 /// `alexandria_index_refresh_start` it is one of the `INDEX_ERR_*`
 /// constants, where `4` is `INDEX_ERR_OTHER`; from `alexandria_index_resume`
 /// it is one of the `RUN_ERR_*` constants, where `4` is `RUN_ERR_NOT_FOUND`
@@ -253,29 +251,6 @@ fn parse_priority(raw: Option<String>) -> RunPriority {
     match raw.as_deref() {
         Some("low") => RunPriority::Low,
         _ => RunPriority::Normal,
-    }
-}
-
-/// Parse a comma-separated list of wire type names into an [`IndexScope`].
-///
-/// NULL and the empty string are the same absence and both mean every type.
-/// At this boundary a client with no scope to send has only those two ways to
-/// say so, and reading either as "index nothing" would turn a missing
-/// argument into a run that does no work at all.
-///
-/// An unrecognised name is rejected, which is the one place this deliberately
-/// parts company with [`parse_priority`]. An unreadable priority has a *safe*
-/// fallback to fall back to; a scope's only candidate is "every type", the
-/// opposite of what a caller asking for a narrower scope wants, and it fails
-/// in the direction of cataloguing exactly the files the owner excluded. The
-/// HTTP body rejects the same name for the same reason (FR-FC-24).
-fn parse_scope(raw: Option<String>) -> Result<IndexScope, DomainError> {
-    match raw {
-        // Through `parse_list` rather than splitting here, so this argument
-        // and `catalog_runs.scope` have exactly one reader of the encoding
-        // between them and cannot drift on what a comma means.
-        Some(list) => IndexScope::parse_list(&list),
-        None => Ok(IndexScope::all()),
     }
 }
 
@@ -429,107 +404,13 @@ fn load_settings() -> Settings {
     Settings::load_or_default(&config_path)
 }
 
-/// Start an asynchronous index scan of `root`. Returns a `IndexStartResult`
-/// with a `run_id` and `status` (parity with HTTP 202 body). The scan runs in
-/// the background on the FFI runtime; read results via the accessor functions.
-///
-/// `priority` is `"low"` or `"normal"` (case-sensitive, matching the HTTP
-/// body's spelling exactly — FR-FC-24). NULL or any other string is treated
-/// as `"normal"`: a client that cannot spell the value gets the safe default
-/// rather than a rejected call.
-///
-/// `types` is the run's scope: a comma-separated list of the wire names
-/// `FileType` reads back (`"video,image"`), the same words the HTTP body's
-/// `types` array carries (FR-FC-24). NULL and the empty string are the same
-/// absence and mean every type — see [`parse_scope`] for why an unrecognised
-/// name is `INDEX_ERR_INVALID_INPUT` here where an unrecognised priority is
-/// not.
-#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
-#[no_mangle]
-pub extern "C" fn alexandria_index_start(
-    root: *const c_char,
-    token: *const c_char,
-    priority: *const c_char,
-    types: *const c_char,
-) -> IndexStartResult {
-    ffi_guard(IndexStartResult::err(INDEX_ERR_OTHER), || {
-        let services = match locked_services() {
-            Some(s) => s,
-            None => return IndexStartResult::err(INDEX_ERR_NOT_INITIALIZED),
-        };
-        let token = cstr_lossy(token).unwrap_or_default();
-        // Denied before any argument is looked at (see `authenticated`):
-        // `start` authenticates, but only after its arguments are parsed, and
-        // the HTTP surface's `require_auth` is a route layer that runs before
-        // its extractors. Without this gate an unauthenticated caller would
-        // learn from the FFI that its `root` was missing or its `types` did not
-        // parse, where HTTP told it only `401` (FR-FC-24 / NFR-09).
-        if !authenticated(&services, &token) {
-            return IndexStartResult::err(INDEX_ERR_UNAUTHORIZED);
-        }
-        // Strict UTF-8, unlike the other arguments: a root is a path, and a
-        // lossily decoded one names a different folder — one whose name has
-        // U+FFFD where the bytes that did not decode were.
-        let root = match cstr_utf8(root) {
-            Some(r) => r,
-            None => return IndexStartResult::err(INDEX_ERR_INVALID_INPUT),
-        };
-        let priority = parse_priority(cstr_lossy(priority));
-        // Parsed before `start`, so a misspelt type is refused without a run
-        // record being opened — the same order the root check keeps (FR-FC-27).
-        let scope = match parse_scope(cstr_lossy(types)) {
-            Ok(scope) => scope,
-            Err(_) => return IndexStartResult::err(INDEX_ERR_INVALID_INPUT),
-        };
-        let rt = runtime();
-
-        let started = rt.block_on(async {
-            services
-                .index_handler
-                .start(
-                    IndexRequest {
-                        root: root.clone(),
-                        priority,
-                        scope: scope.clone(),
-                        library_uuid: None,
-                    },
-                    &token,
-                )
-                .await
-        });
-
-        match started {
-            Ok(s) => {
-                let run_id = s.run_id;
-                let handler = services.index_handler.clone();
-                rt.spawn(async move {
-                    // Per-file failures are counted inside `execute`; an `Err`
-                    // here means the run could not start at all. `execute` has
-                    // already written the `failed` run record on its own error
-                    // path (UC-48), so the failure is recorded, not lost. This
-                    // log line is for the operator.
-                    if let Err(err) = handler.execute(&root, run_id, &scope).await {
-                        tracing::error!(%run_id, error = %err, "index run aborted");
-                    }
-                });
-                IndexStartResult::ok(&s.run_id.to_string())
-            }
-            Err(err) => match err {
-                DomainError::InvalidInput(_) => IndexStartResult::err(INDEX_ERR_INVALID_INPUT),
-                DomainError::Unauthorized => IndexStartResult::err(INDEX_ERR_UNAUTHORIZED),
-                _ => IndexStartResult::err(INDEX_ERR_OTHER),
-            },
-        }
-    })
-}
-
 /// Start an asynchronous re-index/refresh of every cataloged path (UC-02).
 /// Takes only a token (no root — refresh touches everything cataloged) and
 /// returns a `IndexStartResult` with a `run_id` and `status` (parity with the
 /// HTTP `POST /v1/index/refresh` 202 body). The refresh runs in the background
 /// on the FFI runtime; read results via the accessor functions.
 ///
-/// `priority` is parsed exactly as `alexandria_index_start`'s is — see that
+/// `priority` is parsed exactly as `alexandria_library_index_start`'s is — see that
 /// function's doc comment for the accepted spellings and the NULL/garbage
 /// fallback.
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
@@ -769,7 +650,6 @@ struct FilesListFilter {
     file_type: Option<String>,
     state: Option<String>,
     collection_uuid: Option<String>,
-    include_libraries: bool,
 }
 
 impl FilesListFilter {
@@ -795,16 +675,6 @@ impl FilesListFilter {
                 .get("collectionUuid")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string()),
-            // Only a real `true` reaches into libraries, and both the JSON
-            // boolean and the string HTTP takes are accepted so a caller
-            // built against either surface says it the same way
-            // (FR-FC-24). Anything else leaves them excluded, which is the
-            // direction a mistake should fall.
-            include_libraries: match obj.get("includeLibraries") {
-                Some(serde_json::Value::Bool(value)) => *value,
-                Some(serde_json::Value::String(value)) => value == "true",
-                _ => false,
-            },
         })
     }
 }
@@ -812,10 +682,8 @@ impl FilesListFilter {
 /// List/query files filtered by type and lifecycle state (UC-03 / FR-FC-12).
 ///
 /// `json_filters` is a JSON string `{"type":"video","state":"all"}` (empty
-/// string or NULL for defaults). `{"includeLibraries":true}` reaches into
-/// libraries, which is what a caller's search and deleted-items review need
-/// (libraries design / FR-FC-38); without it a library's files are absent,
-/// as they are from the type panels. The function deserializes it, calls the same
+/// string or NULL for defaults), answered across every library. The
+/// function deserializes it, calls the same
 /// `BrowseFilesHandler` the HTTP route uses, and on success serializes the
 /// returned `Vec<FileView>` back to a JSON array — each element the same
 /// `{"file": …, "metadata": …, …}` shape `alexandria_file_get_by_uuid`
@@ -876,9 +744,6 @@ pub extern "C" fn alexandria_files_list(
                 Err(_) => return FileJsonResult::err(FILE_ERR_INVALID_INPUT),
             };
             filter = filter.with_collection(collection_uuid);
-        }
-        if parsed.include_libraries {
-            filter = filter.everywhere();
         }
 
         let result =
@@ -4167,7 +4032,7 @@ fn map_run_err(err: DomainError) -> RunJsonResult {
 }
 
 /// Report an index or re-index run's status and outcome (UC-42 / FR-FC-28).
-/// `run_id` is the id `alexandria_index_start` or
+/// `run_id` is the id `alexandria_library_index_start` or
 /// `alexandria_index_refresh_start` returned. On success `json` carries the
 /// same body the HTTP `GET /v1/index/runs/{runId}` route returns (FR-FC-24).
 ///
@@ -4215,7 +4080,7 @@ pub extern "C" fn alexandria_index_run_status_json(
 }
 
 /// The files a run could not record, oldest first (FR-FC-42). `run_id` is
-/// the id `alexandria_index_start` or `alexandria_index_refresh_start`
+/// the id `alexandria_library_index_start` or `alexandria_index_refresh_start`
 /// returned. On success `json` carries the same array the HTTP
 /// `GET /v1/index/runs/{runId}/failures` route returns (FR-FC-24).
 ///
@@ -4274,7 +4139,7 @@ pub extern "C" fn alexandria_index_run_failures_json(
 }
 
 /// Pause a running index or re-index run where it stands, leaving it
-/// resumable (UC-48 / FR-FC-32). `run_id` is the id `alexandria_index_start`
+/// resumable (UC-48 / FR-FC-32). `run_id` is the id `alexandria_library_index_start`
 /// or `alexandria_index_refresh_start` returned; `token` is the bearer auth
 /// token. Calls the same `RunControlHandler::pause` the HTTP route (Task 12)
 /// calls.
@@ -4319,7 +4184,7 @@ pub extern "C" fn alexandria_index_pause(run_id: *const c_char, token: *const c_
 
 /// Abandon a running or paused index or re-index run (UC-48 / FR-FC-34).
 /// Terminal — a cancelled run is never resumed. `run_id` is the id
-/// `alexandria_index_start` or `alexandria_index_refresh_start` returned;
+/// `alexandria_library_index_start` or `alexandria_index_refresh_start` returned;
 /// `token` is the bearer auth token. Calls the same
 /// `RunControlHandler::cancel` the HTTP route (Task 12) calls.
 ///
@@ -4362,21 +4227,19 @@ pub extern "C" fn alexandria_index_cancel(run_id: *const c_char, token: *const c
 }
 
 /// Put a paused index or re-index run back to work (UC-48 / FR-FC-33).
-/// `run_id` is the id `alexandria_index_start` or `alexandria_index_refresh_start`
+/// `run_id` is the id `alexandria_library_index_start` or `alexandria_index_refresh_start`
 /// returned; `token` is the bearer auth token. Returns the *same* `run_id` on
 /// success — a resume does not mint a fresh run, it continues the one it was
-/// given — wrapped in the same `IndexStartResult` `alexandria_index_start`
+/// given — wrapped in the same `IndexStartResult` `alexandria_library_index_start`
 /// returns (parity of shape, not of meaning: `status` here is a `RUN_ERR_*`
 /// code, because resume is part of run control, not of starting a fresh run).
 ///
 /// `RunControlHandler::resume` only records the state transition; it does not
 /// walk anything. Spawning the walk is this function's job, exactly as
-/// `alexandria_index_start` spawns its own — the handler is kept free of the
+/// `alexandria_library_index_start` spawns its own — the handler is kept free of the
 /// runtime so `execute` is always spawned by whichever transport owns one.
 /// Which handler gets spawned depends on `RunResumed::kind`: an index run
-/// resumes into `index_handler.execute(&root, run_id, &scope)` — the scope
-/// read back off the run, so a resumed segment covers the file types the run
-/// was started with — a refresh into
+/// resumes into `index_handler.execute(&root, run_id)`, a refresh into
 /// `refresh_handler.execute(run_id)` (a refresh carries no root — it touches
 /// everything cataloged). A resumed index run whose stored `root` is somehow
 /// absent — it should never be, every row `RunKind::Index` writes carries one
@@ -4385,7 +4248,7 @@ pub extern "C" fn alexandria_index_cancel(run_id: *const c_char, token: *const c
 /// actually resumes would have no way to notice.
 ///
 /// `priority` re-paces the run (FR-FC-08 / FR-FC-33): `"low"` or `"normal"`,
-/// the same case-sensitive spelling `alexandria_index_start` accepts. Unlike
+/// the same case-sensitive spelling `alexandria_library_index_start` accepts. Unlike
 /// there, NULL or an unrecognised string does **not** mean `"normal"` — it
 /// means *keep the width this run already has*, which is what every caller
 /// written before this parameter existed was asking for. Passing NULL is
@@ -4454,16 +4317,13 @@ pub extern "C" fn alexandria_index_resume(
                     }
                 };
                 let handler = services.index_handler.clone();
-                // The run's own scope, off its row (FR-FC-01): a resumed segment
-                // walks the file types the run was started with, not every type.
-                let scope = resumed.scope;
                 let spawned_run_id = resumed.run_id;
                 rt.spawn(async move {
-                    // Same shape as `alexandria_index_start`'s own spawn: an
+                    // Same shape as `alexandria_library_index_start`'s own spawn: an
                     // `Err` here means the run could not resume at all;
                     // `execute` has already written its own terminal row on that
                     // path (UC-48), so the failure is recorded, not lost.
-                    if let Err(err) = handler.execute(&root, spawned_run_id, &scope).await {
+                    if let Err(err) = handler.execute(&root, spawned_run_id).await {
                         tracing::error!(run_id = %spawned_run_id, error = %err, "resumed index run aborted");
                     }
                 });
@@ -4551,12 +4411,6 @@ mod tests {
     // filesystem or database behind them, so they are unit-tested here
     // rather than through an FFI call in `tests/`.
 
-    // `includeLibraries` decides whether a caller's search can see a
-    // library's files at all, and the only thing that can go wrong on this
-    // surface is the key being read. Unit-tested here, where the parse is,
-    // rather than through a call that would prove the same thing at the cost
-    // of a database.
-
     /// The boundary itself: a panic inside a guarded body must reach the
     /// caller as the family's status code, not as an unwind that ends the
     /// embedder's process.
@@ -4608,37 +4462,6 @@ mod tests {
 
         // The point: this reads rather than panicking a second time.
         let _ = locked_services();
-    }
-
-    #[test]
-    fn given_include_libraries_true_when_the_filter_is_parsed_then_it_reaches_in() {
-        let parsed = FilesListFilter::from_json_str(r#"{"includeLibraries":true}"#).unwrap();
-        assert!(parsed.include_libraries);
-    }
-
-    #[test]
-    fn given_include_libraries_as_a_string_when_parsed_then_it_reaches_in() {
-        // What a caller written against the HTTP surface would send, where
-        // the value is a query-string `true` (FR-FC-24).
-        let parsed = FilesListFilter::from_json_str(r#"{"includeLibraries":"true"}"#).unwrap();
-        assert!(parsed.include_libraries);
-    }
-
-    #[test]
-    fn given_no_include_libraries_when_parsed_then_libraries_stay_excluded() {
-        // The default and every near-miss fall towards the exclusion: a
-        // course leaking into the type panels is the defect marking the
-        // folder was meant to prevent.
-        for body in [
-            "",
-            "{}",
-            r#"{"includeLibraries":false}"#,
-            r#"{"includeLibraries":"yes"}"#,
-            r#"{"includeLibraries":1}"#,
-        ] {
-            let parsed = FilesListFilter::from_json_str(body).unwrap();
-            assert!(!parsed.include_libraries, "`{body}` reached into libraries");
-        }
     }
 
     #[test]
@@ -4818,7 +4641,7 @@ fn spawn_library_walk(
     let handler = services.index_handler.clone();
     let root = library.root_path.clone();
     runtime().spawn(async move {
-        if let Err(err) = handler.execute(&root, run_id, &IndexScope::all()).await {
+        if let Err(err) = handler.execute(&root, run_id).await {
             tracing::error!(%run_id, error = %err, "index run aborted");
         }
     });
