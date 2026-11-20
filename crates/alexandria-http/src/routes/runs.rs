@@ -215,6 +215,18 @@ pub async fn resume_run(
                     )));
                 }
             };
+            // Every index run is its library's, and the walk records each
+            // file into it; a run without one cannot be resumed into
+            // anything, so it is refused like a run without a root.
+            let Some(library_uuid) = resumed.library_uuid else {
+                tracing::error!(
+                    run_id = %resumed.run_id,
+                    "resumed index run has no library; refusing to spawn"
+                );
+                return Err(ApiError(alexandria_core::errors::DomainError::internal(
+                    "resumed index run has no library",
+                )));
+            };
             let handler = state.services.index_handler.clone();
             let spawned_run_id = resumed.run_id;
             tokio::spawn(async move {
@@ -222,7 +234,7 @@ pub async fn resume_run(
                 // the run could not resume at all; `execute` has already
                 // written its own terminal row on that path (UC-48), so the
                 // failure is recorded, not lost.
-                if let Err(err) = handler.execute(&root, spawned_run_id).await {
+                if let Err(err) = handler.execute(&root, spawned_run_id, library_uuid).await {
                     tracing::error!(run_id = %spawned_run_id, error = %err, "resumed index run aborted");
                 }
             });

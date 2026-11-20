@@ -850,51 +850,24 @@ impl CatalogRepository for SqliteCatalogRepository {
     async fn insert_file(&self, new_file: NewFile) -> Result<File, DomainError> {
         let mut tx = self.pool.begin_with(WRITE_TX).await?;
 
+        // Every file belongs to a library (libraries-only design), and it is
+        // the one the caller names — the run's own, for an index walk — not
+        // one worked out from the path. Checked first, inside the same
+        // transaction, so an unknown library is the caller's mistake reported
+        // as such rather than a NOT NULL failure from the column below.
+        let library_id: Option<i64> = sqlx::query_scalar("SELECT id FROM libraries WHERE uuid = ?")
+            .bind(new_file.library_uuid.to_string())
+            .fetch_optional(&mut *tx)
+            .await?;
+        let Some(library_id) = library_id else {
+            return Err(DomainError::InvalidInput("unknown library".to_string()));
+        };
+
         sqlx::query(
-            // `library_id` is resolved here, by the insert itself, rather
-            // than claimed afterwards by whatever ran the walk. A file
-            // indexed into an existing library belongs to it from the moment
-            // it exists — and a rule the database applies is one no future
-            // index path can forget to apply (libraries design section 1).
-            //
-            // The trailing separator is what stops `/library/course` from
-            // claiming `/library/course-notes`: a different folder that
-            // merely starts with the same letters.
-            //
-            // Both sides are compared with forward slashes, because on
-            // Windows a file's path is `D:\course\class-01\lecture.mp4`
-            // and the root it sits under is `D:\course` — and a prefix test
-            // that appended `/` to a backslash path matched nothing at all,
-            // so a library there silently claimed no file it had.
-            //
-            // A `substr` prefix test rather than `LIKE`, matching
-            // `LibraryRepository::claim_files` and `find_overlapping` — the
-            // three have to agree, since between them they decide the same
-            // question at insert time, at registration, and at overlap. Two
-            // reasons, and the second is why this stopped being `LIKE`:
-            // `LIKE`'s `_` and `%` are wildcards, so a library at
-            // `/media/tv_shows` claimed every file under `/media/tv-shows`;
-            // and `LIKE` is case-insensitive over ASCII, so one at
-            // `/media/photos` claimed everything under `/media/Photos` — a
-            // different folder on every filesystem but Windows's, and one
-            // whose files `BrowseLibraryHandler` then could not list, because
-            // its own `strip_prefix` is case-sensitive. `=` compares under
-            // the column's BINARY collation, which agrees with that.
-            //
-            // `ORDER BY` pairs with the `LIMIT`: overlapping libraries are
-            // refused at registration, and if one ever slips through, the
-            // file lands in the same one on every insert rather than in
-            // whichever row the planner reached first.
             "INSERT INTO files \
              (uuid, path, name, type, content_hash, size_bytes, mtime, state, deleted_at, \
              indexed_at, missing_at, library_id) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, 'active', NULL, ?, NULL, \
-             (SELECT id FROM libraries \
-              WHERE substr(replace(?, '\\', '/'), 1, \
-                           length(rtrim(replace(root_path, '\\', '/'), '/') || '/')) \
-                    = (rtrim(replace(root_path, '\\', '/'), '/') || '/') \
-              ORDER BY length(root_path) DESC, id \
-              LIMIT 1))",
+             VALUES (?, ?, ?, ?, ?, ?, ?, 'active', NULL, ?, NULL, ?)",
         )
         .bind(new_file.uuid.to_string())
         .bind(&new_file.path)
@@ -904,8 +877,7 @@ impl CatalogRepository for SqliteCatalogRepository {
         .bind(new_file.size_bytes)
         .bind(new_file.mtime.map(|t| t.to_rfc3339()))
         .bind(new_file.indexed_at.to_rfc3339())
-        // The path a second time, for the library subquery above.
-        .bind(&new_file.path)
+        .bind(library_id)
         .execute(&mut *tx)
         .await?;
 

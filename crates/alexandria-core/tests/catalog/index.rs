@@ -300,7 +300,7 @@ async fn given_already_cataloged_path_when_execute_then_already_cataloged_no_dup
     );
 
     let outcome = handler
-        .execute(ROOT, Uuid::new_v4())
+        .execute(ROOT, Uuid::new_v4(), Uuid::new_v4())
         .await
         .expect("execute");
 
@@ -344,7 +344,7 @@ async fn given_supported_files_when_execute_then_indexed_with_no_hash_and_indexe
     );
 
     let outcome = handler
-        .execute(ROOT, Uuid::new_v4())
+        .execute(ROOT, Uuid::new_v4(), Uuid::new_v4())
         .await
         .expect("execute");
 
@@ -397,7 +397,7 @@ async fn given_a_file_on_disk_when_indexed_then_its_size_and_mtime_are_recorded(
         )
         .await
         .unwrap();
-    handler.execute(ROOT, run_id).await.unwrap();
+    handler.execute(ROOT, run_id, Uuid::new_v4()).await.unwrap();
 
     let file = repo_handle
         .find_by_path("/library/memo.txt")
@@ -441,7 +441,7 @@ async fn given_a_file_when_indexed_then_no_content_hash_is_computed() {
         )
         .await
         .unwrap();
-    handler.execute(ROOT, run_id).await.unwrap();
+    handler.execute(ROOT, run_id, Uuid::new_v4()).await.unwrap();
 
     let file = repo_handle
         .find_by_path("/library/memo.txt")
@@ -504,7 +504,7 @@ async fn given_any_concurrency_when_execute_then_same_counts_and_same_catalog() 
         );
 
         let outcome = handler
-            .execute(ROOT, Uuid::new_v4())
+            .execute(ROOT, Uuid::new_v4(), Uuid::new_v4())
             .await
             .expect("execute");
 
@@ -551,7 +551,7 @@ async fn given_zero_concurrency_when_execute_then_runs_sequentially_rather_than_
     );
 
     let outcome = handler
-        .execute(ROOT, Uuid::new_v4())
+        .execute(ROOT, Uuid::new_v4(), Uuid::new_v4())
         .await
         .expect("execute");
 
@@ -597,7 +597,10 @@ async fn given_zero_low_priority_concurrency_when_a_low_priority_run_executes_th
         )
         .await
         .unwrap();
-    let outcome = handler.execute(ROOT, run_id).await.expect("execute");
+    let outcome = handler
+        .execute(ROOT, run_id, Uuid::new_v4())
+        .await
+        .expect("execute");
 
     assert_eq!(outcome.indexed, 2);
 }
@@ -622,7 +625,7 @@ async fn given_unsupported_extension_when_execute_then_skipped() {
     );
 
     let outcome = handler
-        .execute(ROOT, Uuid::new_v4())
+        .execute(ROOT, Uuid::new_v4(), Uuid::new_v4())
         .await
         .expect("execute");
 
@@ -658,7 +661,7 @@ async fn given_unreadable_file_when_execute_then_it_is_indexed_anyway() {
     );
 
     let outcome = handler
-        .execute(ROOT, Uuid::new_v4())
+        .execute(ROOT, Uuid::new_v4(), Uuid::new_v4())
         .await
         .expect("an unreadable file must not fail the whole run");
 
@@ -708,7 +711,7 @@ async fn given_failing_repository_write_when_execute_then_run_continues_and_coun
     );
 
     let outcome = handler
-        .execute(ROOT, Uuid::new_v4())
+        .execute(ROOT, Uuid::new_v4(), Uuid::new_v4())
         .await
         .expect("a per-file repository error must not fail the whole run");
 
@@ -742,7 +745,10 @@ async fn given_a_file_that_could_not_be_indexed_when_the_run_ends_then_it_is_nam
         runs,
     );
 
-    let outcome = handler.execute(ROOT, run_id).await.expect("run");
+    let outcome = handler
+        .execute(ROOT, run_id, Uuid::new_v4())
+        .await
+        .expect("run");
 
     assert_eq!(outcome.failed, 1);
 
@@ -781,7 +787,10 @@ async fn given_a_file_that_failed_mid_run_when_it_is_named_then_it_carries_the_t
         runs,
     );
 
-    handler.execute(ROOT, run_id).await.expect("run");
+    handler
+        .execute(ROOT, run_id, Uuid::new_v4())
+        .await
+        .expect("run");
 
     let recorded = runs_handle.recorded_failures(run_id);
     assert_eq!(recorded.len(), 1);
@@ -813,7 +822,10 @@ async fn given_a_run_that_indexed_everything_when_it_ends_then_nothing_is_named(
         runs,
     );
 
-    handler.execute(ROOT, run_id).await.expect("run");
+    handler
+        .execute(ROOT, run_id, Uuid::new_v4())
+        .await
+        .expect("run");
 
     assert!(runs_handle.recorded_failures(run_id).is_empty());
 }
@@ -859,7 +871,7 @@ async fn given_a_folder_mixing_audio_video_and_text_when_indexed_then_only_video
         .await
         .expect("start");
     let outcome = handler
-        .execute(ROOT, started.run_id)
+        .execute(ROOT, started.run_id, Uuid::new_v4())
         .await
         .expect("execute");
 
@@ -945,7 +957,7 @@ async fn given_tagged_image_file_when_execute_then_dimensions_and_title_written(
     );
 
     let outcome = handler
-        .execute(ROOT, Uuid::new_v4())
+        .execute(ROOT, Uuid::new_v4(), Uuid::new_v4())
         .await
         .expect("execute");
 
@@ -993,7 +1005,7 @@ async fn given_image_with_dimensions_but_no_title_when_execute_then_only_dimensi
     );
 
     let outcome = handler
-        .execute(ROOT, Uuid::new_v4())
+        .execute(ROOT, Uuid::new_v4(), Uuid::new_v4())
         .await
         .expect("execute");
 
@@ -1035,7 +1047,7 @@ async fn given_image_with_title_but_no_dimensions_when_execute_then_only_title_w
     );
 
     let outcome = handler
-        .execute(ROOT, Uuid::new_v4())
+        .execute(ROOT, Uuid::new_v4(), Uuid::new_v4())
         .await
         .expect("execute");
 
@@ -1087,7 +1099,7 @@ async fn given_image_with_partial_dimensions_when_execute_then_dimensions_write_
     );
 
     let outcome = handler
-        .execute(ROOT, Uuid::new_v4())
+        .execute(ROOT, Uuid::new_v4(), Uuid::new_v4())
         .await
         .expect("execute");
 
@@ -1124,7 +1136,7 @@ async fn given_untagged_image_file_when_execute_then_neither_write_happens() {
     );
 
     let outcome = handler
-        .execute(ROOT, Uuid::new_v4())
+        .execute(ROOT, Uuid::new_v4(), Uuid::new_v4())
         .await
         .expect("execute");
 
@@ -1155,7 +1167,7 @@ async fn given_non_image_file_when_execute_then_image_reader_never_consulted() {
     );
 
     let outcome = handler
-        .execute(ROOT, Uuid::new_v4())
+        .execute(ROOT, Uuid::new_v4(), Uuid::new_v4())
         .await
         .expect("execute");
 
@@ -1198,7 +1210,7 @@ async fn given_tagged_pdf_when_execute_then_page_count_and_metadata_written() {
     );
 
     let outcome = handler
-        .execute(ROOT, Uuid::new_v4())
+        .execute(ROOT, Uuid::new_v4(), Uuid::new_v4())
         .await
         .expect("execute");
 
@@ -1250,7 +1262,7 @@ async fn given_tagged_epub_when_execute_then_metadata_written_no_page_count() {
     );
 
     let outcome = handler
-        .execute(ROOT, Uuid::new_v4())
+        .execute(ROOT, Uuid::new_v4(), Uuid::new_v4())
         .await
         .expect("execute");
 
@@ -1311,7 +1323,7 @@ async fn given_document_with_page_count_but_no_other_fields_when_execute_then_bo
     );
 
     let outcome = handler
-        .execute(ROOT, Uuid::new_v4())
+        .execute(ROOT, Uuid::new_v4(), Uuid::new_v4())
         .await
         .expect("execute");
 
@@ -1352,7 +1364,7 @@ async fn given_untagged_document_file_when_execute_then_neither_write_happens() 
     );
 
     let outcome = handler
-        .execute(ROOT, Uuid::new_v4())
+        .execute(ROOT, Uuid::new_v4(), Uuid::new_v4())
         .await
         .expect("execute");
 
@@ -1384,7 +1396,7 @@ async fn given_non_document_file_when_execute_then_document_reader_never_consult
     );
 
     let outcome = handler
-        .execute(ROOT, Uuid::new_v4())
+        .execute(ROOT, Uuid::new_v4(), Uuid::new_v4())
         .await
         .expect("execute");
 
@@ -1426,7 +1438,7 @@ async fn given_tagged_video_when_execute_then_duration_and_metadata_written() {
     );
 
     let outcome = handler
-        .execute(ROOT, Uuid::new_v4())
+        .execute(ROOT, Uuid::new_v4(), Uuid::new_v4())
         .await
         .expect("execute");
 
@@ -1477,7 +1489,7 @@ async fn given_video_with_duration_but_no_other_fields_when_execute_then_only_du
     );
 
     let outcome = handler
-        .execute(ROOT, Uuid::new_v4())
+        .execute(ROOT, Uuid::new_v4(), Uuid::new_v4())
         .await
         .expect("execute");
 
@@ -1520,7 +1532,7 @@ async fn given_video_with_resolution_but_no_duration_when_execute_then_only_meta
     );
 
     let outcome = handler
-        .execute(ROOT, Uuid::new_v4())
+        .execute(ROOT, Uuid::new_v4(), Uuid::new_v4())
         .await
         .expect("execute");
 
@@ -1565,7 +1577,7 @@ async fn given_untagged_video_file_when_execute_then_neither_write_happens() {
     );
 
     let outcome = handler
-        .execute(ROOT, Uuid::new_v4())
+        .execute(ROOT, Uuid::new_v4(), Uuid::new_v4())
         .await
         .expect("execute");
 
@@ -1598,7 +1610,7 @@ async fn given_non_video_file_when_execute_then_video_reader_never_consulted() {
     );
 
     let outcome = handler
-        .execute(ROOT, Uuid::new_v4())
+        .execute(ROOT, Uuid::new_v4(), Uuid::new_v4())
         .await
         .expect("execute");
 
@@ -1640,7 +1652,7 @@ async fn given_tagged_comic_when_execute_then_page_count_and_metadata_written() 
     );
 
     let outcome = handler
-        .execute(ROOT, Uuid::new_v4())
+        .execute(ROOT, Uuid::new_v4(), Uuid::new_v4())
         .await
         .expect("execute");
 
@@ -1691,7 +1703,7 @@ async fn given_comic_with_page_count_but_no_other_fields_when_execute_then_only_
     );
 
     let outcome = handler
-        .execute(ROOT, Uuid::new_v4())
+        .execute(ROOT, Uuid::new_v4(), Uuid::new_v4())
         .await
         .expect("execute");
 
@@ -1734,7 +1746,7 @@ async fn given_comic_with_issue_number_but_no_page_count_when_execute_then_only_
     );
 
     let outcome = handler
-        .execute(ROOT, Uuid::new_v4())
+        .execute(ROOT, Uuid::new_v4(), Uuid::new_v4())
         .await
         .expect("execute");
 
@@ -1778,7 +1790,7 @@ async fn given_unopenable_comic_file_when_execute_then_neither_write_happens() {
     );
 
     let outcome = handler
-        .execute(ROOT, Uuid::new_v4())
+        .execute(ROOT, Uuid::new_v4(), Uuid::new_v4())
         .await
         .expect("execute");
 
@@ -1812,7 +1824,7 @@ async fn given_non_comic_file_when_execute_then_comic_reader_never_consulted() {
     );
 
     let outcome = handler
-        .execute(ROOT, Uuid::new_v4())
+        .execute(ROOT, Uuid::new_v4(), Uuid::new_v4())
         .await
         .expect("execute");
 
@@ -2196,7 +2208,7 @@ async fn given_an_index_that_walks_when_executed_then_the_run_is_recorded_comple
         .await
         .expect("start");
     let outcome = handler
-        .execute(ROOT, started.run_id)
+        .execute(ROOT, started.run_id, Uuid::new_v4())
         .await
         .expect("execute");
 
@@ -2244,7 +2256,7 @@ async fn given_a_root_that_cannot_be_listed_when_executed_then_the_run_is_record
         .await
         .expect("start");
     let err = handler
-        .execute(ROOT, started.run_id)
+        .execute(ROOT, started.run_id, Uuid::new_v4())
         .await
         .expect_err("must fail");
 
@@ -2297,7 +2309,7 @@ async fn given_files_that_individually_fail_when_executed_then_the_run_is_comple
         .await
         .expect("start");
     let outcome = handler
-        .execute(ROOT, started.run_id)
+        .execute(ROOT, started.run_id, Uuid::new_v4())
         .await
         .expect("execute");
 
@@ -2338,7 +2350,7 @@ async fn given_run_completion_cannot_be_recorded_when_executed_then_the_outcome_
     );
 
     let outcome = handler
-        .execute(ROOT, Uuid::new_v4())
+        .execute(ROOT, Uuid::new_v4(), Uuid::new_v4())
         .await
         .expect("a failed run-completion write must not fail the walk");
 
@@ -2377,7 +2389,7 @@ async fn given_the_run_lookup_fails_when_executed_then_the_walk_still_completes_
     );
 
     let outcome = handler
-        .execute(ROOT, Uuid::new_v4())
+        .execute(ROOT, Uuid::new_v4(), Uuid::new_v4())
         .await
         .expect("a failed concurrency lookup must not fail the walk");
 
@@ -2420,7 +2432,7 @@ async fn given_a_cataloged_file_and_an_unsupported_one_when_indexed_then_the_two
         )
         .await
         .unwrap();
-    handler.execute(ROOT, run_id).await.unwrap();
+    handler.execute(ROOT, run_id, Uuid::new_v4()).await.unwrap();
 
     let IndexStarted { run_id } = handler
         .start(
@@ -2433,7 +2445,7 @@ async fn given_a_cataloged_file_and_an_unsupported_one_when_indexed_then_the_two
         )
         .await
         .unwrap();
-    let outcome = handler.execute(ROOT, run_id).await.unwrap();
+    let outcome = handler.execute(ROOT, run_id, Uuid::new_v4()).await.unwrap();
 
     assert_eq!(outcome.indexed, 0);
     assert_eq!(
@@ -2480,7 +2492,10 @@ async fn given_a_completed_index_when_execute_then_the_final_progress_is_flushed
     .await
     .unwrap();
 
-    handler.execute(ROOT, run_id).await.expect("execute");
+    handler
+        .execute(ROOT, run_id, Uuid::new_v4())
+        .await
+        .expect("execute");
 
     let recorded = runs.get_recorded(run_id).expect("recorded run");
     assert_eq!(
@@ -2535,7 +2550,10 @@ async fn given_a_progress_flush_that_fails_when_execute_then_the_run_still_compl
     .await
     .unwrap();
 
-    let outcome = handler.execute(ROOT, run_id).await.expect("execute");
+    let outcome = handler
+        .execute(ROOT, run_id, Uuid::new_v4())
+        .await
+        .expect("execute");
 
     assert_eq!(outcome.indexed, 1);
     assert!(
@@ -2580,7 +2598,7 @@ async fn given_a_run_that_cannot_list_its_root_when_execute_then_the_cell_is_clo
     .unwrap();
 
     handler
-        .execute(ROOT, run_id)
+        .execute(ROOT, run_id, Uuid::new_v4())
         .await
         .expect_err("the walk could not proceed");
 
@@ -2632,7 +2650,10 @@ async fn given_a_walk_longer_than_the_flush_interval_when_execute_then_intermedi
     .await
     .unwrap();
 
-    let outcome = handler.execute(ROOT, run_id).await.expect("execute");
+    let outcome = handler
+        .execute(ROOT, run_id, Uuid::new_v4())
+        .await
+        .expect("execute");
 
     assert_eq!(outcome.indexed, 6);
     // Each entry of the history is a write the repository actually performed
@@ -2780,7 +2801,10 @@ async fn given_an_index_walk_in_flight_when_paused_then_it_stops_with_entries_un
         registry.clone(),
     );
 
-    let outcome = handler.execute(ROOT, run_id).await.expect("execute");
+    let outcome = handler
+        .execute(ROOT, run_id, Uuid::new_v4())
+        .await
+        .expect("execute");
 
     assert_eq!(outcome.scanned, HALT_WALK_FILES, "discovery found them all");
     let tallied = outcome.indexed + outcome.skipped + outcome.already_cataloged + outcome.failed;
@@ -2877,7 +2901,10 @@ async fn given_a_run_resumed_before_a_walks_pause_lands_when_it_lands_then_the_p
     // closed its cell and before its own pause is evaluated.
     runs.pause_and_resume_before_next_halt(run_id);
 
-    handler.execute(ROOT, run_id).await.expect("execute");
+    handler
+        .execute(ROOT, run_id, Uuid::new_v4())
+        .await
+        .expect("execute");
 
     let recorded = runs.get_recorded(run_id).expect("recorded run");
     assert_eq!(
@@ -2935,7 +2962,10 @@ async fn given_a_run_resumed_before_a_walks_cancel_lands_when_it_lands_then_the_
     // closed its cell and before its own cancel is evaluated.
     runs.pause_and_resume_before_next_halt(run_id);
 
-    handler.execute(ROOT, run_id).await.expect("execute");
+    handler
+        .execute(ROOT, run_id, Uuid::new_v4())
+        .await
+        .expect("execute");
 
     let recorded = runs.get_recorded(run_id).expect("recorded run");
     assert_eq!(
@@ -2986,7 +3016,10 @@ async fn given_an_index_walk_in_flight_when_cancelled_then_it_stops_and_is_termi
         registry.clone(),
     );
 
-    let outcome = handler.execute(ROOT, run_id).await.expect("execute");
+    let outcome = handler
+        .execute(ROOT, run_id, Uuid::new_v4())
+        .await
+        .expect("execute");
 
     let tallied = outcome.indexed + outcome.skipped + outcome.already_cataloged + outcome.failed;
     assert!(tallied < HALT_WALK_FILES, "entries were left unprocessed");
@@ -3058,7 +3091,10 @@ async fn given_a_run_paused_during_discovery_when_execute_then_no_entry_is_proce
         registry.clone(),
     );
 
-    let outcome = handler.execute(ROOT, run_id).await.expect("execute");
+    let outcome = handler
+        .execute(ROOT, run_id, Uuid::new_v4())
+        .await
+        .expect("execute");
 
     assert_eq!(
         outcome.scanned, HALT_WALK_FILES,
@@ -3125,7 +3161,7 @@ async fn given_a_paused_index_run_when_resumed_then_it_re_walks_and_finishes_the
     );
 
     let first = first_segment
-        .execute(ROOT, run_id)
+        .execute(ROOT, run_id, Uuid::new_v4())
         .await
         .expect("first segment");
     assert!(
@@ -3167,7 +3203,7 @@ async fn given_a_paused_index_run_when_resumed_then_it_re_walks_and_finishes_the
     );
 
     let second = second_segment
-        .execute(ROOT, run_id)
+        .execute(ROOT, run_id, Uuid::new_v4())
         .await
         .expect("second segment");
 
@@ -3275,7 +3311,7 @@ async fn given_a_resumed_run_when_executed_then_it_walks_at_the_width_it_was_sta
     );
 
     second_segment
-        .execute(ROOT, run_id)
+        .execute(ROOT, run_id, Uuid::new_v4())
         .await
         .expect("second segment");
 
@@ -3365,7 +3401,7 @@ async fn given_a_paused_run_when_resumed_at_low_priority_then_it_walks_at_the_ne
     );
 
     second_segment
-        .execute(ROOT, run_id)
+        .execute(ROOT, run_id, Uuid::new_v4())
         .await
         .expect("second segment");
 
@@ -3418,7 +3454,10 @@ async fn walk_stopped_before_it_began(
         registry.clone(),
     );
 
-    let outcome = handler.execute(ROOT, run_id).await.expect("execute");
+    let outcome = handler
+        .execute(ROOT, run_id, Uuid::new_v4())
+        .await
+        .expect("execute");
 
     (runs, run_id, outcome.indexed + outcome.already_cataloged)
 }

@@ -21,11 +21,12 @@ use crate::AppState;
 fn spawn_walk(state: &AppState, library: &Library, run_id: uuid::Uuid) {
     let handler = state.services.index_handler.clone();
     let root = library.root_path.clone();
+    let library_uuid = library.uuid;
     tokio::spawn(async move {
         // `execute` writes the run's `failed` record on its own error path
         // (UC-42), so a failure here is recorded, not lost; this line is for
         // the operator.
-        if let Err(err) = handler.execute(&root, run_id).await {
+        if let Err(err) = handler.execute(&root, run_id, library_uuid).await {
             tracing::error!(%run_id, error = %err, "index run aborted");
         }
     });

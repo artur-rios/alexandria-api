@@ -124,8 +124,17 @@ async fn migrated_pool() -> SqlitePool {
         .await
         .expect("connect");
     run_migrations(&pool).await.expect("migrate");
+    // Every file belongs to a library; these all go into this one.
+    sqlx::query("INSERT INTO libraries (uuid, name, root_path) VALUES (?, 'Lib', '/lib')")
+        .bind(BATCH_LIBRARY.to_string())
+        .execute(&pool)
+        .await
+        .expect("library");
     pool
 }
+
+/// The library every seeded row belongs to.
+const BATCH_LIBRARY: Uuid = Uuid::from_u128(0xba7c);
 
 /// Seed `count` documents, each carrying stored title/author metadata, so
 /// a batch query has something to fetch. Returns nothing — the test only
@@ -135,6 +144,7 @@ async fn seed_documents(repo: &SqliteCatalogRepository, count: usize) {
         let uuid = Uuid::new_v4();
         repo.insert_file(NewFile {
             uuid,
+            library_uuid: BATCH_LIBRARY,
             path: format!("/lib/book-{i:04}.epub"),
             name: format!("book-{i:04}.epub"),
             file_type: FileType::Document,
@@ -228,6 +238,7 @@ async fn given_mixed_type_listing_when_listed_then_query_count_scales_with_types
     let video_uuid = Uuid::new_v4();
     repo.insert_file(NewFile {
         uuid: video_uuid,
+        library_uuid: BATCH_LIBRARY,
         path: "/lib/clip.mp4".into(),
         name: "clip.mp4".into(),
         file_type: FileType::Video,

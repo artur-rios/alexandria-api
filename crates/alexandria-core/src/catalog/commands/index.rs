@@ -356,7 +356,17 @@ where
     ///
     /// Every file Alexandria can read is recorded: a library is the folder as
     /// it is, so there is no per-run type filter.
-    pub async fn execute(&self, root: &str, run_id: Uuid) -> Result<IndexOutcome, DomainError> {
+    ///
+    /// `library_uuid` is the library the run walks; every file it records
+    /// belongs to it. Handed in by whoever spawned the walk, as `root` is —
+    /// the registered or re-indexed library for a fresh run, and
+    /// `RunResumed::library_uuid`, read off the run's row, for a resumed one.
+    pub async fn execute(
+        &self,
+        root: &str,
+        run_id: Uuid,
+        library_uuid: Uuid,
+    ) -> Result<IndexOutcome, DomainError> {
         let now = self.clock.now();
         // Read from the run's own row rather than carried in as a parameter
         // or held in a field: `IndexHandler` is long-lived (built once at
@@ -541,7 +551,7 @@ where
                     return EntryOutcome::Skipped;
                 };
                 let path = entry.path.clone();
-                match self.index_entry(entry, file_type, now).await {
+                match self.index_entry(entry, file_type, library_uuid, now).await {
                     Ok(outcome) => outcome,
                     Err(err) => {
                         tracing::warn!(
@@ -725,6 +735,7 @@ where
         &self,
         entry: FileEntry,
         file_type: FileType,
+        library_uuid: Uuid,
         now: DateTime<Utc>,
     ) -> Result<EntryOutcome, DomainError> {
         if self.repo.find_by_path(&entry.path).await?.is_some() {
@@ -732,6 +743,7 @@ where
         }
         let new_file = NewFile {
             uuid: Uuid::new_v4(),
+            library_uuid,
             path: entry.path.clone(),
             name: entry.name,
             file_type,

@@ -4316,6 +4316,15 @@ pub extern "C" fn alexandria_index_resume(
                         return IndexStartResult::err(RUN_ERR_OTHER);
                     }
                 };
+                // Every index run is its library's; one without cannot be
+                // resumed into anything (HTTP refuses it the same way).
+                let Some(library_uuid) = resumed.library_uuid else {
+                    tracing::error!(
+                        run_id = %resumed.run_id,
+                        "resumed index run has no library; refusing to spawn"
+                    );
+                    return IndexStartResult::err(RUN_ERR_OTHER);
+                };
                 let handler = services.index_handler.clone();
                 let spawned_run_id = resumed.run_id;
                 rt.spawn(async move {
@@ -4323,7 +4332,7 @@ pub extern "C" fn alexandria_index_resume(
                     // `Err` here means the run could not resume at all;
                     // `execute` has already written its own terminal row on that
                     // path (UC-48), so the failure is recorded, not lost.
-                    if let Err(err) = handler.execute(&root, spawned_run_id).await {
+                    if let Err(err) = handler.execute(&root, spawned_run_id, library_uuid).await {
                         tracing::error!(run_id = %spawned_run_id, error = %err, "resumed index run aborted");
                     }
                 });
@@ -4640,8 +4649,9 @@ fn spawn_library_walk(
 ) {
     let handler = services.index_handler.clone();
     let root = library.root_path.clone();
+    let library_uuid = library.uuid;
     runtime().spawn(async move {
-        if let Err(err) = handler.execute(&root, run_id).await {
+        if let Err(err) = handler.execute(&root, run_id, library_uuid).await {
             tracing::error!(%run_id, error = %err, "index run aborted");
         }
     });

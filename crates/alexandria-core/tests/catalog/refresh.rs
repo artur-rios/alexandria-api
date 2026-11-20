@@ -420,10 +420,12 @@ async fn given_a_media_kind_the_owner_set_when_filled_then_it_survives() {
         .await
         .expect("connect");
     run_migrations(&pool).await.expect("migrate");
+    let library_uuid = crate::common::seed_library(&pool, "/library").await;
     let repo = SqliteCatalogRepository::new(pool);
     let uuid = Uuid::new_v4();
     repo.insert_file(NewFile {
         uuid,
+        library_uuid,
         path: "/library/film.mkv".to_string(),
         name: "film.mkv".to_string(),
         file_type: FileType::Video,
@@ -482,10 +484,12 @@ async fn given_a_stamped_row_when_read_back_then_it_carries_the_version() {
         .await
         .expect("connect");
     run_migrations(&pool).await.expect("migrate");
+    let library_uuid = crate::common::seed_library(&pool, "/library").await;
     let repo = SqliteCatalogRepository::new(pool);
     let uuid = Uuid::new_v4();
     repo.insert_file(NewFile {
         uuid,
+        library_uuid,
         path: "/library/stamped.mkv".to_string(),
         name: "stamped.mkv".to_string(),
         file_type: FileType::Video,

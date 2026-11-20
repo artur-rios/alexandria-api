@@ -163,7 +163,11 @@ async fn register_and_walk(pool: &SqlitePool, root: &str) -> (RegisteredLibrary,
         .await
         .expect("register");
     let outcome = index_handler(pool, "")
-        .execute(&registered.library.root_path, registered.run_id)
+        .execute(
+            &registered.library.root_path,
+            registered.run_id,
+            registered.library.uuid,
+        )
         .await
         .expect("walk");
     (registered, outcome)
@@ -403,7 +407,7 @@ async fn given_an_indexed_library_when_reindexed_then_existing_files_count_as_al
         .await
         .expect("reindex");
     let outcome = index_handler(&pool, "")
-        .execute(&library.root_path, started.run_id)
+        .execute(&library.root_path, started.run_id, library.uuid)
         .await
         .expect("walk");
 

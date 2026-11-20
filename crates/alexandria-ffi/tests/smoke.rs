@@ -2844,9 +2844,18 @@ fn seed_text_row(db_path: &str, path: &std::path::Path) -> String {
         let pool = alexandria_core::migrate::migrate_database(db_path)
             .await
             .expect("open");
+        // Every file belongs to a library: the row goes into one at its folder.
+        let library_uuid = uuid::Uuid::new_v4();
+        sqlx::query("INSERT INTO libraries (uuid, name, root_path) VALUES (?, 'Seeded', ?)")
+            .bind(library_uuid.to_string())
+            .bind(path.parent().unwrap().to_str().unwrap())
+            .execute(&pool)
+            .await
+            .expect("library");
         SqliteCatalogRepository::new(pool.clone())
             .insert_file(NewFile {
                 uuid,
+                library_uuid,
                 path: path.to_str().unwrap().to_string(),
                 name: path.file_name().unwrap().to_str().unwrap().to_string(),
                 file_type: FileType::Text,

@@ -3469,3 +3469,16 @@ impl alexandria_core::catalog::commands::index::LibraryRunStarter for AlwaysStar
         })
     }
 }
+
+/// Insert a library at `root` straight into the table and answer its uuid,
+/// for a test that writes file rows itself: every file belongs to a library.
+pub async fn seed_library(pool: &sqlx::sqlite::SqlitePool, root: &str) -> Uuid {
+    let uuid = Uuid::new_v4();
+    sqlx::query("INSERT INTO libraries (uuid, name, root_path) VALUES (?, 'Library', ?)")
+        .bind(uuid.to_string())
+        .bind(root)
+        .execute(pool)
+        .await
+        .expect("seed library");
+    uuid
+}

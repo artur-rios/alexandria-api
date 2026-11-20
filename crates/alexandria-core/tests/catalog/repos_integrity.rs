@@ -31,13 +31,22 @@ async fn migrated_pool() -> SqlitePool {
         .await
         .expect("connect");
     run_migrations(&pool).await.expect("migrate");
+    sqlx::query("INSERT INTO libraries (uuid, name, root_path) VALUES (?, 'Everything', '/')")
+        .bind(TEST_LIBRARY.to_string())
+        .execute(&pool)
+        .await
+        .expect("library");
     pool
 }
+
+/// The library every file these tests insert belongs to.
+const TEST_LIBRARY: Uuid = Uuid::from_u128(0x1b);
 
 async fn insert_file(repo: &SqliteCatalogRepository, path: &str, file_type: FileType) -> Uuid {
     let uuid = Uuid::new_v4();
     repo.insert_file(NewFile {
         uuid,
+        library_uuid: TEST_LIBRARY,
         path: path.to_string(),
         name: path.rsplit('/').next().unwrap_or(path).to_string(),
         file_type,
@@ -196,4 +205,40 @@ async fn given_item_on_a_reading_list_when_purged_then_its_reading_progress_is_r
         .is_some());
 
     pool.close().await;
+}
+
+/// Every file belongs to a library (libraries-only design): a file naming a
+/// library the catalog does not hold is refused as invalid input, and leaves
+/// no row behind.
+#[tokio::test]
+async fn given_an_unknown_library_when_a_file_is_inserted_then_invalid_input_and_no_row() {
+    let pool = migrated_pool().await;
+    let repo = SqliteCatalogRepository::new(pool.clone());
+
+    let result = repo
+        .insert_file(NewFile {
+            uuid: Uuid::new_v4(),
+            library_uuid: Uuid::new_v4(),
+            path: "/elsewhere/a.md".to_string(),
+            name: "a.md".to_string(),
+            file_type: FileType::Text,
+            content_hash: None,
+            size_bytes: None,
+            mtime: None,
+            indexed_at: chrono::Utc::now(),
+        })
+        .await;
+
+    assert!(
+        matches!(
+            result,
+            Err(alexandria_core::errors::DomainError::InvalidInput(_))
+        ),
+        "{result:?}"
+    );
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM files")
+        .fetch_one(&pool)
+        .await
+        .expect("count");
+    assert_eq!(count, 0);
 }

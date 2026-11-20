@@ -345,6 +345,9 @@ fn write_minimal_mp4(path: &std::path::Path, i: usize) {
     octx.write_trailer().expect("write trailer");
 }
 
+/// The library every benchmark run records into.
+const BENCH_LIBRARY: Uuid = Uuid::from_u128(0xbe4c);
+
 async fn build(
     db: &std::path::Path,
     concurrency: u32,
@@ -352,6 +355,13 @@ async fn build(
     let pool = migrate_database(db.to_str().expect("utf-8 db path"))
         .await
         .expect("migrate");
+    // Every file belongs to a library; the bench's runs all write into this
+    // one, which holds whatever root a measurement walks.
+    sqlx::query("INSERT INTO libraries (uuid, name, root_path) VALUES (?, 'Bench', '/')")
+        .bind(BENCH_LIBRARY.to_string())
+        .execute(&pool)
+        .await
+        .expect("bench library");
     let repo = SqliteCatalogRepository::new(pool.clone());
     let run_repo = SqliteCatalogRunRepository::new(pool);
     let handler = IndexHandler::new(
@@ -394,7 +404,11 @@ async fn measure(format: Format, count: usize, concurrency: u32) -> (f64, f64) {
 
     let started = Instant::now();
     let outcome = handler
-        .execute(lib.path().to_str().expect("utf-8 lib path"), Uuid::new_v4())
+        .execute(
+            lib.path().to_str().expect("utf-8 lib path"),
+            Uuid::new_v4(),
+            BENCH_LIBRARY,
+        )
         .await
         .expect("index run");
     let elapsed = started.elapsed();
@@ -430,7 +444,11 @@ async fn measure_rate(count: usize, bytes: usize) -> f64 {
 
     let started = Instant::now();
     let outcome = handler
-        .execute(lib.path().to_str().expect("utf-8 lib path"), Uuid::new_v4())
+        .execute(
+            lib.path().to_str().expect("utf-8 lib path"),
+            Uuid::new_v4(),
+            BENCH_LIBRARY,
+        )
         .await
         .expect("index run");
     let elapsed = started.elapsed();
@@ -502,7 +520,11 @@ async fn given_a_generated_library_when_indexed_then_throughput_is_measured() {
     // Fixture generation is outside the measurement; only the run is timed.
     let started = Instant::now();
     let outcome = handler
-        .execute(lib.path().to_str().expect("utf-8 lib path"), Uuid::new_v4())
+        .execute(
+            lib.path().to_str().expect("utf-8 lib path"),
+            Uuid::new_v4(),
+            BENCH_LIBRARY,
+        )
         .await
         .expect("index run");
     let elapsed = started.elapsed();
@@ -576,7 +598,7 @@ async fn given_an_index_run_in_flight_when_reads_are_issued_then_they_are_not_bl
 
     let done = indexing.clone();
     let index_task = tokio::spawn(async move {
-        let outcome = handler.execute(&root, Uuid::new_v4()).await;
+        let outcome = handler.execute(&root, Uuid::new_v4(), BENCH_LIBRARY).await;
         done.store(false, Ordering::SeqCst);
         outcome
     });

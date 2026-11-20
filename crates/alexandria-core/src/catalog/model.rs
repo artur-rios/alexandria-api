@@ -68,6 +68,9 @@ impl FileState {
 #[derive(Debug, Clone)]
 pub struct NewFile {
     pub uuid: Uuid,
+    /// The library the file belongs to. Every file belongs to exactly one
+    /// (libraries-only design); an index walk passes its run's.
+    pub library_uuid: Uuid,
     pub path: String,
     pub name: String,
     pub file_type: FileType,
