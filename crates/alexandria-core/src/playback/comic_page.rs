@@ -5,6 +5,7 @@ use uuid::Uuid;
 
 use crate::auth::AuthService;
 use crate::catalog::comic_tags::is_page_entry;
+use crate::catalog::library_root::LibraryRoot;
 use crate::catalog::model::FileType;
 use crate::catalog::repos::CatalogRepository;
 use crate::errors::DomainError;
@@ -82,7 +83,12 @@ impl ComicArchive for ZipComicArchive {
                 let entry = archive
                     .by_index(i)
                     .map_err(|e| DomainError::disk(format!("cannot read entry {i}: {e}")))?;
-                let name = entry.name().to_string();
+                // zip 9 decodes the name on demand, and a name it cannot
+                // decode fails here rather than in `by_index` as it did before.
+                let name = entry
+                    .name()
+                    .map_err(|e| DomainError::disk(format!("cannot read entry {i}: {e}")))?
+                    .into_owned();
                 if is_page_entry(&name) {
                     names.push(name);
                     indices.push(i);
@@ -212,6 +218,8 @@ pub struct ComicPageHandler<A, R, C> {
     auth: A,
     repo: R,
     archive: C,
+    /// `filesystem.root` (FR-FC-26): see `resolve_playable`.
+    library_root: LibraryRoot,
 }
 
 impl<A, R, C> ComicPageHandler<A, R, C>
@@ -220,11 +228,12 @@ where
     R: CatalogRepository,
     C: ComicArchive,
 {
-    pub fn new(auth: A, repo: R, archive: C) -> Self {
+    pub fn new(auth: A, repo: R, archive: C, library_root: LibraryRoot) -> Self {
         Self {
             auth,
             repo,
             archive,
+            library_root,
         }
     }
 
@@ -234,7 +243,8 @@ where
         page: u32,
         token: &str,
     ) -> Result<ComicPage, DomainError> {
-        let file = resolve_playable(&self.auth, &self.repo, uuid, token).await?;
+        let file =
+            resolve_playable(&self.auth, &self.repo, &self.library_root, uuid, token).await?;
 
         if file.file_type != FileType::Comic {
             return Err(DomainError::InvalidInput(format!(
@@ -299,7 +309,12 @@ mod tests {
             FileState::Active,
             None,
         ));
-        let handler = ComicPageHandler::new(FakeAuth { good: "t" }, repo, FakeArchive);
+        let handler = ComicPageHandler::new(
+            FakeAuth { good: "t" },
+            repo,
+            FakeArchive,
+            crate::catalog::library_root::LibraryRoot::unconfigured(),
+        );
 
         // Act
         let page = handler
@@ -323,7 +338,12 @@ mod tests {
             FileState::Active,
             None,
         ));
-        let handler = ComicPageHandler::new(FakeAuth { good: "t" }, repo, FakeArchive);
+        let handler = ComicPageHandler::new(
+            FakeAuth { good: "t" },
+            repo,
+            FakeArchive,
+            crate::catalog::library_root::LibraryRoot::unconfigured(),
+        );
 
         // Act
         let page = handler
@@ -344,7 +364,12 @@ mod tests {
             FileState::Active,
             None,
         ));
-        let handler = ComicPageHandler::new(FakeAuth { good: "t" }, repo, FakeArchive);
+        let handler = ComicPageHandler::new(
+            FakeAuth { good: "t" },
+            repo,
+            FakeArchive,
+            crate::catalog::library_root::LibraryRoot::unconfigured(),
+        );
 
         // Act
         let zero = handler.read_page(Uuid::nil(), 0, "t").await;
@@ -438,7 +463,12 @@ mod tests {
             FileState::Active,
             None,
         ));
-        let handler = ComicPageHandler::new(FakeAuth { good: "t" }, repo, FakeArchive);
+        let handler = ComicPageHandler::new(
+            FakeAuth { good: "t" },
+            repo,
+            FakeArchive,
+            crate::catalog::library_root::LibraryRoot::unconfigured(),
+        );
 
         // Act
         let result = handler.read_page(Uuid::nil(), 1, "t").await;
@@ -458,7 +488,12 @@ mod tests {
             FileState::Active,
             None,
         ));
-        let handler = ComicPageHandler::new(FakeAuth { good: "t" }, repo, FakeArchive);
+        let handler = ComicPageHandler::new(
+            FakeAuth { good: "t" },
+            repo,
+            FakeArchive,
+            crate::catalog::library_root::LibraryRoot::unconfigured(),
+        );
 
         // Act
         let result = handler.read_page(Uuid::nil(), 1, "t").await;

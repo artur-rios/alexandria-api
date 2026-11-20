@@ -12,7 +12,7 @@ use crate::routes::bearer_token;
 use crate::AppState;
 
 /// `PATCH /v1/files/{uuid}/metadata` — edit a file's type-specific metadata
-/// (UC-04 / FR-FC-14..18). The body is the `SubtypeMetadata` enum (internally
+/// (UC-04 / FR-FC-15..18). The body is the `SubtypeMetadata` enum (internally
 /// tagged by `type`) carrying the editable subtype fields. A PATCH is a full
 /// replace of the editable columns; absent fields write `NULL`. Returns the
 /// updated file plus its written metadata. Both the HTTP and FFI surfaces

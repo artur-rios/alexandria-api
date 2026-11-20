@@ -3,6 +3,7 @@ use uuid::Uuid;
 use crate::auth::AuthService;
 use crate::catalog::clock::Clock;
 use crate::catalog::fs::{sha256_hex, Filesystem};
+use crate::catalog::library_root::LibraryRoot;
 use crate::catalog::model::{File, FileState, FileType};
 use crate::catalog::repos::CatalogRepository;
 use crate::errors::DomainError;
@@ -46,6 +47,9 @@ pub struct EditTextFileContentHandler<A, R, F, C> {
     repo: R,
     fs: F,
     clock: C,
+    /// `filesystem.root` (FR-FC-26): a row pointing outside it has its
+    /// bytes neither read nor changed. See `LibraryRoot`.
+    library_root: LibraryRoot,
 }
 
 impl<A, R, F, C> EditTextFileContentHandler<A, R, F, C>
@@ -55,8 +59,9 @@ where
     F: Filesystem,
     C: Clock,
 {
-    pub fn new(auth: A, repo: R, fs: F, clock: C) -> Self {
+    pub fn new(auth: A, repo: R, fs: F, clock: C, library_root: LibraryRoot) -> Self {
         Self {
+            library_root,
             auth,
             repo,
             fs,
@@ -94,6 +99,12 @@ where
                 "file {uuid} is not a text file"
             )));
         }
+
+        // FR-FC-26, defence in depth: indexing and library moves are bounded
+        // by `filesystem.root`, but a row may still point outside it (indexed
+        // before the bound was configured, or through a symbolic link swapped
+        // in since). Refused before the disk is touched.
+        self.library_root.check_file(&file.path)?;
 
         let expected_hash = sha256_hex(content.as_bytes());
 

@@ -37,6 +37,7 @@ use crate::catalog::commands::soft_delete::SoftDeleteFileHandler;
 use crate::catalog::document_tags::PdfEpubMetadataReader;
 use crate::catalog::fs::StdFilesystem;
 use crate::catalog::image_tags::ExifImageMetadataReader;
+use crate::catalog::library_root::LibraryRoot;
 use crate::catalog::queries::active_runs::GetActiveRunsHandler;
 use crate::catalog::queries::browse::BrowseFilesHandler;
 use crate::catalog::queries::read_content::ReadTextFileContentHandler;
@@ -55,33 +56,15 @@ use crate::collections::queries::list_items::ListCollectionItemsHandler;
 use crate::collections::repos::SqliteCollectionRepository;
 use crate::config::AuthMode;
 use crate::config::Settings;
-use crate::enrichment::commands::{EnrichHandler, FsArtistImageStore};
-use crate::enrichment::providers::commons::CommonsImageClient;
-use crate::enrichment::providers::lrclib::LrclibClient;
-use crate::enrichment::providers::musicbrainz::MusicBrainzClient;
-use crate::enrichment::queries::ReadEnrichmentHandler;
-use crate::enrichment::repos::SqliteEnrichmentRepository;
 use crate::libraries::commands::{
-    MoveLibraryHandler, RegisterLibraryHandler, RemoveLibraryHandler,
+    IndexLibraryHandler, MoveLibraryHandler, RegisterLibraryHandler, RemoveLibraryHandler,
 };
 use crate::libraries::queries::{BrowseLibraryHandler, ListLibrariesHandler};
 use crate::libraries::repos::SqliteLibraryRepository;
 use crate::playback::comic_page::{ComicPageHandler, ZipComicArchive};
-use crate::playback::energy::{EnergyHandler, FfmpegEnergyAnalyzer, SqliteEnergyStore};
 use crate::playback::source::PlaybackSourceHandler;
 use crate::playback::thumbnail::{DiskThumbnailCache, ImageThumbnailRenderer, ThumbnailHandler};
 use crate::playback::StdFileStat;
-use crate::playlists::commands::add_entries::AddEntriesHandler;
-use crate::playlists::commands::create::CreatePlaylistHandler;
-use crate::playlists::commands::delete::DeletePlaylistHandler;
-use crate::playlists::commands::remove_entry::RemoveEntryHandler;
-use crate::playlists::commands::rename::RenamePlaylistHandler;
-use crate::playlists::commands::reorder::ReorderPlaylistHandler;
-use crate::playlists::queries::browse::BrowsePlaylistsHandler;
-use crate::playlists::repos::SqlitePlaylistRepository;
-use crate::plays::commands::record::RecordPlayHandler;
-use crate::plays::queries::stats::MusicStatsHandler;
-use crate::plays::repos::SqlitePlayRepository;
 use crate::reading_lists::commands::add_item::AddItemToReadingListHandler;
 use crate::reading_lists::commands::create::CreateReadingListHandler;
 use crate::reading_lists::commands::delete::DeleteReadingListHandler;
@@ -173,14 +156,6 @@ pub type DefaultPlaybackSourceHandler =
 
 pub type DefaultComicPageHandler =
     ComicPageHandler<RuntimeAuthService, SqliteCatalogRepository, ZipComicArchive>;
-
-/// UC-21 — a track's own sound, measured once and kept.
-pub type DefaultEnergyHandler = EnergyHandler<
-    RuntimeAuthService,
-    SqliteCatalogRepository,
-    SqliteEnergyStore,
-    FfmpegEnergyAnalyzer,
->;
 
 pub type DefaultThumbnailHandler = ThumbnailHandler<
     RuntimeAuthService,
@@ -286,59 +261,27 @@ pub type DefaultRemoveItemFromReadingListHandler =
 pub type DefaultDeleteReadingListHandler =
     DeleteReadingListHandler<RuntimeAuthService, SqliteReadingListRepository>;
 
-/// The enrichment run, over the three real service clients.
-pub type DefaultEnrichHandler = EnrichHandler<
+pub type DefaultRegisterLibraryHandler =
+    RegisterLibraryHandler<RuntimeAuthService, SqliteLibraryRepository, Arc<DefaultIndexHandler>>;
+
+pub type DefaultIndexLibraryHandler = IndexLibraryHandler<
     RuntimeAuthService,
-    SqliteEnrichmentRepository,
-    MusicBrainzClient,
-    CommonsImageClient,
-    LrclibClient,
-    FsArtistImageStore,
-    SystemClock,
+    SqliteLibraryRepository,
+    Arc<DefaultIndexHandler>,
+    SqliteCatalogRunRepository,
 >;
 
-pub type DefaultReadEnrichmentHandler =
-    ReadEnrichmentHandler<RuntimeAuthService, SqliteEnrichmentRepository>;
-
-pub type DefaultRegisterLibraryHandler =
-    RegisterLibraryHandler<RuntimeAuthService, SqliteLibraryRepository>;
-
 pub type DefaultRemoveLibraryHandler =
-    RemoveLibraryHandler<RuntimeAuthService, SqliteLibraryRepository>;
+    RemoveLibraryHandler<RuntimeAuthService, SqliteLibraryRepository, SqliteCatalogRunRepository>;
 
 pub type DefaultMoveLibraryHandler =
-    MoveLibraryHandler<RuntimeAuthService, SqliteLibraryRepository>;
+    MoveLibraryHandler<RuntimeAuthService, SqliteLibraryRepository, SqliteCatalogRunRepository>;
 
 pub type DefaultBrowseLibraryHandler =
     BrowseLibraryHandler<RuntimeAuthService, SqliteLibraryRepository, SqliteCatalogRepository>;
 
 pub type DefaultListLibrariesHandler =
     ListLibrariesHandler<RuntimeAuthService, SqliteLibraryRepository>;
-
-pub type DefaultCreatePlaylistHandler =
-    CreatePlaylistHandler<RuntimeAuthService, SqlitePlaylistRepository>;
-
-pub type DefaultRenamePlaylistHandler =
-    RenamePlaylistHandler<RuntimeAuthService, SqlitePlaylistRepository>;
-
-pub type DefaultDeletePlaylistHandler =
-    DeletePlaylistHandler<RuntimeAuthService, SqlitePlaylistRepository>;
-
-pub type DefaultAddEntriesHandler = AddEntriesHandler<RuntimeAuthService, SqlitePlaylistRepository>;
-
-pub type DefaultRemoveEntryHandler =
-    RemoveEntryHandler<RuntimeAuthService, SqlitePlaylistRepository>;
-
-pub type DefaultReorderPlaylistHandler =
-    ReorderPlaylistHandler<RuntimeAuthService, SqlitePlaylistRepository>;
-
-pub type DefaultBrowsePlaylistsHandler =
-    BrowsePlaylistsHandler<RuntimeAuthService, SqlitePlaylistRepository>;
-
-pub type DefaultRecordPlayHandler =
-    RecordPlayHandler<RuntimeAuthService, SystemClock, SqlitePlayRepository>;
-
-pub type DefaultMusicStatsHandler = MusicStatsHandler<RuntimeAuthService, SqlitePlayRepository>;
 
 pub type DefaultSetLocalCredentialsHandler =
     SetLocalCredentialsHandler<RuntimeAuthService, SqliteLocalCredentialRepository, SystemClock>;
@@ -394,7 +337,6 @@ pub struct Services {
     pub playback_source_handler: Arc<DefaultPlaybackSourceHandler>,
     pub comic_page_handler: Arc<DefaultComicPageHandler>,
     pub thumbnail_handler: Arc<DefaultThumbnailHandler>,
-    pub energy_handler: Arc<DefaultEnergyHandler>,
     pub create_collection_handler: Arc<DefaultCreateCollectionHandler>,
     pub rename_collection_handler: Arc<DefaultRenameCollectionHandler>,
     pub delete_collection_handler: Arc<DefaultDeleteCollectionHandler>,
@@ -420,37 +362,12 @@ pub struct Services {
     pub update_reading_progress_handler: Arc<DefaultUpdateReadingProgressHandler>,
     pub remove_item_from_reading_list_handler: Arc<DefaultRemoveItemFromReadingListHandler>,
     pub delete_reading_list_handler: Arc<DefaultDeleteReadingListHandler>,
-    /// `None` when enrichment is unavailable — switched off, or on with no
-    /// contact configured (`MetadataSettings::unavailable_reason`).
-    ///
-    /// An `Option` rather than a handler that always exists and refuses,
-    /// because the three service clients are only built when they can
-    /// legitimately be used: constructing a MusicBrainz client with no
-    /// contact would produce an agent string its own terms forbid sending,
-    /// and having one to hand is how it eventually gets sent.
-    pub enrich_handler: Option<Arc<DefaultEnrichHandler>>,
-    /// Always present: reading what was already cached is not a network
-    /// operation and stays available after enrichment is switched back off,
-    /// so an owner who turns it on, runs it once and turns it off keeps what
-    /// they fetched.
-    pub read_enrichment_handler: Arc<DefaultReadEnrichmentHandler>,
     pub register_library_handler: Arc<DefaultRegisterLibraryHandler>,
+    pub index_library_handler: Arc<DefaultIndexLibraryHandler>,
     pub remove_library_handler: Arc<DefaultRemoveLibraryHandler>,
     pub move_library_handler: Arc<DefaultMoveLibraryHandler>,
     pub browse_library_handler: Arc<DefaultBrowseLibraryHandler>,
     pub list_libraries_handler: Arc<DefaultListLibrariesHandler>,
-    pub create_playlist_handler: Arc<DefaultCreatePlaylistHandler>,
-    pub rename_playlist_handler: Arc<DefaultRenamePlaylistHandler>,
-    pub delete_playlist_handler: Arc<DefaultDeletePlaylistHandler>,
-    pub add_entries_handler: Arc<DefaultAddEntriesHandler>,
-    pub remove_entry_handler: Arc<DefaultRemoveEntryHandler>,
-    pub reorder_playlist_handler: Arc<DefaultReorderPlaylistHandler>,
-    pub browse_playlists_handler: Arc<DefaultBrowsePlaylistsHandler>,
-    /// Recording a play and reading the rankings it feeds (play history
-    /// design). Two handlers over one repository: everything the statistics
-    /// say is an aggregate of what this one write put there.
-    pub record_play_handler: Arc<DefaultRecordPlayHandler>,
-    pub music_stats_handler: Arc<DefaultMusicStatsHandler>,
     pub set_local_credentials_handler: Arc<DefaultSetLocalCredentialsHandler>,
     pub local_login_handler: Arc<DefaultLocalLoginHandler>,
     pub windows_login_handler: Arc<DefaultWindowsLoginHandler>,
@@ -537,16 +454,20 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
     // (FR-FC-08).
     let indexing_concurrency = settings.indexing.concurrency;
     let indexing_low_priority_concurrency = settings.indexing.low_priority_concurrency;
-    // FR-FC-26: `filesystem.root` bounds which trees UC-01 will index. It is
-    // logged here, once per process, because this is the single startup path
-    // both transports go through — the HTTP binary and `alexandria_index_init`
-    // — so the two surfaces cannot disagree about whether the bound is on.
-    // UC-02 takes no root (it re-walks paths already in the catalog), so it
-    // needs no equivalent.
-    if settings.filesystem.root.trim().is_empty() {
+    // FR-FC-26: `filesystem.root` bounds which trees UC-01 will index, where
+    // UC-51 may move a library to, and which cataloged files playback and the
+    // file-content operations will read or change. It is logged here, once
+    // per process, because this is the single startup path both transports go
+    // through — the HTTP binary and `alexandria_index_init` — so the two
+    // surfaces cannot disagree about whether the bound is on. UC-02 takes no
+    // root (it re-walks paths already in the catalog), so it needs no
+    // equivalent.
+    let library_root = LibraryRoot::new(&settings.filesystem.root);
+    if !library_root.is_configured() {
         tracing::warn!(
-            "filesystem.root is unset: indexing is unconstrained and will catalog any \
-             absolute path a caller supplies; set filesystem.root to bound it"
+            "filesystem.root is unset: indexing, library moves and file access are \
+             unconstrained and will reach any absolute path a caller supplies; set \
+             filesystem.root to bound them"
         );
     } else if let Err(err) = std::fs::canonicalize(settings.filesystem.root.trim()) {
         // Not fatal: the server still starts and every other operation still
@@ -556,7 +477,8 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         tracing::error!(
             root = %settings.filesystem.root,
             error = %err,
-            "configured filesystem.root cannot be resolved; indexing will be refused until it is fixed"
+            "configured filesystem.root cannot be resolved; indexing, library moves and file \
+             access will be refused until it is fixed"
         );
     }
     let index_handler = Arc::new(IndexHandler::new(
@@ -594,7 +516,12 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         run_registry.clone(),
     ));
     let edit_metadata_handler = Arc::new(EditMetadataHandler::new(auth.clone(), repo.clone()));
-    let rename_file_handler = Arc::new(RenameFileHandler::new(auth.clone(), repo.clone(), fs));
+    let rename_file_handler = Arc::new(RenameFileHandler::new(
+        auth.clone(),
+        repo.clone(),
+        fs,
+        library_root.clone(),
+    ));
     let soft_delete_file_handler = Arc::new(SoftDeleteFileHandler::new(
         auth.clone(),
         repo.clone(),
@@ -612,13 +539,18 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         clock,
         retention_days,
     ));
-    let purge_file_on_disk_handler =
-        Arc::new(PurgeFileOnDiskHandler::new(auth.clone(), repo.clone(), fs));
+    let purge_file_on_disk_handler = Arc::new(PurgeFileOnDiskHandler::new(
+        auth.clone(),
+        repo.clone(),
+        fs,
+        library_root.clone(),
+    ));
     let browse_files_handler = Arc::new(BrowseFilesHandler::new(auth.clone(), repo.clone()));
     let read_text_file_content_handler = Arc::new(ReadTextFileContentHandler::new(
         auth.clone(),
         repo.clone(),
         fs,
+        library_root.clone(),
     ));
     let get_run_status_handler = Arc::new(GetRunStatusHandler::new(
         auth.clone(),
@@ -655,16 +587,19 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         repo.clone(),
         fs,
         clock,
+        library_root.clone(),
     ));
     let playback_source_handler = Arc::new(PlaybackSourceHandler::new(
         auth.clone(),
         repo.clone(),
         StdFileStat,
+        library_root.clone(),
     ));
     let comic_page_handler = Arc::new(ComicPageHandler::new(
         auth.clone(),
         repo.clone(),
         ZipComicArchive,
+        library_root.clone(),
     ));
     let thumbnail_handler = Arc::new(ThumbnailHandler::new(
         auth.clone(),
@@ -677,12 +612,7 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         // file, at two different times for two different reasons (see
         // `CoverArtReader`'s own doc comment).
         LoftyCoverArtReader,
-    ));
-    let energy_handler = Arc::new(EnergyHandler::new(
-        auth.clone(),
-        repo.clone(),
-        SqliteEnergyStore::new(pool.clone()),
-        FfmpegEnergyAnalyzer,
+        library_root.clone(),
     ));
     let create_collection_handler = Arc::new(CreateCollectionHandler::new(
         auth.clone(),
@@ -795,46 +725,6 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         auth.clone(),
         reading_list_repo,
     ));
-    let enrichment_repo = SqliteEnrichmentRepository::new(pool.clone());
-    let read_enrichment_handler = Arc::new(ReadEnrichmentHandler::new(
-        auth.clone(),
-        SqliteEnrichmentRepository::new(pool.clone()),
-        &settings.metadata.image_cache_dir,
-    ));
-    // Built only when it can actually run. A client that cannot lawfully
-    // send its own User-Agent is one this process should not be holding.
-    let enrich_handler = if settings.metadata.is_available() {
-        match (
-            MusicBrainzClient::new(&settings.metadata.contact),
-            CommonsImageClient::new(&settings.metadata.contact),
-            LrclibClient::new(&settings.metadata.contact),
-        ) {
-            (Ok(identity), Ok(images), Ok(lyrics)) => Some(Arc::new(EnrichHandler::new(
-                auth.clone(),
-                enrichment_repo,
-                identity,
-                images,
-                lyrics,
-                FsArtistImageStore::new(&settings.metadata.image_cache_dir),
-                clock,
-                settings.metadata.clone(),
-            ))),
-            // A client that will not build is a configuration this process
-            // cannot honour; enrichment stays unavailable rather than
-            // half-wired, and the reason is logged once here rather than
-            // rediscovered on every call.
-            _ => {
-                tracing::warn!(
-                    "music enrichment is enabled but its service clients could not be built; \
-                     it will report as unavailable"
-                );
-                None
-            }
-        }
-    } else {
-        None
-    };
-
     let list_libraries_handler = Arc::new(ListLibrariesHandler::new(
         auth.clone(),
         SqliteLibraryRepository::new(pool.clone()),
@@ -842,14 +732,25 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
     let register_library_handler = Arc::new(RegisterLibraryHandler::new(
         auth.clone(),
         SqliteLibraryRepository::new(pool.clone()),
+        index_handler.clone(),
+        library_root.clone(),
+    ));
+    let index_library_handler = Arc::new(IndexLibraryHandler::new(
+        auth.clone(),
+        SqliteLibraryRepository::new(pool.clone()),
+        index_handler.clone(),
+        SqliteCatalogRunRepository::new(pool.clone()),
     ));
     let remove_library_handler = Arc::new(RemoveLibraryHandler::new(
         auth.clone(),
         SqliteLibraryRepository::new(pool.clone()),
+        SqliteCatalogRunRepository::new(pool.clone()),
     ));
     let move_library_handler = Arc::new(MoveLibraryHandler::new(
         auth.clone(),
         SqliteLibraryRepository::new(pool.clone()),
+        library_root.clone(),
+        SqliteCatalogRunRepository::new(pool.clone()),
     ));
     let browse_library_handler = Arc::new(BrowseLibraryHandler::new(
         auth.clone(),
@@ -857,36 +758,6 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         SqliteCatalogRepository::new(pool.clone()),
     ));
 
-    let playlist_repo = SqlitePlaylistRepository::new(pool.clone());
-    let create_playlist_handler = Arc::new(CreatePlaylistHandler::new(
-        auth.clone(),
-        playlist_repo.clone(),
-    ));
-    let rename_playlist_handler = Arc::new(RenamePlaylistHandler::new(
-        auth.clone(),
-        playlist_repo.clone(),
-    ));
-    let delete_playlist_handler = Arc::new(DeletePlaylistHandler::new(
-        auth.clone(),
-        playlist_repo.clone(),
-    ));
-    let add_entries_handler = Arc::new(AddEntriesHandler::new(auth.clone(), playlist_repo.clone()));
-    let remove_entry_handler =
-        Arc::new(RemoveEntryHandler::new(auth.clone(), playlist_repo.clone()));
-    let reorder_playlist_handler = Arc::new(ReorderPlaylistHandler::new(
-        auth.clone(),
-        playlist_repo.clone(),
-    ));
-    let browse_playlists_handler =
-        Arc::new(BrowsePlaylistsHandler::new(auth.clone(), playlist_repo));
-
-    let play_repo = SqlitePlayRepository::new(pool.clone());
-    let record_play_handler = Arc::new(RecordPlayHandler::new(
-        auth.clone(),
-        clock,
-        play_repo.clone(),
-    ));
-    let music_stats_handler = Arc::new(MusicStatsHandler::new(auth.clone(), play_repo));
     let set_local_credentials_handler = Arc::new(SetLocalCredentialsHandler::new(
         auth.clone(),
         credential_repo.clone(),
@@ -952,7 +823,6 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         playback_source_handler,
         comic_page_handler,
         thumbnail_handler,
-        energy_handler,
         create_collection_handler,
         rename_collection_handler,
         delete_collection_handler,
@@ -978,22 +848,12 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         update_reading_progress_handler,
         remove_item_from_reading_list_handler,
         delete_reading_list_handler,
-        enrich_handler,
-        read_enrichment_handler,
         register_library_handler,
+        index_library_handler,
         remove_library_handler,
         move_library_handler,
         browse_library_handler,
         list_libraries_handler,
-        create_playlist_handler,
-        rename_playlist_handler,
-        delete_playlist_handler,
-        add_entries_handler,
-        remove_entry_handler,
-        reorder_playlist_handler,
-        browse_playlists_handler,
-        record_play_handler,
-        music_stats_handler,
         set_local_credentials_handler,
         local_login_handler,
         windows_login_handler,

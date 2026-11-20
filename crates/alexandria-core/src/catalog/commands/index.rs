@@ -13,27 +13,27 @@ use crate::catalog::document_tags::DocumentMetadataReader;
 use crate::catalog::extraction::{MetadataExtractor, MetadataWrite};
 use crate::catalog::fs::{FileEntry, Filesystem};
 use crate::catalog::image_tags::ImageMetadataReader;
-use crate::catalog::index_scope::IndexScope;
+use crate::catalog::library_root::LibraryRoot;
 use crate::catalog::model::{FileType, NewFile, METADATA_VERSION};
 use crate::catalog::repos::CatalogRepository;
 use crate::catalog::run_registry::{RunCell, RunPhase, RunRegistry, RunSignal};
-use crate::catalog::runs::{CatalogRunRepository, RunCounts, RunKind, RunPriority};
+use crate::catalog::runs::{CatalogRunRepository, RunCounts, RunKind, RunPriority, RunStatus};
 use crate::catalog::video_tags::VideoMetadataReader;
 use crate::errors::DomainError;
+use crate::libraries::model::Library;
 use crate::retry::{retry_on_busy, BUSY_ATTEMPTS};
 
+/// One index run of one library: a library is the only thing a run walks.
 #[derive(Debug, Clone)]
 pub struct IndexRequest {
+    /// The library this run walks. Recorded on the run (FR-FC-43), so its
+    /// status can name the library and a second unfinished run of the same
+    /// library can be refused.
+    pub library_uuid: Uuid,
+    /// The library's folder, which is what the run walks.
     pub root: String,
     /// How hard this run should push (FR-FC-08). See `RunPriority`.
     pub priority: RunPriority,
-    /// The file types this run records. Default is every supported type, so a
-    /// caller that says nothing indexes what it always did.
-    ///
-    /// `start` writes it to the run's row beside the root, and a resume reads
-    /// it back (`RunResumed::scope`), so a run paused mid-library continues
-    /// under the scope it began with rather than widening to every type.
-    pub scope: IndexScope,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -61,6 +61,79 @@ pub struct IndexOutcome {
     pub failed: usize,
 }
 
+/// Opens the index run of a library — what registering one and re-indexing
+/// one both do (libraries-only design, section 1).
+///
+/// A trait so the library handlers can be unit-tested without the whole
+/// `IndexHandler` and its nine collaborators behind them, and so they hold
+/// the one index handler the application already builds.
+#[allow(async_fn_in_trait)]
+pub trait LibraryRunStarter: Send + Sync {
+    /// Refuse a folder no run could walk — missing, or not a folder — before
+    /// anything about the library is stored.
+    async fn check_folder(&self, root: &str) -> Result<(), DomainError>;
+
+    /// Validate the library's folder and open a run of it. The caller spawns
+    /// the walk (`IndexHandler::execute`), as for every run.
+    async fn start_library_run(
+        &self,
+        library: &Library,
+        priority: RunPriority,
+        token: &str,
+    ) -> Result<IndexStarted, DomainError>;
+}
+
+impl<T: LibraryRunStarter> LibraryRunStarter for std::sync::Arc<T> {
+    async fn check_folder(&self, root: &str) -> Result<(), DomainError> {
+        (**self).check_folder(root).await
+    }
+
+    async fn start_library_run(
+        &self,
+        library: &Library,
+        priority: RunPriority,
+        token: &str,
+    ) -> Result<IndexStarted, DomainError> {
+        (**self).start_library_run(library, priority, token).await
+    }
+}
+
+impl<A, R, F, C, M, N, O, P, Q, RR> LibraryRunStarter
+    for IndexHandler<A, R, F, C, M, N, O, P, Q, RR>
+where
+    A: AuthService,
+    R: CatalogRepository,
+    F: Filesystem,
+    C: Clock,
+    M: AudioMetadataReader,
+    N: ImageMetadataReader,
+    O: DocumentMetadataReader,
+    P: VideoMetadataReader,
+    Q: ComicMetadataReader,
+    RR: CatalogRunRepository,
+{
+    async fn check_folder(&self, root: &str) -> Result<(), DomainError> {
+        IndexHandler::check_folder(self, root).await
+    }
+
+    async fn start_library_run(
+        &self,
+        library: &Library,
+        priority: RunPriority,
+        token: &str,
+    ) -> Result<IndexStarted, DomainError> {
+        self.start(
+            IndexRequest {
+                library_uuid: library.uuid,
+                root: library.root_path.clone(),
+                priority,
+            },
+            token,
+        )
+        .await
+    }
+}
+
 /// Index library files (UC-01).
 ///
 /// `start` authenticates the caller, validates the root path — it must exist,
@@ -79,7 +152,7 @@ pub struct IndexOutcome {
 /// field, so a resumed run walks at whatever width the run currently carries
 /// — the one it was started with, or the one a resume re-paced it to
 /// (`RunControlHandler::resume`). The per-file work is a stat plus, for a
-/// supported extension, a tag-header read — never a full-file hash
+/// supported extension, an embedded-metadata read — never a full-file hash
 /// (FR-FC-09/FR-FC-10) — and `StdFilesystem` runs both on Tokio's blocking
 /// pool, so the concurrency still buys real parallelism rather than
 /// interleaved waiting. NFR-02's throughput target rests on the per-file cost
@@ -111,31 +184,14 @@ pub struct IndexHandler<A, R, F, C, M, N, O, P, Q, RR> {
     /// `Normal` counterpart and the zero clamp both share.
     low_priority_concurrency: usize,
     /// The configured library root (`filesystem.root`) every requested index
-    /// root must sit inside (FR-FC-26). `None` when the key is unset, which
-    /// leaves indexing unconstrained — the historical behaviour.
-    library_root: Option<String>,
+    /// root must sit inside (FR-FC-26). Unconfigured when the key is unset,
+    /// which leaves indexing unconstrained — the historical behaviour.
+    library_root: LibraryRoot,
     runs: RR,
     /// Where `execute` publishes this run's live progress (FR-FC-28). Shared
     /// with `GetRunStatusHandler`, which reads it back.
     registry: RunRegistry,
 }
-
-/// The client-facing rejection message for FR-FC-26 when the *requested*
-/// root is genuinely outside the configured library root. Deliberately free
-/// of the configured root's absolute path: the caller does not need to be
-/// told where the library lives in order to learn that its request was out
-/// of bounds.
-const OUTSIDE_LIBRARY_ROOT: &str = "root path is outside the configured library root";
-
-/// The client-facing rejection message for FR-FC-26 when the *server's*
-/// `filesystem.root` configuration itself cannot be resolved. Deliberately
-/// distinct from [`OUTSIDE_LIBRARY_ROOT`]: that message implies the caller's
-/// request was wrong, which is misleading here — the caller's root may be
-/// perfectly fine, and it is the server's configuration that needs fixing.
-/// Still free of the configured root's absolute path — naming the failure
-/// mode is not the same as naming the path.
-const LIBRARY_ROOT_UNRESOLVABLE: &str =
-    "the server's configured library root could not be resolved; contact the operator";
 
 /// What one scanned entry resolved to. Returned by the per-entry future so
 /// the concurrent walk can tally outcomes without sharing a counter.
@@ -236,14 +292,7 @@ where
         runs: RR,
         registry: RunRegistry,
     ) -> Self {
-        let library_root = {
-            let trimmed = library_root.trim();
-            if trimmed.is_empty() {
-                None
-            } else {
-                Some(trimmed.to_string())
-            }
-        };
+        let library_root = LibraryRoot::new(&library_root);
         Self {
             auth,
             repo,
@@ -264,6 +313,19 @@ where
         }
     }
 
+    /// A root a run can walk: one that exists and is a folder.
+    async fn check_folder(&self, root: &str) -> Result<(), DomainError> {
+        if !self.fs.path_exists(root).await {
+            return Err(DomainError::InvalidInput("root path does not exist".into()));
+        }
+        if !self.fs.is_folder(root).await {
+            return Err(DomainError::InvalidInput(
+                "root path is not a folder".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// The width a run at `priority` should be walked at — `Normal` maps to
     /// `concurrency`, `Low` to `low_priority_concurrency`. See `RunPriority`
     /// for why this is a match on a semantic enum rather than a number the
@@ -272,51 +334,6 @@ where
         match priority {
             RunPriority::Normal => self.concurrency,
             RunPriority::Low => self.low_priority_concurrency,
-        }
-    }
-
-    /// FR-FC-26: the requested root must be the configured library root or a
-    /// descendant of it. Returns `Ok(())` unconditionally when no library
-    /// root is configured.
-    ///
-    /// Both sides are canonicalized before comparison. That is what makes the
-    /// check hold against `<root>/../../etc` (the traversal is resolved away),
-    /// against `<root>` vs `<root>/` vs `<root>/.` (all resolve to the same
-    /// path), and against a symlinked root (both sides resolve to the link
-    /// target). The comparison itself is `Path::starts_with`, which matches
-    /// whole path components — a string prefix test would let `/library-evil`
-    /// slip past a `/library` bound.
-    fn check_root_within_library(&self, requested: &str) -> Result<(), DomainError> {
-        let Some(library_root) = self.library_root.as_deref() else {
-            return Ok(());
-        };
-        // A configured root that cannot be resolved is a misconfiguration, not
-        // a caller error. Fail the request rather than silently degrading to
-        // unconstrained indexing: a security bound that disappears when its
-        // configuration is wrong is worse than no bound at all, because the
-        // operator believes it is there. The process still starts and every
-        // other operation still works — only indexing is refused, and the log
-        // names the key to fix.
-        let canonical_library_root = match std::fs::canonicalize(library_root) {
-            Ok(path) => path,
-            Err(err) => {
-                tracing::error!(
-                    root = %library_root,
-                    error = %err,
-                    "configured filesystem.root cannot be resolved; refusing to index until it is fixed"
-                );
-                return Err(DomainError::InvalidInput(LIBRARY_ROOT_UNRESOLVABLE.into()));
-            }
-        };
-        // The requested root's existence was already checked above, so a
-        // canonicalization failure here means the path cannot be resolved to
-        // something comparable. Fail closed.
-        let canonical_requested = std::fs::canonicalize(requested)
-            .map_err(|_| DomainError::InvalidInput(OUTSIDE_LIBRARY_ROOT.into()))?;
-        if canonical_requested.starts_with(&canonical_library_root) {
-            Ok(())
-        } else {
-            Err(DomainError::InvalidInput(OUTSIDE_LIBRARY_ROOT.into()))
         }
     }
 
@@ -333,18 +350,14 @@ where
         token: &str,
     ) -> Result<IndexStarted, DomainError> {
         self.auth.authenticate(token).await?;
-        if !self.fs.path_exists(&request.root).await {
-            return Err(DomainError::InvalidInput("root path does not exist".into()));
-        }
-        self.check_root_within_library(&request.root)?;
+        self.check_folder(&request.root).await?;
+        // FR-FC-26 — see `LibraryRoot::contains` for how both sides are
+        // resolved. The same check bounds a library move (UC-51), so the two
+        // ways a root reaches the catalog cannot disagree about it.
+        self.library_root.check_root(&request.root)?;
         let run_id = Uuid::new_v4();
         let started_at = self.clock.now();
         let concurrency = self.concurrency_for(request.priority) as u32;
-        // The scope is recorded here, beside the root, for the reason the
-        // root is: both are what the run was told to cover, and a resume
-        // that could not read the scope back would walk the very types the
-        // owner excluded (FR-FC-33).
-        let scope = request.scope.to_wire();
         retry_on_busy(BUSY_ATTEMPTS, || {
             self.runs.start(
                 run_id,
@@ -352,7 +365,7 @@ where
                 Some(&request.root),
                 started_at,
                 concurrency,
-                scope.as_deref(),
+                Some(request.library_uuid),
             )
         })
         .await?;
@@ -375,15 +388,18 @@ where
     /// `warn`, and the walk continues. One locked file must not abandon the
     /// rest of the library. Only a failure to list the root at all aborts.
     ///
-    /// `scope` is an argument for the same reason `root` is: both say what
-    /// this walk is to cover, and both are handed in by whoever spawned it —
-    /// `IndexRequest::scope` for a fresh run, and `RunResumed::scope`, read
-    /// back off the run's row, for a resumed one.
+    /// Every file Alexandria can read is recorded: a library is the folder as
+    /// it is, so there is no per-run type filter.
+    ///
+    /// `library_uuid` is the library the run walks; every file it records
+    /// belongs to it. Handed in by whoever spawned the walk, as `root` is —
+    /// the registered or re-indexed library for a fresh run, and
+    /// `RunResumed::library_uuid`, read off the run's row, for a resumed one.
     pub async fn execute(
         &self,
         root: &str,
         run_id: Uuid,
-        scope: &IndexScope,
+        library_uuid: Uuid,
     ) -> Result<IndexOutcome, DomainError> {
         let now = self.clock.now();
         // Read from the run's own row rather than carried in as a parameter
@@ -420,8 +436,42 @@ where
         // for what a late pause with no segment to match cannot tell apart.
         // `None`, for a row that is absent or unreadable, waives that check
         // rather than inventing a segment for the write to match against.
+        //
+        // FR-FC-28: the run becomes observable here. A fresh cell reads as
+        // `Discovering` with no total, which is exactly where the walk below
+        // starts, and the guard closes the run again at every exit — a
+        // panic or a task abort included, which no explicit call can cover.
+        //
+        // Opened *before* the run's row is read, and the row's status honoured.
+        // `start` writes the row as `running` and returns; this walk is
+        // spawned after it. A pause or cancel landing in between finds no
+        // cell, so `RunControlHandler` writes the row directly — and a walk
+        // that then went ahead regardless would index a library the owner was
+        // told had stopped, and close a cancelled run as `complete` (or, for a
+        // pause, race a resumed second walk of the same run). With the cell
+        // open first, a control call almost always either sees it and raises
+        // its signal, or has already written the row this read is about to
+        // see; what remains is a control call that checked the registry just
+        // before this line and writes just after the read below.
+        let run_cell = self.registry.open(run_id);
         let (concurrency, segment) =
             match retry_on_busy(BUSY_ATTEMPTS, || self.runs.get(run_id)).await {
+                Ok(Some(run)) if run.status != RunStatus::Running => {
+                    drop(run_cell);
+                    tracing::info!(
+                        %run_id,
+                        status = ?run.status,
+                        "run was stopped before its walk began; leaving it as it stands"
+                    );
+                    return Ok(IndexOutcome {
+                        run_id,
+                        scanned: 0,
+                        indexed: 0,
+                        skipped: 0,
+                        already_cataloged: 0,
+                        failed: 0,
+                    });
+                }
                 Ok(Some(run)) => (
                     run.concurrency
                         .map(|c| c.max(1) as usize)
@@ -439,11 +489,6 @@ where
                     (self.concurrency, None)
                 }
             };
-        // FR-FC-28: the run becomes observable here. A fresh cell reads as
-        // `Discovering` with no total, which is exactly where the walk below
-        // starts, and the guard closes the run again at every exit — a
-        // panic or a task abort included, which no explicit call can cover.
-        let run_cell = self.registry.open(run_id);
         let entries = match self.fs.list_files(root).await {
             Ok(entries) => entries,
             Err(err) => {
@@ -539,17 +584,8 @@ where
                 let Some(file_type) = classify_by_extension(&entry.name) else {
                     return EntryOutcome::Skipped;
                 };
-                // Filtered after classification because the type is what is
-                // being filtered on, and only the classifier knows it. The
-                // outcome is the same `Skipped` an unsupported extension
-                // takes: in both cases the run saw the file and chose not to
-                // record it, and a second counter would split one fact across
-                // two numbers every reader would then have to add up.
-                if !scope.includes(file_type) {
-                    return EntryOutcome::Skipped;
-                }
                 let path = entry.path.clone();
-                match self.index_entry(entry, file_type, now).await {
+                match self.index_entry(entry, file_type, library_uuid, now).await {
                     Ok(outcome) => outcome,
                     Err(err) => {
                         tracing::warn!(
@@ -570,7 +606,7 @@ where
                         // could not write a note about one file.
                         if let Err(note) = self
                             .runs
-                            .record_failure(run_id, &path, &err.to_string(), now)
+                            .record_failure(run_id, &path, &err.to_string(), self.clock.now())
                             .await
                         {
                             tracing::warn!(
@@ -733,6 +769,7 @@ where
         &self,
         entry: FileEntry,
         file_type: FileType,
+        library_uuid: Uuid,
         now: DateTime<Utc>,
     ) -> Result<EntryOutcome, DomainError> {
         if self.repo.find_by_path(&entry.path).await?.is_some() {
@@ -740,6 +777,7 @@ where
         }
         let new_file = NewFile {
             uuid: Uuid::new_v4(),
+            library_uuid,
             path: entry.path.clone(),
             name: entry.name,
             file_type,

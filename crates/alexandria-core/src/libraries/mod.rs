@@ -6,8 +6,8 @@
 //! each class's recording, handout and slides across four panels, in none of
 //! which they are near each other.
 //!
-//! Laid out like `playlists`: a `model` of the domain types, a `repos` port
-//! with its Sqlite implementation, and one handler per use case.
+//! Laid out like the other feature modules: a `model` of the domain types, a
+//! `repos` port with its Sqlite implementation, and one handler per use case.
 pub mod commands;
 pub mod model;
 pub mod queries;

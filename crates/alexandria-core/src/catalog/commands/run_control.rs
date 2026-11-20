@@ -2,7 +2,6 @@ use uuid::Uuid;
 
 use crate::auth::AuthService;
 use crate::catalog::clock::Clock;
-use crate::catalog::index_scope::IndexScope;
 use crate::catalog::run_registry::{RunRegistry, RunSignal};
 use crate::catalog::runs::{CatalogRunRepository, RunKind, RunPriority, RunStatus};
 use crate::errors::DomainError;
@@ -58,19 +57,14 @@ pub struct RunControlHandler<A, RR, C> {
 ///
 /// `kind` is what says which handler's `execute` to spawn, and `root` is
 /// `None` for a refresh, which takes none.
-///
-/// `scope` is the run's own, read back off its row: a resumed segment must
-/// walk the file types the run was started with, or it would catalogue
-/// exactly the ones the owner excluded. A run recorded before the column
-/// existed, and every refresh, reads back as `IndexScope::all` — the meaning
-/// an absent scope has always had.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunResumed {
     pub run_id: Uuid,
     pub root: Option<String>,
     pub kind: RunKind,
     pub concurrency: u32,
-    pub scope: IndexScope,
+    /// The library an index run walks, read off its row; `None` for a refresh.
+    pub library_uuid: Option<Uuid>,
 }
 
 /// Which verb was asked for. Private, and deliberately not [`RunSignal`]:
@@ -240,11 +234,7 @@ where
             run_id,
             root: run.root,
             kind: run.kind,
-            // The scope the run was started with, straight off the row. The
-            // walk this resume spawns has to be told it: nothing else knows
-            // it, and defaulting to every type here would quietly index the
-            // files the run's scope was drawn to exclude.
-            scope: run.scope,
+            library_uuid: run.library_uuid,
             // The width just written, if this resume named one. Failing that,
             // the row's own — and failing *that*, the configured default, for
             // a run started before run priority ever wrote the column. Note

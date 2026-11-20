@@ -39,34 +39,30 @@ fn serial() -> std::sync::MutexGuard<'static, ()> {
 /// land, so "no progress for N seconds" fires on a run that is perfectly
 /// healthy and about to finish. Observed directly: a run sitting at 4,998 of
 /// 5,000 for over thirty seconds, then completing with `failed: 0`.
+///
+/// The run-status waits are the exception, because they have a better
+/// measure than the count: the run's own `processed`, the live per-entry
+/// counter, which does not land in bursts. For them this bounds a *stall* —
+/// see [`wait_for_run_terminal_or_paused`]. As a total it failed a healthy
+/// run on CI: the 5,000-file index, slower since every file gained a
+/// metadata-stamp write, was at 4,922 of 5,000 and still advancing when two
+/// minutes ran out.
 const ASYNC_RUN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
 
-/// The editable columns of an `audio_files` row, in the order every
-/// assertion here selects them: title, artist, album, year, genre, track,
-/// album_artist.
-type AudioMetadataRow = (
-    Option<String>,
-    Option<String>,
-    Option<String>,
-    Option<i64>,
-    Option<String>,
-    Option<i64>,
-    Option<String>,
-);
+/// The editable columns of a `video_files` row, in the order every
+/// assertion here selects them: title, year, resolution, media_kind.
+type VideoMetadataRow = (Option<String>, Option<i64>, Option<String>, Option<String>);
 
 use alexandria_ffi::{
-    alexandria_enrichment_read_track, alexandria_enrichment_run, alexandria_file_edit_metadata,
-    alexandria_file_purge, alexandria_file_purge_on_disk, alexandria_file_rename,
-    alexandria_file_restore, alexandria_file_soft_delete, alexandria_free_string,
-    alexandria_index_cancel, alexandria_index_count_files, alexandria_index_count_missing,
-    alexandria_index_files_json, alexandria_index_init, alexandria_index_pause,
-    alexandria_index_refresh_start, alexandria_index_resume, alexandria_index_run_failures_json,
-    alexandria_index_run_status_json, alexandria_index_runs_active_json, alexandria_index_start,
-    alexandria_libraries_list, alexandria_library_browse, alexandria_library_move,
-    alexandria_library_register, alexandria_library_remove, alexandria_playlist_add_entries,
-    alexandria_playlist_create, alexandria_playlist_delete, alexandria_playlist_move_entry,
-    alexandria_playlist_read, alexandria_playlist_remove_entry, alexandria_playlist_rename,
-    alexandria_playlists_list, FileMetadataResult, IndexStartResult, PlaylistJsonResult,
+    alexandria_file_edit_metadata, alexandria_file_playback_source, alexandria_file_purge,
+    alexandria_file_purge_on_disk, alexandria_file_rename, alexandria_file_restore,
+    alexandria_file_soft_delete, alexandria_free_string, alexandria_index_cancel,
+    alexandria_index_count_files, alexandria_index_count_missing, alexandria_index_files_json,
+    alexandria_index_init, alexandria_index_pause, alexandria_index_refresh_start,
+    alexandria_index_resume, alexandria_index_run_failures_json, alexandria_index_run_status_json,
+    alexandria_index_runs_active_json, alexandria_libraries_list, alexandria_library_browse,
+    alexandria_library_index_start, alexandria_library_move, alexandria_library_register,
+    alexandria_library_remove, FileMetadataResult, IndexStartResult,
 };
 
 const STATUS_RUN_OK: i32 = alexandria_ffi::RUN_OK;
@@ -89,17 +85,14 @@ const STATUS_FILE_OK: i32 = alexandria_ffi::FILE_OK;
 const STATUS_FILE_OTHER: i32 = alexandria_ffi::FILE_ERR_OTHER;
 const STATUS_FILE_DISK: i32 = alexandria_ffi::FILE_ERR_DISK;
 
-const STATUS_PLAYLIST_OK: i32 = alexandria_ffi::PLAYLIST_OK;
-const STATUS_PLAYLIST_INVALID_INPUT: i32 = alexandria_ffi::PLAYLIST_ERR_INVALID_INPUT;
-const STATUS_PLAYLIST_UNAUTHORIZED: i32 = alexandria_ffi::PLAYLIST_ERR_UNAUTHORIZED;
-const STATUS_PLAYLIST_NOT_FOUND: i32 = alexandria_ffi::PLAYLIST_ERR_NOT_FOUND;
-const STATUS_ENRICHMENT_UNAVAILABLE: i32 = alexandria_ffi::ENRICHMENT_ERR_UNAVAILABLE;
-const STATUS_ENRICHMENT_INVALID_INPUT: i32 = alexandria_ffi::ENRICHMENT_ERR_INVALID_INPUT;
-const STATUS_ENRICHMENT_OK: i32 = alexandria_ffi::ENRICHMENT_OK;
 const STATUS_LIBRARY_OK: i32 = alexandria_ffi::LIBRARY_OK;
 const STATUS_LIBRARY_CONFLICT: i32 = alexandria_ffi::LIBRARY_ERR_CONFLICT;
 const STATUS_LIBRARY_INVALID_INPUT: i32 = alexandria_ffi::LIBRARY_ERR_INVALID_INPUT;
 const STATUS_LIBRARY_NOT_FOUND: i32 = alexandria_ffi::LIBRARY_ERR_NOT_FOUND;
+const STATUS_INDEX_NOT_FOUND: i32 = alexandria_ffi::INDEX_ERR_NOT_FOUND;
+const STATUS_INDEX_CONFLICT: i32 = alexandria_ffi::INDEX_ERR_CONFLICT;
+const STATUS_PLAYBACK_OK: i32 = alexandria_ffi::PLAYBACK_OK;
+const STATUS_PLAYBACK_INVALID_INPUT: i32 = alexandria_ffi::PLAYBACK_ERR_INVALID_INPUT;
 
 /// Bearer token every smoke test authenticates with. A valid UUID: the
 /// active auth mode is local (`init_temp_db` sets `ALEXANDRIA_AUTH_MODE`), so
@@ -216,6 +209,53 @@ fn wait_for_files(expected: i64) -> i64 {
     wait_for_count("files", expected, || alexandria_index_count_files())
 }
 
+/// Index `root` the only way there is: add it as a library, which opens its
+/// first run. Answered as the run start these tests read — a status in the
+/// index family's codes and the run id — so a test reads the same whether it
+/// is about the run or the registration that started it.
+///
+/// `root` and `priority` may be NULL, as an FFI caller may pass them.
+fn index_folder(
+    root: *const std::os::raw::c_char,
+    token: *const std::os::raw::c_char,
+    priority: *const std::os::raw::c_char,
+) -> IndexStartResult {
+    let read = |ptr: *const std::os::raw::c_char| {
+        (!ptr.is_null()).then(|| {
+            unsafe { CStr::from_ptr(ptr) }
+                .to_string_lossy()
+                .into_owned()
+        })
+    };
+    let mut body = serde_json::json!({ "name": "Library", "rootPath": read(root) });
+    if let Some(priority) = read(priority) {
+        body["priority"] = serde_json::Value::String(priority);
+    }
+    let body = CString::new(body.to_string()).unwrap();
+    let result = alexandria_ffi::alexandria_library_register(body.as_ptr(), token);
+    let mut run_id = [0 as std::os::raw::c_char; 37];
+    let status = match result.status {
+        alexandria_ffi::LIBRARY_OK => {
+            let json = unsafe { CStr::from_ptr(result.json) }
+                .to_string_lossy()
+                .into_owned();
+            unsafe { alexandria_ffi::alexandria_free_string(result.json) };
+            let value: serde_json::Value = serde_json::from_str(&json).expect("library json");
+            let id = value["runId"].as_str().expect("runId");
+            for (slot, byte) in run_id.iter_mut().zip(id.bytes()) {
+                *slot = byte as std::os::raw::c_char;
+            }
+            alexandria_ffi::INDEX_OK
+        }
+        alexandria_ffi::LIBRARY_ERR_INVALID_INPUT => alexandria_ffi::INDEX_ERR_INVALID_INPUT,
+        alexandria_ffi::LIBRARY_ERR_UNAUTHORIZED => alexandria_ffi::INDEX_ERR_UNAUTHORIZED,
+        alexandria_ffi::LIBRARY_ERR_NOT_INITIALIZED => alexandria_ffi::INDEX_ERR_NOT_INITIALIZED,
+        alexandria_ffi::LIBRARY_ERR_CONFLICT => alexandria_ffi::INDEX_ERR_CONFLICT,
+        _ => alexandria_ffi::INDEX_ERR_OTHER,
+    };
+    IndexStartResult { status, run_id }
+}
+
 /// The FFI surface runs the same startup gate as the HTTP binary: external
 /// mode with nothing to verify a token against must refuse to initialize
 /// rather than come up and answer `401` to everything forever (FR-AU-08,
@@ -230,7 +270,7 @@ fn wait_for_files(expected: i64) -> i64 {
 /// the mode as it found it, and never reaches the global services slot: the
 /// gate runs before the slot is touched.
 #[test]
-fn given_external_mode_without_a_secret_when_ffi_init_then_refuses_to_start() {
+fn given_external_mode_without_a_key_set_or_secret_when_ffi_init_then_refuses_to_start() {
     // Arrange
     let _g = serial();
     let previous_mode = std::env::var("ALEXANDRIA_AUTH_MODE").ok();
@@ -238,6 +278,7 @@ fn given_external_mode_without_a_secret_when_ffi_init_then_refuses_to_start() {
     // The overrides an ambient environment might carry would configure the
     // very thing this test asserts is missing.
     for key in [
+        "ALEXANDRIA_AUTH_HEIMDALL_JWKS_URL",
         "ALEXANDRIA_AUTH_HEIMDALL_TOKEN_SECRET",
         "ALEXANDRIA_AUTH_HEIMDALL_TOKEN_SECRET_PREVIOUS",
         "ALEXANDRIA_AUTH_HEIMDALL_SCOPE_ID",
@@ -300,21 +341,16 @@ fn given_ffi_library_when_health_status_code_called_then_returns_200() {
 }
 
 #[test]
-fn given_supported_files_when_ffi_index_start_then_returns_ok_with_run_id_and_persists() {
+fn given_supported_files_when_ffi_library_register_then_returns_ok_with_run_id_and_persists() {
     let _g = serial();
     let _db = init_temp_db();
     let lib = tempdir().unwrap();
-    std::fs::write(lib.path().join("a.mp3"), b"audio").unwrap();
+    std::fs::write(lib.path().join("a.mp4"), b"video").unwrap();
     std::fs::write(lib.path().join("b.md"), b"text").unwrap();
 
     let root = c(lib.path().to_str().unwrap());
     let token = c(TEST_TOKEN);
-    let result = alexandria_index_start(
-        root.as_ptr(),
-        token.as_ptr(),
-        std::ptr::null(),
-        std::ptr::null(),
-    );
+    let result = index_folder(root.as_ptr(), token.as_ptr(), std::ptr::null());
 
     assert_eq!(result.status, STATUS_OK);
     assert!(!run_id_string(&result).is_empty());
@@ -331,22 +367,17 @@ fn given_supported_files_when_ffi_index_start_then_returns_ok_with_run_id_and_pe
     }
     let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
     assert_eq!(parsed.as_array().unwrap().len(), 2);
-    assert_eq!(parsed[0]["type"], "audio");
+    assert_eq!(parsed[0]["type"], "video");
     assert_eq!(parsed[1]["type"], "text");
 }
 
 #[test]
-fn given_missing_root_when_ffi_index_start_then_returns_invalid_input() {
+fn given_missing_root_when_ffi_library_register_then_returns_invalid_input() {
     let _g = serial();
     let _db = init_temp_db();
     let root = c("/no/such/dir/here");
     let token = c(TEST_TOKEN);
-    let result = alexandria_index_start(
-        root.as_ptr(),
-        token.as_ptr(),
-        std::ptr::null(),
-        std::ptr::null(),
-    );
+    let result = index_folder(root.as_ptr(), token.as_ptr(), std::ptr::null());
     assert_eq!(result.status, STATUS_INVALID_INPUT);
 }
 
@@ -356,7 +387,7 @@ fn given_missing_root_when_ffi_index_start_then_returns_invalid_input() {
 /// `ALEXANDRIA_*` environment — which is process-wide, so it is removed again
 /// before any assertion can unwind out of this test.
 #[test]
-fn given_root_outside_configured_library_root_when_ffi_index_start_then_invalid_input() {
+fn given_root_outside_configured_library_root_when_ffi_library_register_then_invalid_input() {
     // Arrange
     let _g = serial();
     let parent = tempdir().unwrap();
@@ -370,12 +401,7 @@ fn given_root_outside_configured_library_root_when_ffi_index_start_then_invalid_
     // Act
     let root = c(outside.to_str().unwrap());
     let token = c(TEST_TOKEN);
-    let result = alexandria_index_start(
-        root.as_ptr(),
-        token.as_ptr(),
-        std::ptr::null(),
-        std::ptr::null(),
-    );
+    let result = index_folder(root.as_ptr(), token.as_ptr(), std::ptr::null());
     std::env::remove_var("ALEXANDRIA_FILESYSTEM_ROOT");
 
     // Assert
@@ -386,7 +412,7 @@ fn given_root_outside_configured_library_root_when_ffi_index_start_then_invalid_
 /// *inside* it is accepted — so the test above is proving the constraint, not
 /// some unrelated FFI failure.
 #[test]
-fn given_root_inside_configured_library_root_when_ffi_index_start_then_ok() {
+fn given_root_inside_configured_library_root_when_ffi_library_register_then_ok() {
     // Arrange
     let _g = serial();
     let library = tempdir().unwrap();
@@ -401,12 +427,7 @@ fn given_root_inside_configured_library_root_when_ffi_index_start_then_ok() {
     // Act
     let root = c(inside.to_str().unwrap());
     let token = c(TEST_TOKEN);
-    let result = alexandria_index_start(
-        root.as_ptr(),
-        token.as_ptr(),
-        std::ptr::null(),
-        std::ptr::null(),
-    );
+    let result = index_folder(root.as_ptr(), token.as_ptr(), std::ptr::null());
     std::env::remove_var("ALEXANDRIA_FILESYSTEM_ROOT");
 
     // Assert
@@ -414,36 +435,73 @@ fn given_root_inside_configured_library_root_when_ffi_index_start_then_ok() {
 }
 
 #[test]
-fn given_empty_token_when_ffi_index_start_then_returns_unauthorized() {
+fn given_empty_token_when_ffi_library_register_then_returns_unauthorized() {
     let _g = serial();
     let _db = init_temp_db();
     let lib = tempdir().unwrap();
     let root = c(lib.path().to_str().unwrap());
     let token = c("");
-    let result = alexandria_index_start(
-        root.as_ptr(),
-        token.as_ptr(),
-        std::ptr::null(),
-        std::ptr::null(),
-    );
+    let result = index_folder(root.as_ptr(), token.as_ptr(), std::ptr::null());
     assert_eq!(result.status, STATUS_UNAUTHORIZED);
 }
 
 #[test]
-fn given_not_initialized_when_ffi_index_start_then_returns_not_initialized() {
+fn given_not_initialized_when_ffi_library_register_then_returns_not_initialized() {
     let _g = serial();
     // Replace the global slot with None by re-initializing to a fresh path and
     // then... we can only set Some. Instead, verify the freshly-initialized
     // case: after init returns OK, the slot is Some; assert a NULL root yields
     // invalid input (covers the error path that does not hit the slot error).
     let _db = init_temp_db();
-    let result = alexandria_index_start(
-        std::ptr::null(),
-        std::ptr::null(),
-        std::ptr::null(),
-        std::ptr::null(),
-    );
+    let token = c(TEST_TOKEN);
+    let result = index_folder(std::ptr::null(), token.as_ptr(), std::ptr::null());
     assert_eq!(result.status, STATUS_INVALID_INPUT);
+}
+
+/// Authentication comes before any argument, the NULL root included: HTTP's
+/// `require_auth` answers `401` before it reads a body, and this used to
+/// answer an unauthenticated caller `INVALID_INPUT` instead (FR-AU-07).
+#[test]
+fn given_a_null_root_and_no_token_when_ffi_library_register_then_unauthorized_first() {
+    let _g = serial();
+    let _db = init_temp_db();
+    let result = index_folder(std::ptr::null(), std::ptr::null(), std::ptr::null());
+    assert_eq!(result.status, STATUS_UNAUTHORIZED);
+}
+
+/// A root that is not UTF-8 is refused rather than decoded lossily: the
+/// lossy form is a different folder, with U+FFFD where the bytes were.
+#[cfg(unix)]
+#[test]
+fn given_a_root_that_is_not_utf8_when_ffi_library_register_then_invalid_input() {
+    let _g = serial();
+    let _db = init_temp_db();
+    let root = CString::new(b"/tmp/caf\xe9".to_vec()).unwrap();
+    let token = c(TEST_TOKEN);
+    let result = index_folder(root.as_ptr(), token.as_ptr(), std::ptr::null());
+    assert_eq!(result.status, STATUS_INVALID_INPUT);
+}
+
+/// Neither is a database path: decoded lossily it named a different file,
+/// and init created a new, empty catalog there instead of opening the
+/// owner's.
+#[cfg(unix)]
+#[test]
+fn given_a_db_path_that_is_not_utf8_when_ffi_init_then_invalid_input() {
+    let _g = serial();
+    let dir = tempdir().unwrap();
+    let mut bytes = dir.path().to_str().unwrap().as_bytes().to_vec();
+    bytes.extend_from_slice(b"/caf\xe9.sqlite");
+    let path = CString::new(bytes).unwrap();
+
+    let status = alexandria_index_init(path.as_ptr());
+
+    assert_eq!(status, STATUS_INVALID_INPUT);
+    assert_eq!(
+        std::fs::read_dir(dir.path()).unwrap().count(),
+        0,
+        "a database was created at the mangled path"
+    );
 }
 
 fn files_json_value() -> serde_json::Value {
@@ -468,38 +526,7 @@ fn files_json_value() -> serde_json::Value {
 /// individual row effects, so they poll the run record directly rather than
 /// racing it via `files_json_value()`.
 fn wait_for_run_terminal(run_id: &str, token: &CString) -> serde_json::Value {
-    let run_id_c = CString::new(run_id).unwrap();
-    let deadline = std::time::Instant::now() + ASYNC_RUN_DEADLINE;
-    loop {
-        let result = alexandria_index_run_status_json(run_id_c.as_ptr(), token.as_ptr());
-        assert_eq!(
-            result.status,
-            alexandria_ffi::RUN_OK,
-            "ffi run status failed"
-        );
-        assert!(!result.json.is_null());
-        // SAFETY: `json` is a NUL-terminated string owned by this call.
-        let body = unsafe { CStr::from_ptr(result.json) }
-            .to_str()
-            .unwrap()
-            .to_string();
-        // SAFETY: pointer came from this library and is freed exactly once,
-        // every iteration (not just the last).
-        unsafe {
-            alexandria_free_string(result.json);
-        }
-        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
-        if value["status"] != "running" {
-            return value;
-        }
-        if std::time::Instant::now() > deadline {
-            panic!(
-                "run {run_id} never left running after {ASYNC_RUN_DEADLINE:?}; {}",
-                run_progress(&value)
-            );
-        }
-        std::thread::sleep(std::time::Duration::from_millis(25));
-    }
+    wait_for_run_terminal_or_paused(run_id, token)
 }
 
 /// Wait until `missing_at IS NOT NULL` count reaches `expected` missing files.
@@ -509,7 +536,7 @@ fn wait_for_missing(expected: i64) -> i64 {
 
 /// Task 4 rewrote what a re-index detects a change *by* — a `stat` call
 /// (size + mtime), not a recomputed SHA-256 — so this test's old premise
-/// (capture `a.mp3`'s pre-refresh hash, then wait for refresh to produce a
+/// (capture `a.txt`'s pre-refresh hash, then wait for refresh to produce a
 /// *different* hash) is dead twice over: Task 3 already stopped indexing
 /// from computing a hash at all (a freshly indexed file's `content_hash` is
 /// `null`), and Task 4's refresh never computes a new one either — a
@@ -517,33 +544,28 @@ fn wait_for_missing(expected: i64) -> i64 {
 /// replacing it (FR-FC-10), so there is neither an old hash to capture nor a
 /// new one to compare against.
 ///
-/// What refresh actually guarantees now: `a.mp3`'s changed size is detected
+/// What refresh actually guarantees now: `a.txt`'s changed size is detected
 /// via `stat` and counted in the run's `refreshed` tally, `b.md`'s absence
-/// is counted in `markedMissing`, and `a.mp3`'s `content_hash` comes back
+/// is counted in `markedMissing`, and `a.txt`'s `content_hash` comes back
 /// `null` (not a new hash) while its `missingAt` is cleared.
 #[test]
 fn given_changed_and_deleted_files_when_ffi_refresh_then_refreshes_and_marks_missing() {
     let _g = serial();
     let _db = init_temp_db();
     let lib = tempdir().unwrap();
-    let a_path = lib.path().join("a.mp3");
+    let a_path = lib.path().join("a.txt");
     let b_path = lib.path().join("b.md");
-    std::fs::write(&a_path, b"audio-v1").unwrap();
+    std::fs::write(&a_path, b"text-v1").unwrap();
     std::fs::write(&b_path, b"text-v1").unwrap();
 
     let root = c(lib.path().to_str().unwrap());
     let token = c(TEST_TOKEN);
-    let started = alexandria_index_start(
-        root.as_ptr(),
-        token.as_ptr(),
-        std::ptr::null(),
-        std::ptr::null(),
-    );
+    let started = index_folder(root.as_ptr(), token.as_ptr(), std::ptr::null());
     assert_eq!(started.status, STATUS_OK);
     assert_eq!(wait_for_files(2), 2);
 
     // Mutate on disk: change a's bytes — and with them its size — delete b.
-    std::fs::write(&a_path, b"audio-v2-CHANGED").unwrap();
+    std::fs::write(&a_path, b"text-v2-CHANGED").unwrap();
     std::fs::remove_file(&b_path).unwrap();
 
     let refresh = alexandria_index_refresh_start(token.as_ptr(), std::ptr::null());
@@ -569,7 +591,7 @@ fn given_changed_and_deleted_files_when_ffi_refresh_then_refreshes_and_marks_mis
         .as_array()
         .unwrap()
         .iter()
-        .find(|o| o["name"] == "a.mp3")
+        .find(|o| o["name"] == "a.txt")
         .unwrap();
     let b_row = after
         .as_array()
@@ -603,7 +625,7 @@ fn _unused(c: *const c_char, s: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// UC-04: alexandria_file_edit_metadata (FR-FC-14..18, FR-FC-24)
+// UC-04: alexandria_file_edit_metadata (FR-FC-15..18, FR-FC-24)
 // ---------------------------------------------------------------------------
 
 /// Result JSON of a `FileMetadataResult` on success, parsed. Asserts `FILE_OK`.
@@ -671,57 +693,47 @@ fn uuid_by_name(db_path: &str, name: &str) -> String {
 }
 
 #[test]
-fn given_indexed_audio_file_when_ffi_edit_metadata_then_ok_and_row_updated() {
+fn given_indexed_video_file_when_ffi_edit_metadata_then_ok_and_row_updated() {
     let _g = serial();
     let (_db_dir, db_path) = init_temp_db();
     let lib = tempdir().unwrap();
-    std::fs::write(lib.path().join("song.mp3"), b"audio bytes").unwrap();
+    std::fs::write(lib.path().join("clip.mkv"), b"video bytes").unwrap();
 
     let root = c(lib.path().to_str().unwrap());
     let token = c(TEST_TOKEN);
-    let started = alexandria_index_start(
-        root.as_ptr(),
-        token.as_ptr(),
-        std::ptr::null(),
-        std::ptr::null(),
-    );
+    let started = index_folder(root.as_ptr(), token.as_ptr(), std::ptr::null());
     assert_eq!(started.status, STATUS_OK);
     assert_eq!(wait_for_files(1), 1);
 
-    let uuid = uuid_by_name(&db_path, "song.mp3");
-    let patch = c(
-        r#"{"type":"audio","title":"New Title","artist":"Artist","year":2001,"track":3,"albumArtist":"New Album Artist"}"#,
-    );
+    let uuid = uuid_by_name(&db_path, "clip.mkv");
+    let patch = c(r#"{"type":"video","title":"New Title","year":2001,"mediaKind":"series"}"#);
     let result = alexandria_file_edit_metadata(c(&uuid).as_ptr(), patch.as_ptr(), token.as_ptr());
 
     let json = metadata_json(result);
     assert_eq!(json["file"]["uuid"], uuid);
-    assert_eq!(json["file"]["fileType"], "audio");
-    assert_eq!(json["metadata"]["type"], "audio");
+    assert_eq!(json["file"]["fileType"], "video");
+    assert_eq!(json["metadata"]["type"], "video");
     assert_eq!(json["metadata"]["title"], "New Title");
-    assert_eq!(json["metadata"]["track"], 3);
-    assert_eq!(json["metadata"]["albumArtist"], "New Album Artist");
+    assert_eq!(json["metadata"]["year"], 2001);
+    assert_eq!(json["metadata"]["mediaKind"], "series");
 
     // Persisted subtype row reflects the full-replace PATCH.
     let uuid_clone = uuid.clone();
     let row = with_db(&db_path, move |pool| async move {
-        let row: AudioMetadataRow = sqlx::query_as(
-            "SELECT title, artist, album, year, genre, track, album_artist FROM audio_files \
-             JOIN files ON files.id = audio_files.file_id WHERE files.uuid = ?",
+        let row: VideoMetadataRow = sqlx::query_as(
+            "SELECT title, year, resolution, media_kind FROM video_files \
+             JOIN files ON files.id = video_files.file_id WHERE files.uuid = ?",
         )
         .bind(uuid_clone)
         .fetch_one(&pool)
         .await
-        .expect("audio row");
+        .expect("video row");
         row
     });
     assert_eq!(row.0.as_deref(), Some("New Title"));
-    assert_eq!(row.1.as_deref(), Some("Artist"));
-    assert_eq!(row.2, None, "album absent in patch -> NULL");
-    assert_eq!(row.3, Some(2001));
-    assert_eq!(row.4, None, "genre absent -> NULL");
-    assert_eq!(row.5, Some(3));
-    assert_eq!(row.6.as_deref(), Some("New Album Artist"));
+    assert_eq!(row.1, Some(2001));
+    assert_eq!(row.2, None, "resolution absent in patch -> NULL");
+    assert_eq!(row.3.as_deref(), Some("series"));
 }
 
 #[test]
@@ -729,20 +741,15 @@ fn given_ffi_edit_metadata_variant_mismatch_then_invalid_input() {
     let _g = serial();
     let (_db_dir, db_path) = init_temp_db();
     let lib = tempdir().unwrap();
-    std::fs::write(lib.path().join("song.mp3"), b"audio").unwrap();
+    std::fs::write(lib.path().join("photo.png"), b"image").unwrap();
 
     let root = c(lib.path().to_str().unwrap());
     let token = c(TEST_TOKEN);
-    let started = alexandria_index_start(
-        root.as_ptr(),
-        token.as_ptr(),
-        std::ptr::null(),
-        std::ptr::null(),
-    );
+    let started = index_folder(root.as_ptr(), token.as_ptr(), std::ptr::null());
     assert_eq!(started.status, STATUS_OK);
     assert_eq!(wait_for_files(1), 1);
 
-    let uuid = uuid_by_name(&db_path, "song.mp3");
+    let uuid = uuid_by_name(&db_path, "photo.png");
     let patch = c(r#"{"type":"video","title":"x"}"#);
     let result = alexandria_file_edit_metadata(c(&uuid).as_ptr(), patch.as_ptr(), token.as_ptr());
     assert_eq!(result.status, STATUS_FILE_INVALID_INPUT);
@@ -754,18 +761,13 @@ fn given_ffi_edit_metadata_bad_patch_json_then_invalid_input() {
     let _g = serial();
     let (_db_dir, db_path) = init_temp_db();
     let lib = tempdir().unwrap();
-    std::fs::write(lib.path().join("song.mp3"), b"audio").unwrap();
+    std::fs::write(lib.path().join("memo.txt"), b"text").unwrap();
     let root = c(lib.path().to_str().unwrap());
     let token = c(TEST_TOKEN);
-    alexandria_index_start(
-        root.as_ptr(),
-        token.as_ptr(),
-        std::ptr::null(),
-        std::ptr::null(),
-    );
+    index_folder(root.as_ptr(), token.as_ptr(), std::ptr::null());
     assert_eq!(wait_for_files(1), 1);
 
-    let uuid = uuid_by_name(&db_path, "song.mp3");
+    let uuid = uuid_by_name(&db_path, "memo.txt");
     let patch = c("not-json-at-all");
     let result = alexandria_file_edit_metadata(c(&uuid).as_ptr(), patch.as_ptr(), token.as_ptr());
     assert_eq!(result.status, STATUS_FILE_INVALID_INPUT);
@@ -777,7 +779,7 @@ fn given_ffi_edit_metadata_missing_uuid_then_not_found() {
     let (_db_dir, _db_path) = init_temp_db();
     let token = c(TEST_TOKEN);
     let uuid = c("11111111-1111-1111-1111-111111111111");
-    let patch = c(r#"{"type":"audio","title":"x"}"#);
+    let patch = c(r#"{"type":"video","title":"x"}"#);
     let result = alexandria_file_edit_metadata(uuid.as_ptr(), patch.as_ptr(), token.as_ptr());
     assert_eq!(result.status, STATUS_FILE_NOT_FOUND);
 }
@@ -787,19 +789,14 @@ fn given_ffi_edit_metadata_no_token_then_unauthorized() {
     let _g = serial();
     let (_db_dir, db_path) = init_temp_db();
     let lib = tempdir().unwrap();
-    std::fs::write(lib.path().join("song.mp3"), b"audio").unwrap();
+    std::fs::write(lib.path().join("clip.mkv"), b"video").unwrap();
     let root = c(lib.path().to_str().unwrap());
     let token = c(TEST_TOKEN);
-    alexandria_index_start(
-        root.as_ptr(),
-        token.as_ptr(),
-        std::ptr::null(),
-        std::ptr::null(),
-    );
+    index_folder(root.as_ptr(), token.as_ptr(), std::ptr::null());
     assert_eq!(wait_for_files(1), 1);
 
-    let uuid = uuid_by_name(&db_path, "song.mp3");
-    let patch = c(r#"{"type":"audio","title":"x"}"#);
+    let uuid = uuid_by_name(&db_path, "clip.mkv");
+    let patch = c(r#"{"type":"video","title":"x"}"#);
     let empty = c("");
     let result = alexandria_file_edit_metadata(c(&uuid).as_ptr(), patch.as_ptr(), empty.as_ptr());
     assert_eq!(result.status, STATUS_FILE_UNAUTHORIZED);
@@ -810,18 +807,13 @@ fn given_ffi_edit_metadata_deleted_file_then_invalid_state() {
     let _g = serial();
     let (_db_dir, db_path) = init_temp_db();
     let lib = tempdir().unwrap();
-    std::fs::write(lib.path().join("song.mp3"), b"audio").unwrap();
+    std::fs::write(lib.path().join("clip.mkv"), b"video").unwrap();
     let root = c(lib.path().to_str().unwrap());
     let token = c(TEST_TOKEN);
-    alexandria_index_start(
-        root.as_ptr(),
-        token.as_ptr(),
-        std::ptr::null(),
-        std::ptr::null(),
-    );
+    index_folder(root.as_ptr(), token.as_ptr(), std::ptr::null());
     assert_eq!(wait_for_files(1), 1);
 
-    let uuid = uuid_by_name(&db_path, "song.mp3");
+    let uuid = uuid_by_name(&db_path, "clip.mkv");
     let uuid_for_seed = uuid.clone();
     with_db(&db_path, move |pool| async move {
         sqlx::query("UPDATE files SET state = 'deleted', deleted_at = ? WHERE uuid = ?")
@@ -832,7 +824,7 @@ fn given_ffi_edit_metadata_deleted_file_then_invalid_state() {
             .expect("soft-delete seed");
     });
 
-    let patch = c(r#"{"type":"audio","title":"x"}"#);
+    let patch = c(r#"{"type":"video","title":"x"}"#);
     let result = alexandria_file_edit_metadata(c(&uuid).as_ptr(), patch.as_ptr(), token.as_ptr());
     assert_eq!(result.status, STATUS_FILE_INVALID_STATE);
 }
@@ -879,38 +871,33 @@ fn given_indexed_file_when_ffi_rename_then_ok_and_disk_and_catalog_updated() {
     let _g = serial();
     let (_db_dir, db_path) = init_temp_db();
     let lib = tempdir().unwrap();
-    std::fs::write(lib.path().join("song.mp3"), b"audio bytes").unwrap();
+    std::fs::write(lib.path().join("memo.txt"), b"text bytes").unwrap();
 
     let root = c(lib.path().to_str().unwrap());
     let token = c(TEST_TOKEN);
-    alexandria_index_start(
-        root.as_ptr(),
-        token.as_ptr(),
-        std::ptr::null(),
-        std::ptr::null(),
-    );
+    index_folder(root.as_ptr(), token.as_ptr(), std::ptr::null());
     wait_for_files(1);
 
-    let uuid = uuid_by_name(&db_path, "song.mp3");
-    let name = c("renamed.mp3");
+    let uuid = uuid_by_name(&db_path, "memo.txt");
+    let name = c("renamed.txt");
     let result = alexandria_file_rename(c(&uuid).as_ptr(), name.as_ptr(), token.as_ptr());
 
     let json = file_json_ok(result);
     assert_eq!(json["uuid"], uuid);
-    assert_eq!(json["name"], "renamed.mp3");
+    assert_eq!(json["name"], "renamed.txt");
     assert_eq!(json["state"], "active");
     let new_path = json["path"].as_str().expect("path string");
-    assert!(new_path.ends_with("renamed.mp3"));
+    assert!(new_path.ends_with("renamed.txt"));
 
     // On-disk file moved.
     assert!(
-        !lib.path().join("song.mp3").exists(),
+        !lib.path().join("memo.txt").exists(),
         "old path gone after rename"
     );
-    assert!(lib.path().join("renamed.mp3").exists(), "new path present");
+    assert!(lib.path().join("renamed.txt").exists(), "new path present");
     assert_eq!(
-        std::fs::read(lib.path().join("renamed.mp3")).unwrap(),
-        b"audio bytes"
+        std::fs::read(lib.path().join("renamed.txt")).unwrap(),
+        b"text bytes"
     );
 
     // Catalog row updated.
@@ -921,8 +908,8 @@ fn given_indexed_file_when_ffi_rename_then_ok_and_disk_and_catalog_updated() {
             .await
             .expect("catalog row")
     });
-    assert_eq!(name, "renamed.mp3");
-    assert!(path.ends_with("renamed.mp3"));
+    assert_eq!(name, "renamed.txt");
+    assert!(path.ends_with("renamed.txt"));
 }
 
 #[test]
@@ -930,17 +917,12 @@ fn given_ffi_rename_invalid_name_then_invalid_input() {
     let _g = serial();
     let (_db_dir, db_path) = init_temp_db();
     let lib = tempdir().unwrap();
-    std::fs::write(lib.path().join("song.mp3"), b"x").unwrap();
+    std::fs::write(lib.path().join("memo.txt"), b"x").unwrap();
     let root = c(lib.path().to_str().unwrap());
     let token = c(TEST_TOKEN);
-    alexandria_index_start(
-        root.as_ptr(),
-        token.as_ptr(),
-        std::ptr::null(),
-        std::ptr::null(),
-    );
+    index_folder(root.as_ptr(), token.as_ptr(), std::ptr::null());
     wait_for_files(1);
-    let uuid = uuid_by_name(&db_path, "song.mp3");
+    let uuid = uuid_by_name(&db_path, "memo.txt");
 
     for bad in ["/x", "..", "a:b"] {
         let bad = c(bad);
@@ -959,7 +941,7 @@ fn given_ffi_rename_missing_uuid_then_not_found() {
     let (_db_dir, _db_path) = init_temp_db();
     let token = c(TEST_TOKEN);
     let uuid = c("11111111-1111-1111-1111-111111111111");
-    let name = c("new.mp3");
+    let name = c("new.txt");
     let result = alexandria_file_rename(uuid.as_ptr(), name.as_ptr(), token.as_ptr());
     assert_eq!(result.status, STATUS_FILE_NOT_FOUND);
 }
@@ -969,19 +951,14 @@ fn given_ffi_rename_no_token_then_unauthorized() {
     let _g = serial();
     let (_db_dir, db_path) = init_temp_db();
     let lib = tempdir().unwrap();
-    std::fs::write(lib.path().join("song.mp3"), b"x").unwrap();
+    std::fs::write(lib.path().join("memo.txt"), b"x").unwrap();
     let root = c(lib.path().to_str().unwrap());
     let token = c(TEST_TOKEN);
-    alexandria_index_start(
-        root.as_ptr(),
-        token.as_ptr(),
-        std::ptr::null(),
-        std::ptr::null(),
-    );
+    index_folder(root.as_ptr(), token.as_ptr(), std::ptr::null());
     wait_for_files(1);
 
-    let uuid = uuid_by_name(&db_path, "song.mp3");
-    let name = c("renamed.mp3");
+    let uuid = uuid_by_name(&db_path, "memo.txt");
+    let name = c("renamed.txt");
     let empty = c("");
     let result = alexandria_file_rename(c(&uuid).as_ptr(), name.as_ptr(), empty.as_ptr());
     assert_eq!(result.status, STATUS_FILE_UNAUTHORIZED);
@@ -992,18 +969,13 @@ fn given_ffi_rename_deleted_file_then_invalid_state() {
     let _g = serial();
     let (_db_dir, db_path) = init_temp_db();
     let lib = tempdir().unwrap();
-    std::fs::write(lib.path().join("song.mp3"), b"x").unwrap();
+    std::fs::write(lib.path().join("memo.txt"), b"x").unwrap();
     let root = c(lib.path().to_str().unwrap());
     let token = c(TEST_TOKEN);
-    alexandria_index_start(
-        root.as_ptr(),
-        token.as_ptr(),
-        std::ptr::null(),
-        std::ptr::null(),
-    );
+    index_folder(root.as_ptr(), token.as_ptr(), std::ptr::null());
     wait_for_files(1);
 
-    let uuid = uuid_by_name(&db_path, "song.mp3");
+    let uuid = uuid_by_name(&db_path, "memo.txt");
     let uuid_for_seed = uuid.clone();
     with_db(&db_path, move |pool| async move {
         sqlx::query("UPDATE files SET state = 'deleted', deleted_at = ? WHERE uuid = ?")
@@ -1014,7 +986,7 @@ fn given_ffi_rename_deleted_file_then_invalid_state() {
             .expect("soft-delete seed");
     });
 
-    let name = c("renamed.mp3");
+    let name = c("renamed.txt");
     let result = alexandria_file_rename(c(&uuid).as_ptr(), name.as_ptr(), token.as_ptr());
     assert_eq!(result.status, STATUS_FILE_INVALID_STATE);
 }
@@ -1024,20 +996,15 @@ fn given_ffi_rename_target_owned_by_other_file_then_disk_error() {
     let _g = serial();
     let (_db_dir, db_path) = init_temp_db();
     let lib = tempdir().unwrap();
-    std::fs::write(lib.path().join("a.mp3"), b"aaa").unwrap();
-    std::fs::write(lib.path().join("b.mp3"), b"bbb").unwrap();
+    std::fs::write(lib.path().join("a.txt"), b"aaa").unwrap();
+    std::fs::write(lib.path().join("b.txt"), b"bbb").unwrap();
     let root = c(lib.path().to_str().unwrap());
     let token = c(TEST_TOKEN);
-    alexandria_index_start(
-        root.as_ptr(),
-        token.as_ptr(),
-        std::ptr::null(),
-        std::ptr::null(),
-    );
+    index_folder(root.as_ptr(), token.as_ptr(), std::ptr::null());
     wait_for_files(2);
 
-    let uuid_a = uuid_by_name(&db_path, "a.mp3");
-    let name = c("b.mp3");
+    let uuid_a = uuid_by_name(&db_path, "a.txt");
+    let name = c("b.txt");
     let result = alexandria_file_rename(c(&uuid_a).as_ptr(), name.as_ptr(), token.as_ptr());
     assert_eq!(
         result.status, STATUS_FILE_DISK,
@@ -1045,10 +1012,10 @@ fn given_ffi_rename_target_owned_by_other_file_then_disk_error() {
     );
     assert!(result.json.is_null());
 
-    // a.mp3 left untouched on disk.
+    // a.txt left untouched on disk.
     assert!(
-        lib.path().join("a.mp3").exists(),
-        "a.mp3 untouched after refusal"
+        lib.path().join("a.txt").exists(),
+        "a.txt untouched after refusal"
     );
 }
 
@@ -1061,19 +1028,14 @@ fn given_indexed_file_when_ffi_soft_delete_then_ok_and_catalog_deleted() {
     let _g = serial();
     let (_db_dir, db_path) = init_temp_db();
     let lib = tempdir().unwrap();
-    std::fs::write(lib.path().join("song.mp3"), b"audio bytes").unwrap();
+    std::fs::write(lib.path().join("memo.txt"), b"text bytes").unwrap();
 
     let root = c(lib.path().to_str().unwrap());
     let token = c(TEST_TOKEN);
-    alexandria_index_start(
-        root.as_ptr(),
-        token.as_ptr(),
-        std::ptr::null(),
-        std::ptr::null(),
-    );
+    index_folder(root.as_ptr(), token.as_ptr(), std::ptr::null());
     wait_for_files(1);
 
-    let uuid = uuid_by_name(&db_path, "song.mp3");
+    let uuid = uuid_by_name(&db_path, "memo.txt");
     let result = alexandria_file_soft_delete(c(&uuid).as_ptr(), token.as_ptr());
 
     let json = file_json_ok(result);
@@ -1086,7 +1048,7 @@ fn given_indexed_file_when_ffi_soft_delete_then_ok_and_catalog_deleted() {
 
     // The on-disk file is untouched (UC-06 leaves it; purge-on-disk is UC-09).
     assert!(
-        lib.path().join("song.mp3").exists(),
+        lib.path().join("memo.txt").exists(),
         "on-disk file preserved"
     );
 
@@ -1119,18 +1081,13 @@ fn given_ffi_soft_delete_no_token_then_unauthorized() {
     let _g = serial();
     let (_db_dir, db_path) = init_temp_db();
     let lib = tempdir().unwrap();
-    std::fs::write(lib.path().join("song.mp3"), b"x").unwrap();
+    std::fs::write(lib.path().join("memo.txt"), b"x").unwrap();
     let root = c(lib.path().to_str().unwrap());
     let token = c(TEST_TOKEN);
-    alexandria_index_start(
-        root.as_ptr(),
-        token.as_ptr(),
-        std::ptr::null(),
-        std::ptr::null(),
-    );
+    index_folder(root.as_ptr(), token.as_ptr(), std::ptr::null());
     wait_for_files(1);
 
-    let uuid = uuid_by_name(&db_path, "song.mp3");
+    let uuid = uuid_by_name(&db_path, "memo.txt");
     let empty = c("");
     let result = alexandria_file_soft_delete(c(&uuid).as_ptr(), empty.as_ptr());
     assert_eq!(result.status, STATUS_FILE_UNAUTHORIZED);
@@ -1142,18 +1099,13 @@ fn given_ffi_soft_delete_already_deleted_then_invalid_state() {
     let _g = serial();
     let (_db_dir, db_path) = init_temp_db();
     let lib = tempdir().unwrap();
-    std::fs::write(lib.path().join("song.mp3"), b"x").unwrap();
+    std::fs::write(lib.path().join("memo.txt"), b"x").unwrap();
     let root = c(lib.path().to_str().unwrap());
     let token = c(TEST_TOKEN);
-    alexandria_index_start(
-        root.as_ptr(),
-        token.as_ptr(),
-        std::ptr::null(),
-        std::ptr::null(),
-    );
+    index_folder(root.as_ptr(), token.as_ptr(), std::ptr::null());
     wait_for_files(1);
 
-    let uuid = uuid_by_name(&db_path, "song.mp3");
+    let uuid = uuid_by_name(&db_path, "memo.txt");
     let uuid_for_seed = uuid.clone();
     with_db(&db_path, move |pool| async move {
         sqlx::query("UPDATE files SET state = 'deleted', deleted_at = ? WHERE uuid = ?")
@@ -1177,19 +1129,14 @@ fn given_soft_deleted_file_when_ffi_restore_then_ok_and_catalog_active() {
     let _g = serial();
     let (_db_dir, db_path) = init_temp_db();
     let lib = tempdir().unwrap();
-    std::fs::write(lib.path().join("song.mp3"), b"audio bytes").unwrap();
+    std::fs::write(lib.path().join("memo.txt"), b"text bytes").unwrap();
 
     let root = c(lib.path().to_str().unwrap());
     let token = c(TEST_TOKEN);
-    alexandria_index_start(
-        root.as_ptr(),
-        token.as_ptr(),
-        std::ptr::null(),
-        std::ptr::null(),
-    );
+    index_folder(root.as_ptr(), token.as_ptr(), std::ptr::null());
     wait_for_files(1);
 
-    let uuid = uuid_by_name(&db_path, "song.mp3");
+    let uuid = uuid_by_name(&db_path, "memo.txt");
 
     // Seed a soft-deleted row whose `deleted_at` is comfortably within the
     // default 30-day retention window (one day ago). Exact-boundary coverage
@@ -1216,7 +1163,7 @@ fn given_soft_deleted_file_when_ffi_restore_then_ok_and_catalog_active() {
 
     // The on-disk file is untouched (UC-07 leaves it; purge-on-disk is UC-09).
     assert!(
-        lib.path().join("song.mp3").exists(),
+        lib.path().join("memo.txt").exists(),
         "on-disk file preserved"
     );
 
@@ -1249,18 +1196,13 @@ fn given_ffi_restore_no_token_then_unauthorized() {
     let _g = serial();
     let (_db_dir, db_path) = init_temp_db();
     let lib = tempdir().unwrap();
-    std::fs::write(lib.path().join("song.mp3"), b"x").unwrap();
+    std::fs::write(lib.path().join("memo.txt"), b"x").unwrap();
     let root = c(lib.path().to_str().unwrap());
     let token = c(TEST_TOKEN);
-    alexandria_index_start(
-        root.as_ptr(),
-        token.as_ptr(),
-        std::ptr::null(),
-        std::ptr::null(),
-    );
+    index_folder(root.as_ptr(), token.as_ptr(), std::ptr::null());
     wait_for_files(1);
 
-    let uuid = uuid_by_name(&db_path, "song.mp3");
+    let uuid = uuid_by_name(&db_path, "memo.txt");
     let empty = c("");
     let result = alexandria_file_restore(c(&uuid).as_ptr(), empty.as_ptr());
     assert_eq!(result.status, STATUS_FILE_UNAUTHORIZED);
@@ -1272,19 +1214,14 @@ fn given_ffi_restore_active_file_then_invalid_state() {
     let _g = serial();
     let (_db_dir, db_path) = init_temp_db();
     let lib = tempdir().unwrap();
-    std::fs::write(lib.path().join("song.mp3"), b"x").unwrap();
+    std::fs::write(lib.path().join("memo.txt"), b"x").unwrap();
     let root = c(lib.path().to_str().unwrap());
     let token = c(TEST_TOKEN);
-    alexandria_index_start(
-        root.as_ptr(),
-        token.as_ptr(),
-        std::ptr::null(),
-        std::ptr::null(),
-    );
+    index_folder(root.as_ptr(), token.as_ptr(), std::ptr::null());
     wait_for_files(1);
 
     // Indexed but never soft-deleted — `state = 'active'` (AF-02 not-deleted).
-    let uuid = uuid_by_name(&db_path, "song.mp3");
+    let uuid = uuid_by_name(&db_path, "memo.txt");
     let result = alexandria_file_restore(c(&uuid).as_ptr(), token.as_ptr());
     assert_eq!(result.status, STATUS_FILE_INVALID_STATE);
 }
@@ -1298,18 +1235,13 @@ fn given_soft_deleted_file_past_retention_when_ffi_restore_then_not_found() {
     let _g = serial();
     let (_db_dir, db_path) = init_temp_db();
     let lib = tempdir().unwrap();
-    std::fs::write(lib.path().join("song.mp3"), b"x").unwrap();
+    std::fs::write(lib.path().join("memo.txt"), b"x").unwrap();
     let root = c(lib.path().to_str().unwrap());
     let token = c(TEST_TOKEN);
-    alexandria_index_start(
-        root.as_ptr(),
-        token.as_ptr(),
-        std::ptr::null(),
-        std::ptr::null(),
-    );
+    index_folder(root.as_ptr(), token.as_ptr(), std::ptr::null());
     wait_for_files(1);
 
-    let uuid = uuid_by_name(&db_path, "song.mp3");
+    let uuid = uuid_by_name(&db_path, "memo.txt");
     let uuid_for_seed = uuid.clone();
     with_db(&db_path, move |pool| async move {
         sqlx::query("UPDATE files SET state = 'deleted', deleted_at = ? WHERE uuid = ?")
@@ -1333,19 +1265,14 @@ fn given_soft_deleted_file_past_retention_when_ffi_purge_then_ok_and_rows_remove
     let _g = serial();
     let (_db_dir, db_path) = init_temp_db();
     let lib = tempdir().unwrap();
-    std::fs::write(lib.path().join("song.mp3"), b"audio bytes").unwrap();
+    std::fs::write(lib.path().join("memo.txt"), b"text bytes").unwrap();
 
     let root = c(lib.path().to_str().unwrap());
     let token = c(TEST_TOKEN);
-    alexandria_index_start(
-        root.as_ptr(),
-        token.as_ptr(),
-        std::ptr::null(),
-        std::ptr::null(),
-    );
+    index_folder(root.as_ptr(), token.as_ptr(), std::ptr::null());
     wait_for_files(1);
 
-    let uuid = uuid_by_name(&db_path, "song.mp3");
+    let uuid = uuid_by_name(&db_path, "memo.txt");
 
     // `deleted_at` well past the default 30-day retention window.
     let uuid_for_seed = uuid.clone();
@@ -1375,11 +1302,11 @@ fn given_soft_deleted_file_past_retention_when_ffi_purge_then_ok_and_rows_remove
 
     // The on-disk file is untouched (NFR-07; purge-on-disk is UC-09).
     assert!(
-        lib.path().join("song.mp3").exists(),
+        lib.path().join("memo.txt").exists(),
         "on-disk file preserved"
     );
 
-    // The `files` row and its subtype row (audio_files) are both gone.
+    // The `files` row and its subtype row (text_files) are both gone.
     let uuid_for_check = uuid.clone();
     let (files_remaining, subtype_remaining): (i64, i64) =
         with_db(&db_path, move |pool| async move {
@@ -1389,11 +1316,11 @@ fn given_soft_deleted_file_past_retention_when_ffi_purge_then_ok_and_rows_remove
                 .await
                 .expect("files count");
             let (subtype,): (i64,) =
-                sqlx::query_as("SELECT COUNT(*) FROM audio_files WHERE file_id = ?")
+                sqlx::query_as("SELECT COUNT(*) FROM text_files WHERE file_id = ?")
                     .bind(file_id)
                     .fetch_one(&pool)
                     .await
-                    .expect("audio_files count");
+                    .expect("text_files count");
             (files, subtype)
         });
     assert_eq!(files_remaining, 0, "files row removed by purge");
@@ -1416,18 +1343,13 @@ fn given_ffi_purge_no_token_then_unauthorized() {
     let _g = serial();
     let (_db_dir, db_path) = init_temp_db();
     let lib = tempdir().unwrap();
-    std::fs::write(lib.path().join("song.mp3"), b"x").unwrap();
+    std::fs::write(lib.path().join("memo.txt"), b"x").unwrap();
     let root = c(lib.path().to_str().unwrap());
     let token = c(TEST_TOKEN);
-    alexandria_index_start(
-        root.as_ptr(),
-        token.as_ptr(),
-        std::ptr::null(),
-        std::ptr::null(),
-    );
+    index_folder(root.as_ptr(), token.as_ptr(), std::ptr::null());
     wait_for_files(1);
 
-    let uuid = uuid_by_name(&db_path, "song.mp3");
+    let uuid = uuid_by_name(&db_path, "memo.txt");
     let empty = c("");
     let result = alexandria_file_purge(c(&uuid).as_ptr(), empty.as_ptr());
     assert_eq!(result.status, STATUS_FILE_UNAUTHORIZED);
@@ -1450,19 +1372,14 @@ fn given_ffi_purge_active_file_then_invalid_state() {
     let _g = serial();
     let (_db_dir, db_path) = init_temp_db();
     let lib = tempdir().unwrap();
-    std::fs::write(lib.path().join("song.mp3"), b"x").unwrap();
+    std::fs::write(lib.path().join("memo.txt"), b"x").unwrap();
     let root = c(lib.path().to_str().unwrap());
     let token = c(TEST_TOKEN);
-    alexandria_index_start(
-        root.as_ptr(),
-        token.as_ptr(),
-        std::ptr::null(),
-        std::ptr::null(),
-    );
+    index_folder(root.as_ptr(), token.as_ptr(), std::ptr::null());
     wait_for_files(1);
 
     // Indexed but never soft-deleted — `state = 'active'` (AF-01 not-deleted).
-    let uuid = uuid_by_name(&db_path, "song.mp3");
+    let uuid = uuid_by_name(&db_path, "memo.txt");
     let result = alexandria_file_purge(c(&uuid).as_ptr(), token.as_ptr());
     assert_eq!(result.status, STATUS_FILE_INVALID_STATE);
     assert!(result.json.is_null());
@@ -1473,18 +1390,13 @@ fn given_ffi_purge_within_retention_then_invalid_state_and_row_kept() {
     let _g = serial();
     let (_db_dir, db_path) = init_temp_db();
     let lib = tempdir().unwrap();
-    std::fs::write(lib.path().join("song.mp3"), b"x").unwrap();
+    std::fs::write(lib.path().join("memo.txt"), b"x").unwrap();
     let root = c(lib.path().to_str().unwrap());
     let token = c(TEST_TOKEN);
-    alexandria_index_start(
-        root.as_ptr(),
-        token.as_ptr(),
-        std::ptr::null(),
-        std::ptr::null(),
-    );
+    index_folder(root.as_ptr(), token.as_ptr(), std::ptr::null());
     wait_for_files(1);
 
-    let uuid = uuid_by_name(&db_path, "song.mp3");
+    let uuid = uuid_by_name(&db_path, "memo.txt");
 
     // `deleted_at` one day ago — comfortably within the default 30-day
     // retention window. Exact-boundary coverage is in the core unit tests
@@ -1524,21 +1436,16 @@ fn given_active_file_when_ffi_purge_on_disk_then_ok_and_disk_and_rows_removed() 
     let _g = serial();
     let (_db_dir, db_path) = init_temp_db();
     let lib = tempdir().unwrap();
-    std::fs::write(lib.path().join("song.mp3"), b"audio bytes").unwrap();
+    std::fs::write(lib.path().join("memo.txt"), b"text bytes").unwrap();
 
     let root = c(lib.path().to_str().unwrap());
     let token = c(TEST_TOKEN);
-    alexandria_index_start(
-        root.as_ptr(),
-        token.as_ptr(),
-        std::ptr::null(),
-        std::ptr::null(),
-    );
+    index_folder(root.as_ptr(), token.as_ptr(), std::ptr::null());
     wait_for_files(1);
 
     // No retention gate for UC-09 — an `active` (never soft-deleted) record
     // is purgeable, unlike UC-08.
-    let uuid = uuid_by_name(&db_path, "song.mp3");
+    let uuid = uuid_by_name(&db_path, "memo.txt");
     let file_id: i64 = with_db(&db_path, {
         let uuid = uuid.clone();
         move |pool| async move {
@@ -1558,7 +1465,7 @@ fn given_active_file_when_ffi_purge_on_disk_then_ok_and_disk_and_rows_removed() 
     assert_eq!(json["diskFilePresent"], true);
 
     assert!(
-        !lib.path().join("song.mp3").exists(),
+        !lib.path().join("memo.txt").exists(),
         "on-disk file removed by purge-on-disk"
     );
 
@@ -1571,11 +1478,11 @@ fn given_active_file_when_ffi_purge_on_disk_then_ok_and_disk_and_rows_removed() 
                 .await
                 .expect("files count");
             let (subtype,): (i64,) =
-                sqlx::query_as("SELECT COUNT(*) FROM audio_files WHERE file_id = ?")
+                sqlx::query_as("SELECT COUNT(*) FROM text_files WHERE file_id = ?")
                     .bind(file_id)
                     .fetch_one(&pool)
                     .await
-                    .expect("audio_files count");
+                    .expect("text_files count");
             (files, subtype)
         });
     assert_eq!(files_remaining, 0, "files row removed by purge-on-disk");
@@ -1587,22 +1494,17 @@ fn given_missing_disk_file_when_ffi_purge_on_disk_then_ok_and_absence_reported()
     let _g = serial();
     let (_db_dir, db_path) = init_temp_db();
     let lib = tempdir().unwrap();
-    std::fs::write(lib.path().join("song.mp3"), b"audio bytes").unwrap();
+    std::fs::write(lib.path().join("memo.txt"), b"text bytes").unwrap();
 
     let root = c(lib.path().to_str().unwrap());
     let token = c(TEST_TOKEN);
-    alexandria_index_start(
-        root.as_ptr(),
-        token.as_ptr(),
-        std::ptr::null(),
-        std::ptr::null(),
-    );
+    index_folder(root.as_ptr(), token.as_ptr(), std::ptr::null());
     wait_for_files(1);
 
-    let uuid = uuid_by_name(&db_path, "song.mp3");
+    let uuid = uuid_by_name(&db_path, "memo.txt");
 
     // The file vanishes from disk out from under the catalog (AF-01).
-    std::fs::remove_file(lib.path().join("song.mp3")).unwrap();
+    std::fs::remove_file(lib.path().join("memo.txt")).unwrap();
 
     let result = alexandria_file_purge_on_disk(c(&uuid).as_ptr(), token.as_ptr());
 
@@ -1633,19 +1535,14 @@ fn given_disk_delete_failure_when_ffi_purge_on_disk_then_disk_error_and_row_kept
     let _g = serial();
     let (_db_dir, db_path) = init_temp_db();
     let lib = tempdir().unwrap();
-    std::fs::write(lib.path().join("song.mp3"), b"audio bytes").unwrap();
+    std::fs::write(lib.path().join("memo.txt"), b"text bytes").unwrap();
 
     let root = c(lib.path().to_str().unwrap());
     let token = c(TEST_TOKEN);
-    alexandria_index_start(
-        root.as_ptr(),
-        token.as_ptr(),
-        std::ptr::null(),
-        std::ptr::null(),
-    );
+    index_folder(root.as_ptr(), token.as_ptr(), std::ptr::null());
     wait_for_files(1);
 
-    let uuid = uuid_by_name(&db_path, "song.mp3");
+    let uuid = uuid_by_name(&db_path, "memo.txt");
     let file_id: i64 = with_db(&db_path, {
         let uuid = uuid.clone();
         move |pool| async move {
@@ -1660,8 +1557,8 @@ fn given_disk_delete_failure_when_ffi_purge_on_disk_then_disk_error_and_row_kept
 
     // Replace the indexed file with a directory at the same path so the
     // disk delete fails with something other than `NotFound` (AF-02).
-    std::fs::remove_file(lib.path().join("song.mp3")).expect("pre-remove indexed file");
-    std::fs::create_dir(lib.path().join("song.mp3"))
+    std::fs::remove_file(lib.path().join("memo.txt")).expect("pre-remove indexed file");
+    std::fs::create_dir(lib.path().join("memo.txt"))
         .expect("create directory in place of indexed file");
 
     let result = alexandria_file_purge_on_disk(c(&uuid).as_ptr(), token.as_ptr());
@@ -1677,11 +1574,11 @@ fn given_disk_delete_failure_when_ffi_purge_on_disk_then_disk_error_and_row_kept
                 .await
                 .expect("files count");
             let (subtype,): (i64,) =
-                sqlx::query_as("SELECT COUNT(*) FROM audio_files WHERE file_id = ?")
+                sqlx::query_as("SELECT COUNT(*) FROM text_files WHERE file_id = ?")
                     .bind(file_id)
                     .fetch_one(&pool)
                     .await
-                    .expect("audio_files count");
+                    .expect("text_files count");
             (files, subtype)
         });
     assert_eq!(
@@ -1710,18 +1607,13 @@ fn given_ffi_purge_on_disk_no_token_then_unauthorized() {
     let _g = serial();
     let (_db_dir, db_path) = init_temp_db();
     let lib = tempdir().unwrap();
-    std::fs::write(lib.path().join("song.mp3"), b"x").unwrap();
+    std::fs::write(lib.path().join("memo.txt"), b"x").unwrap();
     let root = c(lib.path().to_str().unwrap());
     let token = c(TEST_TOKEN);
-    alexandria_index_start(
-        root.as_ptr(),
-        token.as_ptr(),
-        std::ptr::null(),
-        std::ptr::null(),
-    );
+    index_folder(root.as_ptr(), token.as_ptr(), std::ptr::null());
     wait_for_files(1);
 
-    let uuid = uuid_by_name(&db_path, "song.mp3");
+    let uuid = uuid_by_name(&db_path, "memo.txt");
     let empty = c("");
     let result = alexandria_file_purge_on_disk(c(&uuid).as_ptr(), empty.as_ptr());
     assert_eq!(result.status, STATUS_FILE_UNAUTHORIZED);
@@ -1729,7 +1621,7 @@ fn given_ffi_purge_on_disk_no_token_then_unauthorized() {
 
     // Auth ran before the disk was touched.
     assert!(
-        lib.path().join("song.mp3").exists(),
+        lib.path().join("memo.txt").exists(),
         "on-disk file untouched when auth is denied"
     );
 }
@@ -1769,8 +1661,6 @@ fn run_status(run_id: &str, token: &CString) -> serde_json::Value {
     serde_json::from_str(&json).expect("CatalogRun json")
 }
 
-/// Poll `alexandria_index_run_status_json` until the run leaves "running",
-/// mirroring `wait_for_files`'s poll-with-deadline shape.
 /// How far a run had got, for a panic message.
 ///
 /// A wait that gives up says nothing useful without this. "Never left
@@ -1785,18 +1675,27 @@ fn run_progress(body: &serde_json::Value) -> String {
     )
 }
 
+/// Poll `alexandria_index_run_status_json` until the run leaves "running".
+///
+/// Gives up only once the run has made no progress — no change of phase,
+/// total or `processed` — for [`ASYNC_RUN_DEADLINE`]. A run still advancing
+/// on a loaded runner is slow, not wrong; one whose counter has not moved in
+/// two minutes is stuck, whether its walk hangs or its terminal write never
+/// landed and the row is left `running` with its last flushed tally.
 fn wait_for_run_terminal_or_paused(run_id: &str, token: &CString) -> serde_json::Value {
-    let deadline = std::time::Instant::now() + ASYNC_RUN_DEADLINE;
+    let mut last = String::new();
+    let mut since = std::time::Instant::now();
     loop {
         let body = run_status(run_id, token);
         if body["status"] != "running" {
             return body;
         }
-        if std::time::Instant::now() > deadline {
-            panic!(
-                "run {run_id} never left running after {ASYNC_RUN_DEADLINE:?}; {}",
-                run_progress(&body)
-            );
+        let progress = run_progress(&body);
+        if progress != last {
+            last = progress;
+            since = std::time::Instant::now();
+        } else if since.elapsed() > ASYNC_RUN_DEADLINE {
+            panic!("run {run_id} made no progress for {ASYNC_RUN_DEADLINE:?}; {progress}");
         }
         std::thread::sleep(std::time::Duration::from_millis(25));
     }
@@ -1883,7 +1782,7 @@ fn run_concurrency(db_path: &str, run_id: &str) -> Option<i64> {
 /// `alexandria-core/tests/catalog/index.rs` do.
 fn write_library(dir: &std::path::Path, count: usize) {
     for i in 0..count {
-        std::fs::write(dir.join(format!("track-{i}.mp3")), b"audio bytes").unwrap();
+        std::fs::write(dir.join(format!("track-{i}.txt")), b"text bytes").unwrap();
     }
 }
 
@@ -1896,12 +1795,7 @@ fn given_a_running_run_when_paused_over_ffi_then_status_is_paused_and_has_progre
 
     let root = c(lib.path().to_str().unwrap());
     let token = c(TEST_TOKEN);
-    let started = alexandria_index_start(
-        root.as_ptr(),
-        token.as_ptr(),
-        std::ptr::null(),
-        std::ptr::null(),
-    );
+    let started = index_folder(root.as_ptr(), token.as_ptr(), std::ptr::null());
     assert_eq!(started.status, STATUS_OK);
     let run_id = run_id_string(&started);
 
@@ -1927,16 +1821,11 @@ fn given_a_completed_run_when_paused_over_ffi_then_invalid_state() {
     let _g = serial();
     let (_db_dir, _db_path) = init_temp_db();
     let lib = tempdir().unwrap();
-    std::fs::write(lib.path().join("song.mp3"), b"audio").unwrap();
+    std::fs::write(lib.path().join("memo.txt"), b"text").unwrap();
 
     let root = c(lib.path().to_str().unwrap());
     let token = c(TEST_TOKEN);
-    let started = alexandria_index_start(
-        root.as_ptr(),
-        token.as_ptr(),
-        std::ptr::null(),
-        std::ptr::null(),
-    );
+    let started = index_folder(root.as_ptr(), token.as_ptr(), std::ptr::null());
     assert_eq!(started.status, STATUS_OK);
     let run_id = run_id_string(&started);
     wait_for_files(1);
@@ -1990,12 +1879,7 @@ fn given_a_paused_run_when_resumed_over_ffi_then_same_run_id_and_it_finishes() {
 
     let root = c(lib.path().to_str().unwrap());
     let token = c(TEST_TOKEN);
-    let started = alexandria_index_start(
-        root.as_ptr(),
-        token.as_ptr(),
-        std::ptr::null(),
-        std::ptr::null(),
-    );
+    let started = index_folder(root.as_ptr(), token.as_ptr(), std::ptr::null());
     assert_eq!(started.status, STATUS_OK);
     let run_id = run_id_string(&started);
 
@@ -2052,12 +1936,7 @@ fn given_a_low_priority_paused_run_when_resumed_at_normal_over_ffi_then_it_is_wi
     let root = c(lib.path().to_str().unwrap());
     let token = c(TEST_TOKEN);
     let low = c("low");
-    let started = alexandria_index_start(
-        root.as_ptr(),
-        token.as_ptr(),
-        low.as_ptr(),
-        std::ptr::null(),
-    );
+    let started = index_folder(root.as_ptr(), token.as_ptr(), low.as_ptr());
     assert_eq!(started.status, STATUS_OK);
     let run_id = run_id_string(&started);
     assert_eq!(
@@ -2114,12 +1993,7 @@ fn given_a_running_run_when_resumed_over_ffi_then_invalid_state() {
 
     let root = c(lib.path().to_str().unwrap());
     let token = c(TEST_TOKEN);
-    let started = alexandria_index_start(
-        root.as_ptr(),
-        token.as_ptr(),
-        std::ptr::null(),
-        std::ptr::null(),
-    );
+    let started = index_folder(root.as_ptr(), token.as_ptr(), std::ptr::null());
     assert_eq!(started.status, STATUS_OK);
     let run_id = run_id_string(&started);
     wait_for_run_cell_live(&run_id, &token);
@@ -2157,12 +2031,7 @@ fn given_a_running_run_when_cancelled_over_ffi_then_terminal_and_a_second_cancel
 
     let root = c(lib.path().to_str().unwrap());
     let token = c(TEST_TOKEN);
-    let started = alexandria_index_start(
-        root.as_ptr(),
-        token.as_ptr(),
-        std::ptr::null(),
-        std::ptr::null(),
-    );
+    let started = index_folder(root.as_ptr(), token.as_ptr(), std::ptr::null());
     assert_eq!(started.status, STATUS_OK);
     let run_id = run_id_string(&started);
 
@@ -2193,12 +2062,7 @@ fn given_a_paused_run_when_cancelled_over_ffi_then_terminal() {
 
     let root = c(lib.path().to_str().unwrap());
     let token = c(TEST_TOKEN);
-    let started = alexandria_index_start(
-        root.as_ptr(),
-        token.as_ptr(),
-        std::ptr::null(),
-        std::ptr::null(),
-    );
+    let started = index_folder(root.as_ptr(), token.as_ptr(), std::ptr::null());
     assert_eq!(started.status, STATUS_OK);
     let run_id = run_id_string(&started);
     wait_for_run_cell_live(&run_id, &token);
@@ -2280,12 +2144,7 @@ fn given_a_paused_run_when_active_runs_queried_then_it_appears() {
 
     let root = c(lib.path().to_str().unwrap());
     let token = c(TEST_TOKEN);
-    let started = alexandria_index_start(
-        root.as_ptr(),
-        token.as_ptr(),
-        std::ptr::null(),
-        std::ptr::null(),
-    );
+    let started = index_folder(root.as_ptr(), token.as_ptr(), std::ptr::null());
     assert_eq!(started.status, STATUS_OK);
     let run_id = run_id_string(&started);
     wait_for_run_cell_live(&run_id, &token);
@@ -2330,21 +2189,16 @@ fn given_ffi_active_runs_no_token_then_unauthorized() {
 }
 
 #[test]
-fn given_low_priority_when_index_started_over_ffi_then_run_recorded_at_low_concurrency() {
+fn given_low_priority_when_library_registered_over_ffi_then_run_recorded_at_low_concurrency() {
     let _g = serial();
     let (_db_dir, db_path) = init_temp_db();
     let lib = tempdir().unwrap();
-    std::fs::write(lib.path().join("song.mp3"), b"audio").unwrap();
+    std::fs::write(lib.path().join("memo.txt"), b"text").unwrap();
 
     let root = c(lib.path().to_str().unwrap());
     let token = c(TEST_TOKEN);
     let priority = c("low");
-    let started = alexandria_index_start(
-        root.as_ptr(),
-        token.as_ptr(),
-        priority.as_ptr(),
-        std::ptr::null(),
-    );
+    let started = index_folder(root.as_ptr(), token.as_ptr(), priority.as_ptr());
     assert_eq!(started.status, STATUS_OK);
     let run_id = run_id_string(&started);
 
@@ -2360,17 +2214,12 @@ fn given_garbage_priority_when_index_started_over_ffi_then_falls_back_to_normal_
     let _g = serial();
     let (_db_dir, db_path) = init_temp_db();
     let lib = tempdir().unwrap();
-    std::fs::write(lib.path().join("song.mp3"), b"audio").unwrap();
+    std::fs::write(lib.path().join("memo.txt"), b"text").unwrap();
 
     let root = c(lib.path().to_str().unwrap());
     let token = c(TEST_TOKEN);
     let priority = c("URGENT!!1");
-    let started = alexandria_index_start(
-        root.as_ptr(),
-        token.as_ptr(),
-        priority.as_ptr(),
-        std::ptr::null(),
-    );
+    let started = index_folder(root.as_ptr(), token.as_ptr(), priority.as_ptr());
     assert_eq!(started.status, STATUS_OK);
     let run_id = run_id_string(&started);
 
@@ -2385,15 +2234,10 @@ fn given_null_priority_when_refresh_started_over_ffi_then_normal_concurrency() {
     let _g = serial();
     let (_db_dir, db_path) = init_temp_db();
     let lib = tempdir().unwrap();
-    std::fs::write(lib.path().join("song.mp3"), b"audio").unwrap();
+    std::fs::write(lib.path().join("memo.txt"), b"text").unwrap();
     let root = c(lib.path().to_str().unwrap());
     let token = c(TEST_TOKEN);
-    alexandria_index_start(
-        root.as_ptr(),
-        token.as_ptr(),
-        std::ptr::null(),
-        std::ptr::null(),
-    );
+    index_folder(root.as_ptr(), token.as_ptr(), std::ptr::null());
     wait_for_files(1);
 
     let refreshed = alexandria_index_refresh_start(token.as_ptr(), std::ptr::null());
@@ -2407,15 +2251,10 @@ fn given_low_priority_when_refresh_started_over_ffi_then_low_concurrency() {
     let _g = serial();
     let (_db_dir, db_path) = init_temp_db();
     let lib = tempdir().unwrap();
-    std::fs::write(lib.path().join("song.mp3"), b"audio").unwrap();
+    std::fs::write(lib.path().join("memo.txt"), b"text").unwrap();
     let root = c(lib.path().to_str().unwrap());
     let token = c(TEST_TOKEN);
-    alexandria_index_start(
-        root.as_ptr(),
-        token.as_ptr(),
-        std::ptr::null(),
-        std::ptr::null(),
-    );
+    index_folder(root.as_ptr(), token.as_ptr(), std::ptr::null());
     wait_for_files(1);
 
     let priority = c("low");
@@ -2450,12 +2289,7 @@ fn given_a_paused_refresh_run_when_resumed_over_ffi_then_it_finishes() {
 
     let root = c(lib.path().to_str().unwrap());
     let token = c(TEST_TOKEN);
-    let started = alexandria_index_start(
-        root.as_ptr(),
-        token.as_ptr(),
-        std::ptr::null(),
-        std::ptr::null(),
-    );
+    let started = index_folder(root.as_ptr(), token.as_ptr(), std::ptr::null());
     assert_eq!(started.status, STATUS_OK);
 
     // Waited on the run rather than on the count: the run record is what
@@ -2541,12 +2375,7 @@ fn given_a_paused_index_run_with_no_stored_root_when_resumed_then_error() {
 
     let root = c(lib.path().to_str().unwrap());
     let token = c(TEST_TOKEN);
-    let started = alexandria_index_start(
-        root.as_ptr(),
-        token.as_ptr(),
-        std::ptr::null(),
-        std::ptr::null(),
-    );
+    let started = index_folder(root.as_ptr(), token.as_ptr(), std::ptr::null());
     assert_eq!(started.status, STATUS_OK);
     let run_id = run_id_string(&started);
     wait_for_run_cell_live(&run_id, &token);
@@ -2584,462 +2413,6 @@ fn given_a_paused_index_run_with_no_stored_root_when_resumed_then_error() {
     );
 }
 
-/// The owner's symptom over the FFI surface (issue #122): `types` names the
-/// file types the run records, comma-separated, in the same words the HTTP
-/// body's array carries (FR-FC-24).
-#[test]
-fn given_an_audio_scope_when_ffi_index_start_then_only_the_audio_is_recorded() {
-    let _g = serial();
-    let _db = init_temp_db();
-    let lib = tempdir().unwrap();
-    std::fs::write(lib.path().join("song.flac"), b"audio").unwrap();
-    std::fs::write(lib.path().join("cover.jpg"), b"image").unwrap();
-
-    let root = c(lib.path().to_str().unwrap());
-    let token = c(TEST_TOKEN);
-    let types = c("audio");
-    let result = alexandria_index_start(
-        root.as_ptr(),
-        token.as_ptr(),
-        std::ptr::null(),
-        types.as_ptr(),
-    );
-    assert_eq!(result.status, STATUS_OK);
-
-    // The run has to be over before the absence of a second row means
-    // anything — until then it only means the walk has not reached it yet.
-    let run = wait_for_run_terminal(&run_id_string(&result), &token);
-    assert_eq!(run["status"], "complete");
-    assert_eq!(run["skipped"], 1, "the cover art was skipped, not failed");
-    assert_eq!(run["failed"], 0);
-
-    let files = files_json_value();
-    let files = files.as_array().expect("array");
-    assert_eq!(files.len(), 1, "the cover art must not be catalogued");
-    assert_eq!(files[0]["type"], "audio");
-}
-
-/// Two types, comma-separated: a scope is a set, and the separator is what
-/// the FFI surface has instead of an array.
-#[test]
-fn given_a_two_type_scope_when_ffi_index_start_then_both_are_recorded() {
-    let _g = serial();
-    let _db = init_temp_db();
-    let lib = tempdir().unwrap();
-    std::fs::write(lib.path().join("song.flac"), b"audio").unwrap();
-    std::fs::write(lib.path().join("notes.md"), b"text").unwrap();
-    std::fs::write(lib.path().join("cover.jpg"), b"image").unwrap();
-
-    let root = c(lib.path().to_str().unwrap());
-    let token = c(TEST_TOKEN);
-    let types = c("audio,text");
-    let result = alexandria_index_start(
-        root.as_ptr(),
-        token.as_ptr(),
-        std::ptr::null(),
-        types.as_ptr(),
-    );
-    assert_eq!(result.status, STATUS_OK);
-    assert_eq!(wait_for_files(2), 2);
-
-    let run = wait_for_run_terminal(&run_id_string(&result), &token);
-    assert_eq!(run["status"], "complete");
-    assert_eq!(run["skipped"], 1, "only the image is out of scope");
-}
-
-/// An empty `types` string is the same absence NULL is — never "index
-/// nothing", which would turn a caller's missing argument into a run that
-/// does no work at all.
-#[test]
-fn given_an_empty_types_string_when_ffi_index_start_then_every_type_is_recorded() {
-    let _g = serial();
-    let _db = init_temp_db();
-    let lib = tempdir().unwrap();
-    std::fs::write(lib.path().join("song.flac"), b"audio").unwrap();
-    std::fs::write(lib.path().join("cover.jpg"), b"image").unwrap();
-
-    let root = c(lib.path().to_str().unwrap());
-    let token = c(TEST_TOKEN);
-    let types = c("");
-    let result = alexandria_index_start(
-        root.as_ptr(),
-        token.as_ptr(),
-        std::ptr::null(),
-        types.as_ptr(),
-    );
-    assert_eq!(result.status, STATUS_OK);
-
-    assert_eq!(wait_for_files(2), 2);
-}
-
-/// Unlike an unrecognised `priority`, an unrecognised type is refused: the
-/// only fallback available is "every type", which is the opposite of what the
-/// caller asked for. Nothing is indexed, and no run record is opened.
-#[test]
-fn given_an_unknown_type_when_ffi_index_start_then_invalid_input() {
-    let _g = serial();
-    let (_dir, db_path) = init_temp_db();
-    let lib = tempdir().unwrap();
-    std::fs::write(lib.path().join("song.flac"), b"audio").unwrap();
-
-    let root = c(lib.path().to_str().unwrap());
-    let token = c(TEST_TOKEN);
-    let types = c("sculpture");
-    let result = alexandria_index_start(
-        root.as_ptr(),
-        token.as_ptr(),
-        std::ptr::null(),
-        types.as_ptr(),
-    );
-
-    assert_eq!(result.status, STATUS_INVALID_INPUT);
-    assert_eq!(
-        run_id_string(&result),
-        "",
-        "a refused start must not carry a run id back"
-    );
-    assert_eq!(
-        alexandria_index_count_files(),
-        0,
-        "a refused start must index nothing"
-    );
-    // The claim the HTTP twin makes too: the scope is parsed ahead of
-    // `start`, so a refused request leaves no run record behind (FR-FC-27).
-    let runs = with_db(&db_path, |pool| async move {
-        let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM catalog_runs")
-            .fetch_one(&pool)
-            .await
-            .expect("count runs");
-        count
-    });
-    assert_eq!(runs, 0, "a refused start must not open a run record");
-}
-
-/// What the authentication gate in `alexandria_index_start` actually buys,
-/// and the only test that fails without it: a caller with a bad token *and*
-/// an unspellable scope must be told it is unauthorized, not that its scope
-/// did not parse.
-///
-/// `start` authenticates too, so every other unauthorized test here passes
-/// with the gate deleted — the parse would simply never be reached. This one
-/// reaches it. HTTP answers `401` to the same pair because `require_auth` is
-/// a route layer that runs before the body is ever extracted, so without the
-/// gate the two surfaces would disagree about which fault a caller is told
-/// about first (FR-FC-24 / NFR-09).
-#[test]
-fn given_a_bad_token_and_an_unknown_type_when_ffi_index_start_then_unauthorized() {
-    let _g = serial();
-    let _db = init_temp_db();
-    let lib = tempdir().unwrap();
-    std::fs::write(lib.path().join("song.flac"), b"audio").unwrap();
-
-    let root = c(lib.path().to_str().unwrap());
-    let token = c("");
-    let types = c("sculpture");
-    let result = alexandria_index_start(
-        root.as_ptr(),
-        token.as_ptr(),
-        std::ptr::null(),
-        types.as_ptr(),
-    );
-
-    assert_eq!(
-        result.status, STATUS_UNAUTHORIZED,
-        "an unauthenticated caller must not learn that its scope failed to parse"
-    );
-}
-
-// ---------------- playlists (Task 9) ----------------
-
-fn playlist_json_ok(result: PlaylistJsonResult) -> serde_json::Value {
-    assert_eq!(
-        result.status, STATUS_PLAYLIST_OK,
-        "expected PLAYLIST_OK, got {}",
-        result.status
-    );
-    assert!(!result.json.is_null(), "success must carry a json pointer");
-    let json = unsafe { CStr::from_ptr(result.json) }
-        .to_str()
-        .unwrap()
-        .to_string();
-    unsafe {
-        alexandria_free_string(result.json);
-    }
-    serde_json::from_str(&json).expect("playlist json")
-}
-
-/// Smoke-test the plain success path: creating a playlist over FFI returns
-/// `PLAYLIST_OK` with a body carrying a valid uuid, matching what
-/// `POST /v1/playlists` answers over HTTP (FR-FC-24 / NFR-09).
-#[test]
-fn given_a_valid_name_when_ffi_playlist_created_then_ok_with_a_uuid() {
-    let _g = serial();
-    let _db = init_temp_db();
-
-    let body = c(&serde_json::json!({ "name": "Road trip" }).to_string());
-    let token = c(TEST_TOKEN);
-    let result = alexandria_playlist_create(body.as_ptr(), token.as_ptr());
-
-    let value = playlist_json_ok(result);
-    let uuid = value["uuid"].as_str().unwrap_or_default();
-    assert!(
-        uuid::Uuid::parse_str(uuid).is_ok(),
-        "create must answer a valid uuid, got {uuid:?}"
-    );
-    assert_eq!(value["name"], "Road trip");
-}
-
-/// An unknown playlist uuid must be reported as `PLAYLIST_ERR_NOT_FOUND`,
-/// matching HTTP's `404` for `GET /v1/playlists/{uuid}`.
-#[test]
-fn given_an_unknown_uuid_when_ffi_playlist_read_then_not_found() {
-    let _g = serial();
-    let _db = init_temp_db();
-
-    let uuid = c("11111111-1111-1111-1111-111111111111");
-    let token = c(TEST_TOKEN);
-    let result = alexandria_playlist_read(uuid.as_ptr(), token.as_ptr());
-
-    assert_eq!(result.status, STATUS_PLAYLIST_NOT_FOUND);
-    assert!(result.json.is_null());
-}
-
-/// A blank name must be reported as `PLAYLIST_ERR_INVALID_INPUT`, matching
-/// HTTP's `400` for the same body on `POST /v1/playlists`
-/// (`validate_playlist_name`).
-#[test]
-fn given_a_blank_name_when_ffi_playlist_created_then_invalid_input() {
-    let _g = serial();
-    let _db = init_temp_db();
-
-    let body = c(&serde_json::json!({ "name": "   " }).to_string());
-    let token = c(TEST_TOKEN);
-    let result = alexandria_playlist_create(body.as_ptr(), token.as_ptr());
-
-    assert_eq!(result.status, STATUS_PLAYLIST_INVALID_INPUT);
-    assert!(result.json.is_null());
-}
-
-/// What the authentication gate in `alexandria_playlist_create` actually
-/// buys, and the only test that fails without it: a caller with a bad token
-/// *and* a malformed body must be told it is unauthorized, not that its body
-/// failed to parse.
-///
-/// `create` parses the body too, so every other unauthorized test for this
-/// function would pass with the gate deleted — the parse would simply never
-/// be reached with a *well-formed* body. This one reaches it. HTTP answers
-/// `401` to the same pair because `require_auth` is a route layer that runs
-/// before the body is ever extracted, so without the gate the two surfaces
-/// would disagree about which fault a caller is told about first
-/// (FR-FC-24 / NFR-09). Task 8's HTTP surface had exactly this gap and had
-/// to be sent back for it.
-#[test]
-fn given_a_bad_token_and_a_malformed_body_when_ffi_playlist_created_then_unauthorized() {
-    let _g = serial();
-    let _db = init_temp_db();
-
-    let body = c("{ not json");
-    let token = c("");
-    let result = alexandria_playlist_create(body.as_ptr(), token.as_ptr());
-
-    assert_eq!(
-        result.status, STATUS_PLAYLIST_UNAUTHORIZED,
-        "create must deny before parsing the body"
-    );
-    assert!(result.json.is_null());
-}
-
-/// `alexandria_playlists_list` must deny an unauthenticated caller,
-/// matching HTTP's `401` for `GET /v1/playlists`.
-#[test]
-fn given_no_token_when_ffi_playlists_list_then_unauthorized() {
-    let _g = serial();
-    let _db = init_temp_db();
-
-    let empty = c("");
-    let result = alexandria_playlists_list(empty.as_ptr());
-
-    assert_eq!(result.status, STATUS_PLAYLIST_UNAUTHORIZED);
-    assert!(result.json.is_null());
-}
-
-/// End-to-end round trip over the whole surface: create, rename, list, add
-/// entries (seeding an audio file directly, mirroring `parity.rs`'s
-/// `seed_file`), move the one entry (a no-op move at its own index, just to
-/// exercise the call), remove it, then delete the playlist — every step
-/// answering `PLAYLIST_OK`.
-#[test]
-fn given_a_full_lifecycle_when_driven_entirely_over_ffi_then_every_step_is_ok() {
-    let _g = serial();
-    let (_dir, db_path) = init_temp_db();
-    let token = c(TEST_TOKEN);
-
-    let create_body = c(&serde_json::json!({ "name": "Road trip" }).to_string());
-    let created = playlist_json_ok(alexandria_playlist_create(
-        create_body.as_ptr(),
-        token.as_ptr(),
-    ));
-    let playlist_uuid = created["uuid"].as_str().unwrap().to_string();
-    let puuid = c(&playlist_uuid);
-
-    let rename_body = c(&serde_json::json!({ "name": "Summer trip" }).to_string());
-    let renamed = playlist_json_ok(alexandria_playlist_rename(
-        puuid.as_ptr(),
-        rename_body.as_ptr(),
-        token.as_ptr(),
-    ));
-    assert_eq!(renamed["name"], "Summer trip");
-
-    let listed = playlist_json_ok(alexandria_playlists_list(token.as_ptr()));
-    assert!(listed
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|p| p["uuid"] == playlist_uuid));
-
-    let file_uuid = with_db(&db_path, |pool| async move {
-        let file_uuid = uuid::Uuid::new_v4().to_string();
-        sqlx::query(
-            "INSERT INTO files (uuid, path, name, type, content_hash, indexed_at) \
-             VALUES (?, ?, ?, ?, 'hash', ?)",
-        )
-        .bind(&file_uuid)
-        .bind(format!("/lib/{file_uuid}"))
-        .bind("seeded.flac")
-        .bind("audio")
-        .bind(chrono::Utc::now().to_rfc3339())
-        .execute(&pool)
-        .await
-        .expect("seed audio file");
-        file_uuid
-    });
-
-    let add_body = c(&serde_json::json!({ "fileUuids": [file_uuid] }).to_string());
-    let entries = playlist_json_ok(alexandria_playlist_add_entries(
-        puuid.as_ptr(),
-        add_body.as_ptr(),
-        token.as_ptr(),
-    ));
-    let entry_uuid = entries.as_array().unwrap()[0]["uuid"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    let entry_uuid_c = c(&entry_uuid);
-
-    let view = playlist_json_ok(alexandria_playlist_read(puuid.as_ptr(), token.as_ptr()));
-    assert_eq!(view["entries"].as_array().unwrap().len(), 1);
-
-    let move_body = c(&serde_json::json!({ "toIndex": 0 }).to_string());
-    let moved = playlist_json_ok(alexandria_playlist_move_entry(
-        puuid.as_ptr(),
-        entry_uuid_c.as_ptr(),
-        move_body.as_ptr(),
-        token.as_ptr(),
-    ));
-    assert_eq!(moved.as_array().unwrap().len(), 1);
-
-    let removed =
-        alexandria_playlist_remove_entry(puuid.as_ptr(), entry_uuid_c.as_ptr(), token.as_ptr());
-    assert_eq!(removed.status, STATUS_PLAYLIST_OK);
-    assert!(!removed.json.is_null());
-    let removed_json = unsafe { CStr::from_ptr(removed.json) }
-        .to_str()
-        .unwrap()
-        .to_string();
-    unsafe {
-        alexandria_free_string(removed.json);
-    }
-    assert_eq!(
-        removed_json, "{}",
-        "remove_entry echoes nothing but success"
-    );
-
-    let deleted = playlist_json_ok(alexandria_playlist_delete(puuid.as_ptr(), token.as_ptr()));
-    assert_eq!(deleted["uuid"], playlist_uuid);
-}
-
-// ---------------- music enrichment ----------------
-
-/// Enrichment is off in every test process — `init_temp_db` sets no
-/// `[metadata]` configuration — so a run must be refused as unavailable
-/// rather than attempted. This is the assertion that matters most for a
-/// feature that reaches the network: the shipped default does not.
-#[test]
-fn given_enrichment_is_not_configured_when_a_run_is_started_then_it_is_unavailable() {
-    let _g = serial();
-    let _db = init_temp_db();
-
-    let token = c(TEST_TOKEN);
-    let result = alexandria_enrichment_run(std::ptr::null(), token.as_ptr());
-
-    assert_eq!(result.status, STATUS_ENRICHMENT_UNAVAILABLE);
-    assert!(result.json.is_null());
-}
-
-/// Naming both scopes is the caller not knowing what it asked for, and is
-/// refused rather than resolved in its favour — matching the HTTP route's
-/// own `400` for the same body.
-#[test]
-fn given_both_scopes_named_when_a_run_is_started_then_it_is_invalid_input() {
-    let _g = serial();
-    let _db = init_temp_db();
-
-    let body = c(&serde_json::json!({
-        "fileUuid": "11111111-1111-1111-1111-111111111111",
-        "artist": "Miles Davis"
-    })
-    .to_string());
-    let token = c(TEST_TOKEN);
-    let result = alexandria_enrichment_run(body.as_ptr(), token.as_ptr());
-
-    // Refused for the body, before the unavailable check would have been
-    // reached — a malformed request is the caller's to fix either way.
-    assert_eq!(result.status, STATUS_ENRICHMENT_INVALID_INPUT);
-}
-
-/// Reading what enrichment stored is a plain database read and must work
-/// whether or not enrichment itself is switched on — an owner who enabled
-/// it, ran it once, and turned it off keeps what they fetched.
-#[test]
-fn given_enrichment_is_off_when_a_track_is_read_then_it_still_answers() {
-    let _g = serial();
-    let _db = init_temp_db();
-
-    let uuid = c("11111111-1111-1111-1111-111111111111");
-    let token = c(TEST_TOKEN);
-    let result = alexandria_enrichment_read_track(uuid.as_ptr(), std::ptr::null(), token.as_ptr());
-
-    assert_eq!(
-        result.status, STATUS_ENRICHMENT_OK,
-        "reading a cached result must not depend on the network switch"
-    );
-    assert!(!result.json.is_null());
-
-    let json = unsafe { std::ffi::CStr::from_ptr(result.json) }
-        .to_string_lossy()
-        .into_owned();
-    let value: serde_json::Value = serde_json::from_str(&json).expect("enrichment json");
-    // Nothing has been looked up, so both halves are absent — which is a
-    // state, not a failure.
-    assert!(value["artistImage"].is_null());
-    assert!(value["lyrics"].is_null());
-    unsafe { alexandria_ffi::alexandria_free_string(result.json) };
-}
-
-/// An unparseable file uuid is the caller's error, not a missing record.
-#[test]
-fn given_a_malformed_uuid_when_a_track_is_read_then_it_is_invalid_input() {
-    let _g = serial();
-    let _db = init_temp_db();
-
-    let uuid = c("not-a-uuid");
-    let token = c(TEST_TOKEN);
-    let result = alexandria_enrichment_read_track(uuid.as_ptr(), std::ptr::null(), token.as_ptr());
-
-    assert_eq!(result.status, STATUS_ENRICHMENT_INVALID_INPUT);
-    assert!(result.json.is_null());
-}
-
 // ---------------- libraries ----------------
 
 fn library_json_ok(result: alexandria_ffi::LibraryJsonResult) -> serde_json::Value {
@@ -3052,19 +2425,45 @@ fn library_json_ok(result: alexandria_ffi::LibraryJsonResult) -> serde_json::Val
     serde_json::from_str(&json).expect("library json")
 }
 
+/// A real folder for `logical` (`/library/course`) inside the test's own
+/// temporary directory, created. Registering walks the folder, so a library
+/// test needs one that exists.
+fn folder(db: &(TempDir, String), logical: &str) -> String {
+    let path = db.0.path().join(logical.trim_start_matches('/'));
+    std::fs::create_dir_all(&path).unwrap();
+    path.to_str().unwrap().to_string()
+}
+
+/// Like [`folder`], without creating it.
+fn path_in(db: &(TempDir, String), logical: &str) -> String {
+    db.0.path()
+        .join(logical.trim_start_matches('/'))
+        .to_str()
+        .unwrap()
+        .to_string()
+}
+
+/// Register `root` as `name`, wait for its first run to finish, and answer
+/// the library's JSON.
+///
+/// Waited on because a library with an unfinished run refuses a move or a
+/// second run (FR-FC-43), and the tests using this are about what comes
+/// after.
+fn register_library(name: &str, root: &str, token: &CString) -> serde_json::Value {
+    let body = c(&serde_json::json!({ "name": name, "rootPath": root }).to_string());
+    let value = library_json_ok(alexandria_library_register(body.as_ptr(), token.as_ptr()));
+    wait_for_run_terminal(value["runId"].as_str().expect("runId"), token);
+    value
+}
+
 /// Registering answers the library, and it is then listed.
 #[test]
 fn given_a_folder_when_registered_over_ffi_then_it_is_a_library() {
     let _g = serial();
     let _db = init_temp_db();
 
-    let body = c(&serde_json::json!({
-        "name": "Course",
-        "rootPath": "/library/course"
-    })
-    .to_string());
     let token = c(TEST_TOKEN);
-    let value = library_json_ok(alexandria_library_register(body.as_ptr(), token.as_ptr()));
+    let value = register_library("Course", &folder(&_db, "/library/course"), &token);
 
     assert_eq!(value["name"], "Course");
     assert!(uuid::Uuid::parse_str(value["uuid"].as_str().unwrap_or_default()).is_ok());
@@ -3081,12 +2480,13 @@ fn given_an_overlapping_folder_when_registered_over_ffi_then_it_is_a_conflict() 
     let _db = init_temp_db();
 
     let token = c(TEST_TOKEN);
-    let first =
-        c(&serde_json::json!({"name": "Course", "rootPath": "/library/course"}).to_string());
-    library_json_ok(alexandria_library_register(first.as_ptr(), token.as_ptr()));
+    register_library("Course", &folder(&_db, "/library/course"), &token);
 
-    let nested =
-        c(&serde_json::json!({"name": "Week", "rootPath": "/library/course/week-1"}).to_string());
+    let nested = c(&serde_json::json!({
+        "name": "Week",
+        "rootPath": folder(&_db, "/library/course/week-1")
+    })
+    .to_string());
     let result = alexandria_library_register(nested.as_ptr(), token.as_ptr());
 
     assert_eq!(result.status, STATUS_LIBRARY_CONFLICT);
@@ -3098,7 +2498,11 @@ fn given_a_blank_name_when_registered_over_ffi_then_it_is_invalid_input() {
     let _g = serial();
     let _db = init_temp_db();
 
-    let body = c(&serde_json::json!({"name": "   ", "rootPath": "/library/course"}).to_string());
+    let body = c(&serde_json::json!({
+        "name": "   ",
+        "rootPath": folder(&_db, "/library/course")
+    })
+    .to_string());
     let token = c(TEST_TOKEN);
 
     assert_eq!(
@@ -3115,8 +2519,7 @@ fn given_a_new_library_when_browsed_over_ffi_then_it_is_simply_empty() {
     let _db = init_temp_db();
 
     let token = c(TEST_TOKEN);
-    let body = c(&serde_json::json!({"name": "Course", "rootPath": "/library/course"}).to_string());
-    let library = library_json_ok(alexandria_library_register(body.as_ptr(), token.as_ptr()));
+    let library = register_library("Course", &folder(&_db, "/library/course"), &token);
     let uuid = c(library["uuid"].as_str().unwrap());
 
     let listing = library_json_ok(alexandria_library_browse(
@@ -3138,18 +2541,18 @@ fn given_a_moved_folder_when_the_root_is_corrected_over_ffi_then_the_library_fol
     let _db = init_temp_db();
 
     let token = c(TEST_TOKEN);
-    let body = c(&serde_json::json!({"name": "Course", "rootPath": "/library/course"}).to_string());
-    let library = library_json_ok(alexandria_library_register(body.as_ptr(), token.as_ptr()));
+    let library = register_library("Course", &folder(&_db, "/library/course"), &token);
     let uuid = c(library["uuid"].as_str().unwrap());
 
-    let moved = c(&serde_json::json!({"rootPath": "/media/courses/rust"}).to_string());
+    let destination = path_in(&_db, "/media/courses/rust");
+    let moved = c(&serde_json::json!({ "rootPath": destination }).to_string());
     let value = library_json_ok(alexandria_library_move(
         uuid.as_ptr(),
         moved.as_ptr(),
         token.as_ptr(),
     ));
 
-    assert_eq!(value["rootPath"], "/media/courses/rust");
+    assert_eq!(value["rootPath"], destination);
     assert_eq!(value["name"], "Course", "the move renamed the library");
 }
 
@@ -3161,15 +2564,12 @@ fn given_another_librarys_folder_when_moved_onto_over_ffi_then_it_is_a_conflict(
     let _db = init_temp_db();
 
     let token = c(TEST_TOKEN);
-    let first =
-        c(&serde_json::json!({"name": "Course", "rootPath": "/library/course"}).to_string());
-    let library = library_json_ok(alexandria_library_register(first.as_ptr(), token.as_ptr()));
-    let second =
-        c(&serde_json::json!({"name": "Photos", "rootPath": "/library/photos"}).to_string());
-    library_json_ok(alexandria_library_register(second.as_ptr(), token.as_ptr()));
+    let library = register_library("Course", &folder(&_db, "/library/course"), &token);
+    register_library("Photos", &folder(&_db, "/library/photos"), &token);
 
     let uuid = c(library["uuid"].as_str().unwrap());
-    let onto = c(&serde_json::json!({"rootPath": "/library/photos/2024"}).to_string());
+    let onto =
+        c(&serde_json::json!({"rootPath": path_in(&_db, "/library/photos/2024")}).to_string());
 
     assert_eq!(
         alexandria_library_move(uuid.as_ptr(), onto.as_ptr(), token.as_ptr()).status,
@@ -3184,8 +2584,7 @@ fn given_a_blank_root_when_a_library_is_moved_over_ffi_then_it_is_invalid_input(
     let _db = init_temp_db();
 
     let token = c(TEST_TOKEN);
-    let body = c(&serde_json::json!({"name": "Course", "rootPath": "/library/course"}).to_string());
-    let library = library_json_ok(alexandria_library_register(body.as_ptr(), token.as_ptr()));
+    let library = register_library("Course", &folder(&_db, "/library/course"), &token);
     let uuid = c(library["uuid"].as_str().unwrap());
     let blank = c(&serde_json::json!({"rootPath": "  "}).to_string());
 
@@ -3242,12 +2641,7 @@ fn given_a_run_with_no_failures_when_asked_over_ffi_then_an_empty_list() {
 
     let root = c(lib.path().to_str().unwrap());
     let token = c(TEST_TOKEN);
-    let started = alexandria_index_start(
-        root.as_ptr(),
-        token.as_ptr(),
-        std::ptr::null(),
-        std::ptr::null(),
-    );
+    let started = index_folder(root.as_ptr(), token.as_ptr(), std::ptr::null());
     assert_eq!(started.status, STATUS_OK);
     let run_id = c(&run_id_string(&started));
 
@@ -3317,12 +2711,7 @@ fn given_a_running_run_when_the_core_is_re_initialized_then_it_is_refused_as_bus
 
     let root = c(lib.path().to_str().unwrap());
     let token = c(TEST_TOKEN);
-    let started = alexandria_index_start(
-        root.as_ptr(),
-        token.as_ptr(),
-        std::ptr::null(),
-        std::ptr::null(),
-    );
+    let started = index_folder(root.as_ptr(), token.as_ptr(), std::ptr::null());
     assert_eq!(started.status, STATUS_OK);
     let run_id = run_id_string(&started);
     wait_for_run_cell_live(&run_id, &token);
@@ -3362,4 +2751,368 @@ fn given_no_running_run_when_the_core_is_re_initialized_then_it_replaces() {
         STATUS_OK,
         "an idle core refused to be re-initialized"
     );
+}
+
+// ---------------- the library-root bound on moves and playback (FR-FC-26) ----------------
+
+/// Initialize a fresh database with `filesystem.root` set to `library`.
+///
+/// The FFI reads configuration only from the `ALEXANDRIA_*` environment, and
+/// only at init, so the variable is removed again straight after: nothing
+/// that follows — an assertion that unwinds included — can leak the bound
+/// into the next test.
+fn init_bounded_db(library: &std::path::Path) -> (TempDir, String) {
+    std::env::set_var("ALEXANDRIA_FILESYSTEM_ROOT", library.to_str().unwrap());
+    let db = init_temp_db();
+    std::env::remove_var("ALEXANDRIA_FILESYSTEM_ROOT");
+    db
+}
+
+/// The move half of the review's D1 over FFI: refused with the invalid-input
+/// status, the class HTTP's 400 maps to (NFR-09), and nothing moves.
+#[test]
+fn given_a_configured_root_when_a_library_is_moved_outside_it_over_ffi_then_invalid_input() {
+    let _g = serial();
+    let parent = tempdir().unwrap();
+    let library = parent.path().join("library");
+    let outside = parent.path().join("secrets");
+    let course = library.join("course");
+    std::fs::create_dir_all(&course).unwrap();
+    std::fs::create_dir(&outside).unwrap();
+    let _db = init_bounded_db(&library);
+    let token = c(TEST_TOKEN);
+    let body = c(
+        &serde_json::json!({"name": "Course", "rootPath": course.to_str().unwrap()}).to_string(),
+    );
+    let registered = library_json_ok(alexandria_library_register(body.as_ptr(), token.as_ptr()));
+    wait_for_run_terminal(registered["runId"].as_str().unwrap(), &token);
+    let uuid = c(registered["uuid"].as_str().unwrap());
+
+    for destination in [
+        outside.to_str().unwrap().to_string(),
+        format!("{}/../secrets", library.to_str().unwrap()),
+        format!("{}/gone/../../secrets", library.to_str().unwrap()),
+    ] {
+        let moved = c(&serde_json::json!({ "rootPath": destination }).to_string());
+        assert_eq!(
+            alexandria_library_move(uuid.as_ptr(), moved.as_ptr(), token.as_ptr()).status,
+            STATUS_LIBRARY_INVALID_INPUT,
+            "{destination} escaped the root"
+        );
+    }
+
+    let listed = library_json_ok(alexandria_libraries_list(token.as_ptr()));
+    assert_eq!(listed[0]["rootPath"], course.to_str().unwrap());
+}
+
+/// The other half of the pair: a destination under the root that does not
+/// exist yet (an unplugged drive) is still recorded.
+#[test]
+fn given_a_configured_root_when_moved_to_a_missing_folder_under_it_over_ffi_then_ok() {
+    let _g = serial();
+    let library = tempdir().unwrap();
+    let course = library.path().join("course");
+    std::fs::create_dir(&course).unwrap();
+    let _db = init_bounded_db(library.path());
+    let token = c(TEST_TOKEN);
+    let body = c(
+        &serde_json::json!({"name": "Course", "rootPath": course.to_str().unwrap()}).to_string(),
+    );
+    let registered = library_json_ok(alexandria_library_register(body.as_ptr(), token.as_ptr()));
+    wait_for_run_terminal(registered["runId"].as_str().unwrap(), &token);
+    let uuid = c(registered["uuid"].as_str().unwrap());
+    let destination = library.path().join("usb-drive").join("rust");
+
+    let moved = c(&serde_json::json!({ "rootPath": destination.to_str().unwrap() }).to_string());
+    let value = library_json_ok(alexandria_library_move(
+        uuid.as_ptr(),
+        moved.as_ptr(),
+        token.as_ptr(),
+    ));
+
+    assert_eq!(value["rootPath"], destination.to_str().unwrap());
+}
+
+/// Put one active text file in the catalog at `path`, behind the FFI's back,
+/// the way a pre-bound index or move would have left it.
+fn seed_text_row(db_path: &str, path: &std::path::Path) -> String {
+    use alexandria_core::catalog::model::{FileType, NewFile};
+    use alexandria_core::catalog::repos::{CatalogRepository, SqliteCatalogRepository};
+    let uuid = uuid::Uuid::new_v4();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let pool = alexandria_core::migrate::migrate_database(db_path)
+            .await
+            .expect("open");
+        // Every file belongs to a library: the row goes into one at its folder.
+        let library_uuid = uuid::Uuid::new_v4();
+        sqlx::query("INSERT INTO libraries (uuid, name, root_path) VALUES (?, 'Seeded', ?)")
+            .bind(library_uuid.to_string())
+            .bind(path.parent().unwrap().to_str().unwrap())
+            .execute(&pool)
+            .await
+            .expect("library");
+        SqliteCatalogRepository::new(pool.clone())
+            .insert_file(NewFile {
+                uuid,
+                library_uuid,
+                path: path.to_str().unwrap().to_string(),
+                name: path.file_name().unwrap().to_str().unwrap().to_string(),
+                file_type: FileType::Text,
+                content_hash: None,
+                size_bytes: None,
+                mtime: None,
+                indexed_at: chrono::Utc::now(),
+            })
+            .await
+            .expect("insert");
+        pool.close().await;
+    });
+    uuid.to_string()
+}
+
+/// Playback's defence in depth over FFI: a row already pointing outside the
+/// configured root gets no descriptor — the FFI hands back a path the
+/// client then opens itself, so this is the FFI's stream.
+#[test]
+fn given_a_row_outside_the_configured_root_when_its_playback_source_is_asked_then_invalid_input() {
+    let _g = serial();
+    let parent = tempdir().unwrap();
+    let library = parent.path().join("library");
+    let outside = parent.path().join("secrets");
+    std::fs::create_dir(&library).unwrap();
+    std::fs::create_dir(&outside).unwrap();
+    std::fs::write(outside.join("passwd.txt"), b"the secret").unwrap();
+    std::fs::write(library.join("song.txt"), b"inside").unwrap();
+    let (_dir, db_path) = init_bounded_db(&library);
+    let out_of_root = c(&seed_text_row(&db_path, &outside.join("passwd.txt")));
+    let in_root = c(&seed_text_row(&db_path, &library.join("song.txt")));
+    let token = c(TEST_TOKEN);
+
+    let refused = alexandria_file_playback_source(out_of_root.as_ptr(), token.as_ptr());
+    let served = alexandria_file_playback_source(in_root.as_ptr(), token.as_ptr());
+
+    assert_eq!(refused.status, STATUS_PLAYBACK_INVALID_INPUT);
+    assert!(refused.json.is_null());
+    assert_eq!(served.status, STATUS_PLAYBACK_OK);
+    unsafe { alexandria_free_string(served.json) };
+}
+
+// ---------------- registering starts indexing; re-indexing one library ----------------
+
+#[test]
+fn given_a_folder_when_registered_over_ffi_then_a_run_id_that_completes() {
+    let _g = serial();
+    let _db = init_temp_db();
+    let token = c(TEST_TOKEN);
+    let root = folder(&_db, "/library/notes");
+    std::fs::write(format!("{root}/a.md"), b"# a").unwrap();
+    std::fs::write(format!("{root}/b.zip"), b"zip").unwrap();
+    let body = c(&serde_json::json!({ "name": "Notes", "rootPath": root }).to_string());
+
+    let value = library_json_ok(alexandria_library_register(body.as_ptr(), token.as_ptr()));
+
+    assert_eq!(value["rootPath"], root);
+    let run = wait_for_run_terminal(value["runId"].as_str().expect("runId"), &token);
+    assert_eq!(run["status"], "complete", "{run}");
+    assert_eq!(run["indexed"], 1, "{run}");
+    assert_eq!(run["skipped"], 1, "{run}");
+    assert_eq!(run["libraryUuid"], value["uuid"], "{run}");
+}
+
+#[test]
+fn given_a_library_when_index_started_over_ffi_then_a_run_id() {
+    let _g = serial();
+    let _db = init_temp_db();
+    let token = c(TEST_TOKEN);
+    let library = register_library("Notes", &folder(&_db, "/library/notes"), &token);
+    let uuid = c(library["uuid"].as_str().unwrap());
+
+    let result = alexandria_library_index_start(uuid.as_ptr(), token.as_ptr(), std::ptr::null());
+
+    assert_eq!(result.status, STATUS_OK);
+    let run_id = run_id_string(&result);
+    assert_ne!(run_id, library["runId"].as_str().unwrap());
+    let run = wait_for_run_terminal(&run_id, &token);
+    assert_eq!(run["status"], "complete", "{run}");
+}
+
+#[test]
+fn given_an_unknown_library_when_index_started_over_ffi_then_not_found() {
+    let _g = serial();
+    let _db = init_temp_db();
+    let token = c(TEST_TOKEN);
+    let uuid = c("11111111-1111-1111-1111-111111111111");
+
+    let result = alexandria_library_index_start(uuid.as_ptr(), token.as_ptr(), std::ptr::null());
+
+    assert_eq!(result.status, STATUS_INDEX_NOT_FOUND);
+}
+
+#[test]
+fn given_a_paused_run_when_index_started_over_ffi_then_conflict() {
+    let _g = serial();
+    let db = init_temp_db();
+    let token = c(TEST_TOKEN);
+    let library = register_library("Notes", &folder(&db, "/library/notes"), &token);
+    let run_id = library["runId"].as_str().unwrap().to_string();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let pool = alexandria_core::migrate::migrate_database(&db.1)
+            .await
+            .expect("open");
+        sqlx::query("UPDATE catalog_runs SET status = 'paused' WHERE id = ?")
+            .bind(&run_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+    });
+    let uuid = c(library["uuid"].as_str().unwrap());
+
+    let result = alexandria_library_index_start(uuid.as_ptr(), token.as_ptr(), std::ptr::null());
+
+    assert_eq!(result.status, STATUS_INDEX_CONFLICT);
+}
+
+#[test]
+fn given_a_low_priority_when_registered_over_ffi_then_its_run_is_low() {
+    let _g = serial();
+    let db = init_temp_db();
+    let token = c(TEST_TOKEN);
+    let body = c(&serde_json::json!({
+        "name": "Notes",
+        "rootPath": folder(&db, "/library/notes"),
+        "priority": "low"
+    })
+    .to_string());
+
+    let value = library_json_ok(alexandria_library_register(body.as_ptr(), token.as_ptr()));
+
+    let run_id = value["runId"].as_str().unwrap().to_string();
+    wait_for_run_terminal(&run_id, &token);
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let concurrency: i64 = rt.block_on(async {
+        let pool = alexandria_core::migrate::migrate_database(&db.1)
+            .await
+            .expect("open");
+        sqlx::query_scalar("SELECT concurrency FROM catalog_runs WHERE id = ?")
+            .bind(&run_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+    });
+    assert_eq!(
+        concurrency,
+        alexandria_core::config::Settings::default()
+            .indexing
+            .low_priority_concurrency as i64
+    );
+}
+
+/// The application binds to the generated header by hand, so the removed
+/// free-form index call must be gone from it, and the library one present.
+#[test]
+fn given_the_header_when_read_then_it_declares_no_free_form_index_start() {
+    let header = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/header.h"))
+        .expect("header.h is generated by build.rs");
+
+    assert!(!header.contains("alexandria_index_start("));
+    assert!(header.contains("alexandria_library_index_start("));
+}
+
+#[test]
+fn given_a_library_when_removed_over_ffi_then_ok_and_its_files_are_gone() {
+    let _g = serial();
+    let db = init_temp_db();
+    let token = c(TEST_TOKEN);
+    let root = folder(&db, "/library/notes");
+    std::fs::write(format!("{root}/a.md"), b"# a").unwrap();
+    let library = register_library("Notes", &root, &token);
+    let uuid = c(library["uuid"].as_str().unwrap());
+
+    let removed = alexandria_library_remove(uuid.as_ptr(), token.as_ptr());
+
+    assert_eq!(removed.status, STATUS_LIBRARY_OK);
+    assert_eq!(alexandria_index_count_files(), 0);
+    assert_eq!(std::fs::read(format!("{root}/a.md")).unwrap(), b"# a");
+}
+
+#[test]
+fn given_a_library_uuid_when_listed_over_ffi_then_only_its_files() {
+    let _g = serial();
+    let db = init_temp_db();
+    let token = c(TEST_TOKEN);
+    let first = folder(&db, "/first");
+    std::fs::write(format!("{first}/a.md"), b"x").unwrap();
+    let second = folder(&db, "/second");
+    std::fs::write(format!("{second}/b.md"), b"x").unwrap();
+    let library = register_library("First", &first, &token);
+    register_library("Second", &second, &token);
+    let filter = c(&serde_json::json!({ "libraryUuid": library["uuid"] }).to_string());
+
+    let listed = file_json_ok(alexandria_ffi::alexandria_files_list(
+        filter.as_ptr(),
+        token.as_ptr(),
+    ));
+
+    let names: Vec<&str> = listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|view| view["file"]["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, vec!["a.md"]);
+}
+
+#[test]
+fn given_a_malformed_library_uuid_when_listed_over_ffi_then_invalid_input() {
+    let _g = serial();
+    let _db = init_temp_db();
+    let token = c(TEST_TOKEN);
+    let filter = c(r#"{"libraryUuid":"not-a-uuid"}"#);
+
+    let result = alexandria_ffi::alexandria_files_list(filter.as_ptr(), token.as_ptr());
+
+    assert_eq!(result.status, STATUS_FILE_INVALID_INPUT);
+}
+
+#[test]
+fn given_audio_as_a_type_filter_when_listed_over_ffi_then_only_audio() {
+    let _g = serial();
+    let db = init_temp_db();
+    let token = c(TEST_TOKEN);
+    let root = folder(&db, "/music");
+    std::fs::write(format!("{root}/song.mp3"), [0u8; 64]).unwrap();
+    std::fs::write(format!("{root}/notes.md"), b"# notes").unwrap();
+    register_library("Music", &root, &token);
+    let filter = c(r#"{"type":"audio"}"#);
+
+    let listed = file_json_ok(alexandria_ffi::alexandria_files_list(
+        filter.as_ptr(),
+        token.as_ptr(),
+    ));
+
+    let names: Vec<&str> = listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|view| view["file"]["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, vec!["song.mp3"]);
+    assert_eq!(listed[0]["file"]["fileType"], "audio");
+}
+
+/// The application binds `alexandria_library_register` from the header, so
+/// the header has to say what it answers now: a library with its run.
+#[test]
+fn given_the_header_when_read_then_library_register_is_documented_with_its_run() {
+    let header = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/header.h"))
+        .expect("header.h is generated by build.rs");
+    let at = header
+        .find("alexandria_library_register(")
+        .expect("declared");
+    let doc = &header[header[..at].rfind("/**").expect("documented")..at];
+
+    assert!(doc.contains("runId"), "{doc}");
+    assert!(!doc.contains("claimed"), "{doc}");
 }

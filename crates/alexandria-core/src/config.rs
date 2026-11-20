@@ -2,7 +2,7 @@ use std::env;
 use std::fmt;
 use std::path::Path;
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use uuid::Uuid;
 
 use crate::errors::DomainError;
@@ -92,18 +92,24 @@ impl fmt::Debug for Secret {
 pub struct AuthSettings {
     #[serde(default = "default_auth_mode")]
     pub mode: AuthMode,
-    /// External mode only: the HS256 secret Heimdall signs its tokens with
-    /// (its `HEIMDALL_AUTH_TOKEN_SECRET`). Required in external mode —
-    /// Heimdall publishes no keys, so this is the only way to verify one of
-    /// its tokens.
+    /// External mode only: where Heimdall publishes the public keys it signs
+    /// its ES256 tokens with, its `/.well-known/jwks.json`. Inside the
+    /// platform this is the internal address,
+    /// `http://heimdall-api.<env>:8080/.well-known/jwks.json`.
+    #[serde(default)]
+    pub heimdall_jwks_url: String,
+    /// External mode only, and only for the overlap: the HS256 secret
+    /// Heimdall signed its tokens with before it moved to ES256 (its
+    /// `HEIMDALL_AUTH_TOKEN_SECRET`). Tokens signed with it are accepted while
+    /// it is set; once Heimdall stops accepting them, remove it and they are
+    /// refused here too.
     #[serde(default)]
     pub heimdall_token_secret: Secret,
-    /// External mode only: the secret Heimdall is rotating away from (its
-    /// `HEIMDALL_AUTH_TOKEN_SECRET_PREVIOUS`). Accepted alongside the current
-    /// one, mirroring Heimdall's own two-key scheme, so a rotation there does
-    /// not black out Alexandria until this file is edited and the process
-    /// restarted. Ignored when equal to the current secret: the same value
-    /// under two names is not a rotation.
+    /// External mode only, and only for the overlap: the secret Heimdall was
+    /// rotating away from (its `HEIMDALL_AUTH_TOKEN_SECRET_PREVIOUS`).
+    /// Accepted alongside the current one, mirroring Heimdall's own two-key
+    /// scheme. Ignored when equal to the current secret: the same value under
+    /// two names is not a rotation.
     #[serde(default)]
     pub heimdall_token_secret_previous: Secret,
     /// External mode only: the UUID of the Heimdall scope Alexandria is
@@ -145,6 +151,7 @@ impl Default for AuthSettings {
     fn default() -> Self {
         Self {
             mode: default_auth_mode(),
+            heimdall_jwks_url: String::new(),
             heimdall_token_secret: Secret::default(),
             heimdall_token_secret_previous: Secret::default(),
             heimdall_scope_id: String::new(),
@@ -168,13 +175,22 @@ impl AuthSettings {
         match self.mode {
             AuthMode::Local => Ok(()),
             AuthMode::External => {
-                if self.heimdall_token_secret.is_empty() {
+                let jwks_url = self.heimdall_jwks_url.trim();
+                if jwks_url.is_empty() && self.heimdall_token_secret.is_empty() {
                     return Err(DomainError::Config(
-                        "auth.heimdall_token_secret is unset: external mode verifies \
-                         Heimdall's tokens against the secret it signs them with, and \
-                         Heimdall publishes no keys to fetch instead"
+                        "auth.heimdall_jwks_url is unset: external mode verifies Heimdall's \
+                         tokens against the key set it publishes at \
+                         /.well-known/jwks.json (or, during the move off HS256, against \
+                         auth.heimdall_token_secret), so it must name one"
                             .to_string(),
                     ));
+                }
+                if !jwks_url.is_empty()
+                    && !(jwks_url.starts_with("http://") || jwks_url.starts_with("https://"))
+                {
+                    return Err(DomainError::Config(format!(
+                        "auth.heimdall_jwks_url is not an http or https URL: {jwks_url:?}"
+                    )));
                 }
 
                 let scope_id = Uuid::parse_str(self.heimdall_scope_id.trim()).map_err(|_| {
@@ -239,10 +255,27 @@ impl Default for HttpSettings {
 }
 
 impl HttpSettings {
-    pub fn socket_addr(&self) -> std::net::SocketAddr {
-        format!("{}:{}", self.bind_addr, self.port)
-            .parse()
-            .expect("invalid http bind address")
+    /// The address to listen on: `bind_addr` and `port` together.
+    ///
+    /// The address is parsed on its own and paired with the port, rather than
+    /// the two being joined into `"addr:port"` and parsed as one. That join
+    /// made an IPv6 address — `"::1"`, or `"::"` for every interface — into
+    /// `"::1:8080"`, which is not a socket address, and the binary panicked at
+    /// startup instead of reporting the setting. The bracketed form a URL
+    /// would use (`"[::1]"`) is accepted too, since it is what worked before.
+    pub fn socket_addr(&self) -> Result<std::net::SocketAddr, DomainError> {
+        let host = self.bind_addr.trim();
+        let host = host
+            .strip_prefix('[')
+            .and_then(|inner| inner.strip_suffix(']'))
+            .unwrap_or(host);
+        let ip: std::net::IpAddr = host.parse().map_err(|_| {
+            DomainError::config(format!(
+                "http.bind_addr {:?} is not an IP address",
+                self.bind_addr
+            ))
+        })?;
+        Ok(std::net::SocketAddr::new(ip, self.port))
     }
 }
 
@@ -272,8 +305,8 @@ impl Default for DatabaseSettings {
 #[derive(Debug, Clone, Deserialize)]
 pub struct IndexingSettings {
     /// How many files UC-01's index walk and UC-02's re-index walk process at
-    /// a time. The per-file cost is a stat plus, for a supported extension, a
-    /// tag-header read — no file bytes are hashed (FR-FC-09/FR-FC-10) — and
+    /// a time. The per-file cost is a stat plus, for a supported extension, an
+    /// embedded-metadata read — no file bytes are hashed (FR-FC-09/FR-FC-10) — and
     /// both run on Tokio's blocking pool, so this is a real parallelism knob.
     /// The database half of each file's work still serializes behind SQLite's
     /// single writer and the pool's 8 connections, so values far above that
@@ -382,104 +415,6 @@ impl Default for PlaybackSettings {
     }
 }
 
-/// Music enrichment: artist photography and lyrics fetched from public
-/// services (music enrichment design).
-///
-/// The only part of Alexandria that reaches the network outbound, and the
-/// reason the Vision Document's "no network calls" now reads "no network
-/// calls except this, off by default". Everything here exists to keep that
-/// exception narrow and deliberate.
-#[derive(Debug, Clone, Deserialize)]
-pub struct MetadataSettings {
-    /// Whether enrichment may run at all. **False by default**, and that
-    /// default is the design, not caution: a product whose pitch is that the
-    /// owner's library is theirs does not start talking to third parties
-    /// because it was installed.
-    #[serde(default)]
-    pub enabled: bool,
-
-    /// How MusicBrainz can reach whoever runs this instance — an email
-    /// address or a URL.
-    ///
-    /// Not politeness. MusicBrainz's terms require a `User-Agent` that
-    /// identifies the application *and* carries a contact, and they are
-    /// entitled to block clients that supply neither. Enrichment refuses to
-    /// start while this is empty rather than sending an anonymous agent
-    /// string and having the whole feature blocked at their end for every
-    /// user of this software.
-    #[serde(default)]
-    pub contact: String,
-
-    /// Directory holding fetched artist images, created on first use.
-    /// Relative by default, matching `playback.thumbnail_cache_dir`.
-    ///
-    /// The bytes live here and never in SQLite; the database holds the path
-    /// and the provenance. Entries are keyed by the artist's MusicBrainz id,
-    /// so an artist re-resolved to the same id reuses the file. Nothing
-    /// evicts old entries — delete the directory to reclaim the space, the
-    /// same as the thumbnail cache.
-    #[serde(default = "default_image_cache_dir")]
-    pub image_cache_dir: String,
-}
-
-fn default_image_cache_dir() -> String {
-    "artist-images".to_string()
-}
-
-impl Default for MetadataSettings {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            contact: String::new(),
-            image_cache_dir: default_image_cache_dir(),
-        }
-    }
-}
-
-impl MetadataSettings {
-    /// Why enrichment cannot run, or `None` when it can.
-    ///
-    /// One place, so the command, the settings view a client reads, and the
-    /// startup log cannot disagree about whether the feature is available —
-    /// and so "it is off" and "it is on but unusable" stay distinguishable.
-    /// A client that only knew `enabled` would tell the owner enrichment was
-    /// available and then watch every lookup fail.
-    pub fn unavailable_reason(&self) -> Option<MetadataUnavailable> {
-        if !self.enabled {
-            return Some(MetadataUnavailable::Disabled);
-        }
-        if self.contact.trim().is_empty() {
-            return Some(MetadataUnavailable::ContactMissing);
-        }
-        None
-    }
-
-    /// Whether enrichment can run.
-    pub fn is_available(&self) -> bool {
-        self.unavailable_reason().is_none()
-    }
-}
-
-/// Why music enrichment is not available.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub enum MetadataUnavailable {
-    /// The operator has not turned it on. The shipped default.
-    Disabled,
-    /// Turned on, but with no contact for the `User-Agent` MusicBrainz
-    /// requires.
-    ContactMissing,
-}
-
-impl MetadataUnavailable {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            MetadataUnavailable::Disabled => "disabled",
-            MetadataUnavailable::ContactMissing => "contactMissing",
-        }
-    }
-}
-
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct Settings {
     #[serde(default)]
@@ -498,8 +433,6 @@ pub struct Settings {
     pub filesystem: FilesystemSettings,
     #[serde(default)]
     pub playback: PlaybackSettings,
-    #[serde(default)]
-    pub metadata: MetadataSettings,
 }
 
 impl Settings {
@@ -542,10 +475,13 @@ impl Settings {
             self.auth.windows_owner_sid = sid;
         }
         // The external-mode keys take the same overrides as everything else,
-        // and the two secrets especially: a deployment must be able to hand
-        // Alexandria the shared signing key through the environment rather
-        // than write to disk the one value that can mint a token every
+        // and the two overlap secrets especially: a deployment must be able to
+        // hand Alexandria the shared signing key through the environment
+        // rather than write to disk the one value that can mint a token every
         // Heimdall-backed application will accept.
+        if let Ok(url) = env::var("ALEXANDRIA_AUTH_HEIMDALL_JWKS_URL") {
+            self.auth.heimdall_jwks_url = url;
+        }
         if let Ok(secret) = env::var("ALEXANDRIA_AUTH_HEIMDALL_TOKEN_SECRET") {
             self.auth.heimdall_token_secret = Secret::new(secret);
         }
@@ -598,23 +534,6 @@ impl Settings {
         if let Ok(dir) = env::var("ALEXANDRIA_PLAYBACK_THUMBNAIL_CACHE_DIR") {
             self.playback.thumbnail_cache_dir = dir;
         }
-        if let Ok(enabled) = env::var("ALEXANDRIA_METADATA_ENABLED") {
-            // Only an explicit, recognized truth value moves this. An
-            // unparseable value leaves the setting alone rather than
-            // defaulting to `false`, which would silently turn the feature
-            // off for an operator who meant to turn it on and mistyped.
-            match enabled.trim().to_ascii_lowercase().as_str() {
-                "true" | "1" | "yes" | "on" => self.metadata.enabled = true,
-                "false" | "0" | "no" | "off" => self.metadata.enabled = false,
-                _ => {}
-            }
-        }
-        if let Ok(contact) = env::var("ALEXANDRIA_METADATA_CONTACT") {
-            self.metadata.contact = contact;
-        }
-        if let Ok(dir) = env::var("ALEXANDRIA_METADATA_IMAGE_CACHE_DIR") {
-            self.metadata.image_cache_dir = dir;
-        }
     }
 }
 
@@ -656,7 +575,7 @@ mod tests {
     #[test]
     fn given_default_settings_when_socket_addr_built_then_is_loopback() {
         let settings = Settings::default();
-        let addr = settings.http.socket_addr();
+        let addr = settings.http.socket_addr().expect("default bind address");
         assert!(addr.ip().is_loopback());
         assert_eq!(addr.port(), 8080);
         assert_eq!(settings.logging.level.as_str(), "info");

@@ -63,6 +63,14 @@ pub struct FileStat {
 #[allow(async_fn_in_trait)]
 pub trait Filesystem: Send + Sync {
     async fn path_exists(&self, root: &str) -> bool;
+    /// Whether `path` is a folder — what a library's root has to be. A file
+    /// would walk as a one-entry tree its library could never show.
+    ///
+    /// Defaults to `path_exists`, which is what an in-memory double holding
+    /// only roots and files can answer.
+    async fn is_folder(&self, path: &str) -> bool {
+        self.path_exists(path).await
+    }
     async fn list_files(&self, root: &str) -> Result<Vec<FileEntry>, DomainError>;
     async fn content_hash(&self, path: &str) -> Result<String, DomainError>;
     /// The file's size and modification time, or `None` when it is gone
@@ -158,14 +166,32 @@ pub struct StdFilesystem;
 impl StdFilesystem {
     fn collect(root: &Path) -> Vec<FileEntry> {
         let mut entries = Vec::new();
-        for entry in walkdir::WalkDir::new(root)
-            .into_iter()
-            .filter_map(|e| e.ok())
-        {
+        for entry in walkdir::WalkDir::new(root).into_iter() {
+            // A folder the walk cannot enter (permission denied, removed
+            // mid-walk) is passed over rather than ending the walk, but said
+            // out loud: its files are on disk and will be in no listing.
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(err) => {
+                    tracing::warn!(error = %err, "skipping a path the walk could not read");
+                    continue;
+                }
+            };
             if !entry.file_type().is_file() {
                 continue;
             }
-            let path = entry.path().to_path_buf();
+            // A path that is not valid UTF-8 is skipped, as a non-UTF-8 name
+            // already was. Stored lossily it named a file that does not
+            // exist — every byte that did not decode became U+FFFD — so
+            // extraction failed, playback could not open it, and the next
+            // re-index marked it missing.
+            let Some(path) = entry.path().to_str().map(str::to_string) else {
+                tracing::warn!(
+                    path = %entry.path().display(),
+                    "skipping a file whose path is not valid UTF-8"
+                );
+                continue;
+            };
             let name = entry
                 .file_name()
                 .to_str()
@@ -182,7 +208,7 @@ impl StdFilesystem {
                 .and_then(|m| m.modified().ok())
                 .map(DateTime::<Utc>::from);
             entries.push(FileEntry {
-                path: path.to_string_lossy().into_owned(),
+                path,
                 name,
                 size_bytes,
                 modified_at,
@@ -205,6 +231,13 @@ impl Filesystem for StdFilesystem {
         // to distinguish the two (UC-01 `start`) get their real error from the
         // subsequent `list_files`.
         blocking(move || Ok(Path::new(&root).exists()))
+            .await
+            .unwrap_or(false)
+    }
+
+    async fn is_folder(&self, path: &str) -> bool {
+        let path = path.to_string();
+        blocking(move || Ok(Path::new(&path).is_dir()))
             .await
             .unwrap_or(false)
     }
@@ -288,5 +321,43 @@ impl FileEntry {
             size_bytes: 0,
             modified_at: None,
         }
+    }
+}
+
+// Unix only: the one case here builds a non-UTF-8 file name from raw bytes,
+// which only `std::os::unix::ffi::OsStrExt` can do. Gating the module rather
+// than the test keeps `use super::*` from being an unused import elsewhere,
+// which `clippy -D warnings` refuses on Windows.
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    /// A folder whose name is not UTF-8 — legal on every Unix filesystem —
+    /// used to put its files in the catalog under a lossy path full of
+    /// U+FFFD, a file that does not exist. They are passed over instead, and
+    /// the rest of the walk is unaffected.
+    #[tokio::test]
+    async fn given_a_folder_whose_name_is_not_utf8_when_walked_then_its_files_are_skipped_not_mangled(
+    ) {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let odd = dir.path().join(OsStr::from_bytes(b"caf\xe9"));
+        std::fs::create_dir(&odd).expect("non-UTF-8 folder");
+        std::fs::write(odd.join("song.mp3"), b"x").expect("write");
+        std::fs::write(dir.path().join("plain.mp3"), b"x").expect("write");
+
+        let entries = StdFilesystem
+            .list_files(dir.path().to_str().expect("utf-8 root"))
+            .await
+            .expect("walk");
+
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["plain.mp3"]);
+        assert!(
+            entries.iter().all(|e| !e.path.contains('\u{FFFD}')),
+            "a path was stored lossily"
+        );
     }
 }

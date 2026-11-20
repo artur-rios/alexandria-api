@@ -1,4 +1,3 @@
-use std::str::FromStr;
 use std::time::Duration;
 
 use sqlx::migrate::MigrateError;
@@ -11,10 +10,12 @@ pub async fn run_migrations(pool: &SqlitePool) -> Result<(), MigrateError> {
 }
 
 pub async fn migrate_database(database_path: &str) -> Result<SqlitePool, DomainError> {
-    let url = format!("sqlite://{database_path}?mode=rwc");
-    // Options are parsed from the same URL `connect(&url)` would have parsed,
-    // then WAL is layered on — so URL handling is unchanged and only the
-    // journal mode differs.
+    // The path is handed to sqlx as a file name, never spliced into a
+    // `sqlite://` URL. URL parsing splits on the first `?` and percent-decodes
+    // what precedes it, so a database at `/data/100%41/x.sqlite` opened
+    // `/data/100A/x.sqlite` instead and one under a folder holding a `?` was
+    // cut short — on a path the FFI embedder passes through verbatim.
+    // `create_if_missing` is the `mode=rwc` that URL used to carry.
     //
     // sqlx leaves `journal_mode` alone by default, which means SQLite's own
     // default: a rollback journal, where a writer takes an exclusive lock over
@@ -39,8 +40,9 @@ pub async fn migrate_database(database_path: &str) -> Result<SqlitePool, DomainE
     // invisibly meant a sqlx upgrade could change the write path's timing with
     // nothing in this repository mentioning the number. Same duration as
     // before — this pins the current behaviour, it does not alter it.
-    let options = SqliteConnectOptions::from_str(&url)
-        .map_err(DomainError::Database)?
+    let options = SqliteConnectOptions::new()
+        .filename(database_path)
+        .create_if_missing(true)
         .journal_mode(SqliteJournalMode::Wal)
         .busy_timeout(Duration::from_secs(5));
     let pool = SqlitePoolOptions::new()

@@ -19,7 +19,12 @@ fn handler(
     repo: FakeCatalogRepository,
     fs: FakeFilesystem,
 ) -> PurgeFileOnDiskHandler<FakeAuth, FakeCatalogRepository, FakeFilesystem> {
-    PurgeFileOnDiskHandler::new(auth, repo, fs)
+    PurgeFileOnDiskHandler::new(
+        auth,
+        repo,
+        fs,
+        alexandria_core::catalog::library_root::LibraryRoot::unconfigured(),
+    )
 }
 
 /// Build a fake filesystem that records `path` as an on-disk entry, mirroring
@@ -35,17 +40,17 @@ fn fs_with_file(path: &str) -> FakeFilesystem {
 #[tokio::test]
 async fn given_active_file_when_purge_on_disk_then_record_removed_and_disk_file_deleted() {
     let repo = FakeCatalogRepository::new();
-    let file = existing_file("/lib/song.mp3", FileType::Audio);
+    let file = existing_file("/lib/memo.txt", FileType::Text);
     let uuid = file.uuid;
     repo.seed(file);
-    let fs = fs_with_file("/lib/song.mp3");
+    let fs = fs_with_file("/lib/memo.txt");
     let h = handler(FakeAuth::Allowing, repo.clone(), fs.clone());
 
     let result = h.purge_on_disk(uuid, TOKEN).await.expect("purge_on_disk");
 
     assert_eq!(result.file.uuid, uuid);
     assert!(result.disk_file_present);
-    assert!(fs.removed("/lib/song.mp3"));
+    assert!(fs.removed("/lib/memo.txt"));
     assert!(repo.file_for_uuid(uuid).is_none());
 }
 
@@ -54,11 +59,11 @@ async fn given_deleted_file_when_purge_on_disk_then_record_removed() {
     // No retention gate — the contrast with UC-08: a `deleted` record is
     // purgeable regardless of how long ago it was deleted.
     let repo = FakeCatalogRepository::new();
-    let file = deleted_file("/lib/song.mp3", "song.mp3", FileType::Audio);
+    let file = deleted_file("/lib/memo.txt", "memo.txt", FileType::Text);
     let uuid = file.uuid;
     assert_eq!(file.state, FileState::Deleted);
     repo.seed(file);
-    let fs = fs_with_file("/lib/song.mp3");
+    let fs = fs_with_file("/lib/memo.txt");
     let h = handler(FakeAuth::Allowing, repo.clone(), fs.clone());
 
     let result = h.purge_on_disk(uuid, TOKEN).await.expect("purge_on_disk");
@@ -73,7 +78,7 @@ async fn given_deleted_file_when_purge_on_disk_then_record_removed() {
 async fn given_missing_disk_file_when_purge_on_disk_then_record_removed_and_disk_file_absent_reported(
 ) {
     let repo = FakeCatalogRepository::new();
-    let file = existing_file("/lib/song.mp3", FileType::Audio);
+    let file = existing_file("/lib/memo.txt", FileType::Text);
     let uuid = file.uuid;
     repo.seed(file);
     // No on-disk entry registered for this path.
@@ -94,11 +99,11 @@ async fn given_missing_disk_file_when_purge_on_disk_then_record_removed_and_disk
 #[tokio::test]
 async fn given_disk_delete_failure_when_purge_on_disk_then_disk_error_and_record_kept() {
     let repo = FakeCatalogRepository::new();
-    let file = existing_file("/lib/song.mp3", FileType::Audio);
+    let file = existing_file("/lib/memo.txt", FileType::Text);
     let uuid = file.uuid;
     repo.seed(file);
-    let mut fs = fs_with_file("/lib/song.mp3");
-    fs.fail_remove_from("/lib/song.mp3");
+    let mut fs = fs_with_file("/lib/memo.txt");
+    fs.fail_remove_from("/lib/memo.txt");
     let h = handler(FakeAuth::Allowing, repo.clone(), fs.clone());
 
     let result = h.purge_on_disk(uuid, TOKEN).await;
@@ -133,10 +138,10 @@ async fn given_unknown_uuid_when_purge_on_disk_then_not_found() {
 #[tokio::test]
 async fn given_unauthenticated_caller_when_purge_on_disk_then_unauthorized() {
     let repo = FakeCatalogRepository::new();
-    let file = existing_file("/lib/song.mp3", FileType::Audio);
+    let file = existing_file("/lib/memo.txt", FileType::Text);
     let uuid = file.uuid;
     repo.seed(file);
-    let fs = fs_with_file("/lib/song.mp3");
+    let fs = fs_with_file("/lib/memo.txt");
     let h = handler(FakeAuth::Denying, repo.clone(), fs.clone());
 
     let result = h.purge_on_disk(uuid, "").await;
@@ -151,19 +156,47 @@ async fn given_unauthenticated_caller_when_purge_on_disk_then_unauthorized() {
 #[tokio::test]
 async fn given_catalog_purge_failure_when_purge_on_disk_then_error_surfaced() {
     let repo = FakeCatalogRepository::new();
-    let file = existing_file("/lib/song.mp3", FileType::Audio);
+    let file = existing_file("/lib/memo.txt", FileType::Text);
     let uuid = file.uuid;
     repo.seed(file);
     repo.fail_purge(uuid);
-    let fs = fs_with_file("/lib/song.mp3");
+    let fs = fs_with_file("/lib/memo.txt");
     let h = handler(FakeAuth::Allowing, repo.clone(), fs.clone());
 
     let result = h.purge_on_disk(uuid, TOKEN).await;
 
     assert!(matches!(result, Err(DomainError::Internal(_))));
     // The disk delete already happened and cannot be undone.
-    assert!(fs.removed("/lib/song.mp3"));
+    assert!(fs.removed("/lib/memo.txt"));
     // The record was not removed because the fake's purge failed before
     // mutating its map.
+    assert!(repo.file_for_uuid(uuid).is_some());
+}
+
+// ---------------- FR-FC-26: the configured library root ----------------
+
+/// A row already pointing outside `filesystem.root` is not deleted from disk,
+/// and the record stays. Purging the record alone (UC-08) does not touch the
+/// disk and is unaffected, so the owner is never stuck with the row.
+#[tokio::test]
+async fn given_a_row_outside_the_configured_root_when_purged_on_disk_then_invalid_input_and_nothing_deleted(
+) {
+    let library = tempfile::tempdir().expect("tempdir");
+    let repo = FakeCatalogRepository::new();
+    let file = existing_file("/lib/memo.txt", FileType::Text);
+    let uuid = file.uuid;
+    repo.seed(file);
+    let fs = fs_with_file("/lib/memo.txt");
+    let h = PurgeFileOnDiskHandler::new(
+        FakeAuth::Allowing,
+        repo.clone(),
+        fs.clone(),
+        alexandria_core::catalog::library_root::LibraryRoot::new(library.path().to_str().unwrap()),
+    );
+
+    let result = h.purge_on_disk(uuid, TOKEN).await;
+
+    assert!(matches!(result, Err(DomainError::InvalidInput(_))));
+    assert!(!fs.removed("/lib/memo.txt"));
     assert!(repo.file_for_uuid(uuid).is_some());
 }

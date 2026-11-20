@@ -56,7 +56,6 @@ use alexandria_core::catalog::commands::index::IndexHandler;
 use alexandria_core::catalog::document_tags::PdfEpubMetadataReader;
 use alexandria_core::catalog::fs::StdFilesystem;
 use alexandria_core::catalog::image_tags::ExifImageMetadataReader;
-use alexandria_core::catalog::index_scope::IndexScope;
 use alexandria_core::catalog::queries::browse::{BrowseFilesHandler, FileFilter};
 use alexandria_core::catalog::repos::SqliteCatalogRepository;
 use alexandria_core::catalog::run_registry::RunRegistry;
@@ -154,7 +153,6 @@ fn fixture_dir(root: &std::path::Path, i: usize) -> std::path::PathBuf {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Format {
     Text,
-    Audio,
     Image,
     Document,
     Comic,
@@ -163,9 +161,8 @@ enum Format {
 
 impl Format {
     /// `Text` first so it prints as the baseline row.
-    const ALL: [Format; 6] = [
+    const ALL: [Format; 5] = [
         Format::Text,
-        Format::Audio,
         Format::Image,
         Format::Document,
         Format::Comic,
@@ -175,7 +172,6 @@ impl Format {
     fn label(self) -> &'static str {
         match self {
             Format::Text => "text (baseline)",
-            Format::Audio => "audio (wav/id3)",
             Format::Image => "image (jpeg/exif)",
             Format::Document => "document (pdf)",
             Format::Comic => "comic (cbz)",
@@ -186,7 +182,6 @@ impl Format {
     fn extension(self) -> &'static str {
         match self {
             Format::Text => "txt",
-            Format::Audio => "wav",
             Format::Image => "jpg",
             Format::Document => "pdf",
             Format::Comic => "cbz",
@@ -209,10 +204,6 @@ impl Format {
             Format::Text => {
                 std::fs::write(path, format!("file {i}\n")).expect("write txt");
             }
-            Format::Audio => {
-                write_minimal_wav(path);
-                write_audio_tags(path, i);
-            }
             Format::Image => {
                 write_minimal_jpeg(path);
                 write_image_exif(path, i);
@@ -222,45 +213,6 @@ impl Format {
             Format::Video => write_minimal_mp4(path, i),
         }
     }
-}
-
-/// A minimal valid WAV (8 bytes of PCM) — enough of a container for lofty to
-/// probe and for an ID3v2 tag to be written onto.
-fn write_minimal_wav(path: &std::path::Path) {
-    let sample_data: [u8; 8] = [0x80; 8];
-    let mut bytes = Vec::new();
-    bytes.extend_from_slice(b"RIFF");
-    bytes.extend_from_slice(&(36u32 + sample_data.len() as u32).to_le_bytes());
-    bytes.extend_from_slice(b"WAVE");
-    bytes.extend_from_slice(b"fmt ");
-    bytes.extend_from_slice(&16u32.to_le_bytes());
-    bytes.extend_from_slice(&1u16.to_le_bytes()); // PCM
-    bytes.extend_from_slice(&1u16.to_le_bytes()); // mono
-    bytes.extend_from_slice(&8000u32.to_le_bytes());
-    bytes.extend_from_slice(&8000u32.to_le_bytes());
-    bytes.extend_from_slice(&1u16.to_le_bytes());
-    bytes.extend_from_slice(&8u16.to_le_bytes());
-    bytes.extend_from_slice(b"data");
-    bytes.extend_from_slice(&(sample_data.len() as u32).to_le_bytes());
-    bytes.extend_from_slice(&sample_data);
-    std::fs::write(path, &bytes).expect("write wav");
-}
-
-fn write_audio_tags(path: &std::path::Path, i: usize) {
-    use lofty::config::WriteOptions;
-    use lofty::tag::{Accessor, Tag, TagExt, TagType};
-
-    let mut tag = Tag::new(TagType::Id3v2);
-    tag.set_title(format!("Title {i}"));
-    tag.set_artist(format!("Artist {i}"));
-    tag.set_album(format!("Album {i}"));
-    tag.set_genre("Bench".to_string());
-    // ID3v2 maps no dedicated `Year` item, so this is where lofty's own
-    // `set_year` put it before 0.25 removed that method.
-    tag.insert_text(lofty::tag::ItemKey::RecordingDate, "2020".to_string());
-    tag.set_track(u32::try_from(i % 100).unwrap_or(0));
-    tag.save_to_path(path, WriteOptions::default())
-        .expect("save id3 tag");
 }
 
 fn write_minimal_jpeg(path: &std::path::Path) {
@@ -395,6 +347,9 @@ fn write_minimal_mp4(path: &std::path::Path, i: usize) {
     octx.write_trailer().expect("write trailer");
 }
 
+/// The library every benchmark run records into.
+const BENCH_LIBRARY: Uuid = Uuid::from_u128(0xbe4c);
+
 async fn build(
     db: &std::path::Path,
     concurrency: u32,
@@ -402,6 +357,13 @@ async fn build(
     let pool = migrate_database(db.to_str().expect("utf-8 db path"))
         .await
         .expect("migrate");
+    // Every file belongs to a library; the bench's runs all write into this
+    // one, which holds whatever root a measurement walks.
+    sqlx::query("INSERT INTO libraries (uuid, name, root_path) VALUES (?, 'Bench', '/')")
+        .bind(BENCH_LIBRARY.to_string())
+        .execute(&pool)
+        .await
+        .expect("bench library");
     let repo = SqliteCatalogRepository::new(pool.clone());
     let run_repo = SqliteCatalogRunRepository::new(pool);
     let handler = IndexHandler::new(
@@ -448,7 +410,7 @@ async fn measure(format: Format, count: usize, concurrency: u32) -> (f64, f64) {
         .execute(
             lib.path().to_str().expect("utf-8 lib path"),
             Uuid::new_v4(),
-            &IndexScope::all(),
+            BENCH_LIBRARY,
         )
         .await
         .expect("index run");
@@ -488,7 +450,7 @@ async fn measure_rate(count: usize, bytes: usize) -> f64 {
         .execute(
             lib.path().to_str().expect("utf-8 lib path"),
             Uuid::new_v4(),
-            &IndexScope::all(),
+            BENCH_LIBRARY,
         )
         .await
         .expect("index run");
@@ -564,7 +526,7 @@ async fn given_a_generated_library_when_indexed_then_throughput_is_measured() {
         .execute(
             lib.path().to_str().expect("utf-8 lib path"),
             Uuid::new_v4(),
-            &IndexScope::all(),
+            BENCH_LIBRARY,
         )
         .await
         .expect("index run");
@@ -639,9 +601,7 @@ async fn given_an_index_run_in_flight_when_reads_are_issued_then_they_are_not_bl
 
     let done = indexing.clone();
     let index_task = tokio::spawn(async move {
-        let outcome = handler
-            .execute(&root, Uuid::new_v4(), &IndexScope::all())
-            .await;
+        let outcome = handler.execute(&root, Uuid::new_v4(), BENCH_LIBRARY).await;
         done.store(false, Ordering::SeqCst);
         outcome
     });
@@ -740,7 +700,7 @@ async fn given_each_media_format_when_indexed_then_extraction_cost_is_measured()
     // cache, the first touch of the sqlite and ffmpeg code paths, and on
     // Windows the anti-malware scan of a freshly written binary. Those landed
     // on `Text`, which is the baseline every other row is divided by, so the
-    // `vs text` column reported audio and document as *faster* than doing no
+    // `vs text` column reported some formats as *faster* than doing no
     // extraction at all — an impossible result, since extraction is strictly
     // extra work on the same walk/hash/persist pipeline. Burning one round
     // first puts the baseline on the same footing as the rows it is compared

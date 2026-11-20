@@ -5,7 +5,7 @@ use crate::catalog::model::{FileMetadata, FileState, SubtypeMetadata};
 use crate::catalog::repos::CatalogRepository;
 use crate::errors::DomainError;
 
-/// Edit a file's type-specific metadata (UC-04 / FR-FC-14..18).
+/// Edit a file's type-specific metadata (UC-04 / FR-FC-15..18).
 ///
 /// The handler authenticates the caller (AF-03), looks the file up by its
 /// public UUID (AF-02 when absent), rejects edits on a soft-deleted record

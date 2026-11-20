@@ -25,6 +25,20 @@ pub struct Library {
     pub root_path: String,
 }
 
+/// A library just registered, with the run that is indexing it.
+///
+/// Registering a folder starts its first index run (libraries-only design,
+/// section 1), so the answer carries the run id a client follows with the
+/// run calls. Flattened, so the JSON is the library's own with `runId` beside
+/// its fields.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RegisteredLibrary {
+    #[serde(flatten)]
+    pub library: Library,
+    pub run_id: Uuid,
+}
+
 /// A folder directly inside the level being browsed.
 ///
 /// Carries no contents. A tree is drawn one level at a time (design section

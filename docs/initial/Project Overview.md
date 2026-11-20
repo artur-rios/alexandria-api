@@ -2,15 +2,19 @@
 
 ## What This Is
 
-Alexandria is a back-end API that indexes, organizes, and surfaces the user's
-personal library of media and documents living on disk. It is written in Rust
+Alexandria is a back-end API for a personal library manager. The owner adds
+folders as libraries; Alexandria indexes every file in them it can read, keeps
+each library's folder structure exactly as it is on disk, and lets a client
+browse that tree and read or play what is in it. A folder that is not a library
+is invisible to it. Audio is played as files; managing music (playlists, play
+history, lookups) lives in Orpheus, a separate project. It is written in Rust
 and exposes a JSON-over-HTTP API that any client in any language can call, while
 keeping its domain logic in a reusable core library that a Flutter desktop
 front-end can also consume directly via FFI.
 
 ## The Problem
 
-Files accumulate across a single user's machine — music, movies and series, HTML
+Files accumulate across a single user's machine — movies and series, HTML
 pages, Markdown and text notes, PDFs and e-books, images, and browser bookmarks
 — with no unified way to browse, search, edit metadata, or track consumption
 progress. Scattered files and disconnected browser-managed bookmarks make
@@ -30,10 +34,13 @@ already on disk, without re-encoding, duplicating, or relocating the files.
 
 ## What It Does
 
-- Indexes thousands of files from disk and keeps catalog metadata up to date.
+- Lets the user add folders as libraries — the only way files enter the
+  catalog — and browses each one as the folder tree it is on disk.
+- Indexes thousands of files from the libraries' folders, only the types it can
+  read, and keeps catalog metadata up to date.
 - Lets the user view, edit metadata of, rename, and delete:
-  - Music (audio files)
   - Movies and series (video files)
+  - Music and other audio files
   - HTML pages
   - Markdown and text files
   - PDF and e-book formats (books)
@@ -55,7 +62,7 @@ already on disk, without re-encoding, duplicating, or relocating the files.
 ## What It Doesn't Do
 
 - No multi-user accounts or shared libraries — single owner only.
-- No complex media editing — no audio or video re-encoding, no image
+- No complex media editing — no video re-encoding, no image
   manipulation. The API manages metadata, names, organization, and (for text)
   content; it does not transform media.
 - No duplicating or relocating source files — files stay on disk where they are.

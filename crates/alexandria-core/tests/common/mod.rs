@@ -3,13 +3,6 @@
 //! collections collaborators with no real database, filesystem, or auth
 //! service.
 
-// This module is included by more than one test target (`catalog.rs`,
-// `collections.rs`), and each uses only the fakes for its own feature area —
-// so every helper is dead code as far as the *other* target's compilation is
-// concerned. The allow is module-wide rather than per item because the set of
-// "unused here" helpers changes with every target that includes the file.
-#![allow(dead_code)]
-
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -30,9 +23,8 @@ use alexandria_core::catalog::comic_tags::{ComicMetadataReader, ComicTags};
 use alexandria_core::catalog::document_tags::{DocumentMetadataReader, DocumentTags};
 use alexandria_core::catalog::fs::{FileEntry, FileStat, Filesystem};
 use alexandria_core::catalog::image_tags::{ImageMetadataReader, ImageTags};
-use alexandria_core::catalog::index_scope::IndexScope;
 use alexandria_core::catalog::model::{
-    File, FileState, FileType, FileView, LibraryScope, NewFile, StateFilter, SubtypeMetadata,
+    File, FileState, FileType, FileView, NewFile, StateFilter, SubtypeMetadata,
 };
 use alexandria_core::catalog::repos::CatalogRepository;
 use alexandria_core::catalog::run_registry::{RunPhase, RunProgress};
@@ -126,11 +118,6 @@ pub struct FakeCatalogRepository {
     /// Page count last written for `uuid` via `set_comic_page_count`
     /// (issue #44 comic slice).
     comic_page_counts: Arc<Mutex<HashMap<Uuid, i64>>>,
-    /// Every uuid `forget_derived_content` has been called for, in order.
-    /// A `Vec` rather than a set: a refresh calling it twice for one file
-    /// would be a second measurement thrown away, which a test should be
-    /// able to see.
-    forgotten_derived: Arc<Mutex<Vec<Uuid>>>,
 }
 
 impl FakeCatalogRepository {
@@ -249,20 +236,30 @@ impl FakeCatalogRepository {
     pub fn comic_page_count_for(&self, uuid: Uuid) -> Option<i64> {
         self.comic_page_counts.lock().unwrap().get(&uuid).copied()
     }
-
-    /// How many times `forget_derived_content` has been called for `uuid` —
-    /// the lyrics and energy a changed file's bytes invalidate (UC-02).
-    pub fn derived_forgotten_for(&self, uuid: Uuid) -> usize {
-        self.forgotten_derived
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|forgotten| **forgotten == uuid)
-            .count()
-    }
 }
 
 impl CatalogRepository for FakeCatalogRepository {
+    async fn set_audio_duration(
+        &self,
+        uuid: Uuid,
+        duration_seconds: f64,
+    ) -> Result<(), DomainError> {
+        let files = self.files.lock().unwrap();
+        let file = files
+            .values()
+            .find(|f| f.uuid == uuid)
+            .ok_or(DomainError::NotFound)?;
+        if file.file_type != alexandria_core::catalog::model::FileType::Audio {
+            return Err(DomainError::InvalidInput("file is not audio".into()));
+        }
+        drop(files);
+        self.audio_durations
+            .lock()
+            .unwrap()
+            .insert(uuid, duration_seconds);
+        Ok(())
+    }
+
     async fn find_by_path(&self, path: &str) -> Result<Option<File>, DomainError> {
         Ok(self.files.lock().unwrap().get(path).cloned())
     }
@@ -423,11 +420,9 @@ impl CatalogRepository for FakeCatalogRepository {
         file_type: Option<FileType>,
         state: StateFilter,
         collection_uuid: Option<Uuid>,
-        // The fake holds no library membership, so the scope changes nothing
-        // here. What it must not do is silently disagree with the real
-        // repository — the persistence tests are where the exclusion is
-        // asserted, against a database that has libraries in it.
-        _scope: LibraryScope,
+        // The fake holds no library membership, so a library filter changes
+        // nothing here; the persistence tests assert it against SQLite.
+        _library_uuid: Option<Uuid>,
     ) -> Result<Vec<File>, DomainError> {
         let files = self.files.lock().unwrap();
         let links = self.collection_links.lock().unwrap();
@@ -470,10 +465,10 @@ impl CatalogRepository for FakeCatalogRepository {
         file_type: Option<FileType>,
         state: StateFilter,
         collection_uuid: Option<Uuid>,
-        scope: LibraryScope,
+        library_uuid: Option<Uuid>,
     ) -> Result<Vec<FileView>, DomainError> {
         let files = self
-            .list_filtered(file_type, state, collection_uuid, scope)
+            .list_filtered(file_type, state, collection_uuid, library_uuid)
             .await?;
         let metadata = self.metadata.lock().unwrap();
         let dimensions = self.dimensions.lock().unwrap();
@@ -602,27 +597,6 @@ impl CatalogRepository for FakeCatalogRepository {
             .copied())
     }
 
-    async fn set_audio_duration(
-        &self,
-        uuid: Uuid,
-        duration_seconds: f64,
-    ) -> Result<(), DomainError> {
-        let files = self.files.lock().unwrap();
-        let file = files
-            .values()
-            .find(|f| f.uuid == uuid)
-            .ok_or(DomainError::NotFound)?;
-        if file.file_type != alexandria_core::catalog::model::FileType::Audio {
-            return Err(DomainError::InvalidInput("file is not audio".into()));
-        }
-        drop(files);
-        self.audio_durations
-            .lock()
-            .unwrap()
-            .insert(uuid, duration_seconds);
-        Ok(())
-    }
-
     async fn set_video_duration(
         &self,
         uuid: Uuid,
@@ -642,6 +616,10 @@ impl CatalogRepository for FakeCatalogRepository {
             .unwrap()
             .insert(uuid, duration_seconds);
         Ok(())
+    }
+
+    async fn find_audio_duration(&self, uuid: Uuid) -> Result<Option<f64>, DomainError> {
+        Ok(self.audio_durations.lock().unwrap().get(&uuid).copied())
     }
 
     async fn find_video_duration(&self, uuid: Uuid) -> Result<Option<f64>, DomainError> {
@@ -776,11 +754,6 @@ impl CatalogRepository for FakeCatalogRepository {
             return Err(DomainError::internal("fake purge failure"));
         }
         files.remove(&file.path);
-        Ok(())
-    }
-
-    async fn forget_derived_content(&self, uuid: Uuid) -> Result<(), DomainError> {
-        self.forgotten_derived.lock().unwrap().push(uuid);
         Ok(())
     }
 
@@ -1491,7 +1464,7 @@ pub fn a_cataloged_file(path: &str, size_bytes: i64, mtime: Option<DateTime<Utc>
         uuid: Uuid::new_v4(),
         path: path.to_string(),
         name: path.rsplit('/').next().unwrap_or(path).to_string(),
-        file_type: FileType::Audio,
+        file_type: FileType::Text,
         content_hash: None,
         size_bytes: Some(size_bytes),
         mtime,
@@ -2618,16 +2591,8 @@ impl CatalogRunRepository for FakeCatalogRunRepository {
         root: Option<&str>,
         started_at: DateTime<Utc>,
         concurrency: u32,
-        scope: Option<&str>,
+        library_uuid: Option<Uuid>,
     ) -> Result<(), DomainError> {
-        // Mirrors the SQLite adapter's read side: the stored list parses back
-        // into the scope, and NULL is every type. A stored value that will
-        // not parse is this fake's own bug, so it panics rather than quietly
-        // widening the run to every type.
-        let scope = match scope {
-            Some(raw) => IndexScope::parse_list(raw).expect("a stored scope must parse back"),
-            None => IndexScope::all(),
-        };
         self.runs.lock().unwrap().insert(
             id,
             CatalogRun {
@@ -2651,7 +2616,7 @@ impl CatalogRunRepository for FakeCatalogRunRepository {
                 // The first execution of the run, as the column's default
                 // says. `resume` counts from here.
                 segment: 0,
-                scope,
+                library_uuid,
             },
         );
         Ok(())
@@ -2912,11 +2877,15 @@ impl CatalogRunRepository for FakeCatalogRunRepository {
 pub struct FailingCatalogRepository;
 
 impl CatalogRepository for FailingCatalogRepository {
-    async fn find_by_path(&self, _path: &str) -> Result<Option<File>, DomainError> {
+    async fn set_audio_duration(
+        &self,
+        _uuid: Uuid,
+        _duration_seconds: f64,
+    ) -> Result<(), DomainError> {
         unimplemented!("not reached by the run-fails-to-list path")
     }
 
-    async fn forget_derived_content(&self, _uuid: Uuid) -> Result<(), DomainError> {
+    async fn find_by_path(&self, _path: &str) -> Result<Option<File>, DomainError> {
         unimplemented!("not reached by the run-fails-to-list path")
     }
 
@@ -2986,7 +2955,7 @@ impl CatalogRepository for FailingCatalogRepository {
         _file_type: Option<FileType>,
         _state: StateFilter,
         _collection_uuid: Option<Uuid>,
-        _scope: LibraryScope,
+        _library_uuid: Option<Uuid>,
     ) -> Result<Vec<File>, DomainError> {
         unimplemented!("not reached by the run-fails-to-list path")
     }
@@ -3004,7 +2973,7 @@ impl CatalogRepository for FailingCatalogRepository {
         _file_type: Option<FileType>,
         _state: StateFilter,
         _collection_uuid: Option<Uuid>,
-        _scope: LibraryScope,
+        _library_uuid: Option<Uuid>,
     ) -> Result<Vec<FileView>, DomainError> {
         unimplemented!("not reached by the run-fails-to-list path")
     }
@@ -3041,14 +3010,6 @@ impl CatalogRepository for FailingCatalogRepository {
         unimplemented!("not reached by the run-fails-to-list path")
     }
 
-    async fn set_audio_duration(
-        &self,
-        _uuid: Uuid,
-        _duration_seconds: f64,
-    ) -> Result<(), DomainError> {
-        unimplemented!("not reached by the run-fails-to-list path")
-    }
-
     async fn set_video_duration(
         &self,
         _uuid: Uuid,
@@ -3058,6 +3019,10 @@ impl CatalogRepository for FailingCatalogRepository {
     }
 
     async fn find_video_duration(&self, _uuid: Uuid) -> Result<Option<f64>, DomainError> {
+        unimplemented!("not reached by the run-fails-to-list path")
+    }
+
+    async fn find_audio_duration(&self, _uuid: Uuid) -> Result<Option<f64>, DomainError> {
         unimplemented!("not reached by the run-fails-to-list path")
     }
 
@@ -3221,7 +3186,7 @@ impl CatalogRunRepository for FailingCatalogRunRepository {
         _root: Option<&str>,
         _started_at: DateTime<Utc>,
         _concurrency: u32,
-        _scope: Option<&str>,
+        _library_uuid: Option<Uuid>,
     ) -> Result<(), DomainError> {
         match self {
             Self::StartFails => Err(DomainError::Disk("run store unavailable".into())),
@@ -3421,19 +3386,19 @@ impl Filesystem for InterruptingFilesystem {
     }
 }
 
-/// Runs an [`Interrupt`] the first time it is asked to read audio tags, then
-/// answers `None` like an unseeded [`FakeAudioMetadataReader`] would.
+/// Runs an [`Interrupt`] the first time it is asked to read video tags, then
+/// answers `None` like an unseeded [`FakeVideoMetadataReader`] would.
 ///
 /// This is the index walk's counterpart to [`InterruptingFilesystem`]:
 /// indexing does not stat per entry, and `CatalogRepository` is far too wide
-/// to wrap, but every audio entry reaches the tag reader inside `index_entry`
-/// — so a walk of `.mp3` files has its seam here.
-pub struct InterruptingAudioMetadataReader {
+/// to wrap, but every video entry reaches the tag reader inside `index_entry`
+/// — so a walk of `.mp4` files has its seam here.
+pub struct InterruptingVideoMetadataReader {
     interrupt: Interrupt,
     fired: AtomicBool,
 }
 
-impl InterruptingAudioMetadataReader {
+impl InterruptingVideoMetadataReader {
     pub fn new(interrupt: Interrupt) -> Self {
         Self {
             interrupt,
@@ -3442,8 +3407,8 @@ impl InterruptingAudioMetadataReader {
     }
 }
 
-impl AudioMetadataReader for InterruptingAudioMetadataReader {
-    async fn read(&self, _path: &str) -> Option<AudioTags> {
+impl VideoMetadataReader for InterruptingVideoMetadataReader {
+    async fn read(&self, _path: &str) -> Option<VideoTags> {
         if !self.fired.swap(true, Ordering::Relaxed) {
             (self.interrupt)().await;
         }
@@ -3466,7 +3431,7 @@ impl AudioMetadataReader for InterruptingAudioMetadataReader {
 /// every future it has already started before any of them finishes, so
 /// `max_seen` reports how many were genuinely started together.
 #[derive(Debug, Default, Clone)]
-pub struct ConcurrencyTrackingAudioMetadataReader {
+pub struct ConcurrencyTrackingVideoMetadataReader {
     // Arc-wrapped, not plain fields: the test needs a handle that outlives
     // the handler's own copy to read `max_seen` afterward, mirroring how
     // `FakeCatalogRepository` shares its state — a cheap `Clone` of a shared
@@ -3475,7 +3440,7 @@ pub struct ConcurrencyTrackingAudioMetadataReader {
     max_seen: Arc<AtomicUsize>,
 }
 
-impl ConcurrencyTrackingAudioMetadataReader {
+impl ConcurrencyTrackingVideoMetadataReader {
     pub fn new() -> Self {
         Self::default()
     }
@@ -3486,8 +3451,8 @@ impl ConcurrencyTrackingAudioMetadataReader {
     }
 }
 
-impl AudioMetadataReader for ConcurrencyTrackingAudioMetadataReader {
-    async fn read(&self, _path: &str) -> Option<AudioTags> {
+impl VideoMetadataReader for ConcurrencyTrackingVideoMetadataReader {
+    async fn read(&self, _path: &str) -> Option<VideoTags> {
         let now_in_flight = self.current.fetch_add(1, Ordering::SeqCst) + 1;
         self.max_seen.fetch_max(now_in_flight, Ordering::SeqCst);
         tokio::task::yield_now().await;
@@ -3563,4 +3528,39 @@ impl RecoveryCodeRepository for FakeRecoveryCodeRepository {
             .filter(|(_, consumed_at)| consumed_at.is_none())
             .count() as u32)
     }
+}
+
+/// A run starter that opens nothing and always succeeds: for library tests
+/// about what is stored, whose folders are paths written by hand rather than
+/// folders on disk a real run could walk.
+pub struct AlwaysStartsRun;
+
+impl alexandria_core::catalog::commands::index::LibraryRunStarter for AlwaysStartsRun {
+    async fn check_folder(&self, _root: &str) -> Result<(), DomainError> {
+        Ok(())
+    }
+
+    async fn start_library_run(
+        &self,
+        _library: &alexandria_core::libraries::model::Library,
+        _priority: alexandria_core::catalog::runs::RunPriority,
+        _token: &str,
+    ) -> Result<alexandria_core::catalog::commands::index::IndexStarted, DomainError> {
+        Ok(alexandria_core::catalog::commands::index::IndexStarted {
+            run_id: Uuid::new_v4(),
+        })
+    }
+}
+
+/// Insert a library at `root` straight into the table and answer its uuid,
+/// for a test that writes file rows itself: every file belongs to a library.
+pub async fn seed_library(pool: &sqlx::sqlite::SqlitePool, root: &str) -> Uuid {
+    let uuid = Uuid::new_v4();
+    sqlx::query("INSERT INTO libraries (uuid, name, root_path) VALUES (?, 'Library', ?)")
+        .bind(uuid.to_string())
+        .bind(root)
+        .execute(pool)
+        .await
+        .expect("seed library");
+    uuid
 }

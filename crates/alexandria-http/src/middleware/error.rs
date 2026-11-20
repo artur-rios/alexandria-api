@@ -43,3 +43,62 @@ impl IntoResponse for ApiError {
             .into_response()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn given_each_error_class_when_mapped_then_it_gets_its_http_status() {
+        let cases = [
+            (ErrorClass::NotFound, StatusCode::NOT_FOUND),
+            (ErrorClass::Unauthorized, StatusCode::UNAUTHORIZED),
+            (ErrorClass::BadRequest, StatusCode::BAD_REQUEST),
+            (ErrorClass::Conflict, StatusCode::CONFLICT),
+            (ErrorClass::TooManyRequests, StatusCode::TOO_MANY_REQUESTS),
+            (
+                ErrorClass::ServiceUnavailable,
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (ErrorClass::Internal, StatusCode::INTERNAL_SERVER_ERROR),
+        ];
+
+        for (class, expected) in cases {
+            assert_eq!(status_for(class), expected, "{class:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn given_a_rejection_when_turned_into_a_response_then_status_type_and_body_are_the_cores()
+    {
+        // Arrange
+        let error = DomainError::rejected("too_long", "too long").with_param("max", "64");
+        let (_, expected_body) = error_body(&error);
+
+        // Act
+        let response = ApiError(error).into_response();
+
+        // Assert
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response.headers()[axum::http::header::CONTENT_TYPE],
+            "application/json"
+        );
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        assert_eq!(bytes, expected_body.to_json().as_bytes());
+    }
+
+    #[tokio::test]
+    async fn given_a_rate_limit_when_turned_into_a_response_then_it_is_429() {
+        // Arrange — no producer raises this today, so no route test reaches it.
+        let error = DomainError::too_many_requests("too_soon", "wait");
+
+        // Act
+        let response = ApiError(error).into_response();
+
+        // Assert
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+}

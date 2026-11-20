@@ -1,12 +1,18 @@
 # Alexandria API
 
-A fast, type-aware personal library back-end written in Rust. Alexandria indexes,
-organizes, and surfaces a single user's on-disk media and documents — audio,
-movies and series, HTML pages, Markdown and text files, PDFs and e-books, comic
-books, images, and browser bookmarks — without re-encoding, duplicating, or
-relocating them. The domain logic lives in a reusable Rust core library exposed
-over both an HTTP/REST-JSON API and a Flutter FFI surface, so any client in any
-language can drive it and the Flutter desktop front-end can call it in-process.
+A fast, type-aware personal library manager back-end written in Rust. The owner
+adds folders as **libraries**; Alexandria indexes every file in them it can read
+— movies and series, music and other audio, HTML pages, Markdown and text files,
+PDFs and e-books, comic books, and images — keeps each library's folder
+structure exactly as it is on disk, and lets a client browse that tree and open,
+read, or play what is in it, without re-encoding, duplicating, or relocating
+anything. A folder that is not a library is invisible to Alexandria. Browser
+bookmarks are kept alongside. Audio is played as files, not managed as music:
+playlists, play history and lookups belong to Orpheus, a separate project. The
+domain logic lives in a reusable Rust core library
+exposed over both an HTTP/REST-JSON API and a Flutter FFI surface, so any client
+in any language can drive it and the Flutter desktop front-end can call it
+in-process.
 
 > Single-user. Metadata + path only, never the bytes. No complex media editing.
 > Two-phase soft/hard deletion. Pluggable auth (external JWT, local encrypted
@@ -33,17 +39,14 @@ its open/closed state, so the tables stay in sync with the board automatically.
 | [F-07 Watchlists](https://github.com/artur-rios/alexandria-api/milestone/8) | UC-20 … UC-25 | 6 / 6 |
 | [F-08 Reading lists](https://github.com/artur-rios/alexandria-api/milestone/9) | UC-26 … UC-31 | 6 / 6 |
 | [F-09 Pluggable authentication](https://github.com/artur-rios/alexandria-api/milestone/10) | UC-34 … UC-36, UC-41 | 4 / 4 |
-| [F-10 Media playback](https://github.com/artur-rios/alexandria-api/milestone/11) | UC-38 … UC-40, and the energy envelope | 4 / 4 |
-| F-11 Playlists | UC-49 … UC-50 | 2 / 2 |
-| F-12 Libraries | UC-51 | 1 / 1 |
-| F-13 Music enrichment | Lyrics and artist photography | 1 / 1 |
-| F-14 Play history | Recording a play, and the rankings | 1 / 1 |
-| **Total** | | **50 / 50** |
+| [F-10 Media playback](https://github.com/artur-rios/alexandria-api/milestone/11) | UC-38 … UC-40 | 3 / 3 |
+| F-12 Libraries | UC-51, UC-01 | 1 / 1 |
+| **Total** | | **46 / 46** |
 
-The last four carry no milestone links and no issue numbers, and that is
-honest rather than an omission: they were built from design documents in
+The last one carries no milestone link and no issue number, and that is
+honest rather than an omission: it was built from a design document in
 `docs/superpowers/specs/` rather than from the issue-per-use-case backlog the
-first eleven follow. What they are not is undocumented — each has its
+first eleven follow. What it is not is undocumented — it has its
 requirements in
 [System Requirements Document §3](docs/requirements/System%20Requirements%20Document.md)
 and its routes in §5, which is what the tables below trace against.
@@ -60,13 +63,13 @@ Workspace scaffold, configuration, migrations, logging, and the health surface.
 
 ### F-01 — File indexing
 
-Discover on-disk files, classify them by type, record the stat pair every
+Discover the files in each library's folder, classify them by type, record the stat pair every
 directory entry already carries, and keep the catalog current — with each run
 observable, pausable, resumable, and cancellable while it walks.
 
 | Issue | Use case | Status | Title | Requirements |
 | --- | --- | :---: | --- | --- |
-| [#2](https://github.com/artur-rios/alexandria-api/issues/2) | UC-01 | &#9745; | Index library files | FR-FC-01 … FR-FC-09, FR-FC-24 |
+| [#2](https://github.com/artur-rios/alexandria-api/issues/2) | UC-01 | &#9745; | Index a library | FR-FC-01 … FR-FC-09, FR-FC-24 |
 | [#3](https://github.com/artur-rios/alexandria-api/issues/3) | UC-02 | &#9745; | Re-index and refresh the catalog | FR-FC-08, FR-FC-10, FR-FC-11, FR-FC-24 |
 | [#99](https://github.com/artur-rios/alexandria-api/issues/99) | UC-42 | &#9745; | Query an index or refresh run | FR-FC-24, FR-FC-27, FR-FC-28, FR-FC-29, FR-FC-35 |
 | — | UC-48 | &#9745; | Pause, resume, or cancel an index run | FR-FC-24, FR-FC-27, FR-FC-29, FR-FC-31 … FR-FC-34 |
@@ -78,7 +81,7 @@ Read the catalog and edit type-specific metadata.
 | Issue | Use case | Status | Title | Requirements |
 | --- | --- | :---: | --- | --- |
 | [#4](https://github.com/artur-rios/alexandria-api/issues/4) | UC-03 | &#9745; | Browse and view file metadata | FR-FC-12, FR-FC-13, FR-FC-24 |
-| [#5](https://github.com/artur-rios/alexandria-api/issues/5) | UC-04 | &#9745; | Edit file metadata | FR-FC-14 … FR-FC-18, FR-FC-24 |
+| [#5](https://github.com/artur-rios/alexandria-api/issues/5) | UC-04 | &#9745; | Edit file metadata | FR-FC-15 … FR-FC-18, FR-FC-24 |
 
 ### F-03 — Renaming & lifecycle management
 
@@ -176,43 +179,17 @@ Serve file bytes to the front-end, plus comic pages and thumbnails.
 | [#90](https://github.com/artur-rios/alexandria-api/issues/90) | UC-38 | &#9745; | Stream file content | FR-MP-01, FR-MP-02, FR-MP-03, FR-MP-06 |
 | [#91](https://github.com/artur-rios/alexandria-api/issues/91) | UC-39 | &#9745; | Read a comic book page | FR-MP-03, FR-MP-04, FR-MP-06 |
 | [#92](https://github.com/artur-rios/alexandria-api/issues/92) | UC-40 | &#9745; | Get a file thumbnail | FR-MP-05, FR-MP-06 |
-| — | — | &#9745; | Measure a track's energy envelope | FR-MP-07 |
-
-### F-11 — Playlists
-
-Named, ordered groupings of audio tracks — audio's counterpart to watchlists
-and reading lists.
-
-| Issue | Use case | Status | Title | Requirements |
-| --- | --- | :---: | --- | --- |
-| — | UC-49 | &#9745; | Manage a playlist | FR-TR-01 … FR-TR-11 |
-| — | UC-50 | &#9745; | Play a playlist | FR-TR-07, FR-TR-11 |
 
 ### F-12 — Libraries
 
-A folder browsed as its own tree, whose files are shown there and not in the
-type panels.
+The way into Alexandria, and the only one: a folder added as a library is
+indexed, browsed as its own tree, re-indexed on its own, corrected when it
+moves, and removed with its catalog records. Every other feature works on the
+files libraries hold.
 
 | Issue | Use case | Status | Title | Requirements |
 | --- | --- | :---: | --- | --- |
-| — | UC-51 | &#9745; | Group a folder as a library | FR-FC-36 … FR-FC-41 |
-
-### F-13 — Music enrichment
-
-The one area that reaches services outside this machine: a track's words and
-an artist's photograph, looked up once and kept.
-
-| Issue | Use case | Status | Title | Requirements |
-| --- | --- | :---: | --- | --- |
-| — | — | &#9745; | Look up lyrics and artist photography | FR-EN-01 … FR-EN-09 |
-
-### F-14 — Play history
-
-What was played, and the rankings built from it.
-
-| Issue | Use case | Status | Title | Requirements |
-| --- | --- | :---: | --- | --- |
-| — | — | &#9745; | Record a play and rank what was played most | FR-PH-01 … FR-PH-10 |
+| — | UC-51 | &#9745; | Add a library | FR-FC-36 … FR-FC-42 |
 
 To update the tables: when an issue closes, flip its marker from **&#9744;** to
 **&#9745;** and bump the milestone's progress count. The issue number references
@@ -247,253 +224,23 @@ and auth-service **traits** in `alexandria-core` are what make the handlers
 unit-testable; `alexandria-http` and `alexandria-ffi` are thin transport layers
 over the same handlers.
 
-## Repository layout
-
-```txt
-alexandria-api/
-├── Cargo.toml                 # workspace
-├── crates/
-│   ├── alexandria-core/       # domain: commands, queries, repos, auth, config
-│   ├── alexandria-http/       # axum routes + middleware
-│   └── alexandria-ffi/        # extern "C" + cbindgen header
-├── config.toml.example
-├── docs/
-│   ├── initial/               # informal docs (Project Overview, Stack, Workflow, Business Rules)
-│   ├── requirements/          # formal specs (Vision, SRD, Use Cases, …)
-│   └── System Behavior Document.md   # how the running system behaves, with diagrams
-├── tools/
-└── README.md
-```
-
-## Building
-
-Requirements: Rust **1.94** or newer (edition 2021) and `cargo`. The floor comes
-from sqlx 0.9, the highest MSRV in the dependency graph.
-
-`alexandria-core` links against `ffmpeg-next` for video metadata extraction, so
-the ffmpeg C development libraries and `clang` (for bindgen) must be installed
-locally before the workspace will build — the only system dependency this
-project has. Without them `cargo build` and `cargo test` fail for the whole
-workspace, not just the video code, so install them first.
-
-Any ffmpeg from **3.0 to 9.0** works — `ffmpeg-sys-next 9` gates its bindings
-by version and covers that whole range — so on a platform with a system package
-you can install whatever it offers. CI builds against Ubuntu's 6.1.
-
-### Debian/Ubuntu
-
-```bash
-sudo apt-get install libavformat-dev libavcodec-dev libavutil-dev libavfilter-dev libavdevice-dev libswscale-dev libswresample-dev pkg-config clang
-```
-
-### macOS
-
-```bash
-brew install ffmpeg pkg-config llvm
-```
-
-Homebrew's `ffmpeg` formula tracks the current major, which is inside the
-supported range.
-
-### Windows
-
-Windows has no system package that ffmpeg's build tooling finds automatically,
-so this takes a few deliberate steps. One constraint causes nearly every failed
-attempt, so read it before picking an option.
-
-**The build needs ffmpeg's headers and import libraries, not `ffmpeg.exe`.**
-Most Windows ffmpeg downloads — including everything labelled "essentials", and
-the packages you get by searching for "ffmpeg windows" — ship only a `bin/`
-directory with the executables. Those are useless here. You need a build that
-also ships `include/` and `lib/`, which in BtbN's naming means a **`.Shared.`**
-variant, and in the ffmpeg world generally is called a *dev* or *shared* build.
-
-Version is not a constraint: `ffmpeg-sys-next 9` supports ffmpeg 3.0 through
-9.0, so any current build will do.
-
-Prerequisites for every option below:
-
-- **MSVC build tools** — the Visual Studio "Desktop development with C++"
-  workload, matching Rust's `x86_64-pc-windows-msvc` target.
-- **LLVM/clang**, which `bindgen` needs to parse ffmpeg's headers:
-
-  ```bash
-  winget install LLVM.LLVM
-  ```
-
-  A default LLVM install is normally enough — bindgen locates `libclang.dll`
-  without help (verified against LLVM 22 installed this way). Only if it
-  reports that it cannot find libclang do you need to point at it explicitly:
-
-  ```bash
-  setx LIBCLANG_PATH "C:\Program Files\LLVM\bin"
-  ```
-
-`setx` writes a persistent user variable but does **not** affect the shell you
-type it in. Open a new terminal before building. Never use `setx PATH` — it
-truncates `PATH` at 1024 characters and can destroy it; edit `PATH` through
-Settings → *Edit environment variables for your account* instead.
-
-#### Option A — winget, prebuilt (fastest; ~1 minute)
-
-Best if you just want the workspace building. The trade-off is licensing: BtbN's
-packages are GPL builds (see [Licensing](#a-note-on-ffmpeg-licensing) below).
-
-1. Install a **shared** build. Pinning a release branch rather than `master`
-   keeps the toolchain reproducible; any of the release branches work:
-
-   ```bash
-   winget install BtbN.FFmpeg.GPL.Shared.7.1
-   ```
-
-   `winget search ffmpeg` lists the alternatives. Avoid `Gyan.FFmpeg` unless you
-   confirm the package ships `include/` and `lib/` — its widely-mirrored builds
-   are executables only.
-2. Find where winget put it — the directory name contains a hash, so it must be
-   looked up rather than guessed. In PowerShell:
-
-   ```powershell
-   Get-ChildItem "$env:LOCALAPPDATA\Microsoft\WinGet\Packages" -Recurse -Depth 3 -Directory -Filter include | Where-Object { $_.FullName -like "*ffmpeg*" }
-   ```
-
-3. Confirm the parent of that `include` directory also contains `lib` and `bin`.
-   That parent is your ffmpeg root. If there is no `include`, you installed a
-   non-`Shared` variant — go back to step 1.
-4. Point the build at it, substituting the path from step 3:
-
-   ```bash
-   setx FFMPEG_DIR "C:\path\to\ffmpeg-n7.1-...-shared"
-   ```
-
-5. Add that root's `bin` directory to `PATH` (via Settings, per the warning
-   above). **Do not skip this.** It is needed at **run** time rather than build
-   time, so the symptom is confusing: `cargo build` succeeds, then every test
-   binary dies instantly with `exit code: 0xc0000135, STATUS_DLL_NOT_FOUND`,
-   because a shared build resolves its DLLs when the process starts.
-6. Open a new terminal and jump to [Verifying](#verifying-the-toolchain).
-
-#### Option B — vcpkg (slower; LGPL by default)
-
-Preferred if you care about the licensing of what you link, since vcpkg's
-default ffmpeg port is LGPL — it omits the GPL-only codecs. It builds from
-source, so budget 30–60 minutes on first install.
-
-1. Clone and bootstrap vcpkg:
-
-   ```bash
-   git clone https://github.com/microsoft/vcpkg C:\vcpkg
-   C:\vcpkg\bootstrap-vcpkg.bat
-   ```
-
-2. Install ffmpeg, pinning a supported major version:
-
-   ```bash
-   C:\vcpkg\vcpkg.exe install "ffmpeg[core,avcodec,avformat,avfilter,avdevice,swscale,swresample]:x64-windows"
-   ```
-
-3. Tell the build where the tree is — `ffmpeg-sys-next` looks for `VCPKG_ROOT`
-   as its second discovery method, after `FFMPEG_DIR`:
-
-   ```bash
-   setx VCPKG_ROOT "C:\vcpkg"
-   ```
-
-4. The `x64-windows` triplet is a dynamic (DLL) build, and the `vcpkg` crate
-   ignores dynamic libraries unless told otherwise:
-
-   ```bash
-   setx VCPKGRS_DYNAMIC "1"
-   ```
-
-   To avoid this and the runtime DLL question entirely, use
-   `:x64-windows-static-md` in step 2 and skip this step.
-5. Open a new terminal and jump to [Verifying](#verifying-the-toolchain).
-
-#### Option C — a downloaded build, placed by hand
-
-Equivalent to Option A without winget; use it when you want a specific build.
-Download a **shared** ffmpeg 6.1 or 7.1 archive, extract it somewhere stable
-such as `C:\ffmpeg`, confirm that directory contains `include/`, `lib/`, and
-`bin/`, then:
-
-```bash
-setx FFMPEG_DIR "C:\ffmpeg"
-```
-
-Add `C:\ffmpeg\bin` to `PATH` for the runtime DLLs, open a new terminal, and
-verify.
-
-#### Verifying the toolchain
-
-Build the one crate that links ffmpeg, before the whole workspace — its failure
-messages are the legible ones:
-
-```bash
-cargo build -p alexandria-core
-```
-
-Then confirm the libraries also resolve at run time, which a build alone does
-not prove:
-
-```bash
-cargo test -p alexandria-core --test hashing
-```
-
-#### When it still fails
-
-`ffmpeg-sys-next` reports which discovery methods it tried, in order:
-`FFMPEG_DIR`, then vcpkg, then `pkg-config`. Read that list in the error — it
-tells you which step above did not take effect.
-
-| Symptom | Cause and fix |
-| --- | --- |
-| `1. FFMPEG_DIR environment variable (not set)` | `setx` does not affect the current shell. Open a new terminal. |
-| `2. vcpkg package manager (ffmpeg package not found)` | `VCPKG_ROOT` unset or the port is not installed for the `x64-windows` triplet. |
-| `The pkg-config command could not be found` | Expected on Windows and harmless — it is only the third fallback. If you see it, the real failure is that methods 1 and 2 both missed. |
-| `Unable to find libclang` | `LIBCLANG_PATH` is unset or wrong. It must point at the directory containing `libclang.dll`, normally `C:\Program Files\LLVM\bin`. |
-| Compile or link errors inside `ffmpeg-sys-next` | Usually a partial install — headers present but import libraries missing, or a mix of two ffmpeg versions on `PATH`/`FFMPEG_DIR`. Confirm one root holds `include/`, `lib/`, and `bin/` together. |
-| Builds fine, but tests fail to start or exit with `0xc0000135` | The shared build's DLLs are not on `PATH`. Add the ffmpeg `bin` directory. |
-
-#### A note on ffmpeg licensing
-
-Alexandria is GPL-3.0-or-later (see [LICENSE](LICENSE)), so linking either
-ffmpeg variant is lawful. This note used to say the opposite, because the
-project was proprietary and only an LGPL build could be linked at all.
-
-The distinction still matters for a different reason. ffmpeg is LGPL by
-default; builds configured with `--enable-gpl` — every BtbN `GPL` package
-above, and most convenience builds — are GPL, and what they add over the LGPL
-build is encoders: x264, x265, xvid. Nothing in Alexandria re-encodes, so an
-LGPL build gives the project every capability it actually uses. Prefer it for
-anything shipped, and treat a GPL build as a development convenience.
-
-What the desktop front end ships on Linux is a separate matter: it carries
-libmpv, which is copyleft wherever it comes from, so those packages are GPL
-regardless of which ffmpeg is in them. Flagging the distinction, not giving
-legal advice.
-
-```bash
-# Build the whole workspace (core + http + ffi)
-cargo build --workspace --release
-
-# Build the HTTP server binary
-cargo build --release -p alexandria-http
-
-# Build the FFI dynamic library + regenerate the C header via cbindgen
-cargo build --release -p alexandria-ffi
-```
-
-The workspace enforces `#![deny(unsafe_code)]` in every crate.
-
 ## Running
+
+The server is built from source. It needs Rust **1.94** or newer and, because
+`alexandria-core` links ffmpeg for video metadata extraction, the ffmpeg C
+development libraries (any version from 3.0 to 9.0) and `clang` installed
+before the workspace will build. The per-platform install — including Windows,
+which takes a few deliberate steps — is in
+[CONTRIBUTING.md](./CONTRIBUTING.md#prerequisites).
 
 Configuration is read from `config.toml` at startup, with every key overridable
 through an environment variable named `ALEXANDRIA_<SECTION>_<KEY>` —
 `ALEXANDRIA_HTTP_PORT`, `ALEXANDRIA_AUTH_MODE`, `ALEXANDRIA_LOGGING_LEVEL`. The
 rule has no exceptions. See [`config.toml.example`](config.toml.example) for the
 full list (auth mode and session TTL, HTTP bind address, SQLite path, filesystem
-root — which both feeds the health probe and bounds what indexing may reach —
-indexing concurrency, soft-delete retention, log level).
+root — which both feeds the health probe and bounds what indexing, library
+moves, and file access may reach — indexing concurrency, soft-delete
+retention, log level).
 
 > Two configuration changes landed together while the project is pre-release,
 > and both fail quietly rather than loudly. The log level's override is now
@@ -514,9 +261,10 @@ sqlx migrate run --source crates/alexandria-core/migrations \
 
 # 3. Start the HTTP server (binds to loopback by default)
 cargo run --release -p alexandria-http
-
-# or, once packaged, run the bundled binary alongside the Flutter desktop app
 ```
+
+The desktop front-end does not need this server: it links the core in process
+over FFI, and its packages carry the FFI library only.
 
 Two notes on that URL, verified against sqlx-cli 0.9.0: `?mode=rwc` is required
 or the CLI refuses to create a database that does not exist yet, and the scheme
@@ -526,10 +274,13 @@ absolute paths, where the drive letter parses as a URL authority.
 Both surfaces read the same configuration: `ALEXANDRIA_CONFIG` (default
 `config.toml`) plus `ALEXANDRIA_*` environment overrides.
 
-In external auth mode, set `ALEXANDRIA_AUTH_MODE=external` and
-`ALEXANDRIA_AUTH_HEIMDALL_TOKEN_SECRET` to the HS256 secret Heimdall signs
-with, and `ALEXANDRIA_AUTH_HEIMDALL_SCOPE_ID` to the UUID of the Heimdall
-scope whose members are accepted as the owner. In
+In external auth mode, set `ALEXANDRIA_AUTH_MODE=external`,
+`ALEXANDRIA_AUTH_HEIMDALL_JWKS_URL` to Heimdall's key set
+(`http://heimdall-api.<env>:8080/.well-known/jwks.json` inside the platform),
+and `ALEXANDRIA_AUTH_HEIMDALL_SCOPE_ID` to the UUID of the Heimdall scope whose
+members are accepted as the owner. While Heimdall still accepts its old HS256
+tokens, `ALEXANDRIA_AUTH_HEIMDALL_TOKEN_SECRET` accepts them here too; unset it
+when Heimdall drops the secret. In
 local login mode (`ALEXANDRIA_AUTH_MODE=local`),
 create the owner's account once via `POST /v1/auth/local/register` (UC-41) —
 it takes `email`, `password`, and `passwordConfirmation`, succeeds only once,
@@ -572,8 +323,9 @@ The fix is to delete the database file and let it rebuild:
 rm "${ALEXANDRIA_DATABASE_PATH:-alexandria.sqlite}"
 ```
 
-Then start the server and re-run `POST /v1/index` against your library. The
-catalog is derived from the files on disk, so re-indexing restores it — but
+Then start the server and add your folders again as libraries
+(`POST /v1/libraries`), which indexes them. The catalog is derived from the
+files on disk, so re-indexing restores it — but
 anything the catalog holds that is *not* derived from disk is lost: edited
 metadata, collections, bookmarks, watchlists, reading lists, watch and reading
 progress, and local-auth accounts. Export or note whatever you need first.
@@ -583,6 +335,8 @@ progress, and local-auth accounts. Export or note whatever you need first.
 | Change | Effect |
 | --- | --- |
 | `size_bytes`/`mtime` change detection replaced full-file hashing (FR-FC-09), and the run record gained progress, pause, priority, and segment columns (UC-42) | Both baselines amended. Delete the database and re-index. |
+| Music and audio removed (0.5.0): Alexandria no longer catalogs audio files, and music now lives in Orpheus, a separate project. Migration 25 deletes the stored music — audio files, tags, lyrics, artist photography records, play history, playlists, and track energy — and removes `audio` from any recorded index run; migration 26 deletes the run failures recorded on audio files | No database deletion needed; the migration runs on startup. Files on disk are never touched. The `[metadata]` config section is ignored if still present. |
+| Libraries are the only way in (0.6.0): files enter the catalog only by being inside a library. `POST /v1/index`, `alexandria_index_start`, the `types` scope and the `includeLibraries` listing flag are gone; adding a library (`POST /v1/libraries`) indexes it, and `POST /v1/libraries/{uuid}/index` re-indexes it. Migration 28 **deletes every catalog record outside a library** — the files, their progress and collection membership, and the index runs over roots no library holds. Audio is a catalog type again, as playable files (no playlists, history or lookups) | **Back up your database before the first start on 0.6.0** if you want to keep watch or reading progress and collection membership on files outside libraries. Then add your folders as libraries. Files on disk are never touched. |
 
 ### Health check
 
@@ -608,38 +362,10 @@ curl -H "Authorization: Bearer $TOKEN" \
      http://127.0.0.1:8080/v1/files/$UUID/thumbnail --output thumb.jpg
 ```
 
-The Flutter front-end must send the `Authorization` header on media
-requests; `video_player` and `just_audio` both support per-request headers.
-Over FFI there is no stream: `alexandria_file_playback_source` returns the
-file's path and the client opens it directly.
-
-## Testing
-
-Tests are organized by crate and split into **unit** (handler logic against
-trait fakes), **integration** (HTTP/FFI end-to-end against real SQLite and a
-temp filesystem), and **parity** (HTTP vs FFI must return identical results).
-See [`docs/requirements/Testing Specification Document.md`](docs/requirements/Testing%20Specification%20Document.md)
-for the full standard.
-
-```bash
-# Run the entire suite
-cargo test --workspace
-
-# Run only unit tests
-cargo test --workspace --lib
-
-# Run only integration tests
-cargo test --workspace --test '*'
-
-# Run the HTTP / FFI parity suite alone
-cargo test -p alexandria-ffi --test parity
-
-# Optional: line/branch coverage
-cargo tarpaulin --workspace --out Html
-```
-
-Every use case is delivered with its tests in the same change, per the
-[Development Workflow Document](docs/requirements/Development%20Workflow%20Document.md).
+An HTTP client must send the `Authorization` header on media requests. Over
+FFI there is no stream: `alexandria_file_playback_source` returns the file's
+path and the client opens it directly, which is what the desktop front-end's
+player (media_kit, over libmpv) does.
 
 ## Documentation
 
@@ -653,43 +379,47 @@ The requirements documents say what the system *shall* do and are the source of
 truth the issues trace into; the behavior document says what it *does*. Where
 the two disagree, one of them is a bug.
 
-Reading order for a new contributor: `docs/initial/Project Overview.md` →
-`docs/requirements/Vision Document.md` →
-`docs/requirements/Use Case Specification Document.md` →
-`docs/System Behavior Document.md`.
+## Changelog
+
+Notable changes are recorded in [CHANGELOG.md](./CHANGELOG.md). No release has
+been tagged yet.
+
+## Contributing
+
+The repository layout, building from source, running the tests, migrations,
+the branching model and the versioning policy are described in
+[CONTRIBUTING.md](./CONTRIBUTING.md).
+
+The GitHub repository is a read-only mirror for the real, open-source code of alexandria-api. Its home is Forgejo, at
+https://git.techcraftsmen.net/artur-rios/alexandria-api. If you want to contribute, e-mail me at arturdev@duck.com.
 
 ## Legal details
 
 Copyright (c) 2026 Artur Rios.
 
-Alexandria is free software: you can redistribute it and/or modify it under the
-terms of the GNU General Public License as published by the Free Software
-Foundation, either version 3 of the License, or (at your option) any later
-version. The full text is in [LICENSE](LICENSE).
+This project is licensed under the [Artur Rios Attribution License](LICENSE).
+It is free and open source: you may view, use, fork, modify, and extend it,
+provided you credit the author, Artur Rios, with a link to
+[artur-rios.tech](https://artur-rios.tech) or
+[github.com/artur-rios](https://github.com/artur-rios). The desktop front end
+([alexandria-ui](https://github.com/artur-rios/alexandria-ui)) is under the same
+licence.
 
-It is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
-without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
-PARTICULAR PURPOSE. See the GNU General Public License for more details.
+### Bundled libraries
 
-### Why this changed
+The Attribution License covers this repository's source code. The third-party
+libraries the program links are not part of it: each keeps its own licence.
 
-This project was proprietary and all rights were reserved. It is copyleft now
-because of what it links.
-
-The core links ffmpeg, and the desktop front end
-([alexandria-ui](https://github.com/artur-rios/alexandria-ui)) links this core
-in process and plays video through libmpv. Its Linux packages are meant to be
-plug and play: unpack one on a machine with a desktop and it runs, with nothing
-to install first. That means carrying those libraries rather than asking the
+The core links ffmpeg, and the desktop front end links this core in process and
+plays video through libmpv. Its Linux release packages are meant to be plug and
+play: unpack one on a machine with a desktop and it runs, with nothing to
+install first. That means carrying those libraries rather than asking the
 user's distribution for them, and libmpv is copyleft from every distribution
 that ships it, as are the x264 and x265 encoders ffmpeg links whether or not
 anything ever encodes with them.
 
-Distributing a program alongside those libraries puts the whole of it under the
-GPL. The front end and this core are one program in the sense the licence
-means, so they are licensed alike.
-
-The alternative was building LGPL versions of mpv and ffmpeg from source and
-staying closed. That was weighed and not chosen: it trades a licence change for
-a release pipeline that builds two large C projects every time and takes on
-their security patching.
+Each bundled library keeps its own licence: the packages carry those texts in
+`lib/licenses`, and the copyleft ones are listed in `lib/licenses/COPYLEFT.tsv`.
+A Linux binary package that bundles them is distributed as a combined work
+subject to those libraries' terms, which means the GPL, version 3. The Windows
+packages carry an LGPL build of ffmpeg and no mpv.

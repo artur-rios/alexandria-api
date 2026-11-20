@@ -5,8 +5,6 @@
 //! `password.rs` — no repository, no clock — so the format and the hash are
 //! testable without a database.
 
-use argon2::password_hash::rand_core::{OsRng, RngCore};
-
 use crate::catalog::fs::sha256_hex;
 
 /// How many codes an owner holds at once. Ten, because a recovery method that
@@ -38,7 +36,10 @@ pub fn generate_recovery_codes() -> Vec<String> {
 
 fn generate_one() -> String {
     let mut bytes = [0u8; RECOVERY_CODE_LENGTH];
-    OsRng.fill_bytes(&mut bytes);
+    // The operating system's generator, as for a password's salt. Its only
+    // failure is the OS refusing randomness at all, which leaves nothing
+    // secure to fall back on.
+    getrandom::fill(&mut bytes).expect("the operating system's random number generator failed");
 
     let mut code = String::with_capacity(RECOVERY_CODE_LENGTH + 1);
     for (index, byte) in bytes.iter().enumerate() {

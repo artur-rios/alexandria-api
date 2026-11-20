@@ -214,8 +214,8 @@ API surface.
 ### 5.1 What a scan costs, and why
 
 Indexing **reads no file bytes to identify a file** (`FR-FC-09`). Per-file work
-is one `stat` plus, at first index only, a tag-header read. Re-index is one
-`stat` and nothing else.
+is one `stat` plus, at first index only, a read of the file's embedded
+metadata. Re-index is one `stat` and nothing else.
 
 This is the single most important behavioral fact about the system, because it
 inverts the cost model:
@@ -241,7 +241,7 @@ by the id `start` returns (`FR-FC-27`).
 
 | Column group | Columns | Written by |
 | --- | --- | --- |
-| Identity | `id`, `kind`, `root`, `scope`, `started_at` | `start` |
+| Identity | `id`, `kind`, `root`, `library_id`, `started_at` | `start` |
 | Lifecycle | `status`, `finished_at`, `error` | terminal writes and the control verbs |
 | Index counts | `scanned`, `indexed`, `skipped`, `already_cataloged`, `failed` | `finish` / `cancel` |
 | Re-index counts | `refreshed`, `marked_missing`, `unchanged`, `failed` | `finish` / `cancel` |
@@ -250,8 +250,7 @@ by the id `start` returns (`FR-FC-27`).
 | Pacing | `concurrency` | `start`, and `resume` when it re-paces |
 | Race guard | `segment` | `resume` only |
 
-`skipped` (an unsupported extension, or a type the run's scope excludes —
-§5.14) and `already_cataloged` (a path the catalog already held) are counted
+`skipped` (a file of a type Alexandria cannot read — §5.13) and `already_cataloged` (a path the catalog already held) are counted
 **apart**. Folding them together made a resumed run
 report every entry an earlier segment had cataloged as a skip — a tally that
 misdescribes what happened.
@@ -304,54 +303,90 @@ sequenceDiagram
     participant R as catalog_runs
     participant W as Walk task
 
-    CL->>T: POST /v1/index {root, priority, types}
-    T->>H: start(request, token)
+    CL->>T: POST /v1/libraries {name, rootPath, priority}
+    T->>H: register → start(library, token)
     H->>H: authenticate
-    H->>H: root exists?
-    H->>H: root inside filesystem.root? (FR-FC-26)
-    H->>R: insert run (running, concurrency from priority)
-    Note over R: FR-FC-27 — the record opens only after<br/>validation, so an invalid root leaves no stray row
-    H-->>T: run id
-    T->>W: spawn execute(root, run_id, scope)
-    T-->>CL: 202 Accepted {runId}
+    H->>H: folder inside filesystem.root? (FR-FC-26)
+    H->>H: overlaps no library?
+    H->>R: insert library
+    H->>H: folder exists?
+    H->>R: insert run (running, library, concurrency from priority)
+    Note over R: FR-FC-27 — the run opens only after<br/>validation; a run that cannot open<br/>removes the library again
+    H-->>T: library + run id
+    T->>W: spawn execute(root, run_id, library)
+    T-->>CL: 201 Created {…library, runId}
     W->>W: walk, classify, stat, persist
 ```
 
-Validation happens in `start`, so a rejected request never leaves a run record
-behind. The run id is handed back only once a record exists to query — the one
+Re-indexing a library (`POST /v1/libraries/{uuid}/index`) takes the same path
+from "insert run" on, after refusing a library that already has a `running` or
+`paused` run (`FR-FC-43`), and answers `202 Accepted {runId}`. A library's folder
+is the only root ever walked: there is no indexing a folder that is not a
+library.
+
+Validation happens before the run opens, so a rejected request never leaves a
+run record behind. The run id is handed back only once a record exists to query — the one
 write in this handler whose failure is *not* swallowed, because a caller must
 never receive an id it can never look up.
 
 ### 5.5 The library-root bound
 
-When `filesystem.root` is set, an index root must be that path or a descendant
-(`FR-FC-26`). Both sides are **canonicalized** before comparison, which is what
+When `filesystem.root` is set, a library's folder must be that path or a
+descendant (`FR-FC-26`), checked when it is added and again when it is indexed. The same check, one function (`LibraryRoot::contains`), also
+bounds the two other ways a path reaches the disk:
+
+- **Correcting a library's root** (UC-51). A correction rewrites every stored
+  path under the library without walking the disk, so without the bound it
+  would be the way around it: add `<root>/x` holding `notes.txt`, correct it
+  to `/home/someone`, and the stream serves
+  `/home/someone/notes.txt`. The rejection is the index's, word for word.
+- **Serving or changing a cataloged file** — stream, comic page, thumbnail,
+  text read and edit, rename, purge-on-disk. A record can still point outside:
+  catalogued before the bound was configured, corrected before corrections
+  were bounded, or reached through a symbolic link swapped in since. Such a
+  record is refused with `file is outside the configured library root`.
+  Purging only the record (UC-08) never touches the disk, so it stays the way
+  to drop one.
+
+Both sides are **canonicalized** before comparison, which is what
 holds the bound against `<root>/../../etc`, against `<root>` vs `<root>/` vs
 `<root>/.`, and against a symlinked root. The comparison is `Path::starts_with`,
 matching whole components — a string prefix test would let `/library-evil` past a
 `/library` bound.
 
+A library may be corrected to a folder that does not exist yet — a drive that is
+not plugged in — so the path is not required to exist. It is resolved through
+its **longest existing ancestor**, which is canonicalized, and the remaining
+segments are normalised lexically (`..` pops, `.` drops). Nothing below a
+missing folder can be a symbolic link, so that is exact. A segment that exists
+but cannot be resolved — a dangling symbolic link, a folder the server may not
+look into, a link loop — makes the whole path count as outside.
+
 Two distinct rejections, deliberately:
 
 | Condition | Message |
 | --- | --- |
-| The requested root is genuinely outside | `root path is outside the configured library root` |
+| The requested root — to index, or to correct a library to — is genuinely outside | `root path is outside the configured library root` |
+| A cataloged file to serve or change resolves outside | `file is outside the configured library root` |
 | The server's own `filesystem.root` cannot be resolved | `the server's configured library root could not be resolved; contact the operator` |
 
-The second is a misconfiguration, not a caller error, and indexing is **refused**
+The last is a misconfiguration, not a caller error, and every bounded operation is **refused**
 rather than degraded to unconstrained. A security bound that disappears when its
 configuration is wrong is worse than no bound, because the operator believes it
 is there. Neither message names the configured path.
 
-When `filesystem.root` is unset the bound is off entirely and any readable root
-is accepted — the constraint is opt-in by configuration, so no existing
-deployment changes behavior on upgrade. Re-index takes no root and is unaffected.
+When `filesystem.root` is unset the bound is off entirely: any readable root is
+indexed, a library may be corrected to any folder, and any cataloged file is
+served — the constraint is opt-in by configuration, so a deployment without it
+behaves exactly as before. One that sets it after cataloging files elsewhere
+will find those files refused until it re-indexes them under the root or
+purges their records. Re-index takes no root and is unaffected.
 
 ### 5.6 The walk
 
 ```mermaid
 flowchart TD
-    START(["execute(root, run_id, scope)"]) --> READ["Read the run's stored concurrency<br/>and segment"]
+    START(["execute(root, run_id, library)"]) --> READ["Read the run's stored concurrency<br/>and segment"]
     READ --> OPEN["Open the run's cell in the registry<br/>phase = discovering"]
     OPEN --> LIST["list_files(root)"]
     LIST -->|"could not list"| FAIL["status = failed<br/>record the error"]
@@ -365,11 +400,9 @@ flowchart TD
     SIG2 -->|"yes"| DRAIN["Halted — counted nowhere,<br/>does not advance `processed`"]
     SIG2 -->|"no"| CLASS{"extension<br/>recognised?"}
     CLASS -->|"no"| SKIP["Skipped"]
-    CLASS -->|"yes"| SCOPE{"type in the<br/>run's scope?"}
-    SCOPE -->|"no"| SKIP
-    SCOPE -->|"yes"| SEEN{"path already<br/>in the catalog?"}
+    CLASS -->|"yes"| SEEN{"path already<br/>in the catalog?"}
     SEEN -->|"yes"| ALREADY["AlreadyCataloged"]
-    SEEN -->|"no"| INS["Insert the record<br/>path · name · type · size · mtime<br/>content_hash stays NULL"]
+    SEEN -->|"no"| INS["Insert the record into the run's library<br/>path · name · type · size · mtime<br/>content_hash stays NULL"]
     INS --> META["Best-effort metadata extraction<br/>(FR-FC-25)"]
     META --> IDX["Indexed"]
     INS -->|"error"| BAD["Failed — logged at warn,<br/>the walk continues"]
@@ -490,7 +523,7 @@ sequenceDiagram
     RC->>RC: does this status permit pause?
     RC->>REG: cell.raise(Pause)
     RC-->>CL: 202 Accepted
-    Note over W: the in-flight window drains —<br/>milliseconds, since per-file work is<br/>a stat and a header read
+    Note over W: the in-flight window drains —<br/>milliseconds, since per-file work is<br/>a stat and a metadata read
     W->>W: read the signal once, after draining
     W->>R: flush the final progress
     W->>R: pause(run_id, now, segment)
@@ -678,7 +711,6 @@ counted in the run's `failed` tally.
 
 | Type | Read from | Fields |
 | --- | --- | --- |
-| Audio | embedded tags (`lofty`) | title, artist, album, year, genre, track, albumArtist |
 | Image | EXIF (`kamadak-exif`) | dimensions, title |
 | Document | PDF (`lopdf`) / EPUB (`epub`) | title, author, year, page count, `formatKind` |
 | Video | container (`ffmpeg-next`) | title, year, resolution, duration |
@@ -688,22 +720,13 @@ Two fields are never inferred: a video's `mediaKind` (nothing in the file
 distinguishes a movie from an episode) and an image's `caption`. Each type's
 writes are independent — one failing does not block the other.
 
-An audio file's `albumArtist` is read the same as its other six fields (issue
-#120) — `ALBUMARTIST` / `TPE2` / `aART`, whichever the file carries — but it is
-never derived from `artist` when the tag is absent. A file with no album
-artist tag reads `albumArtist: null`, not a copy of its track artist: an
-absent tag and a present one that happens to equal the track artist are
-different things, and the core reports what the file says rather than
-guessing on a client's behalf. Because extraction runs only at first index
-(FR-FC-25) and re-index never re-runs it, a library already indexed before
-this field existed gains no `albumArtist` values until it is indexed afresh
-— the same consequence `duration_seconds` had when that field was added.
-
 `formatKind` is set from the format itself: `book` for PDF, `ebook` for EPUB.
 
 ### 5.13 Classification
 
-By extension alone, matched case-insensitively. Anything else is skipped.
+By extension alone, matched case-insensitively. Anything else is skipped
+silently, and not reported as a failure. A run always records every type
+below: a library is the folder as it is, so there is no per-run type scope.
 
 | Type | Extensions |
 | --- | --- |
@@ -718,36 +741,25 @@ By extension alone, matched case-insensitively. Anything else is skipped.
 A `.pdf` indexes as a Document even when it is a comic: extension alone cannot
 distinguish a comic PDF from a book PDF.
 
-### 5.14 The run's scope
+### 5.14 Every file in one library
 
-A run records the file types its **scope** names (`FR-FC-01`), spelled the same
-way the catalog reads a type back — `audio`, `video`, `html`, `text`,
-`document`, `comic`, `image`. HTTP takes them as an array
-(`{"types": ["audio"]}`), the FFI as one comma-separated string
-(`"audio,image"`); an absent key, an empty array, NULL, and the empty string
-all mean **every type**, so every caller predating the scope keeps its
-behaviour.
+A file is written with the library of the run that found it — the run's own,
+passed down the walk — not one worked out from its path, and the catalog
+refuses a file without one (`FR-FC-37`). A refresh (UC-02) updates rows that
+already exist and never inserts, so it cannot create a file outside a library;
+a correction (UC-51) rewrites paths and keeps every file's library.
 
-The check sits *after* classification, because the type is what is being
-filtered on and only the classifier knows it. An out-of-scope file takes the
-same `Skipped` outcome an unsupported extension takes: in both cases the run
-saw a file and chose not to record it, and a second counter would split one
-fact across two numbers every reader would then have to add together.
+Removing a library deletes, in one transaction, its files with their subtype
+rows, watch and reading progress and collection membership; its index runs;
+and every run failure recorded under its folder, a refresh's included
+(`FR-FC-40`). Refresh runs themselves stay. Nothing on disk is touched. Removal
+is refused while one of the library's runs is `running` — the walk would go on
+writing into a library that is gone, and a cancel only raises a signal in
+whichever process is walking — but a `paused` run goes with the library.
 
-An unrecognised type name is **rejected** — the one place a wire word is not
-defaulted. An unreadable priority has a safe fallback to fall back to; a
-scope's only candidate is "every type", which is the opposite of what a caller
-asking for a narrower scope wants, and it fails in the direction of
-cataloguing exactly the files the owner meant to exclude.
-
-The scope is stored on the run, in `catalog_runs.scope`, as the same
-comma-separated list the FFI accepts — for the reason `root` is stored: it is
-what the run was told to cover, and a resume that could not read it back would
-catalogue precisely the files the owner excluded. NULL is every type, so a row
-written before the column existed keeps the meaning it had and needs no
-backfill. A resumed segment (§5.9) walks the scope its run was started with;
-nothing re-scopes a run, and a resume that wanted a different one would be
-starting a different run.
+Upgrading to this model (migration 28) deleted every row outside a library and
+the index runs over roots no library holds, and rebuilt `files` with the
+library required and `audio` back in its type CHECK.
 
 ---
 
@@ -853,18 +865,11 @@ than letting them re-sniff the bytes.
 CBZ, or a page out of range is a `400`.
 
 **`GET /v1/files/{uuid}/thumbnail`** returns a downscaled JPEG for a video, image,
-comic, or audio File (`FR-MP-05`). A type with no thumbnail is a `400`. SVG is
+comic, or audio File (`FR-MP-05`) — for audio, the front cover embedded in the
+file's tag. A type with no thumbnail, or an audio file with no cover, is a
+`400`. SVG is
 rejected explicitly: it is vector, the raster decoder cannot read it, and
 rasterizing it would mean a new dependency.
-
-For audio, the thumbnail is the picture the file's own tag calls the front
-cover (or, failing that, whichever picture the tag lists first). An audio File
-that parses fine but carries no picture at all is a `400`, the same "not
-supported for this file" shape SVG and non-CBZ comics get. An audio File that
-cannot be read or parsed as audio at all — missing on disk, corrupt, or a
-format `lofty` does not support (`.wma`) — is a `500` disk error instead: it is
-told apart from "no picture" deliberately, so an owner is never pointed at the
-wrong problem.
 
 The thumbnail cache is keyed on **uuid and mtime**, not on a content hash —
 hashing a multi-gigabyte video to decide whether its thumbnail is stale would
@@ -954,13 +959,24 @@ Credentials presented for an inactive mode are rejected.
 
 The client logs in against [Heimdall](https://github.com/artur-rios/heimdall-api)
 directly — completing two-factor there if asked — and presents the resulting JWT.
-Alexandria verifies the HS256 signature against a shared secret and accepts the
+Alexandria verifies the ES256 signature against the key the token's `kid` names
+in Heimdall's published key set (`/.well-known/jwks.json`), and accepts the
 caller as the owner only when the token names the configured scope, as the
 holder's scope or as one they own.
 
-A previous secret is accepted alongside the current one, so a rotation on the
-Heimdall side does not black out Alexandria. Issuer and audience are each checked
-only when configured, because Heimdall signs tokens carrying neither by default.
+The key set is fetched when first needed and cached, so a verification costs no
+network call. It is fetched again when a token names a key not yet seen — how a
+rotation on the Heimdall side arrives — or when the cached set is five minutes
+old, so a withdrawn key stops verifying; either at most once a minute, and a
+failed fetch keeps the keys already known. The algorithm is pinned: an ES256
+token verifies only against a published EC key, and nothing in a token's header
+can make a public key serve as an HMAC secret.
+
+While Heimdall still accepts the HS256 tokens it signed with its old shared
+secret, Alexandria accepts them too, as long as that secret (and, mid-rotation,
+the previous one) is configured; removing it refuses them. Issuer and audience
+are each checked only when configured, because Heimdall signs tokens carrying
+neither by default.
 
 Alexandria never sees a password, proxies no login, and gains no endpoints of its
 own. Everyone Heimdall places in the scope acts as the same single owner:
@@ -1040,7 +1056,7 @@ A summary of decisions a reader is most likely to assume the other way.
 | A start with no priority is rejected | It is `normal`; unrecognised values are too |
 | Cancelling a run that already finished succeeds | It is refused as a conflict |
 | Purging a record deletes the file | It does not. Only purge-on-disk touches the disk |
-| `filesystem.root` being unset is safe by default | It disables the indexing bound entirely |
+| `filesystem.root` being unset is safe by default | It disables the bound entirely — on indexing, library corrections, and file access |
 | Windows mode authenticates the caller | It authenticates the *process*; anyone reaching the port is the owner |
 | The FFI surface can stream bytes | It returns a path descriptor instead |
 

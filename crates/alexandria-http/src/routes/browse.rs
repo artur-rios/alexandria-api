@@ -1,4 +1,4 @@
-use axum::extract::rejection::PathRejection;
+use axum::extract::rejection::{PathRejection, QueryRejection};
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
@@ -17,11 +17,8 @@ use crate::AppState;
 /// optional: an omitted or empty `type` means no type filter; an omitted or
 /// empty `state` defaults to `active` (excludes soft-deleted records per the
 /// use case's main-flow step 2); an omitted or empty `collectionUuid` means
-/// no collection filter; an omitted `includeLibraries` excludes files that
-/// belong to a library, and `includeLibraries=true` reaches into them
-/// (libraries design / FR-FC-38) — which is what a client's search and its
-/// deleted-items review need in order to be truthful about what the catalog
-/// holds. An unrecognised `type` or `state` is rejected as
+/// no collection filter; an omitted or empty `libraryUuid` answers across
+/// every library, and one narrows the listing to that library's files. An unrecognised `type` or `state` is rejected as
 /// `400` invalid input rather than silently ignored — the FFI surface
 /// rejects the same inputs identically (FR-FC-24 / NFR-09). A malformed
 /// `collectionUuid` is likewise `400`; a well-formed one that matches no
@@ -34,18 +31,10 @@ pub struct FileListParams {
     pub state: Option<String>,
     #[serde(rename = "collectionUuid", default)]
     pub collection_uuid: Option<String>,
-    #[serde(rename = "includeLibraries", default)]
-    pub include_libraries: Option<String>,
-}
-
-/// Whether the caller asked to reach into libraries.
-///
-/// Only the exact string `true` does. Anything else — absent, empty,
-/// `false`, or a typo — leaves the listing excluding them, because that is
-/// the direction a mistake should fall: a course leaking into the type
-/// panels is the defect marking the folder was meant to prevent.
-fn parse_include_libraries(value: Option<&str>) -> bool {
-    matches!(value, Some("true"))
+    /// One library's files: a search or a trash review within it. Parsed
+    /// as `collectionUuid` is — malformed is `400`, unknown is `[]`.
+    #[serde(rename = "libraryUuid", default)]
+    pub library_uuid: Option<String>,
 }
 
 /// Map a state query value to the `StateFilter`, defaulting to `Active` per
@@ -72,13 +61,18 @@ fn parse_state(s: Option<&str>) -> Result<StateFilter, ApiError> {
 pub async fn list_files(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Query(params): Query<FileListParams>,
+    params: Result<Query<FileListParams>, QueryRejection>,
 ) -> Result<Json<Vec<FileView>>, ApiError> {
     let token = bearer_token(&headers);
 
+    // Taken as a `Result`, like every other extractor on this surface: a bare
+    // `Query` answered a query it could not read (a repeated key, say) with
+    // axum's own plain-text 400 instead of this API's error envelope.
+    let Query(params) = params.map_err(|err| invalid_input(format!("invalid query: {err}")))?;
+
     let mut filter = FileFilter::new().with_state(parse_state(params.state.as_deref())?);
     if let Some(t) = params.file_type.as_deref().filter(|s| !s.is_empty()) {
-        let file_type = parse_file_type(t).ok_or_else(|| {
+        let file_type = FileType::from_wire(t).ok_or_else(|| {
             ApiError(alexandria_core::errors::DomainError::InvalidInput(format!(
                 "unknown file type: {t}"
             )))
@@ -93,8 +87,13 @@ pub async fn list_files(
         })?;
         filter = filter.with_collection(collection_uuid);
     }
-    if parse_include_libraries(params.include_libraries.as_deref()) {
-        filter = filter.everywhere();
+    if let Some(l) = params.library_uuid.as_deref().filter(|s| !s.is_empty()) {
+        let library_uuid = Uuid::parse_str(l).map_err(|_| {
+            ApiError(alexandria_core::errors::DomainError::InvalidInput(format!(
+                "invalid libraryUuid: {l}"
+            )))
+        })?;
+        filter = filter.with_library(library_uuid);
     }
 
     let files = state
@@ -131,17 +130,4 @@ pub async fn get_file(
         .map_err(ApiError)?;
 
     Ok((StatusCode::OK, Json(view)))
-}
-
-fn parse_file_type(s: &str) -> Option<FileType> {
-    match s {
-        "audio" => Some(FileType::Audio),
-        "video" => Some(FileType::Video),
-        "html" => Some(FileType::Html),
-        "text" => Some(FileType::Text),
-        "document" => Some(FileType::Document),
-        "comic" => Some(FileType::Comic),
-        "image" => Some(FileType::Image),
-        _ => None,
-    }
 }

@@ -80,11 +80,12 @@ code.** This is the first review gate.
 
 ## Step 3 — Branch and move the issue to In Progress
 
-Once the plan is approved, create the branch from an up-to-date `main` branch
-using the naming pattern `feature/uc-##-use-case-name`:
+Once the plan is approved, create the branch from an up-to-date `develop` branch
+— never from `main`, which holds only released code — using the naming pattern
+`feature/uc-##-use-case-name`:
 
 ```bash
-git switch main && git pull
+git switch develop && git pull
 git switch -c feature/uc-01-index-library-files
 ```
 
@@ -116,7 +117,7 @@ Report the passing results. **Do not open a pull request yet — stop and ask.**
 
 ## Step 7 — Open the pull request (after approval)
 
-Once approved, push the branch and open a pull request into the `main` branch,
+Once approved, push the branch and open a pull request into the `develop` branch,
 referencing the issue so the merge closes it. Then **hand off to a human** for
 review and merge. Do **not** merge or delete the branch.
 
@@ -129,10 +130,10 @@ then move the issue to **Done** and confirm it is closed.
 
 ## Definition of Done
 
-- [ ] Implemented on a `feature/uc-##-use-case-name` branch created from `main`.
+- [ ] Implemented on a `feature/uc-##-use-case-name` branch created from `develop`.
 - [ ] Main flow and every alternative flow implemented.
 - [ ] Tests cover the use case per the Testing Specification.
 - [ ] The full suite passes (`cargo test`).
-- [ ] The pull request was reviewed by a human and merged.
+- [ ] The pull request was reviewed by a human and merged into `develop`.
 - [ ] The branch was deleted.
 - [ ] The issue is in **Done** and closed.

@@ -49,7 +49,7 @@ in the delivery flow is defined in the
 | FFI function | Integration | `alexandria-ffi/tests/` |
 | HTTP ↔ FFI parity for an operation | Parity (contract) | `alexandria-ffi/tests/parity.rs` |
 | Filesystem interactions (indexing, rename, text content) | Integration | integration tests using a temp dir |
-| Auth service (local + external + Windows) | Unit + integration | `alexandria-core/tests/auth.rs` |
+| Auth service (local + external + Windows) | Unit + integration | `alexandria-core/tests/auth/` |
 
 **Deliberately untested:** plain data-holder structs with no behavior, generated
 OpenAPI scaffolding, and the cbindgen-produced C header (validated at build time
@@ -61,25 +61,40 @@ in isolation.
 The test tree mirrors the source tree of each crate. Integration tests live in
 each crate's top-level `tests/` directory.
 
+Each crate's integration tests build into **one test binary** wherever they
+can share a process: every top-level `tests/*.rs` file (and every
+`tests/*/main.rs`) is a separate crate that Cargo compiles and links on its
+own, with the whole dependency graph in each, so a new area is a module of the
+existing binary, not a new file at the top. A suite gets its own top-level
+file only when it needs a process to itself — it sets environment variables,
+installs a global subscriber, or is the ignored performance harness — and says
+why in its header.
+
 ```
 alexandria-core/
   src/
     catalog/
       commands/
       queries/
-      repos/        # repository traits + sqlx impl
+      repos.rs      # repository traits + sqlx impl
     auth/
-    text/
+    playback/
   tests/
-    catalog/        # mirrors src/catalog
-    auth.rs
-    text.rs
+    integration.rs  # the one binary: declares common and every area below
     common/mod.rs   # shared fixtures: temp db, temp fs, factories
+    catalog/        # mirrors src/catalog (mod.rs lists its files)
+    auth/
+    playback/
+    config.rs           # own process: sets ALEXANDRIA_* environment variables
+    browse_batching.rs  # own process: a global subscriber counts every query
+    throughput.rs       # own process: the ignored NFR harness (§9)
 alexandria-http/
   tests/
-    catalog_api.rs
-    auth_api.rs
-    common/mod.rs
+    api/
+      main.rs       # the one binary: declares common and every file below
+      catalog_api.rs
+      auth_api.rs
+      common/mod.rs
 alexandria-ffi/
   tests/
     parity.rs       # HTTP vs FFI parity
@@ -164,9 +179,15 @@ state.
 | Dependency | In tests |
 | --- | --- |
 | SQLite | in-memory (or on-disk temp) SQLite via sqlx; migrations run at setup. |
-| Filesystem | a per-test temp directory (the `tempfile` crate) holding sample files. |
-| External auth service | a fake auth-service implementation with a fixed HS256 test secret; no network. |
+| Filesystem | a per-test temp directory (the `tempfile` crate) holding sample files. Files reach the catalog only through a library (UC-51), so a test indexes its folder by adding it as a library and waiting for that run; a test that writes file rows directly first seeds the library they belong to, since a file without one is refused. |
+| External auth service | fixed ES256 test keys and an in-memory key set standing in for Heimdall's `/.well-known/jwks.json`, plus a fixed HS256 test secret for the overlap; no network beyond a loopback server for the key set fetch itself. |
 | Local-login credentials | seeded into the test DB with an Argon2 hash of a known password. |
+
+A migration that deletes or rewrites rows is tested from the version before it,
+seeded with raw SQL, and stops at that migration: later migrations rewrite the
+state the test asserts on (the upgrade to libraries-only, migration 28, deletes
+every row outside a library). Each migration's tests migrate through it with
+the module's `apply_through` helper.
 
 ### 7.3 HTTP / FFI parity
 
@@ -282,18 +303,18 @@ absorbs what a process pays exactly once — the first migration on a cold page
 cache, the first touch of the sqlite and ffmpeg code paths, and on Windows the
 anti-malware scan of a newly written binary. Those landed on `text`, the row
 every other row is divided by, and the `vs text` column consequently reported
-audio and document as *faster* than extracting nothing at all. That is
+image and document as *faster* than extracting nothing at all. That is
 impossible: extraction is strictly extra work on the same pipeline. If that
 column ever shows a figure above 100% again, suspect the harness before the
 extractor.
 
-CI runs these on pushes to `main` as a separate job carrying
+CI runs these on pushes to `develop` and `main` as a separate job carrying
 `continue-on-error: true`, so the numbers are recorded over time and the
 harness cannot rot, without a noisy runner turning a red build into something
 to ignore. That job deliberately runs the **debug** profile and without
 `ALEXANDRIA_NFR_STRICT` — it is checking that the harness still compiles and
 still finds every fixture, not measuring the requirement, and paying for an
-LTO release build on every push to `main` would buy a number the loose floors
+LTO release build on every push would buy a number the loose floors
 do not read anyway. The `--release` invocation above is for the on-request run
 that produces a figure worth recording.
 
@@ -335,7 +356,6 @@ in flight: **p95 12.0 ms**, worst 29.4 ms, against a target of < 200 ms.
 | format | files | files/sec | ms/file | vs text |
 | --- | ---: | ---: | ---: | ---: |
 | text (baseline) | 150 | 722 | 1.38 | 100% |
-| audio (wav/id3) | 150 | 339 | 2.95 | 47% |
 | image (jpeg/exif) | 150 | 315 | 3.18 | 44% |
 | document (pdf) | 150 | 267 | 3.74 | 37% |
 | comic (cbz) | 150 | 336 | 2.98 | 46% |
@@ -360,10 +380,10 @@ cargo test
 | Unit tests only | `cargo test --lib` |
 | Integration tests | `cargo test --test '*'` |
 | Parity tests | `cargo test --package alexandria-ffi --test parity` |
-| Auth tests | `cargo test --package alexandria-core --test auth` |
+| Auth tests | `cargo test --package alexandria-core --test integration auth::` |
 | Performance (§9) | `cargo test -p alexandria-core --test throughput -- --ignored --nocapture` |
 | With coverage | `cargo tarpaulin` (optional) |
 
-Categories are separated by crate and test file; parity tests live in their own
-test target so they can be run in isolation, and auth tests are grouped in
-`alexandria-core/tests/auth.rs`.
+Categories are separated by crate and test target; parity tests live in their
+own test target so they can be run in isolation, and auth tests are grouped in
+`alexandria-core/tests/auth/`, run on their own by the `auth::` filter.

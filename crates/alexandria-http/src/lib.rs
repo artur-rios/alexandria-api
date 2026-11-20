@@ -5,6 +5,7 @@ pub mod routes;
 
 use std::sync::Arc;
 
+use axum::extract::DefaultBodyLimit;
 use axum::middleware::from_fn_with_state;
 use axum::routing::{delete, get, patch, post, put};
 use axum::Router;
@@ -30,7 +31,6 @@ pub fn app(settings: Settings, services: Arc<Services>) -> Router {
     // caller is denied without its body or path ever being parsed (FR-AU-07).
     let v1 = Router::new()
         .route("/v1/settings", get(routes::settings::get))
-        .route("/v1/index", post(routes::index::index))
         .route("/v1/index/refresh", post(routes::refresh::refresh))
         .route("/v1/index/runs", get(routes::runs::active_runs))
         .route("/v1/index/runs/{run_id}", get(routes::runs::run_status))
@@ -60,9 +60,15 @@ pub fn app(settings: Settings, services: Arc<Services>) -> Router {
             "/v1/files/{uuid}/content",
             get(routes::text_content::get_content),
         )
+        // No body limit on the one route whose body is a whole file. axum's
+        // default 2 MiB cap meant a text file the GET above served could not
+        // be saved back — refused as a "malformed body" — while the FFI
+        // surface saved it fine (FR-FC-24). The owner's own file is what is
+        // being written, and the gate above has authenticated them before
+        // a byte of it is buffered.
         .route(
             "/v1/files/{uuid}/content",
-            put(routes::text_content::edit_content),
+            put(routes::text_content::edit_content).layer(DefaultBodyLimit::disable()),
         )
         .route("/v1/files/{uuid}/stream", get(routes::playback::stream))
         .route(
@@ -73,7 +79,6 @@ pub fn app(settings: Settings, services: Arc<Services>) -> Router {
             "/v1/files/{uuid}/thumbnail",
             get(routes::playback::thumbnail),
         )
-        .route("/v1/files/{uuid}/energy", get(routes::playback::energy))
         .route("/v1/files/{uuid}", get(routes::browse::get_file))
         .route("/v1/files/{uuid}", delete(routes::delete_file::delete_file))
         .route("/v1/files/{uuid}/restore", post(routes::restore::restore))
@@ -151,45 +156,7 @@ pub fn app(settings: Settings, services: Arc<Services>) -> Router {
                 .patch(routes::libraries::move_root)
                 .delete(routes::libraries::remove),
         )
-        // Music enrichment (music enrichment design). A run is a POST
-        // because it changes what the catalog holds; reading one track's
-        // stored result is a plain GET and stays available even when
-        // enrichment itself is switched off.
-        .route("/v1/enrichment/runs", post(routes::enrichment::run))
-        .route(
-            "/v1/enrichment/tracks/{uuid}",
-            get(routes::enrichment::read_track),
-        )
-        .route(
-            "/v1/enrichment/artist-image",
-            get(routes::enrichment::read_artist_image).post(routes::enrichment::fetch_artist_image),
-        )
-        .route(
-            "/v1/playlists",
-            post(routes::playlists::create).get(routes::playlists::list),
-        )
-        .route(
-            "/v1/playlists/{uuid}",
-            patch(routes::playlists::rename).get(routes::playlists::read),
-        )
-        .route("/v1/playlists/{uuid}", delete(routes::playlists::delete))
-        .route(
-            "/v1/playlists/{uuid}/entries",
-            post(routes::playlists::add_entries),
-        )
-        .route(
-            "/v1/playlists/{uuid}/entries/{entry_uuid}",
-            delete(routes::playlists::remove_entry),
-        )
-        .route(
-            "/v1/playlists/{uuid}/entries/{entry_uuid}/move",
-            post(routes::playlists::move_entry),
-        )
-        // Play history (play history design). Recording a play writes, so
-        // it is a POST; the rankings it feeds are one read rather than four,
-        // so they are one route.
-        .route("/v1/plays", post(routes::plays::record))
-        .route("/v1/plays/stats", get(routes::plays::stats))
+        .route("/v1/libraries/{uuid}/index", post(routes::libraries::index))
         .route_layer(from_fn_with_state(
             state.clone(),
             middleware::auth::require_auth,

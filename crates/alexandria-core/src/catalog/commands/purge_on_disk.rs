@@ -2,6 +2,7 @@ use uuid::Uuid;
 
 use crate::auth::AuthService;
 use crate::catalog::fs::Filesystem;
+use crate::catalog::library_root::LibraryRoot;
 use crate::catalog::model::PurgeOnDiskOutcome;
 use crate::catalog::repos::CatalogRepository;
 use crate::errors::DomainError;
@@ -26,6 +27,9 @@ pub struct PurgeFileOnDiskHandler<A, R, F> {
     auth: A,
     repo: R,
     fs: F,
+    /// `filesystem.root` (FR-FC-26): a row pointing outside it has its
+    /// bytes neither read nor changed. See `LibraryRoot`.
+    library_root: LibraryRoot,
 }
 
 impl<A, R, F> PurgeFileOnDiskHandler<A, R, F>
@@ -34,8 +38,13 @@ where
     R: CatalogRepository,
     F: Filesystem,
 {
-    pub fn new(auth: A, repo: R, fs: F) -> Self {
-        Self { auth, repo, fs }
+    pub fn new(auth: A, repo: R, fs: F, library_root: LibraryRoot) -> Self {
+        Self {
+            auth,
+            repo,
+            fs,
+            library_root,
+        }
     }
 
     /// Purge `uuid`'s on-disk file and catalog row, returning a
@@ -58,6 +67,12 @@ where
             .find_by_uuid(uuid)
             .await?
             .ok_or(DomainError::NotFound)?;
+
+        // FR-FC-26, defence in depth: indexing and library moves are bounded
+        // by `filesystem.root`, but a row may still point outside it (indexed
+        // before the bound was configured, or through a symbolic link swapped
+        // in since). Refused before the disk is touched.
+        self.library_root.check_file(&file.path)?;
 
         // AF-02: a disk failure aborts before any catalog write, so the
         // record is left exactly as it was.

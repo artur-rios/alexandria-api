@@ -2,10 +2,14 @@
 
 This is the brainstorm for a API that aims to be the back-end for a big library for the user, that's why the name "Alexandria".  
 
+Alexandria is a library manager: the user adds folders as libraries, and it
+indexes the files it can read in them, keeping the folder structure, so they
+can be browsed and read or played. Managing music (playlists, history, lookups)
+lives in Orpheus, a separate project.
+
 ## Features
 
 - The user can view, edit metadata and delete:
-  - Music (audio files)
   - Movies and series (video files)
   - HTML pages
   - Markdown and text files
@@ -15,12 +19,12 @@ This is the brainstorm for a API that aims to be the back-end for a big library 
 
 What the user can edit?
 
-- Music metadata
 - Video metadata
 - Markdown and text files
 - Every file name
 
-So I don't want any complex operation, like audio or video editing. I just want a software that can be used to organize and show those files from disk.  
+So I don't want any complex operation, like video editing. I just want a
+software that can be used to organize and show those files from disk.  
 
 How the files can be organized?
 

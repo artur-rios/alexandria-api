@@ -99,24 +99,24 @@ graph LR
 
 ---
 
-### UC-01: Index library files
+### UC-01: Index a library
 
 | Field | Value |
 | --- | --- |
 | **ID** | UC-01 |
-| **Name** | Index library files |
+| **Name** | Index a library |
 | **Actors** | Owner, Local Filesystem |
-| **Description** | Scan a root directory and create type-aware catalog records for every supported file type. |
-| **Preconditions** | The caller is authenticated as the owner; the root path is supplied, and it sits inside the configured `filesystem.root` when one is configured (FR-FC-26); every type named in the run's scope, if it names any, is a supported one. |
-| **Postconditions** | A File record exists for each supported file found, each carrying that file's path, name, type, size, and modification time, plus a subtype record prefilled with whatever metadata could be extracted from the file itself; indexing runs without blocking reads. |
-| **Requirements** | FR-FC-01, FR-FC-02, FR-FC-03, FR-FC-04, FR-FC-05, FR-FC-06, FR-FC-07, FR-FC-08, FR-FC-09, FR-FC-24, FR-FC-25, FR-FC-26, FR-FC-27, FR-FC-31 |
+| **Description** | Walk a library's folder and create type-aware catalog records, in that library, for every file of a type the system can read. Started by adding the library (UC-51) or by re-indexing it. |
+| **Preconditions** | The caller is authenticated as the owner; the library exists and has no unfinished run (FR-FC-43); its folder exists and sits inside the configured `filesystem.root` when one is configured (FR-FC-26). |
+| **Postconditions** | A File record exists in the library for each readable file found, each carrying that file's path, name, type, size, and modification time, plus a subtype record prefilled with whatever metadata could be extracted from the file itself; indexing runs without blocking reads. |
+| **Requirements** | FR-FC-01, FR-FC-02, FR-FC-03, FR-FC-04, FR-FC-05, FR-FC-06, FR-FC-07, FR-FC-08, FR-FC-09, FR-FC-14, FR-FC-24, FR-FC-25, FR-FC-26, FR-FC-27, FR-FC-31, FR-FC-37, FR-FC-43 |
 
 **Main Flow**
 
-1. The owner requests indexing with a root path, optionally a **priority** — `normal` or `low` (FR-FC-31), an absent or unrecognised priority meaning `normal` — and optionally a **scope**: the file types this run records (FR-FC-01), named with the same words the catalog reads a type back as. An absent or empty scope means every supported type, so a folder of albums can be indexed as audio alone rather than as an image library its cover art happened to fill.
-2. The system starts an asynchronous scan and returns immediately with the run's id.
+1. The owner adds a library (UC-51), or asks for an existing one to be re-indexed, optionally at a **priority** — `normal` or `low` (FR-FC-31), an absent or unrecognised priority meaning `normal`. Every type the system can read is recorded: a library is the folder as it is, so there is no per-run type scope.
+2. The system starts an asynchronous scan of the library's folder, recorded as the library's run, and returns immediately with the run's id.
 3. The system walks the tree to discover its entries. While it is counting them the run reports phase `discovering` and no total; once the count is known the total is fixed and the phase becomes `processing` (FR-FC-28).
-4. The system classifies each supported file **by extension**, skips the ones the run's scope excludes — counted in `skipped` alongside the unsupported extensions, since the run saw both and recorded neither — and creates a File record for the rest (with a row in the matching subtype table) carrying path, name, type, and the size and modification time taken from the directory entry. **Nothing reads the file's contents to identify it**, and no content hash is computed: size and modification time are the change signal a later re-index compares (UC-02), and the File's content hash is left unset (FR-FC-09). Files are processed **several at a time**, up to the width the run's priority resolved to (`indexing.concurrency` for `normal`, `indexing.low_priority_concurrency` for `low`); the order is therefore unspecified, but every scanned entry contributes exactly one outcome to the run's counts.
+4. The system classifies each file **by extension**, counts one it cannot read in `skipped`, and creates a File record in the library for the rest (with a row in the matching subtype table) carrying path, name, type, and the size and modification time taken from the directory entry. **Nothing reads the file's contents to identify it**, and no content hash is computed: size and modification time are the change signal a later re-index compares (UC-02), and the File's content hash is left unset (FR-FC-09). Files are processed **several at a time**, up to the width the run's priority resolved to (`indexing.concurrency` for `normal`, `indexing.low_priority_concurrency` for `low`); the order is therefore unspecified, but every scanned entry contributes exactly one outcome to the run's counts.
 5. For the subtypes that carry embedded metadata — audio, image, document, video, and comic — the system reads the file's own metadata and prefills the subtype row with it (FR-FC-25). Extraction is **best-effort**: an unreadable or metadata-less file simply leaves the fields empty, and the owner can set or correct any of them afterwards via UC-04. The row is stamped with the extraction that was applied to it, which is what lets UC-02 tell a row written by an older reading from a current one. A file that gave up nothing is stamped too: the stamp records which extraction has been applied, not which one succeeded, and re-opening an unreadable file on every later pass would buy only a retry that a later extraction — which moves the version, and so revisits every row — performs anyway.
 6. The system records the `indexedAt` timestamp and logs the run's outcome (scanned, indexed, skipped, alreadyCataloged, failed).
 
@@ -127,14 +127,15 @@ its status and live progress, and UC-48 pauses, resumes, or cancels it.
 
 | ID | Condition | Outcome |
 | --- | --- | --- |
-| AF-01 | The root path does not exist on disk | The system rejects the request with an invalid-input error. |
+| AF-01 | The library's folder does not exist on disk | The system rejects the request with an invalid-input error, and no run record is opened. |
 | AF-02 | The caller is not authenticated | The system denies with an unauthorized error. |
-| AF-09 | The request names a type the system does not have (FR-FC-01) | The system rejects the request with an invalid-input error naming the unrecognised type, and no run record is opened. Unlike an unrecognised priority, this is not defaulted: the only available fallback is "every type", which is the opposite of the narrower scope the caller asked for. |
+| AF-09 | The library to re-index does not exist | The system answers not found. |
+| AF-10 | The library already has a `running` or `paused` run (FR-FC-43) | The system refuses with a conflict naming the run; the owner resumes, finishes or cancels it first (UC-48). |
 | AF-03 | A file path is already cataloged | The system creates no duplicate and counts the entry in `alreadyCataloged`, kept apart from `skipped` (an unsupported extension) so that a resumed run's tally stays honest (FR-FC-27); a refresh is handled by UC-02. |
 | AF-08 | The owner pauses or cancels the run while it is in flight (UC-48) | The entries already in flight finish, and the run records itself `paused` or `cancelled` where it stood. Because per-file work is a stat rather than a read of the whole file, that window drains in milliseconds. |
 | AF-04 | A single file cannot be read or persisted | The system counts it as failed, logs a warning naming the path, and continues the run; the remaining files are still indexed. |
 | AF-05 | A file's embedded metadata cannot be parsed, or writing the extracted values fails | The system logs a warning naming the path and leaves the subtype fields empty. The file is still indexed successfully — this is **not** counted as a failure (step 5 is best-effort). |
-| AF-06 | `filesystem.root` is configured and the requested root is neither it nor a descendant of it (FR-FC-26) | The system rejects the request with an invalid-input error saying the root is outside the configured library root. Both paths are canonicalized before the comparison, so `..` segments, trailing separators, symbolic links, and a sibling whose name merely shares a prefix with the library root are all judged on where they actually resolve to. The message does not disclose the configured root's location. Where `filesystem.root` is unset the check does not run at all and any readable root is accepted. |
+| AF-06 | `filesystem.root` is configured and the library's folder is neither it nor a descendant of it (FR-FC-26) | The system rejects the request with an invalid-input error saying the root is outside the configured library root. Both paths are canonicalized before the comparison, so `..` segments, trailing separators, symbolic links, and a sibling whose name merely shares a prefix with the library root are all judged on where they actually resolve to. The message does not disclose the configured root's location. Where `filesystem.root` is unset the check does not run at all and any readable root is accepted. |
 | AF-07 | `filesystem.root` is configured but cannot be resolved on disk | The system rejects the request with a distinct invalid-input error saying the server's configured library root could not be resolved (not the AF-06 "outside the library root" message, which would misleadingly blame the caller) and logs an error naming the key and the unresolvable value. A bound that silently vanished when its configuration went bad would be worse than none, because the operator would still believe it were there. |
 
 ---
@@ -184,14 +185,14 @@ its status and live progress, and UC-48 pauses, resumes, or cancels it.
 | **ID** | UC-03 |
 | **Name** | Browse and view file metadata |
 | **Actors** | Owner |
-| **Description** | List/query files and view a single file's metadata. |
+| **Description** | List/query files across every library — to search, or to review the trash — and view a single file's metadata. Browsing one library as its folder tree is UC-51's. |
 | **Preconditions** | The caller is authenticated. |
-| **Postconditions** | The caller receives filtered list results or a single file's metadata. |
-| **Requirements** | FR-FC-12, FR-FC-13, FR-FC-24 |
+| **Postconditions** | The caller receives filtered list results or a single file's metadata, each carrying the library it belongs to. |
+| **Requirements** | FR-FC-12, FR-FC-13, FR-FC-24, FR-FC-38 |
 
 **Main Flow**
 
-1. The owner requests a file list (optionally filtered by type and lifecycle state) or a single file by UUID. Filtering by containing collection is delivered with UC-14, since no collection exists before then.
+1. The owner requests a file list — optionally filtered by type, lifecycle state, containing collection (UC-14), and library — or a single file by UUID.
 2. The system excludes `deleted` records from default views unless the owner explicitly requests them.
 3. The system returns the matching file(s) with their metadata.
 
@@ -201,7 +202,7 @@ its status and live progress, and UC-48 pauses, resumes, or cancels it.
 | --- | --- | --- |
 | AF-01 | The requested UUID does not exist | The system responds with a not-found error. |
 | AF-02 | The caller is not authenticated | The system denies with an unauthorized error. |
-| AF-03 | A filter value is not a recognised type or lifecycle state | The system rejects with an invalid-input error rather than ignoring the filter. An empty value means "no filter". |
+| AF-03 | A filter value is not a recognised type or lifecycle state, or a library or collection identifier is malformed | The system rejects with an invalid-input error rather than ignoring the filter. An empty value means "no filter"; a well-formed identifier naming nothing matches no files. |
 
 ---
 
@@ -227,7 +228,7 @@ its status and live progress, and UC-48 pauses, resumes, or cancels it.
 
 | ID | Condition | Outcome |
 | --- | --- | --- |
-| AF-01 | The fields do not match the file's subtype (e.g. audio fields on a video) | The system rejects with an invalid-input error. |
+| AF-01 | The fields do not match the file's subtype (e.g. image fields on a video) | The system rejects with an invalid-input error. |
 | AF-02 | The file UUID does not exist | The system responds with a not-found error. |
 | AF-03 | The caller is not authenticated | The system denies with an unauthorized error. |
 | AF-04 | The file is in `deleted` state | The system rejects with an invalid-state error (restore first via UC-07). |
@@ -244,7 +245,7 @@ its status and live progress, and UC-48 pauses, resumes, or cancels it.
 | **Description** | Rename a file, which renames the underlying file on disk. |
 | **Preconditions** | The caller is authenticated; the target file exists and is `active`. |
 | **Postconditions** | The file's name and on-disk path are updated. |
-| **Requirements** | FR-FC-19, FR-FC-24 |
+| **Requirements** | FR-FC-19, FR-FC-24, FR-FC-26 |
 
 **Main Flow**
 
@@ -261,6 +262,7 @@ its status and live progress, and UC-48 pauses, resumes, or cancels it.
 | AF-02 | The on-disk rename fails (permission denied / target exists) | The system rolls back the catalog change, returns a disk-error, and leaves the on-disk file untouched. |
 | AF-03 | The file UUID does not exist | The system responds with a not-found error. |
 | AF-04 | The caller is not authenticated | The system denies with an unauthorized error. |
+| AF-05 | `filesystem.root` is configured and the file's recorded path resolves outside it (FR-FC-26) | The system rejects with an invalid-input error and renames nothing. As UC-38 AF-06. |
 
 ---
 
@@ -358,7 +360,7 @@ its status and live progress, and UC-48 pauses, resumes, or cancels it.
 | **Description** | Remove a file record and delete the underlying file on disk. |
 | **Preconditions** | The caller is authenticated; the target file record exists. |
 | **Postconditions** | The file record is removed and the on-disk file is deleted. |
-| **Requirements** | FR-FC-23, FR-FC-24 |
+| **Requirements** | FR-FC-23, FR-FC-24, FR-FC-26 |
 
 **Main Flow**
 
@@ -375,6 +377,7 @@ its status and live progress, and UC-48 pauses, resumes, or cancels it.
 | AF-02 | The on-disk delete fails (permission denied) | The system rolls back, leaves the record, and returns a disk-error. |
 | AF-03 | The file UUID does not exist | The system responds with a not-found error. |
 | AF-04 | The caller is not authenticated | The system denies with an unauthorized error. |
+| AF-05 | `filesystem.root` is configured and the file's recorded path resolves outside it (FR-FC-26) | The system rejects with an invalid-input error, deletes nothing, and keeps the record. As UC-38 AF-06. Purging the record alone (UC-08) does not touch the disk and is unaffected, so such a record can still be removed. |
 
 ---
 
@@ -1010,7 +1013,7 @@ its status and live progress, and UC-48 pauses, resumes, or cancels it.
 | **Description** | Read the content of a TextFile from disk. |
 | **Preconditions** | The caller is authenticated; the target file is a TextFile and is `active`. |
 | **Postconditions** | The caller receives the file's current on-disk content. |
-| **Requirements** | FR-TX-01, FR-FC-24 |
+| **Requirements** | FR-TX-01, FR-FC-24, FR-FC-26 |
 
 **Main Flow**
 
@@ -1026,6 +1029,7 @@ its status and live progress, and UC-48 pauses, resumes, or cancels it.
 | AF-02 | The on-disk file cannot be read (missing / permission) | The system responds with a disk-error. |
 | AF-03 | The file UUID does not exist | The system responds with a not-found error. |
 | AF-04 | The caller is not authenticated | The system denies with an unauthorized error. |
+| AF-05 | `filesystem.root` is configured and the file's recorded path resolves outside it (FR-FC-26) | The system rejects with an invalid-input error and reads nothing. As UC-38 AF-06. |
 
 ---
 
@@ -1039,7 +1043,7 @@ its status and live progress, and UC-48 pauses, resumes, or cancels it.
 | **Description** | Write edited content back to the TextFile on disk. |
 | **Preconditions** | The caller is authenticated; the target file is a TextFile and is `active`. |
 | **Postconditions** | The on-disk file holds the new content and the File's content hash is refreshed. |
-| **Requirements** | FR-TX-02, FR-TX-03, FR-FC-24 |
+| **Requirements** | FR-TX-02, FR-TX-03, FR-FC-24, FR-FC-26 |
 
 **Main Flow**
 
@@ -1058,9 +1062,7 @@ its status and live progress, and UC-48 pauses, resumes, or cancels it.
 | AF-03 | The post-write content hash does not match the written bytes | The system re-attempts once, then returns an integrity error. |
 | AF-04 | The file UUID does not exist | The system responds with a not-found error. |
 | AF-05 | The caller is not authenticated | The system denies with an unauthorized error. |
-| AF-06 | A correction names a folder that overlaps another library | The system responds with a conflict naming it, as registration would. The library is not asked about itself: it always overlaps where it already is, so a folder that moved within its own root corrects normally. |
-| AF-07 | The catalog already holds files at the destination | The system responds with a conflict and moves nothing. The owner indexed the new location before correcting the record, so both copies exist; the way out is a decision — remove this library and register the new folder — rather than a retry. |
-| AF-08 | The destination folder does not exist on disk | The correction is recorded anyway. The core is told a root and walks it; whether the path is there is answered by the walk, and refusing here would also refuse a drive that is merely unplugged at the moment the owner fixes the record. |
+| AF-06 | `filesystem.root` is configured and the file's recorded path resolves outside it (FR-FC-26) | The system rejects with an invalid-input error before writing anything. As UC-38 AF-06. |
 
 ---
 
@@ -1177,7 +1179,7 @@ UC-36's externally issued JWT.
 | **Description** | Serve the bytes of an active File from its recorded path for playback. Over HTTP the bytes are streamed with `Range` support; over FFI the system returns a playback descriptor instead, since the FFI surface cannot carry a byte stream. |
 | **Preconditions** | The caller is authenticated; the target file is `active` and present on disk. |
 | **Postconditions** | Over HTTP, the caller receives the file's bytes (in full or as the requested range). Over FFI, the caller receives the file's resolved path, MIME type, and byte size. |
-| **Requirements** | FR-MP-01, FR-MP-02, FR-MP-03, FR-MP-06 |
+| **Requirements** | FR-MP-01, FR-MP-02, FR-MP-03, FR-MP-06, FR-FC-26 |
 
 **Main Flow**
 
@@ -1195,9 +1197,7 @@ UC-36's externally issued JWT.
 | AF-03 | The file is marked missing on disk, or its path cannot be stat'd | The system responds with a disk-error. |
 | AF-04 | The requested `Range` is unsatisfiable | The system responds with a range-not-satisfiable error. |
 | AF-05 | The caller is not authenticated | The system denies with an unauthorized error. |
-| AF-06 | A correction names a folder that overlaps another library | The system responds with a conflict naming it, as registration would. The library is not asked about itself: it always overlaps where it already is, so a folder that moved within its own root corrects normally. |
-| AF-07 | The catalog already holds files at the destination | The system responds with a conflict and moves nothing. The owner indexed the new location before correcting the record, so both copies exist; the way out is a decision — remove this library and register the new folder — rather than a retry. |
-| AF-08 | The destination folder does not exist on disk | The correction is recorded anyway. The core is told a root and walks it; whether the path is there is answered by the walk, and refusing here would also refuse a drive that is merely unplugged at the moment the owner fixes the record. |
+| AF-06 | `filesystem.root` is configured and the file's recorded path resolves outside it (FR-FC-26) | The system rejects with an invalid-input error saying the file is outside the configured library root; over HTTP no byte is sent, and over FFI no descriptor is returned. Indexing and library corrections are bounded by the same root, but a record can still point outside — one catalogued before the bound was configured, or reached through a symbolic link swapped in since — and this is the check that keeps it unserved. The path is resolved as FR-FC-26 describes; the message names no path. |
 
 ---
 
@@ -1211,7 +1211,7 @@ UC-36's externally issued JWT.
 | **Description** | Return a single page of a CBZ ComicBook as an image, addressed by 1-based page index. |
 | **Preconditions** | The caller is authenticated; the target file is `active`, present on disk, a ComicBook, and stored as a CBZ archive. |
 | **Postconditions** | The caller receives the requested page's raw bytes, its MIME type, and the comic's total page count. |
-| **Requirements** | FR-MP-03, FR-MP-04, FR-MP-06 |
+| **Requirements** | FR-MP-03, FR-MP-04, FR-MP-06, FR-FC-26 |
 
 **Main Flow**
 
@@ -1232,6 +1232,7 @@ UC-36's externally issued JWT.
 | AF-05 | The file is soft-deleted | The system rejects with an invalid-state error (restore via UC-07 first). |
 | AF-06 | The file is marked missing on disk, or the archive cannot be opened or read | The system responds with a disk-error. |
 | AF-07 | The caller is not authenticated | The system denies with an unauthorized error. |
+| AF-08 | `filesystem.root` is configured and the file's recorded path resolves outside it (FR-FC-26) | The system rejects with an invalid-input error saying the file is outside the configured library root, and opens nothing. As UC-38 AF-06. |
 
 ---
 
@@ -1242,31 +1243,29 @@ UC-36's externally issued JWT.
 | **ID** | UC-40 |
 | **Name** | Get a file thumbnail |
 | **Actors** | Owner, Local Filesystem |
-| **Description** | Return a downscaled JPEG thumbnail for a video, image, comic, or audio File, cached on disk keyed by the file's UUID, modification time, and target dimension. For audio, the thumbnail is the front-cover picture embedded in the file's own tag. |
+| **Description** | Return a downscaled JPEG thumbnail for a video, image, comic, or audio File, cached on disk keyed by the file's UUID, modification time, and target dimension. |
 | **Preconditions** | The caller is authenticated; the target file is `active`, present on disk, and of type video, image, comic, or audio. |
 | **Postconditions** | The caller receives the thumbnail's bytes; on a cache miss, the generated thumbnail is written to the disk cache under that key. |
-| **Requirements** | FR-MP-05, FR-MP-06 |
+| **Requirements** | FR-MP-05, FR-MP-06, FR-FC-26 |
 
 **Main Flow**
 
 1. The owner requests a thumbnail for a File UUID.
 2. The system verifies the file's type is video, image, comic, or audio.
 3. The system looks up the thumbnail cache by a key derived from the file's UUID, its recorded modification time, and the target dimension; on a hit, it returns the cached bytes without rendering anything. The UUID is unique and stable, and folding in the modification time is what invalidates the entry when the file changes — the same job the content hash used to do, without the whole-file read that keying on a hash would now force at browse time (FR-FC-09).
-4. On a cache miss, the system produces a source image — a video keyframe, the decoded image, the comic's first page, or an audio file's embedded front-cover picture — and downscales it to fit within 320 pixels on its longest side, preserving aspect ratio and never enlarging a source that is already smaller, then encodes it as JPEG. An audio File with no embedded picture is rejected as AF-01 rather than produced; nothing is read or extracted from an audio File at index time for this purpose (FR-FC-09, FR-FC-25).
+4. On a cache miss, the system produces a source image — a video keyframe, the decoded image, the comic's first page, or the front cover embedded in an audio file's tag — and downscales it to fit within 320 pixels on its longest side, preserving aspect ratio and never enlarging a source that is already smaller, then encodes it as JPEG.
 5. The system writes the encoded bytes to the cache and returns them.
 
 **Alternative Flows**
 
 | ID | Condition | Outcome |
 | --- | --- | --- |
-| AF-01 | The file's type has no thumbnail (text, HTML page, or document), or is an audio File with no embedded picture | The system rejects with an invalid-input error. |
+| AF-01 | The file's type has no thumbnail (text, HTML page, or document), or an audio file carries no embedded cover | The system rejects with an invalid-input error; for audio, the message says there is no cover art. |
 | AF-02 | The file UUID does not exist | The system responds with a not-found error. |
 | AF-03 | The file is soft-deleted | The system rejects with an invalid-state error (restore via UC-07 first). |
-| AF-04 | The file is marked missing on disk, or its bytes cannot be read or decoded — for audio, this includes a file that cannot be opened or parsed as audio at all (missing at request time despite being marked present, corrupt, or an unsupported format such as `.wma`), told apart from AF-01's "parsed fine, but carries no picture" | The system responds with a disk-error. |
+| AF-04 | The file is marked missing on disk, or its bytes cannot be read or decoded | The system responds with a disk-error. |
 | AF-05 | The caller is not authenticated | The system denies with an unauthorized error. |
-| AF-06 | A correction names a folder that overlaps another library | The system responds with a conflict naming it, as registration would. The library is not asked about itself: it always overlaps where it already is, so a folder that moved within its own root corrects normally. |
-| AF-07 | The catalog already holds files at the destination | The system responds with a conflict and moves nothing. The owner indexed the new location before correcting the record, so both copies exist; the way out is a decision — remove this library and register the new folder — rather than a retry. |
-| AF-08 | The destination folder does not exist on disk | The correction is recorded anyway. The core is told a root and walks it; whether the path is there is answered by the walk, and refusing here would also refuse a drive that is merely unplugged at the moment the owner fixes the record. |
+| AF-06 | `filesystem.root` is configured and the file's recorded path resolves outside it (FR-FC-26) | The system rejects with an invalid-input error saying the file is outside the configured library root, and reads nothing. As UC-38 AF-06. |
 
 ---
 
@@ -1591,7 +1590,7 @@ have only one of.
 2. The system confirms the caller is authenticated as the owner and that the run is `paused`.
 3. The system adds the length of the pause that is ending to the time the run has spent paused, so that pause never counts as work (FR-FC-28), and records the run `running` again under the **same id** — a resume continues a run, it does not start a new one.
 4. The owner may name a priority for the resumed segment (FR-FC-33). Naming one re-paces the run and is remembered, so it holds across a further pause; naming none keeps the priority the run already has, which is what an owner who only wants their run back is asking for. This is the whole answer to changing your mind about throttling mid-run: the priority is fixed while a segment walks, and a pause and a resume is what changes it (FR-FC-31).
-5. The system walks again at that priority, from the root for an index run or across every cataloged path for a re-index, and **within the scope the index run was started with** (FR-FC-01) — a resume continues a run, so it records the same file types that run was always going to. There is no cursor: the run rediscovers its total and counts from zero, and everything an earlier segment already cataloged falls out as `alreadyCataloged` in seconds.
+5. The system walks again at that priority, from the root for an index run or across every cataloged path for a re-index — a resume continues a run, recording into the same library it was started for. There is no cursor: the run rediscovers its total and counts from zero, and everything an earlier segment already cataloged falls out as `alreadyCataloged` in seconds.
 
 **Main Flow — cancel** (FR-FC-34)
 
@@ -1637,162 +1636,97 @@ have only one of.
 
 ### UC-49: Manage a playlist
 
-| Field | Value |
-| --- | --- |
-| **ID** | UC-49 |
-| **Name** | Manage a playlist |
-| **Actors** | Owner |
-| **Description** | Create, rename, and delete a named playlist of audio tracks; add tracks to it, remove one entry, and reorder its entries. |
-| **Preconditions** | The caller is authenticated; for every operation but creation, the playlist exists, and for remove/reorder the addressed entry exists in it. |
-| **Postconditions** | The playlist and its entries reflect the requested change. Entry positions remain contiguous `0..n-1`. The audio files a playlist references are never modified or deleted by a playlist operation — deleting a playlist removes only its entries. |
-| **Requirements** | FR-TR-01, FR-TR-02, FR-TR-03, FR-TR-04, FR-TR-05, FR-TR-06, FR-TR-08, FR-TR-09, FR-FC-24 |
-
-**Main Flow**
-
-1. The owner creates a playlist by submitting a name; the system validates the name is non-blank and creates the playlist, returning its UUID.
-2. The owner may rename the playlist by submitting a new name, validated the same way.
-3. The owner adds one or more audio files to the playlist by UUID; the system appends them, in order, at consecutive positions after whatever the playlist already holds. A track already on the playlist may be added again — it becomes a second, independent entry.
-4. The owner may remove one entry from the playlist by its entry id; the system deletes it and renumbers the remaining entries so positions stay contiguous.
-5. The owner may move one entry to a requested index; the system computes the playlist's full new order in one transaction, renumbers every entry, and returns the new order.
-6. The owner may delete the playlist; the system removes the playlist and every entry it holds, and returns the pre-delete record as confirmation. The referenced audio files are untouched.
-
-**Alternative Flows**
-
-| ID | Condition | Outcome |
-| --- | --- | --- |
-| AF-01 | The submitted name is blank, is whitespace-only, or has leading/trailing whitespace | The system rejects with an invalid-input error without creating or renaming anything. |
-| AF-02 | The playlist UUID, or an entry id addressed within it, does not exist | The system responds with a not-found error. |
-| AF-03 | A file submitted to be added is not an audio file | The system rejects the whole submitted batch with an invalid-input error and adds none of it. |
-| AF-04 | A file UUID submitted to be added does not resolve to any file | The system responds with a not-found error and adds none of the submitted batch — one unresolvable UUID among several means nothing from the batch is added, not just the one entry that failed to resolve. |
-| AF-05 | The requested move index is negative, or is not less than the playlist's current entry count | The system rejects with an invalid-input error; the playlist's order is unchanged. |
-| AF-06 | The caller is not authenticated | The system denies with an unauthorized error. |
-
-> An entry is addressed by its own id, not by the file it references (AF-02,
-> main flow steps 4-5): `playlist_entries` carries no `UNIQUE (playlistId,
-> fileId)`, so the same track may sit at two positions in the same playlist,
-> and only the entry's own id tells them apart.
->
-> Reordering (main flow step 5) is always "put entry X at index N": the
-> system computes the resulting order and renumbers every entry itself. A
-> caller never submits its own list of positions — that would be a second
-> implementation of the ordering rule, and the two would eventually drift.
+**Removed (moved out of scope, see Orpheus)**
 
 ---
 
 ### UC-50: Play a playlist
 
-| Field | Value |
-| --- | --- |
-| **ID** | UC-50 |
-| **Name** | Play a playlist |
-| **Actors** | Owner |
-| **Description** | Read a playlist's tracks in position order so they can be played in sequence. Playback itself — transport controls, the currently-playing track, and advancing to the next one — is implemented by the Alexandria UI, not by this repository; this use case is this core's contribution: the ordered, resolved read that playback consumes. |
-| **Preconditions** | The caller is authenticated; the playlist exists. |
-| **Postconditions** | The caller holds the playlist's tracks in position order, each resolved to its file (including its audio metadata), and each flagged whether its underlying file is currently missing on disk. |
-| **Requirements** | FR-TR-07, FR-TR-11, FR-FC-24 |
+**Removed (moved out of scope, see Orpheus)**
 
-**Main Flow**
-
-1. The owner requests a playlist by UUID to begin playback.
-2. The system reads the playlist's entries in position order and resolves each to its file, batched rather than one lookup per track.
-3. The system reports, for each entry, whether its file's `missingAt` is set, without dropping the entry from the list.
-4. The caller receives the ordered, resolved list and drives playback against it — starting at position 0 and advancing through the returned order, which already reflects any reordering (UC-49) applied earlier.
-
-**Alternative Flows**
-
-| ID | Condition | Outcome |
-| --- | --- | --- |
-| AF-01 | The playlist UUID does not exist | The system responds with a not-found error. |
-| AF-02 | The caller is not authenticated | The system denies with an unauthorized error. |
-| AF-03 | An entry's file has gone missing on disk | The entry is kept in the returned order and flagged `missing: true`, rather than dropped or skipped. A soft-deleted file is reported `missing: false`; whether to skip a flagged entry during playback, and how to tell trashed apart from missing, are UI decisions this use case does not make. |
-
-> This core never advances a "current track," never holds playback state,
-> and never decides what happens when a flagged entry is reached — those are
-> the Alexandria UI's responsibility. What this use case guarantees is that
-> the order the UI plays is exactly the order UC-49's reorder flow last
-> produced, and that a missing file surfaces as a flag the UI can act on
-> rather than as a silently shortened playlist.
-
-### UC-51: Group a folder as a library
+### UC-51: Add a library
 
 | Field | Value |
 | --- | --- |
 | **ID** | UC-51 |
-| **Name** | Group a folder as a library |
-| **Actors** | Owner |
-| **Description** | Mark an indexed folder as a *library* — a folder whose files are read in their folder structure rather than listed with every other file of their type — read one level of it, correct its root when the folder moves, and stop treating it as one. |
-| **Preconditions** | The caller is authenticated. For a read or a removal, the library exists. |
-| **Postconditions** | The library exists and its files are claimed by it, or it no longer exists and its files are back in the type listings. No file is created, moved, or deleted by any of these operations. |
-| **Requirements** | FR-FC-36, FR-FC-37, FR-FC-38, FR-FC-39, FR-FC-40, FR-FC-41, FR-FC-24 |
+| **Name** | Add a library |
+| **Actors** | Owner, Local Filesystem |
+| **Description** | Add a folder as a *library* — the only way files enter the catalog — which indexes it (UC-01); browse it one level at a time in its own folder structure; re-index it; correct its root when the folder moves; and remove it with its catalog records. |
+| **Preconditions** | The caller is authenticated. For a read, a re-index, a correction or a removal, the library exists. |
+| **Postconditions** | The library exists, its first index run has been opened, and every file it holds belongs to it; or it no longer exists and neither do its catalog records. No file on disk is created, moved, or deleted by any of these operations. |
+| **Requirements** | FR-FC-36, FR-FC-37, FR-FC-38, FR-FC-39, FR-FC-40, FR-FC-41, FR-FC-43, FR-FC-01, FR-FC-24, FR-FC-26, FR-FC-31 |
 
 **Main Flow**
 
-1. The owner registers a library by submitting a name and a root path; the
-   system validates that both are non-blank, records the library, and returns
-   its UUID.
-2. The system claims every file already catalogued beneath that root, and every
-   file indexed beneath it afterwards is claimed as it is recorded — a folder is
-   usually marked after it has been indexed.
-3. From then on those files are absent from the type-filtered listings by
-   default, and reachable by a caller that asks the listing to reach into
-   libraries — which is how a client's search and its deleted-items review
-   stay truthful — as well as by a single-file read and by any collection,
-   watchlist, or reading list that references them. The default is the
-   exclusion, so a caller that says nothing sees the type-panel behaviour.
-4. The owner lists the registered libraries, and reads one level of one — the
-   folders directly inside the addressed folder and the files directly in it.
-   The addressed folder is given relative to the library's root; absent, it is
-   the top.
+1. The owner adds a library by submitting a name and a folder, optionally with
+   a priority for its first run (FR-FC-31). The system validates that both are
+   non-blank, that the folder lies inside `filesystem.root` when one is
+   configured (FR-FC-26), and that it overlaps no library already added; it
+   records the library and opens its first index run (UC-01), and returns the
+   library with the run's id. The folder's trailing separators are dropped, so
+   `/media/course/` and `/media/course` are one library.
+2. The run walks the folder and records every file of a type the system can
+   read into the library (FR-FC-37). The owner follows it with UC-42 and may
+   pause, resume, or cancel it with UC-48.
+3. The owner lists the libraries, and reads one level of one — the folders
+   directly inside the addressed folder and the files directly in it. The
+   addressed folder is given relative to the library's root; absent, it is the
+   top. The library's files are also answered by the file listing (UC-03),
+   which can be narrowed to the library, by a single-file read, and by any
+   collection, watchlist, or reading list that references them (FR-FC-38).
+4. The owner may re-index the library, optionally at a priority; the system
+   opens a new run of it (UC-01). Files already catalogued count as
+   `alreadyCataloged`.
 5. The owner may correct the library's root after the folder moved on disk.
-   The system points the library at the new folder and rewrites the stored
-   path of every file it holds, replacing the old root and keeping everything
-   below it exactly as indexed. Files already catalogued at the destination
-   join the library, as they would on registration.
-6. The owner may remove the library. The system stops treating the folder as
-   one; its files return to the type listings, and nothing on disk or in the
-   catalog is otherwise touched.
+   When `filesystem.root` is configured, the new folder must lie inside it
+   (FR-FC-26). The system points the library at the new folder and rewrites
+   the stored path of every file it holds, replacing the old root and keeping
+   everything below it exactly as indexed.
+6. The owner may remove the library. The system deletes its catalog records —
+   every file record in it, with its subtype record, watch and reading
+   progress, and collection membership; its index runs; and every run failure
+   recorded under its folder (FR-FC-40). Collections, watchlists, and reading
+   lists themselves stay, minus those items. Nothing on disk is touched; adding
+   the folder again re-indexes it.
 
 **Alternative Flows**
 
 | ID | Condition | Outcome |
 | --- | --- | --- |
-| AF-01 | The submitted name or root path is blank or whitespace-only | The system rejects with an invalid-input error and registers nothing. |
-| AF-02 | The submitted folder contains, or sits inside, a library already registered | The system responds with a conflict that names the existing library, because "that folder is already inside Photography" is something the owner can act on where a bare refusal is a puzzle. |
+| AF-01 | The submitted name or folder is blank or whitespace-only | The system rejects with an invalid-input error and stores nothing. |
+| AF-02 | The submitted folder contains, or sits inside, a library already added | The system responds with a conflict that names the existing library, because "that folder is already inside Photography" is something the owner can act on where a bare refusal is a puzzle. Nothing is stored. |
 | AF-03 | The addressed library does not exist | The system responds with a not-found error. |
-| AF-04 | The addressed folder holds no catalogued file at any depth | The system answers an empty level rather than a not-found: a folder that exists on disk and whose files were scoped out of the index is empty, not missing. |
+| AF-04 | The addressed folder holds no catalogued file at any depth | The system answers an empty level rather than a not-found: the tree is built from what the library's runs recorded, so a folder holding only files the system cannot read is empty, not missing. |
 | AF-05 | The caller is not authenticated | The system denies with an unauthorized error. |
-| AF-06 | A correction names a folder that overlaps another library | The system responds with a conflict naming it, as registration would. The library is not asked about itself: it always overlaps where it already is, so a folder that moved within its own root corrects normally. |
-| AF-07 | The catalog already holds files at the destination | The system responds with a conflict and moves nothing. The owner indexed the new location before correcting the record, so both copies exist; the way out is a decision — remove this library and register the new folder — rather than a retry. |
-| AF-08 | The destination folder does not exist on disk | The correction is recorded anyway. The core is told a root and walks it; whether the path is there is answered by the walk, and refusing here would also refuse a drive that is merely unplugged at the moment the owner fixes the record. |
+| AF-06 | A correction names a folder that overlaps another library | The system responds with a conflict naming it, as adding would. The library is not asked about itself: it always overlaps where it already is, so a folder that moved within its own root corrects normally. |
+| AF-07 | The submitted folder does not exist on disk, or is a file rather than a folder | Adding is refused with an invalid-input error and nothing is stored: adding walks the folder now, and a file would walk as a one-entry tree the library could never show. This is checked before overlap (AF-02), so the owner hears what is wrong with what they typed. A correction (step 5) is different — see AF-08. |
+| AF-08 | A correction's destination folder does not exist on disk | The correction is recorded anyway. Whether the path is there is answered by the next walk, and refusing here would also refuse a drive that is merely unplugged at the moment the owner fixes the record. When `filesystem.root` is configured the folder must still lie inside it (AF-09), which is judged without the folder existing: its longest existing ancestor is resolved and the rest of the path normalised. |
+| AF-09 | `filesystem.root` is configured and the submitted or corrected folder is neither it nor a descendant of it (FR-FC-26) | The system rejects with an invalid-input error saying the folder is outside the configured library root, and stores or moves nothing. A correction rewrites every stored path under the library without walking the disk, and playback serves whatever path the catalog holds, so an unbounded correction would be a way around the bound. `..` segments and symbolic links are judged on where they resolve to — including through a folder that does not exist yet. |
+| AF-10 | The library has a `running` or `paused` run, and the owner re-indexes or corrects it (FR-FC-43) | The system refuses with a conflict naming the run. A resume walks the root the run started with, so a correction under a paused run would send it walking the old folder; and two walks of one folder would race each other. The owner resumes, finishes or cancels the run first (UC-48). |
+| AF-11 | The library has a `running` run, and the owner removes it (FR-FC-43) | The system refuses with a conflict naming the run: the walk would go on writing into a library that is gone. A `paused` run is not writing, and is removed with the library. |
+| AF-12 | The first run cannot be opened after the library is recorded | The library is removed again and the run's own error is returned, so a failed addition leaves nothing behind. |
 
 > **One level, not the tree.** A course with two hundred classes is a large
 > document to build, send, and parse so the owner can look at the six things in
 > one folder, and the folder they open next is one call away.
 >
-> **A library narrows where a file is listed, never what can be found.** The
-> exclusion is stated as its own requirement (FR-FC-38) rather than left
-> implicit in whichever queries happen to carry it, precisely so that a later
-> reader does not extend it to search and call that a fix.
+> **Libraries are the only way in.** A folder that is not a library is not
+> Alexandria's: there is no indexing a bare root, and every catalogued file
+> belongs to exactly one library. That is what makes the folder structure the
+> organisation of the catalog rather than one view of it, and what lets
+> removing a library mean removing its records.
 >
-> **Which is why the reach is a filter, not a choice of query.** The first
-> version made the exclusion unconditional, on the reasoning that an exclusion
-> a caller can forget to pass is one that will be forgotten. True — but it
-> assumed the browsing listing had browsing callers only, and in a client with
-> no separate search call, that same listing *is* the search and *is* the
-> deleted-items review. A library's files became unfindable, and a deleted one
-> unrestorable, since a library shows only active files. The filter defaults
-> to the exclusion, so forgetting still falls the safe way.
->
-> **Removal restores.** Marking a folder empties part of a type listing, and
-> that is not visible until after it is done — so the way back keeps every file
-> and returns it, or an accidental marking would cost the owner their catalog.
+> **Removal deletes records, never files.** With every file in a library, a
+> removed library's records have nowhere else to be. The files on disk are
+> untouched, and adding the folder again brings them back — without the
+> progress and memberships the removed records carried.
 >
 > **A move is a correction, not a re-index.** The files under a folder that
-> moved are the same files: same bytes, same hashes, same records. Re-walking
-> the new location would create a second set and leave the first to be found
-> missing at the next scan, taking with it every uuid a watchlist, a reading
-> position, or a collection points at. So the root and the paths beneath it
-> are rewritten together, in one transaction, and everything below the root is
+> moved are the same files: same bytes, same records. Re-walking the new
+> location would create a second set and leave the first to be found missing
+> at the next scan, taking with it every uuid a watchlist, a reading position,
+> or a collection points at. So the root and the paths beneath it are
+> rewritten together, in one transaction, and everything below the root is
 > kept exactly as it was indexed — which is also what lets a Windows path keep
 > its separators while the root itself is replaced.
 
@@ -1848,15 +1782,15 @@ have only one of.
 
 | Use Case | Requirements |
 | --- | --- |
-| UC-01: Index library files | FR-FC-01, FR-FC-02, FR-FC-03, FR-FC-04, FR-FC-05, FR-FC-06, FR-FC-07, FR-FC-08, FR-FC-09, FR-FC-24, FR-FC-25, FR-FC-26, FR-FC-27, FR-FC-31 |
+| UC-01: Index a library | FR-FC-01, FR-FC-02, FR-FC-03, FR-FC-04, FR-FC-05, FR-FC-06, FR-FC-07, FR-FC-08, FR-FC-09, FR-FC-14, FR-FC-24, FR-FC-25, FR-FC-26, FR-FC-27, FR-FC-31, FR-FC-37, FR-FC-43 |
 | UC-02: Re-index and refresh the catalog | FR-FC-08, FR-FC-10, FR-FC-11, FR-FC-24, FR-FC-27, FR-FC-31 |
-| UC-03: Browse and view file metadata | FR-FC-12, FR-FC-13, FR-FC-24 |
+| UC-03: Browse and view file metadata | FR-FC-12, FR-FC-13, FR-FC-24, FR-FC-38 |
 | UC-04: Edit file metadata | FR-FC-14, FR-FC-15, FR-FC-16, FR-FC-17, FR-FC-18, FR-FC-24 |
-| UC-05: Rename a file | FR-FC-19, FR-FC-24 |
+| UC-05: Rename a file | FR-FC-19, FR-FC-24, FR-FC-26 |
 | UC-06: Soft-delete a file | FR-FC-20, FR-FC-24 |
 | UC-07: Restore a soft-deleted file | FR-FC-21, FR-FC-24 |
 | UC-08: Hard-purge a file record | FR-FC-22, FR-FC-24, NFR-07 |
-| UC-09: Purge a file on disk | FR-FC-23, FR-FC-24 |
+| UC-09: Purge a file on disk | FR-FC-23, FR-FC-24, FR-FC-26 |
 | UC-10: Create a collection | FR-CO-01, FR-CO-02, FR-FC-24 |
 | UC-11: Rename a collection | FR-CO-03, FR-FC-24 |
 | UC-12: Delete a collection | FR-CO-04, FR-FC-24 |
@@ -1879,14 +1813,14 @@ have only one of.
 | UC-29: Update reading progress | FR-RL-04, FR-RL-05, FR-FC-24 |
 | UC-30: Remove an item from a reading list | FR-RL-06, FR-FC-24 |
 | UC-31: Delete a reading list | FR-RL-07, FR-FC-24 |
-| UC-32: Read text file content | FR-TX-01, FR-FC-24 |
-| UC-33: Edit text file content | FR-TX-02, FR-TX-03, FR-FC-24 |
+| UC-32: Read text file content | FR-TX-01, FR-FC-24, FR-FC-26 |
+| UC-33: Edit text file content | FR-TX-02, FR-TX-03, FR-FC-24, FR-FC-26 |
 | UC-34: Local login | FR-AU-01, FR-AU-04, FR-AU-07, FR-AU-08, FR-AU-09 |
 | UC-35: Set or change local login credentials | FR-AU-05, FR-AU-06, FR-AU-07, FR-AU-08, FR-AU-11 |
 | UC-36: Authenticate via external JWT | FR-AU-01, FR-AU-02, FR-AU-03, FR-AU-07, FR-AU-08 |
-| UC-38: Stream file content | FR-MP-01, FR-MP-02, FR-MP-03, FR-MP-06 |
-| UC-39: Read a comic book page | FR-MP-03, FR-MP-04, FR-MP-06 |
-| UC-40: Get a file thumbnail | FR-MP-05, FR-MP-06 |
+| UC-38: Stream file content | FR-MP-01, FR-MP-02, FR-MP-03, FR-MP-06, FR-FC-26 |
+| UC-39: Read a comic book page | FR-MP-03, FR-MP-04, FR-MP-06, FR-FC-26 |
+| UC-40: Get a file thumbnail | FR-MP-05, FR-MP-06, FR-FC-26 |
 | UC-41: Register the local account | FR-AU-05, FR-AU-06, FR-AU-08, FR-AU-09, FR-AU-10, FR-AU-11, FR-AU-13, FR-AU-19 |
 | UC-42: Query an index or refresh run | FR-FC-24, FR-FC-27, FR-FC-28, FR-FC-29, FR-FC-35 |
 | UC-43: Redeem a recovery code | FR-AU-11, FR-AU-14, FR-AU-15, FR-AU-16 |
@@ -1896,20 +1830,19 @@ have only one of.
 | UC-47: Report the retention window | FR-FC-30, FR-FC-24 |
 | UC-48: Pause, resume, or cancel an index run | FR-FC-24, FR-FC-27, FR-FC-29, FR-FC-31, FR-FC-32, FR-FC-33, FR-FC-34 |
 | UC-52: Report which files a run could not record | FR-FC-42, FR-FC-24 |
-| UC-49: Manage a playlist | FR-TR-01, FR-TR-02, FR-TR-03, FR-TR-04, FR-TR-05, FR-TR-06, FR-TR-08, FR-TR-09, FR-FC-24 |
-| UC-50: Play a playlist | FR-TR-07, FR-TR-11, FR-FC-24 |
-| UC-51: Group a folder as a library | FR-FC-36, FR-FC-37, FR-FC-38, FR-FC-39, FR-FC-40, FR-FC-41, FR-FC-24 |
+| UC-49: Manage a playlist | Removed (moved out of scope, see Orpheus) |
+| UC-50: Play a playlist | Removed (moved out of scope, see Orpheus) |
+| UC-51: Add a library | FR-FC-36, FR-FC-37, FR-FC-38, FR-FC-39, FR-FC-40, FR-FC-41, FR-FC-43, FR-FC-01, FR-FC-24, FR-FC-26, FR-FC-31 |
 
 Every functional requirement in [System Requirements Document](System%20Requirements%20Document.md)
 §3 appears in at least one row above except FR-AU-12, FR-AU-18, FR-AU-21,
-FR-AU-23, FR-AU-24, and FR-TR-10, which are cross-cutting (the error envelope
-shape, the account query, the Windows startup account check, the
-Windows-mode refusal of local-mode operations, the loopback-bind warning,
-and the playlist-entry cleanup a file purge performs regardless of which
-playlist use case is or is not in play, respectively) rather than tied to
-one use case: FR-FC-01..40, FR-CO-01..07, FR-BM-01..06, FR-WL-01..08,
-FR-RL-01..08, FR-TX-01..03, FR-AU-01..11, FR-AU-13..17, FR-AU-19, FR-AU-20,
-FR-AU-22, FR-MP-01..06, FR-TR-01..09, FR-TR-11.
+FR-AU-23, and FR-AU-24, which are cross-cutting (the error envelope shape,
+the account query, the Windows startup account check, the Windows-mode
+refusal of local-mode operations, and the loopback-bind warning,
+respectively) rather than tied to one use case: FR-FC-01..40, FR-CO-01..07,
+FR-BM-01..06, FR-WL-01..08, FR-RL-01..08, FR-TX-01..03, FR-AU-01..11,
+FR-AU-13..17, FR-AU-19, FR-AU-20, FR-AU-22, FR-MP-01..06. The requirements
+of the removed UC-49 and UC-50 are removed with them.
 UC-37 (Health check) is specified in the
 [Operations & Infrastructure Document](Operations%20%26%20Infrastructure%20Document.md)
 §5.3, not here, since it is an operational concern rather than a catalog use case.

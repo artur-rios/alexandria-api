@@ -62,14 +62,8 @@ pub enum DomainError {
     /// submitted bytes, even after one retry (UC-33 AF-03).
     #[error("integrity error: {0}")]
     Integrity(String),
-    /// A required external dependency could not be reached. Carries no reason
-    /// code, and its message is deliberately not echoed — which of an
-    /// installation's dependencies is down is not a caller's business.
-    #[error("service unavailable: {0}")]
-    ServiceUnavailable(String),
-    /// A dependency is unavailable for a reason the caller *does* need to
-    /// know. Stands to `ServiceUnavailable` exactly as `Rejected` stands to
-    /// `InvalidInput`: same class, plus a stable code.
+    /// A required external dependency is unavailable for a reason the caller
+    /// needs to know, carried as a stable code.
     #[error("service unavailable: {0}")]
     Unavailable(Rejection),
     /// A request refused because it came too soon after some earlier one —
@@ -269,10 +263,6 @@ pub fn error_body(err: &DomainError) -> (ErrorClass, ErrorBody) {
         DomainError::Conflict(msg) => (ErrorClass::Conflict, ErrorBody::plain(msg)),
         DomainError::Disk(_) => (ErrorClass::Internal, ErrorBody::plain("disk error")),
         DomainError::Integrity(_) => (ErrorClass::Internal, ErrorBody::plain("integrity error")),
-        DomainError::ServiceUnavailable(_) => (
-            ErrorClass::ServiceUnavailable,
-            ErrorBody::plain("service unavailable"),
-        ),
         DomainError::Unavailable(rejection) => (
             ErrorClass::ServiceUnavailable,
             ErrorBody {
@@ -297,5 +287,222 @@ pub fn error_body(err: &DomainError) -> (ErrorClass, ErrorBody) {
             ErrorBody::plain("configuration error"),
         ),
         DomainError::Internal(_) => (ErrorClass::Internal, ErrorBody::plain("internal error")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn params(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn given_each_plain_variant_when_rendered_then_class_and_message_match_the_contract() {
+        // Arrange
+        let cases = [
+            (DomainError::NotFound, ErrorClass::NotFound, "not found"),
+            (
+                DomainError::Unauthorized,
+                ErrorClass::Unauthorized,
+                "unauthorized",
+            ),
+            (
+                DomainError::InvalidInput("title must not be empty".into()),
+                ErrorClass::BadRequest,
+                "title must not be empty",
+            ),
+            (
+                DomainError::InvalidState,
+                ErrorClass::Conflict,
+                "invalid state",
+            ),
+            (
+                DomainError::conflict("an account already exists"),
+                ErrorClass::Conflict,
+                "an account already exists",
+            ),
+        ];
+
+        for (error, expected_class, expected_message) in cases {
+            // Act
+            let (class, body) = error_body(&error);
+
+            // Assert
+            assert_eq!(class, expected_class, "{error:?}");
+            assert_eq!(body.error, expected_message, "{error:?}");
+            assert_eq!(body.code, None, "{error:?} carries no code");
+            assert!(body.params.is_empty(), "{error:?} carries no params");
+        }
+    }
+
+    #[test]
+    fn given_an_internal_failure_when_rendered_then_its_detail_is_not_echoed() {
+        // Arrange — every one of these carries detail a caller must not see:
+        // a disk path, a SQL error, a configuration value.
+        let cases = [
+            (DomainError::disk("C:\\secret\\path.txt"), "disk error"),
+            (
+                DomainError::integrity("hash 1234 != 5678"),
+                "integrity error",
+            ),
+            (
+                DomainError::Database(sqlx::Error::PoolTimedOut),
+                "database error",
+            ),
+            (
+                DomainError::config("auth.secret = hunter2"),
+                "configuration error",
+            ),
+            (
+                DomainError::internal("thread panicked at src/x.rs"),
+                "internal error",
+            ),
+        ];
+
+        for (error, expected_message) in cases {
+            // Act
+            let (class, body) = error_body(&error);
+
+            // Assert
+            assert_eq!(class, ErrorClass::Internal, "{error:?}");
+            assert_eq!(body.error, expected_message, "{error:?}");
+            assert_eq!(body.code, None);
+            assert!(body.params.is_empty());
+        }
+    }
+
+    #[test]
+    fn given_a_rejection_when_rendered_then_code_message_and_params_travel_as_a_bad_request() {
+        // Arrange
+        let error = DomainError::rejected("password_too_short", "too short")
+            .with_param("min", "12")
+            .with_param("actual", "3");
+
+        // Act
+        let (class, body) = error_body(&error);
+
+        // Assert
+        assert_eq!(class, ErrorClass::BadRequest);
+        assert_eq!(body.error, "too short");
+        assert_eq!(body.code, Some("password_too_short"));
+        assert_eq!(body.params, params(&[("actual", "3"), ("min", "12")]));
+    }
+
+    #[test]
+    fn given_an_unavailable_dependency_when_rendered_then_it_is_service_unavailable_with_its_code()
+    {
+        // Arrange
+        let error = DomainError::unavailable("mail_down", "mail is down").with_param("retry", "30");
+
+        // Act
+        let (class, body) = error_body(&error);
+
+        // Assert
+        assert_eq!(class, ErrorClass::ServiceUnavailable);
+        assert_eq!(body.error, "mail is down");
+        assert_eq!(body.code, Some("mail_down"));
+        assert_eq!(body.params, params(&[("retry", "30")]));
+    }
+
+    #[test]
+    fn given_a_rate_limit_when_rendered_then_it_is_too_many_requests_with_the_wait() {
+        // Arrange
+        let error =
+            DomainError::too_many_requests("resend_too_soon", "wait").with_param("seconds", "60");
+
+        // Act
+        let (class, body) = error_body(&error);
+
+        // Assert
+        assert_eq!(class, ErrorClass::TooManyRequests);
+        assert_eq!(body.error, "wait");
+        assert_eq!(body.code, Some("resend_too_soon"));
+        assert_eq!(body.params, params(&[("seconds", "60")]));
+    }
+
+    #[test]
+    fn given_a_variant_without_a_rejection_when_a_param_is_added_then_it_is_unchanged() {
+        // Arrange
+        let error = DomainError::NotFound;
+
+        // Act
+        let error = error.with_param("ignored", "value");
+
+        // Assert
+        assert!(matches!(error, DomainError::NotFound));
+        let (_, body) = error_body(&DomainError::conflict("x").with_param("k", "v"));
+        assert!(body.params.is_empty(), "a conflict carries no params");
+    }
+
+    #[test]
+    fn given_the_same_param_twice_when_added_then_the_last_value_wins() {
+        // Arrange
+        let rejection = Rejection::new("code", "message");
+
+        // Act
+        let rejection = rejection.with_param("min", "8").with_param("min", "12");
+
+        // Assert
+        assert_eq!(rejection.params, params(&[("min", "12")]));
+        assert_eq!(rejection.to_string(), "message", "Display is the message");
+    }
+
+    #[test]
+    fn given_a_plain_body_when_serialized_then_code_and_params_are_omitted() {
+        // Arrange
+        let (_, body) = error_body(&DomainError::NotFound);
+
+        // Act
+        let json = body.to_json();
+
+        // Assert
+        assert_eq!(json, r#"{"error":"not found"}"#);
+    }
+
+    #[test]
+    fn given_a_coded_body_when_serialized_then_params_are_sorted_by_key() {
+        // Arrange — inserted out of order; the BTreeMap must sort them so
+        // the HTTP and FFI bytes compare equal in the parity suite.
+        let error = DomainError::rejected("too_long", "too long")
+            .with_param("max", "64")
+            .with_param("field", "title");
+        let (_, body) = error_body(&error);
+
+        // Act
+        let json = body.to_json();
+
+        // Assert
+        assert_eq!(
+            json,
+            r#"{"error":"too long","code":"too_long","params":{"field":"title","max":"64"}}"#
+        );
+    }
+
+    #[test]
+    fn given_each_variant_when_displayed_then_the_message_names_its_kind() {
+        // Arrange & Act & Assert — the `Display` text is what logs show.
+        assert_eq!(DomainError::NotFound.to_string(), "entity not found");
+        assert_eq!(
+            DomainError::InvalidInput("bad".into()).to_string(),
+            "invalid input: bad"
+        );
+        assert_eq!(
+            DomainError::rejected("c", "nope").to_string(),
+            "invalid input: nope"
+        );
+        assert_eq!(DomainError::disk("d").to_string(), "disk error: d");
+        assert_eq!(
+            DomainError::too_many_requests("c", "later").to_string(),
+            "too many requests: later"
+        );
+        assert_eq!(
+            DomainError::unavailable("c", "down").to_string(),
+            "service unavailable: down"
+        );
     }
 }

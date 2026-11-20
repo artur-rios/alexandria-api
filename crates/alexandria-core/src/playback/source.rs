@@ -3,6 +3,7 @@
 use uuid::Uuid;
 
 use crate::auth::AuthService;
+use crate::catalog::library_root::LibraryRoot;
 use crate::catalog::repos::CatalogRepository;
 use crate::errors::DomainError;
 use crate::playback::mime::mime_for_path;
@@ -19,6 +20,8 @@ pub struct PlaybackSourceHandler<A, R, S> {
     auth: A,
     repo: R,
     stat: S,
+    /// `filesystem.root` (FR-FC-26): see `resolve_playable`.
+    library_root: LibraryRoot,
 }
 
 impl<A, R, S> PlaybackSourceHandler<A, R, S>
@@ -27,12 +30,18 @@ where
     R: CatalogRepository,
     S: FileStat,
 {
-    pub fn new(auth: A, repo: R, stat: S) -> Self {
-        Self { auth, repo, stat }
+    pub fn new(auth: A, repo: R, stat: S, library_root: LibraryRoot) -> Self {
+        Self {
+            auth,
+            repo,
+            stat,
+            library_root,
+        }
     }
 
     pub async fn resolve(&self, uuid: Uuid, token: &str) -> Result<PlaybackSource, DomainError> {
-        let file = resolve_playable(&self.auth, &self.repo, uuid, token).await?;
+        let file =
+            resolve_playable(&self.auth, &self.repo, &self.library_root, uuid, token).await?;
 
         // The stat is load-bearing twice: it supplies `size_bytes` for the
         // FFI descriptor, and it is what turns a file that vanished without
@@ -82,6 +91,7 @@ mod tests {
             FakeStat {
                 size: Ok(2_097_152),
             },
+            LibraryRoot::unconfigured(),
         );
 
         // Act
@@ -104,8 +114,12 @@ mod tests {
             FileState::Active,
             None,
         ));
-        let handler =
-            PlaybackSourceHandler::new(FakeAuth { good: "t" }, repo, FakeStat { size: Err(()) });
+        let handler = PlaybackSourceHandler::new(
+            FakeAuth { good: "t" },
+            repo,
+            FakeStat { size: Err(()) },
+            LibraryRoot::unconfigured(),
+        );
 
         // Act
         let result = handler.resolve(Uuid::nil(), "t").await;
@@ -123,8 +137,12 @@ mod tests {
             FileState::Active,
             None,
         ));
-        let handler =
-            PlaybackSourceHandler::new(FakeAuth { good: "t" }, repo, FakeStat { size: Ok(10) });
+        let handler = PlaybackSourceHandler::new(
+            FakeAuth { good: "t" },
+            repo,
+            FakeStat { size: Ok(10) },
+            LibraryRoot::unconfigured(),
+        );
 
         // Act
         let source = handler.resolve(Uuid::nil(), "t").await.expect("resolves");

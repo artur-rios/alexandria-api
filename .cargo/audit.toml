@@ -1,0 +1,39 @@
+# `cargo audit` reads this from the repository's root. Each advisory ignored
+# here has no fixed version Alexandria can reach yet, and a reason it does not
+# apply or cannot be acted on today. Remove an entry as soon as the upstream
+# release that fixes it lands; the condition is written next to each.
+
+[advisories]
+ignore = [
+    # rsa 0.9 (Marvin attack, a timing side channel on RSA private-key
+    # operations). It enters through jsonwebtoken's `rust_crypto` feature,
+    # which builds every algorithm. Alexandria holds no RSA key and accepts
+    # only ES256 and HS256 tokens, so no RSA operation ever runs.
+    # Remove when jsonwebtoken moves to rsa >= 0.10 (11.1.0 is on 0.9).
+    "RUSTSEC-2023-0071",
+
+    # crypto-bigint 0.5 (timing variability in arithmetic on secret
+    # integers). Through elliptic-curve 0.13, also from jsonwebtoken, and used
+    # here only to verify Heimdall's ES256 signatures, an operation on public
+    # values. Remove when jsonwebtoken moves to the RustCrypto 0.14 curves
+    # (crypto-bigint >= 0.7.6).
+    "RUSTSEC-2026-0387",
+
+    # libsqlite3-sys 0.37 bundles SQLite 3.53, which can return uninitialised
+    # page-cache memory when it opens a crafted database with a `-wal` file of
+    # a different page size. Alexandria opens only its own database, in its own
+    # data directory; an attacker who can write there already has the data.
+    # sqlx 0.9.0 caps libsqlite3-sys below 0.38 and the fix is 0.39. Remove
+    # when sqlx allows libsqlite3-sys >= 0.39.
+    "RUSTSEC-2026-0459",
+
+    # quick-xml 0.37 (quadratic duplicate-attribute check; unbounded namespace
+    # declarations in NsReader) and paste (unmaintained). Both come only from
+    # little_exif, a dev-dependency that writes EXIF into test fixtures: no
+    # shipped binary contains them, and the XML they parse is the tests' own.
+    # Remove when little_exif moves to quick-xml >= 0.41 and off paste
+    # (0.6.23 has neither).
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
+    "RUSTSEC-2024-0436",
+]

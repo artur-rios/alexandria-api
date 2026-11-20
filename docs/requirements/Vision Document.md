@@ -5,8 +5,8 @@
 ### 1.1 Purpose
 
 This document establishes the **why and what, at altitude** for Alexandria — a
-personal library back-end that indexes, organizes, and surfaces a single user's
-on-disk media and documents. It states the problem, the product's position, the
+personal library manager back-end that indexes, organizes, and surfaces the
+folders a single user adds as libraries. It states the problem, the product's position, the
 stakeholders, the core features, and the success criteria. It states no versions,
 no endpoints, and no field types — those live in the
 [Technology Stack Document](Technology%20Stack%20Document.md) and the
@@ -14,15 +14,21 @@ no endpoints, and no field types — those live in the
 
 ### 1.2 Scope
 
-Alexandria catalogs a single owner's files already living on disk: audio,
-movies, series, HTML pages, Markdown and text files, PDFs and e-books, comic
-books, images, and browser bookmarks. It lets the owner browse, edit metadata,
-rename, organize into collections, build watchlists and reading lists to track
-consumption, and edit the content of Markdown and text files in place. It exposes
-the same domain operations over an HTTP/REST-JSON API and a Flutter FFI surface.
+Alexandria is a library manager. The single owner adds folders that already
+live on disk as **libraries**; Alexandria indexes every file in them it can read
+— movies, series, music and other audio, HTML pages, Markdown and text files,
+PDFs and e-books, comic books, and images — keeps each library's folder
+structure exactly as it is, and lets the owner browse that tree and read or play
+what is in it. A folder that is not a library is not Alexandria's. It also lets
+the owner edit metadata, rename, organize into collections, build watchlists
+and reading lists to track consumption, keep browser bookmarks, and edit the
+content of Markdown and text files in place. It exposes the same domain
+operations over an HTTP/REST-JSON API and a Flutter FFI surface. Audio is
+played as files; managing music — playlists, play history, lookups — lives in
+Orpheus, a separate project.
 
 It is explicitly **out of scope** to: support multiple users or shared
-libraries; perform complex media editing (audio/video re-encoding, image
+libraries; perform complex media editing (video re-encoding, image
 manipulation); store or duplicate file bytes; automatically remove files from
 disk; or issue its own JWTs in external-auth mode.
 
@@ -34,6 +40,7 @@ unmodified, which is not the media editing excluded above.
 | Term | Definition |
 | --- | --- |
 | **Owner** | The single authenticated user to whom all cataloged data belongs. |
+| **Library** | A folder the owner added. The only way files enter the catalog: every catalogued file belongs to exactly one library, and a library is browsed as its own folder tree. |
 | **Catalog** | The set of indexed file records, collections, bookmarks, watchlists, reading lists, and progress entries. |
 | **Collection** | A named flat folder grouping files (kind = file) or bookmarks (kind = bookmark). |
 | **Watchlist** | A named group tracking watch progress for movies and series (VideoFiles). |
@@ -46,7 +53,7 @@ unmodified, which is not the media editing excluded above.
 
 ## 2. Problem Statement
 
-Files accumulate across a single user's machine — music, movies and series,
+Files accumulate across a single user's machine — movies and series,
 HTML pages, Markdown and text notes, PDFs and e-books, comic books, images, and
 browser bookmarks — with no unified way to browse, search, edit metadata, or
 track consumption progress. Scattered files and disconnected, browser-managed
@@ -111,8 +118,8 @@ database instead.
 
 | ID | Feature | Description |
 | --- | --- | --- |
-| **F-01** | File indexing | Scan a directory tree and create type-aware catalog records for supported file types, recording each file's path, size, and modification time without reading its contents. Runs asynchronously without blocking reads, report their progress while they go, and can be started at a chosen priority, paused, resumed — optionally at a new priority — and cancelled. |
-| **F-02** | Catalog browsing and metadata editing | List, query, view, and edit the metadata of any supported file type; edit comic-book, video, audio, document, and image metadata; browse by type and collection. |
+| **F-01** | File indexing | Scan a library's folder tree and create type-aware catalog records, in that library, for the file types it can read, recording each file's path, size, and modification time without reading its contents. Runs asynchronously without blocking reads, report their progress while they go, and can be started at a chosen priority, paused, resumed — optionally at a new priority — and cancelled. |
+| **F-02** | Catalog browsing and metadata editing | List, query, view, and edit the metadata of any supported file type; edit audio, comic-book, video, document, and image metadata; search across libraries by type, collection, and library. |
 | **F-03** | Renaming and lifecycle management | Rename files (which renames them on disk), soft-delete records with restore, hard-purge records, and explicitly purge a file on disk. |
 | **F-04** | Text file content editing | Read Markdown and text file content and write edited content back to the file on disk. |
 | **F-05** | Collections | Create, rename, and delete flat file collections and bookmark collections; add and remove items of the matching kind. |
@@ -121,6 +128,7 @@ database instead.
 | **F-08** | Reading lists | Create and delete reading lists, add books and comic books, update read progress (per issue for comic series), and remove items. |
 | **F-09** | Pluggable authentication | Authenticate the single owner via an external JWT service, local hashed-credential login, or the Windows account the server process runs as, selected at startup; authorize every operation. |
 | **F-10** | Dual-transport parity | Expose the same domain operations over HTTP/REST-JSON and a Rust FFI surface with identical results. |
+| **F-12** | Libraries | Add a folder as a library, which indexes it; browse it one level at a time in its own folder structure; re-index it; correct its root when the folder moves; remove it with its catalog records, never its files. |
 
 These `F-xx` IDs are traced to requirement ranges in
 [System Requirements Document](System%20Requirements%20Document.md) §9.
@@ -131,6 +139,7 @@ These `F-xx` IDs are traced to requirement ranges in
 
 ```mermaid
 erDiagram
+    Library ||--o{ File : "holds"
     File ||--o{ AudioFile : "subtype"
     File ||--o{ VideoFile : "subtype"
     File ||--o{ HtmlPage : "subtype"
@@ -171,7 +180,7 @@ Alexandria has exactly one kind of actor, so no role hierarchy diagram applies.
 - The platform is **Rust**, with `#![deny(unsafe_code)]` applied project-wide; concrete versions are pinned in the [Technology Stack Document](Technology%20Stack%20Document.md).
 - The relational store is **SQLite**, embedded and bundled with the desktop app; additional databases may be introduced later but SQLite is the starting point (see [Technology Stack Document](Technology%20Stack%20Document.md) §4).
 - The API stores **metadata and a reference to the file on disk only** — its path, size, and modification time — never file bytes.
-- The API performs **no complex media editing** — no audio or video re-encoding, no image manipulation.
+- The API performs **no complex media editing** — no video re-encoding, no image manipulation.
 - **Exactly one auth mode** is active at runtime, selected by startup configuration; JWTs are never issued by Alexandria.
 - Deletion is **two-phase**: soft delete (restorable) then hard purge after a configurable retention window; on-disk files are removed only by an explicit purge-on-disk operation.
 - Indexing runs **asynchronously** and must not block read/query operations.

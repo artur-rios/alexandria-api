@@ -8,12 +8,9 @@ use tokio::runtime::{Builder, Runtime};
 
 use alexandria_core::auth::windows_identity::{verify_owner, ProcessWindowsIdentity};
 use alexandria_core::auth::AuthService;
-use alexandria_core::catalog::commands::index::IndexRequest;
-use alexandria_core::catalog::index_scope::IndexScope;
 use alexandria_core::catalog::runs::{RunKind, RunPriority};
 use alexandria_core::config::AuthMode;
 use alexandria_core::config::Settings;
-use alexandria_core::enrichment::model::EnrichmentScope;
 use alexandria_core::errors::{error_body, DomainError};
 use alexandria_core::migrate::migrate_database;
 use alexandria_core::services::{build_services, Services};
@@ -45,6 +42,10 @@ pub const INDEX_ERR_OTHER: c_int = 4;
 /// takes effect when the scan finishes" instead of reporting an error for
 /// something that is going to work.
 pub const INDEX_ERR_BUSY: c_int = 5;
+/// `alexandria_library_index_start` named no library (HTTP's `404`).
+pub const INDEX_ERR_NOT_FOUND: c_int = 6;
+/// The library already has an unfinished run (FR-FC-43; HTTP's `409`).
+pub const INDEX_ERR_CONFLICT: c_int = 7;
 
 /// FFI status codes returned by file operations (UC-04+). Deliberately
 /// separate from `INDEX_*` so a future use case can grow either set without
@@ -163,7 +164,7 @@ fn authenticated(services: &Services, token: &str) -> bool {
 ///
 /// Shared with `alexandria_index_resume` (UC-48), which reuses this same
 /// struct shape for a call that is not starting anything new. That reuse
-/// changes what `status` means: from `alexandria_index_start` and
+/// changes what `status` means: from `alexandria_library_index_start` and
 /// `alexandria_index_refresh_start` it is one of the `INDEX_ERR_*`
 /// constants, where `4` is `INDEX_ERR_OTHER`; from `alexandria_index_resume`
 /// it is one of the `RUN_ERR_*` constants, where `4` is `RUN_ERR_NOT_FOUND`
@@ -222,6 +223,22 @@ fn cstr_lossy(ptr: *const c_char) -> Option<String> {
     Some(s)
 }
 
+/// A caller-supplied C string that must be valid UTF-8 as it stands — a
+/// filesystem path, where [`cstr_lossy`]'s replacement characters would turn
+/// one path into another. `None` for NULL and for bytes that do not decode,
+/// both of which the caller reports as invalid input.
+#[allow(unsafe_code)] // dereferences a caller-supplied raw pointer
+fn cstr_utf8(ptr: *const c_char) -> Option<String> {
+    if ptr.is_null() {
+        return None;
+    }
+    // SAFETY: the caller passes a valid NUL-terminated C string.
+    unsafe { CStr::from_ptr(ptr) }
+        .to_str()
+        .ok()
+        .map(str::to_string)
+}
+
 /// Parse a wire priority string into a [`RunPriority`].
 ///
 /// `"low"` maps to `RunPriority::Low`; anything else — NULL, `"normal"`, an
@@ -234,29 +251,6 @@ fn parse_priority(raw: Option<String>) -> RunPriority {
     match raw.as_deref() {
         Some("low") => RunPriority::Low,
         _ => RunPriority::Normal,
-    }
-}
-
-/// Parse a comma-separated list of wire type names into an [`IndexScope`].
-///
-/// NULL and the empty string are the same absence and both mean every type.
-/// At this boundary a client with no scope to send has only those two ways to
-/// say so, and reading either as "index nothing" would turn a missing
-/// argument into a run that does no work at all.
-///
-/// An unrecognised name is rejected, which is the one place this deliberately
-/// parts company with [`parse_priority`]. An unreadable priority has a *safe*
-/// fallback to fall back to; a scope's only candidate is "every type", the
-/// opposite of what a caller asking for a narrower scope wants, and it fails
-/// in the direction of cataloguing exactly the files the owner excluded. The
-/// HTTP body rejects the same name for the same reason (FR-FC-24).
-fn parse_scope(raw: Option<String>) -> Result<IndexScope, DomainError> {
-    match raw {
-        // Through `parse_list` rather than splitting here, so this argument
-        // and `catalog_runs.scope` have exactly one reader of the encoding
-        // between them and cannot drift on what a comma means.
-        Some(list) => IndexScope::parse_list(&list),
-        None => Ok(IndexScope::all()),
     }
 }
 
@@ -282,6 +276,12 @@ fn parse_resume_priority(raw: Option<String>) -> Option<RunPriority> {
     }
 }
 
+/// This core's version, as a NUL-terminated string such as `"0.6.0"`.
+///
+/// The pointer is to static storage owned by the library: it stays valid for
+/// the life of the process and must **not** be passed to
+/// `alexandria_free_string`, which would free memory this library never
+/// allocated.
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
 pub extern "C" fn alexandria_version() -> *const c_char {
@@ -320,7 +320,10 @@ pub extern "C" fn alexandria_health_status_code() -> i32 {
 #[no_mangle]
 pub extern "C" fn alexandria_index_init(db_path: *const c_char) -> c_int {
     ffi_guard(INDEX_ERR_OTHER, || {
-        let path = match cstr_lossy(db_path) {
+        // Strict UTF-8: decoded lossily, a path that did not decode named a
+        // different file, and the migration below created a new, empty
+        // database there rather than opening the owner's.
+        let path = match cstr_utf8(db_path) {
             Some(p) => p,
             None => return INDEX_ERR_INVALID_INPUT,
         };
@@ -361,13 +364,32 @@ pub extern "C" fn alexandria_index_init(db_path: *const c_char) -> c_int {
         let result = runtime().block_on(async {
             let pool = migrate_database(&path).await?;
             let services = Arc::new(build_services(&settings, pool).await);
-            *services_slot()
+            let mut slot = services_slot()
                 .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(services);
-            Ok::<(), DomainError>(())
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            // Asked again, under the lock, at the moment of the swap. The
+            // check above ran before the migration and the build, and a run
+            // started from another thread in between would otherwise be
+            // orphaned exactly as that check exists to prevent. Holding the
+            // lock here means no caller can fetch the old services between
+            // this answer and the replacement.
+            if slot
+                .as_ref()
+                .is_some_and(|existing| existing.run_registry.live_runs() > 0)
+            {
+                return Ok(false);
+            }
+            *slot = Some(services);
+            Ok::<bool, DomainError>(true)
         });
         match result {
-            Ok(()) => INDEX_OK,
+            Ok(true) => INDEX_OK,
+            Ok(false) => {
+                tracing::warn!(
+                    "a run started while re-initializing; keeping the services it runs on"
+                );
+                INDEX_ERR_BUSY
+            }
             Err(_) => INDEX_ERR_OTHER,
         }
     })
@@ -382,110 +404,13 @@ fn load_settings() -> Settings {
     Settings::load_or_default(&config_path)
 }
 
-/// Start an asynchronous index scan of `root`. Returns a `IndexStartResult`
-/// with a `run_id` and `status` (parity with HTTP 202 body). The scan runs in
-/// the background on the FFI runtime; read results via the accessor functions.
-///
-/// `priority` is `"low"` or `"normal"` (case-sensitive, matching the HTTP
-/// body's spelling exactly — FR-FC-24). NULL or any other string is treated
-/// as `"normal"`: a client that cannot spell the value gets the safe default
-/// rather than a rejected call.
-///
-/// `types` is the run's scope: a comma-separated list of the wire names
-/// `FileType` reads back (`"audio,image"`), the same words the HTTP body's
-/// `types` array carries (FR-FC-24). NULL and the empty string are the same
-/// absence and mean every type — see [`parse_scope`] for why an unrecognised
-/// name is `INDEX_ERR_INVALID_INPUT` here where an unrecognised priority is
-/// not.
-#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
-#[no_mangle]
-pub extern "C" fn alexandria_index_start(
-    root: *const c_char,
-    token: *const c_char,
-    priority: *const c_char,
-    types: *const c_char,
-) -> IndexStartResult {
-    ffi_guard(IndexStartResult::err(INDEX_ERR_OTHER), || {
-        let services = match locked_services() {
-            Some(s) => s,
-            None => return IndexStartResult::err(INDEX_ERR_NOT_INITIALIZED),
-        };
-        let root = match cstr_lossy(root) {
-            Some(r) => r,
-            None => return IndexStartResult::err(INDEX_ERR_INVALID_INPUT),
-        };
-        let token = cstr_lossy(token).unwrap_or_default();
-        // Denied before the scope is looked at (see `authenticated`): `start`
-        // authenticates, but only after its arguments are parsed, and the HTTP
-        // surface's `require_auth` is a route layer that runs before its
-        // extractors. Without this gate an unauthenticated caller would learn
-        // from the FFI that its `types` did not parse where HTTP told it only
-        // `401` (FR-FC-24 / NFR-09).
-        //
-        // Not the full "deny before any payload is looked at" the collection
-        // entry points keep: the NULL-`root` check above still answers
-        // `INVALID_INPUT` to an unauthenticated caller, where HTTP answers
-        // `401`. That gap predates this argument and is left as it is rather
-        // than changed in passing — this gate covers the parameter it was added
-        // with.
-        if !authenticated(&services, &token) {
-            return IndexStartResult::err(INDEX_ERR_UNAUTHORIZED);
-        }
-        let priority = parse_priority(cstr_lossy(priority));
-        // Parsed before `start`, so a misspelt type is refused without a run
-        // record being opened — the same order the root check keeps (FR-FC-27).
-        let scope = match parse_scope(cstr_lossy(types)) {
-            Ok(scope) => scope,
-            Err(_) => return IndexStartResult::err(INDEX_ERR_INVALID_INPUT),
-        };
-        let rt = runtime();
-
-        let started = rt.block_on(async {
-            services
-                .index_handler
-                .start(
-                    IndexRequest {
-                        root: root.clone(),
-                        priority,
-                        scope: scope.clone(),
-                    },
-                    &token,
-                )
-                .await
-        });
-
-        match started {
-            Ok(s) => {
-                let run_id = s.run_id;
-                let handler = services.index_handler.clone();
-                rt.spawn(async move {
-                    // Per-file failures are counted inside `execute`; an `Err`
-                    // here means the run could not start at all. `execute` has
-                    // already written the `failed` run record on its own error
-                    // path (UC-48), so the failure is recorded, not lost. This
-                    // log line is for the operator.
-                    if let Err(err) = handler.execute(&root, run_id, &scope).await {
-                        tracing::error!(%run_id, error = %err, "index run aborted");
-                    }
-                });
-                IndexStartResult::ok(&s.run_id.to_string())
-            }
-            Err(err) => match err {
-                DomainError::InvalidInput(_) => IndexStartResult::err(INDEX_ERR_INVALID_INPUT),
-                DomainError::Unauthorized => IndexStartResult::err(INDEX_ERR_UNAUTHORIZED),
-                _ => IndexStartResult::err(INDEX_ERR_OTHER),
-            },
-        }
-    })
-}
-
 /// Start an asynchronous re-index/refresh of every cataloged path (UC-02).
 /// Takes only a token (no root — refresh touches everything cataloged) and
 /// returns a `IndexStartResult` with a `run_id` and `status` (parity with the
 /// HTTP `POST /v1/index/refresh` 202 body). The refresh runs in the background
 /// on the FFI runtime; read results via the accessor functions.
 ///
-/// `priority` is parsed exactly as `alexandria_index_start`'s is — see that
+/// `priority` is parsed exactly as `alexandria_library_index_start`'s is — see that
 /// function's doc comment for the accepted spellings and the NULL/garbage
 /// fallback.
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
@@ -575,7 +500,7 @@ impl FileMetadataResult {
     }
 }
 
-/// Edit a file's type-specific metadata (UC-04 / FR-FC-14..18).
+/// Edit a file's type-specific metadata (UC-04 / FR-FC-15..18).
 ///
 /// `uuid` is the file's public UUID string; `json_patch` is the JSON body
 /// (the `SubtypeMetadata` enum, internally tagged by `type`) that HTTP would
@@ -725,7 +650,7 @@ struct FilesListFilter {
     file_type: Option<String>,
     state: Option<String>,
     collection_uuid: Option<String>,
-    include_libraries: bool,
+    library_uuid: Option<String>,
 }
 
 impl FilesListFilter {
@@ -751,27 +676,20 @@ impl FilesListFilter {
                 .get("collectionUuid")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string()),
-            // Only a real `true` reaches into libraries, and both the JSON
-            // boolean and the string HTTP takes are accepted so a caller
-            // built against either surface says it the same way
-            // (FR-FC-24). Anything else leaves them excluded, which is the
-            // direction a mistake should fall.
-            include_libraries: match obj.get("includeLibraries") {
-                Some(serde_json::Value::Bool(value)) => *value,
-                Some(serde_json::Value::String(value)) => value == "true",
-                _ => false,
-            },
+            library_uuid: obj
+                .get("libraryUuid")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
         })
     }
 }
 
 /// List/query files filtered by type and lifecycle state (UC-03 / FR-FC-12).
 ///
-/// `json_filters` is a JSON string `{"type":"audio","state":"all"}` (empty
-/// string or NULL for defaults). `{"includeLibraries":true}` reaches into
-/// libraries, which is what a caller's search and deleted-items review need
-/// (libraries design / FR-FC-38); without it a library's files are absent,
-/// as they are from the type panels. The function deserializes it, calls the same
+/// `json_filters` is a JSON string `{"type":"video","state":"all"}` (empty
+/// string or NULL for defaults), answered across every library unless
+/// `"libraryUuid"` names one. The
+/// function deserializes it, calls the same
 /// `BrowseFilesHandler` the HTTP route uses, and on success serializes the
 /// returned `Vec<FileView>` back to a JSON array — each element the same
 /// `{"file": …, "metadata": …, …}` shape `alexandria_file_get_by_uuid`
@@ -807,7 +725,7 @@ pub extern "C" fn alexandria_files_list(
         // filter — HTTP answers `400` for these and the two surfaces must agree
         // (FR-FC-24 / NFR-09). An empty string means "no filter", as on HTTP.
         let file_type = match parsed.file_type.as_deref().filter(|s| !s.is_empty()) {
-            Some(t) => match parse_file_type(t) {
+            Some(t) => match alexandria_core::catalog::model::FileType::from_wire(t) {
                 Some(ft) => Some(ft),
                 None => return FileJsonResult::err(FILE_ERR_INVALID_INPUT),
             },
@@ -833,8 +751,14 @@ pub extern "C" fn alexandria_files_list(
             };
             filter = filter.with_collection(collection_uuid);
         }
-        if parsed.include_libraries {
-            filter = filter.everywhere();
+        // One library's files, parsed as `collectionUuid` is (FR-FC-24):
+        // malformed is invalid input, unknown answers `[]`.
+        if let Some(l) = parsed.library_uuid.as_deref().filter(|s| !s.is_empty()) {
+            let library_uuid = match uuid::Uuid::parse_str(l) {
+                Ok(u) => u,
+                Err(_) => return FileJsonResult::err(FILE_ERR_INVALID_INPUT),
+            };
+            filter = filter.with_library(library_uuid);
         }
 
         let result =
@@ -962,7 +886,9 @@ pub extern "C" fn alexandria_file_read_content(
 /// desktop, on the same machine as the file — opens that path directly.
 /// Zero bytes cross this boundary. Parity with HTTP is defined on this
 /// descriptor and on the authorization, state, and error decisions rather
-/// than on byte transfer (FR-MP-06).
+/// than on byte transfer (FR-MP-06). A file whose path resolves outside the
+/// configured `filesystem.root` gets `PLAYBACK_ERR_INVALID_INPUT` and no
+/// descriptor (FR-FC-26), as HTTP's `400`.
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
 pub extern "C" fn alexandria_file_playback_source(
@@ -1093,61 +1019,6 @@ pub extern "C" fn alexandria_file_thumbnail(
                     "uuid": thumb.uuid,
                     "mimeType": thumb.mime_type,
                     "bytesBase64": encoded,
-                })
-                .to_string();
-                PlaybackJsonResult::ok(json)
-            }
-            Err(err) => map_playback_err(err),
-        }
-    })
-}
-
-/// UC-21 — the sound of a track, as levels a visualiser can draw.
-///
-/// `uuid` is the file's public UUID (NUL-terminated string), `token` the
-/// bearer auth token. On success the JSON carries the shape of the envelope
-/// and the levels themselves, base64 encoded: `{"uuid":…,"bands":16,
-/// "frameMs":100,"levelsBase64":"…"}` — row-major, `bands` levels per frame,
-/// each 0 (silence) to 255 (the loudest moment of this track).
-///
-/// **The first call for a track decodes it**, which is a second or two of CPU
-/// on the blocking pool; every call after it reads what was stored. A caller
-/// on a frame deadline should treat the first call as slow and draw nothing
-/// until it answers, which is exactly what the player does.
-#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
-#[no_mangle]
-pub extern "C" fn alexandria_track_energy(
-    uuid: *const c_char,
-    token: *const c_char,
-) -> PlaybackJsonResult {
-    ffi_guard(PlaybackJsonResult::err(PLAYBACK_ERR_OTHER), || {
-        let services = match locked_services() {
-            Some(s) => s,
-            None => return PlaybackJsonResult::err(PLAYBACK_ERR_NOT_INITIALIZED),
-        };
-
-        let token = cstr_lossy(token).unwrap_or_default();
-        if !authenticated(&services, &token) {
-            return PlaybackJsonResult::err(PLAYBACK_ERR_UNAUTHORIZED);
-        }
-
-        let uuid = match cstr_lossy(uuid).and_then(|s| uuid::Uuid::parse_str(&s).ok()) {
-            Some(u) => u,
-            None => return PlaybackJsonResult::err(PLAYBACK_ERR_INVALID_INPUT),
-        };
-
-        let result =
-            runtime().block_on(async { services.energy_handler.energy(uuid, &token).await });
-
-        match result {
-            Ok(energy) => {
-                use base64::Engine;
-                let encoded = base64::engine::general_purpose::STANDARD.encode(&energy.levels);
-                let json = serde_json::json!({
-                    "uuid": energy.uuid,
-                    "bands": energy.bands,
-                    "frameMs": energy.frame_ms,
-                    "levelsBase64": encoded,
                 })
                 .to_string();
                 PlaybackJsonResult::ok(json)
@@ -2979,20 +2850,6 @@ pub extern "C" fn alexandria_watchlist_delete(
     })
 }
 
-fn parse_file_type(s: &str) -> Option<alexandria_core::catalog::model::FileType> {
-    use alexandria_core::catalog::model::FileType;
-    match s {
-        "audio" => Some(FileType::Audio),
-        "video" => Some(FileType::Video),
-        "html" => Some(FileType::Html),
-        "text" => Some(FileType::Text),
-        "document" => Some(FileType::Document),
-        "comic" => Some(FileType::Comic),
-        "image" => Some(FileType::Image),
-        _ => None,
-    }
-}
-
 fn map_file_err(err: DomainError) -> FileJsonResult {
     match err {
         DomainError::NotFound => FileJsonResult::err(FILE_ERR_NOT_FOUND),
@@ -3050,16 +2907,23 @@ pub extern "C" fn alexandria_index_files_json() -> *mut c_char {
             Some(s) => s,
             None => return std::ptr::null_mut(),
         };
-        let rows: Vec<FileRow> = runtime()
-            .block_on(async {
-                sqlx::query_as(
-                    "SELECT path, name, type, content_hash, missing_at \
-                     FROM files ORDER BY path",
-                )
-                .fetch_all(&services.pool)
-                .await
-            })
-            .unwrap_or_default();
+        // A failed read is the NULL the doc comment promises, not `[]`: an
+        // empty array is a real answer — "nothing is indexed" — and a
+        // database that could not be read is not that.
+        let rows: Vec<FileRow> = match runtime().block_on(async {
+            sqlx::query_as(
+                "SELECT path, name, type, content_hash, missing_at \
+                 FROM files ORDER BY path",
+            )
+            .fetch_all(&services.pool)
+            .await
+        }) {
+            Ok(rows) => rows,
+            Err(err) => {
+                tracing::error!(error = %err, "could not read the indexed files");
+                return std::ptr::null_mut();
+            }
+        };
 
         let arr: Vec<_> = rows
             .iter()
@@ -3576,703 +3440,6 @@ pub extern "C" fn alexandria_reading_list_delete(
     })
 }
 
-/// FFI status codes returned by playlist operations (Tasks 1-6).
-/// Deliberately separate from `READING_LIST_*` / `WATCHLIST_*` — per the
-/// convention above — so playlist use cases can grow their own set without
-/// colliding; `PLAYLIST_OK == READING_LIST_OK == WATCHLIST_OK == 0` by
-/// convention.
-pub const PLAYLIST_OK: c_int = 0;
-pub const PLAYLIST_ERR_INVALID_INPUT: c_int = 1;
-pub const PLAYLIST_ERR_UNAUTHORIZED: c_int = 2;
-pub const PLAYLIST_ERR_NOT_INITIALIZED: c_int = 3;
-pub const PLAYLIST_ERR_NOT_FOUND: c_int = 4;
-pub const PLAYLIST_ERR_INVALID_STATE: c_int = 5;
-pub const PLAYLIST_ERR_OTHER: c_int = 9;
-
-/// Result of every playlist FFI function. On success `status` is
-/// `PLAYLIST_OK` and `json` is a NUL-terminated JSON string of the response
-/// body — byte-for-byte the same shape HTTP returns from the matching
-/// `/v1/playlists*` route (FR-FC-24 / NFR-09). On failure `json` is NULL
-/// and `status` carries the mapped error code. The caller must free `json`
-/// with `alexandria_free_string`.
-#[repr(C)]
-#[derive(Debug)]
-pub struct PlaylistJsonResult {
-    pub status: c_int,
-    pub json: *mut c_char,
-}
-
-impl PlaylistJsonResult {
-    fn err(status: c_int) -> Self {
-        Self {
-            status,
-            json: std::ptr::null_mut(),
-        }
-    }
-
-    fn ok(json: String) -> Self {
-        let cstring = CString::new(json).unwrap_or_default();
-        Self {
-            status: PLAYLIST_OK,
-            json: cstring.into_raw(),
-        }
-    }
-}
-
-fn map_playlist_err(err: DomainError) -> PlaylistJsonResult {
-    match err {
-        DomainError::NotFound => PlaylistJsonResult::err(PLAYLIST_ERR_NOT_FOUND),
-        DomainError::Unauthorized => PlaylistJsonResult::err(PLAYLIST_ERR_UNAUTHORIZED),
-        DomainError::InvalidInput(_) => PlaylistJsonResult::err(PLAYLIST_ERR_INVALID_INPUT),
-        DomainError::InvalidState => PlaylistJsonResult::err(PLAYLIST_ERR_INVALID_STATE),
-        _ => PlaylistJsonResult::err(PLAYLIST_ERR_OTHER),
-    }
-}
-
-/// Request body accepted by `alexandria_playlist_create` and
-/// `alexandria_playlist_rename` — the same JSON `POST /v1/playlists` /
-/// `PATCH /v1/playlists/{uuid}` take: `{"name":"Road trip"}`.
-#[derive(Debug)]
-struct PlaylistNameBody {
-    name: String,
-}
-
-impl PlaylistNameBody {
-    fn from_json_str(s: &str) -> Option<Self> {
-        let value: serde_json::Value = serde_json::from_str(s).ok()?;
-        let obj = value.as_object()?;
-        let name = obj.get("name")?.as_str()?.to_string();
-        Some(Self { name })
-    }
-}
-
-/// Create a named, empty playlist (Task 1).
-///
-/// `json_body` is the JSON body HTTP would send (`name`). The function
-/// deserializes it, calls the same `CreatePlaylistHandler` the HTTP route
-/// uses, and on success serializes the returned `Playlist` back to JSON —
-/// so the FFI and HTTP surfaces agree byte-for-byte modulo key ordering
-/// (parity, FR-FC-24 / NFR-09). `token` is the bearer auth token.
-#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
-#[no_mangle]
-pub extern "C" fn alexandria_playlist_create(
-    json_body: *const c_char,
-    token: *const c_char,
-) -> PlaylistJsonResult {
-    ffi_guard(PlaylistJsonResult::err(PLAYLIST_ERR_OTHER), || {
-        let services = match locked_services() {
-            Some(s) => s,
-            None => return PlaylistJsonResult::err(PLAYLIST_ERR_NOT_INITIALIZED),
-        };
-
-        let token = cstr_lossy(token).unwrap_or_default();
-        if !authenticated(&services, &token) {
-            return PlaylistJsonResult::err(PLAYLIST_ERR_UNAUTHORIZED);
-        }
-
-        let body_str = match cstr_lossy(json_body) {
-            Some(s) => s,
-            None => return PlaylistJsonResult::err(PLAYLIST_ERR_INVALID_INPUT),
-        };
-        let body = match PlaylistNameBody::from_json_str(&body_str) {
-            Some(b) => b,
-            None => return PlaylistJsonResult::err(PLAYLIST_ERR_INVALID_INPUT),
-        };
-
-        let result = runtime().block_on(async {
-            services
-                .create_playlist_handler
-                .create(&body.name, &token)
-                .await
-        });
-
-        match result {
-            Ok(playlist) => {
-                let json = serde_json::to_string(&playlist).unwrap_or_default();
-                PlaylistJsonResult::ok(json)
-            }
-            Err(err) => map_playlist_err(err),
-        }
-    })
-}
-
-/// Rename a playlist, leaving its entries and their order untouched
-/// (Task 2).
-///
-/// `uuid` is the playlist's public UUID (NUL-terminated string).
-/// `json_body` is the JSON body HTTP would send (`name`). Both surfaces
-/// call the same `RenamePlaylistHandler` so they stay at parity (FR-FC-24 /
-/// NFR-09). `token` is the bearer auth token.
-#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
-#[no_mangle]
-pub extern "C" fn alexandria_playlist_rename(
-    uuid: *const c_char,
-    json_body: *const c_char,
-    token: *const c_char,
-) -> PlaylistJsonResult {
-    ffi_guard(PlaylistJsonResult::err(PLAYLIST_ERR_OTHER), || {
-        let services = match locked_services() {
-            Some(s) => s,
-            None => return PlaylistJsonResult::err(PLAYLIST_ERR_NOT_INITIALIZED),
-        };
-
-        let token = cstr_lossy(token).unwrap_or_default();
-        if !authenticated(&services, &token) {
-            return PlaylistJsonResult::err(PLAYLIST_ERR_UNAUTHORIZED);
-        }
-
-        let uuid = match cstr_lossy(uuid).and_then(|s| uuid::Uuid::parse_str(&s).ok()) {
-            Some(u) => u,
-            None => return PlaylistJsonResult::err(PLAYLIST_ERR_INVALID_INPUT),
-        };
-
-        let body_str = match cstr_lossy(json_body) {
-            Some(s) => s,
-            None => return PlaylistJsonResult::err(PLAYLIST_ERR_INVALID_INPUT),
-        };
-        let body = match PlaylistNameBody::from_json_str(&body_str) {
-            Some(b) => b,
-            None => return PlaylistJsonResult::err(PLAYLIST_ERR_INVALID_INPUT),
-        };
-
-        let result = runtime().block_on(async {
-            services
-                .rename_playlist_handler
-                .rename(uuid, &body.name, &token)
-                .await
-        });
-
-        match result {
-            Ok(playlist) => {
-                let json = serde_json::to_string(&playlist).unwrap_or_default();
-                PlaylistJsonResult::ok(json)
-            }
-            Err(err) => map_playlist_err(err),
-        }
-    })
-}
-
-/// Delete a playlist, removing its entries; referenced audio files are
-/// preserved (Task 3).
-///
-/// `uuid` is the playlist's public UUID (NUL-terminated string). On success
-/// `json` carries the pre-delete `Playlist` — byte-for-byte the same shape
-/// HTTP returns from `DELETE /v1/playlists/{uuid}` (parity, FR-FC-24 /
-/// NFR-09). `token` is the bearer auth token.
-#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
-#[no_mangle]
-pub extern "C" fn alexandria_playlist_delete(
-    uuid: *const c_char,
-    token: *const c_char,
-) -> PlaylistJsonResult {
-    ffi_guard(PlaylistJsonResult::err(PLAYLIST_ERR_OTHER), || {
-        let services = match locked_services() {
-            Some(s) => s,
-            None => return PlaylistJsonResult::err(PLAYLIST_ERR_NOT_INITIALIZED),
-        };
-
-        // Deny before touching the payload — an unauthenticated caller must not
-        // learn whether the uuid would have parsed.
-        let token = cstr_lossy(token).unwrap_or_default();
-        if !authenticated(&services, &token) {
-            return PlaylistJsonResult::err(PLAYLIST_ERR_UNAUTHORIZED);
-        }
-
-        let uuid = match cstr_lossy(uuid).and_then(|s| uuid::Uuid::parse_str(&s).ok()) {
-            Some(u) => u,
-            None => return PlaylistJsonResult::err(PLAYLIST_ERR_INVALID_INPUT),
-        };
-
-        let result = runtime()
-            .block_on(async { services.delete_playlist_handler.delete(uuid, &token).await });
-
-        match result {
-            Ok(playlist) => {
-                let json = serde_json::to_string(&playlist).unwrap_or_default();
-                PlaylistJsonResult::ok(json)
-            }
-            Err(err) => map_playlist_err(err),
-        }
-    })
-}
-
-/// Every persisted playlist, without their tracks (Task 6).
-///
-/// `token` is the bearer auth token. On success `json` carries a
-/// `Vec<Playlist>` — byte-for-byte the same shape HTTP returns from
-/// `GET /v1/playlists` (parity, FR-FC-24 / NFR-09).
-#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
-#[no_mangle]
-pub extern "C" fn alexandria_playlists_list(token: *const c_char) -> PlaylistJsonResult {
-    ffi_guard(PlaylistJsonResult::err(PLAYLIST_ERR_OTHER), || {
-        let services = match locked_services() {
-            Some(s) => s,
-            None => return PlaylistJsonResult::err(PLAYLIST_ERR_NOT_INITIALIZED),
-        };
-
-        let token = cstr_lossy(token).unwrap_or_default();
-        if !authenticated(&services, &token) {
-            return PlaylistJsonResult::err(PLAYLIST_ERR_UNAUTHORIZED);
-        }
-
-        let result =
-            runtime().block_on(async { services.browse_playlists_handler.list(&token).await });
-
-        match result {
-            Ok(playlists) => {
-                let json = serde_json::to_string(&playlists).unwrap_or_default();
-                PlaylistJsonResult::ok(json)
-            }
-            Err(err) => map_playlist_err(err),
-        }
-    })
-}
-
-/// Read a playlist back with its tracks, in position order (Task 6).
-///
-/// `uuid` is the playlist's public UUID (NUL-terminated string). On success
-/// `json` carries a `PlaylistView` — byte-for-byte the same shape HTTP
-/// returns from `GET /v1/playlists/{uuid}` (parity, FR-FC-24 / NFR-09).
-/// `token` is the bearer auth token.
-#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
-#[no_mangle]
-pub extern "C" fn alexandria_playlist_read(
-    uuid: *const c_char,
-    token: *const c_char,
-) -> PlaylistJsonResult {
-    ffi_guard(PlaylistJsonResult::err(PLAYLIST_ERR_OTHER), || {
-        let services = match locked_services() {
-            Some(s) => s,
-            None => return PlaylistJsonResult::err(PLAYLIST_ERR_NOT_INITIALIZED),
-        };
-
-        let token = cstr_lossy(token).unwrap_or_default();
-        if !authenticated(&services, &token) {
-            return PlaylistJsonResult::err(PLAYLIST_ERR_UNAUTHORIZED);
-        }
-
-        let uuid = match cstr_lossy(uuid).and_then(|s| uuid::Uuid::parse_str(&s).ok()) {
-            Some(u) => u,
-            None => return PlaylistJsonResult::err(PLAYLIST_ERR_INVALID_INPUT),
-        };
-
-        let result = runtime()
-            .block_on(async { services.browse_playlists_handler.read(uuid, &token).await });
-
-        match result {
-            Ok(view) => {
-                let json = serde_json::to_string(&view).unwrap_or_default();
-                PlaylistJsonResult::ok(json)
-            }
-            Err(err) => map_playlist_err(err),
-        }
-    })
-}
-
-/// Request body accepted by `alexandria_playlist_add_entries` — the same
-/// JSON `POST /v1/playlists/{uuid}/entries` takes: `{"fileUuids":["…"]}`.
-#[derive(Debug)]
-struct AddEntriesToPlaylistBody {
-    file_uuids: Vec<uuid::Uuid>,
-}
-
-impl AddEntriesToPlaylistBody {
-    fn from_json_str(s: &str) -> Option<Self> {
-        let value: serde_json::Value = serde_json::from_str(s).ok()?;
-        let obj = value.as_object()?;
-        let raw = obj.get("fileUuids")?.as_array()?;
-        let mut file_uuids = Vec::with_capacity(raw.len());
-        for v in raw {
-            file_uuids.push(uuid::Uuid::parse_str(v.as_str()?).ok()?);
-        }
-        Some(Self { file_uuids })
-    }
-}
-
-/// Append tracks to a playlist, in order, at consecutive positions after
-/// whatever it already holds (Task 4). The whole slice succeeds or none of
-/// it does.
-///
-/// `uuid` is the playlist's public UUID (NUL-terminated string).
-/// `json_body` is the JSON body HTTP would send (`fileUuids`). On success
-/// `json` carries the new `Vec<PlaylistEntry>` — byte-for-byte the same
-/// shape HTTP returns from `POST /v1/playlists/{uuid}/entries` (parity,
-/// FR-FC-24 / NFR-09). `token` is the bearer auth token.
-#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
-#[no_mangle]
-pub extern "C" fn alexandria_playlist_add_entries(
-    uuid: *const c_char,
-    json_body: *const c_char,
-    token: *const c_char,
-) -> PlaylistJsonResult {
-    ffi_guard(PlaylistJsonResult::err(PLAYLIST_ERR_OTHER), || {
-        let services = match locked_services() {
-            Some(s) => s,
-            None => return PlaylistJsonResult::err(PLAYLIST_ERR_NOT_INITIALIZED),
-        };
-
-        let token = cstr_lossy(token).unwrap_or_default();
-        if !authenticated(&services, &token) {
-            return PlaylistJsonResult::err(PLAYLIST_ERR_UNAUTHORIZED);
-        }
-
-        let uuid = match cstr_lossy(uuid).and_then(|s| uuid::Uuid::parse_str(&s).ok()) {
-            Some(u) => u,
-            None => return PlaylistJsonResult::err(PLAYLIST_ERR_INVALID_INPUT),
-        };
-
-        let body_str = match cstr_lossy(json_body) {
-            Some(s) => s,
-            None => return PlaylistJsonResult::err(PLAYLIST_ERR_INVALID_INPUT),
-        };
-        let body = match AddEntriesToPlaylistBody::from_json_str(&body_str) {
-            Some(b) => b,
-            None => return PlaylistJsonResult::err(PLAYLIST_ERR_INVALID_INPUT),
-        };
-
-        let result = runtime().block_on(async {
-            services
-                .add_entries_handler
-                .add(uuid, &body.file_uuids, &token)
-                .await
-        });
-
-        match result {
-            Ok(entries) => {
-                let json = serde_json::to_string(&entries).unwrap_or_default();
-                PlaylistJsonResult::ok(json)
-            }
-            Err(err) => map_playlist_err(err),
-        }
-    })
-}
-
-/// Remove one entry from a playlist, addressed by its own `entry_uuid`
-/// rather than a file uuid, since a playlist may hold the same track more
-/// than once (Task 4).
-///
-/// `playlist_uuid` is the playlist's public UUID (NUL-terminated string);
-/// `entry_uuid` is the entry's own public UUID (NUL-terminated string),
-/// passed directly rather than through a body (there is nothing else to
-/// carry) -- the internal rowid is never exposed on this transport, matching
-/// HTTP's `{entryUuid}` path parameter (SRD §4.0). On success `json` is an
-/// empty JSON object (`"{}"`) — the core handler answers
-/// `Result<(), DomainError>`, nothing beyond success is available to echo
-/// back, matching `DELETE /v1/playlists/{uuid}/entries/{entryUuid}`'s
-/// `200 {}` exactly (parity, FR-FC-24 / NFR-09) rather than inventing an
-/// FFI-only shape. `token` is the bearer auth token.
-#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
-#[no_mangle]
-pub extern "C" fn alexandria_playlist_remove_entry(
-    playlist_uuid: *const c_char,
-    entry_uuid: *const c_char,
-    token: *const c_char,
-) -> PlaylistJsonResult {
-    ffi_guard(PlaylistJsonResult::err(PLAYLIST_ERR_OTHER), || {
-        let services = match locked_services() {
-            Some(s) => s,
-            None => return PlaylistJsonResult::err(PLAYLIST_ERR_NOT_INITIALIZED),
-        };
-
-        let token = cstr_lossy(token).unwrap_or_default();
-        if !authenticated(&services, &token) {
-            return PlaylistJsonResult::err(PLAYLIST_ERR_UNAUTHORIZED);
-        }
-
-        let playlist_uuid =
-            match cstr_lossy(playlist_uuid).and_then(|s| uuid::Uuid::parse_str(&s).ok()) {
-                Some(u) => u,
-                None => return PlaylistJsonResult::err(PLAYLIST_ERR_INVALID_INPUT),
-            };
-
-        let entry_uuid = match cstr_lossy(entry_uuid).and_then(|s| uuid::Uuid::parse_str(&s).ok()) {
-            Some(u) => u,
-            None => return PlaylistJsonResult::err(PLAYLIST_ERR_INVALID_INPUT),
-        };
-
-        let result = runtime().block_on(async {
-            services
-                .remove_entry_handler
-                .remove(playlist_uuid, entry_uuid, &token)
-                .await
-        });
-
-        match result {
-            Ok(()) => PlaylistJsonResult::ok("{}".to_string()),
-            Err(err) => map_playlist_err(err),
-        }
-    })
-}
-
-/// Request body accepted by `alexandria_playlist_move_entry` — the same
-/// JSON `POST /v1/playlists/{uuid}/entries/{entryUuid}/move` takes:
-/// `{"toIndex":…}`.
-#[derive(Debug)]
-struct MoveEntryBody {
-    to_index: i64,
-}
-
-impl MoveEntryBody {
-    fn from_json_str(s: &str) -> Option<Self> {
-        let value: serde_json::Value = serde_json::from_str(s).ok()?;
-        let obj = value.as_object()?;
-        Some(Self {
-            to_index: obj.get("toIndex")?.as_i64()?,
-        })
-    }
-}
-
-/// Move one playlist entry to a new index, renumbering the rest in one
-/// transaction (Task 5), addressed by its own `entry_uuid` rather than a
-/// file uuid, since a playlist may hold the same track more than once.
-///
-/// `playlist_uuid` is the playlist's public UUID (NUL-terminated string);
-/// `entry_uuid` is the entry's own public UUID (NUL-terminated string) —
-/// the internal rowid is never exposed on this transport (SRD §4.0).
-/// `json_body` is the JSON body HTTP would send (`toIndex`). On success
-/// `json` carries the playlist's full new order (`Vec<PlaylistEntry>`) —
-/// byte-for-byte the same shape HTTP returns from `POST
-/// /v1/playlists/{uuid}/entries/{entryUuid}/move` (parity, FR-FC-24 /
-/// NFR-09). `token` is the bearer auth token.
-#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
-#[no_mangle]
-pub extern "C" fn alexandria_playlist_move_entry(
-    playlist_uuid: *const c_char,
-    entry_uuid: *const c_char,
-    json_body: *const c_char,
-    token: *const c_char,
-) -> PlaylistJsonResult {
-    ffi_guard(PlaylistJsonResult::err(PLAYLIST_ERR_OTHER), || {
-        let services = match locked_services() {
-            Some(s) => s,
-            None => return PlaylistJsonResult::err(PLAYLIST_ERR_NOT_INITIALIZED),
-        };
-
-        let token = cstr_lossy(token).unwrap_or_default();
-        if !authenticated(&services, &token) {
-            return PlaylistJsonResult::err(PLAYLIST_ERR_UNAUTHORIZED);
-        }
-
-        let playlist_uuid =
-            match cstr_lossy(playlist_uuid).and_then(|s| uuid::Uuid::parse_str(&s).ok()) {
-                Some(u) => u,
-                None => return PlaylistJsonResult::err(PLAYLIST_ERR_INVALID_INPUT),
-            };
-
-        let entry_uuid = match cstr_lossy(entry_uuid).and_then(|s| uuid::Uuid::parse_str(&s).ok()) {
-            Some(u) => u,
-            None => return PlaylistJsonResult::err(PLAYLIST_ERR_INVALID_INPUT),
-        };
-
-        let body_str = match cstr_lossy(json_body) {
-            Some(s) => s,
-            None => return PlaylistJsonResult::err(PLAYLIST_ERR_INVALID_INPUT),
-        };
-        let body = match MoveEntryBody::from_json_str(&body_str) {
-            Some(b) => b,
-            None => return PlaylistJsonResult::err(PLAYLIST_ERR_INVALID_INPUT),
-        };
-
-        let result = runtime().block_on(async {
-            services
-                .reorder_playlist_handler
-                .move_entry(playlist_uuid, entry_uuid, body.to_index, &token)
-                .await
-        });
-
-        match result {
-            Ok(entries) => {
-                let json = serde_json::to_string(&entries).unwrap_or_default();
-                PlaylistJsonResult::ok(json)
-            }
-            Err(err) => map_playlist_err(err),
-        }
-    })
-}
-
-/// FFI status codes returned by play-history operations (play history
-/// design). Deliberately separate from `PLAYLIST_*` — per the convention
-/// above — even though the two families are about the same music: a
-/// playlist is a thing the owner curates and a play is something that
-/// happened, and the calls fail for different reasons. `PLAY_OK ==
-/// PLAYLIST_OK == 0` by convention.
-pub const PLAY_OK: c_int = 0;
-pub const PLAY_ERR_INVALID_INPUT: c_int = 1;
-pub const PLAY_ERR_UNAUTHORIZED: c_int = 2;
-pub const PLAY_ERR_NOT_INITIALIZED: c_int = 3;
-pub const PLAY_ERR_NOT_FOUND: c_int = 4;
-pub const PLAY_ERR_OTHER: c_int = 9;
-
-/// Result of every play-history FFI function. On success `status` is
-/// `PLAY_OK` and `json` is a NUL-terminated JSON string of the response
-/// body — byte-for-byte the same shape HTTP returns from the matching
-/// `/v1/plays*` route (FR-FC-24 / NFR-09). On failure `json` is NULL and
-/// `status` carries the mapped error code. The caller must free `json`
-/// with `alexandria_free_string`.
-#[repr(C)]
-#[derive(Debug)]
-pub struct PlayJsonResult {
-    pub status: c_int,
-    pub json: *mut c_char,
-}
-
-impl PlayJsonResult {
-    fn err(status: c_int) -> Self {
-        Self {
-            status,
-            json: std::ptr::null_mut(),
-        }
-    }
-
-    fn ok(json: String) -> Self {
-        let cstring = CString::new(json).unwrap_or_default();
-        Self {
-            status: PLAY_OK,
-            json: cstring.into_raw(),
-        }
-    }
-}
-
-fn map_play_err(err: DomainError) -> PlayJsonResult {
-    match err {
-        DomainError::NotFound => PlayJsonResult::err(PLAY_ERR_NOT_FOUND),
-        DomainError::Unauthorized => PlayJsonResult::err(PLAY_ERR_UNAUTHORIZED),
-        DomainError::InvalidInput(_) => PlayJsonResult::err(PLAY_ERR_INVALID_INPUT),
-        _ => PlayJsonResult::err(PLAY_ERR_OTHER),
-    }
-}
-
-/// Request body accepted by `alexandria_play_record` — the same JSON
-/// `POST /v1/plays` takes: `{"fileUuid":"…"}`.
-#[derive(Debug)]
-struct RecordPlayBody {
-    file_uuid: uuid::Uuid,
-}
-
-impl RecordPlayBody {
-    fn from_json_str(s: &str) -> Option<Self> {
-        let value: serde_json::Value = serde_json::from_str(s).ok()?;
-        let obj = value.as_object()?;
-        let file_uuid = uuid::Uuid::parse_str(obj.get("fileUuid")?.as_str()?).ok()?;
-        Some(Self { file_uuid })
-    }
-}
-
-/// Query accepted by `alexandria_music_stats` — the JSON form of the query
-/// string `GET /v1/plays/stats` takes: `{"limit":10}`. An absent or
-/// unreadable value means "not specified", which the core reads as its
-/// default of ten; a value that is present but out of range is refused by
-/// the handler on both surfaces alike.
-#[derive(Debug, Default)]
-struct MusicStatsQuery {
-    limit: Option<i64>,
-}
-
-impl MusicStatsQuery {
-    fn from_json_str(s: &str) -> Self {
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(s) else {
-            return Self::default();
-        };
-        Self {
-            limit: value.get("limit").and_then(serde_json::Value::as_i64),
-        }
-    }
-}
-
-/// Record that a track was played (play history design).
-///
-/// `json_body` is the JSON body HTTP would send (`fileUuid`). The function
-/// deserializes it, calls the same `RecordPlayHandler` the HTTP route uses,
-/// and on success serializes the returned `PlayEvent` back to JSON — so the
-/// FFI and HTTP surfaces agree byte-for-byte modulo key ordering (parity,
-/// FR-FC-24 / NFR-09). `token` is the bearer auth token.
-///
-/// The play is stamped from the core's clock, not from anything passed
-/// here: the caller says *what* was played, never *when*.
-#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
-#[no_mangle]
-pub extern "C" fn alexandria_play_record(
-    json_body: *const c_char,
-    token: *const c_char,
-) -> PlayJsonResult {
-    ffi_guard(PlayJsonResult::err(PLAY_ERR_OTHER), || {
-        let services = match locked_services() {
-            Some(s) => s,
-            None => return PlayJsonResult::err(PLAY_ERR_NOT_INITIALIZED),
-        };
-
-        let token = cstr_lossy(token).unwrap_or_default();
-        if !authenticated(&services, &token) {
-            return PlayJsonResult::err(PLAY_ERR_UNAUTHORIZED);
-        }
-
-        let body_str = match cstr_lossy(json_body) {
-            Some(s) => s,
-            None => return PlayJsonResult::err(PLAY_ERR_INVALID_INPUT),
-        };
-        let body = match RecordPlayBody::from_json_str(&body_str) {
-            Some(b) => b,
-            None => return PlayJsonResult::err(PLAY_ERR_INVALID_INPUT),
-        };
-
-        let result = runtime().block_on(async {
-            services
-                .record_play_handler
-                .record(body.file_uuid, &token)
-                .await
-        });
-
-        match result {
-            Ok(play) => {
-                let json = serde_json::to_string(&play).unwrap_or_default();
-                PlayJsonResult::ok(json)
-            }
-            Err(err) => map_play_err(err),
-        }
-    })
-}
-
-/// What was played most (play history design).
-///
-/// `json_query` is the JSON form of the query string HTTP would send
-/// (`limit`); NULL or an empty string asks for the default. On success
-/// `json` carries the `MusicStats` — byte-for-byte the same shape HTTP
-/// returns from `GET /v1/plays/stats` (parity, FR-FC-24 / NFR-09).
-/// `token` is the bearer auth token.
-#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
-#[no_mangle]
-pub extern "C" fn alexandria_music_stats(
-    json_query: *const c_char,
-    token: *const c_char,
-) -> PlayJsonResult {
-    ffi_guard(PlayJsonResult::err(PLAY_ERR_OTHER), || {
-        let services = match locked_services() {
-            Some(s) => s,
-            None => return PlayJsonResult::err(PLAY_ERR_NOT_INITIALIZED),
-        };
-
-        // Deny before touching the payload — an unauthenticated caller must
-        // not learn whether its limit would have validated.
-        let token = cstr_lossy(token).unwrap_or_default();
-        if !authenticated(&services, &token) {
-            return PlayJsonResult::err(PLAY_ERR_UNAUTHORIZED);
-        }
-
-        let query = MusicStatsQuery::from_json_str(&cstr_lossy(json_query).unwrap_or_default());
-
-        let result = runtime()
-            .block_on(async { services.music_stats_handler.read(query.limit, &token).await });
-
-        match result {
-            Ok(stats) => {
-                let json = serde_json::to_string(&stats).unwrap_or_default();
-                PlayJsonResult::ok(json)
-            }
-            Err(err) => map_play_err(err),
-        }
-    })
-}
-
 /// FFI status codes returned by local-auth operations (UC-34/UC-35).
 /// Deliberately separate from the other `*_OK == 0` families — per the
 /// convention above — so local-auth use cases can grow their own set
@@ -4374,9 +3541,7 @@ fn map_auth_err(err: DomainError) -> AuthJsonResult {
         DomainError::Config(_) => AUTH_ERR_CONFIG,
         DomainError::Conflict(_) => AUTH_ERR_CONFLICT,
         DomainError::TooManyRequests(_) => AUTH_ERR_RATE_LIMITED,
-        DomainError::ServiceUnavailable(_) | DomainError::Unavailable(_) => {
-            AUTH_ERR_SERVICE_UNAVAILABLE
-        }
+        DomainError::Unavailable(_) => AUTH_ERR_SERVICE_UNAVAILABLE,
         _ => AUTH_ERR_OTHER,
     };
     let (_, body) = error_body(&err);
@@ -4882,7 +4047,7 @@ fn map_run_err(err: DomainError) -> RunJsonResult {
 }
 
 /// Report an index or re-index run's status and outcome (UC-42 / FR-FC-28).
-/// `run_id` is the id `alexandria_index_start` or
+/// `run_id` is the id `alexandria_library_index_start` or
 /// `alexandria_index_refresh_start` returned. On success `json` carries the
 /// same body the HTTP `GET /v1/index/runs/{runId}` route returns (FR-FC-24).
 ///
@@ -4930,7 +4095,7 @@ pub extern "C" fn alexandria_index_run_status_json(
 }
 
 /// The files a run could not record, oldest first (FR-FC-42). `run_id` is
-/// the id `alexandria_index_start` or `alexandria_index_refresh_start`
+/// the id `alexandria_library_index_start` or `alexandria_index_refresh_start`
 /// returned. On success `json` carries the same array the HTTP
 /// `GET /v1/index/runs/{runId}/failures` route returns (FR-FC-24).
 ///
@@ -4989,7 +4154,7 @@ pub extern "C" fn alexandria_index_run_failures_json(
 }
 
 /// Pause a running index or re-index run where it stands, leaving it
-/// resumable (UC-48 / FR-FC-32). `run_id` is the id `alexandria_index_start`
+/// resumable (UC-48 / FR-FC-32). `run_id` is the id `alexandria_library_index_start`
 /// or `alexandria_index_refresh_start` returned; `token` is the bearer auth
 /// token. Calls the same `RunControlHandler::pause` the HTTP route (Task 12)
 /// calls.
@@ -5034,7 +4199,7 @@ pub extern "C" fn alexandria_index_pause(run_id: *const c_char, token: *const c_
 
 /// Abandon a running or paused index or re-index run (UC-48 / FR-FC-34).
 /// Terminal — a cancelled run is never resumed. `run_id` is the id
-/// `alexandria_index_start` or `alexandria_index_refresh_start` returned;
+/// `alexandria_library_index_start` or `alexandria_index_refresh_start` returned;
 /// `token` is the bearer auth token. Calls the same
 /// `RunControlHandler::cancel` the HTTP route (Task 12) calls.
 ///
@@ -5077,21 +4242,19 @@ pub extern "C" fn alexandria_index_cancel(run_id: *const c_char, token: *const c
 }
 
 /// Put a paused index or re-index run back to work (UC-48 / FR-FC-33).
-/// `run_id` is the id `alexandria_index_start` or `alexandria_index_refresh_start`
+/// `run_id` is the id `alexandria_library_index_start` or `alexandria_index_refresh_start`
 /// returned; `token` is the bearer auth token. Returns the *same* `run_id` on
 /// success — a resume does not mint a fresh run, it continues the one it was
-/// given — wrapped in the same `IndexStartResult` `alexandria_index_start`
+/// given — wrapped in the same `IndexStartResult` `alexandria_library_index_start`
 /// returns (parity of shape, not of meaning: `status` here is a `RUN_ERR_*`
 /// code, because resume is part of run control, not of starting a fresh run).
 ///
 /// `RunControlHandler::resume` only records the state transition; it does not
 /// walk anything. Spawning the walk is this function's job, exactly as
-/// `alexandria_index_start` spawns its own — the handler is kept free of the
+/// `alexandria_library_index_start` spawns its own — the handler is kept free of the
 /// runtime so `execute` is always spawned by whichever transport owns one.
 /// Which handler gets spawned depends on `RunResumed::kind`: an index run
-/// resumes into `index_handler.execute(&root, run_id, &scope)` — the scope
-/// read back off the run, so a resumed segment covers the file types the run
-/// was started with — a refresh into
+/// resumes into `index_handler.execute(&root, run_id)`, a refresh into
 /// `refresh_handler.execute(run_id)` (a refresh carries no root — it touches
 /// everything cataloged). A resumed index run whose stored `root` is somehow
 /// absent — it should never be, every row `RunKind::Index` writes carries one
@@ -5100,7 +4263,7 @@ pub extern "C" fn alexandria_index_cancel(run_id: *const c_char, token: *const c
 /// actually resumes would have no way to notice.
 ///
 /// `priority` re-paces the run (FR-FC-08 / FR-FC-33): `"low"` or `"normal"`,
-/// the same case-sensitive spelling `alexandria_index_start` accepts. Unlike
+/// the same case-sensitive spelling `alexandria_library_index_start` accepts. Unlike
 /// there, NULL or an unrecognised string does **not** mean `"normal"` — it
 /// means *keep the width this run already has*, which is what every caller
 /// written before this parameter existed was asking for. Passing NULL is
@@ -5168,17 +4331,23 @@ pub extern "C" fn alexandria_index_resume(
                         return IndexStartResult::err(RUN_ERR_OTHER);
                     }
                 };
+                // Every index run is its library's; one without cannot be
+                // resumed into anything (HTTP refuses it the same way).
+                let Some(library_uuid) = resumed.library_uuid else {
+                    tracing::error!(
+                        run_id = %resumed.run_id,
+                        "resumed index run has no library; refusing to spawn"
+                    );
+                    return IndexStartResult::err(RUN_ERR_OTHER);
+                };
                 let handler = services.index_handler.clone();
-                // The run's own scope, off its row (FR-FC-01): a resumed segment
-                // walks the file types the run was started with, not every type.
-                let scope = resumed.scope;
                 let spawned_run_id = resumed.run_id;
                 rt.spawn(async move {
-                    // Same shape as `alexandria_index_start`'s own spawn: an
+                    // Same shape as `alexandria_library_index_start`'s own spawn: an
                     // `Err` here means the run could not resume at all;
                     // `execute` has already written its own terminal row on that
                     // path (UC-48), so the failure is recorded, not lost.
-                    if let Err(err) = handler.execute(&root, spawned_run_id, &scope).await {
+                    if let Err(err) = handler.execute(&root, spawned_run_id, library_uuid).await {
                         tracing::error!(run_id = %spawned_run_id, error = %err, "resumed index run aborted");
                     }
                 });
@@ -5266,12 +4435,6 @@ mod tests {
     // filesystem or database behind them, so they are unit-tested here
     // rather than through an FFI call in `tests/`.
 
-    // `includeLibraries` decides whether a caller's search can see a
-    // library's files at all, and the only thing that can go wrong on this
-    // surface is the key being read. Unit-tested here, where the parse is,
-    // rather than through a call that would prove the same thing at the cost
-    // of a database.
-
     /// The boundary itself: a panic inside a guarded body must reach the
     /// caller as the family's status code, not as an unwind that ends the
     /// embedder's process.
@@ -5323,37 +4486,6 @@ mod tests {
 
         // The point: this reads rather than panicking a second time.
         let _ = locked_services();
-    }
-
-    #[test]
-    fn given_include_libraries_true_when_the_filter_is_parsed_then_it_reaches_in() {
-        let parsed = FilesListFilter::from_json_str(r#"{"includeLibraries":true}"#).unwrap();
-        assert!(parsed.include_libraries);
-    }
-
-    #[test]
-    fn given_include_libraries_as_a_string_when_parsed_then_it_reaches_in() {
-        // What a caller written against the HTTP surface would send, where
-        // the value is a query-string `true` (FR-FC-24).
-        let parsed = FilesListFilter::from_json_str(r#"{"includeLibraries":"true"}"#).unwrap();
-        assert!(parsed.include_libraries);
-    }
-
-    #[test]
-    fn given_no_include_libraries_when_parsed_then_libraries_stay_excluded() {
-        // The default and every near-miss fall towards the exclusion: a
-        // course leaking into the type panels is the defect marking the
-        // folder was meant to prevent.
-        for body in [
-            "",
-            "{}",
-            r#"{"includeLibraries":false}"#,
-            r#"{"includeLibraries":"yes"}"#,
-            r#"{"includeLibraries":1}"#,
-        ] {
-            let parsed = FilesListFilter::from_json_str(body).unwrap();
-            assert!(!parsed.include_libraries, "`{body}` reached into libraries");
-        }
     }
 
     #[test]
@@ -5463,327 +4595,8 @@ mod tests {
     }
 }
 
-/// FFI status codes returned by music enrichment (music enrichment design).
-/// Its own set, per the convention above, so it can grow without colliding;
-/// `ENRICHMENT_OK == PLAYLIST_OK == 0`.
-pub const ENRICHMENT_OK: c_int = 0;
-pub const ENRICHMENT_ERR_INVALID_INPUT: c_int = 1;
-pub const ENRICHMENT_ERR_UNAUTHORIZED: c_int = 2;
-pub const ENRICHMENT_ERR_NOT_INITIALIZED: c_int = 3;
-pub const ENRICHMENT_ERR_NOT_FOUND: c_int = 4;
-/// Enrichment is switched off, or is on with no contact configured.
-///
-/// Its own code rather than folded into `INVALID_INPUT`, because it is not
-/// something the *caller* did: the request was well formed and the
-/// installation is not configured for it. A client that can tell the two
-/// apart says "your administrator has not enabled this" instead of marking
-/// the owner's input wrong. `alexandria_settings_json` reports the same
-/// fact up front, so a client need never discover it by being refused.
-pub const ENRICHMENT_ERR_UNAVAILABLE: c_int = 5;
-pub const ENRICHMENT_ERR_OTHER: c_int = 9;
-
-/// Result of every enrichment FFI function. On success `status` is
-/// `ENRICHMENT_OK` and `json` is a NUL-terminated JSON string of the
-/// response body — byte-for-byte the same shape HTTP returns from the
-/// matching `/v1/enrichment*` route (FR-FC-24 / NFR-09). On failure `json`
-/// is NULL. The caller must free `json` with `alexandria_free_string`.
-#[repr(C)]
-#[derive(Debug)]
-pub struct EnrichmentJsonResult {
-    pub status: c_int,
-    pub json: *mut c_char,
-}
-
-impl EnrichmentJsonResult {
-    fn err(status: c_int) -> Self {
-        Self {
-            status,
-            json: std::ptr::null_mut(),
-        }
-    }
-
-    fn ok(json: String) -> Self {
-        let cstring = CString::new(json).unwrap_or_default();
-        Self {
-            status: ENRICHMENT_OK,
-            json: cstring.into_raw(),
-        }
-    }
-}
-
-fn map_enrichment_err(err: DomainError) -> EnrichmentJsonResult {
-    match err {
-        DomainError::NotFound => EnrichmentJsonResult::err(ENRICHMENT_ERR_NOT_FOUND),
-        DomainError::Unauthorized => EnrichmentJsonResult::err(ENRICHMENT_ERR_UNAUTHORIZED),
-        // `InvalidState` is how the run handler reports "switched off", and
-        // `InvalidInput` mentioning the contact is how it reports the other
-        // half. Both are the installation's configuration rather than the
-        // caller's request, so both map to UNAVAILABLE — a caller that saw
-        // INVALID_INPUT for a missing contact would tell the owner their
-        // input was wrong when they never gave any.
-        DomainError::InvalidState => EnrichmentJsonResult::err(ENRICHMENT_ERR_UNAVAILABLE),
-        DomainError::InvalidInput(ref message) if message.contains("metadata.contact") => {
-            EnrichmentJsonResult::err(ENRICHMENT_ERR_UNAVAILABLE)
-        }
-        DomainError::InvalidInput(_) => EnrichmentJsonResult::err(ENRICHMENT_ERR_INVALID_INPUT),
-        _ => EnrichmentJsonResult::err(ENRICHMENT_ERR_OTHER),
-    }
-}
-
-/// Run music enrichment (music enrichment design).
-///
-/// `scope_json` is the JSON body `POST /v1/enrichment/runs` takes, and NULL
-/// or an empty string means the same thing an absent body does there: sweep
-/// everything not yet looked up. `{"fileUuid":"…"}` scopes it to one track,
-/// `{"artist":"…"}` to one artist. `token` is the bearer auth token.
-///
-/// **This call reaches the network** — the only FFI function in this library
-/// that does — and it is slow by design: MusicBrainz is rate-limited to one
-/// request per second and a sweep over a large library will take hours. A
-/// caller must run it off whatever thread its interface draws on, and should
-/// expect to show progress from the returned counts rather than a spinner.
-///
-/// A run that reached nothing still succeeds: a service being down or having
-/// no answer is counted in the report, not raised.
-#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
-#[no_mangle]
-pub extern "C" fn alexandria_enrichment_run(
-    scope_json: *const c_char,
-    token: *const c_char,
-) -> EnrichmentJsonResult {
-    ffi_guard(EnrichmentJsonResult::err(ENRICHMENT_ERR_OTHER), || {
-        let services = match locked_services() {
-            Some(s) => s,
-            None => return EnrichmentJsonResult::err(ENRICHMENT_ERR_NOT_INITIALIZED),
-        };
-
-        let token = cstr_lossy(token).unwrap_or_default();
-        if !authenticated(&services, &token) {
-            return EnrichmentJsonResult::err(ENRICHMENT_ERR_UNAUTHORIZED);
-        }
-
-        let scope = match enrichment_scope_from_json(scope_json) {
-            Some(scope) => scope,
-            None => return EnrichmentJsonResult::err(ENRICHMENT_ERR_INVALID_INPUT),
-        };
-
-        // Absent for the same reason the HTTP route answers a conflict: the
-        // capability is real, this installation has not turned it on.
-        let handler = match services.enrich_handler.clone() {
-            Some(handler) => handler,
-            None => return EnrichmentJsonResult::err(ENRICHMENT_ERR_UNAVAILABLE),
-        };
-
-        let result = runtime().block_on(async { handler.enrich(scope, &token).await });
-
-        match result {
-            Ok(report) => {
-                let json = serde_json::to_string(&report).unwrap_or_default();
-                EnrichmentJsonResult::ok(json)
-            }
-            Err(err) => map_enrichment_err(err),
-        }
-    })
-}
-
-/// The scope a body names, or `None` when the body is present but unusable.
-///
-/// A NULL or empty body is the sweep, which is both the common case and the
-/// one a caller should not have to spell `{}` to ask for.
-fn enrichment_scope_from_json(scope_json: *const c_char) -> Option<EnrichmentScope> {
-    let Some(raw) = cstr_lossy(scope_json) else {
-        return Some(EnrichmentScope::pending());
-    };
-    if raw.trim().is_empty() {
-        return Some(EnrichmentScope::pending());
-    }
-
-    let value: serde_json::Value = serde_json::from_str(&raw).ok()?;
-    let object = value.as_object()?;
-
-    let file_uuid = object.get("fileUuid").and_then(|v| v.as_str());
-    let artist = object.get("artist").and_then(|v| v.as_str());
-    // How many of the sweep to do in this call. What lets an interface show
-    // progress and stop between batches without the core holding a
-    // half-finished run.
-    let limit = object
-        .get("limit")
-        .and_then(|v| v.as_u64())
-        .and_then(|v| u32::try_from(v).ok())
-        .filter(|limit| *limit > 0);
-
-    match (file_uuid, artist) {
-        // Refused rather than resolved in the caller's favour: a caller that
-        // sent both does not know what it asked for, and choosing for it
-        // hides that until the results look wrong.
-        (Some(_), Some(_)) => None,
-        (Some(uuid), None) => uuid::Uuid::parse_str(uuid).ok().map(EnrichmentScope::File),
-        (None, Some(artist)) if !artist.trim().is_empty() => {
-            Some(EnrichmentScope::Artist(artist.trim().to_string()))
-        }
-        (None, Some(_)) => None,
-        (None, None) => Some(EnrichmentScope::Pending { limit }),
-    }
-}
-
-/// Read what enrichment has stored for one track.
-///
-/// `uuid` is the file's public UUID. `artist` is whose image to read — the
-/// caller is a player already showing the track, so it is holding the tags
-/// and passing the name costs nothing, where resolving it here would be a
-/// second query for a fact it has. NULL means "no image wanted".
-///
-/// Unlike the run above this makes **no network call** and works whether or
-/// not enrichment is switched on: reading what was already cached is a plain
-/// database read, so an owner who enabled it, ran it once and turned it off
-/// keeps what they fetched.
-#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
-#[no_mangle]
-pub extern "C" fn alexandria_enrichment_read_track(
-    uuid: *const c_char,
-    artist: *const c_char,
-    token: *const c_char,
-) -> EnrichmentJsonResult {
-    ffi_guard(EnrichmentJsonResult::err(ENRICHMENT_ERR_OTHER), || {
-        let services = match locked_services() {
-            Some(s) => s,
-            None => return EnrichmentJsonResult::err(ENRICHMENT_ERR_NOT_INITIALIZED),
-        };
-
-        let token = cstr_lossy(token).unwrap_or_default();
-        if !authenticated(&services, &token) {
-            return EnrichmentJsonResult::err(ENRICHMENT_ERR_UNAUTHORIZED);
-        }
-
-        let uuid = match cstr_lossy(uuid).and_then(|s| uuid::Uuid::parse_str(&s).ok()) {
-            Some(u) => u,
-            None => return EnrichmentJsonResult::err(ENRICHMENT_ERR_INVALID_INPUT),
-        };
-        let artist = cstr_lossy(artist);
-
-        let result = runtime().block_on(async {
-            services
-                .read_enrichment_handler
-                .read(uuid, artist.as_deref(), &token)
-                .await
-        });
-
-        match result {
-            Ok(view) => {
-                let json = serde_json::to_string(&view).unwrap_or_default();
-                EnrichmentJsonResult::ok(json)
-            }
-            Err(err) => map_enrichment_err(err),
-        }
-    })
-}
-
-/// UC-46 step 3 — the photograph stored for one artist, by name (FR-PL-15).
-///
-/// A read, never a lookup: an artists list is a screenful of rows, and a call
-/// per row that could reach the network would be dozens of requests a second
-/// against services that allow one. `ENRICHMENT_ERR_NOT_FOUND` for an artist
-/// nobody has looked up and for one looked up without success — a client has
-/// nothing different to draw for the two.
-///
-/// By name, not by file: a client's artists list is grouped by a name it
-/// worked out itself across every track of a record, and a picture stored
-/// under whatever one file happened to be tagged with is one that list will
-/// never find.
-#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
-#[no_mangle]
-pub extern "C" fn alexandria_artist_image(
-    name: *const c_char,
-    token: *const c_char,
-) -> EnrichmentJsonResult {
-    ffi_guard(EnrichmentJsonResult::err(ENRICHMENT_ERR_OTHER), || {
-        let services = match locked_services() {
-            Some(s) => s,
-            None => return EnrichmentJsonResult::err(ENRICHMENT_ERR_NOT_INITIALIZED),
-        };
-
-        let token = cstr_lossy(token).unwrap_or_default();
-        if !authenticated(&services, &token) {
-            return EnrichmentJsonResult::err(ENRICHMENT_ERR_UNAUTHORIZED);
-        }
-
-        let name = match cstr_lossy(name) {
-            Some(name) => name,
-            None => return EnrichmentJsonResult::err(ENRICHMENT_ERR_INVALID_INPUT),
-        };
-
-        let result = runtime().block_on(async {
-            services
-                .read_enrichment_handler
-                .artist_image(&name, &token)
-                .await
-        });
-
-        match result {
-            Ok(Some(image)) => {
-                let json = serde_json::to_string(&image).unwrap_or_default();
-                EnrichmentJsonResult::ok(json)
-            }
-            Ok(None) => EnrichmentJsonResult::err(ENRICHMENT_ERR_NOT_FOUND),
-            Err(err) => map_enrichment_err(err),
-        }
-    })
-}
-
-/// UC-46 step 3 — look one artist's photograph up, and keep it (FR-PL-15).
-///
-/// **Reaches the network**, once, for one artist: the identity service and
-/// then the picture. A row already settled — found, or looked for and not
-/// found — is answered from storage without a request, which is what keeps a
-/// library of five hundred artists from being five hundred requests every
-/// session.
-///
-/// Answers the row whatever it concluded, so a caller can tell "found" from
-/// "nothing to be found" and stop asking. The path is relative to the core's
-/// own image cache; `alexandria_artist_image` answers it resolved.
-#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
-#[no_mangle]
-pub extern "C" fn alexandria_artist_image_fetch(
-    name: *const c_char,
-    token: *const c_char,
-) -> EnrichmentJsonResult {
-    ffi_guard(EnrichmentJsonResult::err(ENRICHMENT_ERR_OTHER), || {
-        let services = match locked_services() {
-            Some(s) => s,
-            None => return EnrichmentJsonResult::err(ENRICHMENT_ERR_NOT_INITIALIZED),
-        };
-
-        let token = cstr_lossy(token).unwrap_or_default();
-        if !authenticated(&services, &token) {
-            return EnrichmentJsonResult::err(ENRICHMENT_ERR_UNAUTHORIZED);
-        }
-
-        let name = match cstr_lossy(name) {
-            Some(name) => name,
-            None => return EnrichmentJsonResult::err(ENRICHMENT_ERR_INVALID_INPUT),
-        };
-
-        // Absent for the same reason the run above is: the capability is
-        // real, this installation has not turned it on.
-        let handler = match services.enrich_handler.clone() {
-            Some(handler) => handler,
-            None => return EnrichmentJsonResult::err(ENRICHMENT_ERR_UNAVAILABLE),
-        };
-
-        let result = runtime().block_on(async { handler.artist_image(&name, &token).await });
-
-        match result {
-            Ok(image) => {
-                let json = serde_json::to_string(&image).unwrap_or_default();
-                EnrichmentJsonResult::ok(json)
-            }
-            Err(err) => map_enrichment_err(err),
-        }
-    })
-}
-
 /// FFI status codes returned by library operations (libraries design). Its
-/// own set, per the convention above; `LIBRARY_OK == PLAYLIST_OK == 0`.
+/// own set, per the convention above; `LIBRARY_OK == FILE_OK == 0`.
 pub const LIBRARY_OK: c_int = 0;
 pub const LIBRARY_ERR_INVALID_INPUT: c_int = 1;
 pub const LIBRARY_ERR_UNAUTHORIZED: c_int = 2;
@@ -5836,12 +4649,82 @@ fn map_library_err(err: DomainError) -> LibraryJsonResult {
     }
 }
 
-/// Treat a folder as a library (libraries design).
+/// Walk `library`'s folder for the run `run_id` on the runtime, as
+/// HTTP's `spawn_walk` does — the call that opened the run has answered.
+fn spawn_library_walk(
+    services: &Services,
+    library: &alexandria_core::libraries::model::Library,
+    run_id: uuid::Uuid,
+) {
+    let handler = services.index_handler.clone();
+    let root = library.root_path.clone();
+    let library_uuid = library.uuid;
+    runtime().spawn(async move {
+        if let Err(err) = handler.execute(&root, run_id, library_uuid).await {
+            tracing::error!(%run_id, error = %err, "index run aborted");
+        }
+    });
+}
+
+/// Re-index one library (UC-01). `priority` is `"low"` or anything else
+/// (normal), lenient as every start is.
 ///
-/// `json_body` is the JSON body `POST /v1/libraries` takes (`name`,
-/// `rootPath`). Whatever is already indexed beneath the folder is claimed by
-/// this call. Answers `LIBRARY_ERR_CONFLICT` when the folder overlaps an
-/// existing library.
+/// Answers `INDEX_OK` with the run id, `INDEX_ERR_NOT_FOUND` for an unknown
+/// library, `INDEX_ERR_CONFLICT` while it has an unfinished run (FR-FC-43),
+/// `INDEX_ERR_INVALID_INPUT` for a malformed uuid, `INDEX_ERR_UNAUTHORIZED`
+/// or `INDEX_ERR_NOT_INITIALIZED` — HTTP's `202`, `404`, `409`, `400`, `401`.
+#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
+#[no_mangle]
+pub extern "C" fn alexandria_library_index_start(
+    uuid: *const c_char,
+    token: *const c_char,
+    priority: *const c_char,
+) -> IndexStartResult {
+    ffi_guard(IndexStartResult::err(INDEX_ERR_OTHER), || {
+        let services = match locked_services() {
+            Some(s) => s,
+            None => return IndexStartResult::err(INDEX_ERR_NOT_INITIALIZED),
+        };
+        let token = cstr_lossy(token).unwrap_or_default();
+        if !authenticated(&services, &token) {
+            return IndexStartResult::err(INDEX_ERR_UNAUTHORIZED);
+        }
+        let Some(uuid) = cstr_lossy(uuid).and_then(|raw| uuid::Uuid::parse_str(&raw).ok()) else {
+            return IndexStartResult::err(INDEX_ERR_INVALID_INPUT);
+        };
+        let priority = parse_priority(cstr_lossy(priority));
+
+        let started = runtime().block_on(async {
+            services
+                .index_library_handler
+                .index(uuid, priority, &token)
+                .await
+        });
+
+        match started {
+            Ok((library, started)) => {
+                spawn_library_walk(&services, &library, started.run_id);
+                IndexStartResult::ok(&started.run_id.to_string())
+            }
+            Err(DomainError::NotFound) => IndexStartResult::err(INDEX_ERR_NOT_FOUND),
+            Err(DomainError::Conflict(_)) => IndexStartResult::err(INDEX_ERR_CONFLICT),
+            Err(DomainError::InvalidInput(_)) => IndexStartResult::err(INDEX_ERR_INVALID_INPUT),
+            Err(DomainError::Unauthorized) => IndexStartResult::err(INDEX_ERR_UNAUTHORIZED),
+            Err(_) => IndexStartResult::err(INDEX_ERR_OTHER),
+        }
+    })
+}
+
+/// Add a folder as a library and start indexing it (FR-FC-36).
+///
+/// `json_body` is the JSON body `POST /v1/libraries` takes: `name`,
+/// `rootPath`, and an optional `priority` (`"low"`; anything else is normal)
+/// for the first run. On success `json` is the library with the `runId` of
+/// its first index run beside its fields; follow it with
+/// `alexandria_index_run_status_json`. Answers `LIBRARY_ERR_INVALID_INPUT` for
+/// a blank name or folder, a folder that does not exist or is not a folder,
+/// or one outside `filesystem.root`; `LIBRARY_ERR_CONFLICT` when the folder
+/// overlaps an existing library. A refusal stores nothing.
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
 pub extern "C" fn alexandria_library_register(
@@ -5873,17 +4756,26 @@ pub extern "C" fn alexandria_library_register(
             .get("rootPath")
             .and_then(|v| v.as_str())
             .unwrap_or_default();
+        // Lenient, as HTTP's `deserialize_priority` is (FR-FC-24): only the
+        // string `"low"` asks for a gentle first run.
+        let priority = parse_priority(
+            body.get("priority")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+        );
 
-        let result = runtime().block_on(async {
+        let rt = runtime();
+        let result = rt.block_on(async {
             services
                 .register_library_handler
-                .register(name, root_path, &token)
+                .register(name, root_path, priority, &token)
                 .await
         });
 
         match result {
-            Ok(library) => {
-                LibraryJsonResult::ok(serde_json::to_string(&library).unwrap_or_default())
+            Ok(registered) => {
+                spawn_library_walk(&services, &registered.library, registered.run_id);
+                LibraryJsonResult::ok(serde_json::to_string(&registered).unwrap_or_default())
             }
             Err(err) => map_library_err(err),
         }
@@ -5896,7 +4788,8 @@ pub extern "C" fn alexandria_library_register(
 /// (`rootPath`). The library's files move with it, keeping their uuids and
 /// everything that points at them. Answers `LIBRARY_ERR_CONFLICT` when the
 /// destination overlaps another library, or when the catalog already holds
-/// files there.
+/// files there, and `LIBRARY_ERR_INVALID_INPUT` when `rootPath` is blank or
+/// lies outside the configured `filesystem.root` (FR-FC-26), as HTTP's `400`.
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
 pub extern "C" fn alexandria_library_move(
@@ -6019,9 +4912,9 @@ pub extern "C" fn alexandria_library_browse(
     })
 }
 
-/// Stop treating a folder as a library.
-///
-/// The files are kept and return to the type panels. On success `json`
+/// Remove a library and its catalog records (FR-FC-40); nothing on disk is
+/// touched. `LIBRARY_ERR_CONFLICT` while one of its runs is running
+/// (FR-FC-43), as HTTP answers `409`. On success `json`
 /// carries an empty object rather than NULL, so a caller can tell success
 /// from the failure codes without a special case.
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`

@@ -27,7 +27,7 @@ health, configuration, deployment) are specified in the
 
 | Term | Definition |
 | --- | --- |
-| **File** | An indexed on-disk resource. One of seven subtypes: AudioFile, VideoFile, HtmlPage, TextFile, Document, ComicBook, Image. |
+| **File** | An indexed on-disk resource inside a library (FR-FC-36). One of seven subtypes: AudioFile, VideoFile, HtmlPage, TextFile, Document, ComicBook, Image. |
 | **Path** | The absolute on-disk location of a File. Unique across the catalog. |
 | **Content hash** | SHA-256 hash of a File's bytes. Informational, and usually absent: indexing and re-index never compute one (FR-FC-09, FR-FC-10). The only thing that writes it is the post-write verification of a text edit (FR-TX-03). |
 | **Stat pair** | A File's `sizeBytes` and `mtime`, both taken from the directory entry during the walk. Together they are the change signal a re-index compares (FR-FC-10). |
@@ -81,7 +81,7 @@ graph LR
 
 | ID | Requirement |
 | --- | --- |
-| FR-FC-01 | The system shall index audio files from a specified root path, creating a File record with path, name, type, size, and modification time (FR-FC-09), plus an AudioFile subtype record. Its metadata fields are prefilled from the file's embedded tags at first index (FR-FC-25) and are editable by the owner via FR-FC-14. A run shall accept an optional **scope** — the set of file types it records, named with the same words the catalog reads a type back as — and shall record only files of those types, counting one of any other type as `skipped` (FR-FC-27), the same outcome an unsupported extension takes: in both cases the run saw the file and chose not to record it. An absent or empty scope shall mean every supported type, so a caller that names none indexes them all and every caller predating the scope keeps its behaviour. An unrecognised type name shall be rejected as invalid input on both surfaces (FR-FC-24) rather than falling back to every type: that fallback is the opposite of what a caller asking for a narrower scope wants, and it fails in the direction of cataloguing exactly the files the owner meant to exclude. The scope shall be stored on the run and reused when the run is resumed (FR-FC-33), for the reason its root is: it is what the run was told to cover, and a resumed segment that could not read it back would record exactly the types the owner excluded. A run recorded before the scope existed has none stored, which means every type, as an absent scope always has. |
+| FR-FC-01 | The system shall index the files of a library (FR-FC-36): walk its folder and, for every file of a type it can read, create a File record with path, name, type, size, and modification time (FR-FC-09), plus a subtype record, belonging to that library (FR-FC-37). Audio files are indexed as AudioFiles, alongside the other types. Its metadata fields are prefilled from the file's own embedded metadata at first index (FR-FC-25) and are editable by the owner via FR-FC-14 through FR-FC-18. A file of any other type is counted as `skipped` (FR-FC-27). A run always covers every type the system can read: a library is the folder as it is, so there is no per-run type scope, and the run's root is the library's folder at the moment it starts. Indexing is started by adding a library (FR-FC-36) or by re-indexing one on the owner's request; there is no way to index a folder that is not a library. |
 | FR-FC-02 | The system shall index video files as VideoFiles. Title, year, resolution and duration are prefilled from the container at first index (FR-FC-25), but `mediaKind` (movie/series) is owner-supplied via FR-FC-15: nothing in a video file distinguishes a movie from an episode, so indexing does not infer it. |
 | FR-FC-03 | The system shall index saved HTML pages. |
 | FR-FC-04 | The system shall index Markdown and plain-text files as TextFiles. |
@@ -92,9 +92,9 @@ graph LR
 | FR-FC-09 | The system shall record, for each indexed file, its path, name, type, size in bytes, and last-modification time, all taken from the directory entry. Indexing shall not read the contents of the file for the purpose of identifying or fingerprinting it, and shall leave the File's content hash unset. Metadata extraction (FR-FC-25) reads only as much of a file as its own format demands, which is why the cost of a scan is set by the number of files in the library rather than by their total size (NFR-02). |
 | FR-FC-10 | The system shall, on re-index, compare each cataloged path's recorded size and modification time against the file now on disk, and shall treat a difference in either as a change. For a changed file the system shall store the new size and modification time, update `indexedAt`, and clear the File's stored content hash, so that a hash cannot outlive the bytes it described. Re-index shall read no file contents and shall compute no hash. A file whose size and modification time are both unchanged is recorded unchanged. |
 | FR-FC-11 | The system shall, on re-index, detect a path that no longer exists on disk and set the File's `missingAt` marker without deleting the record or changing its `state`. |
-| FR-FC-12 | The system shall list and query files filtered by type and lifecycle state, answering each matching file as the same record its single-file lookup (FR-FC-13) would answer: the File plus its subtype metadata and extracted scalars. Filtering by containing collection is delivered with Collections (FR-CO-07), since no collection exists before then. |
+| FR-FC-12 | The system shall list and query files across every library, filtered by type, lifecycle state, containing collection (FR-CO-07), and library, answering each matching file as the same record its single-file lookup (FR-FC-13) would answer: the File plus its library, its subtype metadata and extracted scalars. A malformed library or collection identifier is invalid input; a well-formed one that names nothing matches no files. |
 | FR-FC-13 | The system shall return a single file's metadata by its public UUID. |
-| FR-FC-14 | The system shall allow editing audio metadata (title, artist, album, year, genre, track, albumArtist). |
+| FR-FC-14 | The system shall allow editing audio metadata (title, artist, album, year, genre, track, albumArtist). An audio file's duration is read from the stream at index time and reported beside its metadata, as a video's is (FR-FC-02); it is not owner-editable. |
 | FR-FC-15 | The system shall allow editing video metadata (title, year, resolution; `mediaKind` movie/series). |
 | FR-FC-16 | The system shall allow editing document metadata (title, author, year; `formatKind` book/ebook). |
 | FR-FC-17 | The system shall allow editing comic-book metadata (title, series, issueNumber). |
@@ -105,8 +105,8 @@ graph LR
 | FR-FC-22 | The system shall hard-purge a File record permanently only after its soft-delete retention window has elapsed. |
 | FR-FC-23 | The system shall, on an explicit purge-on-disk operation, remove the File record and delete the underlying file on disk. |
 | FR-FC-24 | The system shall expose every catalog operation via both the HTTP/REST-JSON surface and the FFI surface with identical results. FR-MP-06 defines the single exception: byte transfer, where the FFI surface returns a playback descriptor instead of a stream. |
-| FR-FC-25 | The system shall prefill a file's subtype metadata from the metadata embedded in the file itself (audio tags, image EXIF, document and comic metadata, video container metadata) at first index, and shall record which extraction wrote the row. Extraction is best-effort: a failure leaves the fields empty and never fails the file's indexing. The row is stamped either way — the stamp records which extraction was applied, not which one succeeded — so a file nothing can be read from is opened once rather than on every later pass. On re-index (FR-FC-10) the system shall re-read a file whose row an older extraction wrote and shall **fill only the subtype fields the catalog is missing**, leaving every field that already holds a value — an owner's edit (FR-FC-14..18) or an earlier extraction's — exactly as it is, and shall then stamp the row so the file is read once rather than once per run. |
-| FR-FC-26 | The system shall reject an index request (FR-FC-01) whose root path is not the configured `filesystem.root` or a descendant of it, comparing the two paths after resolving each to its canonical form so that traversal segments, trailing separators, and symbolic links cannot escape the bound. When `filesystem.root` is unset, indexing is unconstrained and any readable root is accepted — the constraint is opt-in by configuration. Re-index (FR-FC-10, FR-FC-11) takes no root and is unaffected. |
+| FR-FC-25 | The system shall prefill a file's subtype metadata from the metadata embedded in the file itself (audio tags, image EXIF, document and comic metadata, video container metadata) at first index, and shall record which extraction wrote the row. Extraction is best-effort: a failure leaves the fields empty and never fails the file's indexing. The row is stamped either way — the stamp records which extraction was applied, not which one succeeded — so a file nothing can be read from is opened once rather than on every later pass. On re-index (FR-FC-10) the system shall re-read a file whose row an older extraction wrote and shall **fill only the subtype fields the catalog is missing**, leaving every field that already holds a value — an owner's edit (FR-FC-15..18) or an earlier extraction's — exactly as it is, and shall then stamp the row so the file is read once rather than once per run. |
+| FR-FC-26 | The system shall bound what the catalog can reach by the configured `filesystem.root`, in three places. It shall reject adding a library (FR-FC-36) whose folder, an index run (FR-FC-01) whose root, and a library root correction (FR-FC-41) whose new root, is not the configured root or a descendant of it. And it shall refuse to read, stream, decode, write, rename, or delete the on-disk file of a catalog record whose path does not resolve inside it (UC-05, UC-09, UC-32, UC-33, UC-38 – UC-40), so that a record already pointing outside — catalogued before the bound was configured, or reached through a symbolic link swapped in since — is not served. Paths are compared after resolving each to its canonical form, so that traversal segments, trailing separators, and symbolic links cannot escape the bound. A path that does not exist yet — a library corrected to a folder on a drive that is not plugged in — is resolved through its longest existing ancestor, with the remaining segments normalised lexically, so such a folder inside the root is still accepted; a path that cannot be resolved at all (a dangling symbolic link, a folder the server may not look into) is treated as outside. When `filesystem.root` is set but cannot itself be resolved, all three are refused with a distinct error rather than left unconstrained. When `filesystem.root` is unset, none of this applies and any path is accepted — the constraint is opt-in by configuration. Re-index (FR-FC-10, FR-FC-11) takes no root and is unaffected. |
 | FR-FC-27 | The system shall record every index and re-index run: its id, kind, start time, status, finish time once it has one, and the outcome counts for its kind. A run's status shall be one of `running`, `paused`, `complete`, `failed`, or `cancelled`; `running` and `paused` are the non-terminal ones. Its counts shall be `scanned`, `indexed`, `skipped` (classified out), `alreadyCataloged` (a path the catalog already held), and `failed` for an index run, and `refreshed`, `markedMissing`, `unchanged`, and `failed` for a re-index. `skipped` and `alreadyCataloged` are counted apart so that a resumed run's tally describes what it actually did rather than reporting every entry an earlier segment cataloged as a skip. A run whose walk completes shall be recorded `complete` even when individual files failed — those are counted in the run's `failed` tally, and one file's failure shall not abandon the rest of the walk. A run that could not proceed at all shall be recorded `failed` with the underlying error. |
 | FR-FC-28 | The system shall expose a run's recorded status and outcome to an authenticated caller, given the run id returned when the run was started, over both the HTTP and FFI surfaces. While the run is in flight the answer shall also carry its live progress: `phase` (`discovering` while the entries are still being counted, `processing` once they are, and absent once the run is terminal), `total` (absent until discovery has finished counting), `processed` (entries the current segment has finished with), `activeMillis` (elapsed time with paused stretches subtracted), and `pausedAt` for a run that is paused right now. A run this process is no longer executing shall still report the last progress it published, so a run paused across a restart can still say how far it got. The system shall not report a remaining-time estimate: `processed`, `total`, and `activeMillis` are the inputs a client cannot derive for itself, and smoothing an estimate over them is a presentation decision. |
 | FR-FC-29 | The system shall, at startup, record every run still marked `running` as `paused` and offer it for resume (FR-FC-33); runs execute in-process, so such a run provably has no task behind it. Nothing shall resume by itself — resuming is an explicit act by the owner. |
@@ -116,13 +116,14 @@ graph LR
 | FR-FC-33 | The system shall resume a `paused` index or re-index run on the owner's request, recording it `running` again and continuing it under the same run id, with the time it spent paused excluded from its `activeMillis`. A resumed index run re-walks its root and a resumed re-index re-visits every cataloged path; entries an earlier segment already cataloged are counted in `alreadyCataloged`. A resume shall accept a priority of its own — `normal` or `low`, spelled exactly as FR-FC-31 spells them — and shall walk the resumed segment at the concurrency that priority resolves to, storing it on the run so the new pacing survives a further pause. An absent or unrecognised priority shall keep the width the run already has rather than resetting it to `normal`, on both surfaces: sending nothing is not a request to speed up, and every caller predating the option sends nothing. This is how a large scan started at `normal` is throttled down once the owner wants the application back, without losing the work already done or the run's record. A resume requested against a run in any other status shall be refused as a conflict, and refusing it shall leave the run's stored priority untouched. |
 | FR-FC-34 | The system shall cancel a `running` or `paused` index or re-index run on the owner's request, recording it `cancelled` with a finish time and with the progress it last published. Where a walk was executing, the partial tally it had reached is kept as well; a run no process is executing has none to offer, and is recorded without counts rather than with invented ones. `cancelled` is terminal: a cancelled run shall never be resumed. A cancel requested against an already-terminal run shall be refused as a conflict. |
 | FR-FC-35 | The system shall report every outstanding run — every run whose status is `running` or `paused` — to an authenticated caller in one call, newest first, each carrying the same body FR-FC-28 defines. A caller with nothing outstanding shall receive an empty list rather than an error. This is what lets a client show whether anything is indexing and offer a resume at launch without having to remember every run id it ever started. |
-| FR-FC-36 | The system shall register a named folder as a *library*: a folder whose files are browsed in their folder structure rather than listed with every other file of their type. A library is refused when its folder contains, or sits inside, one already registered, and the refusal names the existing library. |
-| FR-FC-37 | The system shall claim the files already catalogued beneath a library's root at the moment it is registered, and claim files indexed beneath it afterwards as they arrive. A folder is usually marked *after* it has been indexed, and a library that showed nothing until the owner re-walked their disk would read as broken. |
-| FR-FC-38 | The system shall exclude a library's files from the type-filtered catalog listings by default, and shall answer them to a caller that asks the listing to reach into libraries, to a single-file read, and to every collection, watchlist, and reading list that references them. A library narrows where a file is *listed*, never what can be *found* — and because a client's search and its deleted-items review are built from the same listing, the reach has to be a filter the caller sets rather than a property of which query it called. The default is the exclusion, so a caller that says nothing gets the type-panel behaviour. |
+| FR-FC-36 | The system shall add a named folder as a *library* — the only way files enter the catalog — and start its first index run (FR-FC-01) in the same request, at an optional priority (FR-FC-31), answering the library with the run's id. Adding is refused, storing nothing, when the name or folder is blank, the folder does not exist or is not a folder, it lies outside the configured `filesystem.root` (FR-FC-26), or it contains or sits inside a library already added, in which case the refusal names the existing library. A library whose first run cannot be opened is not left behind. |
+| FR-FC-37 | The system shall keep every catalogued file in exactly one library: the library whose run recorded it. A file is never written without one, and libraries never nest or overlap, so no file has two answers to which library holds it. |
+| FR-FC-38 | The system shall answer a library's files everywhere a file can be listed or referenced — the file listing (FR-FC-12), a single-file read, and every collection, watchlist, and reading list that references them. Nothing is hidden from the listing; a caller narrows it to one library with a library filter. |
 | FR-FC-39 | The system shall report one level of a library at a time — the folders directly inside the addressed folder, and the files directly in it — rather than the whole tree. A course with two hundred classes is a large document to build, send, and parse so the owner can look at the six things in one folder. |
-| FR-FC-40 | The system shall stop treating a folder as a library on request, keeping every file it grouped and returning them to the type listings. Marking a folder empties part of a listing, which is not visible until after it is done, so the way back restores rather than deletes. |
-| FR-FC-41 | The system shall correct a library's root folder on request, moving the stored paths of the files it holds to match, so that a folder that moved on disk is one record to correct rather than a catalog to re-walk. The files keep their identity — a re-index at the new location would mint new records and leave every watchlist place, reading position, and collection membership pointing at records that had gone missing. The correction is refused when the destination overlaps another library, or when the catalog already holds files there. |
+| FR-FC-40 | The system shall remove a library on request, deleting its catalog records: every file record in it with its subtype record, watch and reading progress, and collection membership; its index runs; and every run failure recorded under its folder. Files on disk are never touched, and adding the folder again re-indexes it. Removal is refused while one of the library's runs is running (FR-FC-43); a paused run goes with the library. |
+| FR-FC-41 | The system shall correct a library's root folder on request, moving the stored paths of the files it holds to match, so that a folder that moved on disk is one record to correct rather than a catalog to re-walk. The files keep their identity — a re-index at the new location would mint new records and leave every watchlist place, reading position, and collection membership pointing at records that had gone missing. The correction is refused when the destination overlaps another library, when the catalog already holds files there, or when it lies outside the configured `filesystem.root` (FR-FC-26), and while the library has an unfinished run (FR-FC-43), whose resume would walk the old folder. |
 | FR-FC-42 | The system shall record which files a run could not process, each with the reason it gave up, and answer that list for a run on request. The tally already says how many; without the paths a client can only tell the owner a number about files that are on disk, in no listing, and named nowhere they can reach. The list is bounded per run — a folder whose every file fails must not write a row per file — and the tally remains the authority on how many there were. Recording a failure is best-effort: a walk that cannot write the note carries on rather than abandoning the rest of the library. |
+| FR-FC-43 | The system shall allow a library at most one unfinished index run — `running` or `paused`, which is also what a run interrupted by a stop becomes. While one exists, a second index run of the library and a correction of its root are refused as a conflict naming the run, and removal is refused while that run is `running`. The owner cancels or finishes the run first (FR-FC-34). Refusing rather than waiting: a cancel only signals the walk, in whichever process it runs. The store itself holds the rule, so two requests that both pass the check still start only one run. |
 
 ### 3.2 Collections (CO)
 
@@ -187,7 +188,7 @@ graph LR
 | ID | Requirement |
 | --- | --- |
 | FR-AU-01 | The system shall read the active authentication mode from startup configuration; exactly one mode (external JWT, local login, or Windows account) shall be active at runtime. |
-| FR-AU-02 | In external mode, the system shall verify each caller's JWT against a configured signing secret shared with the external authentication service, and shall accept the caller as the owner only when the token names the configured scope. |
+| FR-AU-02 | In external mode, the system shall verify each caller's JWT against the public signing keys the external authentication service publishes (ES256, selected by the token's `kid`, with the algorithm pinned), and shall accept the caller as the owner only when the token names the configured scope. While a shared HS256 secret is still configured, tokens signed with it are accepted too. |
 | FR-AU-03 | The system shall accept only the active auth mode and shall reject credentials presented via the inactive mode. |
 | FR-AU-04 | In local mode, the system shall verify the caller's email and password against the salted Argon2 password hash stored in the SQLite credential row. |
 | FR-AU-05 | The system shall provide a local setup operation to set or change local-login credentials (email and password). |
@@ -220,68 +221,20 @@ graph LR
 | FR-MP-03 | The system shall never re-encode, transcode, or otherwise modify the bytes it serves. |
 | FR-MP-04 | The system shall return a single page of a CBZ ComicBook as an image, addressed by 1-based page index. |
 | FR-MP-05 | The system shall return a downscaled thumbnail image for a video, image, comic, or audio File. For audio, the thumbnail is the front-cover picture embedded in the file's own tag; a file with no embedded picture returns no thumbnail. |
-| FR-MP-07 | The system shall return, for an audio File, an energy envelope of the recording it holds: a level per frequency band per frame of its duration, measured from the file's own audio, scaled against the loudest moment of that recording, and identical for two encodings of the same music. It shall measure a file at most once, storing what it measured and answering later calls from storage, and shall measure on request rather than at index time. |
+| FR-MP-07 | **Removed (moved out of scope, see Orpheus)** |
 | FR-MP-06 | The system shall expose playback operations via both the HTTP and FFI surfaces. Because the FFI surface cannot carry a byte stream, FR-MP-01 over FFI returns a **playback descriptor** — resolved absolute path, MIME type, and byte size — and parity for it is defined on that descriptor and on the authorization, state, and error decisions rather than on byte transfer. FR-MP-04 and FR-MP-05 return their bytes over both surfaces and are byte-exact across them. |
 
 ### 3.9 Playlists (TR)
 
-Playlists are named, ordered groupings of audio tracks — audio's counterpart
-to watchlists (video) and reading lists (books/comics), one medium over from
-UC-31. Every operation below is exposed identically over the HTTP and FFI
-surfaces (FR-FC-24, NFR-09).
-
-| ID | Requirement |
-| --- | --- |
-| FR-TR-01 | The system shall create a named playlist for holding audio tracks. |
-| FR-TR-02 | The system shall rename a playlist, leaving its entries and their order untouched. |
-| FR-TR-03 | The system shall delete a playlist, removing its entries but preserving the audio files they reference. |
-| FR-TR-04 | The system shall add one or more audio files to a playlist, in order, at consecutive positions after whatever the playlist already holds, all-or-nothing: a submitted file that does not resolve to an audio file rejects the whole batch and adds none of it. |
-| FR-TR-05 | The system shall remove one entry from a playlist, addressed by the entry's own id rather than by file, since a playlist may hold the same track more than once (FR-TR-08). |
-| FR-TR-06 | The system shall move one playlist entry to a requested index, computing the playlist's full new order and renumbering every entry in one transaction; the caller supplies only the target index, never a list of positions, so there is exactly one implementation of the ordering rule. |
-| FR-TR-07 | The system shall list playlists, and read a single playlist back with its tracks resolved and returned in position order. |
-| FR-TR-08 | The system shall allow a playlist to hold the same track more than once: an entry's identity is its own row, not its file. |
-| FR-TR-09 | The system shall keep a playlist's entry positions contiguous, `0..n-1`: adding entries extends the sequence with new consecutive positions after whatever the playlist already holds, removing an entry shifts every later position down by one to close the gap it leaves, moving an entry recomputes and rewrites the playlist's full stored order, and purging a file's entries (FR-TR-10) renumbers whatever playlists it left holes in the same way a removal does. |
-| FR-TR-10 | The system shall delete a file's playlist entries when the file is purged, since `playlist_entries` carries no foreign key and nothing cascades to it automatically. |
-| FR-TR-11 | The system shall keep a playlist entry whose file has gone missing on disk, reporting it flagged (`missing: true`) rather than dropping it. A soft-deleted file (`state = deleted`, `missingAt` still unset) is reported `missing: false` — the two are different failure modes with different remedies, and a caller that wants to tell them apart reads the file's own `state`. |
+**Removed (moved out of scope, see Orpheus)**
 
 ### 3.10 Music Enrichment (EN)
 
-The one area that reaches services outside this machine. Everything here is
-therefore optional, off unless configured, and settled once: a lookup that
-concluded — found, found nothing, or was refused — is never made again, so a
-library costs its lookups once rather than once a session.
-
-| ID | Requirement |
-| --- | --- |
-| FR-EN-01 | The system shall run music enrichment only where the owner has enabled it and supplied a contact address; with either absent it shall refuse every lookup as unavailable rather than reaching the network anonymously. The contact is a condition of use of the services this calls, not a courtesy. |
-| FR-EN-02 | The system shall identify a track against a recording-identity service by its tags, accepting a match only above a confidence threshold and recording a match below it as rejected — a confidently wrong result is worse than none. |
-| FR-EN-03 | The system shall fetch and store the words of an identified track, and shall answer a track's stored words without reaching the network. |
-| FR-EN-04 | The system shall fetch and store an artist's photograph **by the artist's name**, so that the name a client groups by and the name a picture is stored under are the same one, and shall answer a stored photograph without reaching the network. |
-| FR-EN-05 | The system shall store, for every artist and track it has looked up, the outcome of that lookup — found, nothing found, rejected, or failed — and shall not repeat a lookup that concluded. Only `failed` is retried, because only `failed` says the answer is unknown rather than known to be nothing. |
-| FR-EN-06 | The system shall accept an artist photograph only in a format a client can draw, and shall record a picture in any other format as nothing found: an image that exists and cannot be shown is, to every caller, the same fact as no image, and recording it as found would settle the artist against a file that renders as a blank forever. |
-| FR-EN-07 | The system shall bound what it downloads from an external service, refusing a response that exceeds its size cap as it is read rather than after it has been held in full. |
-| FR-EN-08 | The system shall observe the rate limits of the services it calls, at most one identity request per second, and shall report a refusal for rate limiting distinctly from a refusal for anything else. |
-| FR-EN-09 | The system shall expose enrichment over both the HTTP and FFI surfaces (FR-FC-24, NFR-09). Reading a stored result stays available while enrichment itself is switched off; only a *run* is refused. |
+**Removed (moved out of scope, see Orpheus)**
 
 ### 3.11 Play History (PH)
 
-What was played, and the rankings built from it. The core records and counts;
-it holds no opinion about when a track counts as played, because it cannot
-see what the owner is hearing — that rule belongs to whatever is doing the
-playing.
-
-| ID | Requirement |
-| --- | --- |
-| FR-PH-01 | The system shall record that an audio File was played, stamping the moment from its own clock rather than from anything the caller supplies. A file that is not audio is refused: these are the statistics of music, and a video's viewing is the watchlists' business with its own progress model. |
-| FR-PH-02 | The system shall record every play, including repeats of the same track: playing a record twice is two plays, which is the whole of what counting them is for. |
-| FR-PH-03 | The system shall answer a summary of the history — how many plays, across how many distinct tracks, and the first and last moment they span. |
-| FR-PH-04 | The system shall answer four rankings — tracks, artists, albums, and genres — each cut to a caller-supplied limit within a bounded range, refusing a limit outside it rather than clamping: a caller that asked for a thousand and silently got a hundred would report the top hundred as though it were the whole answer. |
-| FR-PH-05 | The system shall rank a track under its own title, or under its filename where nothing tagged it, and shall rank an untagged track in the track ranking alone — it has no artist, album, or genre, and ranking it under "unknown" would invent one. |
-| FR-PH-06 | The system shall credit a played track to its record's artist: the track's own album-artist tag, else the commonest album-artist tag on the rest of that album, else the album's commonest performer, else the track's own performer. A guest on one track of a record is therefore not an artist in their own right. |
-| FR-PH-07 | The system shall rank an album by the pair of its title and that credit, never by title alone: a title names many records, and merging two of them reports a play count belonging to neither. |
-| FR-PH-08 | The system shall read a played track's tags live rather than snapshotting them onto the play, so correcting a misspelled artist corrects the history with it. |
-| FR-PH-09 | The system shall keep the plays of a soft-deleted or missing track — the play happened, and the file is still in the catalog — and shall delete a track's plays when the track is purged. |
-| FR-PH-10 | The system shall expose play history over both the HTTP and FFI surfaces (FR-FC-24, NFR-09). |
+**Removed (moved out of scope, see Orpheus)**
 
 ---
 
@@ -301,7 +254,6 @@ owner; it has no public UUID surface beyond the set/change operation.
 
 ```mermaid
 erDiagram
-    File ||--o{ AudioFile : "subtype"
     File ||--o{ VideoFile : "subtype"
     File ||--o{ HtmlPage : "subtype"
     File ||--o{ TextFile : "subtype"
@@ -326,6 +278,7 @@ erDiagram
 | path | text | required, unique | Absolute on-disk path. |
 | name | text | required | Editable file name. |
 | type | enum | required; one of `audio`, `video`, `html`, `text`, `document`, `comic`, `image` | Subtype discriminator. |
+| libraryId | integer | required, FK → Library | The library the file belongs to (FR-FC-37). Exposed on a listed or read file as the library's `libraryUuid`. |
 | contentHash | text | nullable | SHA-256 of the file bytes, when one is known. `NULL` is the normal state: indexing and re-index never compute one (FR-FC-09, FR-FC-10), and a re-index clears it on a changed file. The only writer is the post-write verification of a text edit (FR-TX-03). Informational — nothing reads it back as a decision input. |
 | sizeBytes | integer | nullable | The file's size on disk at the last index or re-index; half of the change signal (FR-FC-10). |
 | mtime | timestamp | nullable | The file's last-modification time on disk at the last index or re-index; the other half of the change signal (FR-FC-10), and part of the thumbnail cache key (FR-MP-05). |
@@ -336,13 +289,13 @@ erDiagram
 | metadataVersion | integer | required, defaults to 0 | Which extraction wrote the row's subtype metadata (FR-FC-25). Zero is "an extraction that predates this column", which is what every row indexed by an earlier build is; a re-index re-reads anything behind the current version and stamps it. Internal only — nothing on the wire carries it. |
 | collectionId | integer | nullable, FK → Collection | Containing collection, if any. Internal only: it is never exposed on the `File` payload, because it is an internal key and its public counterpart is reachable the other way round — `GET /v1/collections/{uuid}/items` (FR-CO-07) lists a collection's members, and `GET /v1/files?collectionUuid=…` (FR-FC-12) filters by it. |
 
-Type-specific subtype tables (AudioFile, VideoFile, HtmlPage, TextFile, Document,
-ComicBook, Image) share the File's `id` as a foreign key and carry only their
+Type-specific subtype tables (AudioFile, VideoFile, HtmlPage, TextFile,
+Document, ComicBook, Image) share the File's `id` as a foreign key and carry only their
 type-specific metadata. Representative subtype fields:
 
 | Subtype | Extra Fields |
 | --- | --- |
-| AudioFile | title, artist, album, year, genre, track, albumArtist |
+| AudioFile | title, artist, album, year, genre, track, albumArtist, durationSeconds |
 | VideoFile | title, year, resolution, mediaKind (movie/series), episodeCount (series), durationSeconds |
 | HtmlPage | title, sourceUrl, savedAt |
 | TextFile | (content is read/written on disk, not stored) |
@@ -483,7 +436,8 @@ kept indefinitely.
 | kind | text | required | `index` or `refresh`. |
 | status | text | required | `running`, `paused`, `complete`, `failed`, or `cancelled` (FR-FC-27). |
 | root | text | nullable | The indexed root, for an index run only; `NULL` for a refresh, which takes no root. |
-| scope | text | nullable | The file types the run records (FR-FC-01), as the comma-separated list of type names the caller sent (`audio`, `audio,image`). Written at start beside `root` — both are what the run was told to cover — and read back when the run is resumed (FR-FC-33), so a paused run continues under the scope it started with rather than widening to every type. `NULL` is every type: what an absent scope means, what a refresh has, and what every row written before this column holds. Internal; it is an input to how the run is walked, not part of the run body a client reads. |
+| scope | text | nullable | No longer written: a run covers every readable type (FR-FC-01). Older rows may still hold the type list an earlier version recorded; it is not read. |
+| libraryId | integer | nullable | The library an index run walks (FR-FC-43); `NULL` for a refresh, which re-checks every library. Reported as the run's `libraryUuid`. |
 | startedAt | timestamp | required | When the run started. |
 | finishedAt | timestamp | nullable | When the run reached a terminal status; `NULL` while `running` or `paused`. |
 | phase | text | nullable | `discovering` or `processing` while a walk is executing the run, and kept across an owner's pause so a client can see where the walk stopped. `NULL` once the run is terminal — `complete` beside `processing` would say two contradictory things — `NULL` for a run paused by startup reconciliation, whose process is gone so it is in no phase until it resumes, and `NULL` for a run that never published one. |
@@ -494,7 +448,7 @@ kept indefinitely.
 | concurrency | integer | nullable | The width the run's priority (FR-FC-31) resolved to. Written at start, and rewritten by a resume that names a priority of its own (FR-FC-33) — that write is what re-paces the run, since the next segment is walked at whatever this column says. A resume naming no priority leaves it alone. Internal; `NULL` only for a run started before priority existed, which resumes at the configured default. |
 | scanned | integer | nullable | Index only: entries scanned. |
 | indexed | integer | nullable | Index only: files newly indexed. |
-| skipped | integer | nullable | Index only: entries the run saw and did not record — an unsupported extension, or a file whose type the run's scope excludes (FR-FC-01). One counter rather than two: in both cases the run classified the entry out, and splitting them would leave every reader adding the two back together. |
+| skipped | integer | nullable | Index only: entries the run saw and did not record — a file of a type the system cannot read (FR-FC-01). Runs recorded before the scope was removed also counted files their scope excluded here. |
 | alreadyCataloged | integer | nullable | Index only: entries whose path the catalog already held. |
 | refreshed | integer | nullable | Refresh only: records refreshed. |
 | markedMissing | integer | nullable | Refresh only: records marked missing. |
@@ -517,24 +471,11 @@ from zero (FR-FC-33).
 
 ### 4.12 Playlist Fields
 
-| Field | Type | Constraints | Description |
-| --- | --- | --- | --- |
-| id | integer | PK | Internal primary key. |
-| uuid | UUID | required, unique | Public identifier. |
-| name | text | required, non-empty | Playlist name. |
+**Removed (moved out of scope, see Orpheus)**
 
 ### 4.13 PlaylistEntry Fields
 
-| Field | Type | Constraints | Description |
-| --- | --- | --- | --- |
-| id | integer | PK | Internal primary key, and an entry's own identity — not its file. A playlist may hold the same track more than once (FR-TR-08), so removing or reordering "that track" means acting on this row, not on `fileId`. Never exposed to a caller (§4.0). |
-| uuid | UUID | required, unique | Public identifier. HTTP and FFI address an entry by this uuid — not by `id` — the same identifier strategy every other entity in this schema follows (§4.0). |
-| playlistId | integer | required, no FK | Containing playlist. `playlist_entries` carries no foreign key — SQLite cannot add one via `ALTER TABLE` — so purging a file deletes its entries explicitly (FR-TR-10) rather than relying on a cascade. |
-| fileId | integer | required, no FK | Referenced audio file. Adding rejects anything that is not `FileType::Audio`. Deliberately **not** `UNIQUE (playlistId, fileId)`, unlike ReadingProgress: the same track may appear as two distinct entries. |
-| position | integer | required | Contiguous `0..n-1` within the playlist, so the stored position is always the position displayed. An append extends the sequence; a removal shifts every later position down by one to close the gap; a move recomputes and rewrites the playlist's full stored order (FR-TR-09). |
-
-`missing` (FR-TR-11) is not a stored column: it is computed when a playlist is
-read back, from whether the referenced File's own `missingAt` is set.
+**Removed (moved out of scope, see Orpheus)**
 
 ---
 
@@ -548,7 +489,6 @@ endpoint requires authentication from the active mode (see §7).
 
 | Method | Path | Description | Requirement |
 | --- | --- | --- | --- |
-| POST | /v1/index | Start an asynchronous indexing scan of a root path, optionally at a `priority` of `normal` or `low`, and optionally scoped to a `types` array naming the file types to record. | FR-FC-01..09, FR-FC-31 |
 | POST | /v1/index/refresh | Re-index existing records (compare size and mtime, mark missing), optionally at a `priority`. | FR-FC-10, FR-FC-11, FR-FC-31 |
 | GET | /v1/settings | Report the client-relevant configuration, beginning with the retention window. | FR-FC-30 |
 | GET | /v1/index/runs/{runId} | Report an index or re-index run's status, progress, and outcome. | FR-FC-27, FR-FC-28 |
@@ -557,11 +497,12 @@ endpoint requires authentication from the active mode (see §7).
 | POST | /v1/index/runs/{runId}/pause | Pause a running run, leaving it resumable. | FR-FC-32 |
 | POST | /v1/index/runs/{runId}/resume | Resume a paused run under the same run id, optionally at a new `priority` of `normal` or `low`. | FR-FC-33, FR-FC-31 |
 | POST | /v1/index/runs/{runId}/cancel | Abandon a running or paused run. Terminal. | FR-FC-34 |
-| POST | /v1/libraries | Register a folder as a library, by `name` and `rootPath`. Answers a conflict when it overlaps one already registered. | FR-FC-36, FR-FC-37 |
+| POST | /v1/libraries | Add a folder as a library, by `name` and `rootPath`, optionally at a `priority`, and start its first index run; answers the library with the run's `runId`. Answers a conflict when it overlaps one already added. | FR-FC-36, FR-FC-01..09, FR-FC-31 |
+| POST | /v1/libraries/{uuid}/index | Re-index one library, optionally at a `priority`; answers the run id. A conflict while the library has an unfinished run. | FR-FC-01..09, FR-FC-31, FR-FC-43 |
 | GET | /v1/libraries | List every registered library. | FR-FC-36 |
 | GET | /v1/libraries/{uuid} | Report one level of a library — the folders and files directly inside the optional `path`, which is relative to its root and defaults to the top. | FR-FC-39 |
-| PATCH | /v1/libraries/{uuid} | Correct the library's `rootPath` after its folder moved, taking its files with it. | FR-FC-41 |
-| DELETE | /v1/libraries/{uuid} | Stop treating the folder as a library, keeping its files. | FR-FC-40 |
+| PATCH | /v1/libraries/{uuid} | Correct the library's `rootPath` after its folder moved, taking its files with it. | FR-FC-41, FR-FC-43 |
+| DELETE | /v1/libraries/{uuid} | Remove the library and its catalog records; files on disk are untouched. | FR-FC-40, FR-FC-43 |
 
 `status` on the runs listing is optional and defaults to `active`, the only
 value it accepts; any other value is rejected as invalid input rather than
@@ -575,9 +516,9 @@ was given — a resume continues a run, it does not mint a new one.
 
 | Method | Path | Description | Requirement |
 | --- | --- | --- | --- |
-| GET | /v1/files | List/query files by type and state, optionally reaching into libraries with `includeLibraries=true` (collection filter ships with Collections), each returned as the same record `GET /v1/files/{uuid}` answers for one file. An unrecognised filter value is rejected as invalid input. | FR-FC-12, FR-FC-38 |
+| GET | /v1/files | List/query files across every library by `type`, `state`, `collectionUuid`, and `libraryUuid`, each returned as the same record `GET /v1/files/{uuid}` answers for one file. An unrecognised filter value is rejected as invalid input. | FR-FC-12, FR-FC-38 |
 | GET | /v1/files/{uuid} | Get one file's metadata. | FR-FC-13 |
-| PATCH | /v1/files/{uuid}/metadata | Edit type-specific metadata. | FR-FC-14..18 |
+| PATCH | /v1/files/{uuid}/metadata | Edit type-specific metadata. | FR-FC-15..18 |
 | POST | /v1/files/{uuid}/rename | Rename the file (and on-disk file). | FR-FC-19 |
 | DELETE | /v1/files/{uuid} | Soft-delete the record. | FR-FC-20 |
 | POST | /v1/files/{uuid}/restore | Restore a soft-deleted record. | FR-FC-21 |
@@ -694,7 +635,6 @@ account is UC-41).
 | GET | /v1/files/{uuid}/stream | Stream an `active` File's bytes from disk, honouring `Range`. | FR-MP-01, FR-MP-02, FR-MP-03 |
 | GET | /v1/files/{uuid}/pages/{page} | Return one page of a CBZ ComicBook, 1-based. | FR-MP-04 |
 | GET | /v1/files/{uuid}/thumbnail | Return a downscaled JPEG thumbnail (video, image, comic, audio). | FR-MP-05 |
-| GET | /v1/files/{uuid}/energy | Return the energy envelope of an audio File's recording, measured on the first call and answered from storage after it. | FR-MP-07 |
 
 `/stream` is deliberately not `/content`: that path is UC-32's text-content
 read and UC-33's editor, which exchange a JSON document rather than a seekable
@@ -703,63 +643,15 @@ returns a playback descriptor instead of bytes (FR-MP-06).
 
 ### 5.10 Playlists
 
-| Method | Path | Description | Requirement |
-| --- | --- | --- | --- |
-| POST | /v1/playlists | Create a playlist. | FR-TR-01 |
-| GET | /v1/playlists | List playlists (without their tracks). | FR-TR-07 |
-| GET | /v1/playlists/{uuid} | Read a playlist back with its tracks, in position order. | FR-TR-07, FR-TR-11 |
-| PATCH | /v1/playlists/{uuid} | Rename a playlist. | FR-TR-02 |
-| DELETE | /v1/playlists/{uuid} | Delete a playlist (preserves its audio files). | FR-TR-03 |
-| POST | /v1/playlists/{uuid}/entries | Add audio files, in order (rejects non-audio). | FR-TR-04 |
-| DELETE | /v1/playlists/{uuid}/entries/{entryUuid} | Remove one entry. | FR-TR-05 |
-| POST | /v1/playlists/{uuid}/entries/{entryUuid}/move | Move one entry to a new index, renumbering the rest. | FR-TR-06 |
-
-`DELETE /v1/playlists/{uuid}/entries/{entryUuid}` answers `200 {}`: the core
-handler removing the entry returns nothing beyond success, so there is
-nothing to echo back beyond the identifiers already in the URL. The FFI
-counterpart (`alexandria_playlist_remove_entry`) mirrors this with the same
-literal `"{}"` payload rather than inventing an FFI-only field to fill it
-out.
-
-Over FFI, playlist operations report failure through a `PLAYLIST_ERR_*`
-family (`INVALID_INPUT`, `UNAUTHORIZED`, `NOT_INITIALIZED`, `NOT_FOUND`,
-`INVALID_STATE`, `OTHER`) that mirrors `READING_LIST_ERR_*` value for value,
-the same convention every other feature area's FFI error family follows so
-that a value never means one thing for playlists and another for reading
-lists.
+**Removed (moved out of scope, see Orpheus)**
 
 ### 5.11 Music Enrichment
 
-| Method | Path | Description | Requirement |
-| --- | --- | --- | --- |
-| POST | /v1/enrichment/runs | Run enrichment over a scope, looking up what is not already settled. | FR-EN-01..03, FR-EN-05 |
-| GET | /v1/enrichment/tracks/{uuid} | Read one track's stored enrichment, including its words. | FR-EN-03, FR-EN-09 |
-| GET | /v1/enrichment/artist-image | Read the stored photograph for an artist, by name. | FR-EN-04, FR-EN-09 |
-| POST | /v1/enrichment/artist-image | Look one artist's photograph up, by name, and keep it. | FR-EN-01, FR-EN-04..08 |
-
-A run is a `POST` because it changes what the catalog holds; reading a stored
-result is a plain `GET` and stays available even where enrichment itself is
-switched off (FR-EN-09). The artist photograph is addressed **by name** on
-both verbs rather than by a representative file: a client's artists list is
-grouped by a name it worked out across a record, and a picture stored under
-whatever one file happened to be tagged with is one that list can never find
-(FR-EN-04).
+**Removed (moved out of scope, see Orpheus)**
 
 ### 5.12 Play History
 
-| Method | Path | Description | Requirement |
-| --- | --- | --- | --- |
-| POST | /v1/plays | Record that an audio File was played, stamped from the core's clock. | FR-PH-01, FR-PH-02 |
-| GET | /v1/plays/stats | Read the summary and the four rankings, each cut to `limit`. | FR-PH-03..FR-PH-07 |
-
-`POST /v1/plays` takes only which file was played — never when. The caller
-says *what*, the core says *when* (FR-PH-01), because a client that could name
-the moment could also name one in the middle of last year, and every ranking
-is an aggregate over exactly that column.
-
-The rankings are one route rather than four. They are read together, on one
-screen, and answering them separately would mean four round trips whose
-totals could disagree with each other because each saw a different instant.
+**Removed (moved out of scope, see Orpheus)**
 
 ---
 
@@ -774,7 +666,7 @@ totals could disagree with each other because each saw a different instant.
 | NFR-05 | Security | The system shall never store plaintext passwords and shall never log credentials or tokens. |
 | NFR-06 | Security | The system shall reject every operation that lacks valid authentication from the active auth mode. |
 | NFR-07 | Reliability | The system shall keep soft-deleted records restorable until their retention window elapses; a hard purge shall not remove the on-disk file. |
-| NFR-08 | Functional suitability | The system shall not perform audio re-encoding, video re-encoding, or image manipulation. |
+| NFR-08 | Functional suitability | The system shall not perform video re-encoding, or image manipulation. |
 | NFR-09 | Compatibility | The HTTP/REST-JSON surface and the FFI surface shall return identical results for the same operation (parity). |
 | NFR-10 | Configurability | The soft-delete retention window shall be configurable; its default shall be 30 days. |
 
@@ -792,7 +684,6 @@ totals could disagree with each other because each saw a different instant.
 | Create / update / delete / restore bookmark | ✅ | ❌ |
 | Create / update / delete watchlist and progress | ✅ | ❌ |
 | Create / update / delete reading list and progress | ✅ | ❌ |
-| Create / rename / delete playlist; add / remove / reorder entries | ✅ | ❌ |
 | Local login (local mode) | ✅ (open to verify) | ⚠️ only the login verification endpoint; all other operations denied |
 | Register the local account (local mode) | n/a — no account exists yet to authenticate as | ⚠️ only once, while no local account exists; a second attempt is denied with a conflict (UC-41) |
 | Set or change local credentials (local mode) | ✅ | ❌ |
@@ -853,7 +744,7 @@ The feature identifiers are the milestones the
 | --- | --- |
 | F-00 Foundation and operations | IR-01 through IR-06 (Operations & Infrastructure Document §2) |
 | F-01 File indexing | FR-FC-01 through FR-FC-11, FR-FC-25 through FR-FC-29, FR-FC-31 through FR-FC-35 |
-| F-02 Catalog browsing and metadata editing | FR-FC-12 through FR-FC-18 |
+| F-02 Catalog browsing and metadata editing | FR-FC-12, FR-FC-13, FR-FC-14 through FR-FC-18 |
 | F-03 Renaming and lifecycle management | FR-FC-19 through FR-FC-23 |
 | F-04 Text file content editing | FR-TX-01 through FR-TX-03 |
 | F-05 Collections | FR-CO-01 through FR-CO-08 |
@@ -861,11 +752,11 @@ The feature identifiers are the milestones the
 | F-07 Watchlists | FR-WL-01 through FR-WL-08 |
 | F-08 Reading lists | FR-RL-01 through FR-RL-08 |
 | F-09 Pluggable authentication | FR-AU-01 through FR-AU-24 |
-| F-10 Media playback | FR-MP-01 through FR-MP-07 |
-| F-11 Playlists | FR-TR-01 through FR-TR-11 |
-| F-12 Libraries | FR-FC-36 through FR-FC-41 |
-| F-13 Music enrichment | FR-EN-01 through FR-EN-09 |
-| F-14 Play history | FR-PH-01 through FR-PH-10 |
+| F-10 Media playback | FR-MP-01 through FR-MP-06 |
+| F-11 Playlists | **Removed (moved out of scope, see Orpheus)** |
+| F-12 Libraries | FR-FC-36 through FR-FC-41, FR-FC-43 |
+| F-13 Music enrichment | **Removed (moved out of scope, see Orpheus)** |
+| F-14 Play history | **Removed (moved out of scope, see Orpheus)** |
 
 Dual-transport parity (FR-FC-24, FR-AU-08, FR-MP-06, NFR-09) is not a
 milestone of its own: it is a constraint every feature above satisfies as it

@@ -66,7 +66,13 @@ where
             .ok_or_else(|| DomainError::config("local credentials have not been set"))?;
 
         // AF-02: wrong email or password — denied without logging either.
-        if credential.email != email || !verify_password(password, &credential.password_hash) {
+        //
+        // The password is verified whatever the email was. Short-circuiting on
+        // the email skipped Argon2 for a wrong one, so a wrong email answered
+        // in microseconds and the right one took the hash's full cost: a
+        // stopwatch was enough to learn the account's email.
+        let password_matches = verify_password(password, &credential.password_hash);
+        if credential.email != email || !password_matches {
             return Err(DomainError::Unauthorized);
         }
 

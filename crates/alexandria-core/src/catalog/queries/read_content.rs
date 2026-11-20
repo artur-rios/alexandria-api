@@ -2,6 +2,7 @@ use uuid::Uuid;
 
 use crate::auth::AuthService;
 use crate::catalog::fs::Filesystem;
+use crate::catalog::library_root::LibraryRoot;
 use crate::catalog::model::{FileContent, FileState, FileType};
 use crate::catalog::repos::CatalogRepository;
 use crate::errors::DomainError;
@@ -18,6 +19,9 @@ pub struct ReadTextFileContentHandler<A, R, F> {
     auth: A,
     repo: R,
     fs: F,
+    /// `filesystem.root` (FR-FC-26): a row pointing outside it has its
+    /// bytes neither read nor changed. See `LibraryRoot`.
+    library_root: LibraryRoot,
 }
 
 impl<A, R, F> ReadTextFileContentHandler<A, R, F>
@@ -26,8 +30,13 @@ where
     R: CatalogRepository,
     F: Filesystem,
 {
-    pub fn new(auth: A, repo: R, fs: F) -> Self {
-        Self { auth, repo, fs }
+    pub fn new(auth: A, repo: R, fs: F, library_root: LibraryRoot) -> Self {
+        Self {
+            auth,
+            repo,
+            fs,
+            library_root,
+        }
     }
 
     /// Read the content of the TextFile identified by `uuid`.
@@ -55,6 +64,12 @@ where
                 "file {uuid} is not a text file"
             )));
         }
+
+        // FR-FC-26, defence in depth: indexing and library moves are bounded
+        // by `filesystem.root`, but a row may still point outside it (indexed
+        // before the bound was configured, or through a symbolic link swapped
+        // in since). Refused before the disk is touched.
+        self.library_root.check_file(&file.path)?;
 
         // AF-02: read the bytes at the recorded path.
         let content = self.fs.read_file(&file.path).await?;

@@ -79,7 +79,9 @@ impl CbzComicMetadataReader {
         let mut comic_info_index: Option<usize> = None;
         for i in 0..archive.len() {
             let entry = archive.by_index(i).ok()?;
-            let name = entry.name().to_string();
+            // A name zip 9 cannot decode fails the read, as an unreadable
+            // entry does.
+            let name = entry.name().ok()?.into_owned();
             if name.eq_ignore_ascii_case("ComicInfo.xml") {
                 comic_info_index = Some(i);
                 continue;

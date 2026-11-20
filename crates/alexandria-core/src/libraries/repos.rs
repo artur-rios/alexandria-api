@@ -3,6 +3,7 @@ use sqlx::Row;
 use uuid::Uuid;
 
 use crate::errors::{DomainError, WRITE_TX};
+use crate::libraries::commands::normalize_root;
 use crate::libraries::model::{Library, NewLibrary};
 
 /// Libraries repository port.
@@ -51,21 +52,17 @@ pub trait LibraryRepository: Send + Sync {
     /// Returns the moved library and how many files came with it.
     async fn move_root(&self, uuid: Uuid, new_root: &str) -> Result<(Library, u32), DomainError>;
 
-    /// Attach every active file under the library's root to it.
+    /// Delete the library and its catalog records, answering how many files
+    /// went (libraries-only design, section 3).
     ///
-    /// Run after an index rather than during it: the walk records files
-    /// through the catalog's own path, which knows nothing of libraries, and
-    /// teaching it would thread a concept through every insert for the sake
-    /// of one column. Returns how many files it claimed.
-    async fn claim_files(&self, uuid: Uuid) -> Result<u32, DomainError>;
-
-    /// Delete the library and return its files to the type panels.
-    ///
-    /// The files themselves are untouched: what goes is the grouping. There
-    /// is no foreign key to cascade (SQLite cannot add one through ALTER
-    /// TABLE), so clearing the column is explicit — and it is also what
-    /// makes marking a folder by mistake recoverable.
-    async fn delete(&self, uuid: Uuid) -> Result<(), DomainError>;
+    /// Every file belongs to a library, so a removed library's files have
+    /// nowhere else to be: their rows go, with everything attached to them —
+    /// subtype rows, watch and reading progress (their collection membership
+    /// is a column of the row) — and so do the library's index runs and every
+    /// failure recorded on a path under it. One transaction: nothing here
+    /// cascades, so a delete that stopped halfway would leave rows pointing at
+    /// a library that is gone. Nothing on disk is touched.
+    async fn delete(&self, uuid: Uuid) -> Result<u32, DomainError>;
 }
 
 /// The Sqlite implementation.
@@ -229,14 +226,26 @@ impl LibraryRepository for SqliteLibraryRepository {
         // so a normalized length indexes the stored path exactly — which is
         // what lets `D:\courses\rust\class-01\x.mp4` keep its backslashes
         // below the root while the root itself is replaced wholesale.
-        let old_len = Self::as_prefix(&old_root).len() - 1;
-        let new_root = new_root.trim_end_matches(['/', '\\']).to_string();
+        //
+        // Counted in characters, not bytes: SQLite's `substr` on TEXT counts
+        // characters, so a byte length overshoots by one for every multi-byte
+        // letter in the root (`/media/Música`) and cuts the head off every
+        // path below it — the separator first.
+        let old_len = Self::as_prefix(&old_root).chars().count() - 1;
+        // Two spellings of the new root. The paths below it are rewritten
+        // from the separator onward, so they take the root without its
+        // trailing one (`E:` + `\\a.mp3`); the library itself is stored as
+        // registration stores a root, separator kept where it is the root of
+        // a drive or of the filesystem (`E:\\`, `/`) — `E:` alone is not the
+        // root of drive E, and an empty root would overlap every library.
+        let path_root = new_root.trim_end_matches(['/', '\\']).to_string();
+        let new_root = normalize_root(new_root).to_string();
 
         let moved = sqlx::query(
             "UPDATE files SET path = ? || substr(path, ?) WHERE library_id =
              (SELECT id FROM libraries WHERE uuid = ?)",
         )
-        .bind(&new_root)
+        .bind(&path_root)
         .bind(i64::try_from(old_len).unwrap_or(i64::MAX) + 1)
         .bind(uuid.to_string())
         .execute(&mut *tx)
@@ -282,86 +291,81 @@ impl LibraryRepository for SqliteLibraryRepository {
         ))
     }
 
-    async fn claim_files(&self, uuid: Uuid) -> Result<u32, DomainError> {
-        let mut tx = self
-            .pool
-            .begin_with(WRITE_TX)
-            .await
-            .map_err(|e| DomainError::Disk(e.to_string()))?;
+    async fn delete(&self, uuid: Uuid) -> Result<u32, DomainError> {
+        let disk = |e: sqlx::Error| DomainError::Disk(e.to_string());
+        let mut tx = self.pool.begin_with(WRITE_TX).await.map_err(disk)?;
 
         let library: Option<(i64, String)> =
             sqlx::query_as("SELECT id, root_path FROM libraries WHERE uuid = ?")
                 .bind(uuid.to_string())
                 .fetch_optional(&mut *tx)
                 .await
-                .map_err(|e| DomainError::Disk(e.to_string()))?;
+                .map_err(disk)?;
         let Some((id, root_path)) = library else {
             return Err(DomainError::NotFound);
         };
 
-        // `substr(…) = ?` rather than `LIKE`: see `find_overlapping` for why.
-        // The short version is that `LIKE` is case-insensitive over ASCII, so
-        // this claimed every file under `/media/Photos` for a library rooted
-        // at `/media/photos` — and `BrowseLibraryHandler` then dropped every
-        // one of them from the tree, because its `strip_prefix` is not. A
-        // file claimed by a library that cannot list it is reachable from
-        // nowhere but search.
-        let prefix = Self::as_prefix(&root_path);
-        let claimed = sqlx::query(
-            "UPDATE files SET library_id = ?
-             WHERE library_id IS NULL
-               AND substr(replace(path, '\\', '/'), 1, length(?)) = ?",
+        // The rows that hold a file id: the progress tables have no FOREIGN
+        // KEY, and the subtype tables' cascade only runs with foreign keys on,
+        // which this does not rely on.
+        for sql in [
+            "DELETE FROM reading_progress WHERE item_file_id IN (SELECT id FROM files WHERE library_id = ?)",
+            "DELETE FROM watch_progress WHERE video_file_id IN (SELECT id FROM files WHERE library_id = ?)",
+            "DELETE FROM video_files WHERE file_id IN (SELECT id FROM files WHERE library_id = ?)",
+            "DELETE FROM html_pages WHERE file_id IN (SELECT id FROM files WHERE library_id = ?)",
+            "DELETE FROM text_files WHERE file_id IN (SELECT id FROM files WHERE library_id = ?)",
+            "DELETE FROM documents WHERE file_id IN (SELECT id FROM files WHERE library_id = ?)",
+            "DELETE FROM comic_books WHERE file_id IN (SELECT id FROM files WHERE library_id = ?)",
+            "DELETE FROM images WHERE file_id IN (SELECT id FROM files WHERE library_id = ?)",
+            "DELETE FROM audio_files WHERE file_id IN (SELECT id FROM files WHERE library_id = ?)",
+        ] {
+            sqlx::query(sql).bind(id).execute(&mut *tx).await.map_err(disk)?;
+        }
+
+        let removed = sqlx::query("DELETE FROM files WHERE library_id = ?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await
+            .map_err(disk)?
+            .rows_affected();
+
+        // The library's own runs and their failures, then the failures any
+        // other run (a refresh) recorded under its folder: those files are
+        // not in the catalog any more. The same separator-safe prefix test
+        // `find_overlapping` uses, so `/media/course` does not take
+        // `/media/course-notes` with it.
+        sqlx::query(
+            "DELETE FROM catalog_run_failures \
+             WHERE run_id IN (SELECT id FROM catalog_runs WHERE library_id = ?)",
         )
         .bind(id)
+        .execute(&mut *tx)
+        .await
+        .map_err(disk)?;
+        let prefix = Self::as_prefix(&root_path);
+        sqlx::query(
+            "DELETE FROM catalog_run_failures \
+             WHERE substr(replace(path, '\\', '/'), 1, length(?)) = ?",
+        )
         .bind(&prefix)
         .bind(&prefix)
         .execute(&mut *tx)
         .await
-        .map_err(|e| DomainError::Disk(e.to_string()))?
-        .rows_affected();
-
-        tx.commit()
-            .await
-            .map_err(|e| DomainError::Disk(e.to_string()))?;
-
-        Ok(u32::try_from(claimed).unwrap_or(u32::MAX))
-    }
-
-    async fn delete(&self, uuid: Uuid) -> Result<(), DomainError> {
-        let mut tx = self
-            .pool
-            .begin_with(WRITE_TX)
-            .await
-            .map_err(|e| DomainError::Disk(e.to_string()))?;
-
-        let id: Option<i64> = sqlx::query_scalar("SELECT id FROM libraries WHERE uuid = ?")
-            .bind(uuid.to_string())
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(|e| DomainError::Disk(e.to_string()))?;
-        let Some(id) = id else {
-            return Err(DomainError::NotFound);
-        };
-
-        // Released before the library row goes, and in the same transaction:
-        // nothing cascades here, so a delete that failed halfway would leave
-        // files pointing at a library that no longer exists — invisible to
-        // every listing, since they are excluded by the column being set.
-        sqlx::query("UPDATE files SET library_id = NULL WHERE library_id = ?")
+        .map_err(disk)?;
+        sqlx::query("DELETE FROM catalog_runs WHERE library_id = ?")
             .bind(id)
             .execute(&mut *tx)
             .await
-            .map_err(|e| DomainError::Disk(e.to_string()))?;
+            .map_err(disk)?;
 
         sqlx::query("DELETE FROM libraries WHERE id = ?")
             .bind(id)
             .execute(&mut *tx)
             .await
-            .map_err(|e| DomainError::Disk(e.to_string()))?;
+            .map_err(disk)?;
 
-        tx.commit()
-            .await
-            .map_err(|e| DomainError::Disk(e.to_string()))
+        tx.commit().await.map_err(disk)?;
+        Ok(u32::try_from(removed).unwrap_or(u32::MAX))
     }
 }
 

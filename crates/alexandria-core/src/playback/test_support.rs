@@ -15,7 +15,7 @@ use uuid::Uuid;
 
 use crate::auth::{AuthService, Principal};
 use crate::catalog::model::{
-    File, FileState, FileType, FileView, LibraryScope, NewFile, StateFilter, SubtypeMetadata,
+    File, FileState, FileType, FileView, NewFile, StateFilter, SubtypeMetadata,
 };
 use crate::catalog::repos::CatalogRepository;
 use crate::config::AuthMode;
@@ -138,7 +138,7 @@ impl CatalogRepository for FakeRepo {
         _file_type: Option<FileType>,
         _state: StateFilter,
         _collection_uuid: Option<Uuid>,
-        _scope: LibraryScope,
+        _library_uuid: Option<Uuid>,
     ) -> Result<Vec<File>, DomainError> {
         unimplemented!()
     }
@@ -156,7 +156,7 @@ impl CatalogRepository for FakeRepo {
         _file_type: Option<FileType>,
         _state: StateFilter,
         _collection_uuid: Option<Uuid>,
-        _scope: LibraryScope,
+        _library_uuid: Option<Uuid>,
     ) -> Result<Vec<FileView>, DomainError> {
         unimplemented!()
     }
@@ -213,6 +213,10 @@ impl CatalogRepository for FakeRepo {
         unimplemented!()
     }
 
+    async fn find_audio_duration(&self, _uuid: Uuid) -> Result<Option<f64>, DomainError> {
+        unimplemented!()
+    }
+
     async fn set_comic_page_count(&self, _uuid: Uuid, _page_count: i64) -> Result<(), DomainError> {
         unimplemented!()
     }
@@ -243,10 +247,6 @@ impl CatalogRepository for FakeRepo {
     }
 
     async fn purge(&self, _uuid: Uuid) -> Result<(), DomainError> {
-        unimplemented!()
-    }
-
-    async fn forget_derived_content(&self, _uuid: Uuid) -> Result<(), DomainError> {
         unimplemented!()
     }
 

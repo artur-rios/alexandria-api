@@ -1,5 +1,6 @@
 pub mod commands;
 pub mod heimdall;
+pub mod jwks;
 pub mod local;
 pub mod password;
 pub mod recovery;

@@ -5,7 +5,7 @@ use sqlx::sqlite::SqlitePool;
 use uuid::Uuid;
 
 use crate::catalog::model::{
-    File, FileState, FileType, FileView, FormatKind, LibraryScope, MediaKind, NewFile, StateFilter,
+    File, FileState, FileType, FileView, FormatKind, MediaKind, NewFile, StateFilter,
     SubtypeMetadata,
 };
 use crate::errors::{DomainError, WRITE_TX};
@@ -68,7 +68,7 @@ pub trait CatalogRepository: Send + Sync {
     /// `missing_at`; leaves `state` (soft-delete is UC-06) and `deleted_at`.
     async fn mark_missing(&self, path: &str, missing_at: DateTime<Utc>) -> Result<(), DomainError>;
     /// Replace the editable subtype columns of the file identified by `uuid`
-    /// (UC-04 / FR-FC-14..18). Full replace: every editable column listed in
+    /// (UC-04 / FR-FC-15..18). Full replace: every editable column listed in
     /// `SubtypeMetadata` is written, `None` writes `NULL`. Non-editable
     /// columns (`episodeCount`, `pageCount`, `width`, `height`, `sourceUrl`,
     /// `savedAt`) are left untouched. Returns `NotFound` when no file row
@@ -123,7 +123,7 @@ pub trait CatalogRepository: Send + Sync {
         file_type: Option<FileType>,
         state: StateFilter,
         collection_uuid: Option<Uuid>,
-        scope: LibraryScope,
+        library_uuid: Option<Uuid>,
     ) -> Result<Vec<File>, DomainError>;
 
     /// List files filtered exactly as `list_filtered`, but answering the
@@ -142,14 +142,14 @@ pub trait CatalogRepository: Send + Sync {
     /// memory. A listing filtered to one type costs two queries (the files
     /// query plus one subtype batch) whatever its size, or more only when
     /// chunking splits that one batch across several `IN` lists; a mixed
-    /// listing costs one query per subtype present, bounded by the five
+    /// listing costs one query per subtype present, bounded by the four
     /// subtypes that carry `SubtypeMetadata` (Text/Html never register).
     async fn list_filtered_view(
         &self,
         file_type: Option<FileType>,
         state: StateFilter,
         collection_uuid: Option<Uuid>,
-        scope: LibraryScope,
+        library_uuid: Option<Uuid>,
     ) -> Result<Vec<FileView>, DomainError>;
 
     /// The uuid of the library the file `uuid` identifies belongs to, or
@@ -230,7 +230,13 @@ pub trait CatalogRepository: Send + Sync {
     /// duration).
     async fn find_video_duration(&self, uuid: Uuid) -> Result<Option<f64>, DomainError>;
 
-    /// Write an audio file's duration in seconds (music enrichment design).
+    /// Read an audio file's duration in seconds, if one was read from the
+    /// stream. `None` when the file doesn't exist, isn't audio, or the column
+    /// is still `NULL`. The single-file twin of what the listing's audio
+    /// batch answers, so a file read alone says what its listing row says.
+    async fn find_audio_duration(&self, uuid: Uuid) -> Result<Option<f64>, DomainError>;
+
+    /// Write an audio file's duration in seconds.
     /// Its own call rather than a `SubtypeMetadata::Audio` field for the same
     /// reason `set_video_duration` is: how long the audio actually runs is a
     /// property of the stream, not a claim the owner may correct (UC-04).
@@ -303,27 +309,6 @@ pub trait CatalogRepository: Send + Sync {
     /// with `InvalidState`); the repository defends the `NotFound` invariant.
     async fn purge(&self, uuid: Uuid) -> Result<(), DomainError>;
 
-    /// Drop what was measured or fetched from a file's *bytes*, because those
-    /// bytes have changed (UC-02).
-    ///
-    /// The energy envelope (FR-MP-07) and the fetched lyrics are both keyed
-    /// by `files.id` and both describe one particular recording. Neither is
-    /// re-derived on its own: energy is measured once and answered from
-    /// storage ever after, and a settled lyrics row is never looked up again.
-    /// So a file re-encoded, retagged in place, or simply replaced at the
-    /// same path kept the previous recording's envelope and the previous
-    /// track's words — the player animating one song's spectrum over another,
-    /// which is exactly the hazard `purge` guards against for a reused row id
-    /// and which needs no purge to happen.
-    ///
-    /// Deliberately *not* the extracted tags: those are re-read and merged by
-    /// the refresh itself, and merging keeps the owner's own edits. These two
-    /// are not the owner's, and there is nothing in them to keep.
-    ///
-    /// A file with neither is the normal case, so removing nothing is
-    /// success, not `NotFound`.
-    async fn forget_derived_content(&self, uuid: Uuid) -> Result<(), DomainError>;
-
     /// Link the file identified by `uuid` to the collection identified by
     /// `collection_uuid` (UC-13 / FR-CO-05). The caller has already confirmed
     /// both exist and that the collection is `kind = file`.
@@ -364,7 +349,7 @@ impl SqliteCatalogRepository {
     /// This is belt-and-braces, not a necessity: the subtype tables declare
     /// `FOREIGN KEY (file_id) REFERENCES files (id) ON DELETE CASCADE`, and the
     /// cascade **is** live, because sqlx sets `PRAGMA foreign_keys = ON` on
-    /// every connection it opens (pinned by a test in `tests/migrations.rs`).
+    /// every connection it opens (pinned by a test in `tests/migrations/mod.rs`).
     ///
     /// The explicit delete stays because it makes the purge self-contained
     /// rather than dependent on a pragma default that sqlx could change. What
@@ -433,16 +418,20 @@ impl SqliteCatalogRepository {
         let views = files
             .into_iter()
             .map(|(id, file, library_uuid)| match file.file_type {
-                FileType::Audio => FileView {
-                    file,
-                    library_uuid,
-                    metadata: audio.get(&id).cloned(),
-                    width: None,
-                    height: None,
-                    page_count: None,
-                    duration_seconds: None,
-                    comic_page_count: None,
-                },
+                FileType::Audio => {
+                    let (metadata, duration_seconds) =
+                        audio.get(&id).cloned().unwrap_or((None, None));
+                    FileView {
+                        file,
+                        library_uuid,
+                        metadata,
+                        width: None,
+                        height: None,
+                        page_count: None,
+                        duration_seconds,
+                        comic_page_count: None,
+                    }
+                }
                 FileType::Video => {
                     let (metadata, duration_seconds) =
                         video.get(&id).cloned().unwrap_or((None, None));
@@ -556,15 +545,15 @@ impl SqliteCatalogRepository {
     /// FR-CO-07's real collection filter, when it lands, edits this once
     /// rather than two call sites that happen to agree today.
     ///
-    /// `file_type` and `collection_uuid` only need to be checked for
-    /// presence here — the caller binds their actual values in the same
-    /// order this appends the placeholders (`type = ?` before the
-    /// collection subquery's `?`).
+    /// `file_type`, `collection_uuid` and `library_uuid` only need to be
+    /// checked for presence here — the caller binds their actual values in
+    /// the same order this appends the placeholders (`type = ?`, then the
+    /// collection subquery's `?`, then the library's).
     fn list_filter_where_clause(
         file_type: Option<FileType>,
         state: StateFilter,
         collection_uuid: Option<Uuid>,
-        scope: LibraryScope,
+        library_uuid: Option<Uuid>,
     ) -> String {
         // The filters are enumerated (not user strings), so there is no SQL
         // injection surface here — every value below is still bound as a
@@ -595,21 +584,11 @@ impl SqliteCatalogRepository {
             conj = " AND ";
         }
 
-        // Files in a library are browsed as that library's tree and nowhere
-        // else (libraries design section 3) — unless the caller has asked
-        // for everything the catalog holds.
-        //
-        // Carried by the filter rather than by which function was called,
-        // and defaulting to the exclusion, so that forgetting to say
-        // anything gives the type-panel behaviour rather than leaking a
-        // course into it. What the exclusion must NOT do is hide these files
-        // from callers that are not browsing: this application's search and
-        // its deleted-items review are both built from this listing, and an
-        // unconditional exclusion made a library's files unfindable and a
-        // deleted one unrestorable (FR-FC-38).
-        if matches!(scope, LibraryScope::OutsideLibraries) {
+        // One library's files, for a search or a trash review within it. A
+        // uuid that names no library matches no files, as a collection's does.
+        if library_uuid.is_some() {
             sql.push_str(conj);
-            sql.push_str("library_id IS NULL");
+            sql.push_str("library_id = (SELECT id FROM libraries WHERE uuid = ?)");
         }
 
         sql.push_str(" ORDER BY path");
@@ -634,12 +613,16 @@ impl SqliteCatalogRepository {
     /// An id with no `audio_files` row at all (should not happen while the
     /// indexer keeps the two in lockstep, but the caller does not rely on
     /// that) is likewise simply absent.
-    async fn batch_audio(&self, ids: &[i64]) -> Result<HashMap<i64, SubtypeMetadata>, DomainError> {
+    #[allow(clippy::type_complexity)]
+    async fn batch_audio(
+        &self,
+        ids: &[i64],
+    ) -> Result<HashMap<i64, (Option<SubtypeMetadata>, Option<f64>)>, DomainError> {
         let mut out = HashMap::new();
         for chunk in ids.chunks(MAX_SQLITE_PARAMS) {
             let sql = format!(
-                "SELECT file_id, title, artist, album, year, genre, track, album_artist \
-                 FROM audio_files WHERE file_id IN ({})",
+                "SELECT file_id, title, artist, album, year, genre, track, album_artist, \
+                 duration_seconds FROM audio_files WHERE file_id IN ({})",
                 Self::in_placeholders(chunk)
             );
             let mut query = sqlx::query_as::<_, AudioBatchRow>(sqlx::AssertSqlSafe(sql));
@@ -647,7 +630,8 @@ impl SqliteCatalogRepository {
                 query = query.bind(id);
             }
             let rows = query.fetch_all(&self.pool).await?;
-            for (file_id, title, artist, album, year, genre, track, album_artist) in rows {
+            for (file_id, title, artist, album, year, genre, track, album_artist, duration) in rows
+            {
                 let all_none = title.is_none()
                     && artist.is_none()
                     && album.is_none()
@@ -655,20 +639,18 @@ impl SqliteCatalogRepository {
                     && genre.is_none()
                     && track.is_none()
                     && album_artist.is_none();
-                if !all_none {
-                    out.insert(
-                        file_id,
-                        SubtypeMetadata::Audio {
-                            title,
-                            artist,
-                            album,
-                            year,
-                            genre,
-                            track,
-                            album_artist,
-                        },
-                    );
-                }
+                // As for video: the metadata half is `None` when every tag is,
+                // and the duration is reported as read, whatever the tags.
+                let metadata = (!all_none).then_some(SubtypeMetadata::Audio {
+                    title,
+                    artist,
+                    album,
+                    year,
+                    genre,
+                    track,
+                    album_artist,
+                });
+                out.insert(file_id, (metadata, duration));
             }
         }
         Ok(out)
@@ -913,6 +895,7 @@ type AudioBatchRow = (
     Option<String>,
     Option<i64>,
     Option<String>,
+    Option<f64>,
 );
 type VideoBatchRow = (
     i64,
@@ -971,51 +954,24 @@ impl CatalogRepository for SqliteCatalogRepository {
     async fn insert_file(&self, new_file: NewFile) -> Result<File, DomainError> {
         let mut tx = self.pool.begin_with(WRITE_TX).await?;
 
+        // Every file belongs to a library (libraries-only design), and it is
+        // the one the caller names — the run's own, for an index walk — not
+        // one worked out from the path. Checked first, inside the same
+        // transaction, so an unknown library is the caller's mistake reported
+        // as such rather than a NOT NULL failure from the column below.
+        let library_id: Option<i64> = sqlx::query_scalar("SELECT id FROM libraries WHERE uuid = ?")
+            .bind(new_file.library_uuid.to_string())
+            .fetch_optional(&mut *tx)
+            .await?;
+        let Some(library_id) = library_id else {
+            return Err(DomainError::InvalidInput("unknown library".to_string()));
+        };
+
         sqlx::query(
-            // `library_id` is resolved here, by the insert itself, rather
-            // than claimed afterwards by whatever ran the walk. A file
-            // indexed into an existing library belongs to it from the moment
-            // it exists — and a rule the database applies is one no future
-            // index path can forget to apply (libraries design section 1).
-            //
-            // The trailing separator is what stops `/library/course` from
-            // claiming `/library/course-notes`: a different folder that
-            // merely starts with the same letters.
-            //
-            // Both sides are compared with forward slashes, because on
-            // Windows a file's path is `D:\course\class-01\lecture.mp4`
-            // and the root it sits under is `D:\course` — and a prefix test
-            // that appended `/` to a backslash path matched nothing at all,
-            // so a library there silently claimed no file it had.
-            //
-            // A `substr` prefix test rather than `LIKE`, matching
-            // `LibraryRepository::claim_files` and `find_overlapping` — the
-            // three have to agree, since between them they decide the same
-            // question at insert time, at registration, and at overlap. Two
-            // reasons, and the second is why this stopped being `LIKE`:
-            // `LIKE`'s `_` and `%` are wildcards, so a library at
-            // `/media/tv_shows` claimed every file under `/media/tv-shows`;
-            // and `LIKE` is case-insensitive over ASCII, so one at
-            // `/media/photos` claimed everything under `/media/Photos` — a
-            // different folder on every filesystem but Windows's, and one
-            // whose files `BrowseLibraryHandler` then could not list, because
-            // its own `strip_prefix` is case-sensitive. `=` compares under
-            // the column's BINARY collation, which agrees with that.
-            //
-            // `ORDER BY` pairs with the `LIMIT`: overlapping libraries are
-            // refused at registration, and if one ever slips through, the
-            // file lands in the same one on every insert rather than in
-            // whichever row the planner reached first.
             "INSERT INTO files \
              (uuid, path, name, type, content_hash, size_bytes, mtime, state, deleted_at, \
              indexed_at, missing_at, library_id) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, 'active', NULL, ?, NULL, \
-             (SELECT id FROM libraries \
-              WHERE substr(replace(?, '\\', '/'), 1, \
-                           length(rtrim(replace(root_path, '\\', '/'), '/') || '/')) \
-                    = (rtrim(replace(root_path, '\\', '/'), '/') || '/') \
-              ORDER BY length(root_path) DESC, id \
-              LIMIT 1))",
+             VALUES (?, ?, ?, ?, ?, ?, ?, 'active', NULL, ?, NULL, ?)",
         )
         .bind(new_file.uuid.to_string())
         .bind(&new_file.path)
@@ -1025,8 +981,7 @@ impl CatalogRepository for SqliteCatalogRepository {
         .bind(new_file.size_bytes)
         .bind(new_file.mtime.map(|t| t.to_rfc3339()))
         .bind(new_file.indexed_at.to_rfc3339())
-        // The path a second time, for the library subquery above.
-        .bind(&new_file.path)
+        .bind(library_id)
         .execute(&mut *tx)
         .await?;
 
@@ -1406,7 +1361,7 @@ impl CatalogRepository for SqliteCatalogRepository {
         file_type: Option<FileType>,
         state: StateFilter,
         collection_uuid: Option<Uuid>,
-        scope: LibraryScope,
+        library_uuid: Option<Uuid>,
     ) -> Result<Vec<File>, DomainError> {
         // Build the query dynamically based on which filters are active —
         // see `list_filter_where_clause`.
@@ -1418,7 +1373,7 @@ impl CatalogRepository for SqliteCatalogRepository {
             file_type,
             state,
             collection_uuid,
-            scope,
+            library_uuid,
         ));
 
         // sqlx 0.9 refuses a runtime-built SQL string unless the caller asserts
@@ -1435,6 +1390,10 @@ impl CatalogRepository for SqliteCatalogRepository {
             Some(u) => query.bind(u.to_string()),
             None => query,
         };
+        let query = match library_uuid {
+            Some(u) => query.bind(u.to_string()),
+            None => query,
+        };
 
         let rows = query.fetch_all(&self.pool).await?;
         rows.into_iter().map(parse_file_row).collect()
@@ -1445,7 +1404,7 @@ impl CatalogRepository for SqliteCatalogRepository {
         file_type: Option<FileType>,
         state: StateFilter,
         collection_uuid: Option<Uuid>,
-        scope: LibraryScope,
+        library_uuid: Option<Uuid>,
     ) -> Result<Vec<FileView>, DomainError> {
         // Same filter, built by the same helper `list_filtered` uses, with
         // `id` selected alongside the public columns — the subtype batches
@@ -1463,7 +1422,7 @@ impl CatalogRepository for SqliteCatalogRepository {
             file_type,
             state,
             collection_uuid,
-            scope,
+            library_uuid,
         ));
 
         // See `list_filtered`'s matching comment: `sql` is assembled only
@@ -1474,6 +1433,10 @@ impl CatalogRepository for SqliteCatalogRepository {
             None => query,
         };
         let query = match collection_uuid {
+            Some(u) => query.bind(u.to_string()),
+            None => query,
+        };
+        let query = match library_uuid {
             Some(u) => query.bind(u.to_string()),
             None => query,
         };
@@ -1837,6 +1800,18 @@ impl CatalogRepository for SqliteCatalogRepository {
         Ok(())
     }
 
+    async fn find_audio_duration(&self, uuid: Uuid) -> Result<Option<f64>, DomainError> {
+        let row: Option<(Option<f64>,)> = sqlx::query_as(
+            "SELECT a.duration_seconds FROM audio_files a \
+             JOIN files f ON f.id = a.file_id \
+             WHERE f.uuid = ? AND f.type = 'audio'",
+        )
+        .bind(uuid.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.and_then(|(d,)| d))
+    }
+
     async fn find_video_duration(&self, uuid: Uuid) -> Result<Option<f64>, DomainError> {
         let row: Option<(i64, String)> =
             sqlx::query_as("SELECT id, type FROM files WHERE uuid = ?")
@@ -2081,15 +2056,14 @@ impl CatalogRepository for SqliteCatalogRepository {
             .await?;
 
         // The progress rows that tracked this file go with it. Unlike the
-        // subtype tables, `watch_progress`, `reading_progress`, and
-        // `playlist_entries` declare no foreign key (SQLite cannot add one
-        // via `ALTER TABLE`), so the cascade that covers the subtype row does
-        // not reach them — see `delete_subtype_sql`. Without these
-        // statements a purged video/document/comic/track leaves rows
-        // pointing at a `files.id` that no longer exists: invisible to
-        // UC-21/UC-27 and the playlist read, which inner-join `files`, but
-        // permanently orphaned. A zero-row DELETE is the normal case here,
-        // not an error.
+        // subtype tables, `watch_progress` and `reading_progress` declare no
+        // foreign key (SQLite cannot add one via `ALTER TABLE`), so the
+        // cascade that covers the subtype row does not reach them — see
+        // `delete_subtype_sql`. Without these statements a purged
+        // video/document/comic/track leaves rows pointing at a `files.id`
+        // that no longer exists: invisible to UC-21/UC-27, which inner-join
+        // `files`, but permanently orphaned. A zero-row DELETE is the normal
+        // case here, not an error.
         sqlx::query("DELETE FROM watch_progress WHERE video_file_id = ?")
             .bind(id)
             .execute(&mut *tx)
@@ -2099,82 +2073,6 @@ impl CatalogRepository for SqliteCatalogRepository {
             .bind(id)
             .execute(&mut *tx)
             .await?;
-
-        // The same obligation for the lyrics fetched against this file
-        // (music enrichment design). `track_lyrics` carries no foreign key
-        // for the identical reason, so a purge that forgot this would leave
-        // a row holding lyrics for a `files.id` that no longer exists -- and
-        // a later file reusing that autoincrement id would inherit them,
-        // which is worse than an orphan: it is the wrong words shown
-        // confidently against the wrong track.
-        //
-        // `artist_images` is deliberately NOT touched here. It is keyed by
-        // artist name, not by file, and one purged track does not mean the
-        // artist has left the library -- deleting their photograph because
-        // one of their files was purged would throw away a lookup every
-        // other track by them still uses.
-        sqlx::query("DELETE FROM track_lyrics WHERE file_id = ?")
-            .bind(id)
-            .execute(&mut *tx)
-            .await?;
-
-        // And the same for the sound of it (UC-21). `track_energy` is keyed
-        // by `files.id` and carries no foreign key either, so the levels of a
-        // purged track would otherwise be drawn for whatever file inherited
-        // its autoincrement id -- one track's music, animated against
-        // another's.
-        sqlx::query("DELETE FROM track_energy WHERE file_id = ?")
-            .bind(id)
-            .execute(&mut *tx)
-            .await?;
-
-        // Collect the playlists this file's entries belong to *before*
-        // deleting them -- once the rows are gone there is nothing left to
-        // read `playlist_id` off of. A file can sit in more than one
-        // playlist, and more than once in the same one (no `UNIQUE
-        // (playlist_id, file_id)`), so this is a distinct list, not one
-        // playlist_id per entry.
-        let affected_playlists: Vec<(i64,)> =
-            sqlx::query_as("SELECT DISTINCT playlist_id FROM playlist_entries WHERE file_id = ?")
-                .bind(id)
-                .fetch_all(&mut *tx)
-                .await?;
-
-        sqlx::query("DELETE FROM playlist_entries WHERE file_id = ?")
-            .bind(id)
-            .execute(&mut *tx)
-            .await?;
-
-        // The DELETE above can punch one or more holes in each affected
-        // playlist's position sequence -- unlike `remove_entry`, which
-        // removes exactly one row and can shift everything after it down
-        // by one, a purge may remove several entries (the same file
-        // appearing more than once, or several purges since the playlist
-        // was last touched) at scattered positions. Re-reading each
-        // playlist's remaining entries in position order and rewriting
-        // them to `0..n-1` closes every gap at once, the same read-move-
-        // rewrite approach `PlaylistRepository::move_entry` uses, rather
-        // than computing which positions shift by how much. Without this,
-        // FR-TR-09's contiguity guarantee holds for every mutation except
-        // this one -- positions never return to `0..n-1` on their own, and
-        // nothing else in this schema renumbers past what the removal
-        // itself already touched.
-        for (playlist_id,) in affected_playlists {
-            let remaining: Vec<(i64,)> = sqlx::query_as(
-                "SELECT id FROM playlist_entries WHERE playlist_id = ? ORDER BY position",
-            )
-            .bind(playlist_id)
-            .fetch_all(&mut *tx)
-            .await?;
-
-            for (position, (entry_id,)) in remaining.into_iter().enumerate() {
-                sqlx::query("UPDATE playlist_entries SET position = ? WHERE id = ?")
-                    .bind(position as i64)
-                    .bind(entry_id)
-                    .execute(&mut *tx)
-                    .await?;
-            }
-        }
 
         let affected = sqlx::query("DELETE FROM files WHERE id = ?")
             .bind(id)
@@ -2186,36 +2084,6 @@ impl CatalogRepository for SqliteCatalogRepository {
                 "purge matched zero rows for uuid {uuid}"
             )));
         }
-
-        tx.commit().await?;
-        Ok(())
-    }
-
-    async fn forget_derived_content(&self, uuid: Uuid) -> Result<(), DomainError> {
-        // One transaction, because the two belong to the same fact: the
-        // bytes this row describes are not the bytes those rows were made
-        // from. Half of that applied would leave a track whose words are the
-        // old song's and whose envelope is the new one's.
-        //
-        // Both are `WHERE file_id = (SELECT id …)`, so a uuid naming no file
-        // deletes nothing and still succeeds — the caller is a refresh
-        // walking rows it has just read, and it has nothing to do with a
-        // `NotFound` here that a concurrent purge could produce.
-        let mut tx = self.pool.begin_with(WRITE_TX).await?;
-
-        sqlx::query(
-            "DELETE FROM track_lyrics WHERE file_id = (SELECT id FROM files WHERE uuid = ?)",
-        )
-        .bind(uuid.to_string())
-        .execute(&mut *tx)
-        .await?;
-
-        sqlx::query(
-            "DELETE FROM track_energy WHERE file_id = (SELECT id FROM files WHERE uuid = ?)",
-        )
-        .bind(uuid.to_string())
-        .execute(&mut *tx)
-        .await?;
 
         tx.commit().await?;
         Ok(())
