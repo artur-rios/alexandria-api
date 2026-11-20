@@ -13,7 +13,10 @@ use alexandria_core::migrate::migrate_database;
 use chrono::Utc;
 use uuid::Uuid;
 
-use crate::common::FakeAuth;
+use alexandria_core::catalog::library_root::LibraryRoot;
+use alexandria_core::catalog::runs::{RunPriority, SqliteCatalogRunRepository};
+
+use crate::common::{AlwaysStartsRun, FakeAuth};
 
 const ROOT: &str = "/library/course";
 
@@ -62,9 +65,12 @@ async fn given_a_registered_library_when_the_videos_are_listed_then_its_files_ar
     RegisterLibraryHandler::new(
         FakeAuth::Allowing,
         SqliteLibraryRepository::new(pool.clone()),
+        AlwaysStartsRun,
+        LibraryRoot::unconfigured(),
     )
-    .register("Course", ROOT, "token")
+    .register("Course", ROOT, RunPriority::Normal, "token")
     .await
+    .map(|registered| registered.library)
     .expect("register");
 
     let listed = catalog
@@ -96,9 +102,12 @@ async fn given_a_library_when_it_is_removed_then_its_files_come_back() {
     let library = RegisterLibraryHandler::new(
         FakeAuth::Allowing,
         SqliteLibraryRepository::new(pool.clone()),
+        AlwaysStartsRun,
+        LibraryRoot::unconfigured(),
     )
-    .register("Course", ROOT, "token")
+    .register("Course", ROOT, RunPriority::Normal, "token")
     .await
+    .map(|registered| registered.library)
     .expect("register");
 
     RemoveLibraryHandler::new(
@@ -130,15 +139,24 @@ async fn given_an_overlapping_folder_when_registered_then_it_is_refused_by_name(
     let handler = RegisterLibraryHandler::new(
         FakeAuth::Allowing,
         SqliteLibraryRepository::new(pool.clone()),
+        AlwaysStartsRun,
+        LibraryRoot::unconfigured(),
     );
     handler
-        .register("Course", ROOT, "token")
+        .register("Course", ROOT, RunPriority::Normal, "token")
         .await
+        .map(|registered| registered.library)
         .expect("register");
 
     let nested = handler
-        .register("Week one", "/library/course/class-01", "token")
-        .await;
+        .register(
+            "Week one",
+            "/library/course/class-01",
+            RunPriority::Normal,
+            "token",
+        )
+        .await
+        .map(|registered| registered.library);
 
     match nested {
         Err(DomainError::Conflict(message)) => assert!(message.contains("Course"), "{message}"),
@@ -155,15 +173,24 @@ async fn given_a_sibling_folder_with_a_shared_prefix_when_registered_then_it_is_
     let handler = RegisterLibraryHandler::new(
         FakeAuth::Allowing,
         SqliteLibraryRepository::new(pool.clone()),
+        AlwaysStartsRun,
+        LibraryRoot::unconfigured(),
     );
     handler
-        .register("Course", ROOT, "token")
+        .register("Course", ROOT, RunPriority::Normal, "token")
         .await
+        .map(|registered| registered.library)
         .expect("first");
 
     let sibling = handler
-        .register("Notes", "/library/course-notes", "token")
-        .await;
+        .register(
+            "Notes",
+            "/library/course-notes",
+            RunPriority::Normal,
+            "token",
+        )
+        .await
+        .map(|registered| registered.library);
 
     assert!(sibling.is_ok(), "a sibling folder was refused: {sibling:?}");
 }
@@ -183,9 +210,12 @@ async fn given_a_root_holding_an_underscore_when_it_claims_then_a_sibling_is_lef
     let library = RegisterLibraryHandler::new(
         FakeAuth::Allowing,
         SqliteLibraryRepository::new(pool.clone()),
+        AlwaysStartsRun,
+        LibraryRoot::unconfigured(),
     )
-    .register("Shows", "/library/tv_shows", "token")
+    .register("Shows", "/library/tv_shows", RunPriority::Normal, "token")
     .await
+    .map(|registered| registered.library)
     .expect("register");
 
     let listing = BrowseLibraryHandler::new(
@@ -233,9 +263,12 @@ async fn given_a_root_holding_an_underscore_when_a_sibling_is_indexed_then_it_is
     RegisterLibraryHandler::new(
         FakeAuth::Allowing,
         SqliteLibraryRepository::new(pool.clone()),
+        AlwaysStartsRun,
+        LibraryRoot::unconfigured(),
     )
-    .register("Shows", "/library/tv_shows", "token")
+    .register("Shows", "/library/tv_shows", RunPriority::Normal, "token")
     .await
+    .map(|registered| registered.library)
     .expect("register");
 
     let stranger = insert(&catalog, "/library/tv-shows/theirs.mkv", FileType::Video).await;
@@ -265,15 +298,24 @@ async fn given_a_padded_path_when_registered_then_the_overlap_is_still_refused()
     let handler = RegisterLibraryHandler::new(
         FakeAuth::Allowing,
         SqliteLibraryRepository::new(pool.clone()),
+        AlwaysStartsRun,
+        LibraryRoot::unconfigured(),
     );
     handler
-        .register("Course", ROOT, "token")
+        .register("Course", ROOT, RunPriority::Normal, "token")
         .await
+        .map(|registered| registered.library)
         .expect("register");
 
     let nested = handler
-        .register("Week one", "  /library/course/class-01  ", "token")
-        .await;
+        .register(
+            "Week one",
+            "  /library/course/class-01  ",
+            RunPriority::Normal,
+            "token",
+        )
+        .await
+        .map(|registered| registered.library);
 
     match nested {
         Err(DomainError::Conflict(message)) => assert!(message.contains("Course"), "{message}"),
@@ -298,9 +340,12 @@ async fn given_files_already_indexed_when_a_library_is_registered_then_they_are_
     let library = RegisterLibraryHandler::new(
         FakeAuth::Allowing,
         SqliteLibraryRepository::new(pool.clone()),
+        AlwaysStartsRun,
+        LibraryRoot::unconfigured(),
     )
-    .register("Course", ROOT, "token")
+    .register("Course", ROOT, RunPriority::Normal, "token")
     .await
+    .map(|registered| registered.library)
     .expect("register");
 
     let listing = BrowseLibraryHandler::new(
@@ -330,9 +375,12 @@ async fn given_a_library_when_a_file_is_indexed_into_it_later_then_it_is_claimed
     let library = RegisterLibraryHandler::new(
         FakeAuth::Allowing,
         SqliteLibraryRepository::new(pool.clone()),
+        AlwaysStartsRun,
+        LibraryRoot::unconfigured(),
     )
-    .register("Course", ROOT, "token")
+    .register("Course", ROOT, RunPriority::Normal, "token")
     .await
+    .map(|registered| registered.library)
     .expect("register");
 
     // Indexed after the library existed.
@@ -414,9 +462,12 @@ mod windows_paths {
         RegisterLibraryHandler::new(
             FakeAuth::Allowing,
             SqliteLibraryRepository::new(pool.clone()),
+            AlwaysStartsRun,
+            LibraryRoot::unconfigured(),
         )
-        .register("Rust course", WINDOWS_ROOT, "token")
+        .register("Rust course", WINDOWS_ROOT, RunPriority::Normal, "token")
         .await
+        .map(|registered| registered.library)
         .expect("register")
         .uuid
     }
@@ -539,9 +590,17 @@ mod windows_paths {
         let nested = RegisterLibraryHandler::new(
             FakeAuth::Allowing,
             SqliteLibraryRepository::new(pool.clone()),
+            AlwaysStartsRun,
+            LibraryRoot::unconfigured(),
         )
-        .register("One class", r"D:\courses\rust\class-01", "token")
-        .await;
+        .register(
+            "One class",
+            r"D:\courses\rust\class-01",
+            RunPriority::Normal,
+            "token",
+        )
+        .await
+        .map(|registered| registered.library);
 
         assert!(
             matches!(nested, Err(DomainError::Conflict(_))),
@@ -565,9 +624,12 @@ mod reaching_in {
         RegisterLibraryHandler::new(
             FakeAuth::Allowing,
             SqliteLibraryRepository::new(pool.clone()),
+            AlwaysStartsRun,
+            LibraryRoot::unconfigured(),
         )
-        .register("Course", ROOT, "token")
+        .register("Course", ROOT, RunPriority::Normal, "token")
         .await
+        .map(|registered| registered.library)
         .expect("register")
         .uuid
     }
@@ -723,9 +785,12 @@ mod moving {
         RegisterLibraryHandler::new(
             FakeAuth::Allowing,
             SqliteLibraryRepository::new(pool.clone()),
+            AlwaysStartsRun,
+            LibraryRoot::unconfigured(),
         )
-        .register("Course", root, "token")
+        .register("Course", root, RunPriority::Normal, "token")
         .await
+        .map(|registered| registered.library)
         .expect("register")
         .uuid
     }
@@ -739,6 +804,7 @@ mod moving {
             FakeAuth::Allowing,
             SqliteLibraryRepository::new(pool.clone()),
             alexandria_core::catalog::library_root::LibraryRoot::unconfigured(),
+            SqliteCatalogRunRepository::new(pool.clone()),
         )
         .move_to(uuid, root, "token")
         .await
@@ -867,9 +933,17 @@ mod moving {
         RegisterLibraryHandler::new(
             FakeAuth::Allowing,
             SqliteLibraryRepository::new(pool.clone()),
+            AlwaysStartsRun,
+            LibraryRoot::unconfigured(),
         )
-        .register("Photography", "/library/photos", "token")
+        .register(
+            "Photography",
+            "/library/photos",
+            RunPriority::Normal,
+            "token",
+        )
         .await
+        .map(|registered| registered.library)
         .expect("register the other");
 
         let refused = move_to(&pool, uuid, "/library/photos/courses").await;
@@ -962,6 +1036,7 @@ mod moving {
             alexandria_core::catalog::library_root::LibraryRoot::new(
                 library_root.to_str().unwrap(),
             ),
+            SqliteCatalogRunRepository::new(pool.clone()),
         )
         .move_to(uuid, root, "token")
         .await
@@ -1075,9 +1150,12 @@ mod case {
         let library = RegisterLibraryHandler::new(
             FakeAuth::Allowing,
             SqliteLibraryRepository::new(pool.clone()),
+            AlwaysStartsRun,
+            LibraryRoot::unconfigured(),
         )
-        .register("Photos", "/library/photos", "token")
+        .register("Photos", "/library/photos", RunPriority::Normal, "token")
         .await
+        .map(|registered| registered.library)
         .expect("register");
 
         let listing = BrowseLibraryHandler::new(
@@ -1128,9 +1206,12 @@ mod case {
         RegisterLibraryHandler::new(
             FakeAuth::Allowing,
             SqliteLibraryRepository::new(pool.clone()),
+            AlwaysStartsRun,
+            LibraryRoot::unconfigured(),
         )
-        .register("Photos", "/library/photos", "token")
+        .register("Photos", "/library/photos", RunPriority::Normal, "token")
         .await
+        .map(|registered| registered.library)
         .expect("register");
 
         let stranger = insert(&catalog, "/library/Photos/theirs.jpg", FileType::Image).await;
@@ -1159,17 +1240,28 @@ mod case {
         RegisterLibraryHandler::new(
             FakeAuth::Allowing,
             SqliteLibraryRepository::new(pool.clone()),
+            AlwaysStartsRun,
+            LibraryRoot::unconfigured(),
         )
-        .register("Photos", "/library/photos", "token")
+        .register("Photos", "/library/photos", RunPriority::Normal, "token")
         .await
+        .map(|registered| registered.library)
         .expect("register");
 
         RegisterLibraryHandler::new(
             FakeAuth::Allowing,
             SqliteLibraryRepository::new(pool.clone()),
+            AlwaysStartsRun,
+            LibraryRoot::unconfigured(),
         )
-        .register("Photographs", "/library/Photos", "token")
+        .register(
+            "Photographs",
+            "/library/Photos",
+            RunPriority::Normal,
+            "token",
+        )
         .await
+        .map(|registered| registered.library)
         .expect("a folder differing only in case was refused as an overlap");
     }
 
@@ -1181,17 +1273,28 @@ mod case {
         RegisterLibraryHandler::new(
             FakeAuth::Allowing,
             SqliteLibraryRepository::new(pool.clone()),
+            AlwaysStartsRun,
+            LibraryRoot::unconfigured(),
         )
-        .register("Photos", "/library/photos", "token")
+        .register("Photos", "/library/photos", RunPriority::Normal, "token")
         .await
+        .map(|registered| registered.library)
         .expect("register");
 
         let refused = RegisterLibraryHandler::new(
             FakeAuth::Allowing,
             SqliteLibraryRepository::new(pool.clone()),
+            AlwaysStartsRun,
+            LibraryRoot::unconfigured(),
         )
-        .register("Inner", "/library/photos/2024", "token")
-        .await;
+        .register(
+            "Inner",
+            "/library/photos/2024",
+            RunPriority::Normal,
+            "token",
+        )
+        .await
+        .map(|registered| registered.library);
 
         assert!(
             matches!(refused, Err(DomainError::Conflict(_))),

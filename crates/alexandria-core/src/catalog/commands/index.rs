@@ -20,6 +20,7 @@ use crate::catalog::run_registry::{RunCell, RunPhase, RunRegistry, RunSignal};
 use crate::catalog::runs::{CatalogRunRepository, RunCounts, RunKind, RunPriority, RunStatus};
 use crate::catalog::video_tags::VideoMetadataReader;
 use crate::errors::DomainError;
+use crate::libraries::model::Library;
 use crate::retry::{retry_on_busy, BUSY_ATTEMPTS};
 
 #[derive(Debug, Clone)]
@@ -34,6 +35,10 @@ pub struct IndexRequest {
     /// it back (`RunResumed::scope`), so a run paused mid-library continues
     /// under the scope it began with rather than widening to every type.
     pub scope: IndexScope,
+    /// The library this run walks. Recorded on the run (FR-FC-42), so its
+    /// status can name the library and a second unfinished run of the same
+    /// library can be refused.
+    pub library_uuid: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -59,6 +64,66 @@ pub struct IndexOutcome {
     /// file failed (unreadable bytes, or a repository write error). The run
     /// continues past them; each is logged at `warn`.
     pub failed: usize,
+}
+
+/// Opens the index run of a library — what registering one and re-indexing
+/// one both do (libraries-only design, section 1).
+///
+/// A trait so the library handlers can be unit-tested without the whole
+/// `IndexHandler` and its nine collaborators behind them, and so they hold
+/// the one index handler the application already builds.
+#[allow(async_fn_in_trait)]
+pub trait LibraryRunStarter: Send + Sync {
+    /// Validate the library's folder and open a run of it. The caller spawns
+    /// the walk (`IndexHandler::execute`), as for every run.
+    async fn start_library_run(
+        &self,
+        library: &Library,
+        priority: RunPriority,
+        token: &str,
+    ) -> Result<IndexStarted, DomainError>;
+}
+
+impl<T: LibraryRunStarter> LibraryRunStarter for std::sync::Arc<T> {
+    async fn start_library_run(
+        &self,
+        library: &Library,
+        priority: RunPriority,
+        token: &str,
+    ) -> Result<IndexStarted, DomainError> {
+        (**self).start_library_run(library, priority, token).await
+    }
+}
+
+impl<A, R, F, C, N, O, P, Q, RR> LibraryRunStarter for IndexHandler<A, R, F, C, N, O, P, Q, RR>
+where
+    A: AuthService,
+    R: CatalogRepository,
+    F: Filesystem,
+    C: Clock,
+    N: ImageMetadataReader,
+    O: DocumentMetadataReader,
+    P: VideoMetadataReader,
+    Q: ComicMetadataReader,
+    RR: CatalogRunRepository,
+{
+    async fn start_library_run(
+        &self,
+        library: &Library,
+        priority: RunPriority,
+        token: &str,
+    ) -> Result<IndexStarted, DomainError> {
+        self.start(
+            IndexRequest {
+                root: library.root_path.clone(),
+                priority,
+                scope: IndexScope::all(),
+                library_uuid: Some(library.uuid),
+            },
+            token,
+        )
+        .await
+    }
 }
 
 /// Index library files (UC-01).
@@ -279,6 +344,7 @@ where
                 started_at,
                 concurrency,
                 scope.as_deref(),
+                request.library_uuid,
             )
         })
         .await?;

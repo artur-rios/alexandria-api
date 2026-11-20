@@ -157,6 +157,7 @@ pub fn app(settings: Settings, services: Arc<Services>) -> Router {
                 .patch(routes::libraries::move_root)
                 .delete(routes::libraries::remove),
         )
+        .route("/v1/libraries/{uuid}/index", post(routes::libraries::index))
         .route_layer(from_fn_with_state(
             state.clone(),
             middleware::auth::require_auth,

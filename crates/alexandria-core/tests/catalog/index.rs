@@ -201,6 +201,7 @@ async fn given_valid_root_and_authenticated_when_start_then_returns_run_id() {
                 root: ROOT.to_string(),
                 priority: RunPriority::Normal,
                 scope: IndexScope::all(),
+                library_uuid: None,
             },
             TOKEN,
         )
@@ -232,6 +233,7 @@ async fn given_missing_root_when_start_then_invalid_input() {
                 root: "/nope".to_string(),
                 priority: RunPriority::Normal,
                 scope: IndexScope::all(),
+                library_uuid: None,
             },
             TOKEN,
         )
@@ -268,6 +270,7 @@ async fn given_unauthenticated_when_start_then_unauthorized() {
                 root: ROOT.to_string(),
                 priority: RunPriority::Normal,
                 scope: IndexScope::all(),
+                library_uuid: None,
             },
             "",
         )
@@ -393,6 +396,7 @@ async fn given_a_file_on_disk_when_indexed_then_its_size_and_mtime_are_recorded(
                 root: ROOT.into(),
                 priority: RunPriority::Normal,
                 scope: IndexScope::all(),
+                library_uuid: None,
             },
             TOKEN,
         )
@@ -440,6 +444,7 @@ async fn given_a_file_when_indexed_then_no_content_hash_is_computed() {
                 root: ROOT.into(),
                 priority: RunPriority::Normal,
                 scope: IndexScope::all(),
+                library_uuid: None,
             },
             TOKEN,
         )
@@ -599,6 +604,7 @@ async fn given_zero_low_priority_concurrency_when_a_low_priority_run_executes_th
                 root: ROOT.into(),
                 priority: RunPriority::Low,
                 scope: IndexScope::all(),
+                library_uuid: None,
             },
             TOKEN,
         )
@@ -872,6 +878,7 @@ async fn given_a_folder_mixing_audio_video_and_text_when_indexed_then_only_video
                 root: ROOT.to_string(),
                 priority: RunPriority::Normal,
                 scope: IndexScope::all(),
+                library_uuid: None,
             },
             TOKEN,
         )
@@ -1889,6 +1896,7 @@ async fn start_bounded_with_runs(
                 root: requested.to_string(),
                 priority: RunPriority::Normal,
                 scope: IndexScope::all(),
+                library_uuid: None,
             },
             TOKEN,
         )
@@ -2022,6 +2030,7 @@ async fn given_empty_configured_library_root_when_start_then_any_root_accepted()
                 root: requested,
                 priority: RunPriority::Normal,
                 scope: IndexScope::all(),
+                library_uuid: None,
             },
             TOKEN,
         )
@@ -2061,6 +2070,7 @@ async fn given_unresolvable_configured_library_root_when_start_then_invalid_inpu
                 root: requested,
                 priority: RunPriority::Normal,
                 scope: IndexScope::all(),
+                library_uuid: None,
             },
             TOKEN,
         )
@@ -2094,6 +2104,7 @@ async fn given_a_started_index_when_started_then_the_run_is_recorded_running() {
                 root: ROOT.to_string(),
                 priority: RunPriority::Normal,
                 scope: IndexScope::all(),
+                library_uuid: None,
             },
             TOKEN,
         )
@@ -2132,6 +2143,7 @@ async fn given_a_low_priority_index_when_started_then_the_run_records_the_low_co
                 root: ROOT.into(),
                 priority: RunPriority::Low,
                 scope: IndexScope::all(),
+                library_uuid: None,
             },
             TOKEN,
         )
@@ -2169,6 +2181,7 @@ async fn given_a_normal_priority_index_when_started_then_the_run_records_the_nor
                 root: ROOT.into(),
                 priority: RunPriority::Normal,
                 scope: IndexScope::all(),
+                library_uuid: None,
             },
             TOKEN,
         )
@@ -2209,6 +2222,7 @@ async fn given_an_index_that_walks_when_executed_then_the_run_is_recorded_comple
                 root: ROOT.to_string(),
                 priority: RunPriority::Normal,
                 scope: IndexScope::all(),
+                library_uuid: None,
             },
             TOKEN,
         )
@@ -2257,6 +2271,7 @@ async fn given_a_root_that_cannot_be_listed_when_executed_then_the_run_is_record
                 root: ROOT.to_string(),
                 priority: RunPriority::Normal,
                 scope: IndexScope::all(),
+                library_uuid: None,
             },
             TOKEN,
         )
@@ -2310,6 +2325,7 @@ async fn given_files_that_individually_fail_when_executed_then_the_run_is_comple
                 root: ROOT.to_string(),
                 priority: RunPriority::Normal,
                 scope: IndexScope::all(),
+                library_uuid: None,
             },
             TOKEN,
         )
@@ -2434,6 +2450,7 @@ async fn given_a_cataloged_file_and_an_unsupported_one_when_indexed_then_the_two
                 root: ROOT.into(),
                 priority: RunPriority::Normal,
                 scope: IndexScope::all(),
+                library_uuid: None,
             },
             TOKEN,
         )
@@ -2450,6 +2467,7 @@ async fn given_a_cataloged_file_and_an_unsupported_one_when_indexed_then_the_two
                 root: ROOT.into(),
                 priority: RunPriority::Normal,
                 scope: IndexScope::all(),
+                library_uuid: None,
             },
             TOKEN,
         )
@@ -2500,6 +2518,7 @@ async fn given_a_completed_index_when_execute_then_the_final_progress_is_flushed
         Some(ROOT),
         now(),
         TEST_CONCURRENCY,
+        None,
         None,
     )
     .await
@@ -2559,6 +2578,7 @@ async fn given_a_progress_flush_that_fails_when_execute_then_the_run_still_compl
         now(),
         TEST_CONCURRENCY,
         None,
+        None,
     )
     .await
     .unwrap();
@@ -2605,6 +2625,7 @@ async fn given_a_run_that_cannot_list_its_root_when_execute_then_the_cell_is_clo
         Some(ROOT),
         now(),
         TEST_CONCURRENCY,
+        None,
         None,
     )
     .await
@@ -2658,6 +2679,7 @@ async fn given_a_walk_longer_than_the_flush_interval_when_execute_then_intermedi
         Some(ROOT),
         now(),
         TEST_CONCURRENCY,
+        None,
         None,
     )
     .await
@@ -2793,6 +2815,7 @@ async fn given_an_index_walk_in_flight_when_paused_then_it_stops_with_entries_un
         now(),
         TEST_CONCURRENCY,
         None,
+        None,
     )
     .await
     .unwrap();
@@ -2890,6 +2913,7 @@ async fn given_a_run_resumed_before_a_walks_pause_lands_when_it_lands_then_the_p
         now(),
         TEST_CONCURRENCY,
         None,
+        None,
     )
     .await
     .unwrap();
@@ -2951,6 +2975,7 @@ async fn given_a_run_resumed_before_a_walks_cancel_lands_when_it_lands_then_the_
         now(),
         TEST_CONCURRENCY,
         None,
+        None,
     )
     .await
     .unwrap();
@@ -3007,6 +3032,7 @@ async fn given_an_index_walk_in_flight_when_cancelled_then_it_stops_and_is_termi
         Some(ROOT),
         now(),
         TEST_CONCURRENCY,
+        None,
         None,
     )
     .await
@@ -3083,6 +3109,7 @@ async fn given_a_run_paused_during_discovery_when_execute_then_no_entry_is_proce
         now(),
         TEST_CONCURRENCY,
         None,
+        None,
     )
     .await
     .unwrap();
@@ -3151,6 +3178,7 @@ async fn given_a_paused_index_run_when_resumed_then_it_re_walks_and_finishes_the
         Some(ROOT),
         now(),
         TEST_CONCURRENCY,
+        None,
         None,
     )
     .await
@@ -3295,6 +3323,7 @@ async fn given_a_resumed_run_when_executed_then_it_walks_at_the_width_it_was_sta
         now(),
         RESUMED_AT_CONCURRENCY,
         None,
+        None,
     )
     .await
     .unwrap();
@@ -3376,6 +3405,7 @@ async fn given_a_paused_run_when_resumed_at_low_priority_then_it_walks_at_the_ne
         Some(ROOT),
         now(),
         STARTED_AT_CONCURRENCY,
+        None,
         None,
     )
     .await
@@ -3653,6 +3683,7 @@ async fn given_a_paused_scoped_run_when_resumed_then_the_second_segment_keeps_th
                 root: ROOT.to_string(),
                 priority: RunPriority::Normal,
                 scope: text_only.clone(),
+                library_uuid: None,
             },
             TOKEN,
         )
@@ -3704,6 +3735,7 @@ async fn given_a_run_with_no_stored_scope_when_resumed_then_it_walks_every_type(
         Some(ROOT),
         now(),
         TEST_CONCURRENCY,
+        None,
         None,
     )
     .await
@@ -3764,6 +3796,7 @@ async fn given_a_scoped_index_when_started_then_the_run_records_the_scope() {
                 root: ROOT.to_string(),
                 priority: RunPriority::Normal,
                 scope: IndexScope::parse(["text"]).expect("scope"),
+                library_uuid: None,
             },
             TOKEN,
         )
@@ -3793,6 +3826,7 @@ async fn walk_stopped_before_it_began(
         Some(ROOT),
         now(),
         TEST_CONCURRENCY,
+        None,
         None,
     )
     .await

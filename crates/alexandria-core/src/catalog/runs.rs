@@ -251,6 +251,10 @@ pub struct CatalogRun {
     /// how the run is walked, not a fact about its progress.
     #[serde(skip)]
     pub scope: IndexScope,
+    /// The library an index run walks; `None` for a refresh, which re-checks
+    /// the whole catalog and belongs to no library.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub library_uuid: Option<Uuid>,
 }
 
 /// How many failures one run records by path.
@@ -282,6 +286,8 @@ pub trait CatalogRunRepository: Send + Sync {
     /// catalog rather than through a walk, so it has nothing to scope.
     /// Recorded beside `root` because both are what the run was told to
     /// cover, and a resume needs both back.
+    // Eight until the type scope goes, with free-form indexing.
+    #[allow(clippy::too_many_arguments)]
     async fn start(
         &self,
         id: Uuid,
@@ -290,6 +296,7 @@ pub trait CatalogRunRepository: Send + Sync {
         started_at: DateTime<Utc>,
         concurrency: u32,
         scope: Option<&str>,
+        library_uuid: Option<Uuid>,
     ) -> Result<(), DomainError>;
 
     /// Close a run's record as `complete` with its tally. Per-file failures
@@ -543,6 +550,25 @@ pub trait CatalogRunRepository: Send + Sync {
     /// [`get`]: CatalogRunRepository::get
     async fn list_active(&self) -> Result<Vec<CatalogRun>, DomainError>;
 
+    /// The newest index run of `library` that is not finished — `running`, or
+    /// `paused` (which is also what startup makes of a run a crash
+    /// interrupted). A library has at most one (FR-FC-42): a second walk of
+    /// the same folder, or a move under a paused one, is refused while this
+    /// answers `Some`.
+    ///
+    /// Built on `list_active` so that every implementation, the test doubles
+    /// included, answers it the same way.
+    async fn unfinished_for_library(
+        &self,
+        library: Uuid,
+    ) -> Result<Option<CatalogRun>, DomainError> {
+        Ok(self
+            .list_active()
+            .await?
+            .into_iter()
+            .find(|run| run.library_uuid == Some(library)))
+    }
+
     /// Pause every run still `running`, returning how many were reconciled
     /// (FR-FC-29).
     ///
@@ -593,7 +619,8 @@ macro_rules! run_columns {
     () => {
         "kind, status, root, started_at, finished_at, scanned, indexed, \
          skipped, already_cataloged, refreshed, marked_missing, unchanged, failed, error, \
-         phase, total, processed, paused_at, paused_millis, concurrency, segment, scope"
+         phase, total, processed, paused_at, paused_millis, concurrency, segment, scope, \
+         (SELECT uuid FROM libraries WHERE libraries.id = catalog_runs.library_id) AS library_uuid"
     };
 }
 
@@ -694,6 +721,14 @@ fn row_to_run(id: Uuid, row: &SqliteRow) -> Result<CatalogRun, DomainError> {
             .try_get::<Option<i64>, _>("concurrency")?
             .map(|concurrency| concurrency as u32),
         segment: row.try_get("segment")?,
+        library_uuid: row
+            .try_get::<Option<String>, _>("library_uuid")?
+            .map(|raw| {
+                Uuid::parse_str(&raw).map_err(|err| {
+                    DomainError::internal(format!("corrupt libraries.uuid {raw:?}: {err}"))
+                })
+            })
+            .transpose()?,
         // A corrupt value is reported rather than guessed at, the way
         // `parse_type_str` reports an unknown `files.type`: the only fallback
         // available is "every type", which is precisely the behaviour a
@@ -914,10 +949,12 @@ impl CatalogRunRepository for SqliteCatalogRunRepository {
         started_at: DateTime<Utc>,
         concurrency: u32,
         scope: Option<&str>,
+        library_uuid: Option<Uuid>,
     ) -> Result<(), DomainError> {
         sqlx::query(
-            "INSERT INTO catalog_runs (id, kind, status, root, started_at, concurrency, scope) \
-             VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO catalog_runs \
+             (id, kind, status, root, started_at, concurrency, scope, library_id) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, (SELECT id FROM libraries WHERE uuid = ?))",
         )
         .bind(id.to_string())
         .bind(kind.as_str())
@@ -930,6 +967,8 @@ impl CatalogRunRepository for SqliteCatalogRunRepository {
         // The wire list `IndexScope::to_wire` produced, or NULL for every
         // type — see `CatalogRunRepository::start`.
         .bind(scope)
+        // The library this run walks, or NULL for a refresh (which has none).
+        .bind(library_uuid.map(|uuid| uuid.to_string()))
         .execute(&self.pool)
         .await?;
         Ok(())

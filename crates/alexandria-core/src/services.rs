@@ -56,7 +56,7 @@ use crate::collections::repos::SqliteCollectionRepository;
 use crate::config::AuthMode;
 use crate::config::Settings;
 use crate::libraries::commands::{
-    MoveLibraryHandler, RegisterLibraryHandler, RemoveLibraryHandler,
+    IndexLibraryHandler, MoveLibraryHandler, RegisterLibraryHandler, RemoveLibraryHandler,
 };
 use crate::libraries::queries::{BrowseLibraryHandler, ListLibrariesHandler};
 use crate::libraries::repos::SqliteLibraryRepository;
@@ -258,13 +258,20 @@ pub type DefaultDeleteReadingListHandler =
     DeleteReadingListHandler<RuntimeAuthService, SqliteReadingListRepository>;
 
 pub type DefaultRegisterLibraryHandler =
-    RegisterLibraryHandler<RuntimeAuthService, SqliteLibraryRepository>;
+    RegisterLibraryHandler<RuntimeAuthService, SqliteLibraryRepository, Arc<DefaultIndexHandler>>;
+
+pub type DefaultIndexLibraryHandler = IndexLibraryHandler<
+    RuntimeAuthService,
+    SqliteLibraryRepository,
+    Arc<DefaultIndexHandler>,
+    SqliteCatalogRunRepository,
+>;
 
 pub type DefaultRemoveLibraryHandler =
     RemoveLibraryHandler<RuntimeAuthService, SqliteLibraryRepository>;
 
 pub type DefaultMoveLibraryHandler =
-    MoveLibraryHandler<RuntimeAuthService, SqliteLibraryRepository>;
+    MoveLibraryHandler<RuntimeAuthService, SqliteLibraryRepository, SqliteCatalogRunRepository>;
 
 pub type DefaultBrowseLibraryHandler =
     BrowseLibraryHandler<RuntimeAuthService, SqliteLibraryRepository, SqliteCatalogRepository>;
@@ -352,6 +359,7 @@ pub struct Services {
     pub remove_item_from_reading_list_handler: Arc<DefaultRemoveItemFromReadingListHandler>,
     pub delete_reading_list_handler: Arc<DefaultDeleteReadingListHandler>,
     pub register_library_handler: Arc<DefaultRegisterLibraryHandler>,
+    pub index_library_handler: Arc<DefaultIndexLibraryHandler>,
     pub remove_library_handler: Arc<DefaultRemoveLibraryHandler>,
     pub move_library_handler: Arc<DefaultMoveLibraryHandler>,
     pub browse_library_handler: Arc<DefaultBrowseLibraryHandler>,
@@ -712,6 +720,14 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
     let register_library_handler = Arc::new(RegisterLibraryHandler::new(
         auth.clone(),
         SqliteLibraryRepository::new(pool.clone()),
+        index_handler.clone(),
+        library_root.clone(),
+    ));
+    let index_library_handler = Arc::new(IndexLibraryHandler::new(
+        auth.clone(),
+        SqliteLibraryRepository::new(pool.clone()),
+        index_handler.clone(),
+        SqliteCatalogRunRepository::new(pool.clone()),
     ));
     let remove_library_handler = Arc::new(RemoveLibraryHandler::new(
         auth.clone(),
@@ -721,6 +737,7 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         auth.clone(),
         SqliteLibraryRepository::new(pool.clone()),
         library_root.clone(),
+        SqliteCatalogRunRepository::new(pool.clone()),
     ));
     let browse_library_handler = Arc::new(BrowseLibraryHandler::new(
         auth.clone(),
@@ -819,6 +836,7 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         remove_item_from_reading_list_handler,
         delete_reading_list_handler,
         register_library_handler,
+        index_library_handler,
         remove_library_handler,
         move_library_handler,
         browse_library_handler,

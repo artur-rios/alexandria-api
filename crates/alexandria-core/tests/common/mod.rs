@@ -2529,6 +2529,7 @@ impl CatalogRunRepository for FakeCatalogRunRepository {
         started_at: DateTime<Utc>,
         concurrency: u32,
         scope: Option<&str>,
+        library_uuid: Option<Uuid>,
     ) -> Result<(), DomainError> {
         // Mirrors the SQLite adapter's read side: the stored list parses back
         // into the scope, and NULL is every type. A stored value that will
@@ -2562,6 +2563,7 @@ impl CatalogRunRepository for FakeCatalogRunRepository {
                 // says. `resume` counts from here.
                 segment: 0,
                 scope,
+                library_uuid,
             },
         );
         Ok(())
@@ -3120,6 +3122,7 @@ impl CatalogRunRepository for FailingCatalogRunRepository {
         _started_at: DateTime<Utc>,
         _concurrency: u32,
         _scope: Option<&str>,
+        _library_uuid: Option<Uuid>,
     ) -> Result<(), DomainError> {
         match self {
             Self::StartFails => Err(DomainError::Disk("run store unavailable".into())),
@@ -3460,5 +3463,23 @@ impl RecoveryCodeRepository for FakeRecoveryCodeRepository {
             .iter()
             .filter(|(_, consumed_at)| consumed_at.is_none())
             .count() as u32)
+    }
+}
+
+/// A run starter that opens nothing and always succeeds: for library tests
+/// about what is stored, whose folders are paths written by hand rather than
+/// folders on disk a real run could walk.
+pub struct AlwaysStartsRun;
+
+impl alexandria_core::catalog::commands::index::LibraryRunStarter for AlwaysStartsRun {
+    async fn start_library_run(
+        &self,
+        _library: &alexandria_core::libraries::model::Library,
+        _priority: alexandria_core::catalog::runs::RunPriority,
+        _token: &str,
+    ) -> Result<alexandria_core::catalog::commands::index::IndexStarted, DomainError> {
+        Ok(alexandria_core::catalog::commands::index::IndexStarted {
+            run_id: Uuid::new_v4(),
+        })
     }
 }

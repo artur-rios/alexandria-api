@@ -32,7 +32,7 @@ use alexandria_ffi::{
     alexandria_index_count_files, alexandria_index_files_json, alexandria_index_init,
     alexandria_index_pause, alexandria_index_refresh_start, alexandria_index_resume,
     alexandria_index_run_status_json, alexandria_index_runs_active_json, alexandria_index_start,
-    alexandria_reading_list_add_item, alexandria_reading_list_create,
+    alexandria_library_register, alexandria_reading_list_add_item, alexandria_reading_list_create,
     alexandria_reading_list_delete, alexandria_reading_list_remove_item,
     alexandria_reading_list_update_progress, alexandria_reading_lists_list,
     alexandria_settings_json, alexandria_watchlist_add_video, alexandria_watchlist_create,
@@ -12742,4 +12742,88 @@ async fn given_a_text_scope_when_started_via_http_and_ffi_then_both_catalog_only
         http_names, ffi_names,
         "HTTP and FFI must resolve the same scope to the same set of files"
     );
+}
+
+/// FFI-36 parity — registering one folder answers the same library on both
+/// surfaces, with a run id beside it (FR-FC-36, FR-FC-24). Only the minted
+/// uuids differ.
+#[tokio::test]
+async fn given_the_same_folder_when_registered_on_both_surfaces_then_the_json_matches_except_uuids()
+{
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let folder = tempdir().unwrap();
+    std::fs::write(folder.path().join("a.md"), b"# a").unwrap();
+    let root = folder.path().to_str().unwrap().to_string();
+    let body = json!({ "name": "Notes", "rootPath": root, "priority": "low" });
+
+    // ---- HTTP leg ----
+    let http_dir = tempdir().unwrap();
+    let http_pool = migrate_database(&db_path(&http_dir, "http.sqlite"))
+        .await
+        .expect("http migrate");
+    seed_session(&http_pool, TEST_TOKEN).await;
+    let http_services =
+        std::sync::Arc::new(build_services(&local_settings(), http_pool.clone()).await);
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/libraries")
+        .header("authorization", &format!("Bearer {TEST_TOKEN}"))
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let resp = app(Settings::default(), http_services.clone())
+        .oneshot(req)
+        .await
+        .expect("http register");
+    assert_eq!(resp.status(), axum::http::StatusCode::CREATED);
+    let http_body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
+    wait_for_http_run_terminal(
+        &http_services,
+        http_body["runId"].as_str().unwrap(),
+        TEST_TOKEN,
+    )
+    .await;
+
+    // ---- FFI leg ----
+    let ffi_dir = tempdir().unwrap();
+    let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
+    let ffi_body: serde_json::Value = tokio::task::spawn_blocking(move || -> serde_json::Value {
+        let cdb = CString::new(ffi_db).unwrap();
+        assert_eq!(
+            alexandria_index_init(cdb.as_ptr()),
+            alexandria_ffi::INDEX_OK
+        );
+        let request = CString::new(body.to_string()).unwrap();
+        let token = CString::new(TEST_TOKEN).unwrap();
+        let r = alexandria_library_register(request.as_ptr(), token.as_ptr());
+        assert_eq!(r.status, alexandria_ffi::LIBRARY_OK, "ffi register");
+        let s = unsafe { CStr::from_ptr(r.json) }
+            .to_string_lossy()
+            .into_owned();
+        unsafe {
+            alexandria_free_string(r.json);
+        }
+        let value: serde_json::Value = serde_json::from_str(&s).unwrap();
+        wait_for_ffi_run_terminal(value["runId"].as_str().unwrap(), &token);
+        value
+    })
+    .await
+    .unwrap();
+
+    // ---- compare ----
+    let norm = |v: &serde_json::Value| -> serde_json::Value {
+        let mut c = v.clone();
+        let obj = c.as_object_mut().expect("object");
+        for key in ["uuid", "runId"] {
+            let minted = obj.remove(key).expect(key);
+            assert!(
+                uuid::Uuid::parse_str(minted.as_str().unwrap()).is_ok(),
+                "{key}"
+            );
+        }
+        c
+    };
+    assert_eq!(norm(&http_body), norm(&ffi_body));
+    assert_eq!(http_body["rootPath"], root);
 }

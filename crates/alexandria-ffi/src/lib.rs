@@ -44,6 +44,10 @@ pub const INDEX_ERR_OTHER: c_int = 4;
 /// takes effect when the scan finishes" instead of reporting an error for
 /// something that is going to work.
 pub const INDEX_ERR_BUSY: c_int = 5;
+/// `alexandria_library_index_start` named no library (HTTP's `404`).
+pub const INDEX_ERR_NOT_FOUND: c_int = 6;
+/// The library already has an unfinished run (FR-FC-42; HTTP's `409`).
+pub const INDEX_ERR_CONFLICT: c_int = 7;
 
 /// FFI status codes returned by file operations (UC-04+). Deliberately
 /// separate from `INDEX_*` so a future use case can grow either set without
@@ -487,6 +491,7 @@ pub extern "C" fn alexandria_index_start(
                         root: root.clone(),
                         priority,
                         scope: scope.clone(),
+                        library_uuid: None,
                     },
                     &token,
                 )
@@ -4803,6 +4808,71 @@ fn map_library_err(err: DomainError) -> LibraryJsonResult {
 /// `rootPath`). Whatever is already indexed beneath the folder is claimed by
 /// this call. Answers `LIBRARY_ERR_CONFLICT` when the folder overlaps an
 /// existing library.
+/// Walk `library`'s folder for the run `run_id` on the runtime, as
+/// HTTP's `spawn_walk` does — the call that opened the run has answered.
+fn spawn_library_walk(
+    services: &Services,
+    library: &alexandria_core::libraries::model::Library,
+    run_id: uuid::Uuid,
+) {
+    let handler = services.index_handler.clone();
+    let root = library.root_path.clone();
+    runtime().spawn(async move {
+        if let Err(err) = handler.execute(&root, run_id, &IndexScope::all()).await {
+            tracing::error!(%run_id, error = %err, "index run aborted");
+        }
+    });
+}
+
+/// Re-index one library (UC-01). `priority` is `"low"` or anything else
+/// (normal), lenient as every start is.
+///
+/// Answers `INDEX_OK` with the run id, `INDEX_ERR_NOT_FOUND` for an unknown
+/// library, `INDEX_ERR_CONFLICT` while it has an unfinished run (FR-FC-42),
+/// `INDEX_ERR_INVALID_INPUT` for a malformed uuid, `INDEX_ERR_UNAUTHORIZED`
+/// or `INDEX_ERR_NOT_INITIALIZED` — HTTP's `202`, `404`, `409`, `400`, `401`.
+#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
+#[no_mangle]
+pub extern "C" fn alexandria_library_index_start(
+    uuid: *const c_char,
+    token: *const c_char,
+    priority: *const c_char,
+) -> IndexStartResult {
+    ffi_guard(IndexStartResult::err(INDEX_ERR_OTHER), || {
+        let services = match locked_services() {
+            Some(s) => s,
+            None => return IndexStartResult::err(INDEX_ERR_NOT_INITIALIZED),
+        };
+        let token = cstr_lossy(token).unwrap_or_default();
+        if !authenticated(&services, &token) {
+            return IndexStartResult::err(INDEX_ERR_UNAUTHORIZED);
+        }
+        let Some(uuid) = cstr_lossy(uuid).and_then(|raw| uuid::Uuid::parse_str(&raw).ok()) else {
+            return IndexStartResult::err(INDEX_ERR_INVALID_INPUT);
+        };
+        let priority = parse_priority(cstr_lossy(priority));
+
+        let started = runtime().block_on(async {
+            services
+                .index_library_handler
+                .index(uuid, priority, &token)
+                .await
+        });
+
+        match started {
+            Ok((library, started)) => {
+                spawn_library_walk(&services, &library, started.run_id);
+                IndexStartResult::ok(&started.run_id.to_string())
+            }
+            Err(DomainError::NotFound) => IndexStartResult::err(INDEX_ERR_NOT_FOUND),
+            Err(DomainError::Conflict(_)) => IndexStartResult::err(INDEX_ERR_CONFLICT),
+            Err(DomainError::InvalidInput(_)) => IndexStartResult::err(INDEX_ERR_INVALID_INPUT),
+            Err(DomainError::Unauthorized) => IndexStartResult::err(INDEX_ERR_UNAUTHORIZED),
+            Err(_) => IndexStartResult::err(INDEX_ERR_OTHER),
+        }
+    })
+}
+
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
 pub extern "C" fn alexandria_library_register(
@@ -4834,17 +4904,26 @@ pub extern "C" fn alexandria_library_register(
             .get("rootPath")
             .and_then(|v| v.as_str())
             .unwrap_or_default();
+        // Lenient, as HTTP's `deserialize_priority` is (FR-FC-24): only the
+        // string `"low"` asks for a gentle first run.
+        let priority = parse_priority(
+            body.get("priority")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+        );
 
-        let result = runtime().block_on(async {
+        let rt = runtime();
+        let result = rt.block_on(async {
             services
                 .register_library_handler
-                .register(name, root_path, &token)
+                .register(name, root_path, priority, &token)
                 .await
         });
 
         match result {
-            Ok(library) => {
-                LibraryJsonResult::ok(serde_json::to_string(&library).unwrap_or_default())
+            Ok(registered) => {
+                spawn_library_walk(&services, &registered.library, registered.run_id);
+                LibraryJsonResult::ok(serde_json::to_string(&registered).unwrap_or_default())
             }
             Err(err) => map_library_err(err),
         }

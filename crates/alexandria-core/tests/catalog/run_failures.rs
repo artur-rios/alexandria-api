@@ -26,9 +26,17 @@ async fn repository() -> (SqliteCatalogRunRepository, tempfile::TempDir) {
 /// started would be refused rather than silently orphaned.
 async fn started(repo: &SqliteCatalogRunRepository) -> Uuid {
     let id = Uuid::new_v4();
-    repo.start(id, RunKind::Index, Some("/library"), Utc::now(), 4, None)
-        .await
-        .expect("start");
+    repo.start(
+        id,
+        RunKind::Index,
+        Some("/library"),
+        Utc::now(),
+        4,
+        None,
+        None,
+    )
+    .await
+    .expect("start");
 
     id
 }

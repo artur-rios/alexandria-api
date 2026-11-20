@@ -62,6 +62,7 @@ pub async fn index(
         root: body.root.clone(),
         priority: body.priority,
         scope: scope.clone(),
+        library_uuid: None,
     };
 
     let started = state

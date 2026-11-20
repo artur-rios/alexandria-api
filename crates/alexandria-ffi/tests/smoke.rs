@@ -61,8 +61,8 @@ use alexandria_ffi::{
     alexandria_index_init, alexandria_index_pause, alexandria_index_refresh_start,
     alexandria_index_resume, alexandria_index_run_failures_json, alexandria_index_run_status_json,
     alexandria_index_runs_active_json, alexandria_index_start, alexandria_libraries_list,
-    alexandria_library_browse, alexandria_library_move, alexandria_library_register,
-    alexandria_library_remove, FileMetadataResult, IndexStartResult,
+    alexandria_library_browse, alexandria_library_index_start, alexandria_library_move,
+    alexandria_library_register, alexandria_library_remove, FileMetadataResult, IndexStartResult,
 };
 
 const STATUS_RUN_OK: i32 = alexandria_ffi::RUN_OK;
@@ -89,6 +89,8 @@ const STATUS_LIBRARY_OK: i32 = alexandria_ffi::LIBRARY_OK;
 const STATUS_LIBRARY_CONFLICT: i32 = alexandria_ffi::LIBRARY_ERR_CONFLICT;
 const STATUS_LIBRARY_INVALID_INPUT: i32 = alexandria_ffi::LIBRARY_ERR_INVALID_INPUT;
 const STATUS_LIBRARY_NOT_FOUND: i32 = alexandria_ffi::LIBRARY_ERR_NOT_FOUND;
+const STATUS_INDEX_NOT_FOUND: i32 = alexandria_ffi::INDEX_ERR_NOT_FOUND;
+const STATUS_INDEX_CONFLICT: i32 = alexandria_ffi::INDEX_ERR_CONFLICT;
 const STATUS_PLAYBACK_OK: i32 = alexandria_ffi::PLAYBACK_OK;
 const STATUS_PLAYBACK_INVALID_INPUT: i32 = alexandria_ffi::PLAYBACK_ERR_INVALID_INPUT;
 
@@ -2812,19 +2814,45 @@ fn library_json_ok(result: alexandria_ffi::LibraryJsonResult) -> serde_json::Val
     serde_json::from_str(&json).expect("library json")
 }
 
+/// A real folder for `logical` (`/library/course`) inside the test's own
+/// temporary directory, created. Registering walks the folder, so a library
+/// test needs one that exists.
+fn folder(db: &(TempDir, String), logical: &str) -> String {
+    let path = db.0.path().join(logical.trim_start_matches('/'));
+    std::fs::create_dir_all(&path).unwrap();
+    path.to_str().unwrap().to_string()
+}
+
+/// Like [`folder`], without creating it.
+fn path_in(db: &(TempDir, String), logical: &str) -> String {
+    db.0.path()
+        .join(logical.trim_start_matches('/'))
+        .to_str()
+        .unwrap()
+        .to_string()
+}
+
+/// Register `root` as `name`, wait for its first run to finish, and answer
+/// the library's JSON.
+///
+/// Waited on because a library with an unfinished run refuses a move or a
+/// second run (FR-FC-42), and the tests using this are about what comes
+/// after.
+fn register_library(name: &str, root: &str, token: &CString) -> serde_json::Value {
+    let body = c(&serde_json::json!({ "name": name, "rootPath": root }).to_string());
+    let value = library_json_ok(alexandria_library_register(body.as_ptr(), token.as_ptr()));
+    wait_for_run_terminal(value["runId"].as_str().expect("runId"), token);
+    value
+}
+
 /// Registering answers the library, and it is then listed.
 #[test]
 fn given_a_folder_when_registered_over_ffi_then_it_is_a_library() {
     let _g = serial();
     let _db = init_temp_db();
 
-    let body = c(&serde_json::json!({
-        "name": "Course",
-        "rootPath": "/library/course"
-    })
-    .to_string());
     let token = c(TEST_TOKEN);
-    let value = library_json_ok(alexandria_library_register(body.as_ptr(), token.as_ptr()));
+    let value = register_library("Course", &folder(&_db, "/library/course"), &token);
 
     assert_eq!(value["name"], "Course");
     assert!(uuid::Uuid::parse_str(value["uuid"].as_str().unwrap_or_default()).is_ok());
@@ -2841,12 +2869,13 @@ fn given_an_overlapping_folder_when_registered_over_ffi_then_it_is_a_conflict() 
     let _db = init_temp_db();
 
     let token = c(TEST_TOKEN);
-    let first =
-        c(&serde_json::json!({"name": "Course", "rootPath": "/library/course"}).to_string());
-    library_json_ok(alexandria_library_register(first.as_ptr(), token.as_ptr()));
+    register_library("Course", &folder(&_db, "/library/course"), &token);
 
-    let nested =
-        c(&serde_json::json!({"name": "Week", "rootPath": "/library/course/week-1"}).to_string());
+    let nested = c(&serde_json::json!({
+        "name": "Week",
+        "rootPath": folder(&_db, "/library/course/week-1")
+    })
+    .to_string());
     let result = alexandria_library_register(nested.as_ptr(), token.as_ptr());
 
     assert_eq!(result.status, STATUS_LIBRARY_CONFLICT);
@@ -2858,7 +2887,11 @@ fn given_a_blank_name_when_registered_over_ffi_then_it_is_invalid_input() {
     let _g = serial();
     let _db = init_temp_db();
 
-    let body = c(&serde_json::json!({"name": "   ", "rootPath": "/library/course"}).to_string());
+    let body = c(&serde_json::json!({
+        "name": "   ",
+        "rootPath": folder(&_db, "/library/course")
+    })
+    .to_string());
     let token = c(TEST_TOKEN);
 
     assert_eq!(
@@ -2875,8 +2908,7 @@ fn given_a_new_library_when_browsed_over_ffi_then_it_is_simply_empty() {
     let _db = init_temp_db();
 
     let token = c(TEST_TOKEN);
-    let body = c(&serde_json::json!({"name": "Course", "rootPath": "/library/course"}).to_string());
-    let library = library_json_ok(alexandria_library_register(body.as_ptr(), token.as_ptr()));
+    let library = register_library("Course", &folder(&_db, "/library/course"), &token);
     let uuid = c(library["uuid"].as_str().unwrap());
 
     let listing = library_json_ok(alexandria_library_browse(
@@ -2898,18 +2930,18 @@ fn given_a_moved_folder_when_the_root_is_corrected_over_ffi_then_the_library_fol
     let _db = init_temp_db();
 
     let token = c(TEST_TOKEN);
-    let body = c(&serde_json::json!({"name": "Course", "rootPath": "/library/course"}).to_string());
-    let library = library_json_ok(alexandria_library_register(body.as_ptr(), token.as_ptr()));
+    let library = register_library("Course", &folder(&_db, "/library/course"), &token);
     let uuid = c(library["uuid"].as_str().unwrap());
 
-    let moved = c(&serde_json::json!({"rootPath": "/media/courses/rust"}).to_string());
+    let destination = path_in(&_db, "/media/courses/rust");
+    let moved = c(&serde_json::json!({ "rootPath": destination }).to_string());
     let value = library_json_ok(alexandria_library_move(
         uuid.as_ptr(),
         moved.as_ptr(),
         token.as_ptr(),
     ));
 
-    assert_eq!(value["rootPath"], "/media/courses/rust");
+    assert_eq!(value["rootPath"], destination);
     assert_eq!(value["name"], "Course", "the move renamed the library");
 }
 
@@ -2921,15 +2953,12 @@ fn given_another_librarys_folder_when_moved_onto_over_ffi_then_it_is_a_conflict(
     let _db = init_temp_db();
 
     let token = c(TEST_TOKEN);
-    let first =
-        c(&serde_json::json!({"name": "Course", "rootPath": "/library/course"}).to_string());
-    let library = library_json_ok(alexandria_library_register(first.as_ptr(), token.as_ptr()));
-    let second =
-        c(&serde_json::json!({"name": "Photos", "rootPath": "/library/photos"}).to_string());
-    library_json_ok(alexandria_library_register(second.as_ptr(), token.as_ptr()));
+    let library = register_library("Course", &folder(&_db, "/library/course"), &token);
+    register_library("Photos", &folder(&_db, "/library/photos"), &token);
 
     let uuid = c(library["uuid"].as_str().unwrap());
-    let onto = c(&serde_json::json!({"rootPath": "/library/photos/2024"}).to_string());
+    let onto =
+        c(&serde_json::json!({"rootPath": path_in(&_db, "/library/photos/2024")}).to_string());
 
     assert_eq!(
         alexandria_library_move(uuid.as_ptr(), onto.as_ptr(), token.as_ptr()).status,
@@ -2944,8 +2973,7 @@ fn given_a_blank_root_when_a_library_is_moved_over_ffi_then_it_is_invalid_input(
     let _db = init_temp_db();
 
     let token = c(TEST_TOKEN);
-    let body = c(&serde_json::json!({"name": "Course", "rootPath": "/library/course"}).to_string());
-    let library = library_json_ok(alexandria_library_register(body.as_ptr(), token.as_ptr()));
+    let library = register_library("Course", &folder(&_db, "/library/course"), &token);
     let uuid = c(library["uuid"].as_str().unwrap());
     let blank = c(&serde_json::json!({"rootPath": "  "}).to_string());
 
@@ -3156,6 +3184,7 @@ fn given_a_configured_root_when_a_library_is_moved_outside_it_over_ffi_then_inva
         &serde_json::json!({"name": "Course", "rootPath": course.to_str().unwrap()}).to_string(),
     );
     let registered = library_json_ok(alexandria_library_register(body.as_ptr(), token.as_ptr()));
+    wait_for_run_terminal(registered["runId"].as_str().unwrap(), &token);
     let uuid = c(registered["uuid"].as_str().unwrap());
 
     for destination in [
@@ -3189,6 +3218,7 @@ fn given_a_configured_root_when_moved_to_a_missing_folder_under_it_over_ffi_then
         &serde_json::json!({"name": "Course", "rootPath": course.to_str().unwrap()}).to_string(),
     );
     let registered = library_json_ok(alexandria_library_register(body.as_ptr(), token.as_ptr()));
+    wait_for_run_terminal(registered["runId"].as_str().unwrap(), &token);
     let uuid = c(registered["uuid"].as_str().unwrap());
     let destination = library.path().join("usb-drive").join("rust");
 
@@ -3256,4 +3286,115 @@ fn given_a_row_outside_the_configured_root_when_its_playback_source_is_asked_the
     assert!(refused.json.is_null());
     assert_eq!(served.status, STATUS_PLAYBACK_OK);
     unsafe { alexandria_free_string(served.json) };
+}
+
+// ---------------- registering starts indexing; re-indexing one library ----------------
+
+#[test]
+fn given_a_folder_when_registered_over_ffi_then_a_run_id_that_completes() {
+    let _g = serial();
+    let _db = init_temp_db();
+    let token = c(TEST_TOKEN);
+    let root = folder(&_db, "/library/notes");
+    std::fs::write(format!("{root}/a.md"), b"# a").unwrap();
+    std::fs::write(format!("{root}/b.zip"), b"zip").unwrap();
+    let body = c(&serde_json::json!({ "name": "Notes", "rootPath": root }).to_string());
+
+    let value = library_json_ok(alexandria_library_register(body.as_ptr(), token.as_ptr()));
+
+    assert_eq!(value["rootPath"], root);
+    let run = wait_for_run_terminal(value["runId"].as_str().expect("runId"), &token);
+    assert_eq!(run["status"], "complete", "{run}");
+    assert_eq!(run["indexed"], 1, "{run}");
+    assert_eq!(run["skipped"], 1, "{run}");
+    assert_eq!(run["libraryUuid"], value["uuid"], "{run}");
+}
+
+#[test]
+fn given_a_library_when_index_started_over_ffi_then_a_run_id() {
+    let _g = serial();
+    let _db = init_temp_db();
+    let token = c(TEST_TOKEN);
+    let library = register_library("Notes", &folder(&_db, "/library/notes"), &token);
+    let uuid = c(library["uuid"].as_str().unwrap());
+
+    let result = alexandria_library_index_start(uuid.as_ptr(), token.as_ptr(), std::ptr::null());
+
+    assert_eq!(result.status, STATUS_OK);
+    let run_id = run_id_string(&result);
+    assert_ne!(run_id, library["runId"].as_str().unwrap());
+    let run = wait_for_run_terminal(&run_id, &token);
+    assert_eq!(run["status"], "complete", "{run}");
+}
+
+#[test]
+fn given_an_unknown_library_when_index_started_over_ffi_then_not_found() {
+    let _g = serial();
+    let _db = init_temp_db();
+    let token = c(TEST_TOKEN);
+    let uuid = c("11111111-1111-1111-1111-111111111111");
+
+    let result = alexandria_library_index_start(uuid.as_ptr(), token.as_ptr(), std::ptr::null());
+
+    assert_eq!(result.status, STATUS_INDEX_NOT_FOUND);
+}
+
+#[test]
+fn given_a_paused_run_when_index_started_over_ffi_then_conflict() {
+    let _g = serial();
+    let db = init_temp_db();
+    let token = c(TEST_TOKEN);
+    let library = register_library("Notes", &folder(&db, "/library/notes"), &token);
+    let run_id = library["runId"].as_str().unwrap().to_string();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let pool = alexandria_core::migrate::migrate_database(&db.1)
+            .await
+            .expect("open");
+        sqlx::query("UPDATE catalog_runs SET status = 'paused' WHERE id = ?")
+            .bind(&run_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+    });
+    let uuid = c(library["uuid"].as_str().unwrap());
+
+    let result = alexandria_library_index_start(uuid.as_ptr(), token.as_ptr(), std::ptr::null());
+
+    assert_eq!(result.status, STATUS_INDEX_CONFLICT);
+}
+
+#[test]
+fn given_a_low_priority_when_registered_over_ffi_then_its_run_is_low() {
+    let _g = serial();
+    let db = init_temp_db();
+    let token = c(TEST_TOKEN);
+    let body = c(&serde_json::json!({
+        "name": "Notes",
+        "rootPath": folder(&db, "/library/notes"),
+        "priority": "low"
+    })
+    .to_string());
+
+    let value = library_json_ok(alexandria_library_register(body.as_ptr(), token.as_ptr()));
+
+    let run_id = value["runId"].as_str().unwrap().to_string();
+    wait_for_run_terminal(&run_id, &token);
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let concurrency: i64 = rt.block_on(async {
+        let pool = alexandria_core::migrate::migrate_database(&db.1)
+            .await
+            .expect("open");
+        sqlx::query_scalar("SELECT concurrency FROM catalog_runs WHERE id = ?")
+            .bind(&run_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+    });
+    assert_eq!(
+        concurrency,
+        alexandria_core::config::Settings::default()
+            .indexing
+            .low_priority_concurrency as i64
+    );
 }

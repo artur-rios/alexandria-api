@@ -7,12 +7,30 @@ use axum::Json;
 use serde::Deserialize;
 use uuid::Uuid;
 
-use alexandria_core::libraries::model::{Library, LibraryListing};
+use alexandria_core::catalog::commands::index::IndexStarted;
+use alexandria_core::catalog::index_scope::IndexScope;
+use alexandria_core::catalog::runs::RunPriority;
+use alexandria_core::libraries::model::{Library, LibraryListing, RegisteredLibrary};
 
 use crate::middleware::auth::invalid_input;
 use crate::middleware::error::ApiError;
-use crate::routes::bearer_token;
+use crate::routes::{bearer_token, deserialize_priority};
 use crate::AppState;
+
+/// Walk `library`'s folder for the run `run_id`, on a task of its own — the
+/// walk takes minutes and the request that opened the run has answered.
+fn spawn_walk(state: &AppState, library: &Library, run_id: uuid::Uuid) {
+    let handler = state.services.index_handler.clone();
+    let root = library.root_path.clone();
+    tokio::spawn(async move {
+        // `execute` writes the run's `failed` record on its own error path
+        // (UC-42), so a failure here is recorded, not lost; this line is for
+        // the operator.
+        if let Err(err) = handler.execute(&root, run_id, &IndexScope::all()).await {
+            tracing::error!(%run_id, error = %err, "index run aborted");
+        }
+    });
+}
 
 /// Body for `POST /v1/libraries`: the folder, and what to call it.
 #[derive(Debug, Deserialize)]
@@ -20,37 +38,79 @@ use crate::AppState;
 pub struct RegisterLibraryRequest {
     pub name: String,
     pub root_path: String,
+    /// How hard the first run should push: `"low"` or `"normal"`, lenient as
+    /// every start body is — absent or unrecognised is `Normal`.
+    #[serde(default, deserialize_with = "deserialize_priority")]
+    pub priority: RunPriority,
 }
 
-/// `POST /v1/libraries` — treat a folder as a library.
+/// `POST /v1/libraries` — add a folder as a library and start indexing it.
 ///
-/// Returns `201` with the library, `400` (blank name or path), `401`, or
-/// `409` when the folder overlaps one that already exists — which names the
-/// existing library, because "that folder is already inside Photography" is
-/// something the owner can act on where a bare refusal is a puzzle.
-///
-/// Whatever is already indexed beneath the folder is claimed by the same
-/// call: a folder is usually marked after it has been indexed, and a library
-/// that showed nothing until the owner re-walked their disk would read as
-/// broken.
+/// Returns `201` with the library and the `runId` of its first index run,
+/// which a client follows with `GET /v1/index/runs/{runId}`; `400` (blank
+/// name or path, a folder that does not exist, or one outside the configured
+/// `filesystem.root`), `401`, or `409` when the folder overlaps a library
+/// that already exists — which names it, because "that folder is already
+/// inside Photography" is something the owner can act on where a bare
+/// refusal is a puzzle. A refusal stores nothing.
 pub async fn register(
     State(state): State<AppState>,
     headers: HeaderMap,
     body: Result<Json<RegisterLibraryRequest>, JsonRejection>,
-) -> Result<(StatusCode, Json<Library>), ApiError> {
+) -> Result<(StatusCode, Json<RegisteredLibrary>), ApiError> {
     let token = bearer_token(&headers);
 
     let Json(request) =
         body.map_err(|err| invalid_input(format!("invalid register library body: {err}")))?;
 
-    let library = state
+    let registered = state
         .services
         .register_library_handler
-        .register(&request.name, &request.root_path, &token)
+        .register(&request.name, &request.root_path, request.priority, &token)
         .await
         .map_err(ApiError)?;
 
-    Ok((StatusCode::CREATED, Json(library)))
+    spawn_walk(&state, &registered.library, registered.run_id);
+
+    Ok((StatusCode::CREATED, Json(registered)))
+}
+
+/// Body for `POST /v1/libraries/{uuid}/index`. Optional as a whole: no body
+/// is a normal-priority run.
+#[derive(Debug, Default, Deserialize)]
+pub struct IndexLibraryRequest {
+    #[serde(default, deserialize_with = "deserialize_priority")]
+    pub priority: RunPriority,
+}
+
+/// `POST /v1/libraries/{uuid}/index` — re-index one library (UC-01).
+///
+/// Returns `202` with the run id, `401`, `404` for an unknown library, or
+/// `409` while the library already has an unfinished run, naming it
+/// (FR-FC-42).
+pub async fn index(
+    State(state): State<AppState>,
+    uuid: Result<Path<Uuid>, PathRejection>,
+    headers: HeaderMap,
+    body: Result<Json<IndexLibraryRequest>, JsonRejection>,
+) -> Result<(StatusCode, Json<IndexStarted>), ApiError> {
+    let token = bearer_token(&headers);
+
+    let Path(uuid) = uuid.map_err(|_| invalid_input("path segment is not a valid UUID"))?;
+    // A missing or unreadable body is a normal run, the way a bodiless
+    // resume keeps its width: the priority is the only thing it could say.
+    let request = body.map(|Json(request)| request).unwrap_or_default();
+
+    let (library, started) = state
+        .services
+        .index_library_handler
+        .index(uuid, request.priority, &token)
+        .await
+        .map_err(ApiError)?;
+
+    spawn_walk(&state, &library, started.run_id);
+
+    Ok((StatusCode::ACCEPTED, Json(started)))
 }
 
 /// `GET /v1/libraries` — every registered library.

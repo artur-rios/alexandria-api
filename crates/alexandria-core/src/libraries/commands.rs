@@ -3,9 +3,11 @@
 use uuid::Uuid;
 
 use crate::auth::AuthService;
+use crate::catalog::commands::index::{IndexStarted, LibraryRunStarter};
 use crate::catalog::library_root::LibraryRoot;
+use crate::catalog::runs::{CatalogRunRepository, RunPriority};
 use crate::errors::DomainError;
-use crate::libraries::model::{Library, NewLibrary};
+use crate::libraries::model::{Library, NewLibrary, RegisteredLibrary};
 use crate::libraries::repos::LibraryRepository;
 
 /// What is wrong with a library's name, or `None` when it can be stored.
@@ -16,49 +18,91 @@ pub fn validate_library_name(name: &str) -> Option<&'static str> {
     name.trim().is_empty().then_some("name is blank")
 }
 
-/// Register a folder as a library (libraries design).
-pub struct RegisterLibraryHandler<A, R> {
-    auth: A,
-    repo: R,
+/// A root as the caller sent it, trimmed of surrounding whitespace and of
+/// trailing separators, which is the one spelling that is checked, stored and
+/// walked.
+///
+/// `/media/course/` and `/media/course` are one folder; storing the first
+/// would make every prefix test against it look for `/media/course//`. A root
+/// that is nothing but separators (`/`), or a drive (`D:\`), keeps its last
+/// one, or it would stop naming a folder at all.
+pub fn normalize_root(raw: &str) -> &str {
+    let trimmed = raw.trim();
+    let stripped = trimmed.trim_end_matches(['/', '\\']);
+    if stripped.is_empty() || stripped.ends_with(':') {
+        trimmed
+    } else {
+        stripped
+    }
 }
 
-impl<A, R> RegisterLibraryHandler<A, R>
+/// The refusal for a library whose run is not finished (FR-FC-42).
+///
+/// Names the run, because "cancel it first" is only something the owner can
+/// act on when they know which run to cancel.
+pub(crate) fn unfinished_run_conflict(run_id: Uuid) -> DomainError {
+    DomainError::Conflict(format!(
+        "the library has an unfinished run {run_id}; cancel it first"
+    ))
+}
+
+/// Register a folder as a library and start indexing it (FR-FC-36).
+pub struct RegisterLibraryHandler<A, R, S> {
+    auth: A,
+    repo: R,
+    starter: S,
+    /// `filesystem.root` (FR-FC-26): a library's folder is now the only root
+    /// ever walked, so it is bounded here, before anything is stored.
+    library_root: LibraryRoot,
+}
+
+impl<A, R, S> RegisterLibraryHandler<A, R, S>
 where
     A: AuthService,
     R: LibraryRepository,
+    S: LibraryRunStarter,
 {
-    pub fn new(auth: A, repo: R) -> Self {
-        Self { auth, repo }
+    pub fn new(auth: A, repo: R, starter: S, library_root: LibraryRoot) -> Self {
+        Self {
+            auth,
+            repo,
+            starter,
+            library_root,
+        }
     }
 
-    /// Register `root_path` under `name`, and claim what is already indexed
-    /// beneath it.
+    /// Register `root_path` under `name` and open its first index run.
     ///
-    /// Claiming here rather than only at the next index run: a folder is
-    /// usually marked *after* it has been indexed, and a library that showed
-    /// nothing until the owner re-walked their disk would read as broken.
+    /// Checked in this order, and a refusal stores nothing: the name, the
+    /// root, `filesystem.root`, overlap with another library — and then the
+    /// run's own checks (the folder exists). The library row has to exist
+    /// before the run can name it, so a run that cannot open removes the row
+    /// again rather than leaving a library nobody can index.
+    ///
+    /// The caller spawns the walk with the returned run id, as for every run.
     pub async fn register(
         &self,
         name: &str,
         root_path: &str,
+        priority: RunPriority,
         token: &str,
-    ) -> Result<Library, DomainError> {
+    ) -> Result<RegisteredLibrary, DomainError> {
         self.auth.authenticate(token).await?;
 
         if let Some(reason) = validate_library_name(name) {
             return Err(DomainError::InvalidInput(reason.to_string()));
         }
-        // Trimmed once, here, and every use below is of the trimmed value.
-        // The overlap check used to run on what the caller sent while the
-        // insert stored the trimmed form, so `"  /media/photos/2024"` was
+        // Normalized once, here, and every use below is of the normalized
+        // value. The overlap check used to run on what the caller sent while
+        // the insert stored a trimmed form, so `"  /media/photos/2024"` was
         // compared as a path with two leading spaces — a prefix of nothing —
-        // and then stored as a folder genuinely inside `/media/photos`. That
-        // produced the one state the design rules out: a file in two
-        // libraries, and two answers to where it appears.
-        let root_path = root_path.trim();
+        // and then stored as a folder genuinely inside `/media/photos`.
+        let root_path = normalize_root(root_path);
         if root_path.is_empty() {
             return Err(DomainError::InvalidInput("root path is blank".to_string()));
         }
+
+        self.library_root.check_root(root_path)?;
 
         // Refused rather than allowed to overlap, and the existing one is
         // named: "that folder is already inside Photography" is something
@@ -79,16 +123,98 @@ where
             })
             .await?;
 
+        // Claimed for files indexed before this library existed. Removed with
+        // free-form indexing, after which nothing outside a library exists.
         self.repo.claim_files(library.uuid).await?;
 
-        Ok(library)
+        match self
+            .starter
+            .start_library_run(&library, priority, token)
+            .await
+        {
+            Ok(started) => Ok(RegisteredLibrary {
+                library,
+                run_id: started.run_id,
+            }),
+            Err(err) => {
+                // Best effort: the run's own refusal is the error that
+                // matters, and a failure to undo the row must not replace it.
+                if let Err(undo) = self.repo.delete(library.uuid).await {
+                    tracing::warn!(
+                        library = %library.uuid,
+                        error = %undo,
+                        "could not remove a library whose first run did not open"
+                    );
+                }
+                Err(err)
+            }
+        }
+    }
+}
+
+/// Re-index one library (UC-01).
+pub struct IndexLibraryHandler<A, R, S, RR> {
+    auth: A,
+    repo: R,
+    starter: S,
+    runs: RR,
+}
+
+impl<A, R, S, RR> IndexLibraryHandler<A, R, S, RR>
+where
+    A: AuthService,
+    R: LibraryRepository,
+    S: LibraryRunStarter,
+    RR: CatalogRunRepository,
+{
+    pub fn new(auth: A, repo: R, starter: S, runs: RR) -> Self {
+        Self {
+            auth,
+            repo,
+            starter,
+            runs,
+        }
+    }
+
+    /// Open an index run of the library `uuid` names, and answer the library
+    /// with it — the caller walks `library.root_path`.
+    ///
+    /// Refused while the library already has an unfinished run (FR-FC-42):
+    /// two walks of one folder would race each other's inserts, and a paused
+    /// run is the owner's to resume or cancel rather than to be overtaken.
+    pub async fn index(
+        &self,
+        uuid: Uuid,
+        priority: RunPriority,
+        token: &str,
+    ) -> Result<(Library, IndexStarted), DomainError> {
+        self.auth.authenticate(token).await?;
+
+        let library = self
+            .repo
+            .find_by_uuid(uuid)
+            .await?
+            .ok_or(DomainError::NotFound)?;
+
+        if let Some(run) = self.runs.unfinished_for_library(uuid).await? {
+            return Err(unfinished_run_conflict(run.id));
+        }
+
+        let started = self
+            .starter
+            .start_library_run(&library, priority, token)
+            .await?;
+        Ok((library, started))
     }
 }
 
 /// Point a library at the folder it moved to (design section 1).
-pub struct MoveLibraryHandler<A, R> {
+pub struct MoveLibraryHandler<A, R, RR> {
     auth: A,
     repo: R,
+    /// A resume walks the root frozen on the run's row, so moving under an
+    /// unfinished run would send it walking the old folder (FR-FC-42).
+    runs: RR,
     /// `filesystem.root` (FR-FC-26). A move rewrites every stored path under
     /// the library without walking the disk, and playback serves whatever
     /// path the catalog holds — so the new root is bounded exactly as an
@@ -96,16 +222,18 @@ pub struct MoveLibraryHandler<A, R> {
     library_root: LibraryRoot,
 }
 
-impl<A, R> MoveLibraryHandler<A, R>
+impl<A, R, RR> MoveLibraryHandler<A, R, RR>
 where
     A: AuthService,
     R: LibraryRepository,
+    RR: CatalogRunRepository,
 {
-    pub fn new(auth: A, repo: R, library_root: LibraryRoot) -> Self {
+    pub fn new(auth: A, repo: R, library_root: LibraryRoot, runs: RR) -> Self {
         Self {
             auth,
             repo,
             library_root,
+            runs,
         }
     }
 
@@ -138,7 +266,7 @@ where
         // Trimmed before it is either checked or stored, for the reason
         // `register` above trims: checking one spelling and writing another
         // lets a folder past the overlap rule it was meant to fail.
-        let new_root = new_root.trim();
+        let new_root = normalize_root(new_root);
         if new_root.is_empty() {
             return Err(DomainError::InvalidInput("root path is blank".to_string()));
         }
@@ -147,6 +275,10 @@ where
             .find_by_uuid(uuid)
             .await?
             .ok_or(DomainError::NotFound)?;
+
+        if let Some(run) = self.runs.unfinished_for_library(uuid).await? {
+            return Err(unfinished_run_conflict(run.id));
+        }
 
         self.library_root.check_root(new_root)?;
 
