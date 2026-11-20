@@ -5,7 +5,7 @@ use uuid::Uuid;
 use crate::auth::AuthService;
 use crate::catalog::commands::index::{IndexStarted, LibraryRunStarter};
 use crate::catalog::library_root::LibraryRoot;
-use crate::catalog::runs::{CatalogRunRepository, RunPriority};
+use crate::catalog::runs::{CatalogRunRepository, RunPriority, RunStatus};
 use crate::errors::DomainError;
 use crate::libraries::model::{Library, NewLibrary, RegisteredLibrary};
 use crate::libraries::repos::LibraryRepository;
@@ -135,7 +135,7 @@ where
             Err(err) => {
                 // Best effort: the run's own refusal is the error that
                 // matters, and a failure to undo the row must not replace it.
-                if let Err(undo) = self.repo.delete(library.uuid).await {
+                if let Err(undo) = self.repo.delete(library.uuid).await.map(|_| ()) {
                     tracing::warn!(
                         library = %library.uuid,
                         error = %undo,
@@ -293,27 +293,34 @@ where
     }
 }
 
-/// Stop treating a folder as a library.
-pub struct RemoveLibraryHandler<A, R> {
+/// Remove a library and its catalog records (FR-FC-40).
+pub struct RemoveLibraryHandler<A, R, RR> {
     auth: A,
     repo: R,
+    runs: RR,
 }
 
-impl<A, R> RemoveLibraryHandler<A, R>
+impl<A, R, RR> RemoveLibraryHandler<A, R, RR>
 where
     A: AuthService,
     R: LibraryRepository,
+    RR: CatalogRunRepository,
 {
-    pub fn new(auth: A, repo: R) -> Self {
-        Self { auth, repo }
+    pub fn new(auth: A, repo: R, runs: RR) -> Self {
+        Self { auth, repo, runs }
     }
 
-    /// Remove the library `uuid` identifies.
+    /// Remove the library `uuid` identifies, with every file record in it.
     ///
-    /// The files are kept and return to the type panels. Marking a folder as
-    /// a library empties part of a panel, which is not visible until after
-    /// it is done — so the way back has to restore rather than delete, or an
-    /// accidental marking costs the owner their catalog.
+    /// Every file belongs to a library, so a removed library's records have
+    /// nowhere else to be; the files on disk are never touched, and adding
+    /// the folder again re-indexes them.
+    ///
+    /// Refused while one of its runs is *running* (FR-FC-42), naming it: the
+    /// walk would go on writing rows into a library that is gone, and there
+    /// is no waiting for it — a cancel only raises a signal, in whichever
+    /// process the walk is in. A paused run is not writing, and goes with the
+    /// library.
     pub async fn remove(&self, uuid: Uuid, token: &str) -> Result<(), DomainError> {
         self.auth.authenticate(token).await?;
 
@@ -322,6 +329,12 @@ where
             .await?
             .ok_or(DomainError::NotFound)?;
 
-        self.repo.delete(uuid).await
+        if let Some(run) = self.runs.unfinished_for_library(uuid).await? {
+            if run.status == RunStatus::Running {
+                return Err(unfinished_run_conflict(run.id));
+            }
+        }
+
+        self.repo.delete(uuid).await.map(|_removed| ())
     }
 }

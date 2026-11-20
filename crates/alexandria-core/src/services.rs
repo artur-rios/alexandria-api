@@ -268,7 +268,7 @@ pub type DefaultIndexLibraryHandler = IndexLibraryHandler<
 >;
 
 pub type DefaultRemoveLibraryHandler =
-    RemoveLibraryHandler<RuntimeAuthService, SqliteLibraryRepository>;
+    RemoveLibraryHandler<RuntimeAuthService, SqliteLibraryRepository, SqliteCatalogRunRepository>;
 
 pub type DefaultMoveLibraryHandler =
     MoveLibraryHandler<RuntimeAuthService, SqliteLibraryRepository, SqliteCatalogRunRepository>;
@@ -732,6 +732,7 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
     let remove_library_handler = Arc::new(RemoveLibraryHandler::new(
         auth.clone(),
         SqliteLibraryRepository::new(pool.clone()),
+        SqliteCatalogRunRepository::new(pool.clone()),
     ));
     let move_library_handler = Arc::new(MoveLibraryHandler::new(
         auth.clone(),

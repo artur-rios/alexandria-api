@@ -204,11 +204,12 @@ pub async fn move_root(
     Ok((StatusCode::OK, Json(library)))
 }
 
-/// `DELETE /v1/libraries/{uuid}` — stop treating the folder as a library.
+/// `DELETE /v1/libraries/{uuid}` — remove a library and its catalog records.
 ///
-/// The files are kept and return to the type panels. Marking a folder
-/// empties part of a panel, which is not visible until after it is done, so
-/// the way back restores rather than deletes.
+/// Every file record in the library goes, with its progress and collection
+/// membership; nothing on disk is touched, and adding the folder again
+/// re-indexes it (FR-FC-40). Returns `204`, `401`, `404`, or `409` while one
+/// of the library's runs is running, naming it (FR-FC-42).
 pub async fn remove(
     State(state): State<AppState>,
     uuid: Result<Path<Uuid>, PathRejection>,

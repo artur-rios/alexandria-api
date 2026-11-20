@@ -563,3 +563,58 @@ async fn given_a_low_priority_when_a_library_is_posted_then_its_run_is_low() {
         Settings::default().indexing.low_priority_concurrency as i64
     );
 }
+
+#[tokio::test]
+async fn given_a_library_when_deleted_then_204_and_its_files_are_gone() {
+    let harness = test_app().await;
+    let app = app(Settings::default(), harness.services.clone());
+    let root = harness.folder("/library/notes");
+    std::fs::write(format!("{root}/a.md"), b"# a").unwrap();
+    let uuid = register(&app, "Notes", &root).await;
+
+    let deleted = app
+        .clone()
+        .oneshot(authed_request(
+            "DELETE",
+            &format!("/v1/libraries/{uuid}"),
+            None,
+        ))
+        .await
+        .expect("delete");
+
+    assert_eq!(deleted.status(), StatusCode::NO_CONTENT);
+    let files = app
+        .clone()
+        .oneshot(authed_request("GET", "/v1/files", None))
+        .await
+        .expect("list");
+    assert_eq!(body_json(files).await.as_array().map(|a| a.len()), Some(0));
+    assert_eq!(std::fs::read(format!("{root}/a.md")).unwrap(), b"# a");
+}
+
+#[tokio::test]
+async fn given_a_running_run_when_a_library_is_deleted_then_409() {
+    let harness = test_app().await;
+    let app = app(Settings::default(), harness.services.clone());
+    let uuid = register(&app, "Notes", &harness.folder("/library/notes")).await;
+    sqlx::query(
+        "UPDATE catalog_runs SET status = 'running' \
+         WHERE library_id = (SELECT id FROM libraries WHERE uuid = ?)",
+    )
+    .bind(&uuid)
+    .execute(&harness.pool)
+    .await
+    .unwrap();
+
+    let deleted = app
+        .clone()
+        .oneshot(authed_request(
+            "DELETE",
+            &format!("/v1/libraries/{uuid}"),
+            None,
+        ))
+        .await
+        .expect("delete");
+
+    assert_eq!(deleted.status(), StatusCode::CONFLICT);
+}

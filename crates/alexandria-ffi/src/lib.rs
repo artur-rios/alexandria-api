@@ -4893,9 +4893,9 @@ pub extern "C" fn alexandria_library_browse(
     })
 }
 
-/// Stop treating a folder as a library.
-///
-/// The files are kept and return to the type panels. On success `json`
+/// Remove a library and its catalog records (FR-FC-40); nothing on disk is
+/// touched. `LIBRARY_ERR_CONFLICT` while one of its runs is running
+/// (FR-FC-42), as HTTP answers `409`. On success `json`
 /// carries an empty object rather than NULL, so a caller can tell success
 /// from the failure codes without a special case.
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`

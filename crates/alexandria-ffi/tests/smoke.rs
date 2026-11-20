@@ -3019,3 +3019,20 @@ fn given_the_header_when_read_then_it_declares_no_free_form_index_start() {
     assert!(!header.contains("alexandria_index_start("));
     assert!(header.contains("alexandria_library_index_start("));
 }
+
+#[test]
+fn given_a_library_when_removed_over_ffi_then_ok_and_its_files_are_gone() {
+    let _g = serial();
+    let db = init_temp_db();
+    let token = c(TEST_TOKEN);
+    let root = folder(&db, "/library/notes");
+    std::fs::write(format!("{root}/a.md"), b"# a").unwrap();
+    let library = register_library("Notes", &root, &token);
+    let uuid = c(library["uuid"].as_str().unwrap());
+
+    let removed = alexandria_library_remove(uuid.as_ptr(), token.as_ptr());
+
+    assert_eq!(removed.status, STATUS_LIBRARY_OK);
+    assert_eq!(alexandria_index_count_files(), 0);
+    assert_eq!(std::fs::read(format!("{root}/a.md")).unwrap(), b"# a");
+}
