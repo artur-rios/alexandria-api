@@ -5,8 +5,8 @@
 ### 1.1 Purpose
 
 This document establishes the **why and what, at altitude** for Alexandria — a
-personal library back-end that indexes, organizes, and surfaces a single user's
-on-disk media and documents. It states the problem, the product's position, the
+personal library manager back-end that indexes, organizes, and surfaces the
+folders a single user adds as libraries. It states the problem, the product's position, the
 stakeholders, the core features, and the success criteria. It states no versions,
 no endpoints, and no field types — those live in the
 [Technology Stack Document](Technology%20Stack%20Document.md) and the
@@ -14,14 +14,18 @@ no endpoints, and no field types — those live in the
 
 ### 1.2 Scope
 
-Alexandria catalogs a single owner's files to read and watch that already live
-on disk: movies, series, HTML pages, Markdown and text files, PDFs and e-books,
-comic books, images, and browser bookmarks. It lets the owner browse, edit
-metadata, rename, organize into collections, build watchlists and reading lists
-to track consumption, and edit the content of Markdown and text files in place.
-It exposes the same domain operations over an HTTP/REST-JSON API and a Flutter
-FFI surface. Music is not part of Alexandria; it lives in Orpheus, a separate
-project.
+Alexandria is a library manager. The single owner adds folders that already
+live on disk as **libraries**; Alexandria indexes every file in them it can read
+— movies, series, music and other audio, HTML pages, Markdown and text files,
+PDFs and e-books, comic books, and images — keeps each library's folder
+structure exactly as it is, and lets the owner browse that tree and read or play
+what is in it. A folder that is not a library is not Alexandria's. It also lets
+the owner edit metadata, rename, organize into collections, build watchlists
+and reading lists to track consumption, keep browser bookmarks, and edit the
+content of Markdown and text files in place. It exposes the same domain
+operations over an HTTP/REST-JSON API and a Flutter FFI surface. Audio is
+played as files; managing music — playlists, play history, lookups — lives in
+Orpheus, a separate project.
 
 It is explicitly **out of scope** to: support multiple users or shared
 libraries; perform complex media editing (video re-encoding, image
@@ -36,6 +40,7 @@ unmodified, which is not the media editing excluded above.
 | Term | Definition |
 | --- | --- |
 | **Owner** | The single authenticated user to whom all cataloged data belongs. |
+| **Library** | A folder the owner added. The only way files enter the catalog: every catalogued file belongs to exactly one library, and a library is browsed as its own folder tree. |
 | **Catalog** | The set of indexed file records, collections, bookmarks, watchlists, reading lists, and progress entries. |
 | **Collection** | A named flat folder grouping files (kind = file) or bookmarks (kind = bookmark). |
 | **Watchlist** | A named group tracking watch progress for movies and series (VideoFiles). |
@@ -113,8 +118,8 @@ database instead.
 
 | ID | Feature | Description |
 | --- | --- | --- |
-| **F-01** | File indexing | Scan a directory tree and create type-aware catalog records for supported file types, recording each file's path, size, and modification time without reading its contents. Runs asynchronously without blocking reads, report their progress while they go, and can be started at a chosen priority, paused, resumed — optionally at a new priority — and cancelled. |
-| **F-02** | Catalog browsing and metadata editing | List, query, view, and edit the metadata of any supported file type; edit comic-book, video, document, and image metadata; browse by type and collection. |
+| **F-01** | File indexing | Scan a library's folder tree and create type-aware catalog records, in that library, for the file types it can read, recording each file's path, size, and modification time without reading its contents. Runs asynchronously without blocking reads, report their progress while they go, and can be started at a chosen priority, paused, resumed — optionally at a new priority — and cancelled. |
+| **F-02** | Catalog browsing and metadata editing | List, query, view, and edit the metadata of any supported file type; edit audio, comic-book, video, document, and image metadata; search across libraries by type, collection, and library. |
 | **F-03** | Renaming and lifecycle management | Rename files (which renames them on disk), soft-delete records with restore, hard-purge records, and explicitly purge a file on disk. |
 | **F-04** | Text file content editing | Read Markdown and text file content and write edited content back to the file on disk. |
 | **F-05** | Collections | Create, rename, and delete flat file collections and bookmark collections; add and remove items of the matching kind. |
@@ -123,6 +128,7 @@ database instead.
 | **F-08** | Reading lists | Create and delete reading lists, add books and comic books, update read progress (per issue for comic series), and remove items. |
 | **F-09** | Pluggable authentication | Authenticate the single owner via an external JWT service, local hashed-credential login, or the Windows account the server process runs as, selected at startup; authorize every operation. |
 | **F-10** | Dual-transport parity | Expose the same domain operations over HTTP/REST-JSON and a Rust FFI surface with identical results. |
+| **F-12** | Libraries | Add a folder as a library, which indexes it; browse it one level at a time in its own folder structure; re-index it; correct its root when the folder moves; remove it with its catalog records, never its files. |
 
 These `F-xx` IDs are traced to requirement ranges in
 [System Requirements Document](System%20Requirements%20Document.md) §9.
@@ -133,6 +139,8 @@ These `F-xx` IDs are traced to requirement ranges in
 
 ```mermaid
 erDiagram
+    Library ||--o{ File : "holds"
+    File ||--o{ AudioFile : "subtype"
     File ||--o{ VideoFile : "subtype"
     File ||--o{ HtmlPage : "subtype"
     File ||--o{ TextFile : "subtype"

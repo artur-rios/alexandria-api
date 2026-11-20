@@ -179,9 +179,15 @@ state.
 | Dependency | In tests |
 | --- | --- |
 | SQLite | in-memory (or on-disk temp) SQLite via sqlx; migrations run at setup. |
-| Filesystem | a per-test temp directory (the `tempfile` crate) holding sample files. |
+| Filesystem | a per-test temp directory (the `tempfile` crate) holding sample files. Files reach the catalog only through a library (UC-51), so a test indexes its folder by adding it as a library and waiting for that run; a test that writes file rows directly first seeds the library they belong to, since a file without one is refused. |
 | External auth service | fixed ES256 test keys and an in-memory key set standing in for Heimdall's `/.well-known/jwks.json`, plus a fixed HS256 test secret for the overlap; no network beyond a loopback server for the key set fetch itself. |
 | Local-login credentials | seeded into the test DB with an Argon2 hash of a known password. |
+
+A migration that deletes or rewrites rows is tested from the version before it,
+seeded with raw SQL, and stops at that migration: later migrations rewrite the
+state the test asserts on (the upgrade to libraries-only, migration 28, deletes
+every row outside a library). Each migration's tests migrate through it with
+the module's `apply_through` helper.
 
 ### 7.3 HTTP / FFI parity
 

@@ -2,9 +2,12 @@
 
 ## What This Is
 
-Alexandria is a back-end API that indexes, organizes, and surfaces the user's
-personal library of things to read and watch living on disk. Music is not
-part of it; that lives in Orpheus, a separate project. It is written in Rust
+Alexandria is a back-end API for a personal library manager. The owner adds
+folders as libraries; Alexandria indexes every file in them it can read, keeps
+each library's folder structure exactly as it is on disk, and lets a client
+browse that tree and read or play what is in it. A folder that is not a library
+is invisible to it. Audio is played as files; managing music (playlists, play
+history, lookups) lives in Orpheus, a separate project. It is written in Rust
 and exposes a JSON-over-HTTP API that any client in any language can call, while
 keeping its domain logic in a reusable core library that a Flutter desktop
 front-end can also consume directly via FFI.
@@ -31,9 +34,13 @@ already on disk, without re-encoding, duplicating, or relocating the files.
 
 ## What It Does
 
-- Indexes thousands of files from disk and keeps catalog metadata up to date.
+- Lets the user add folders as libraries — the only way files enter the
+  catalog — and browses each one as the folder tree it is on disk.
+- Indexes thousands of files from the libraries' folders, only the types it can
+  read, and keeps catalog metadata up to date.
 - Lets the user view, edit metadata of, rename, and delete:
   - Movies and series (video files)
+  - Music and other audio files
   - HTML pages
   - Markdown and text files
   - PDF and e-book formats (books)

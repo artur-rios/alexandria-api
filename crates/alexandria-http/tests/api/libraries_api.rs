@@ -43,7 +43,7 @@ async fn body_json(response: axum::response::Response) -> Value {
 /// uuid.
 ///
 /// Waited on because a library with an unfinished run refuses a move or a
-/// second run (FR-FC-42), and these tests are about what happens after.
+/// second run (FR-FC-43), and these tests are about what happens after.
 async fn register(app: &axum::Router, name: &str, root: &str) -> String {
     let response = app
         .clone()

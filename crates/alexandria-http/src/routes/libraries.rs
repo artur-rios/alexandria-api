@@ -87,7 +87,7 @@ pub struct IndexLibraryRequest {
 ///
 /// Returns `202` with the run id, `401`, `404` for an unknown library, or
 /// `409` while the library already has an unfinished run, naming it
-/// (FR-FC-42).
+/// (FR-FC-43).
 pub async fn index(
     State(state): State<AppState>,
     uuid: Result<Path<Uuid>, PathRejection>,
@@ -209,7 +209,7 @@ pub async fn move_root(
 /// Every file record in the library goes, with its progress and collection
 /// membership; nothing on disk is touched, and adding the folder again
 /// re-indexes it (FR-FC-40). Returns `204`, `401`, `404`, or `409` while one
-/// of the library's runs is running, naming it (FR-FC-42).
+/// of the library's runs is running, naming it (FR-FC-43).
 pub async fn remove(
     State(state): State<AppState>,
     uuid: Result<Path<Uuid>, PathRejection>,

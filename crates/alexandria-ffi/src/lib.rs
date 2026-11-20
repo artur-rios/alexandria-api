@@ -44,7 +44,7 @@ pub const INDEX_ERR_OTHER: c_int = 4;
 pub const INDEX_ERR_BUSY: c_int = 5;
 /// `alexandria_library_index_start` named no library (HTTP's `404`).
 pub const INDEX_ERR_NOT_FOUND: c_int = 6;
-/// The library already has an unfinished run (FR-FC-42; HTTP's `409`).
+/// The library already has an unfinished run (FR-FC-43; HTTP's `409`).
 pub const INDEX_ERR_CONFLICT: c_int = 7;
 
 /// FFI status codes returned by file operations (UC-04+). Deliberately
@@ -276,7 +276,7 @@ fn parse_resume_priority(raw: Option<String>) -> Option<RunPriority> {
     }
 }
 
-/// This core's version, as a NUL-terminated string such as `"0.5.0"`.
+/// This core's version, as a NUL-terminated string such as `"0.6.0"`.
 ///
 /// The pointer is to static storage owned by the library: it stays valid for
 /// the life of the process and must **not** be passed to
@@ -4676,7 +4676,7 @@ fn spawn_library_walk(
 /// (normal), lenient as every start is.
 ///
 /// Answers `INDEX_OK` with the run id, `INDEX_ERR_NOT_FOUND` for an unknown
-/// library, `INDEX_ERR_CONFLICT` while it has an unfinished run (FR-FC-42),
+/// library, `INDEX_ERR_CONFLICT` while it has an unfinished run (FR-FC-43),
 /// `INDEX_ERR_INVALID_INPUT` for a malformed uuid, `INDEX_ERR_UNAUTHORIZED`
 /// or `INDEX_ERR_NOT_INITIALIZED` — HTTP's `202`, `404`, `409`, `400`, `401`.
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
@@ -4910,7 +4910,7 @@ pub extern "C" fn alexandria_library_browse(
 
 /// Remove a library and its catalog records (FR-FC-40); nothing on disk is
 /// touched. `LIBRARY_ERR_CONFLICT` while one of its runs is running
-/// (FR-FC-42), as HTTP answers `409`. On success `json`
+/// (FR-FC-43), as HTTP answers `409`. On success `json`
 /// carries an empty object rather than NULL, so a caller can tell success
 /// from the failure codes without a special case.
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`

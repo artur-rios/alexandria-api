@@ -97,7 +97,7 @@ feature/uc-##-use-case-name
 
 | Use case | Branch |
 | --- | --- |
-| UC-01: Index library files | `feature/uc-01-index-library-files` |
+| UC-01: Index a library | `feature/uc-01-index-a-library` |
 | UC-17: Browse bookmarks | `feature/uc-17-browse-bookmarks` |
 | UC-33: Edit text file content | `feature/uc-33-edit-text-file-content` |
 

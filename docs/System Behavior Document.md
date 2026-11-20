@@ -241,7 +241,7 @@ by the id `start` returns (`FR-FC-27`).
 
 | Column group | Columns | Written by |
 | --- | --- | --- |
-| Identity | `id`, `kind`, `root`, `scope`, `started_at` | `start` |
+| Identity | `id`, `kind`, `root`, `library_id`, `started_at` | `start` |
 | Lifecycle | `status`, `finished_at`, `error` | terminal writes and the control verbs |
 | Index counts | `scanned`, `indexed`, `skipped`, `already_cataloged`, `failed` | `finish` / `cancel` |
 | Re-index counts | `refreshed`, `marked_missing`, `unchanged`, `failed` | `finish` / `cancel` |
@@ -250,8 +250,7 @@ by the id `start` returns (`FR-FC-27`).
 | Pacing | `concurrency` | `start`, and `resume` when it re-paces |
 | Race guard | `segment` | `resume` only |
 
-`skipped` (an unsupported extension, or a type the run's scope excludes —
-§5.14) and `already_cataloged` (a path the catalog already held) are counted
+`skipped` (a file of a type Alexandria cannot read — §5.13) and `already_cataloged` (a path the catalog already held) are counted
 **apart**. Folding them together made a resumed run
 report every entry an earlier segment had cataloged as a skip — a tally that
 misdescribes what happened.
@@ -304,34 +303,42 @@ sequenceDiagram
     participant R as catalog_runs
     participant W as Walk task
 
-    CL->>T: POST /v1/index {root, priority, types}
-    T->>H: start(request, token)
+    CL->>T: POST /v1/libraries {name, rootPath, priority}
+    T->>H: register → start(library, token)
     H->>H: authenticate
-    H->>H: root exists?
-    H->>H: root inside filesystem.root? (FR-FC-26)
-    H->>R: insert run (running, concurrency from priority)
-    Note over R: FR-FC-27 — the record opens only after<br/>validation, so an invalid root leaves no stray row
-    H-->>T: run id
-    T->>W: spawn execute(root, run_id, scope)
-    T-->>CL: 202 Accepted {runId}
+    H->>H: folder inside filesystem.root? (FR-FC-26)
+    H->>H: overlaps no library?
+    H->>R: insert library
+    H->>H: folder exists?
+    H->>R: insert run (running, library, concurrency from priority)
+    Note over R: FR-FC-27 — the run opens only after<br/>validation; a run that cannot open<br/>removes the library again
+    H-->>T: library + run id
+    T->>W: spawn execute(root, run_id, library)
+    T-->>CL: 201 Created {…library, runId}
     W->>W: walk, classify, stat, persist
 ```
 
-Validation happens in `start`, so a rejected request never leaves a run record
-behind. The run id is handed back only once a record exists to query — the one
+Re-indexing a library (`POST /v1/libraries/{uuid}/index`) takes the same path
+from "insert run" on, after refusing a library that already has a `running` or
+`paused` run (`FR-FC-43`), and answers `202 Accepted {runId}`. A library's folder
+is the only root ever walked: there is no indexing a folder that is not a
+library.
+
+Validation happens before the run opens, so a rejected request never leaves a
+run record behind. The run id is handed back only once a record exists to query — the one
 write in this handler whose failure is *not* swallowed, because a caller must
 never receive an id it can never look up.
 
 ### 5.5 The library-root bound
 
-When `filesystem.root` is set, an index root must be that path or a descendant
-(`FR-FC-26`). The same check, one function (`LibraryRoot::contains`), also
+When `filesystem.root` is set, a library's folder must be that path or a
+descendant (`FR-FC-26`), checked when it is added and again when it is indexed. The same check, one function (`LibraryRoot::contains`), also
 bounds the two other ways a path reaches the disk:
 
 - **Correcting a library's root** (UC-51). A correction rewrites every stored
   path under the library without walking the disk, so without the bound it
-  would be the way around it: index `<root>/x/notes.txt`, register `<root>/x`,
-  correct it to `/home/someone`, and the stream serves
+  would be the way around it: add `<root>/x` holding `notes.txt`, correct it
+  to `/home/someone`, and the stream serves
   `/home/someone/notes.txt`. The rejection is the index's, word for word.
 - **Serving or changing a cataloged file** — stream, comic page, thumbnail,
   text read and edit, rename, purge-on-disk. A record can still point outside:
@@ -379,7 +386,7 @@ purges their records. Re-index takes no root and is unaffected.
 
 ```mermaid
 flowchart TD
-    START(["execute(root, run_id, scope)"]) --> READ["Read the run's stored concurrency<br/>and segment"]
+    START(["execute(root, run_id, library)"]) --> READ["Read the run's stored concurrency<br/>and segment"]
     READ --> OPEN["Open the run's cell in the registry<br/>phase = discovering"]
     OPEN --> LIST["list_files(root)"]
     LIST -->|"could not list"| FAIL["status = failed<br/>record the error"]
@@ -393,11 +400,9 @@ flowchart TD
     SIG2 -->|"yes"| DRAIN["Halted — counted nowhere,<br/>does not advance `processed`"]
     SIG2 -->|"no"| CLASS{"extension<br/>recognised?"}
     CLASS -->|"no"| SKIP["Skipped"]
-    CLASS -->|"yes"| SCOPE{"type in the<br/>run's scope?"}
-    SCOPE -->|"no"| SKIP
-    SCOPE -->|"yes"| SEEN{"path already<br/>in the catalog?"}
+    CLASS -->|"yes"| SEEN{"path already<br/>in the catalog?"}
     SEEN -->|"yes"| ALREADY["AlreadyCataloged"]
-    SEEN -->|"no"| INS["Insert the record<br/>path · name · type · size · mtime<br/>content_hash stays NULL"]
+    SEEN -->|"no"| INS["Insert the record into the run's library<br/>path · name · type · size · mtime<br/>content_hash stays NULL"]
     INS --> META["Best-effort metadata extraction<br/>(FR-FC-25)"]
     META --> IDX["Indexed"]
     INS -->|"error"| BAD["Failed — logged at warn,<br/>the walk continues"]
@@ -719,13 +724,13 @@ writes are independent — one failing does not block the other.
 
 ### 5.13 Classification
 
-By extension alone, matched case-insensitively. Anything else is skipped —
-including audio files such as `.mp3` or `.flac`, which Alexandria does not
-catalog (music lives in Orpheus): they are skipped silently, as any
-unrecognised extension is, and are not reported as failures.
+By extension alone, matched case-insensitively. Anything else is skipped
+silently, and not reported as a failure. A run always records every type
+below: a library is the folder as it is, so there is no per-run type scope.
 
 | Type | Extensions |
 | --- | --- |
+| Audio | mp3, flac, wav, ogg, oga, m4a, aac, opus, wma |
 | Video | mp4, m4v, mkv, avi, mov, webm, mpg, mpeg, wmv, flv |
 | Html | html, htm, mhtml |
 | Text | md, markdown, txt |
@@ -736,36 +741,25 @@ unrecognised extension is, and are not reported as failures.
 A `.pdf` indexes as a Document even when it is a comic: extension alone cannot
 distinguish a comic PDF from a book PDF.
 
-### 5.14 The run's scope
+### 5.14 Every file in one library
 
-A run records the file types its **scope** names (`FR-FC-01`), spelled the same
-way the catalog reads a type back — `video`, `html`, `text`,
-`document`, `comic`, `image`. HTTP takes them as an array
-(`{"types": ["video"]}`), the FFI as one comma-separated string
-(`"video,image"`); an absent key, an empty array, NULL, and the empty string
-all mean **every type**, so every caller predating the scope keeps its
-behaviour.
+A file is written with the library of the run that found it — the run's own,
+passed down the walk — not one worked out from its path, and the catalog
+refuses a file without one (`FR-FC-37`). A refresh (UC-02) updates rows that
+already exist and never inserts, so it cannot create a file outside a library;
+a correction (UC-51) rewrites paths and keeps every file's library.
 
-The check sits *after* classification, because the type is what is being
-filtered on and only the classifier knows it. An out-of-scope file takes the
-same `Skipped` outcome an unsupported extension takes: in both cases the run
-saw a file and chose not to record it, and a second counter would split one
-fact across two numbers every reader would then have to add together.
+Removing a library deletes, in one transaction, its files with their subtype
+rows, watch and reading progress and collection membership; its index runs;
+and every run failure recorded under its folder, a refresh's included
+(`FR-FC-40`). Refresh runs themselves stay. Nothing on disk is touched. Removal
+is refused while one of the library's runs is `running` — the walk would go on
+writing into a library that is gone, and a cancel only raises a signal in
+whichever process is walking — but a `paused` run goes with the library.
 
-An unrecognised type name is **rejected** — the one place a wire word is not
-defaulted. An unreadable priority has a safe fallback to fall back to; a
-scope's only candidate is "every type", which is the opposite of what a caller
-asking for a narrower scope wants, and it fails in the direction of
-cataloguing exactly the files the owner meant to exclude.
-
-The scope is stored on the run, in `catalog_runs.scope`, as the same
-comma-separated list the FFI accepts — for the reason `root` is stored: it is
-what the run was told to cover, and a resume that could not read it back would
-catalogue precisely the files the owner excluded. NULL is every type, so a row
-written before the column existed keeps the meaning it had and needs no
-backfill. A resumed segment (§5.9) walks the scope its run was started with;
-nothing re-scopes a run, and a resume that wanted a different one would be
-starting a different run.
+Upgrading to this model (migration 28) deleted every row outside a library and
+the index runs over roots no library holds, and rebuilt `files` with the
+library required and `audio` back in its type CHECK.
 
 ---
 
@@ -871,7 +865,9 @@ than letting them re-sniff the bytes.
 CBZ, or a page out of range is a `400`.
 
 **`GET /v1/files/{uuid}/thumbnail`** returns a downscaled JPEG for a video, image,
-or comic File (`FR-MP-05`). A type with no thumbnail is a `400`. SVG is
+comic, or audio File (`FR-MP-05`) — for audio, the front cover embedded in the
+file's tag. A type with no thumbnail, or an audio file with no cover, is a
+`400`. SVG is
 rejected explicitly: it is vector, the raster decoder cannot read it, and
 rasterizing it would mean a new dependency.
 

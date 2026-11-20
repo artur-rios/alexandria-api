@@ -531,7 +531,7 @@ pub trait CatalogRunRepository: Send + Sync {
 
     /// The newest index run of `library` that is not finished — `running`, or
     /// `paused` (which is also what startup makes of a run a crash
-    /// interrupted). A library has at most one (FR-FC-42): a second walk of
+    /// interrupted). A library has at most one (FR-FC-43): a second walk of
     /// the same folder, or a move under a paused one, is refused while this
     /// answers `Some`.
     ///

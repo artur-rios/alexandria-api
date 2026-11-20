@@ -2447,7 +2447,7 @@ fn path_in(db: &(TempDir, String), logical: &str) -> String {
 /// the library's JSON.
 ///
 /// Waited on because a library with an unfinished run refuses a move or a
-/// second run (FR-FC-42), and the tests using this are about what comes
+/// second run (FR-FC-43), and the tests using this are about what comes
 /// after.
 fn register_library(name: &str, root: &str, token: &CString) -> serde_json::Value {
     let body = c(&serde_json::json!({ "name": name, "rootPath": root }).to_string());

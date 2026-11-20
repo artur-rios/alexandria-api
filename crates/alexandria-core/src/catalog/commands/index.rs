@@ -26,7 +26,7 @@ use crate::retry::{retry_on_busy, BUSY_ATTEMPTS};
 /// One index run of one library: a library is the only thing a run walks.
 #[derive(Debug, Clone)]
 pub struct IndexRequest {
-    /// The library this run walks. Recorded on the run (FR-FC-42), so its
+    /// The library this run walks. Recorded on the run (FR-FC-43), so its
     /// status can name the library and a second unfinished run of the same
     /// library can be refused.
     pub library_uuid: Uuid,

@@ -293,13 +293,13 @@ impl StateFilter {
 #[serde(rename_all = "camelCase")]
 pub struct FileView {
     pub file: File,
-    /// The library this file belongs to, or `None` when it belongs to none
-    /// (libraries design / FR-FC-38).
+    /// The library this file belongs to (FR-FC-37). Every file belongs to
+    /// one; `None` only where a row's library could not be read back, which
+    /// answers the file rather than failing the whole listing.
     ///
-    /// Carried on every listing because a caller that reached into libraries
-    /// has to be able to tell which rows it reached: a client's dashboard
-    /// still owes the owner a view without them, and a search result is
-    /// clearer for saying where the hit lives. The uuid rather than the
+    /// Carried on every listing because a search result is clearer for
+    /// saying where the hit lives, and a client listing several libraries
+    /// at once needs to group what it got. The uuid rather than the
     /// name — the name is the library's own record to answer, and a listing
     /// that repeated it would go stale the moment one was renamed.
     pub library_uuid: Option<Uuid>,

@@ -36,7 +36,7 @@ pub fn normalize_root(raw: &str) -> &str {
     }
 }
 
-/// The refusal for a library whose run is not finished (FR-FC-42).
+/// The refusal for a library whose run is not finished (FR-FC-43).
 ///
 /// Names the run, because "cancel it first" is only something the owner can
 /// act on when they know which run to cancel.
@@ -175,7 +175,7 @@ where
     /// Open an index run of the library `uuid` names, and answer the library
     /// with it — the caller walks `library.root_path`.
     ///
-    /// Refused while the library already has an unfinished run (FR-FC-42):
+    /// Refused while the library already has an unfinished run (FR-FC-43):
     /// two walks of one folder would race each other's inserts, and a paused
     /// run is the owner's to resume or cancel rather than to be overtaken.
     pub async fn index(
@@ -209,7 +209,7 @@ pub struct MoveLibraryHandler<A, R, RR> {
     auth: A,
     repo: R,
     /// A resume walks the root frozen on the run's row, so moving under an
-    /// unfinished run would send it walking the old folder (FR-FC-42).
+    /// unfinished run would send it walking the old folder (FR-FC-43).
     runs: RR,
     /// `filesystem.root` (FR-FC-26). A move rewrites every stored path under
     /// the library without walking the disk, and playback serves whatever
@@ -316,7 +316,7 @@ where
     /// nowhere else to be; the files on disk are never touched, and adding
     /// the folder again re-indexes them.
     ///
-    /// Refused while one of its runs is *running* (FR-FC-42), naming it: the
+    /// Refused while one of its runs is *running* (FR-FC-43), naming it: the
     /// walk would go on writing rows into a library that is gone, and there
     /// is no waiting for it — a cancel only raises a signal, in whichever
     /// process the walk is in. A paused run is not writing, and goes with the

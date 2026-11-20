@@ -5,6 +5,8 @@
 | Entity | Represents |
 | --- | --- |
 | **File** | An indexed on-disk resource. Subtypes carry type-specific metadata. The API stores a path and content hash plus metadata; it never stores the bytes. |
+| **Library** | A folder the owner added. Every **File** belongs to exactly one, and its folder structure is how the library is browsed. Libraries never nest or overlap. |
+| **AudioFile** | A music or other audio **File**: tags (title, artist, album, …) and its duration; played, never managed as music. |
 | **VideoFile** | A movie or series **File**. Marked as movie or series; carries editable video metadata (title, year, resolution, …). |
 | **HtmlPage** | A saved/linked HTML page **File** (metadata + references to the page/format). |
 | **TextFile** | A Markdown or plain-text **File** whose content can be read and edited in place on disk. |
@@ -22,6 +24,7 @@
 
 | From | Cardinality | To | Notes |
 | --- | --- | --- | --- |
+| Library | 1 — N | File | Every file belongs to exactly one library; removing the library deletes its files' records (BR-21). |
 | Collection (kind = file) | 1 — N | File | A file collection contains zero or more files. A file may belong to a collection. |
 | Collection (kind = bookmark) | 1 — N | Bookmark | A bookmark collection contains zero or more bookmarks. A bookmark may belong to a collection. |
 | Watchlist | 1 — N | WatchProgress | Deleting a watchlist removes its WatchProgress entries, not its VideoFiles. |
@@ -56,6 +59,8 @@ The owner is a single implicit principal; entities carry no per-user foreign key
 | **BR-17** | Exactly one auth mode (external JWT, local login, or Windows account) is active at a time, selected by startup configuration. A caller authenticated by an inactive mode is rejected. | Avoid ambiguity in the trust boundary; keep the model simple per deployment. |
 | **BR-18** | Local-login credentials (email and a salted/hashed password) live in a single SQLite row and are set or changed via a local setup command. The plaintext password is never stored and never logged. | Protect the single user's credentials on a local-only desktop deployment. |
 | **BR-19** | Deleting a ReadingList removes its ReadingProgress entries only. Its target Documents and ComicBooks are preserved. | Removing a tracking list should not remove the catalogued items. |
+| **BR-20** | A Library is the only way a file enters the catalog. The owner adds a folder as a library; every file in it Alexandria can read is indexed, its folder structure is kept, and every catalogued file belongs to exactly one library. Libraries never nest or overlap. | The owner manages folder structures they built on disk; a folder that is not a library is not Alexandria's. |
+| **BR-21** | Removing a Library deletes its catalog records — its files with their progress and collection membership, and its runs — and never touches a file on disk. | No file can exist outside a library, and disk deletions must never be a side effect (BR-11). |
 
 ## Validation Constraints
 

@@ -27,7 +27,7 @@ resolver = "2"
 # between an owner running a stale library and a feature that quietly does
 # nothing — which is exactly what a schema this release adds to, and a lookup
 # this release changes the shape of, would otherwise look like.
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 # Floor set by sqlx 0.9, the highest MSRV in the dependency graph.
 rust-version = "1.94"
