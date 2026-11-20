@@ -7,8 +7,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
-No release has been tagged yet. The workspace version in `Cargo.toml` (currently 0.6.0) tracks client
-compatibility with the desktop front-end, not a published release. What exists so far:
+## [0.6.0] - 2026-11-20
+
+The first tagged release. The workspace version in `Cargo.toml` tracks client compatibility with the desktop
+front-end, which refuses a core of another minor version at startup. Everything up to this release:
 
 ### Added
 
@@ -66,10 +68,9 @@ Music and audio moved out of Alexandria in 0.5.0, which made it a library for th
 Orpheus, a separate project. 0.6.0 brings audio back as playable files only (see Added); everything below except the
 file type itself stays removed.
 
-- The `audio` file type: audio files are no longer catalogued, and the tag reading (lofty) and the audio metadata
-  (title, artist, album, genre, track, album artist) that came with it are gone. Audio files in an indexed folder are
-  skipped silently like any other unrecognised extension. `audio` is rejected as a file type filter and as an index
-  scope.
+- The `audio` file type, in 0.5.0: audio files were no longer catalogued and an indexed folder skipped them. 0.6.0
+  restores the type, its tag reading (lofty) and its metadata as playable files (see Added); only what follows stays
+  removed.
 - Playlists and their entries.
 - Play history and the play statistics.
 - Music enrichment: lyrics and artist photography lookups, and the `[metadata]` configuration section with its
@@ -130,4 +131,5 @@ file type itself stays removed.
   deleted from disk: those calls answer `400` / `*_ERR_INVALID_INPUT` with `file is outside the configured library
   root`. Purging only the record still works. With `filesystem.root` unset nothing changes (`alexandria-core`).
 
-[Unreleased]: https://github.com/artur-rios/alexandria-api/commits/develop
+[Unreleased]: https://github.com/artur-rios/alexandria-api/compare/v0.6.0...develop
+[0.6.0]: https://github.com/artur-rios/alexandria-api/releases/tag/v0.6.0
