@@ -5,8 +5,6 @@
 use chrono::{TimeZone, Utc};
 use uuid::Uuid;
 
-use alexandria_core::catalog::index_scope::IndexScope;
-use alexandria_core::catalog::model::FileType;
 use alexandria_core::catalog::run_registry::{RunPhase, RunProgress};
 use alexandria_core::catalog::runs::{
     CatalogRunRepository, RunCounts, RunKind, RunStatus, SqliteCatalogRunRepository,
@@ -79,52 +77,6 @@ async fn given_a_run_started_at_a_given_width_when_read_then_the_width_round_tri
 
     let run = repo.get(id).await.expect("get").expect("run exists");
     assert_eq!(run.concurrency, Some(1));
-}
-
-/// The real-SQL counterpart of the handler-level scope tests
-/// (`tests/catalog/index.rs`): `start`'s `scope` INSERT and `get`'s `scope`
-/// SELECT round-trip through an actual `catalog_runs` row, so a resume can
-/// read back the types the run was told to record.
-#[tokio::test]
-async fn given_a_scoped_run_when_read_then_the_scope_round_trips() {
-    let (repo, _dir) = repo().await;
-    let id = Uuid::new_v4();
-
-    repo.start(
-        id,
-        RunKind::Index,
-        Some("/library"),
-        t(1),
-        4,
-        Some("text,image"),
-    )
-    .await
-    .expect("start");
-
-    let run = repo.get(id).await.expect("get").expect("run exists");
-    assert!(run.scope.includes(FileType::Text));
-    assert!(run.scope.includes(FileType::Image));
-    assert!(
-        !run.scope.includes(FileType::Video),
-        "a stored scope names what it covers, and nothing else"
-    );
-}
-
-/// A row written before `catalog_runs.scope` existed holds NULL there, which
-/// has to go on meaning what an absent scope has always meant. That is what
-/// makes the added column need no backfill.
-#[tokio::test]
-async fn given_a_run_with_no_stored_scope_when_read_then_it_covers_every_type() {
-    let (repo, _dir) = repo().await;
-    let id = Uuid::new_v4();
-
-    repo.start(id, RunKind::Index, Some("/library"), t(1), 4, None)
-        .await
-        .expect("start");
-
-    let run = repo.get(id).await.expect("get").expect("run exists");
-    assert_eq!(run.scope, IndexScope::all());
-    assert!(run.scope.includes(FileType::Image));
 }
 
 #[tokio::test]

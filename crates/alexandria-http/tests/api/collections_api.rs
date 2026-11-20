@@ -415,10 +415,13 @@ fn unauthenticated_delete_request(uuid: &str) -> Request<Body> {
 /// unlinks rather than deletes contained items.
 async fn seed_linked_file(pool: &SqlitePool, collection_uuid: &str) -> String {
     let file_uuid = uuid::Uuid::new_v4().to_string();
+    crate::common::seeded_library(pool).await;
     sqlx::query(
-        "INSERT INTO files (uuid, path, name, type, content_hash, indexed_at, collection_id) \
+        "INSERT INTO files (uuid, path, name, type, content_hash, indexed_at, collection_id, \
+         library_id) \
          VALUES (?, ?, ?, 'text', 'hash', ?, \
-         (SELECT id FROM collections WHERE uuid = ?))",
+         (SELECT id FROM collections WHERE uuid = ?), \
+         (SELECT id FROM libraries WHERE uuid = 'seeded-library'))",
     )
     .bind(&file_uuid)
     .bind(format!("/lib/{file_uuid}.txt"))
@@ -544,9 +547,10 @@ fn unauthenticated_add_items_request(uuid: &str, body: Value) -> Request<Body> {
 /// Insert a minimal, unlinked `files` row and return its uuid.
 async fn seed_standalone_file(pool: &SqlitePool) -> String {
     let file_uuid = uuid::Uuid::new_v4().to_string();
+    crate::common::seeded_library(pool).await;
     sqlx::query(
-        "INSERT INTO files (uuid, path, name, type, content_hash, indexed_at) \
-         VALUES (?, ?, ?, 'text', 'hash', ?)",
+        "INSERT INTO files (uuid, path, name, type, content_hash, indexed_at, library_id) \
+         VALUES (?, ?, ?, 'text', 'hash', ?, (SELECT id FROM libraries WHERE uuid = 'seeded-library'))",
     )
     .bind(&file_uuid)
     .bind(format!("/lib/{file_uuid}.txt"))

@@ -7,8 +7,6 @@
 
 use crate::common;
 
-use alexandria_core::catalog::model::{FileType, NewFile};
-use alexandria_core::catalog::repos::{CatalogRepository, SqliteCatalogRepository};
 use alexandria_core::config::Settings;
 use alexandria_http::app;
 use axum::body::{to_bytes, Body};
@@ -41,24 +39,11 @@ async fn body_json(response: axum::response::Response) -> Value {
     serde_json::from_slice(&bytes).expect("json")
 }
 
-/// Put one active document in the catalog at `path`.
-async fn seed_file(pool: &sqlx::sqlite::SqlitePool, path: &str) {
-    SqliteCatalogRepository::new(pool.clone())
-        .insert_file(NewFile {
-            uuid: uuid::Uuid::new_v4(),
-            path: path.to_string(),
-            name: path.rsplit('/').next().unwrap_or(path).to_string(),
-            file_type: FileType::Document,
-            content_hash: Some("0".repeat(64)),
-            size_bytes: None,
-            mtime: None,
-            indexed_at: chrono::Utc::now(),
-        })
-        .await
-        .expect("insert");
-}
-
-/// Register a library and answer its uuid.
+/// Register a library, wait for its first run to finish, and answer its
+/// uuid.
+///
+/// Waited on because a library with an unfinished run refuses a move or a
+/// second run (FR-FC-43), and these tests are about what happens after.
 async fn register(app: &axum::Router, name: &str, root: &str) -> String {
     let response = app
         .clone()
@@ -71,10 +56,30 @@ async fn register(app: &axum::Router, name: &str, root: &str) -> String {
         .expect("register");
     assert_eq!(response.status(), StatusCode::CREATED);
 
-    body_json(response).await["uuid"]
-        .as_str()
-        .expect("uuid")
-        .to_string()
+    let body = body_json(response).await;
+    let run_id = body["runId"].as_str().expect("runId");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let status = app
+            .clone()
+            .oneshot(authed_request(
+                "GET",
+                &format!("/v1/index/runs/{run_id}"),
+                None,
+            ))
+            .await
+            .expect("run status");
+        if body_json(status).await["status"] != "running" {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the run never finished"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    body["uuid"].as_str().expect("uuid").to_string()
 }
 
 #[tokio::test]
@@ -82,7 +87,7 @@ async fn given_a_folder_when_posted_then_it_is_created_and_listed() {
     let harness = test_app().await;
     let app = app(Settings::default(), harness.services.clone());
 
-    register(&app, "Course", "/library/course").await;
+    register(&app, "Course", &harness.folder("/library/course")).await;
 
     let listed = app
         .clone()
@@ -97,21 +102,21 @@ async fn given_a_folder_when_posted_then_it_is_created_and_listed() {
 async fn given_a_moved_folder_when_patched_then_the_library_answers_from_its_new_root() {
     let harness = test_app().await;
     let app = app(Settings::default(), harness.services.clone());
-    let uuid = register(&app, "Course", "/library/course").await;
+    let uuid = register(&app, "Course", &harness.folder("/library/course")).await;
 
     let response = app
         .clone()
         .oneshot(authed_request(
             "PATCH",
             &format!("/v1/libraries/{uuid}"),
-            Some(json!({"rootPath": "/media/courses/rust"})),
+            Some(json!({"rootPath": harness.path("/media/courses/rust")})),
         ))
         .await
         .expect("patch");
 
     assert_eq!(response.status(), StatusCode::OK);
     let value = body_json(response).await;
-    assert_eq!(value["rootPath"], "/media/courses/rust");
+    assert_eq!(value["rootPath"], harness.path("/media/courses/rust"));
     assert_eq!(value["uuid"], uuid, "the move replaced the library");
     assert_eq!(value["name"], "Course", "the move renamed the library");
 }
@@ -123,15 +128,15 @@ async fn given_another_librarys_folder_when_patched_onto_then_it_is_a_conflict()
     // file belonging to two libraries at once.
     let harness = test_app().await;
     let app = app(Settings::default(), harness.services.clone());
-    let uuid = register(&app, "Course", "/library/course").await;
-    register(&app, "Photos", "/library/photos").await;
+    let uuid = register(&app, "Course", &harness.folder("/library/course")).await;
+    register(&app, "Photos", &harness.folder("/library/photos")).await;
 
     let response = app
         .clone()
         .oneshot(authed_request(
             "PATCH",
             &format!("/v1/libraries/{uuid}"),
-            Some(json!({"rootPath": "/library/photos/2024"})),
+            Some(json!({"rootPath": harness.path("/library/photos/2024")})),
         ))
         .await
         .expect("patch");
@@ -143,7 +148,7 @@ async fn given_another_librarys_folder_when_patched_onto_then_it_is_a_conflict()
 async fn given_a_blank_root_when_patched_then_it_is_a_bad_request() {
     let harness = test_app().await;
     let app = app(Settings::default(), harness.services.clone());
-    let uuid = register(&app, "Course", "/library/course").await;
+    let uuid = register(&app, "Course", &harness.folder("/library/course")).await;
 
     let response = app
         .clone()
@@ -167,7 +172,7 @@ async fn given_an_unknown_library_when_patched_then_it_is_not_found() {
         .oneshot(authed_request(
             "PATCH",
             "/v1/libraries/11111111-1111-1111-1111-111111111111",
-            Some(json!({"rootPath": "/media/courses"})),
+            Some(json!({"rootPath": harness.path("/media/courses")})),
         ))
         .await
         .expect("patch");
@@ -181,7 +186,7 @@ async fn given_no_credential_when_a_library_is_patched_then_it_is_unauthorized()
     // unauthenticated caller learns nothing about whether the library exists.
     let harness = test_app().await;
     let app = app(Settings::default(), harness.services.clone());
-    let uuid = register(&app, "Course", "/library/course").await;
+    let uuid = register(&app, "Course", &harness.folder("/library/course")).await;
 
     let response = app
         .clone()
@@ -200,79 +205,10 @@ async fn given_no_credential_when_a_library_is_patched_then_it_is_unauthorized()
 }
 
 #[tokio::test]
-async fn given_a_library_when_the_listing_asks_to_reach_in_then_its_files_are_answered() {
-    // The listing is what a client's search and its deleted-items review are
-    // built from, so "absent from the type panels" must not mean "absent from
-    // the catalog" (FR-FC-38). Both directions are asserted here, because
-    // either one alone passes for the wrong reason.
-    let harness = test_app().await;
-    let app = app(Settings::default(), harness.services.clone());
-    seed_file(&harness.pool, "/library/course/syllabus.pdf").await;
-    register(&app, "Course", "/library/course").await;
-
-    let excluded = app
-        .clone()
-        .oneshot(authed_request("GET", "/v1/files?type=document", None))
-        .await
-        .expect("list");
-    assert_eq!(
-        body_json(excluded).await.as_array().map(|a| a.len()),
-        Some(0),
-        "the type panel listed a library's file"
-    );
-
-    let included = app
-        .clone()
-        .oneshot(authed_request(
-            "GET",
-            "/v1/files?type=document&includeLibraries=true",
-            None,
-        ))
-        .await
-        .expect("list");
-    assert_eq!(
-        body_json(included).await.as_array().map(|a| a.len()),
-        Some(1),
-        "a library's file could not be reached, so nothing could find it"
-    );
-}
-
-#[tokio::test]
-async fn given_anything_but_true_when_the_listing_is_asked_then_libraries_stay_excluded() {
-    // A typo must fall towards the exclusion: a course leaking into the type
-    // panels is the defect marking the folder was meant to prevent.
-    let harness = test_app().await;
-    let app = app(Settings::default(), harness.services.clone());
-    seed_file(&harness.pool, "/library/course/syllabus.pdf").await;
-    register(&app, "Course", "/library/course").await;
-
-    for query in [
-        "includeLibraries=false",
-        "includeLibraries=1",
-        "includeLibraries=",
-    ] {
-        let response = app
-            .clone()
-            .oneshot(authed_request(
-                "GET",
-                &format!("/v1/files?type=document&{query}"),
-                None,
-            ))
-            .await
-            .expect("list");
-        assert_eq!(
-            body_json(response).await.as_array().map(|a| a.len()),
-            Some(0),
-            "`{query}` reached into libraries"
-        );
-    }
-}
-
-#[tokio::test]
 async fn given_a_library_when_deleted_then_it_is_gone_from_the_listing() {
     let harness = test_app().await;
     let app = app(Settings::default(), harness.services.clone());
-    let uuid = register(&app, "Course", "/library/course").await;
+    let uuid = register(&app, "Course", &harness.folder("/library/course")).await;
 
     let deleted = app
         .clone()
@@ -373,22 +309,7 @@ async fn given_a_configured_root_when_a_library_is_moved_outside_it_then_400_and
     std::fs::create_dir(&x).unwrap();
     std::fs::write(x.join("passwd.txt"), b"inside").unwrap();
     std::fs::write(b.outside.join("passwd.txt"), b"the secret").unwrap();
-    let indexed = b
-        .app
-        .clone()
-        .oneshot(authed_request(
-            "POST",
-            "/v1/index",
-            Some(json!({ "root": x.to_str().unwrap() })),
-        ))
-        .await
-        .expect("index");
-    assert_eq!(indexed.status(), StatusCode::ACCEPTED);
-    let run_id = body_json(indexed).await["runId"]
-        .as_str()
-        .expect("runId")
-        .to_string();
-    common::wait_for_run_terminal(&b.harness.services, &run_id, common::TEST_TOKEN).await;
+    // Registering indexes the folder: the file is catalogued under it.
     let uuid = register(&b.app, "X", x.to_str().unwrap()).await;
 
     // Act
@@ -498,9 +419,202 @@ async fn given_a_traversal_climbing_out_of_the_root_when_moved_then_400() {
 async fn given_no_configured_root_when_a_library_is_moved_anywhere_then_200() {
     let harness = test_app().await;
     let app = app(Settings::default(), harness.services.clone());
-    let uuid = register(&app, "Course", "/library/course").await;
+    let uuid = register(&app, "Course", &harness.folder("/library/course")).await;
 
     let response = patch_root(&app, &uuid, "/etc").await;
 
     assert_eq!(response.status(), StatusCode::OK);
+}
+
+// ---- registering starts indexing; one library is re-indexed on its own ----
+
+/// Post a library and answer the whole response body.
+async fn register_body(app: &axum::Router, name: &str, root: &str, extra: Value) -> Value {
+    let mut body = json!({"name": name, "rootPath": root});
+    if let (Some(body), Some(extra)) = (body.as_object_mut(), extra.as_object()) {
+        body.extend(extra.clone());
+    }
+    let response = app
+        .clone()
+        .oneshot(authed_request("POST", "/v1/libraries", Some(body)))
+        .await
+        .expect("register");
+    assert_eq!(response.status(), StatusCode::CREATED);
+    body_json(response).await
+}
+
+#[tokio::test]
+async fn given_a_folder_when_posted_then_201_with_the_library_and_a_run_id_that_completes() {
+    let harness = test_app().await;
+    let app = app(Settings::default(), harness.services.clone());
+    let root = harness.folder("/library/notes");
+    std::fs::write(format!("{root}/a.md"), b"# a").unwrap();
+    std::fs::write(format!("{root}/b.zip"), b"zip").unwrap();
+
+    let body = register_body(&app, "Notes", &root, json!({})).await;
+
+    assert_eq!(body["rootPath"], root);
+    assert!(body["uuid"].is_string(), "{body}");
+    let run_id = body["runId"].as_str().expect("runId");
+    let run = common::wait_for_run_terminal(&harness.services, run_id, common::TEST_TOKEN).await;
+    assert_eq!(run["status"], "complete", "{run}");
+    assert_eq!(run["indexed"], 1, "{run}");
+    assert_eq!(run["skipped"], 1, "{run}");
+    assert_eq!(run["libraryUuid"], body["uuid"], "{run}");
+}
+
+#[tokio::test]
+async fn given_a_library_when_index_is_posted_then_202_with_a_run_id() {
+    let harness = test_app().await;
+    let app = app(Settings::default(), harness.services.clone());
+    let body = register_body(&app, "Notes", &harness.folder("/library/notes"), json!({})).await;
+    let first = body["runId"].as_str().unwrap();
+    common::wait_for_run_terminal(&harness.services, first, common::TEST_TOKEN).await;
+
+    let response = app
+        .clone()
+        .oneshot(authed_request(
+            "POST",
+            &format!("/v1/libraries/{}/index", body["uuid"].as_str().unwrap()),
+            None,
+        ))
+        .await
+        .expect("index");
+
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let started = body_json(response).await;
+    let run_id = started["runId"].as_str().expect("runId");
+    assert_ne!(run_id, first);
+    let run = common::wait_for_run_terminal(&harness.services, run_id, common::TEST_TOKEN).await;
+    assert_eq!(run["status"], "complete", "{run}");
+}
+
+#[tokio::test]
+async fn given_an_unknown_library_when_index_is_posted_then_404() {
+    let harness = test_app().await;
+    let app = app(Settings::default(), harness.services.clone());
+
+    let response = app
+        .clone()
+        .oneshot(authed_request(
+            "POST",
+            &format!("/v1/libraries/{}/index", uuid::Uuid::new_v4()),
+            Some(json!({"priority": "low"})),
+        ))
+        .await
+        .expect("index");
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn given_a_paused_run_when_index_is_posted_then_409() {
+    let harness = test_app().await;
+    let app = app(Settings::default(), harness.services.clone());
+    let body = register_body(&app, "Notes", &harness.folder("/library/notes"), json!({})).await;
+    let first = body["runId"].as_str().unwrap();
+    common::wait_for_run_terminal(&harness.services, first, common::TEST_TOKEN).await;
+    sqlx::query("UPDATE catalog_runs SET status = 'paused' WHERE id = ?")
+        .bind(first)
+        .execute(&harness.pool)
+        .await
+        .unwrap();
+
+    let response = app
+        .clone()
+        .oneshot(authed_request(
+            "POST",
+            &format!("/v1/libraries/{}/index", body["uuid"].as_str().unwrap()),
+            None,
+        ))
+        .await
+        .expect("index");
+
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert!(
+        body_json(response).await["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains(first),
+        "the refusal names the run"
+    );
+}
+
+#[tokio::test]
+async fn given_a_low_priority_when_a_library_is_posted_then_its_run_is_low() {
+    let harness = test_app().await;
+    let app = app(Settings::default(), harness.services.clone());
+
+    let body = register_body(
+        &app,
+        "Notes",
+        &harness.folder("/library/notes"),
+        json!({"priority": "low"}),
+    )
+    .await;
+
+    let concurrency: i64 = sqlx::query_scalar("SELECT concurrency FROM catalog_runs WHERE id = ?")
+        .bind(body["runId"].as_str().unwrap())
+        .fetch_one(&harness.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        concurrency,
+        Settings::default().indexing.low_priority_concurrency as i64
+    );
+}
+
+#[tokio::test]
+async fn given_a_library_when_deleted_then_204_and_its_files_are_gone() {
+    let harness = test_app().await;
+    let app = app(Settings::default(), harness.services.clone());
+    let root = harness.folder("/library/notes");
+    std::fs::write(format!("{root}/a.md"), b"# a").unwrap();
+    let uuid = register(&app, "Notes", &root).await;
+
+    let deleted = app
+        .clone()
+        .oneshot(authed_request(
+            "DELETE",
+            &format!("/v1/libraries/{uuid}"),
+            None,
+        ))
+        .await
+        .expect("delete");
+
+    assert_eq!(deleted.status(), StatusCode::NO_CONTENT);
+    let files = app
+        .clone()
+        .oneshot(authed_request("GET", "/v1/files", None))
+        .await
+        .expect("list");
+    assert_eq!(body_json(files).await.as_array().map(|a| a.len()), Some(0));
+    assert_eq!(std::fs::read(format!("{root}/a.md")).unwrap(), b"# a");
+}
+
+#[tokio::test]
+async fn given_a_running_run_when_a_library_is_deleted_then_409() {
+    let harness = test_app().await;
+    let app = app(Settings::default(), harness.services.clone());
+    let uuid = register(&app, "Notes", &harness.folder("/library/notes")).await;
+    sqlx::query(
+        "UPDATE catalog_runs SET status = 'running' \
+         WHERE library_id = (SELECT id FROM libraries WHERE uuid = ?)",
+    )
+    .bind(&uuid)
+    .execute(&harness.pool)
+    .await
+    .unwrap();
+
+    let deleted = app
+        .clone()
+        .oneshot(authed_request(
+            "DELETE",
+            &format!("/v1/libraries/{uuid}"),
+            None,
+        ))
+        .await
+        .expect("delete");
+
+    assert_eq!(deleted.status(), StatusCode::CONFLICT);
 }

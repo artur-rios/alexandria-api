@@ -4,6 +4,7 @@ use serde::Serialize;
 use uuid::Uuid;
 
 use crate::auth::AuthService;
+use crate::catalog::audio_tags::AudioMetadataReader;
 use crate::catalog::classify::classify_by_extension;
 use crate::catalog::clock::Clock;
 use crate::catalog::comic_tags::ComicMetadataReader;
@@ -12,7 +13,6 @@ use crate::catalog::document_tags::DocumentMetadataReader;
 use crate::catalog::extraction::{MetadataExtractor, MetadataWrite};
 use crate::catalog::fs::{FileEntry, Filesystem};
 use crate::catalog::image_tags::ImageMetadataReader;
-use crate::catalog::index_scope::IndexScope;
 use crate::catalog::library_root::LibraryRoot;
 use crate::catalog::model::{FileType, NewFile, METADATA_VERSION};
 use crate::catalog::repos::CatalogRepository;
@@ -20,20 +20,20 @@ use crate::catalog::run_registry::{RunCell, RunPhase, RunRegistry, RunSignal};
 use crate::catalog::runs::{CatalogRunRepository, RunCounts, RunKind, RunPriority, RunStatus};
 use crate::catalog::video_tags::VideoMetadataReader;
 use crate::errors::DomainError;
+use crate::libraries::model::Library;
 use crate::retry::{retry_on_busy, BUSY_ATTEMPTS};
 
+/// One index run of one library: a library is the only thing a run walks.
 #[derive(Debug, Clone)]
 pub struct IndexRequest {
+    /// The library this run walks. Recorded on the run (FR-FC-43), so its
+    /// status can name the library and a second unfinished run of the same
+    /// library can be refused.
+    pub library_uuid: Uuid,
+    /// The library's folder, which is what the run walks.
     pub root: String,
     /// How hard this run should push (FR-FC-08). See `RunPriority`.
     pub priority: RunPriority,
-    /// The file types this run records. Default is every supported type, so a
-    /// caller that says nothing indexes what it always did.
-    ///
-    /// `start` writes it to the run's row beside the root, and a resume reads
-    /// it back (`RunResumed::scope`), so a run paused mid-library continues
-    /// under the scope it began with rather than widening to every type.
-    pub scope: IndexScope,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -59,6 +59,79 @@ pub struct IndexOutcome {
     /// file failed (unreadable bytes, or a repository write error). The run
     /// continues past them; each is logged at `warn`.
     pub failed: usize,
+}
+
+/// Opens the index run of a library — what registering one and re-indexing
+/// one both do (libraries-only design, section 1).
+///
+/// A trait so the library handlers can be unit-tested without the whole
+/// `IndexHandler` and its nine collaborators behind them, and so they hold
+/// the one index handler the application already builds.
+#[allow(async_fn_in_trait)]
+pub trait LibraryRunStarter: Send + Sync {
+    /// Refuse a folder no run could walk — missing, or not a folder — before
+    /// anything about the library is stored.
+    async fn check_folder(&self, root: &str) -> Result<(), DomainError>;
+
+    /// Validate the library's folder and open a run of it. The caller spawns
+    /// the walk (`IndexHandler::execute`), as for every run.
+    async fn start_library_run(
+        &self,
+        library: &Library,
+        priority: RunPriority,
+        token: &str,
+    ) -> Result<IndexStarted, DomainError>;
+}
+
+impl<T: LibraryRunStarter> LibraryRunStarter for std::sync::Arc<T> {
+    async fn check_folder(&self, root: &str) -> Result<(), DomainError> {
+        (**self).check_folder(root).await
+    }
+
+    async fn start_library_run(
+        &self,
+        library: &Library,
+        priority: RunPriority,
+        token: &str,
+    ) -> Result<IndexStarted, DomainError> {
+        (**self).start_library_run(library, priority, token).await
+    }
+}
+
+impl<A, R, F, C, M, N, O, P, Q, RR> LibraryRunStarter
+    for IndexHandler<A, R, F, C, M, N, O, P, Q, RR>
+where
+    A: AuthService,
+    R: CatalogRepository,
+    F: Filesystem,
+    C: Clock,
+    M: AudioMetadataReader,
+    N: ImageMetadataReader,
+    O: DocumentMetadataReader,
+    P: VideoMetadataReader,
+    Q: ComicMetadataReader,
+    RR: CatalogRunRepository,
+{
+    async fn check_folder(&self, root: &str) -> Result<(), DomainError> {
+        IndexHandler::check_folder(self, root).await
+    }
+
+    async fn start_library_run(
+        &self,
+        library: &Library,
+        priority: RunPriority,
+        token: &str,
+    ) -> Result<IndexStarted, DomainError> {
+        self.start(
+            IndexRequest {
+                library_uuid: library.uuid,
+                root: library.root_path.clone(),
+                priority,
+            },
+            token,
+        )
+        .await
+    }
 }
 
 /// Index library files (UC-01).
@@ -96,15 +169,15 @@ pub struct IndexOutcome {
 /// against trait fakes (no real DB, filesystem, or auth service in unit
 /// tests), then wired with the concrete Sqlite/StdFilesystem/Bearer/services
 /// at runtime.
-pub struct IndexHandler<A, R, F, C, N, O, P, Q, RR> {
+pub struct IndexHandler<A, R, F, C, M, N, O, P, Q, RR> {
     auth: A,
     repo: R,
     fs: F,
     clock: C,
-    /// The four readers, held together (`MetadataExtractor`) because the
+    /// The five readers, held together (`MetadataExtractor`) because the
     /// refresh reads the same files with the same readers and this is the
     /// one description of how a file's own metadata reaches the catalog.
-    extractor: MetadataExtractor<N, O, P, Q>,
+    extractor: MetadataExtractor<M, N, O, P, Q>,
     concurrency: usize,
     /// The width a `RunPriority::Low` run processes at
     /// (`indexing.low_priority_concurrency`). See `concurrency` for the
@@ -176,12 +249,13 @@ impl IndexTally {
     }
 }
 
-impl<A, R, F, C, N, O, P, Q, RR> IndexHandler<A, R, F, C, N, O, P, Q, RR>
+impl<A, R, F, C, M, N, O, P, Q, RR> IndexHandler<A, R, F, C, M, N, O, P, Q, RR>
 where
     A: AuthService,
     R: CatalogRepository,
     F: Filesystem,
     C: Clock,
+    M: AudioMetadataReader,
     N: ImageMetadataReader,
     O: DocumentMetadataReader,
     P: VideoMetadataReader,
@@ -207,6 +281,7 @@ where
         repo: R,
         fs: F,
         clock: C,
+        audio_tags: M,
         image_tags: N,
         document_tags: O,
         video_tags: P,
@@ -223,13 +298,32 @@ where
             repo,
             fs,
             clock,
-            extractor: MetadataExtractor::new(image_tags, document_tags, video_tags, comic_tags),
+            extractor: MetadataExtractor::new(
+                audio_tags,
+                image_tags,
+                document_tags,
+                video_tags,
+                comic_tags,
+            ),
             concurrency: concurrency.max(1) as usize,
             low_priority_concurrency: low_priority_concurrency.max(1) as usize,
             library_root,
             runs,
             registry,
         }
+    }
+
+    /// A root a run can walk: one that exists and is a folder.
+    async fn check_folder(&self, root: &str) -> Result<(), DomainError> {
+        if !self.fs.path_exists(root).await {
+            return Err(DomainError::InvalidInput("root path does not exist".into()));
+        }
+        if !self.fs.is_folder(root).await {
+            return Err(DomainError::InvalidInput(
+                "root path is not a folder".into(),
+            ));
+        }
+        Ok(())
     }
 
     /// The width a run at `priority` should be walked at — `Normal` maps to
@@ -256,9 +350,7 @@ where
         token: &str,
     ) -> Result<IndexStarted, DomainError> {
         self.auth.authenticate(token).await?;
-        if !self.fs.path_exists(&request.root).await {
-            return Err(DomainError::InvalidInput("root path does not exist".into()));
-        }
+        self.check_folder(&request.root).await?;
         // FR-FC-26 — see `LibraryRoot::contains` for how both sides are
         // resolved. The same check bounds a library move (UC-51), so the two
         // ways a root reaches the catalog cannot disagree about it.
@@ -266,11 +358,6 @@ where
         let run_id = Uuid::new_v4();
         let started_at = self.clock.now();
         let concurrency = self.concurrency_for(request.priority) as u32;
-        // The scope is recorded here, beside the root, for the reason the
-        // root is: both are what the run was told to cover, and a resume
-        // that could not read the scope back would walk the very types the
-        // owner excluded (FR-FC-33).
-        let scope = request.scope.to_wire();
         retry_on_busy(BUSY_ATTEMPTS, || {
             self.runs.start(
                 run_id,
@@ -278,7 +365,7 @@ where
                 Some(&request.root),
                 started_at,
                 concurrency,
-                scope.as_deref(),
+                Some(request.library_uuid),
             )
         })
         .await?;
@@ -301,15 +388,18 @@ where
     /// `warn`, and the walk continues. One locked file must not abandon the
     /// rest of the library. Only a failure to list the root at all aborts.
     ///
-    /// `scope` is an argument for the same reason `root` is: both say what
-    /// this walk is to cover, and both are handed in by whoever spawned it —
-    /// `IndexRequest::scope` for a fresh run, and `RunResumed::scope`, read
-    /// back off the run's row, for a resumed one.
+    /// Every file Alexandria can read is recorded: a library is the folder as
+    /// it is, so there is no per-run type filter.
+    ///
+    /// `library_uuid` is the library the run walks; every file it records
+    /// belongs to it. Handed in by whoever spawned the walk, as `root` is —
+    /// the registered or re-indexed library for a fresh run, and
+    /// `RunResumed::library_uuid`, read off the run's row, for a resumed one.
     pub async fn execute(
         &self,
         root: &str,
         run_id: Uuid,
-        scope: &IndexScope,
+        library_uuid: Uuid,
     ) -> Result<IndexOutcome, DomainError> {
         let now = self.clock.now();
         // Read from the run's own row rather than carried in as a parameter
@@ -494,17 +584,8 @@ where
                 let Some(file_type) = classify_by_extension(&entry.name) else {
                     return EntryOutcome::Skipped;
                 };
-                // Filtered after classification because the type is what is
-                // being filtered on, and only the classifier knows it. The
-                // outcome is the same `Skipped` an unsupported extension
-                // takes: in both cases the run saw the file and chose not to
-                // record it, and a second counter would split one fact across
-                // two numbers every reader would then have to add up.
-                if !scope.includes(file_type) {
-                    return EntryOutcome::Skipped;
-                }
                 let path = entry.path.clone();
-                match self.index_entry(entry, file_type, now).await {
+                match self.index_entry(entry, file_type, library_uuid, now).await {
                     Ok(outcome) => outcome,
                     Err(err) => {
                         tracing::warn!(
@@ -688,6 +769,7 @@ where
         &self,
         entry: FileEntry,
         file_type: FileType,
+        library_uuid: Uuid,
         now: DateTime<Utc>,
     ) -> Result<EntryOutcome, DomainError> {
         if self.repo.find_by_path(&entry.path).await?.is_some() {
@@ -695,6 +777,7 @@ where
         }
         let new_file = NewFile {
             uuid: Uuid::new_v4(),
+            library_uuid,
             path: entry.path.clone(),
             name: entry.name,
             file_type,

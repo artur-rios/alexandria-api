@@ -15,14 +15,15 @@ use tower::ServiceExt;
 
 use crate::common::{test_app, wait_for_run_terminal, write_file, ASYNC_RUN_DEADLINE, TEST_TOKEN};
 
+/// Add `root` as a library, which starts its first index run.
 fn index_request(root: &str, priority: Option<&str>) -> Request<Body> {
-    let mut body = serde_json::json!({ "root": root });
+    let mut body = serde_json::json!({ "name": "Library", "rootPath": root });
     if let Some(priority) = priority {
         body["priority"] = serde_json::Value::String(priority.to_string());
     }
     Request::builder()
         .method("POST")
-        .uri("/v1/index")
+        .uri("/v1/libraries")
         .header("authorization", format!("Bearer {TEST_TOKEN}"))
         .header("content-type", "application/json")
         .body(Body::from(body.to_string()))
@@ -166,7 +167,7 @@ async fn start_index(router: &axum::Router, root: &str) -> String {
         .oneshot(index_request(root, None))
         .await
         .expect("index");
-    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    assert_eq!(response.status(), StatusCode::CREATED);
     body_json(response).await["runId"]
         .as_str()
         .expect("runId")
@@ -191,7 +192,7 @@ async fn paused_index_run(
         .oneshot(index_request(lib.path().to_str().unwrap(), priority))
         .await
         .expect("index");
-    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    assert_eq!(response.status(), StatusCode::CREATED);
     let run_id = body_json(response).await["runId"]
         .as_str()
         .expect("runId")
@@ -752,7 +753,7 @@ async fn given_no_token_when_runs_listed_then_401() {
 /// concurrency — the only place a chosen priority is observable, since
 /// `CatalogRun::concurrency` is `#[serde(skip)]` on the run body.
 #[tokio::test]
-async fn given_low_priority_when_index_started_then_run_recorded_at_low_concurrency() {
+async fn given_low_priority_when_library_posted_then_run_recorded_at_low_concurrency() {
     let test = test_app().await;
     let router = app(Settings::default(), test.services.clone());
     let lib = tempfile::tempdir().unwrap();
@@ -762,7 +763,7 @@ async fn given_low_priority_when_index_started_then_run_recorded_at_low_concurre
         .oneshot(index_request(lib.path().to_str().unwrap(), Some("low")))
         .await
         .expect("index");
-    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    assert_eq!(response.status(), StatusCode::CREATED);
     let run_id = body_json(response).await["runId"]
         .as_str()
         .unwrap()
@@ -781,7 +782,7 @@ async fn given_low_priority_when_index_started_then_run_recorded_at_low_concurre
 /// `alexandria-ffi::parse_priority` (Task 11) applies to a garbage FFI
 /// argument (FR-FC-24).
 #[tokio::test]
-async fn given_garbage_priority_when_index_started_then_falls_back_to_normal_concurrency() {
+async fn given_garbage_priority_when_library_posted_then_falls_back_to_normal_concurrency() {
     let test = test_app().await;
     let router = app(Settings::default(), test.services.clone());
     let lib = tempfile::tempdir().unwrap();
@@ -794,7 +795,7 @@ async fn given_garbage_priority_when_index_started_then_falls_back_to_normal_con
         ))
         .await
         .expect("index");
-    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    assert_eq!(response.status(), StatusCode::CREATED);
     let run_id = body_json(response).await["runId"]
         .as_str()
         .unwrap()

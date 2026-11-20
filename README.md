@@ -1,11 +1,15 @@
 # Alexandria API
 
-A fast, type-aware personal library back-end written in Rust. Alexandria indexes,
-organizes, and surfaces a single user's on-disk things to read and watch —
-movies and series, HTML pages, Markdown and text files, PDFs and e-books, comic
-books, images, and browser bookmarks — without re-encoding, duplicating, or
-relocating them. Music is not part of Alexandria; it lives in Orpheus, a
-separate project. The domain logic lives in a reusable Rust core library
+A fast, type-aware personal library manager back-end written in Rust. The owner
+adds folders as **libraries**; Alexandria indexes every file in them it can read
+— movies and series, music and other audio, HTML pages, Markdown and text files,
+PDFs and e-books, comic books, and images — keeps each library's folder
+structure exactly as it is on disk, and lets a client browse that tree and open,
+read, or play what is in it, without re-encoding, duplicating, or relocating
+anything. A folder that is not a library is invisible to Alexandria. Browser
+bookmarks are kept alongside. Audio is played as files, not managed as music:
+playlists, play history and lookups belong to Orpheus, a separate project. The
+domain logic lives in a reusable Rust core library
 exposed over both an HTTP/REST-JSON API and a Flutter FFI surface, so any client
 in any language can drive it and the Flutter desktop front-end can call it
 in-process.
@@ -36,7 +40,7 @@ its open/closed state, so the tables stay in sync with the board automatically.
 | [F-08 Reading lists](https://github.com/artur-rios/alexandria-api/milestone/9) | UC-26 … UC-31 | 6 / 6 |
 | [F-09 Pluggable authentication](https://github.com/artur-rios/alexandria-api/milestone/10) | UC-34 … UC-36, UC-41 | 4 / 4 |
 | [F-10 Media playback](https://github.com/artur-rios/alexandria-api/milestone/11) | UC-38 … UC-40 | 3 / 3 |
-| F-12 Libraries | UC-51 | 1 / 1 |
+| F-12 Libraries | UC-51, UC-01 | 1 / 1 |
 | **Total** | | **46 / 46** |
 
 The last one carries no milestone link and no issue number, and that is
@@ -59,13 +63,13 @@ Workspace scaffold, configuration, migrations, logging, and the health surface.
 
 ### F-01 — File indexing
 
-Discover on-disk files, classify them by type, record the stat pair every
+Discover the files in each library's folder, classify them by type, record the stat pair every
 directory entry already carries, and keep the catalog current — with each run
 observable, pausable, resumable, and cancellable while it walks.
 
 | Issue | Use case | Status | Title | Requirements |
 | --- | --- | :---: | --- | --- |
-| [#2](https://github.com/artur-rios/alexandria-api/issues/2) | UC-01 | &#9745; | Index library files | FR-FC-01 … FR-FC-09, FR-FC-24 |
+| [#2](https://github.com/artur-rios/alexandria-api/issues/2) | UC-01 | &#9745; | Index a library | FR-FC-01 … FR-FC-09, FR-FC-24 |
 | [#3](https://github.com/artur-rios/alexandria-api/issues/3) | UC-02 | &#9745; | Re-index and refresh the catalog | FR-FC-08, FR-FC-10, FR-FC-11, FR-FC-24 |
 | [#99](https://github.com/artur-rios/alexandria-api/issues/99) | UC-42 | &#9745; | Query an index or refresh run | FR-FC-24, FR-FC-27, FR-FC-28, FR-FC-29, FR-FC-35 |
 | — | UC-48 | &#9745; | Pause, resume, or cancel an index run | FR-FC-24, FR-FC-27, FR-FC-29, FR-FC-31 … FR-FC-34 |
@@ -178,12 +182,14 @@ Serve file bytes to the front-end, plus comic pages and thumbnails.
 
 ### F-12 — Libraries
 
-A folder browsed as its own tree, whose files are shown there and not in the
-type panels.
+The way into Alexandria, and the only one: a folder added as a library is
+indexed, browsed as its own tree, re-indexed on its own, corrected when it
+moves, and removed with its catalog records. Every other feature works on the
+files libraries hold.
 
 | Issue | Use case | Status | Title | Requirements |
 | --- | --- | :---: | --- | --- |
-| — | UC-51 | &#9745; | Group a folder as a library | FR-FC-36 … FR-FC-41 |
+| — | UC-51 | &#9745; | Add a library | FR-FC-36 … FR-FC-42 |
 
 To update the tables: when an issue closes, flip its marker from **&#9744;** to
 **&#9745;** and bump the milestone's progress count. The issue number references
@@ -317,8 +323,9 @@ The fix is to delete the database file and let it rebuild:
 rm "${ALEXANDRIA_DATABASE_PATH:-alexandria.sqlite}"
 ```
 
-Then start the server and re-run `POST /v1/index` against your library. The
-catalog is derived from the files on disk, so re-indexing restores it — but
+Then start the server and add your folders again as libraries
+(`POST /v1/libraries`), which indexes them. The catalog is derived from the
+files on disk, so re-indexing restores it — but
 anything the catalog holds that is *not* derived from disk is lost: edited
 metadata, collections, bookmarks, watchlists, reading lists, watch and reading
 progress, and local-auth accounts. Export or note whatever you need first.
@@ -329,6 +336,7 @@ progress, and local-auth accounts. Export or note whatever you need first.
 | --- | --- |
 | `size_bytes`/`mtime` change detection replaced full-file hashing (FR-FC-09), and the run record gained progress, pause, priority, and segment columns (UC-42) | Both baselines amended. Delete the database and re-index. |
 | Music and audio removed (0.5.0): Alexandria no longer catalogs audio files, and music now lives in Orpheus, a separate project. Migration 25 deletes the stored music — audio files, tags, lyrics, artist photography records, play history, playlists, and track energy — and removes `audio` from any recorded index run; migration 26 deletes the run failures recorded on audio files | No database deletion needed; the migration runs on startup. Files on disk are never touched. The `[metadata]` config section is ignored if still present. |
+| Libraries are the only way in (0.6.0): files enter the catalog only by being inside a library. `POST /v1/index`, `alexandria_index_start`, the `types` scope and the `includeLibraries` listing flag are gone; adding a library (`POST /v1/libraries`) indexes it, and `POST /v1/libraries/{uuid}/index` re-indexes it. Migration 28 **deletes every catalog record outside a library** — the files, their progress and collection membership, and the index runs over roots no library holds. Audio is a catalog type again, as playable files (no playlists, history or lookups) | **Back up your database before the first start on 0.6.0** if you want to keep watch or reading progress and collection membership on files outside libraries. Then add your folders as libraries. Files on disk are never touched. |
 
 ### Health check
 

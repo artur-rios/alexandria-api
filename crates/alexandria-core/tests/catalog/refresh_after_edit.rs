@@ -16,6 +16,7 @@
 //! this crate's precedent for a real SQLite pool in an integration test,
 //! `catalog/hashing.rs` for touching the real filesystem directly.
 
+use crate::common::FakeAudioMetadataReader;
 use alexandria_core::auth::BearerAuthService;
 use alexandria_core::catalog::clock::SystemClock;
 use alexandria_core::catalog::comic_tags::CbzComicMetadataReader;
@@ -51,16 +52,18 @@ async fn given_a_just_edited_text_file_when_refreshed_then_it_is_unchanged_and_i
     // no stored hash, no stat.
     let pool = migrated_pool().await;
     let repo = SqliteCatalogRepository::new(pool.clone());
-    let runs = SqliteCatalogRunRepository::new(pool);
+    let runs = SqliteCatalogRunRepository::new(pool.clone());
 
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("notes.txt");
     std::fs::write(&path, "before").expect("seed file on disk");
     let path_str = path.to_str().expect("utf-8 path").to_string();
 
+    let library_uuid = crate::common::seed_library(&pool, dir.path().to_str().unwrap()).await;
     let uuid = Uuid::new_v4();
     repo.insert_file(NewFile {
         uuid,
+        library_uuid,
         path: path_str,
         name: "notes.txt".to_string(),
         file_type: FileType::Text,
@@ -101,6 +104,7 @@ async fn given_a_just_edited_text_file_when_refreshed_then_it_is_unchanged_and_i
         repo.clone(),
         StdFilesystem,
         SystemClock,
+        FakeAudioMetadataReader::new(),
         ExifImageMetadataReader,
         PdfEpubMetadataReader,
         FfmpegVideoMetadataReader,

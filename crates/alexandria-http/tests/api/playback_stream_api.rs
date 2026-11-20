@@ -15,16 +15,20 @@ use tower::ServiceExt;
 
 use crate::common::{file_rows_with_uuid, test_app, wait_for_files};
 
+/// Add `root` as a library, which starts its first index run: the only way
+/// files enter the catalog.
 fn index_request(root: &str) -> Request<Body> {
     Request::builder()
         .method("POST")
-        .uri("/v1/index")
+        .uri("/v1/libraries")
         .header(
             "authorization",
             format!("Bearer {}", common::TEST_TOKEN).as_str(),
         )
         .header("content-type", "application/json")
-        .body(Body::from(serde_json::json!({ "root": root }).to_string()))
+        .body(Body::from(
+            serde_json::json!({ "name": "Library", "rootPath": root }).to_string(),
+        ))
         .unwrap()
 }
 
@@ -380,9 +384,18 @@ async fn seed_row(pool: &sqlx::sqlite::SqlitePool, path: &std::path::Path) -> St
     use alexandria_core::catalog::model::{FileType, NewFile};
     use alexandria_core::catalog::repos::{CatalogRepository, SqliteCatalogRepository};
     let uuid = uuid::Uuid::new_v4();
+    // Every file belongs to a library: the row goes into one at its folder.
+    let library_uuid = uuid::Uuid::new_v4();
+    sqlx::query("INSERT INTO libraries (uuid, name, root_path) VALUES (?, 'Seeded', ?)")
+        .bind(library_uuid.to_string())
+        .bind(path.parent().unwrap().to_str().unwrap())
+        .execute(pool)
+        .await
+        .expect("library");
     SqliteCatalogRepository::new(pool.clone())
         .insert_file(NewFile {
             uuid,
+            library_uuid,
             path: path.to_str().unwrap().to_string(),
             name: path.file_name().unwrap().to_str().unwrap().to_string(),
             file_type: FileType::Text,

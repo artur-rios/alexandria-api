@@ -17,14 +17,14 @@ use alexandria_core::auth::local::{
 use alexandria_core::auth::{AuthService, Principal};
 use alexandria_core::bookmarks::model::{Bookmark, BookmarkState, NewBookmark};
 use alexandria_core::bookmarks::repos::BookmarkRepository;
+use alexandria_core::catalog::audio_tags::{AudioMetadataReader, AudioTags};
 use alexandria_core::catalog::clock::{Clock, FixedClock};
 use alexandria_core::catalog::comic_tags::{ComicMetadataReader, ComicTags};
 use alexandria_core::catalog::document_tags::{DocumentMetadataReader, DocumentTags};
 use alexandria_core::catalog::fs::{FileEntry, FileStat, Filesystem};
 use alexandria_core::catalog::image_tags::{ImageMetadataReader, ImageTags};
-use alexandria_core::catalog::index_scope::IndexScope;
 use alexandria_core::catalog::model::{
-    File, FileState, FileType, FileView, LibraryScope, NewFile, StateFilter, SubtypeMetadata,
+    File, FileState, FileType, FileView, NewFile, StateFilter, SubtypeMetadata,
 };
 use alexandria_core::catalog::repos::CatalogRepository;
 use alexandria_core::catalog::run_registry::{RunPhase, RunProgress};
@@ -112,6 +112,9 @@ pub struct FakeCatalogRepository {
     /// Duration (seconds) last written for `uuid` via `set_video_duration`
     /// (issue #44 video slice).
     video_durations: Arc<Mutex<HashMap<Uuid, f64>>>,
+    /// Every audio duration written, so a test can assert indexing
+    /// actually extracted and stored one.
+    pub audio_durations: Arc<Mutex<HashMap<Uuid, f64>>>,
     /// Page count last written for `uuid` via `set_comic_page_count`
     /// (issue #44 comic slice).
     comic_page_counts: Arc<Mutex<HashMap<Uuid, i64>>>,
@@ -236,6 +239,27 @@ impl FakeCatalogRepository {
 }
 
 impl CatalogRepository for FakeCatalogRepository {
+    async fn set_audio_duration(
+        &self,
+        uuid: Uuid,
+        duration_seconds: f64,
+    ) -> Result<(), DomainError> {
+        let files = self.files.lock().unwrap();
+        let file = files
+            .values()
+            .find(|f| f.uuid == uuid)
+            .ok_or(DomainError::NotFound)?;
+        if file.file_type != alexandria_core::catalog::model::FileType::Audio {
+            return Err(DomainError::InvalidInput("file is not audio".into()));
+        }
+        drop(files);
+        self.audio_durations
+            .lock()
+            .unwrap()
+            .insert(uuid, duration_seconds);
+        Ok(())
+    }
+
     async fn find_by_path(&self, path: &str) -> Result<Option<File>, DomainError> {
         Ok(self.files.lock().unwrap().get(path).cloned())
     }
@@ -396,11 +420,9 @@ impl CatalogRepository for FakeCatalogRepository {
         file_type: Option<FileType>,
         state: StateFilter,
         collection_uuid: Option<Uuid>,
-        // The fake holds no library membership, so the scope changes nothing
-        // here. What it must not do is silently disagree with the real
-        // repository — the persistence tests are where the exclusion is
-        // asserted, against a database that has libraries in it.
-        _scope: LibraryScope,
+        // The fake holds no library membership, so a library filter changes
+        // nothing here; the persistence tests assert it against SQLite.
+        _library_uuid: Option<Uuid>,
     ) -> Result<Vec<File>, DomainError> {
         let files = self.files.lock().unwrap();
         let links = self.collection_links.lock().unwrap();
@@ -443,10 +465,10 @@ impl CatalogRepository for FakeCatalogRepository {
         file_type: Option<FileType>,
         state: StateFilter,
         collection_uuid: Option<Uuid>,
-        scope: LibraryScope,
+        library_uuid: Option<Uuid>,
     ) -> Result<Vec<FileView>, DomainError> {
         let files = self
-            .list_filtered(file_type, state, collection_uuid, scope)
+            .list_filtered(file_type, state, collection_uuid, library_uuid)
             .await?;
         let metadata = self.metadata.lock().unwrap();
         let dimensions = self.dimensions.lock().unwrap();
@@ -594,6 +616,10 @@ impl CatalogRepository for FakeCatalogRepository {
             .unwrap()
             .insert(uuid, duration_seconds);
         Ok(())
+    }
+
+    async fn find_audio_duration(&self, uuid: Uuid) -> Result<Option<f64>, DomainError> {
+        Ok(self.audio_durations.lock().unwrap().get(&uuid).copied())
     }
 
     async fn find_video_duration(&self, uuid: Uuid) -> Result<Option<f64>, DomainError> {
@@ -2192,6 +2218,43 @@ impl SessionRepository for FailingSessionRepository {
     }
 }
 
+/// In-memory audio-tag reader (issue #44 pilot). `read()` answers `None`
+/// for any path with no seeded tags, mirroring "no tags found / couldn't
+/// parse" — the same outcome `LoftyAudioMetadataReader` produces for those
+/// cases. Also counts calls, so a test can assert the reader was never
+/// consulted at all (e.g. for a non-audio file) — `metadata_for` staying
+/// `None` alone can't distinguish "never called" from "called, but its
+/// result was rejected/discarded downstream."
+#[derive(Debug, Default, Clone)]
+pub struct FakeAudioMetadataReader {
+    tags: Arc<Mutex<HashMap<String, AudioTags>>>,
+    call_count: Arc<Mutex<usize>>,
+}
+
+impl FakeAudioMetadataReader {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Seed the tags `read()` returns for `path`.
+    pub fn seed(&self, path: &str, tags: AudioTags) -> &Self {
+        self.tags.lock().unwrap().insert(path.to_string(), tags);
+        self
+    }
+
+    /// How many times `read()` has been called.
+    pub fn call_count(&self) -> usize {
+        *self.call_count.lock().unwrap()
+    }
+}
+
+impl AudioMetadataReader for FakeAudioMetadataReader {
+    async fn read(&self, path: &str) -> Option<AudioTags> {
+        *self.call_count.lock().unwrap() += 1;
+        self.tags.lock().unwrap().get(path).cloned()
+    }
+}
+
 /// In-memory image-EXIF reader (issue #44 image slice). `read()` answers
 /// `None` for any path with no seeded tags, mirroring "no EXIF found /
 /// couldn't parse" — the same outcome `ExifImageMetadataReader` produces
@@ -2528,16 +2591,8 @@ impl CatalogRunRepository for FakeCatalogRunRepository {
         root: Option<&str>,
         started_at: DateTime<Utc>,
         concurrency: u32,
-        scope: Option<&str>,
+        library_uuid: Option<Uuid>,
     ) -> Result<(), DomainError> {
-        // Mirrors the SQLite adapter's read side: the stored list parses back
-        // into the scope, and NULL is every type. A stored value that will
-        // not parse is this fake's own bug, so it panics rather than quietly
-        // widening the run to every type.
-        let scope = match scope {
-            Some(raw) => IndexScope::parse_list(raw).expect("a stored scope must parse back"),
-            None => IndexScope::all(),
-        };
         self.runs.lock().unwrap().insert(
             id,
             CatalogRun {
@@ -2561,7 +2616,7 @@ impl CatalogRunRepository for FakeCatalogRunRepository {
                 // The first execution of the run, as the column's default
                 // says. `resume` counts from here.
                 segment: 0,
-                scope,
+                library_uuid,
             },
         );
         Ok(())
@@ -2822,6 +2877,14 @@ impl CatalogRunRepository for FakeCatalogRunRepository {
 pub struct FailingCatalogRepository;
 
 impl CatalogRepository for FailingCatalogRepository {
+    async fn set_audio_duration(
+        &self,
+        _uuid: Uuid,
+        _duration_seconds: f64,
+    ) -> Result<(), DomainError> {
+        unimplemented!("not reached by the run-fails-to-list path")
+    }
+
     async fn find_by_path(&self, _path: &str) -> Result<Option<File>, DomainError> {
         unimplemented!("not reached by the run-fails-to-list path")
     }
@@ -2892,7 +2955,7 @@ impl CatalogRepository for FailingCatalogRepository {
         _file_type: Option<FileType>,
         _state: StateFilter,
         _collection_uuid: Option<Uuid>,
-        _scope: LibraryScope,
+        _library_uuid: Option<Uuid>,
     ) -> Result<Vec<File>, DomainError> {
         unimplemented!("not reached by the run-fails-to-list path")
     }
@@ -2910,7 +2973,7 @@ impl CatalogRepository for FailingCatalogRepository {
         _file_type: Option<FileType>,
         _state: StateFilter,
         _collection_uuid: Option<Uuid>,
-        _scope: LibraryScope,
+        _library_uuid: Option<Uuid>,
     ) -> Result<Vec<FileView>, DomainError> {
         unimplemented!("not reached by the run-fails-to-list path")
     }
@@ -2956,6 +3019,10 @@ impl CatalogRepository for FailingCatalogRepository {
     }
 
     async fn find_video_duration(&self, _uuid: Uuid) -> Result<Option<f64>, DomainError> {
+        unimplemented!("not reached by the run-fails-to-list path")
+    }
+
+    async fn find_audio_duration(&self, _uuid: Uuid) -> Result<Option<f64>, DomainError> {
         unimplemented!("not reached by the run-fails-to-list path")
     }
 
@@ -3119,7 +3186,7 @@ impl CatalogRunRepository for FailingCatalogRunRepository {
         _root: Option<&str>,
         _started_at: DateTime<Utc>,
         _concurrency: u32,
-        _scope: Option<&str>,
+        _library_uuid: Option<Uuid>,
     ) -> Result<(), DomainError> {
         match self {
             Self::StartFails => Err(DomainError::Disk("run store unavailable".into())),
@@ -3461,4 +3528,39 @@ impl RecoveryCodeRepository for FakeRecoveryCodeRepository {
             .filter(|(_, consumed_at)| consumed_at.is_none())
             .count() as u32)
     }
+}
+
+/// A run starter that opens nothing and always succeeds: for library tests
+/// about what is stored, whose folders are paths written by hand rather than
+/// folders on disk a real run could walk.
+pub struct AlwaysStartsRun;
+
+impl alexandria_core::catalog::commands::index::LibraryRunStarter for AlwaysStartsRun {
+    async fn check_folder(&self, _root: &str) -> Result<(), DomainError> {
+        Ok(())
+    }
+
+    async fn start_library_run(
+        &self,
+        _library: &alexandria_core::libraries::model::Library,
+        _priority: alexandria_core::catalog::runs::RunPriority,
+        _token: &str,
+    ) -> Result<alexandria_core::catalog::commands::index::IndexStarted, DomainError> {
+        Ok(alexandria_core::catalog::commands::index::IndexStarted {
+            run_id: Uuid::new_v4(),
+        })
+    }
+}
+
+/// Insert a library at `root` straight into the table and answer its uuid,
+/// for a test that writes file rows itself: every file belongs to a library.
+pub async fn seed_library(pool: &sqlx::sqlite::SqlitePool, root: &str) -> Uuid {
+    let uuid = Uuid::new_v4();
+    sqlx::query("INSERT INTO libraries (uuid, name, root_path) VALUES (?, 'Library', ?)")
+        .bind(uuid.to_string())
+        .bind(root)
+        .execute(pool)
+        .await
+        .expect("seed library");
+    uuid
 }

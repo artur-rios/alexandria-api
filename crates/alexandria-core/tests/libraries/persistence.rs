@@ -2,10 +2,10 @@
 //! proves migration 20 applies, and that the exclusion is real rather than
 //! sound in principle.
 
-use alexandria_core::catalog::model::{FileType, LibraryScope, NewFile, StateFilter};
+use alexandria_core::catalog::model::{FileType, NewFile};
 use alexandria_core::catalog::repos::{CatalogRepository, SqliteCatalogRepository};
 use alexandria_core::errors::DomainError;
-use alexandria_core::libraries::commands::{RegisterLibraryHandler, RemoveLibraryHandler};
+use alexandria_core::libraries::commands::RegisterLibraryHandler;
 use alexandria_core::libraries::model::LibraryListing;
 use alexandria_core::libraries::queries::BrowseLibraryHandler;
 use alexandria_core::libraries::repos::SqliteLibraryRepository;
@@ -13,27 +13,63 @@ use alexandria_core::migrate::migrate_database;
 use chrono::Utc;
 use uuid::Uuid;
 
-use crate::common::FakeAuth;
+use alexandria_core::catalog::library_root::LibraryRoot;
+use alexandria_core::catalog::runs::{RunPriority, SqliteCatalogRunRepository};
+
+use crate::common::{AlwaysStartsRun, FakeAuth};
 
 const ROOT: &str = "/library/course";
 
-async fn fixtures() -> (
-    sqlx::sqlite::SqlitePool,
-    SqliteCatalogRepository,
-    tempfile::TempDir,
-) {
+/// The catalog repository, with the pool beside it so a test file can be
+/// put into the library that holds its path.
+struct Catalog {
+    repo: SqliteCatalogRepository,
+    pool: sqlx::sqlite::SqlitePool,
+}
+
+impl std::ops::Deref for Catalog {
+    type Target = SqliteCatalogRepository;
+    fn deref(&self) -> &SqliteCatalogRepository {
+        &self.repo
+    }
+}
+
+async fn fixtures() -> (sqlx::sqlite::SqlitePool, Catalog, tempfile::TempDir) {
     let dir = tempfile::tempdir().expect("tempdir");
     let pool = migrate_database(dir.path().join("a.sqlite").to_str().unwrap())
         .await
         .expect("migrate");
-    (pool.clone(), SqliteCatalogRepository::new(pool), dir)
+    let catalog = Catalog {
+        repo: SqliteCatalogRepository::new(pool.clone()),
+        pool: pool.clone(),
+    };
+    (pool, catalog, dir)
 }
 
-async fn insert(catalog: &SqliteCatalogRepository, path: &str, file_type: FileType) -> Uuid {
+/// Put one file at `path` into the library whose folder holds it — what an
+/// index run of that library records. Every file belongs to a library, so a
+/// path no library holds is the test's own mistake.
+async fn insert(catalog: &Catalog, path: &str, file_type: FileType) -> Uuid {
+    let libraries: Vec<(String, String)> = sqlx::query_as("SELECT uuid, root_path FROM libraries")
+        .fetch_all(&catalog.pool)
+        .await
+        .expect("libraries");
+    let slashed = |p: &str| p.replace('\\', "/");
+    let library = libraries
+        .iter()
+        .filter(|(_, root)| {
+            let root = format!("{}/", slashed(root).trim_end_matches('/'));
+            slashed(path).starts_with(&root)
+        })
+        .max_by_key(|(_, root)| root.len())
+        .map(|(uuid, _)| Uuid::parse_str(uuid).expect("uuid"))
+        .unwrap_or_else(|| panic!("no library holds {path}; register one first"));
+
     let uuid = Uuid::new_v4();
     catalog
         .insert_file(NewFile {
             uuid,
+            library_uuid: library,
             path: path.to_string(),
             name: path.rsplit(['/', '\\']).next().unwrap_or(path).to_string(),
             file_type,
@@ -48,81 +84,6 @@ async fn insert(catalog: &SqliteCatalogRepository, path: &str, file_type: FileTy
 }
 
 #[tokio::test]
-async fn given_a_registered_library_when_the_videos_are_listed_then_its_files_are_absent() {
-    // The whole point: a hundred lecture recordings must not bury the films.
-    let (pool, catalog, _dir) = fixtures().await;
-    insert(
-        &catalog,
-        "/library/course/class-01/lecture.mp4",
-        FileType::Video,
-    )
-    .await;
-    insert(&catalog, "/library/films/a-film.mkv", FileType::Video).await;
-
-    RegisterLibraryHandler::new(
-        FakeAuth::Allowing,
-        SqliteLibraryRepository::new(pool.clone()),
-    )
-    .register("Course", ROOT, "token")
-    .await
-    .expect("register");
-
-    let listed = catalog
-        .list_filtered_view(
-            Some(FileType::Video),
-            StateFilter::Active,
-            None,
-            LibraryScope::OutsideLibraries,
-        )
-        .await
-        .expect("list");
-
-    assert_eq!(listed.len(), 1, "a library's file was still in the panel");
-    assert_eq!(listed[0].file.name, "a-film.mkv");
-}
-
-#[tokio::test]
-async fn given_a_library_when_it_is_removed_then_its_files_come_back() {
-    // Marking a folder empties part of a panel, and that is not visible
-    // until after it is done. The way back has to restore, not delete.
-    let (pool, catalog, _dir) = fixtures().await;
-    insert(
-        &catalog,
-        "/library/course/class-01/lecture.mp4",
-        FileType::Video,
-    )
-    .await;
-
-    let library = RegisterLibraryHandler::new(
-        FakeAuth::Allowing,
-        SqliteLibraryRepository::new(pool.clone()),
-    )
-    .register("Course", ROOT, "token")
-    .await
-    .expect("register");
-
-    RemoveLibraryHandler::new(
-        FakeAuth::Allowing,
-        SqliteLibraryRepository::new(pool.clone()),
-    )
-    .remove(library.uuid, "token")
-    .await
-    .expect("remove");
-
-    let listed = catalog
-        .list_filtered_view(
-            Some(FileType::Video),
-            StateFilter::Active,
-            None,
-            LibraryScope::OutsideLibraries,
-        )
-        .await
-        .expect("list");
-
-    assert_eq!(listed.len(), 1, "removing a library lost its files");
-}
-
-#[tokio::test]
 async fn given_an_overlapping_folder_when_registered_then_it_is_refused_by_name() {
     // Two libraries owning one file means two answers to "where does this
     // appear". Refused with the existing one named, so the owner can act.
@@ -130,15 +91,24 @@ async fn given_an_overlapping_folder_when_registered_then_it_is_refused_by_name(
     let handler = RegisterLibraryHandler::new(
         FakeAuth::Allowing,
         SqliteLibraryRepository::new(pool.clone()),
+        AlwaysStartsRun,
+        LibraryRoot::unconfigured(),
     );
     handler
-        .register("Course", ROOT, "token")
+        .register("Course", ROOT, RunPriority::Normal, "token")
         .await
+        .map(|registered| registered.library)
         .expect("register");
 
     let nested = handler
-        .register("Week one", "/library/course/class-01", "token")
-        .await;
+        .register(
+            "Week one",
+            "/library/course/class-01",
+            RunPriority::Normal,
+            "token",
+        )
+        .await
+        .map(|registered| registered.library);
 
     match nested {
         Err(DomainError::Conflict(message)) => assert!(message.contains("Course"), "{message}"),
@@ -155,104 +125,26 @@ async fn given_a_sibling_folder_with_a_shared_prefix_when_registered_then_it_is_
     let handler = RegisterLibraryHandler::new(
         FakeAuth::Allowing,
         SqliteLibraryRepository::new(pool.clone()),
+        AlwaysStartsRun,
+        LibraryRoot::unconfigured(),
     );
     handler
-        .register("Course", ROOT, "token")
+        .register("Course", ROOT, RunPriority::Normal, "token")
         .await
+        .map(|registered| registered.library)
         .expect("first");
 
     let sibling = handler
-        .register("Notes", "/library/course-notes", "token")
-        .await;
+        .register(
+            "Notes",
+            "/library/course-notes",
+            RunPriority::Normal,
+            "token",
+        )
+        .await
+        .map(|registered| registered.library);
 
     assert!(sibling.is_ok(), "a sibling folder was refused: {sibling:?}");
-}
-
-#[tokio::test]
-async fn given_a_root_holding_an_underscore_when_it_claims_then_a_sibling_is_left_alone() {
-    // `_` is LIKE's single-character wildcard, and it is also an entirely
-    // ordinary character in a folder name. Unescaped, a library at
-    // `/library/tv_shows` claimed every file under `/library/tv-shows` — a
-    // different folder — which took those files out of the type panels, put
-    // them in the wrong tree, and left `move_root` rewriting their paths by
-    // slicing at a root they were never under.
-    let (pool, catalog, _dir) = fixtures().await;
-    insert(&catalog, "/library/tv_shows/mine.mkv", FileType::Video).await;
-    let stranger = insert(&catalog, "/library/tv-shows/theirs.mkv", FileType::Video).await;
-
-    let library = RegisterLibraryHandler::new(
-        FakeAuth::Allowing,
-        SqliteLibraryRepository::new(pool.clone()),
-    )
-    .register("Shows", "/library/tv_shows", "token")
-    .await
-    .expect("register");
-
-    let listing = BrowseLibraryHandler::new(
-        FakeAuth::Allowing,
-        SqliteLibraryRepository::new(pool.clone()),
-        SqliteCatalogRepository::new(pool.clone()),
-    )
-    .browse(library.uuid, "", "token")
-    .await
-    .expect("browse");
-
-    assert_eq!(
-        listing.files.len(),
-        1,
-        "the library claimed a file from a sibling folder: {:?}",
-        listing
-            .files
-            .iter()
-            .map(|v| &v.file.path)
-            .collect::<Vec<_>>()
-    );
-
-    // And the stranger is still where it belongs: in the type panel.
-    let outside = SqliteCatalogRepository::new(pool.clone())
-        .list_filtered_view(
-            Some(FileType::Video),
-            StateFilter::Active,
-            None,
-            LibraryScope::OutsideLibraries,
-        )
-        .await
-        .expect("list");
-    assert!(
-        outside.iter().any(|view| view.file.uuid == stranger),
-        "a file outside the library vanished from the type panel"
-    );
-}
-
-#[tokio::test]
-async fn given_a_root_holding_an_underscore_when_a_sibling_is_indexed_then_it_is_not_claimed() {
-    // The other half of the same escape: the claim at insert time runs its
-    // own LIKE, so fixing only `claim_files` would leave the next scan
-    // putting the sibling's files back into the library.
-    let (pool, catalog, _dir) = fixtures().await;
-    RegisterLibraryHandler::new(
-        FakeAuth::Allowing,
-        SqliteLibraryRepository::new(pool.clone()),
-    )
-    .register("Shows", "/library/tv_shows", "token")
-    .await
-    .expect("register");
-
-    let stranger = insert(&catalog, "/library/tv-shows/theirs.mkv", FileType::Video).await;
-
-    let outside = SqliteCatalogRepository::new(pool.clone())
-        .list_filtered_view(
-            Some(FileType::Video),
-            StateFilter::Active,
-            None,
-            LibraryScope::OutsideLibraries,
-        )
-        .await
-        .expect("list");
-    assert!(
-        outside.iter().any(|view| view.file.uuid == stranger),
-        "a file indexed beside a library was claimed by it"
-    );
 }
 
 #[tokio::test]
@@ -265,55 +157,29 @@ async fn given_a_padded_path_when_registered_then_the_overlap_is_still_refused()
     let handler = RegisterLibraryHandler::new(
         FakeAuth::Allowing,
         SqliteLibraryRepository::new(pool.clone()),
+        AlwaysStartsRun,
+        LibraryRoot::unconfigured(),
     );
     handler
-        .register("Course", ROOT, "token")
+        .register("Course", ROOT, RunPriority::Normal, "token")
         .await
+        .map(|registered| registered.library)
         .expect("register");
 
     let nested = handler
-        .register("Week one", "  /library/course/class-01  ", "token")
-        .await;
+        .register(
+            "Week one",
+            "  /library/course/class-01  ",
+            RunPriority::Normal,
+            "token",
+        )
+        .await
+        .map(|registered| registered.library);
 
     match nested {
         Err(DomainError::Conflict(message)) => assert!(message.contains("Course"), "{message}"),
         other => panic!("expected a conflict naming the existing library, got {other:?}"),
     }
-}
-
-#[tokio::test]
-async fn given_files_already_indexed_when_a_library_is_registered_then_they_are_claimed() {
-    // A folder is usually marked *after* it has been indexed. A library that
-    // showed nothing until the owner re-walked their disk would read as
-    // broken.
-    let (pool, catalog, _dir) = fixtures().await;
-    insert(
-        &catalog,
-        "/library/course/class-01/lecture.mp4",
-        FileType::Video,
-    )
-    .await;
-    insert(&catalog, "/library/course/syllabus.pdf", FileType::Document).await;
-
-    let library = RegisterLibraryHandler::new(
-        FakeAuth::Allowing,
-        SqliteLibraryRepository::new(pool.clone()),
-    )
-    .register("Course", ROOT, "token")
-    .await
-    .expect("register");
-
-    let listing = BrowseLibraryHandler::new(
-        FakeAuth::Allowing,
-        SqliteLibraryRepository::new(pool.clone()),
-        SqliteCatalogRepository::new(pool.clone()),
-    )
-    .browse(library.uuid, "", "token")
-    .await
-    .expect("browse");
-
-    assert_eq!(listing.folders.len(), 1, "the class folder was not seen");
-    assert_eq!(listing.files.len(), 1, "the syllabus was not at the top");
 }
 
 #[tokio::test]
@@ -330,9 +196,12 @@ async fn given_a_library_when_a_file_is_indexed_into_it_later_then_it_is_claimed
     let library = RegisterLibraryHandler::new(
         FakeAuth::Allowing,
         SqliteLibraryRepository::new(pool.clone()),
+        AlwaysStartsRun,
+        LibraryRoot::unconfigured(),
     )
-    .register("Course", ROOT, "token")
+    .register("Course", ROOT, RunPriority::Normal, "token")
     .await
+    .map(|registered| registered.library)
     .expect("register");
 
     // Indexed after the library existed.
@@ -342,20 +211,6 @@ async fn given_a_library_when_a_file_is_indexed_into_it_later_then_it_is_claimed
         FileType::Video,
     )
     .await;
-
-    let listed = catalog
-        .list_filtered_view(
-            Some(FileType::Video),
-            StateFilter::Active,
-            None,
-            LibraryScope::OutsideLibraries,
-        )
-        .await
-        .expect("list");
-    assert!(
-        listed.is_empty(),
-        "a file indexed into a library appeared in the type panel"
-    );
 
     let listing = BrowseLibraryHandler::new(
         FakeAuth::Allowing,
@@ -369,31 +224,6 @@ async fn given_a_library_when_a_file_is_indexed_into_it_later_then_it_is_claimed
         listing.folders.len(),
         1,
         "the new class was not in the tree"
-    );
-}
-
-#[tokio::test]
-async fn given_no_library_when_a_file_is_indexed_then_it_belongs_to_none() {
-    // The great majority of files. The subquery must answer NULL rather than
-    // attaching them to whichever library happened to sort first.
-    let (_pool, catalog, _dir) = fixtures().await;
-
-    insert(&catalog, "/library/films/a-film.mkv", FileType::Video).await;
-
-    let listed = catalog
-        .list_filtered_view(
-            Some(FileType::Video),
-            StateFilter::Active,
-            None,
-            LibraryScope::OutsideLibraries,
-        )
-        .await
-        .expect("list");
-
-    assert_eq!(
-        listed.len(),
-        1,
-        "an ordinary file was hidden from its panel"
     );
 }
 
@@ -414,9 +244,12 @@ mod windows_paths {
         RegisterLibraryHandler::new(
             FakeAuth::Allowing,
             SqliteLibraryRepository::new(pool.clone()),
+            AlwaysStartsRun,
+            LibraryRoot::unconfigured(),
         )
-        .register("Rust course", WINDOWS_ROOT, "token")
+        .register("Rust course", WINDOWS_ROOT, RunPriority::Normal, "token")
         .await
+        .map(|registered| registered.library)
         .expect("register")
         .uuid
     }
@@ -433,68 +266,9 @@ mod windows_paths {
     }
 
     #[tokio::test]
-    async fn given_a_windows_root_when_a_library_is_registered_then_it_claims_what_is_under_it() {
-        let (pool, catalog, _dir) = fixtures().await;
-        insert(
-            &catalog,
-            r"D:\courses\rust\class-01\lecture.mp4",
-            FileType::Video,
-        )
-        .await;
-        insert(&catalog, r"D:\films\a-film.mkv", FileType::Video).await;
-
-        library_over(&pool).await;
-
-        let listed = catalog
-            .list_filtered_view(
-                Some(FileType::Video),
-                StateFilter::Active,
-                None,
-                LibraryScope::OutsideLibraries,
-            )
-            .await
-            .expect("list");
-
-        assert_eq!(
-            listed.len(),
-            1,
-            "the lecture stayed in the type panel, so the library claimed nothing"
-        );
-        assert!(listed[0].file.path.ends_with("a-film.mkv"));
-    }
-
-    #[tokio::test]
-    async fn given_a_windows_root_when_a_file_is_indexed_under_it_then_it_is_claimed_at_once() {
-        // The insert-time half, which is a different query from the claim
-        // above and was wrong in the same way.
-        let (pool, catalog, _dir) = fixtures().await;
-        library_over(&pool).await;
-        insert(
-            &catalog,
-            r"D:\courses\rust\class-02\lecture.mp4",
-            FileType::Video,
-        )
-        .await;
-
-        let listed = catalog
-            .list_filtered_view(
-                Some(FileType::Video),
-                StateFilter::Active,
-                None,
-                LibraryScope::OutsideLibraries,
-            )
-            .await
-            .expect("list");
-
-        assert!(
-            listed.is_empty(),
-            "a file indexed into the library still appeared in the type panel"
-        );
-    }
-
-    #[tokio::test]
     async fn given_a_windows_library_when_it_is_browsed_then_its_folders_are_seen() {
         let (pool, catalog, _dir) = fixtures().await;
+        let uuid = library_over(&pool).await;
         insert(
             &catalog,
             r"D:\courses\rust\class-01\lecture.mp4",
@@ -507,7 +281,6 @@ mod windows_paths {
             FileType::Document,
         )
         .await;
-        let uuid = library_over(&pool).await;
 
         let top = browse_at(&pool, uuid, "").await;
 
@@ -539,9 +312,17 @@ mod windows_paths {
         let nested = RegisterLibraryHandler::new(
             FakeAuth::Allowing,
             SqliteLibraryRepository::new(pool.clone()),
+            AlwaysStartsRun,
+            LibraryRoot::unconfigured(),
         )
-        .register("One class", r"D:\courses\rust\class-01", "token")
-        .await;
+        .register(
+            "One class",
+            r"D:\courses\rust\class-01",
+            RunPriority::Normal,
+            "token",
+        )
+        .await
+        .map(|registered| registered.library);
 
         assert!(
             matches!(nested, Err(DomainError::Conflict(_))),
@@ -552,169 +333,6 @@ mod windows_paths {
 
 /// Correcting a library's root when its folder moved (design section 1,
 /// FR-FC-41).
-mod reaching_in {
-    use super::*;
-    use alexandria_core::catalog::queries::browse::{BrowseFilesHandler, FileFilter};
-
-    /// A library's files must stay *findable* even though they are not
-    /// *listed*. The distinction was lost the first time: the exclusion was
-    /// unconditional, and an application whose search and whose
-    /// deleted-items review are both built from this listing could no longer
-    /// reach them at all (FR-FC-38).
-    async fn registered(pool: &sqlx::sqlite::SqlitePool) -> Uuid {
-        RegisterLibraryHandler::new(
-            FakeAuth::Allowing,
-            SqliteLibraryRepository::new(pool.clone()),
-        )
-        .register("Course", ROOT, "token")
-        .await
-        .expect("register")
-        .uuid
-    }
-
-    #[tokio::test]
-    async fn given_a_library_file_when_the_listing_reaches_in_then_it_is_answered() {
-        let (pool, catalog, _dir) = fixtures().await;
-        insert(
-            &catalog,
-            "/library/course/class-01/lecture.mp4",
-            FileType::Video,
-        )
-        .await;
-        registered(&pool).await;
-
-        let everywhere = catalog
-            .list_filtered_view(
-                Some(FileType::Video),
-                StateFilter::Active,
-                None,
-                LibraryScope::Everywhere,
-            )
-            .await
-            .expect("list");
-
-        assert_eq!(
-            everywhere.len(),
-            1,
-            "a library's file could not be reached at all — this is what \
-             makes it unsearchable"
-        );
-    }
-
-    #[tokio::test]
-    async fn given_a_library_file_when_the_listing_does_not_reach_in_then_it_is_absent() {
-        // The other half, and the one that keeps the type panels honest: the
-        // default must still exclude, or marking a folder would do nothing.
-        let (pool, catalog, _dir) = fixtures().await;
-        insert(
-            &catalog,
-            "/library/course/class-01/lecture.mp4",
-            FileType::Video,
-        )
-        .await;
-        registered(&pool).await;
-
-        let outside = catalog
-            .list_filtered_view(
-                Some(FileType::Video),
-                StateFilter::Active,
-                None,
-                LibraryScope::OutsideLibraries,
-            )
-            .await
-            .expect("list");
-
-        assert!(outside.is_empty(), "the type panel listed a library's file");
-    }
-
-    #[tokio::test]
-    async fn given_a_deleted_library_file_when_the_review_reaches_in_then_it_can_be_offered_back() {
-        // The worse of the two holes: a deleted library file appears in no
-        // type panel, in no deleted-items review, and not in its own library
-        // either — `list_in_library` answers only active files. It was the
-        // owner's data with no way back.
-        let (pool, catalog, _dir) = fixtures().await;
-        let uuid = insert(&catalog, "/library/course/syllabus.pdf", FileType::Document).await;
-        registered(&pool).await;
-        catalog.soft_delete(uuid, Utc::now()).await.expect("delete");
-
-        let review = catalog
-            .list_filtered_view(None, StateFilter::Deleted, None, LibraryScope::Everywhere)
-            .await
-            .expect("list");
-
-        assert_eq!(
-            review.iter().map(|view| view.file.uuid).collect::<Vec<_>>(),
-            vec![uuid],
-            "a deleted library file was unreachable, so it could never be \
-             restored"
-        );
-    }
-
-    #[tokio::test]
-    async fn given_a_listing_that_reached_in_when_it_is_read_then_each_row_says_where_it_lives() {
-        // A caller that reached into libraries has to be able to tell which
-        // rows it reached — a client's dashboard still owes the owner a view
-        // without them, and it has only this listing to work from.
-        let (pool, catalog, _dir) = fixtures().await;
-        insert(&catalog, "/library/course/syllabus.pdf", FileType::Document).await;
-        insert(&catalog, "/elsewhere/manual.pdf", FileType::Document).await;
-        let library = registered(&pool).await;
-
-        let everywhere = catalog
-            .list_filtered_view(
-                Some(FileType::Document),
-                StateFilter::Active,
-                None,
-                LibraryScope::Everywhere,
-            )
-            .await
-            .expect("list");
-
-        let marked: Vec<_> = everywhere
-            .iter()
-            .map(|view| (view.file.name.clone(), view.library_uuid))
-            .collect();
-
-        assert!(
-            marked.contains(&("syllabus.pdf".to_string(), Some(library))),
-            "a library's file did not say which library: {marked:?}"
-        );
-        assert!(
-            marked.contains(&("manual.pdf".to_string(), None)),
-            "a file outside every library claimed one: {marked:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn given_a_library_file_when_it_is_read_alone_then_it_says_the_same_thing() {
-        // One shape that means different things depending on how the caller
-        // got there is the kind of difference nobody notices until it is a
-        // bug.
-        let (pool, catalog, _dir) = fixtures().await;
-        let uuid = insert(&catalog, "/library/course/syllabus.pdf", FileType::Document).await;
-        let library = registered(&pool).await;
-
-        let view = BrowseFilesHandler::new(FakeAuth::Allowing, SqliteCatalogRepository::new(pool))
-            .get_by_uuid(uuid, "token")
-            .await
-            .expect("read");
-
-        assert_eq!(view.library_uuid, Some(library));
-    }
-
-    #[tokio::test]
-    async fn given_the_default_filter_when_it_is_built_then_it_excludes_libraries() {
-        // The default is the narrow one deliberately: a caller that says
-        // nothing gets the type-panel behaviour, so forgetting leaks nothing.
-        assert_eq!(FileFilter::new().scope, LibraryScope::OutsideLibraries);
-        assert_eq!(
-            FileFilter::new().everywhere().scope,
-            LibraryScope::Everywhere
-        );
-    }
-}
-
 mod moving {
     use super::*;
     use alexandria_core::libraries::commands::MoveLibraryHandler;
@@ -723,9 +341,12 @@ mod moving {
         RegisterLibraryHandler::new(
             FakeAuth::Allowing,
             SqliteLibraryRepository::new(pool.clone()),
+            AlwaysStartsRun,
+            LibraryRoot::unconfigured(),
         )
-        .register("Course", root, "token")
+        .register("Course", root, RunPriority::Normal, "token")
         .await
+        .map(|registered| registered.library)
         .expect("register")
         .uuid
     }
@@ -739,9 +360,46 @@ mod moving {
             FakeAuth::Allowing,
             SqliteLibraryRepository::new(pool.clone()),
             alexandria_core::catalog::library_root::LibraryRoot::unconfigured(),
+            SqliteCatalogRunRepository::new(pool.clone()),
         )
         .move_to(uuid, root, "token")
         .await
+    }
+
+    #[tokio::test]
+    async fn given_a_library_when_moved_to_the_root_of_a_drive_then_the_root_keeps_its_separator() {
+        // `E:` is not the root of drive E on Windows — it is the current
+        // directory there — so a walk of a library stored as `E:` would find
+        // `E:music`, not `E:\music`, and re-catalogue everything beside the
+        // moved records. The paths below are rewritten without doubling it.
+        let (pool, catalog, _dir) = fixtures().await;
+        let uuid = registered(&pool, r"D:\courses").await;
+        insert(&catalog, r"D:\courses\a.mp3", FileType::Audio).await;
+
+        let moved = move_to(&pool, uuid, r"E:\").await.expect("move");
+
+        assert_eq!(moved.root_path, r"E:\");
+        let path: String = sqlx::query_scalar("SELECT path FROM files")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(path, r"E:\a.mp3");
+    }
+
+    #[tokio::test]
+    async fn given_a_library_when_moved_to_the_filesystem_root_then_it_is_stored_as_slash() {
+        let (pool, catalog, _dir) = fixtures().await;
+        let uuid = registered(&pool, "/media/course").await;
+        insert(&catalog, "/media/course/a.md", FileType::Text).await;
+
+        let moved = move_to(&pool, uuid, "/").await.expect("move");
+
+        assert_eq!(moved.root_path, "/");
+        let path: String = sqlx::query_scalar("SELECT path FROM files")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(path, "/a.md");
     }
 
     async fn browse_at(pool: &sqlx::sqlite::SqlitePool, uuid: Uuid, path: &str) -> LibraryListing {
@@ -867,9 +525,17 @@ mod moving {
         RegisterLibraryHandler::new(
             FakeAuth::Allowing,
             SqliteLibraryRepository::new(pool.clone()),
+            AlwaysStartsRun,
+            LibraryRoot::unconfigured(),
         )
-        .register("Photography", "/library/photos", "token")
+        .register(
+            "Photography",
+            "/library/photos",
+            RunPriority::Normal,
+            "token",
+        )
         .await
+        .map(|registered| registered.library)
         .expect("register the other");
 
         let refused = move_to(&pool, uuid, "/library/photos/courses").await;
@@ -898,35 +564,6 @@ mod moving {
         let moved = move_to(&pool, uuid, "/library/course/class-01").await;
 
         assert!(moved.is_ok(), "a library could not be moved within itself");
-    }
-
-    #[tokio::test]
-    async fn given_the_destination_is_already_indexed_when_the_root_is_corrected_then_it_is_refused(
-    ) {
-        // The owner indexed the new location first, so the catalog holds both
-        // copies and `files.path` is UNIQUE. Refused by name, because the way
-        // out is a decision rather than a retry.
-        let (pool, catalog, _dir) = fixtures().await;
-        let uuid = registered(&pool, ROOT).await;
-        insert(&catalog, "/library/course/syllabus.pdf", FileType::Document).await;
-        insert(
-            &catalog,
-            "/media/courses/rust/syllabus.pdf",
-            FileType::Document,
-        )
-        .await;
-
-        let refused = move_to(&pool, uuid, "/media/courses/rust").await;
-
-        assert!(
-            matches!(refused, Err(DomainError::Conflict(_))),
-            "a move collided with the catalog and was not reported as a conflict"
-        );
-
-        // And nothing moved: the transaction is the guarantee that a refused
-        // correction leaves the library exactly where it was.
-        let top = browse_at(&pool, uuid, "").await;
-        assert_eq!(top.files[0].file.path, "/library/course/syllabus.pdf");
     }
 
     #[tokio::test]
@@ -962,6 +599,7 @@ mod moving {
             alexandria_core::catalog::library_root::LibraryRoot::new(
                 library_root.to_str().unwrap(),
             ),
+            SqliteCatalogRunRepository::new(pool.clone()),
         )
         .move_to(uuid, root, "token")
         .await
@@ -1019,32 +657,6 @@ mod moving {
             format!("{destination}/syllabus.pdf")
         );
     }
-
-    #[tokio::test]
-    async fn given_files_at_the_destination_when_a_library_moves_there_then_they_join_it() {
-        // The destination may already hold files indexed before the record
-        // was corrected. They belong to the library now, for the same reason
-        // registering claims what is already there.
-        let (pool, catalog, _dir) = fixtures().await;
-        let uuid = registered(&pool, ROOT).await;
-        insert(&catalog, "/media/rust/extra.pdf", FileType::Document).await;
-
-        move_to(&pool, uuid, "/media/rust").await.expect("move");
-
-        let listed = catalog
-            .list_filtered_view(
-                Some(FileType::Document),
-                StateFilter::Active,
-                None,
-                LibraryScope::OutsideLibraries,
-            )
-            .await
-            .expect("list");
-        assert!(
-            listed.is_empty(),
-            "a file at the destination stayed in the type panel"
-        );
-    }
 }
 
 /// A folder whose name differs from a library's only in case.
@@ -1067,90 +679,6 @@ mod case {
     use super::*;
 
     #[tokio::test]
-    async fn given_a_folder_differing_only_in_case_when_a_library_claims_then_it_is_left_alone() {
-        let (pool, catalog, _dir) = fixtures().await;
-        insert(&catalog, "/library/photos/mine.jpg", FileType::Image).await;
-        let stranger = insert(&catalog, "/library/Photos/theirs.jpg", FileType::Image).await;
-
-        let library = RegisterLibraryHandler::new(
-            FakeAuth::Allowing,
-            SqliteLibraryRepository::new(pool.clone()),
-        )
-        .register("Photos", "/library/photos", "token")
-        .await
-        .expect("register");
-
-        let listing = BrowseLibraryHandler::new(
-            FakeAuth::Allowing,
-            SqliteLibraryRepository::new(pool.clone()),
-            SqliteCatalogRepository::new(pool.clone()),
-        )
-        .browse(library.uuid, "", "token")
-        .await
-        .expect("browse");
-
-        assert_eq!(
-            listing.files.len(),
-            1,
-            "the library claimed a file from a folder differing only in case: {:?}",
-            listing
-                .files
-                .iter()
-                .map(|v| &v.file.path)
-                .collect::<Vec<_>>()
-        );
-
-        // And the stranger is still findable where it belongs. This is the
-        // assertion that actually bites: before the fix it was claimed, and
-        // the tree above could not list it either.
-        let outside = SqliteCatalogRepository::new(pool.clone())
-            .list_filtered_view(
-                Some(FileType::Image),
-                StateFilter::Active,
-                None,
-                LibraryScope::OutsideLibraries,
-            )
-            .await
-            .expect("list");
-        assert!(
-            outside.iter().any(|view| view.file.uuid == stranger),
-            "a file in a folder differing only in case vanished from the type panel"
-        );
-    }
-
-    #[tokio::test]
-    async fn given_a_library_when_a_file_differing_only_in_case_is_indexed_then_it_is_not_claimed()
-    {
-        // The other half: `insert_file` resolves `library_id` itself, so a
-        // fix confined to `claim_files` would leave the next scan putting
-        // the stranger back into the library.
-        let (pool, catalog, _dir) = fixtures().await;
-        RegisterLibraryHandler::new(
-            FakeAuth::Allowing,
-            SqliteLibraryRepository::new(pool.clone()),
-        )
-        .register("Photos", "/library/photos", "token")
-        .await
-        .expect("register");
-
-        let stranger = insert(&catalog, "/library/Photos/theirs.jpg", FileType::Image).await;
-
-        let outside = SqliteCatalogRepository::new(pool.clone())
-            .list_filtered_view(
-                Some(FileType::Image),
-                StateFilter::Active,
-                None,
-                LibraryScope::OutsideLibraries,
-            )
-            .await
-            .expect("list");
-        assert!(
-            outside.iter().any(|view| view.file.uuid == stranger),
-            "a file indexed into a folder differing only in case was claimed"
-        );
-    }
-
-    #[tokio::test]
     async fn given_a_folder_differing_only_in_case_when_registered_then_it_is_not_an_overlap() {
         // The mirror image, and the one the owner meets first: two real
         // folders, and the second refused with "that folder overlaps the
@@ -1159,17 +687,28 @@ mod case {
         RegisterLibraryHandler::new(
             FakeAuth::Allowing,
             SqliteLibraryRepository::new(pool.clone()),
+            AlwaysStartsRun,
+            LibraryRoot::unconfigured(),
         )
-        .register("Photos", "/library/photos", "token")
+        .register("Photos", "/library/photos", RunPriority::Normal, "token")
         .await
+        .map(|registered| registered.library)
         .expect("register");
 
         RegisterLibraryHandler::new(
             FakeAuth::Allowing,
             SqliteLibraryRepository::new(pool.clone()),
+            AlwaysStartsRun,
+            LibraryRoot::unconfigured(),
         )
-        .register("Photographs", "/library/Photos", "token")
+        .register(
+            "Photographs",
+            "/library/Photos",
+            RunPriority::Normal,
+            "token",
+        )
         .await
+        .map(|registered| registered.library)
         .expect("a folder differing only in case was refused as an overlap");
     }
 
@@ -1181,17 +720,28 @@ mod case {
         RegisterLibraryHandler::new(
             FakeAuth::Allowing,
             SqliteLibraryRepository::new(pool.clone()),
+            AlwaysStartsRun,
+            LibraryRoot::unconfigured(),
         )
-        .register("Photos", "/library/photos", "token")
+        .register("Photos", "/library/photos", RunPriority::Normal, "token")
         .await
+        .map(|registered| registered.library)
         .expect("register");
 
         let refused = RegisterLibraryHandler::new(
             FakeAuth::Allowing,
             SqliteLibraryRepository::new(pool.clone()),
+            AlwaysStartsRun,
+            LibraryRoot::unconfigured(),
         )
-        .register("Inner", "/library/photos/2024", "token")
-        .await;
+        .register(
+            "Inner",
+            "/library/photos/2024",
+            RunPriority::Normal,
+            "token",
+        )
+        .await
+        .map(|registered| registered.library);
 
         assert!(
             matches!(refused, Err(DomainError::Conflict(_))),

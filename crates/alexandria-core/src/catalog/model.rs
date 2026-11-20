@@ -5,6 +5,7 @@ use uuid::Uuid;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum FileType {
+    Audio,
     Video,
     Html,
     Text,
@@ -16,6 +17,7 @@ pub enum FileType {
 impl FileType {
     pub fn as_str(&self) -> &'static str {
         match self {
+            FileType::Audio => "audio",
             FileType::Video => "video",
             FileType::Html => "html",
             FileType::Text => "text",
@@ -27,11 +29,12 @@ impl FileType {
 
     /// The inverse of [`FileType::as_str`]: the wire name a client reads back
     /// is the one it may spell, so a caller never has to learn a second
-    /// vocabulary for the same six types. `None` for anything else, which
+    /// vocabulary for the same seven types. `None` for anything else, which
     /// every caller (an index scope, a listing's type filter on either
     /// surface) refuses as invalid input.
     pub fn from_wire(name: &str) -> Option<Self> {
         Some(match name {
+            "audio" => FileType::Audio,
             "video" => FileType::Video,
             "html" => FileType::Html,
             "text" => FileType::Text,
@@ -68,6 +71,9 @@ impl FileState {
 #[derive(Debug, Clone)]
 pub struct NewFile {
     pub uuid: Uuid,
+    /// The library the file belongs to. Every file belongs to exactly one
+    /// (libraries-only design); an index walk passes its run's.
+    pub library_uuid: Uuid,
     pub path: String,
     pub name: String,
     pub file_type: FileType,
@@ -141,7 +147,7 @@ impl FormatKind {
 
 /// Type-specific metadata for an editable subtype (UC-04 / FR-FC-15..18).
 ///
-/// Only the four subtypes with editable metadata have a variant. Video/
+/// Only the five subtypes with editable metadata have a variant. Audio/Video/
 /// Document/Comic/Image map one-to-one to their subtype table; Text and Html
 /// have no editable subtype metadata, so a PATCH against them is rejected
 /// (AF-01) at the handler — there is no variant to (de)serialize.
@@ -153,11 +159,30 @@ impl FormatKind {
 /// are never touched.
 ///
 /// The enum is internally tagged by `type` so the REST/FFI JSON body carries
-/// the discriminator (`{"type":"video","title":…}`), which the handler checks
+/// the discriminator (`{"type":"audio","title":…}`), which the handler checks
 /// against the file's actual `FileType` (AF-01).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum SubtypeMetadata {
+    Audio {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        artist: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        album: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        year: Option<i64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        genre: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        track: Option<i64>,
+        /// The artist of the record, distinct from `artist` (the artist of
+        /// the track) — see `AudioTags::album_artist`'s doc comment for why
+        /// the core never derives one from the other.
+        #[serde(rename = "albumArtist", skip_serializing_if = "Option::is_none")]
+        album_artist: Option<String>,
+    },
     Video {
         #[serde(skip_serializing_if = "Option::is_none")]
         title: Option<String>,
@@ -199,6 +224,7 @@ impl SubtypeMetadata {
     /// to validate the variant matches the file's actual subtype (AF-01).
     pub fn file_type(&self) -> FileType {
         match self {
+            SubtypeMetadata::Audio { .. } => FileType::Audio,
             SubtypeMetadata::Video { .. } => FileType::Video,
             SubtypeMetadata::Document { .. } => FileType::Document,
             SubtypeMetadata::Comic { .. } => FileType::Comic,
@@ -214,39 +240,6 @@ impl SubtypeMetadata {
 pub struct FileMetadata {
     pub file: File,
     pub metadata: SubtypeMetadata,
-}
-
-/// Whether a listing reaches into libraries (libraries design, FR-FC-38).
-///
-/// A library's files are browsed as that library's tree and are absent from
-/// the type-filtered listings — that is the whole point of marking a folder.
-/// But *absent from the listings* was read as *absent from the catalog* by
-/// every caller that had only the listing to work with: an application whose
-/// search and whose deleted-items review are both built from it loses the
-/// ability to find those files at all, and a deleted one becomes
-/// unrestorable, since the library tree shows only active files.
-///
-/// So the reach is part of the filter, and the default is the narrow one: a
-/// caller that says nothing gets the type-panel behaviour, and only a caller
-/// that means "everything the catalog holds" says so.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum LibraryScope {
-    /// Only files outside every library — what a type panel lists (default).
-    #[default]
-    OutsideLibraries,
-    /// Every file the filter matches, libraries included — what a search and
-    /// a deleted-items review need in order to be truthful.
-    Everywhere,
-}
-
-impl LibraryScope {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            LibraryScope::OutsideLibraries => "outsidelibraries",
-            LibraryScope::Everywhere => "everywhere",
-        }
-    }
 }
 
 /// Lifecycle filter for catalog browse queries (UC-03 / FR-FC-12). The
@@ -300,13 +293,13 @@ impl StateFilter {
 #[serde(rename_all = "camelCase")]
 pub struct FileView {
     pub file: File,
-    /// The library this file belongs to, or `None` when it belongs to none
-    /// (libraries design / FR-FC-38).
+    /// The library this file belongs to (FR-FC-37). Every file belongs to
+    /// one; `None` only where a row's library could not be read back, which
+    /// answers the file rather than failing the whole listing.
     ///
-    /// Carried on every listing because a caller that reached into libraries
-    /// has to be able to tell which rows it reached: a client's dashboard
-    /// still owes the owner a view without them, and a search result is
-    /// clearer for saying where the hit lives. The uuid rather than the
+    /// Carried on every listing because a search result is clearer for
+    /// saying where the hit lives, and a client listing several libraries
+    /// at once needs to group what it got. The uuid rather than the
     /// name — the name is the library's own record to answer, and a listing
     /// that repeated it would go stale the moment one was renamed.
     pub library_uuid: Option<Uuid>,
@@ -381,9 +374,10 @@ pub struct File {
 /// number's only job is to tell a row written by an older extraction from one
 /// written by this one, so that the first can be revisited exactly once.
 ///
-/// 1 — the first stamp, added for a music tag the catalog no longer reads.
-/// It stays at 1 rather than going back to 0: rows already stamped have
-/// nothing left to fill, and the next field extraction learns bumps it to 2.
+/// 1 — the album artist. Files indexed before migration 15 carry no
+/// `album_artist`, which is why the artists list showed a compilation's
+/// performers instead of the records' own artists: the tag was in the file
+/// and never in the catalog, and nothing revisited a row once it was written.
 pub const METADATA_VERSION: i64 = 1;
 
 /// Response of UC-09 purge-on-disk (FR-FC-23): the pre-delete snapshot of the
@@ -418,7 +412,8 @@ mod tests {
             .to_string()
     }
 
-    const FILE_TYPES: [FileType; 6] = [
+    const FILE_TYPES: [FileType; 7] = [
+        FileType::Audio,
         FileType::Video,
         FileType::Html,
         FileType::Text,
@@ -442,7 +437,7 @@ mod tests {
 
     #[test]
     fn given_an_unknown_or_differently_cased_name_when_read_from_the_wire_then_it_is_none() {
-        for name in ["", "audio", "Video", "VIDEO", " video", "videos"] {
+        for name in ["", "Audio", "Video", "VIDEO", " video", "videos"] {
             assert_eq!(FileType::from_wire(name), None, "{name:?}");
         }
     }
@@ -474,14 +469,6 @@ mod tests {
         for name in ["", "Book", "e-book"] {
             assert_eq!(FormatKind::parse(name), None, "{name:?}");
         }
-    }
-
-    #[test]
-    fn given_each_library_scope_when_named_then_as_str_matches_serde_and_default_is_outside() {
-        for scope in [LibraryScope::OutsideLibraries, LibraryScope::Everywhere] {
-            assert_eq!(wire_name(scope), scope.as_str(), "{scope:?}");
-        }
-        assert_eq!(LibraryScope::default(), LibraryScope::OutsideLibraries);
     }
 
     #[test]

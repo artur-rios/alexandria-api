@@ -26,16 +26,20 @@ fn settings_with_cache_dir(cache_dir: &std::path::Path) -> Settings {
     settings
 }
 
+/// Add `root` as a library, which starts its first index run: the only way
+/// files enter the catalog.
 fn index_request(root: &str) -> Request<Body> {
     Request::builder()
         .method("POST")
-        .uri("/v1/index")
+        .uri("/v1/libraries")
         .header(
             "authorization",
             format!("Bearer {}", common::TEST_TOKEN).as_str(),
         )
         .header("content-type", "application/json")
-        .body(Body::from(serde_json::json!({ "root": root }).to_string()))
+        .body(Body::from(
+            serde_json::json!({ "name": "Library", "rootPath": root }).to_string(),
+        ))
         .unwrap()
 }
 
@@ -310,4 +314,76 @@ async fn given_document_when_thumbnailed_then_bad_request() {
 
     // Assert
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+/// UC-40 for audio: the thumbnail is the front cover embedded in the file's
+/// own tag, scaled like any other picture.
+#[tokio::test]
+async fn given_audio_with_a_front_cover_when_thumbnailed_then_jpeg_within_max_dimension() {
+    use lofty::config::WriteOptions;
+    use lofty::picture::{MimeType, Picture, PictureType};
+    use lofty::tag::{Tag, TagExt, TagType};
+
+    // Arrange — a 640x320 JPEG as the front cover of an untagged WAV.
+    let lib = tempdir().unwrap();
+    let path = lib.path().join("song.wav");
+    let samples: u32 = 800;
+    let mut wav = Vec::new();
+    for chunk in [
+        &b"RIFF"[..],
+        &(36 + samples).to_le_bytes(),
+        b"WAVEfmt ",
+        &16u32.to_le_bytes(),
+        &1u16.to_le_bytes(),
+        &1u16.to_le_bytes(),
+        &8000u32.to_le_bytes(),
+        &8000u32.to_le_bytes(),
+        &1u16.to_le_bytes(),
+        &8u16.to_le_bytes(),
+        b"data",
+        &samples.to_le_bytes(),
+    ] {
+        wav.extend_from_slice(chunk);
+    }
+    wav.extend(std::iter::repeat_n(128u8, samples as usize));
+    std::fs::write(&path, wav).unwrap();
+    let mut cover = std::io::Cursor::new(Vec::new());
+    image::RgbImage::from_pixel(640, 320, image::Rgb([200, 30, 30]))
+        .write_to(&mut cover, image::ImageFormat::Jpeg)
+        .unwrap();
+    let mut tag = Tag::new(TagType::Id3v2);
+    tag.push_picture(
+        Picture::unchecked(cover.into_inner())
+            .pic_type(PictureType::CoverFront)
+            .mime_type(MimeType::Jpeg)
+            .build(),
+    );
+    tag.save_to_path(&path, WriteOptions::default())
+        .expect("save the cover");
+    let cache_dir = tempdir().unwrap();
+    let test = test_app_with_settings(settings_with_cache_dir(cache_dir.path())).await;
+    let router = app(Settings::default(), test.services.clone());
+    router
+        .clone()
+        .oneshot(index_request(lib.path().to_str().unwrap()))
+        .await
+        .expect("index");
+    wait_for_files(&test.pool, 1).await;
+    let uuid = file_rows_with_uuid(&test.pool).await[0].0.clone();
+
+    // Act
+    let response = router
+        .oneshot(thumbnail_request(&uuid))
+        .await
+        .expect("one-shot");
+
+    // Assert
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get("content-type").unwrap(),
+        "image/jpeg"
+    );
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let decoded = image::load_from_memory(&body).expect("valid jpeg");
+    assert_eq!((decoded.width(), decoded.height()), (320, 160));
 }

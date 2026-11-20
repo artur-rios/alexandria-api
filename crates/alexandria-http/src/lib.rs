@@ -31,7 +31,6 @@ pub fn app(settings: Settings, services: Arc<Services>) -> Router {
     // caller is denied without its body or path ever being parsed (FR-AU-07).
     let v1 = Router::new()
         .route("/v1/settings", get(routes::settings::get))
-        .route("/v1/index", post(routes::index::index))
         .route("/v1/index/refresh", post(routes::refresh::refresh))
         .route("/v1/index/runs", get(routes::runs::active_runs))
         .route("/v1/index/runs/{run_id}", get(routes::runs::run_status))
@@ -157,6 +156,7 @@ pub fn app(settings: Settings, services: Arc<Services>) -> Router {
                 .patch(routes::libraries::move_root)
                 .delete(routes::libraries::remove),
         )
+        .route("/v1/libraries/{uuid}/index", post(routes::libraries::index))
         .route_layer(from_fn_with_state(
             state.clone(),
             middleware::auth::require_auth,

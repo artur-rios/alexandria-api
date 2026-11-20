@@ -18,6 +18,30 @@ pub struct TestApp {
     _db_dir: TempDir,
 }
 
+impl TestApp {
+    /// A real folder for `logical` (`/library/course`) inside this test's own
+    /// temporary directory, created, as an absolute path.
+    ///
+    /// Registering a library walks its folder, so a library test needs one
+    /// that exists; this keeps the tests reading in the paths they are about.
+    pub fn folder(&self, logical: &str) -> String {
+        let path = self._db_dir.path().join(logical.trim_start_matches('/'));
+        std::fs::create_dir_all(&path).expect("folder");
+        path.to_str().expect("utf-8 path").to_string()
+    }
+
+    /// Like [`TestApp::folder`], without creating it — for a file path, or a
+    /// folder a test means to be missing.
+    pub fn path(&self, logical: &str) -> String {
+        self._db_dir
+            .path()
+            .join(logical.trim_start_matches('/'))
+            .to_str()
+            .expect("utf-8 path")
+            .to_string()
+    }
+}
+
 /// Bearer token every integration test authenticates with. A valid UUID: the
 /// active auth mode is local (below), so it must parse as a session id
 /// (`LocalAuthService::authenticate`). A matching session is seeded in
@@ -333,4 +357,16 @@ pub fn count_dir_entries(dir: &std::path::Path) -> usize {
         Ok(entries) => entries.count(),
         Err(_) => 0,
     }
+}
+
+/// The library a test's hand-written file rows belong to — every file is in
+/// one. Created once per database; its folder overlaps no test folder.
+pub async fn seeded_library(pool: &sqlx::sqlite::SqlitePool) {
+    sqlx::query(
+        "INSERT OR IGNORE INTO libraries (uuid, name, root_path) \
+         VALUES ('seeded-library', 'Seeded', '/seeded-library')",
+    )
+    .execute(pool)
+    .await
+    .expect("seed library");
 }

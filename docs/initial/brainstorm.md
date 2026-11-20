@@ -2,8 +2,10 @@
 
 This is the brainstorm for a API that aims to be the back-end for a big library for the user, that's why the name "Alexandria".  
 
-Alexandria is for things to read and watch. Music lives in Orpheus, a separate
-project.
+Alexandria is a library manager: the user adds folders as libraries, and it
+indexes the files it can read in them, keeping the folder structure, so they
+can be browsed and read or played. Managing music (playlists, history, lookups)
+lives in Orpheus, a separate project.
 
 ## Features
 

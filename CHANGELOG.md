@@ -7,16 +7,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
-No release has been tagged yet. The workspace version in `Cargo.toml` (currently 0.5.0) tracks client
+No release has been tagged yet. The workspace version in `Cargo.toml` (currently 0.6.0) tracks client
 compatibility with the desktop front-end, not a published release. What exists so far:
 
 ### Added
 
 - One Rust core library, `alexandria-core`, exposed over an HTTP REST/JSON server (`alexandria-http`) and a C ABI for
   the Flutter desktop front-end (`alexandria-ffi`), so both surfaces return identical results.
-- Indexing and re-indexing of on-disk movies and series, HTML pages, Markdown and text files, PDFs and e-books,
-  comic books, and images, with each run observable, pausable, resumable, and cancellable; folders can be grouped as
-  libraries and browsed as their own tree.
+- Libraries: the owner adds a folder as a library, and Alexandria indexes every file in it that it can read — movies
+  and series, music and other audio, HTML pages, Markdown and text files, PDFs and e-books, comic books, and images —
+  keeps its folder structure, and answers it one level at a time. Each run is observable, pausable, resumable, and
+  cancellable. A library can be re-indexed on its own (`POST /v1/libraries/{uuid}/index`,
+  `alexandria_library_index_start`), corrected when its folder moves, and removed.
+- Audio as playable files: tags (title, artist, album, album artist, year, genre, track) and duration read at index
+  time, the embedded front cover as the thumbnail, byte-range streaming, and metadata editing like every other type.
+  No playlists, play history, or lookups: music management is Orpheus's.
+- `GET /v1/files` and `alexandria_files_list` filter by `libraryUuid`, and every listed file carries its
+  `libraryUuid`; run status and the active-run listing carry the run's `libraryUuid` (none for a refresh).
 - Catalog browsing, metadata editing, renaming on disk, text file editing, and two-phase soft-delete, restore, and purge.
 - Collections, browser bookmarks, watchlists, and reading lists.
 - Pluggable authentication: an external Heimdall JWT, a local encrypted login with recovery codes, or the Windows
@@ -25,10 +32,39 @@ compatibility with the desktop front-end, not a published release. What exists s
 - A health check, `config.toml` configuration with `ALEXANDRIA_*` environment overrides, and SQLite migrations applied
   on startup.
 
+### Changed
+
+Libraries are the only way into Alexandria (0.6.0). A file enters the catalog only by being inside a library, and
+every file belongs to exactly one.
+
+- Adding a library (`POST /v1/libraries`, `alexandria_library_register`) starts its first index run, with an optional
+  `priority`, and answers the library with the run's `runId`. It is refused, storing nothing, for a folder that does not
+  exist, one outside `filesystem.root`, or one overlapping another library.
+- A library with a running or paused run refuses a second run and a move (`409` / `INDEX_ERR_CONFLICT`,
+  `LIBRARY_ERR_CONFLICT`), naming the run; removal is refused only while the run is running.
+- Removing a library (`DELETE /v1/libraries/{uuid}`, `alexandria_library_remove`) deletes its catalog records — its
+  files with their progress and collection membership, its runs, and the failures recorded under its folder — instead
+  of returning its files to the type listings. Files on disk are never touched.
+- `GET /v1/files` answers files in every library; nothing is hidden from it any more.
+- Breaking for clients: the core is version 0.6.0, and a client built against 0.5 refuses it at startup.
+
+### Upgrade
+
+Starting 0.6.0 deletes every catalog record outside a library, with its progress and collection membership (migration
+28); index runs over roots no library holds are deleted with their failures, and refresh runs are kept. A library left
+with more than one unfinished run keeps the newest and the rest are cancelled (migration 29), since a library may have
+only one. Files on disk are untouched. Back up the database file (`database.path`, `alexandria.sqlite` by default) first to keep them, then add
+your folders as libraries to index them again.
+
 ### Removed
 
-Music and audio moved out of Alexandria, which is now a library for things you read and watch; music lives in Orpheus,
-a separate project.
+- Free-form indexing: `POST /v1/index` and `alexandria_index_start` (0.6.0). Add the folder as a library instead.
+- The per-run type scope (`types` / `IndexScope`) and the `includeLibraries` listing flag (0.6.0). A library is
+  indexed whole, and the listing answers every library.
+
+Music and audio moved out of Alexandria in 0.5.0, which made it a library for things you read and watch; music lives in
+Orpheus, a separate project. 0.6.0 brings audio back as playable files only (see Added); everything below except the
+file type itself stays removed.
 
 - The `audio` file type: audio files are no longer catalogued, and the tag reading (lofty) and the audio metadata
   (title, artist, album, genre, track, album artist) that came with it are gone. Audio files in an indexed folder are
@@ -64,8 +100,8 @@ a separate project.
 - The `Authorization` scheme is matched case-insensitively (`BEARER <token>` is accepted).
 - `GET /v1/files` answers an unreadable query with the usual JSON error envelope rather than plain text.
 - `PUT /v1/files/{uuid}/content` saves text files larger than 2 MiB, as the FFI surface already did.
-- `alexandria_index_start` authenticates before checking `root`; it and `alexandria_index_init` refuse a path that is
-  not valid UTF-8 instead of decoding it lossily (`alexandria-ffi`).
+- `alexandria_index_init` refuses a database path that is not valid UTF-8 instead of decoding it lossily
+  (`alexandria-ffi`).
 - `alexandria_index_init` re-checks for a live run at the moment it swaps services, closing a window in which a run
   started on another thread could be orphaned.
 - `alexandria_index_files_json` returns NULL when the catalog cannot be read, as documented, instead of `[]`.

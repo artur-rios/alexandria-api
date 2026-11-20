@@ -27,7 +27,7 @@ resolver = "2"
 # between an owner running a stale library and a feature that quietly does
 # nothing — which is exactly what a schema this release adds to, and a lookup
 # this release changes the shape of, would otherwise look like.
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 # Floor set by sqlx 0.9, the highest MSRV in the dependency graph.
 rust-version = "1.94"
@@ -75,6 +75,7 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png",
 # out of that feature) and, during the overlap, its old HS256 ones (`hmac`).
 jsonwebtoken = { version = "12", features = ["rust_crypto"] }
 kamadak-exif = "0.6"
+lofty = "0.25"
 lopdf = "0.47"
 quick-xml = "0.42"
 # Fetches Heimdall's key set (`auth::jwks`) in external mode, the only call

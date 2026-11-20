@@ -63,6 +63,14 @@ pub struct FileStat {
 #[allow(async_fn_in_trait)]
 pub trait Filesystem: Send + Sync {
     async fn path_exists(&self, root: &str) -> bool;
+    /// Whether `path` is a folder — what a library's root has to be. A file
+    /// would walk as a one-entry tree its library could never show.
+    ///
+    /// Defaults to `path_exists`, which is what an in-memory double holding
+    /// only roots and files can answer.
+    async fn is_folder(&self, path: &str) -> bool {
+        self.path_exists(path).await
+    }
     async fn list_files(&self, root: &str) -> Result<Vec<FileEntry>, DomainError>;
     async fn content_hash(&self, path: &str) -> Result<String, DomainError>;
     /// The file's size and modification time, or `None` when it is gone
@@ -227,6 +235,13 @@ impl Filesystem for StdFilesystem {
             .unwrap_or(false)
     }
 
+    async fn is_folder(&self, path: &str) -> bool {
+        let path = path.to_string();
+        blocking(move || Ok(Path::new(&path).is_dir()))
+            .await
+            .unwrap_or(false)
+    }
+
     async fn list_files(&self, root: &str) -> Result<Vec<FileEntry>, DomainError> {
         let root = root.to_string();
         blocking(move || {
@@ -330,8 +345,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let odd = dir.path().join(OsStr::from_bytes(b"caf\xe9"));
         std::fs::create_dir(&odd).expect("non-UTF-8 folder");
-        std::fs::write(odd.join("notes.txt"), b"x").expect("write");
-        std::fs::write(dir.path().join("plain.txt"), b"x").expect("write");
+        std::fs::write(odd.join("song.mp3"), b"x").expect("write");
+        std::fs::write(dir.path().join("plain.mp3"), b"x").expect("write");
 
         let entries = StdFilesystem
             .list_files(dir.path().to_str().expect("utf-8 root"))
@@ -339,7 +354,7 @@ mod tests {
             .expect("walk");
 
         let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
-        assert_eq!(names, vec!["plain.txt"]);
+        assert_eq!(names, vec!["plain.mp3"]);
         assert!(
             entries.iter().all(|e| !e.path.contains('\u{FFFD}')),
             "a path was stored lossily"

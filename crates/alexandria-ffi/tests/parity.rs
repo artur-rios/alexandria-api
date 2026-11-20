@@ -31,8 +31,8 @@ use alexandria_ffi::{
     alexandria_files_list, alexandria_free_string, alexandria_index_cancel,
     alexandria_index_count_files, alexandria_index_files_json, alexandria_index_init,
     alexandria_index_pause, alexandria_index_refresh_start, alexandria_index_resume,
-    alexandria_index_run_status_json, alexandria_index_runs_active_json, alexandria_index_start,
-    alexandria_reading_list_add_item, alexandria_reading_list_create,
+    alexandria_index_run_status_json, alexandria_index_runs_active_json,
+    alexandria_library_register, alexandria_reading_list_add_item, alexandria_reading_list_create,
     alexandria_reading_list_delete, alexandria_reading_list_remove_item,
     alexandria_reading_list_update_progress, alexandria_reading_lists_list,
     alexandria_settings_json, alexandria_watchlist_add_video, alexandria_watchlist_create,
@@ -169,6 +169,53 @@ fn run_id_string(r: &IndexStartResult) -> String {
     .into_owned()
 }
 
+/// Index `root` the only way there is: add it as a library, which opens its
+/// first run. Answered as the run start these tests read — a status in the
+/// index family's codes and the run id — so a test reads the same whether it
+/// is about the run or the registration that started it.
+///
+/// `root` and `priority` may be NULL, as an FFI caller may pass them.
+fn index_folder(
+    root: *const std::os::raw::c_char,
+    token: *const std::os::raw::c_char,
+    priority: *const std::os::raw::c_char,
+) -> IndexStartResult {
+    let read = |ptr: *const std::os::raw::c_char| {
+        (!ptr.is_null()).then(|| {
+            unsafe { CStr::from_ptr(ptr) }
+                .to_string_lossy()
+                .into_owned()
+        })
+    };
+    let mut body = serde_json::json!({ "name": "Library", "rootPath": read(root) });
+    if let Some(priority) = read(priority) {
+        body["priority"] = serde_json::Value::String(priority);
+    }
+    let body = CString::new(body.to_string()).unwrap();
+    let result = alexandria_ffi::alexandria_library_register(body.as_ptr(), token);
+    let mut run_id = [0 as std::os::raw::c_char; 37];
+    let status = match result.status {
+        alexandria_ffi::LIBRARY_OK => {
+            let json = unsafe { CStr::from_ptr(result.json) }
+                .to_string_lossy()
+                .into_owned();
+            unsafe { alexandria_ffi::alexandria_free_string(result.json) };
+            let value: serde_json::Value = serde_json::from_str(&json).expect("library json");
+            let id = value["runId"].as_str().expect("runId");
+            for (slot, byte) in run_id.iter_mut().zip(id.bytes()) {
+                *slot = byte as std::os::raw::c_char;
+            }
+            alexandria_ffi::INDEX_OK
+        }
+        alexandria_ffi::LIBRARY_ERR_INVALID_INPUT => alexandria_ffi::INDEX_ERR_INVALID_INPUT,
+        alexandria_ffi::LIBRARY_ERR_UNAUTHORIZED => alexandria_ffi::INDEX_ERR_UNAUTHORIZED,
+        alexandria_ffi::LIBRARY_ERR_NOT_INITIALIZED => alexandria_ffi::INDEX_ERR_NOT_INITIALIZED,
+        alexandria_ffi::LIBRARY_ERR_CONFLICT => alexandria_ffi::INDEX_ERR_CONFLICT,
+        _ => alexandria_ffi::INDEX_ERR_OTHER,
+    };
+    IndexStartResult { status, run_id }
+}
+
 #[tokio::test]
 async fn given_same_lib_when_indexed_via_http_and_ffi_then_files_rows_identical() {
     let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
@@ -191,13 +238,15 @@ async fn given_same_lib_when_indexed_via_http_and_ffi_then_files_rows_identical(
 
     let request = Request::builder()
         .method("POST")
-        .uri("/v1/index")
+        .uri("/v1/libraries")
         .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .header("content-type", "application/json")
-        .body(Body::from(json!({ "root": lib_path }).to_string()))
+        .body(Body::from(
+            json!({ "name": "Library", "rootPath": lib_path }).to_string(),
+        ))
         .unwrap();
     let response = router.oneshot(request).await.expect("http oneshot");
-    assert_eq!(response.status(), axum::http::StatusCode::ACCEPTED);
+    assert_eq!(response.status(), axum::http::StatusCode::CREATED);
     let http_body: serde_json::Value =
         serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
     let http_run_id = http_body["runId"].as_str().expect("http runId");
@@ -239,12 +288,7 @@ async fn given_same_lib_when_indexed_via_http_and_ffi_then_files_rows_identical(
 
         let root = CString::new(lib_for_ffi).unwrap();
         let token = CString::new(TEST_TOKEN).unwrap();
-        let result = alexandria_index_start(
-            root.as_ptr(),
-            token.as_ptr(),
-            std::ptr::null(),
-            std::ptr::null(),
-        );
+        let result = index_folder(root.as_ptr(), token.as_ptr(), std::ptr::null());
         assert_eq!(result.status, alexandria_ffi::INDEX_OK, "ffi start failed");
         assert!(!run_id_string(&result).is_empty());
 
@@ -326,18 +370,18 @@ async fn given_same_lib_when_refreshed_via_http_and_ffi_then_rows_and_missing_ma
 
     let index_req = Request::builder()
         .method("POST")
-        .uri("/v1/index")
+        .uri("/v1/libraries")
         .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .header("content-type", "application/json")
         .body(Body::from(
-            json!({ "root": http_lib.path().to_str().unwrap() }).to_string(),
+            json!({ "name": "Library", "rootPath": http_lib.path().to_str().unwrap() }).to_string(),
         ))
         .unwrap();
     let resp = app(Settings::default(), http_services.clone())
         .oneshot(index_req)
         .await
         .expect("http index");
-    assert_eq!(resp.status(), axum::http::StatusCode::ACCEPTED);
+    assert_eq!(resp.status(), axum::http::StatusCode::CREATED);
 
     wait_for_http_files(&http_pool, 2).await;
 
@@ -395,12 +439,7 @@ async fn given_same_lib_when_refreshed_via_http_and_ffi_then_rows_and_missing_ma
 
             let root = CString::new(ffi_lib_path.clone()).unwrap();
             let token = CString::new(TEST_TOKEN).unwrap();
-            let started = alexandria_index_start(
-                root.as_ptr(),
-                token.as_ptr(),
-                std::ptr::null(),
-                std::ptr::null(),
-            );
+            let started = index_folder(root.as_ptr(), token.as_ptr(), std::ptr::null());
             assert_eq!(started.status, alexandria_ffi::INDEX_OK);
             wait_for_ffi_files(2);
 
@@ -509,11 +548,11 @@ async fn given_a_freshly_indexed_file_when_hash_read_via_http_and_ffi_then_both_
 
     let index_req = Request::builder()
         .method("POST")
-        .uri("/v1/index")
+        .uri("/v1/libraries")
         .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .header("content-type", "application/json")
         .body(Body::from(
-            json!({ "root": http_lib.path().to_str().unwrap() }).to_string(),
+            json!({ "name": "Library", "rootPath": http_lib.path().to_str().unwrap() }).to_string(),
         ))
         .unwrap();
     let _ = app(Settings::default(), http_services.clone())
@@ -559,12 +598,7 @@ async fn given_a_freshly_indexed_file_when_hash_read_via_http_and_ffi_then_both_
 
         let root = CString::new(ffi_lib_path).unwrap();
         let token = CString::new(TEST_TOKEN).unwrap();
-        let started = alexandria_index_start(
-            root.as_ptr(),
-            token.as_ptr(),
-            std::ptr::null(),
-            std::ptr::null(),
-        );
+        let started = index_folder(root.as_ptr(), token.as_ptr(), std::ptr::null());
         assert_eq!(started.status, alexandria_ffi::INDEX_OK, "ffi start failed");
 
         let dl = std::time::Instant::now() + ASYNC_RUN_DEADLINE;
@@ -744,11 +778,11 @@ async fn given_same_video_file_when_metadata_edited_via_http_and_ffi_then_respon
 
     let index_req = Request::builder()
         .method("POST")
-        .uri("/v1/index")
+        .uri("/v1/libraries")
         .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .header("content-type", "application/json")
         .body(Body::from(
-            json!({ "root": http_lib.path().to_str().unwrap() }).to_string(),
+            json!({ "name": "Library", "rootPath": http_lib.path().to_str().unwrap() }).to_string(),
         ))
         .unwrap();
     let index_resp = app(Settings::default(), http_services.clone())
@@ -815,12 +849,7 @@ async fn given_same_video_file_when_metadata_edited_via_http_and_ffi_then_respon
 
             let root = CString::new(ffi_lib_path).unwrap();
             let token = CString::new(TEST_TOKEN).unwrap();
-            let started = alexandria_index_start(
-                root.as_ptr(),
-                token.as_ptr(),
-                std::ptr::null(),
-                std::ptr::null(),
-            );
+            let started = index_folder(root.as_ptr(), token.as_ptr(), std::ptr::null());
             assert_eq!(started.status, alexandria_ffi::INDEX_OK);
             // As on the HTTP leg: the run's end, not the file count.
             wait_for_ffi_run_terminal(&run_id_string(&started), &token);
@@ -982,6 +1011,12 @@ fn norm(v: serde_json::Value) -> FileViews {
                 file.remove("indexedAt");
                 file.remove("mtime");
             }
+            // Each leg's database mints its own library; that every file is
+            // in one is the fact both surfaces must agree on.
+            if let Some(view) = f.as_object_mut() {
+                let library = view.remove("libraryUuid").expect("libraryUuid");
+                assert!(uuid::Uuid::parse_str(library.as_str().unwrap_or_default()).is_ok());
+            }
             f
         })
         .collect();
@@ -1015,11 +1050,11 @@ async fn given_same_lib_when_files_listed_via_http_and_ffi_then_arrays_identical
 
     let index_req = Request::builder()
         .method("POST")
-        .uri("/v1/index")
+        .uri("/v1/libraries")
         .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .header("content-type", "application/json")
         .body(Body::from(
-            json!({ "root": http_lib.path().to_str().unwrap() }).to_string(),
+            json!({ "name": "Library", "rootPath": http_lib.path().to_str().unwrap() }).to_string(),
         ))
         .unwrap();
     let index_resp = app(Settings::default(), http_services.clone())
@@ -1168,12 +1203,7 @@ async fn given_same_lib_when_files_listed_via_http_and_ffi_then_arrays_identical
 
             let root = CString::new(ffi_lib_path).unwrap();
             let token = CString::new(TEST_TOKEN).unwrap();
-            let started = alexandria_index_start(
-                root.as_ptr(),
-                token.as_ptr(),
-                std::ptr::null(),
-                std::ptr::null(),
-            );
+            let started = index_folder(root.as_ptr(), token.as_ptr(), std::ptr::null());
             assert_eq!(started.status, alexandria_ffi::INDEX_OK);
             // As on the HTTP leg: the run's end, not the file count.
             wait_for_ffi_run_terminal(&run_id_string(&started), &token);
@@ -1291,11 +1321,11 @@ async fn given_same_file_when_fetched_via_http_and_ffi_then_file_view_bodies_ide
 
     let index_req = Request::builder()
         .method("POST")
-        .uri("/v1/index")
+        .uri("/v1/libraries")
         .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .header("content-type", "application/json")
         .body(Body::from(
-            json!({ "root": http_lib.path().to_str().unwrap() }).to_string(),
+            json!({ "name": "Library", "rootPath": http_lib.path().to_str().unwrap() }).to_string(),
         ))
         .unwrap();
     let index_resp = app(Settings::default(), http_services.clone())
@@ -1363,12 +1393,7 @@ async fn given_same_file_when_fetched_via_http_and_ffi_then_file_view_bodies_ide
 
         let root = CString::new(ffi_lib_path).unwrap();
         let token = CString::new(TEST_TOKEN).unwrap();
-        let started = alexandria_index_start(
-            root.as_ptr(),
-            token.as_ptr(),
-            std::ptr::null(),
-            std::ptr::null(),
-        );
+        let started = index_folder(root.as_ptr(), token.as_ptr(), std::ptr::null());
         assert_eq!(started.status, alexandria_ffi::INDEX_OK);
         // As on the HTTP leg: the run's end, not the file count.
         wait_for_ffi_run_terminal(&run_id_string(&started), &token);
@@ -1529,11 +1554,11 @@ async fn given_unknown_filter_values_when_listed_via_http_and_ffi_then_both_reje
 
     let index_req = Request::builder()
         .method("POST")
-        .uri("/v1/index")
+        .uri("/v1/libraries")
         .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .header("content-type", "application/json")
         .body(Body::from(
-            json!({ "root": http_lib.path().to_str().unwrap() }).to_string(),
+            json!({ "name": "Library", "rootPath": http_lib.path().to_str().unwrap() }).to_string(),
         ))
         .unwrap();
     let _ = app(Settings::default(), http_services.clone())
@@ -1565,8 +1590,8 @@ async fn given_unknown_filter_values_when_listed_via_http_and_ffi_then_both_reje
     );
     assert_eq!(
         http_status("/v1/files?type=audio").await,
-        axum::http::StatusCode::BAD_REQUEST,
-        "audio was removed in 0.5 and is now an unknown type"
+        axum::http::StatusCode::OK,
+        "audio is a catalog type again"
     );
     assert_eq!(
         http_status("/v1/files?state=delted").await,
@@ -1580,7 +1605,7 @@ async fn given_unknown_filter_values_when_listed_via_http_and_ffi_then_both_reje
     let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
     let ffi_lib_path = ffi_lib.path().to_str().unwrap().to_string();
 
-    let (bad_type, removed_type, bad_state, empty_values) =
+    let (bad_type, audio_type, bad_state, empty_values) =
         tokio::task::spawn_blocking(move || -> (i32, i32, i32, i32) {
             let cdb = CString::new(ffi_db).unwrap();
             assert_eq!(
@@ -1590,12 +1615,7 @@ async fn given_unknown_filter_values_when_listed_via_http_and_ffi_then_both_reje
 
             let root = CString::new(ffi_lib_path).unwrap();
             let token = CString::new(TEST_TOKEN).unwrap();
-            let started = alexandria_index_start(
-                root.as_ptr(),
-                token.as_ptr(),
-                std::ptr::null(),
-                std::ptr::null(),
-            );
+            let started = index_folder(root.as_ptr(), token.as_ptr(), std::ptr::null());
             assert_eq!(started.status, alexandria_ffi::INDEX_OK);
             wait_for_ffi_files(1);
 
@@ -1628,9 +1648,9 @@ async fn given_unknown_filter_values_when_listed_via_http_and_ffi_then_both_reje
         "FFI must reject an unknown type like HTTP does, not drop the filter"
     );
     assert_eq!(
-        removed_type,
-        alexandria_ffi::FILE_ERR_INVALID_INPUT,
-        "FFI must reject the removed audio type like HTTP does"
+        audio_type,
+        alexandria_ffi::FILE_OK,
+        "FFI must accept audio as a type like HTTP does"
     );
     assert_eq!(
         bad_state,
@@ -1809,11 +1829,11 @@ async fn given_same_file_when_renamed_via_http_and_ffi_then_file_bodies_and_disk
 
     let index_req = Request::builder()
         .method("POST")
-        .uri("/v1/index")
+        .uri("/v1/libraries")
         .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .header("content-type", "application/json")
         .body(Body::from(
-            json!({ "root": http_lib.path().to_str().unwrap() }).to_string(),
+            json!({ "name": "Library", "rootPath": http_lib.path().to_str().unwrap() }).to_string(),
         ))
         .unwrap();
     let _ = app(Settings::default(), http_services.clone())
@@ -1862,12 +1882,7 @@ async fn given_same_file_when_renamed_via_http_and_ffi_then_file_bodies_and_disk
 
             let root = CString::new(ffi_lib_path).unwrap();
             let token = CString::new(TEST_TOKEN).unwrap();
-            let started = alexandria_index_start(
-                root.as_ptr(),
-                token.as_ptr(),
-                std::ptr::null(),
-                std::ptr::null(),
-            );
+            let started = index_folder(root.as_ptr(), token.as_ptr(), std::ptr::null());
             assert_eq!(started.status, alexandria_ffi::INDEX_OK);
             wait_for_ffi_files(1);
 
@@ -2064,11 +2079,11 @@ async fn given_same_file_when_soft_deleted_via_http_and_ffi_then_file_bodies_ide
 
     let index_req = Request::builder()
         .method("POST")
-        .uri("/v1/index")
+        .uri("/v1/libraries")
         .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .header("content-type", "application/json")
         .body(Body::from(
-            json!({ "root": http_lib.path().to_str().unwrap() }).to_string(),
+            json!({ "name": "Library", "rootPath": http_lib.path().to_str().unwrap() }).to_string(),
         ))
         .unwrap();
     let _ = app(Settings::default(), http_services.clone())
@@ -2115,12 +2130,7 @@ async fn given_same_file_when_soft_deleted_via_http_and_ffi_then_file_bodies_ide
 
             let root = CString::new(ffi_lib_path).unwrap();
             let token = CString::new(TEST_TOKEN).unwrap();
-            let started = alexandria_index_start(
-                root.as_ptr(),
-                token.as_ptr(),
-                std::ptr::null(),
-                std::ptr::null(),
-            );
+            let started = index_folder(root.as_ptr(), token.as_ptr(), std::ptr::null());
             assert_eq!(started.status, alexandria_ffi::INDEX_OK);
             wait_for_ffi_files(1);
 
@@ -2335,11 +2345,11 @@ async fn given_soft_deleted_file_when_restored_via_http_and_ffi_then_file_bodies
 
     let index_req = Request::builder()
         .method("POST")
-        .uri("/v1/index")
+        .uri("/v1/libraries")
         .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .header("content-type", "application/json")
         .body(Body::from(
-            json!({ "root": http_lib.path().to_str().unwrap() }).to_string(),
+            json!({ "name": "Library", "rootPath": http_lib.path().to_str().unwrap() }).to_string(),
         ))
         .unwrap();
     let _ = app(Settings::default(), http_services.clone())
@@ -2395,12 +2405,7 @@ async fn given_soft_deleted_file_when_restored_via_http_and_ffi_then_file_bodies
 
             let root = CString::new(ffi_lib_path).unwrap();
             let token = CString::new(TEST_TOKEN).unwrap();
-            let started = alexandria_index_start(
-                root.as_ptr(),
-                token.as_ptr(),
-                std::ptr::null(),
-                std::ptr::null(),
-            );
+            let started = index_folder(root.as_ptr(), token.as_ptr(), std::ptr::null());
             assert_eq!(started.status, alexandria_ffi::INDEX_OK);
             wait_for_ffi_files(1);
 
@@ -2613,11 +2618,11 @@ async fn given_purgeable_file_when_purged_via_http_and_ffi_then_file_bodies_iden
 
     let index_req = Request::builder()
         .method("POST")
-        .uri("/v1/index")
+        .uri("/v1/libraries")
         .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .header("content-type", "application/json")
         .body(Body::from(
-            json!({ "root": http_lib.path().to_str().unwrap() }).to_string(),
+            json!({ "name": "Library", "rootPath": http_lib.path().to_str().unwrap() }).to_string(),
         ))
         .unwrap();
     let _ = app(Settings::default(), http_services.clone())
@@ -2684,12 +2689,7 @@ async fn given_purgeable_file_when_purged_via_http_and_ffi_then_file_bodies_iden
 
             let root = CString::new(ffi_lib_path).unwrap();
             let token = CString::new(TEST_TOKEN).unwrap();
-            let started = alexandria_index_start(
-                root.as_ptr(),
-                token.as_ptr(),
-                std::ptr::null(),
-                std::ptr::null(),
-            );
+            let started = index_folder(root.as_ptr(), token.as_ptr(), std::ptr::null());
             assert_eq!(started.status, alexandria_ffi::INDEX_OK);
             wait_for_ffi_files(1);
 
@@ -2927,11 +2927,11 @@ async fn given_active_file_when_purged_on_disk_via_http_and_ffi_then_file_bodies
 
     let index_req = Request::builder()
         .method("POST")
-        .uri("/v1/index")
+        .uri("/v1/libraries")
         .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .header("content-type", "application/json")
         .body(Body::from(
-            json!({ "root": http_lib.path().to_str().unwrap() }).to_string(),
+            json!({ "name": "Library", "rootPath": http_lib.path().to_str().unwrap() }).to_string(),
         ))
         .unwrap();
     let index_resp = app(Settings::default(), http_services.clone())
@@ -3001,12 +3001,7 @@ async fn given_active_file_when_purged_on_disk_via_http_and_ffi_then_file_bodies
 
             let root = CString::new(ffi_lib_path).unwrap();
             let token = CString::new(TEST_TOKEN).unwrap();
-            let started = alexandria_index_start(
-                root.as_ptr(),
-                token.as_ptr(),
-                std::ptr::null(),
-                std::ptr::null(),
-            );
+            let started = index_folder(root.as_ptr(), token.as_ptr(), std::ptr::null());
             assert_eq!(started.status, alexandria_ffi::INDEX_OK);
             wait_for_ffi_run_terminal(&run_id_string(&started), &token);
             wait_for_ffi_files(1);
@@ -3256,11 +3251,11 @@ async fn given_missing_disk_file_when_purged_on_disk_via_http_and_ffi_then_both_
 
     let index_req = Request::builder()
         .method("POST")
-        .uri("/v1/index")
+        .uri("/v1/libraries")
         .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .header("content-type", "application/json")
         .body(Body::from(
-            json!({ "root": http_lib.path().to_str().unwrap() }).to_string(),
+            json!({ "name": "Library", "rootPath": http_lib.path().to_str().unwrap() }).to_string(),
         ))
         .unwrap();
     let _ = app(Settings::default(), http_services.clone())
@@ -3325,12 +3320,7 @@ async fn given_missing_disk_file_when_purged_on_disk_via_http_and_ffi_then_both_
 
             let root = CString::new(ffi_lib_path).unwrap();
             let token = CString::new(TEST_TOKEN).unwrap();
-            let started = alexandria_index_start(
-                root.as_ptr(),
-                token.as_ptr(),
-                std::ptr::null(),
-                std::ptr::null(),
-            );
+            let started = index_folder(root.as_ptr(), token.as_ptr(), std::ptr::null());
             assert_eq!(started.status, alexandria_ffi::INDEX_OK);
             wait_for_ffi_files(1);
 
@@ -3564,11 +3554,11 @@ async fn given_active_file_when_purged_via_http_and_ffi_then_both_invalid_state(
 
     let index_req = Request::builder()
         .method("POST")
-        .uri("/v1/index")
+        .uri("/v1/libraries")
         .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .header("content-type", "application/json")
         .body(Body::from(
-            json!({ "root": http_lib.path().to_str().unwrap() }).to_string(),
+            json!({ "name": "Library", "rootPath": http_lib.path().to_str().unwrap() }).to_string(),
         ))
         .unwrap();
     let _ = app(Settings::default(), http_services.clone())
@@ -3619,12 +3609,7 @@ async fn given_active_file_when_purged_via_http_and_ffi_then_both_invalid_state(
 
         let root = CString::new(ffi_lib_path).unwrap();
         let token = CString::new(TEST_TOKEN).unwrap();
-        let started = alexandria_index_start(
-            root.as_ptr(),
-            token.as_ptr(),
-            std::ptr::null(),
-            std::ptr::null(),
-        );
+        let started = index_folder(root.as_ptr(), token.as_ptr(), std::ptr::null());
         assert_eq!(started.status, alexandria_ffi::INDEX_OK);
         wait_for_ffi_files(1);
 
@@ -4510,9 +4495,10 @@ async fn given_same_file_when_added_to_collection_via_http_and_ffi_then_bodies_a
     let http_pool = migrate_database(&http_db).await.expect("http migrate");
     seed_session(&http_pool, TEST_TOKEN).await;
     let http_file_uuid = uuid::Uuid::new_v4().to_string();
+    seeded_library(&http_pool).await;
     sqlx::query(
-        "INSERT INTO files (uuid, path, name, type, content_hash, indexed_at) \
-         VALUES (?, ?, ?, 'text', 'hash', ?)",
+        "INSERT INTO files (uuid, path, name, type, content_hash, indexed_at, library_id) \
+         VALUES (?, ?, ?, 'text', 'hash', ?, (SELECT id FROM libraries WHERE uuid = 'seeded-library'))",
     )
     .bind(&http_file_uuid)
     .bind(format!("/lib/{http_file_uuid}.txt"))
@@ -4571,9 +4557,10 @@ async fn given_same_file_when_added_to_collection_via_http_and_ffi_then_bodies_a
     let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
     let ffi_pool_pre = migrate_database(&ffi_db).await.expect("ffi pre-migrate");
     let ffi_file_uuid = uuid::Uuid::new_v4().to_string();
+    seeded_library(&ffi_pool_pre).await;
     sqlx::query(
-        "INSERT INTO files (uuid, path, name, type, content_hash, indexed_at) \
-         VALUES (?, ?, ?, 'text', 'hash', ?)",
+        "INSERT INTO files (uuid, path, name, type, content_hash, indexed_at, library_id) \
+         VALUES (?, ?, ?, 'text', 'hash', ?, (SELECT id FROM libraries WHERE uuid = 'seeded-library'))",
     )
     .bind(&ffi_file_uuid)
     .bind(format!("/lib/{ffi_file_uuid}.txt"))
@@ -4767,9 +4754,10 @@ async fn given_same_linked_file_when_removed_via_http_and_ffi_then_bodies_and_li
     let http_pool = migrate_database(&http_db).await.expect("http migrate");
     seed_session(&http_pool, TEST_TOKEN).await;
     let http_file_uuid = uuid::Uuid::new_v4().to_string();
+    seeded_library(&http_pool).await;
     sqlx::query(
-        "INSERT INTO files (uuid, path, name, type, content_hash, indexed_at) \
-         VALUES (?, ?, ?, 'text', 'hash', ?)",
+        "INSERT INTO files (uuid, path, name, type, content_hash, indexed_at, library_id) \
+         VALUES (?, ?, ?, 'text', 'hash', ?, (SELECT id FROM libraries WHERE uuid = 'seeded-library'))",
     )
     .bind(&http_file_uuid)
     .bind(format!("/lib/{http_file_uuid}.txt"))
@@ -4845,9 +4833,10 @@ async fn given_same_linked_file_when_removed_via_http_and_ffi_then_bodies_and_li
     let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
     let ffi_pool_pre = migrate_database(&ffi_db).await.expect("ffi pre-migrate");
     let ffi_file_uuid = uuid::Uuid::new_v4().to_string();
+    seeded_library(&ffi_pool_pre).await;
     sqlx::query(
-        "INSERT INTO files (uuid, path, name, type, content_hash, indexed_at) \
-         VALUES (?, ?, ?, 'text', 'hash', ?)",
+        "INSERT INTO files (uuid, path, name, type, content_hash, indexed_at, library_id) \
+         VALUES (?, ?, ?, 'text', 'hash', ?, (SELECT id FROM libraries WHERE uuid = 'seeded-library'))",
     )
     .bind(&ffi_file_uuid)
     .bind(format!("/lib/{ffi_file_uuid}.txt"))
@@ -5040,9 +5029,10 @@ async fn given_same_collection_when_items_listed_via_http_and_ffi_then_bodies_id
     let http_pool = migrate_database(&http_db).await.expect("http migrate");
     seed_session(&http_pool, TEST_TOKEN).await;
     let http_file_uuid = uuid::Uuid::new_v4().to_string();
+    seeded_library(&http_pool).await;
     sqlx::query(
-        "INSERT INTO files (uuid, path, name, type, content_hash, indexed_at) \
-         VALUES (?, ?, ?, 'text', 'hash', ?)",
+        "INSERT INTO files (uuid, path, name, type, content_hash, indexed_at, library_id) \
+         VALUES (?, ?, ?, 'text', 'hash', ?, (SELECT id FROM libraries WHERE uuid = 'seeded-library'))",
     )
     .bind(&http_file_uuid)
     .bind(format!("/lib/{http_file_uuid}.txt"))
@@ -5111,9 +5101,10 @@ async fn given_same_collection_when_items_listed_via_http_and_ffi_then_bodies_id
     let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
     let ffi_pool_pre = migrate_database(&ffi_db).await.expect("ffi pre-migrate");
     let ffi_file_uuid = uuid::Uuid::new_v4().to_string();
+    seeded_library(&ffi_pool_pre).await;
     sqlx::query(
-        "INSERT INTO files (uuid, path, name, type, content_hash, indexed_at) \
-         VALUES (?, ?, ?, 'text', 'hash', ?)",
+        "INSERT INTO files (uuid, path, name, type, content_hash, indexed_at, library_id) \
+         VALUES (?, ?, ?, 'text', 'hash', ?, (SELECT id FROM libraries WHERE uuid = 'seeded-library'))",
     )
     .bind(&ffi_file_uuid)
     .bind(format!("/lib/{ffi_file_uuid}.txt"))
@@ -6065,9 +6056,10 @@ async fn given_no_token_when_watchlist_created_via_http_and_ffi_then_both_unauth
 /// the watchlist handler to look up, not a full index run.
 async fn seed_file(pool: &sqlx::sqlite::SqlitePool, file_type: &str) -> String {
     let file_uuid = uuid::Uuid::new_v4().to_string();
+    seeded_library(pool).await;
     sqlx::query(
-        "INSERT INTO files (uuid, path, name, type, content_hash, indexed_at) \
-         VALUES (?, ?, ?, ?, 'hash', ?)",
+        "INSERT INTO files (uuid, path, name, type, content_hash, indexed_at, library_id) \
+         VALUES (?, ?, ?, ?, 'hash', ?, (SELECT id FROM libraries WHERE uuid = 'seeded-library'))",
     )
     .bind(&file_uuid)
     .bind(format!("/lib/{file_uuid}"))
@@ -8713,9 +8705,10 @@ async fn given_unknown_reading_list_when_deleted_via_http_and_ffi_then_both_not_
 /// bypasses the indexer for handlers that never touch the filesystem.
 async fn seed_file_at_path(pool: &sqlx::sqlite::SqlitePool, file_type: &str, path: &str) -> String {
     let file_uuid = uuid::Uuid::new_v4().to_string();
+    seeded_library(pool).await;
     sqlx::query(
-        "INSERT INTO files (uuid, path, name, type, content_hash, indexed_at) \
-         VALUES (?, ?, ?, ?, 'hash', ?)",
+        "INSERT INTO files (uuid, path, name, type, content_hash, indexed_at, library_id) \
+         VALUES (?, ?, ?, ?, 'hash', ?, (SELECT id FROM libraries WHERE uuid = 'seeded-library'))",
     )
     .bind(&file_uuid)
     .bind(path)
@@ -9473,11 +9466,11 @@ async fn given_tagged_image_file_when_indexed_via_http_and_ffi_then_extracted_me
 
     let index_req = Request::builder()
         .method("POST")
-        .uri("/v1/index")
+        .uri("/v1/libraries")
         .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .header("content-type", "application/json")
         .body(Body::from(
-            json!({ "root": http_lib.path().to_str().unwrap() }).to_string(),
+            json!({ "name": "Library", "rootPath": http_lib.path().to_str().unwrap() }).to_string(),
         ))
         .unwrap();
     let _ = app(Settings::default(), http_services.clone())
@@ -9525,12 +9518,7 @@ async fn given_tagged_image_file_when_indexed_via_http_and_ffi_then_extracted_me
 
         let root = CString::new(ffi_lib_path).unwrap();
         let token = CString::new(TEST_TOKEN).unwrap();
-        let started = alexandria_index_start(
-            root.as_ptr(),
-            token.as_ptr(),
-            std::ptr::null(),
-            std::ptr::null(),
-        );
+        let started = index_folder(root.as_ptr(), token.as_ptr(), std::ptr::null());
         assert_eq!(started.status, alexandria_ffi::INDEX_OK);
 
         // Poll the FFI leg's own sqlite file directly for both extraction
@@ -9693,11 +9681,11 @@ async fn given_tagged_pdf_file_when_indexed_via_http_and_ffi_then_extracted_meta
 
     let index_req = Request::builder()
         .method("POST")
-        .uri("/v1/index")
+        .uri("/v1/libraries")
         .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .header("content-type", "application/json")
         .body(Body::from(
-            json!({ "root": http_lib.path().to_str().unwrap() }).to_string(),
+            json!({ "name": "Library", "rootPath": http_lib.path().to_str().unwrap() }).to_string(),
         ))
         .unwrap();
     let _ = app(Settings::default(), http_services.clone())
@@ -9744,12 +9732,7 @@ async fn given_tagged_pdf_file_when_indexed_via_http_and_ffi_then_extracted_meta
 
         let root = CString::new(ffi_lib_path).unwrap();
         let token = CString::new(TEST_TOKEN).unwrap();
-        let started = alexandria_index_start(
-            root.as_ptr(),
-            token.as_ptr(),
-            std::ptr::null(),
-            std::ptr::null(),
-        );
+        let started = index_folder(root.as_ptr(), token.as_ptr(), std::ptr::null());
         assert_eq!(started.status, alexandria_ffi::INDEX_OK);
 
         // Poll the FFI leg's own sqlite file directly for all three
@@ -9915,11 +9898,11 @@ async fn given_tagged_mp4_file_when_indexed_via_http_and_ffi_then_extracted_meta
 
     let index_req = Request::builder()
         .method("POST")
-        .uri("/v1/index")
+        .uri("/v1/libraries")
         .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .header("content-type", "application/json")
         .body(Body::from(
-            json!({ "root": http_lib.path().to_str().unwrap() }).to_string(),
+            json!({ "name": "Library", "rootPath": http_lib.path().to_str().unwrap() }).to_string(),
         ))
         .unwrap();
     let _ = app(Settings::default(), http_services.clone())
@@ -9966,12 +9949,7 @@ async fn given_tagged_mp4_file_when_indexed_via_http_and_ffi_then_extracted_meta
 
         let root = CString::new(ffi_lib_path).unwrap();
         let token = CString::new(TEST_TOKEN).unwrap();
-        let started = alexandria_index_start(
-            root.as_ptr(),
-            token.as_ptr(),
-            std::ptr::null(),
-            std::ptr::null(),
-        );
+        let started = index_folder(root.as_ptr(), token.as_ptr(), std::ptr::null());
         assert_eq!(started.status, alexandria_ffi::INDEX_OK);
 
         // Poll the FFI leg's own sqlite file directly for all three
@@ -10132,11 +10110,11 @@ async fn given_tagged_cbz_file_when_indexed_via_http_and_ffi_then_extracted_meta
 
     let index_req = Request::builder()
         .method("POST")
-        .uri("/v1/index")
+        .uri("/v1/libraries")
         .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .header("content-type", "application/json")
         .body(Body::from(
-            json!({ "root": http_lib.path().to_str().unwrap() }).to_string(),
+            json!({ "name": "Library", "rootPath": http_lib.path().to_str().unwrap() }).to_string(),
         ))
         .unwrap();
     let _ = app(Settings::default(), http_services.clone())
@@ -10183,12 +10161,7 @@ async fn given_tagged_cbz_file_when_indexed_via_http_and_ffi_then_extracted_meta
 
         let root = CString::new(ffi_lib_path).unwrap();
         let token = CString::new(TEST_TOKEN).unwrap();
-        let started = alexandria_index_start(
-            root.as_ptr(),
-            token.as_ptr(),
-            std::ptr::null(),
-            std::ptr::null(),
-        );
+        let started = index_folder(root.as_ptr(), token.as_ptr(), std::ptr::null());
         assert_eq!(started.status, alexandria_ffi::INDEX_OK);
 
         // Poll the FFI leg's own sqlite file directly for all four
@@ -11363,9 +11336,10 @@ async fn given_same_collections_when_listed_via_http_and_ffi_then_bodies_identic
             ("aaaaaaaa-0000-4000-8000-000000000001", "active"),
             ("aaaaaaaa-0000-4000-8000-000000000002", "deleted"),
         ] {
+            seeded_library(pool).await;
             sqlx::query(
-                "INSERT INTO files (uuid, path, name, type, content_hash, state, indexed_at, collection_id) \
-                 VALUES (?, ?, ?, 'text', 'hash', ?, ?, ?)",
+                "INSERT INTO files (uuid, path, name, type, content_hash, state, indexed_at, collection_id, library_id) \
+                 VALUES (?, ?, ?, 'text', 'hash', ?, ?, ?, (SELECT id FROM libraries WHERE uuid = 'seeded-library'))",
             )
             .bind(uuid)
             .bind(format!("/lib/{uuid}.txt"))
@@ -11622,16 +11596,18 @@ async fn start_http_run(
 ) -> String {
     let request = Request::builder()
         .method("POST")
-        .uri("/v1/index")
+        .uri("/v1/libraries")
         .header("authorization", &format!("Bearer {token}"))
         .header("content-type", "application/json")
-        .body(Body::from(json!({ "root": root }).to_string()))
+        .body(Body::from(
+            json!({ "name": "Library", "rootPath": root }).to_string(),
+        ))
         .unwrap();
     let response = app(Settings::default(), services.clone())
         .oneshot(request)
         .await
         .expect("http start");
-    assert_eq!(response.status(), axum::http::StatusCode::ACCEPTED);
+    assert_eq!(response.status(), axum::http::StatusCode::CREATED);
     let body: serde_json::Value =
         serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
     body["runId"].as_str().unwrap().to_string()
@@ -11805,12 +11781,7 @@ async fn given_a_running_run_when_paused_via_http_and_ffi_then_both_report_pause
 
         let root = CString::new(ffi_lib_path).unwrap();
         let token = CString::new(TEST_TOKEN).unwrap();
-        let started = alexandria_index_start(
-            root.as_ptr(),
-            token.as_ptr(),
-            std::ptr::null(),
-            std::ptr::null(),
-        );
+        let started = index_folder(root.as_ptr(), token.as_ptr(), std::ptr::null());
         assert_eq!(started.status, alexandria_ffi::INDEX_OK, "ffi start failed");
         let run_id = run_id_string(&started);
 
@@ -11926,12 +11897,7 @@ async fn given_a_paused_run_when_resumed_via_http_and_ffi_then_both_answer_with_
 
             let root = CString::new(ffi_lib_path).unwrap();
             let token = CString::new(TEST_TOKEN).unwrap();
-            let started = alexandria_index_start(
-                root.as_ptr(),
-                token.as_ptr(),
-                std::ptr::null(),
-                std::ptr::null(),
-            );
+            let started = index_folder(root.as_ptr(), token.as_ptr(), std::ptr::null());
             assert_eq!(started.status, alexandria_ffi::INDEX_OK, "ffi start failed");
             let run_id = run_id_string(&started);
 
@@ -12069,12 +12035,7 @@ async fn given_a_paused_run_when_resumed_at_low_priority_via_http_and_ffi_then_b
 
         let root = CString::new(ffi_lib_path).unwrap();
         let token = CString::new(TEST_TOKEN).unwrap();
-        let started = alexandria_index_start(
-            root.as_ptr(),
-            token.as_ptr(),
-            std::ptr::null(),
-            std::ptr::null(),
-        );
+        let started = index_folder(root.as_ptr(), token.as_ptr(), std::ptr::null());
         assert_eq!(started.status, alexandria_ffi::INDEX_OK, "ffi start failed");
         let run_id = run_id_string(&started);
 
@@ -12191,12 +12152,7 @@ async fn given_a_running_run_when_cancelled_via_http_and_ffi_then_both_report_ca
 
             let root = CString::new(ffi_lib_path).unwrap();
             let token = CString::new(TEST_TOKEN).unwrap();
-            let started = alexandria_index_start(
-                root.as_ptr(),
-                token.as_ptr(),
-                std::ptr::null(),
-                std::ptr::null(),
-            );
+            let started = index_folder(root.as_ptr(), token.as_ptr(), std::ptr::null());
             assert_eq!(started.status, alexandria_ffi::INDEX_OK, "ffi start failed");
             let run_id = run_id_string(&started);
 
@@ -12395,12 +12351,7 @@ async fn given_two_paused_runs_when_active_runs_listed_via_http_and_ffi_then_bot
             let token = CString::new(TEST_TOKEN).unwrap();
 
             let first_root = CString::new(first_lib_ffi_path).unwrap();
-            let first_started = alexandria_index_start(
-                first_root.as_ptr(),
-                token.as_ptr(),
-                std::ptr::null(),
-                std::ptr::null(),
-            );
+            let first_started = index_folder(first_root.as_ptr(), token.as_ptr(), std::ptr::null());
             assert_eq!(first_started.status, alexandria_ffi::INDEX_OK);
             let first_run_id = run_id_string(&first_started);
             wait_for_ffi_run_cell_live(&first_run_id, &token);
@@ -12419,12 +12370,8 @@ async fn given_two_paused_runs_when_active_runs_listed_via_http_and_ffi_then_bot
             wait_for_ffi_run_terminal(&first_run_id, &token);
 
             let second_root = CString::new(second_lib_ffi_path).unwrap();
-            let second_started = alexandria_index_start(
-                second_root.as_ptr(),
-                token.as_ptr(),
-                std::ptr::null(),
-                std::ptr::null(),
-            );
+            let second_started =
+                index_folder(second_root.as_ptr(), token.as_ptr(), std::ptr::null());
             assert_eq!(second_started.status, alexandria_ffi::INDEX_OK);
             let second_run_id = run_id_string(&second_started);
             wait_for_ffi_run_cell_live(&second_run_id, &token);
@@ -12535,18 +12482,18 @@ async fn given_low_priority_when_started_via_http_and_ffi_then_both_spell_it_the
 
     let request = Request::builder()
         .method("POST")
-        .uri("/v1/index")
+        .uri("/v1/libraries")
         .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .header("content-type", "application/json")
         .body(Body::from(
-            json!({ "root": http_lib.path().to_str().unwrap(), "priority": "low" }).to_string(),
+            json!({ "name": "Library", "rootPath": http_lib.path().to_str().unwrap(), "priority": "low" }).to_string(),
         ))
         .unwrap();
     let response = app(Settings::default(), http_services.clone())
         .oneshot(request)
         .await
         .expect("http start");
-    assert_eq!(response.status(), axum::http::StatusCode::ACCEPTED);
+    assert_eq!(response.status(), axum::http::StatusCode::CREATED);
     let http_run_id: serde_json::Value =
         serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
     let http_run_id = http_run_id["runId"].as_str().unwrap().to_string();
@@ -12576,12 +12523,7 @@ async fn given_low_priority_when_started_via_http_and_ffi_then_both_spell_it_the
         let root = CString::new(ffi_lib_path).unwrap();
         let token = CString::new(TEST_TOKEN).unwrap();
         let priority = CString::new("low").unwrap();
-        let started = alexandria_index_start(
-            root.as_ptr(),
-            token.as_ptr(),
-            priority.as_ptr(),
-            std::ptr::null(),
-        );
+        let started = index_folder(root.as_ptr(), token.as_ptr(), priority.as_ptr());
         assert_eq!(started.status, alexandria_ffi::INDEX_OK, "ffi start failed");
         run_id_string(&started)
     })
@@ -12619,127 +12561,417 @@ async fn given_low_priority_when_started_via_http_and_ffi_then_both_spell_it_the
     );
 }
 
-/// UC-01 / FR-FC-24 parity for the run's scope (issue #122). The two surfaces
-/// spell a scope differently — a JSON array on HTTP, a comma-separated C
-/// string on the FFI — so the only thing that can be compared is what each
-/// one *did* with it, which is the set of files it catalogued.
-///
-/// Both legs index the same two-file library (a note and a picture) scoped
-/// to `text`. The payload deliberately carries a type each leg must
-/// exclude: a transport that dropped the scope on the floor would catalogue
-/// `cover.png` and fail here, which a scope naming every present type could
-/// never detect. Each leg's own list is asserted as well as the two against
-/// each other, so a run that indexed nothing at all cannot pass by agreeing
-/// with a run that did the same.
+/// FFI-36 parity — registering one folder answers the same library on both
+/// surfaces, with a run id beside it (FR-FC-36, FR-FC-24). Only the minted
+/// uuids differ.
 #[tokio::test]
-async fn given_a_text_scope_when_started_via_http_and_ffi_then_both_catalog_only_the_text() {
+async fn given_the_same_folder_when_registered_on_both_surfaces_then_the_json_matches_except_uuids()
+{
     let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let folder = tempdir().unwrap();
+    std::fs::write(folder.path().join("a.md"), b"# a").unwrap();
+    let root = folder.path().to_str().unwrap().to_string();
+    let body = json!({ "name": "Notes", "rootPath": root, "priority": "low" });
 
     // ---- HTTP leg ----
     let http_dir = tempdir().unwrap();
-    let http_db = db_path(&http_dir, "http.sqlite");
-    let http_pool = migrate_database(&http_db).await.expect("http migrate");
+    let http_pool = migrate_database(&db_path(&http_dir, "http.sqlite"))
+        .await
+        .expect("http migrate");
     seed_session(&http_pool, TEST_TOKEN).await;
     let http_services =
         std::sync::Arc::new(build_services(&local_settings(), http_pool.clone()).await);
-
-    let http_lib = tempdir().unwrap();
-    std::fs::write(http_lib.path().join("memo.txt"), b"text-bytes").unwrap();
-    std::fs::write(http_lib.path().join("cover.png"), b"image-bytes").unwrap();
-
-    let request = Request::builder()
+    let req = Request::builder()
         .method("POST")
-        .uri("/v1/index")
+        .uri("/v1/libraries")
         .header("authorization", &format!("Bearer {TEST_TOKEN}"))
         .header("content-type", "application/json")
-        .body(Body::from(
-            json!({ "root": http_lib.path().to_str().unwrap(), "types": ["text"] }).to_string(),
-        ))
+        .body(Body::from(body.to_string()))
         .unwrap();
-    let response = app(Settings::default(), http_services.clone())
-        .oneshot(request)
+    let resp = app(Settings::default(), http_services.clone())
+        .oneshot(req)
         .await
-        .expect("http start");
-    assert_eq!(response.status(), axum::http::StatusCode::ACCEPTED);
+        .expect("http register");
+    assert_eq!(resp.status(), axum::http::StatusCode::CREATED);
     let http_body: serde_json::Value =
-        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
-    let http_run_id = http_body["runId"].as_str().expect("http runId").to_string();
-
-    // Terminal, not a file count: the assertion below is about a file that
-    // must *not* appear, and only a finished run can say it never will.
-    let http_run = wait_for_http_run_terminal(&http_services, &http_run_id, TEST_TOKEN).await;
-    assert_eq!(http_run["status"], "complete");
-
-    let http_names: Vec<String> = sqlx::query_as("SELECT name FROM files ORDER BY name")
-        .fetch_all(&http_pool)
-        .await
-        .unwrap()
-        .into_iter()
-        .map(|(name,): (String,)| name)
-        .collect();
+        serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
+    wait_for_http_run_terminal(
+        &http_services,
+        http_body["runId"].as_str().unwrap(),
+        TEST_TOKEN,
+    )
+    .await;
 
     // ---- FFI leg ----
     let ffi_dir = tempdir().unwrap();
     let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
-    let ffi_lib = tempdir().unwrap();
-    std::fs::write(ffi_lib.path().join("memo.txt"), b"text-bytes").unwrap();
-    std::fs::write(ffi_lib.path().join("cover.png"), b"image-bytes").unwrap();
-    let ffi_lib_path = ffi_lib.path().to_str().unwrap().to_string();
-
-    let ffi_json = tokio::task::spawn_blocking(move || -> String {
+    let ffi_body: serde_json::Value = tokio::task::spawn_blocking(move || -> serde_json::Value {
         let cdb = CString::new(ffi_db).unwrap();
         assert_eq!(
             alexandria_index_init(cdb.as_ptr()),
             alexandria_ffi::INDEX_OK
         );
-
-        let root = CString::new(ffi_lib_path).unwrap();
+        let request = CString::new(body.to_string()).unwrap();
         let token = CString::new(TEST_TOKEN).unwrap();
-        let types = CString::new("text").unwrap();
-        let started = alexandria_index_start(
-            root.as_ptr(),
-            token.as_ptr(),
-            std::ptr::null(),
-            types.as_ptr(),
-        );
-        assert_eq!(started.status, alexandria_ffi::INDEX_OK, "ffi start failed");
-        wait_for_ffi_run_terminal(&run_id_string(&started), &token);
-
-        let raw = alexandria_index_files_json();
-        assert!(!raw.is_null());
-        // SAFETY: returned by the FFI accessor as a NUL-terminated string.
-        let json = unsafe { CStr::from_ptr(raw) }.to_str().unwrap().to_string();
-        // SAFETY: pointer came from this library and is freed once.
+        let r = alexandria_library_register(request.as_ptr(), token.as_ptr());
+        assert_eq!(r.status, alexandria_ffi::LIBRARY_OK, "ffi register");
+        let s = unsafe { CStr::from_ptr(r.json) }
+            .to_string_lossy()
+            .into_owned();
         unsafe {
-            alexandria_free_string(raw);
+            alexandria_free_string(r.json);
         }
-        json
+        let value: serde_json::Value = serde_json::from_str(&s).unwrap();
+        wait_for_ffi_run_terminal(value["runId"].as_str().unwrap(), &token);
+        value
     })
     .await
     .unwrap();
 
-    let ffi_value: serde_json::Value = serde_json::from_str(&ffi_json).unwrap();
-    let mut ffi_names: Vec<String> = ffi_value
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|o| o["name"].as_str().unwrap().to_string())
-        .collect();
-    ffi_names.sort();
+    // ---- compare ----
+    let norm = |v: &serde_json::Value| -> serde_json::Value {
+        let mut c = v.clone();
+        let obj = c.as_object_mut().expect("object");
+        for key in ["uuid", "runId"] {
+            let minted = obj.remove(key).expect(key);
+            assert!(
+                uuid::Uuid::parse_str(minted.as_str().unwrap()).is_ok(),
+                "{key}"
+            );
+        }
+        c
+    };
+    assert_eq!(norm(&http_body), norm(&ffi_body));
+    assert_eq!(http_body["rootPath"], root);
+}
 
-    // ---- compare (two independent legs, same scope) ----
+/// The library a test's hand-written file rows belong to — every file is in
+/// one. Created once per database; its folder overlaps no test folder.
+async fn seeded_library(pool: &sqlx::sqlite::SqlitePool) {
+    sqlx::query(
+        "INSERT OR IGNORE INTO libraries (uuid, name, root_path) \
+         VALUES ('seeded-library', 'Seeded', '/seeded-library')",
+    )
+    .execute(pool)
+    .await
+    .expect("seed library");
+}
+
+/// FR-FC-12 parity — a listing narrowed to one library answers the same
+/// files on both surfaces, and both refuse a malformed library uuid
+/// (FR-FC-24).
+#[tokio::test]
+async fn given_a_library_filter_when_listed_on_both_surfaces_then_the_json_matches() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let folders = tempdir().unwrap();
+    let first = folders.path().join("first");
+    let second = folders.path().join("second");
+    for (dir, name) in [(&first, "a.md"), (&second, "b.md")] {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join(name), b"x").unwrap();
+    }
+    let roots = [
+        first.to_str().unwrap().to_string(),
+        second.to_str().unwrap().to_string(),
+    ];
+
+    // ---- HTTP leg ----
+    let http_dir = tempdir().unwrap();
+    let http_pool = migrate_database(&db_path(&http_dir, "http.sqlite"))
+        .await
+        .expect("http migrate");
+    seed_session(&http_pool, TEST_TOKEN).await;
+    let http_services =
+        std::sync::Arc::new(build_services(&local_settings(), http_pool.clone()).await);
+    let request = |method: &str, uri: String, body: Option<serde_json::Value>| {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("authorization", &format!("Bearer {TEST_TOKEN}"))
+            .header("content-type", "application/json")
+            .body(body.map_or_else(Body::empty, |b| Body::from(b.to_string())))
+            .unwrap()
+    };
+    let mut http_first = String::new();
+    for (i, root) in roots.iter().enumerate() {
+        let resp = app(Settings::default(), http_services.clone())
+            .oneshot(request(
+                "POST",
+                "/v1/libraries".into(),
+                Some(json!({ "name": "Lib", "rootPath": root })),
+            ))
+            .await
+            .unwrap();
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
+        wait_for_http_run_terminal(&http_services, body["runId"].as_str().unwrap(), TEST_TOKEN)
+            .await;
+        if i == 0 {
+            http_first = body["uuid"].as_str().unwrap().to_string();
+        }
+    }
+    let listed = app(Settings::default(), http_services.clone())
+        .oneshot(request(
+            "GET",
+            format!("/v1/files?libraryUuid={http_first}"),
+            None,
+        ))
+        .await
+        .unwrap();
+    let http_listing: serde_json::Value =
+        serde_json::from_slice(&to_bytes(listed.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let malformed = app(Settings::default(), http_services.clone())
+        .oneshot(request("GET", "/v1/files?libraryUuid=nope".into(), None))
+        .await
+        .unwrap();
+    assert_eq!(malformed.status(), axum::http::StatusCode::BAD_REQUEST);
+
+    // ---- FFI leg ----
+    let ffi_dir = tempdir().unwrap();
+    let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
+    let ffi_listing: serde_json::Value = tokio::task::spawn_blocking(move || {
+        let cdb = CString::new(ffi_db).unwrap();
+        assert_eq!(
+            alexandria_index_init(cdb.as_ptr()),
+            alexandria_ffi::INDEX_OK
+        );
+        let token = CString::new(TEST_TOKEN).unwrap();
+        let take = |json: *mut std::os::raw::c_char| -> serde_json::Value {
+            let s = unsafe { CStr::from_ptr(json) }
+                .to_string_lossy()
+                .into_owned();
+            unsafe { alexandria_free_string(json) };
+            serde_json::from_str(&s).unwrap()
+        };
+        let mut first = String::new();
+        for (i, root) in roots.iter().enumerate() {
+            let body =
+                CString::new(json!({ "name": "Lib", "rootPath": root }).to_string()).unwrap();
+            let r = alexandria_library_register(body.as_ptr(), token.as_ptr());
+            assert_eq!(r.status, alexandria_ffi::LIBRARY_OK);
+            let value = take(r.json);
+            wait_for_ffi_run_terminal(value["runId"].as_str().unwrap(), &token);
+            if i == 0 {
+                first = value["uuid"].as_str().unwrap().to_string();
+            }
+        }
+        let malformed = CString::new(r#"{"libraryUuid":"nope"}"#).unwrap();
+        assert_eq!(
+            alexandria_files_list(malformed.as_ptr(), token.as_ptr()).status,
+            alexandria_ffi::FILE_ERR_INVALID_INPUT
+        );
+        let filter = CString::new(json!({ "libraryUuid": first }).to_string()).unwrap();
+        let r = alexandria_files_list(filter.as_ptr(), token.as_ptr());
+        assert_eq!(r.status, alexandria_ffi::FILE_OK);
+        take(r.json)
+    })
+    .await
+    .unwrap();
+
+    // ---- compare ----
+    assert_eq!(http_listing.as_array().map(|a| a.len()), Some(1));
+    assert_eq!(norm(http_listing), norm(ffi_listing));
+}
+
+/// One leg's view of the library calls: status codes as both surfaces
+/// spell them, so they can be compared.
+#[derive(Debug, PartialEq)]
+struct LibraryCalls {
+    reindex_ok: bool,
+    reindex_unknown: &'static str,
+    reindex_while_paused: &'static str,
+    remove_while_running: &'static str,
+    remove_ok: bool,
+    files_after_remove: i64,
+}
+
+/// FR-FC-24 parity for re-indexing one library and for removing one: both
+/// surfaces start a run, refuse an unknown library and an unfinished run the
+/// same way, and remove a library's records the same way.
+#[tokio::test]
+async fn given_a_library_when_reindexed_and_removed_on_both_surfaces_then_they_agree() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let folder = tempdir().unwrap();
+    std::fs::write(folder.path().join("a.md"), b"# a").unwrap();
+    let root = folder.path().to_str().unwrap().to_string();
+
+    // ---- HTTP leg ----
+    let http_dir = tempdir().unwrap();
+    let http_pool = migrate_database(&db_path(&http_dir, "http.sqlite"))
+        .await
+        .expect("http migrate");
+    seed_session(&http_pool, TEST_TOKEN).await;
+    let services = std::sync::Arc::new(build_services(&local_settings(), http_pool.clone()).await);
+    let call = |method: &'static str, uri: String, body: Option<serde_json::Value>| {
+        let services = services.clone();
+        async move {
+            let req = Request::builder()
+                .method(method)
+                .uri(uri)
+                .header("authorization", &format!("Bearer {TEST_TOKEN}"))
+                .header("content-type", "application/json")
+                .body(body.map_or_else(Body::empty, |b| Body::from(b.to_string())))
+                .unwrap();
+            let resp = app(Settings::default(), services)
+                .oneshot(req)
+                .await
+                .unwrap();
+            let status = resp.status();
+            let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            (
+                status,
+                serde_json::from_slice::<serde_json::Value>(&bytes).unwrap_or_default(),
+            )
+        }
+    };
+    let set_status = |pool: sqlx::SqlitePool, status: &'static str| async move {
+        sqlx::query(
+            "UPDATE catalog_runs SET status = ? \
+                 WHERE id = (SELECT id FROM catalog_runs ORDER BY started_at DESC LIMIT 1)",
+        )
+        .bind(status)
+        .execute(&pool)
+        .await
+        .unwrap();
+    };
+    let named = |status: axum::http::StatusCode| match status.as_u16() {
+        404 => "not found",
+        409 => "conflict",
+        _ => "other",
+    };
+
+    let (_, library) = call(
+        "POST",
+        "/v1/libraries".into(),
+        Some(json!({ "name": "Notes", "rootPath": root })),
+    )
+    .await;
+    let uuid = library["uuid"].as_str().unwrap().to_string();
+    wait_for_http_run_terminal(&services, library["runId"].as_str().unwrap(), TEST_TOKEN).await;
+    let (status, started) = call("POST", format!("/v1/libraries/{uuid}/index"), None).await;
+    let reindex_ok = status == axum::http::StatusCode::ACCEPTED && started["runId"].is_string();
+    wait_for_http_run_terminal(&services, started["runId"].as_str().unwrap(), TEST_TOKEN).await;
+    let (unknown, _) = call(
+        "POST",
+        format!("/v1/libraries/{}/index", uuid::Uuid::new_v4()),
+        None,
+    )
+    .await;
+    set_status(http_pool.clone(), "paused").await;
+    let (paused, _) = call("POST", format!("/v1/libraries/{uuid}/index"), None).await;
+    set_status(http_pool.clone(), "running").await;
+    let (running, _) = call("DELETE", format!("/v1/libraries/{uuid}"), None).await;
+    set_status(http_pool.clone(), "complete").await;
+    let (removed, _) = call("DELETE", format!("/v1/libraries/{uuid}"), None).await;
+    let http_files: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM files")
+        .fetch_one(&http_pool)
+        .await
+        .unwrap();
+    let http = LibraryCalls {
+        reindex_ok,
+        reindex_unknown: named(unknown),
+        reindex_while_paused: named(paused),
+        remove_while_running: named(running),
+        remove_ok: removed == axum::http::StatusCode::NO_CONTENT,
+        files_after_remove: http_files,
+    };
+
+    // ---- FFI leg ----
+    let ffi_dir = tempdir().unwrap();
+    let ffi_db = setup_ffi_db(&ffi_dir, "ffi.sqlite", TEST_TOKEN).await;
+    let ffi_db_path = ffi_db.clone();
+    let ffi = tokio::task::spawn_blocking(move || {
+        let cdb = CString::new(ffi_db).unwrap();
+        assert_eq!(
+            alexandria_index_init(cdb.as_ptr()),
+            alexandria_ffi::INDEX_OK
+        );
+        let token = CString::new(TEST_TOKEN).unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let pool = rt.block_on(migrate_database(&ffi_db_path)).unwrap();
+        let set_status = |status: &str| {
+            rt.block_on(
+                sqlx::query(
+                    "UPDATE catalog_runs SET status = ? \
+                 WHERE id = (SELECT id FROM catalog_runs ORDER BY started_at DESC LIMIT 1)",
+                )
+                .bind(status)
+                .execute(&pool),
+            )
+            .unwrap();
+        };
+        let index_named = |status: i32| match status {
+            alexandria_ffi::INDEX_ERR_NOT_FOUND => "not found",
+            alexandria_ffi::INDEX_ERR_CONFLICT => "conflict",
+            _ => "other",
+        };
+
+        let body = CString::new(json!({ "name": "Notes", "rootPath": root }).to_string()).unwrap();
+        let r = alexandria_library_register(body.as_ptr(), token.as_ptr());
+        assert_eq!(r.status, alexandria_ffi::LIBRARY_OK);
+        let library: serde_json::Value =
+            serde_json::from_str(&unsafe { CStr::from_ptr(r.json) }.to_string_lossy()).unwrap();
+        unsafe { alexandria_free_string(r.json) };
+        wait_for_ffi_run_terminal(library["runId"].as_str().unwrap(), &token);
+        let uuid = CString::new(library["uuid"].as_str().unwrap()).unwrap();
+
+        let started = alexandria_ffi::alexandria_library_index_start(
+            uuid.as_ptr(),
+            token.as_ptr(),
+            std::ptr::null(),
+        );
+        let reindex_ok = started.status == alexandria_ffi::INDEX_OK;
+        wait_for_ffi_run_terminal(&run_id_string(&started), &token);
+        let stranger = CString::new(uuid::Uuid::new_v4().to_string()).unwrap();
+        let unknown = alexandria_ffi::alexandria_library_index_start(
+            stranger.as_ptr(),
+            token.as_ptr(),
+            std::ptr::null(),
+        )
+        .status;
+        set_status("paused");
+        let paused = alexandria_ffi::alexandria_library_index_start(
+            uuid.as_ptr(),
+            token.as_ptr(),
+            std::ptr::null(),
+        )
+        .status;
+        set_status("running");
+        let running =
+            alexandria_ffi::alexandria_library_remove(uuid.as_ptr(), token.as_ptr()).status;
+        set_status("complete");
+        let removed =
+            alexandria_ffi::alexandria_library_remove(uuid.as_ptr(), token.as_ptr()).status;
+        let files: i64 = rt
+            .block_on(sqlx::query_scalar("SELECT COUNT(*) FROM files").fetch_one(&pool))
+            .unwrap();
+        LibraryCalls {
+            reindex_ok,
+            reindex_unknown: index_named(unknown),
+            reindex_while_paused: index_named(paused),
+            remove_while_running: if running == alexandria_ffi::LIBRARY_ERR_CONFLICT {
+                "conflict"
+            } else {
+                "other"
+            },
+            remove_ok: removed == alexandria_ffi::LIBRARY_OK,
+            files_after_remove: files,
+        }
+    })
+    .await
+    .unwrap();
+
+    // ---- compare ----
     assert_eq!(
-        http_names,
-        vec!["memo.txt".to_string()],
-        "http scoped to text must catalog the note and not the picture"
+        http,
+        LibraryCalls {
+            reindex_ok: true,
+            reindex_unknown: "not found",
+            reindex_while_paused: "conflict",
+            remove_while_running: "conflict",
+            remove_ok: true,
+            files_after_remove: 0,
+        }
     );
-    assert_eq!(
-        ffi_names,
-        vec!["memo.txt".to_string()],
-        "ffi scoped to text must catalog the note and not the picture"
-    );
-    assert_eq!(
-        http_names, ffi_names,
-        "HTTP and FFI must resolve the same scope to the same set of files"
-    );
+    assert_eq!(ffi, http);
 }

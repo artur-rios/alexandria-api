@@ -21,6 +21,7 @@ use crate::bookmarks::commands::purge::PurgeBookmarkHandler;
 use crate::bookmarks::commands::update::UpdateBookmarkHandler;
 use crate::bookmarks::queries::browse::BrowseBookmarksHandler;
 use crate::bookmarks::repos::SqliteBookmarkRepository;
+use crate::catalog::audio_tags::{LoftyAudioMetadataReader, LoftyCoverArtReader};
 use crate::catalog::clock::{Clock, SystemClock};
 use crate::catalog::comic_tags::CbzComicMetadataReader;
 use crate::catalog::commands::edit_content::EditTextFileContentHandler;
@@ -56,7 +57,7 @@ use crate::collections::repos::SqliteCollectionRepository;
 use crate::config::AuthMode;
 use crate::config::Settings;
 use crate::libraries::commands::{
-    MoveLibraryHandler, RegisterLibraryHandler, RemoveLibraryHandler,
+    IndexLibraryHandler, MoveLibraryHandler, RegisterLibraryHandler, RemoveLibraryHandler,
 };
 use crate::libraries::queries::{BrowseLibraryHandler, ListLibrariesHandler};
 use crate::libraries::repos::SqliteLibraryRepository;
@@ -89,6 +90,7 @@ pub type DefaultIndexHandler = IndexHandler<
     SqliteCatalogRepository,
     StdFilesystem,
     SystemClock,
+    LoftyAudioMetadataReader,
     ExifImageMetadataReader,
     PdfEpubMetadataReader,
     FfmpegVideoMetadataReader,
@@ -102,6 +104,7 @@ pub type DefaultRefreshHandler = RefreshHandler<
     StdFilesystem,
     SystemClock,
     SqliteCatalogRunRepository,
+    LoftyAudioMetadataReader,
     ExifImageMetadataReader,
     PdfEpubMetadataReader,
     FfmpegVideoMetadataReader,
@@ -160,6 +163,7 @@ pub type DefaultThumbnailHandler = ThumbnailHandler<
     ZipComicArchive,
     ImageThumbnailRenderer,
     DiskThumbnailCache,
+    LoftyCoverArtReader,
 >;
 
 pub type DefaultCreateCollectionHandler =
@@ -258,13 +262,20 @@ pub type DefaultDeleteReadingListHandler =
     DeleteReadingListHandler<RuntimeAuthService, SqliteReadingListRepository>;
 
 pub type DefaultRegisterLibraryHandler =
-    RegisterLibraryHandler<RuntimeAuthService, SqliteLibraryRepository>;
+    RegisterLibraryHandler<RuntimeAuthService, SqliteLibraryRepository, Arc<DefaultIndexHandler>>;
+
+pub type DefaultIndexLibraryHandler = IndexLibraryHandler<
+    RuntimeAuthService,
+    SqliteLibraryRepository,
+    Arc<DefaultIndexHandler>,
+    SqliteCatalogRunRepository,
+>;
 
 pub type DefaultRemoveLibraryHandler =
-    RemoveLibraryHandler<RuntimeAuthService, SqliteLibraryRepository>;
+    RemoveLibraryHandler<RuntimeAuthService, SqliteLibraryRepository, SqliteCatalogRunRepository>;
 
 pub type DefaultMoveLibraryHandler =
-    MoveLibraryHandler<RuntimeAuthService, SqliteLibraryRepository>;
+    MoveLibraryHandler<RuntimeAuthService, SqliteLibraryRepository, SqliteCatalogRunRepository>;
 
 pub type DefaultBrowseLibraryHandler =
     BrowseLibraryHandler<RuntimeAuthService, SqliteLibraryRepository, SqliteCatalogRepository>;
@@ -352,6 +363,7 @@ pub struct Services {
     pub remove_item_from_reading_list_handler: Arc<DefaultRemoveItemFromReadingListHandler>,
     pub delete_reading_list_handler: Arc<DefaultDeleteReadingListHandler>,
     pub register_library_handler: Arc<DefaultRegisterLibraryHandler>,
+    pub index_library_handler: Arc<DefaultIndexLibraryHandler>,
     pub remove_library_handler: Arc<DefaultRemoveLibraryHandler>,
     pub move_library_handler: Arc<DefaultMoveLibraryHandler>,
     pub browse_library_handler: Arc<DefaultBrowseLibraryHandler>,
@@ -431,6 +443,7 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
             RuntimeAuthService::Windows(LocalAuthService::new(session_repo.clone(), clock))
         }
     };
+    let audio_tags = LoftyAudioMetadataReader;
     let image_tags = ExifImageMetadataReader;
     let document_tags = PdfEpubMetadataReader;
     let video_tags = FfmpegVideoMetadataReader;
@@ -473,6 +486,7 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         repo.clone(),
         fs,
         clock,
+        audio_tags,
         image_tags,
         document_tags,
         video_tags,
@@ -491,6 +505,7 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         // The same readers the index uses: a refresh that re-read a file
         // differently from the run that first catalogued it would fill the
         // gaps with a second opinion.
+        audio_tags,
         image_tags,
         document_tags,
         video_tags,
@@ -592,6 +607,11 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         ZipComicArchive,
         ImageThumbnailRenderer,
         DiskThumbnailCache::new(settings.playback.thumbnail_cache_dir.clone()),
+        // Beside `audio_tags` (`LoftyAudioMetadataReader`), the reader it
+        // sits next to: both are lofty-backed reads of the same tagged
+        // file, at two different times for two different reasons (see
+        // `CoverArtReader`'s own doc comment).
+        LoftyCoverArtReader,
         library_root.clone(),
     ));
     let create_collection_handler = Arc::new(CreateCollectionHandler::new(
@@ -712,15 +732,25 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
     let register_library_handler = Arc::new(RegisterLibraryHandler::new(
         auth.clone(),
         SqliteLibraryRepository::new(pool.clone()),
+        index_handler.clone(),
+        library_root.clone(),
+    ));
+    let index_library_handler = Arc::new(IndexLibraryHandler::new(
+        auth.clone(),
+        SqliteLibraryRepository::new(pool.clone()),
+        index_handler.clone(),
+        SqliteCatalogRunRepository::new(pool.clone()),
     ));
     let remove_library_handler = Arc::new(RemoveLibraryHandler::new(
         auth.clone(),
         SqliteLibraryRepository::new(pool.clone()),
+        SqliteCatalogRunRepository::new(pool.clone()),
     ));
     let move_library_handler = Arc::new(MoveLibraryHandler::new(
         auth.clone(),
         SqliteLibraryRepository::new(pool.clone()),
         library_root.clone(),
+        SqliteCatalogRunRepository::new(pool.clone()),
     ));
     let browse_library_handler = Arc::new(BrowseLibraryHandler::new(
         auth.clone(),
@@ -819,6 +849,7 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         remove_item_from_reading_list_handler,
         delete_reading_list_handler,
         register_library_handler,
+        index_library_handler,
         remove_library_handler,
         move_library_handler,
         browse_library_handler,

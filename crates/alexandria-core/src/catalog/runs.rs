@@ -4,7 +4,6 @@ use sqlx::sqlite::{SqlitePool, SqliteRow};
 use sqlx::Row;
 use uuid::Uuid;
 
-use crate::catalog::index_scope::IndexScope;
 use crate::catalog::run_registry::{RunPhase, RunProgress};
 use crate::errors::DomainError;
 
@@ -236,21 +235,10 @@ pub struct CatalogRun {
     /// [`pause`]: CatalogRunRepository::pause
     #[serde(skip)]
     pub segment: i64,
-    /// The file types the run was told to record (FR-FC-01), so a resumed
-    /// segment walks the scope the run was started with rather than every
-    /// type.
-    ///
-    /// Recorded for the same reason `root` is: it is what the run was told to
-    /// cover, and a resume that could not read it back would catalogue
-    /// exactly the files the owner excluded. A NULL column — a refresh, which
-    /// has no walk to scope, or a row written before the column existed —
-    /// reads back as [`IndexScope::all`], which is what an absent scope has
-    /// always meant.
-    ///
-    /// Not serialized, for the reason `concurrency` is not: it is an input to
-    /// how the run is walked, not a fact about its progress.
-    #[serde(skip)]
-    pub scope: IndexScope,
+    /// The library an index run walks; `None` for a refresh, which re-checks
+    /// the whole catalog and belongs to no library.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub library_uuid: Option<Uuid>,
 }
 
 /// How many failures one run records by path.
@@ -275,13 +263,11 @@ pub trait CatalogRunRepository: Send + Sync {
     /// see `CatalogRun::concurrency` — recorded here so a resume can reuse it
     /// instead of falling back to whatever the configuration says later.
     ///
-    /// `scope` is the run's file types as one comma-separated list of wire
-    /// names (`"video,image"`) — exactly what [`IndexScope::to_wire`]
-    /// produces, and exactly what `row_to_run` reads back. `None` is every
-    /// type, and is also what a refresh passes: it discovers through the
-    /// catalog rather than through a walk, so it has nothing to scope.
-    /// Recorded beside `root` because both are what the run was told to
-    /// cover, and a resume needs both back.
+    /// `library_uuid` is the library an index run walks; `None` for a
+    /// refresh, which re-checks every library at once.
+    ///
+    /// The `scope` column (a per-run type filter) is no longer written: a
+    /// library is the folder as it is, and every readable type is recorded.
     async fn start(
         &self,
         id: Uuid,
@@ -289,7 +275,7 @@ pub trait CatalogRunRepository: Send + Sync {
         root: Option<&str>,
         started_at: DateTime<Utc>,
         concurrency: u32,
-        scope: Option<&str>,
+        library_uuid: Option<Uuid>,
     ) -> Result<(), DomainError>;
 
     /// Close a run's record as `complete` with its tally. Per-file failures
@@ -543,6 +529,25 @@ pub trait CatalogRunRepository: Send + Sync {
     /// [`get`]: CatalogRunRepository::get
     async fn list_active(&self) -> Result<Vec<CatalogRun>, DomainError>;
 
+    /// The newest index run of `library` that is not finished — `running`, or
+    /// `paused` (which is also what startup makes of a run a crash
+    /// interrupted). A library has at most one (FR-FC-43): a second walk of
+    /// the same folder, or a move under a paused one, is refused while this
+    /// answers `Some`.
+    ///
+    /// Built on `list_active` so that every implementation, the test doubles
+    /// included, answers it the same way.
+    async fn unfinished_for_library(
+        &self,
+        library: Uuid,
+    ) -> Result<Option<CatalogRun>, DomainError> {
+        Ok(self
+            .list_active()
+            .await?
+            .into_iter()
+            .find(|run| run.library_uuid == Some(library)))
+    }
+
     /// Pause every run still `running`, returning how many were reconciled
     /// (FR-FC-29).
     ///
@@ -593,7 +598,8 @@ macro_rules! run_columns {
     () => {
         "kind, status, root, started_at, finished_at, scanned, indexed, \
          skipped, already_cataloged, refreshed, marked_missing, unchanged, failed, error, \
-         phase, total, processed, paused_at, paused_millis, concurrency, segment, scope"
+         phase, total, processed, paused_at, paused_millis, concurrency, segment, \
+         (SELECT uuid FROM libraries WHERE libraries.id = catalog_runs.library_id) AS library_uuid"
     };
 }
 
@@ -694,16 +700,14 @@ fn row_to_run(id: Uuid, row: &SqliteRow) -> Result<CatalogRun, DomainError> {
             .try_get::<Option<i64>, _>("concurrency")?
             .map(|concurrency| concurrency as u32),
         segment: row.try_get("segment")?,
-        // A corrupt value is reported rather than guessed at, the way
-        // `parse_type_str` reports an unknown `files.type`: the only fallback
-        // available is "every type", which is precisely the behaviour a
-        // stored scope exists to prevent.
-        scope: match row.try_get::<Option<String>, _>("scope")? {
-            Some(raw) => IndexScope::parse_list(&raw).map_err(|err| {
-                DomainError::internal(format!("corrupt catalog_runs.scope: {err}"))
-            })?,
-            None => IndexScope::all(),
-        },
+        library_uuid: row
+            .try_get::<Option<String>, _>("library_uuid")?
+            .map(|raw| {
+                Uuid::parse_str(&raw).map_err(|err| {
+                    DomainError::internal(format!("corrupt libraries.uuid {raw:?}: {err}"))
+                })
+            })
+            .transpose()?,
     })
 }
 
@@ -913,10 +917,24 @@ impl CatalogRunRepository for SqliteCatalogRunRepository {
         root: Option<&str>,
         started_at: DateTime<Utc>,
         concurrency: u32,
-        scope: Option<&str>,
+        library_uuid: Option<Uuid>,
     ) -> Result<(), DomainError> {
-        sqlx::query(
-            "INSERT INTO catalog_runs (id, kind, status, root, started_at, concurrency, scope) \
+        // The library an index run walks, resolved here so a library removed
+        // since the caller looked it up is reported rather than written as
+        // nobody's run.
+        let library_id: Option<i64> = match library_uuid {
+            Some(uuid) => Some(
+                sqlx::query_scalar("SELECT id FROM libraries WHERE uuid = ?")
+                    .bind(uuid.to_string())
+                    .fetch_optional(&self.pool)
+                    .await?
+                    .ok_or(DomainError::NotFound)?,
+            ),
+            None => None,
+        };
+        let inserted = sqlx::query(
+            "INSERT INTO catalog_runs \
+             (id, kind, status, root, started_at, concurrency, library_id) \
              VALUES (?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(id.to_string())
@@ -927,12 +945,29 @@ impl CatalogRunRepository for SqliteCatalogRunRepository {
         // Narrowed to i64 for the column; the reverse narrowing happens in
         // `get`, which is safe for the reason documented there.
         .bind(concurrency as i64)
-        // The wire list `IndexScope::to_wire` produced, or NULL for every
-        // type — see `CatalogRunRepository::start`.
-        .bind(scope)
+        .bind(library_id)
         .execute(&self.pool)
-        .await?;
-        Ok(())
+        .await;
+        match inserted {
+            Ok(_) => Ok(()),
+            // Migration 29's index: the library already has an unfinished run
+            // (FR-FC-43). Named, as the handlers name it, so the owner knows
+            // which run to cancel.
+            Err(sqlx::Error::Database(db)) if db.is_unique_violation() && library_id.is_some() => {
+                let existing: Option<String> = sqlx::query_scalar(
+                    "SELECT id FROM catalog_runs \
+                     WHERE library_id = ? AND status IN ('running', 'paused')",
+                )
+                .bind(library_id)
+                .fetch_optional(&self.pool)
+                .await?;
+                Err(DomainError::Conflict(format!(
+                    "the library has an unfinished run {}; cancel it first",
+                    existing.unwrap_or_default()
+                )))
+            }
+            Err(err) => Err(err.into()),
+        }
     }
 
     async fn record_failure(

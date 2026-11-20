@@ -49,13 +49,13 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use alexandria_core::auth::BearerAuthService;
+use alexandria_core::catalog::audio_tags::LoftyAudioMetadataReader;
 use alexandria_core::catalog::clock::SystemClock;
 use alexandria_core::catalog::comic_tags::CbzComicMetadataReader;
 use alexandria_core::catalog::commands::index::IndexHandler;
 use alexandria_core::catalog::document_tags::PdfEpubMetadataReader;
 use alexandria_core::catalog::fs::StdFilesystem;
 use alexandria_core::catalog::image_tags::ExifImageMetadataReader;
-use alexandria_core::catalog::index_scope::IndexScope;
 use alexandria_core::catalog::queries::browse::{BrowseFilesHandler, FileFilter};
 use alexandria_core::catalog::repos::SqliteCatalogRepository;
 use alexandria_core::catalog::run_registry::RunRegistry;
@@ -71,6 +71,7 @@ type BenchIndexHandler = IndexHandler<
     SqliteCatalogRepository,
     StdFilesystem,
     SystemClock,
+    LoftyAudioMetadataReader,
     ExifImageMetadataReader,
     PdfEpubMetadataReader,
     FfmpegVideoMetadataReader,
@@ -346,6 +347,9 @@ fn write_minimal_mp4(path: &std::path::Path, i: usize) {
     octx.write_trailer().expect("write trailer");
 }
 
+/// The library every benchmark run records into.
+const BENCH_LIBRARY: Uuid = Uuid::from_u128(0xbe4c);
+
 async fn build(
     db: &std::path::Path,
     concurrency: u32,
@@ -353,6 +357,13 @@ async fn build(
     let pool = migrate_database(db.to_str().expect("utf-8 db path"))
         .await
         .expect("migrate");
+    // Every file belongs to a library; the bench's runs all write into this
+    // one, which holds whatever root a measurement walks.
+    sqlx::query("INSERT INTO libraries (uuid, name, root_path) VALUES (?, 'Bench', '/')")
+        .bind(BENCH_LIBRARY.to_string())
+        .execute(&pool)
+        .await
+        .expect("bench library");
     let repo = SqliteCatalogRepository::new(pool.clone());
     let run_repo = SqliteCatalogRunRepository::new(pool);
     let handler = IndexHandler::new(
@@ -360,6 +371,7 @@ async fn build(
         repo.clone(),
         StdFilesystem,
         SystemClock,
+        LoftyAudioMetadataReader,
         ExifImageMetadataReader,
         PdfEpubMetadataReader,
         FfmpegVideoMetadataReader,
@@ -398,7 +410,7 @@ async fn measure(format: Format, count: usize, concurrency: u32) -> (f64, f64) {
         .execute(
             lib.path().to_str().expect("utf-8 lib path"),
             Uuid::new_v4(),
-            &IndexScope::all(),
+            BENCH_LIBRARY,
         )
         .await
         .expect("index run");
@@ -438,7 +450,7 @@ async fn measure_rate(count: usize, bytes: usize) -> f64 {
         .execute(
             lib.path().to_str().expect("utf-8 lib path"),
             Uuid::new_v4(),
-            &IndexScope::all(),
+            BENCH_LIBRARY,
         )
         .await
         .expect("index run");
@@ -514,7 +526,7 @@ async fn given_a_generated_library_when_indexed_then_throughput_is_measured() {
         .execute(
             lib.path().to_str().expect("utf-8 lib path"),
             Uuid::new_v4(),
-            &IndexScope::all(),
+            BENCH_LIBRARY,
         )
         .await
         .expect("index run");
@@ -589,9 +601,7 @@ async fn given_an_index_run_in_flight_when_reads_are_issued_then_they_are_not_bl
 
     let done = indexing.clone();
     let index_task = tokio::spawn(async move {
-        let outcome = handler
-            .execute(&root, Uuid::new_v4(), &IndexScope::all())
-            .await;
+        let outcome = handler.execute(&root, Uuid::new_v4(), BENCH_LIBRARY).await;
         done.store(false, Ordering::SeqCst);
         outcome
     });
