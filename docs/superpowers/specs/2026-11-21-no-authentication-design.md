@@ -1,7 +1,7 @@
 # No authentication, pinned and favorite libraries, catalog statistics
 
 **Date:** 2026-11-21
-**Status:** draft
+**Status:** approved
 **Companion:** alexandria-ui `docs/superpowers/specs/2026-11-21-library-navigation-design.md`
 
 ## Why
@@ -30,6 +30,7 @@ totals on the home screen. The core has to store the pins and favorites and answ
   codes.
 - A library can be pinned and marked as a favorite. Both are stored in the catalog, and the library listing reports
   them.
+- A library can be renamed at any time.
 - One call answers the catalog totals: how many libraries there are, and how many files of each type.
 - The core's docs (README, CONTRIBUTING, CHANGELOG, `docs/requirements`, `docs/initial`,
   `docs/System Behavior Document.md`, `config.toml.example`) describe a local, login-free core with only a C ABI.
@@ -150,7 +151,21 @@ ALTER TABLE libraries ADD COLUMN favorite INTEGER NOT NULL DEFAULT 0 CHECK (favo
   - They return `0`, `LIBRARY_ERR_INVALID_INPUT` (a malformed UUID), `LIBRARY_ERR_NOT_INITIALIZED` or
     `LIBRARY_ERR_NOT_FOUND`.
   - Setting a flag to the value it already has succeeds and changes nothing.
-- Moving or rescanning a library keeps its flags. Removing it removes them with it.
+- Moving, renaming or rescanning a library keeps its flags. Removing it removes them with it.
+
+### 5a. Renaming a library
+
+The owner wants a library to be renamable at any time. Today its name is fixed when it is added.
+
+- A command with a handler, a repository method and an FFI function:
+  `alexandria_library_rename(uuid: *const c_char, json_body: *const c_char) -> LibraryJsonResult`. It has the same
+  shape as `alexandria_library_move`. The body is `{"name": "..."}`, and the answer is the updated library as JSON.
+- The name is checked by `validate_library_name`, the rule register uses: a blank name is refused with
+  `LIBRARY_ERR_INVALID_INPUT`, and the stored name is trimmed. Two libraries may share a name, as they may today.
+- It is allowed at any time, including while the library's run is in progress or paused. The name is not part of
+  anything a run reads, so nothing waits for the run.
+- It also returns `LIBRARY_ERR_NOT_FOUND` for an unknown UUID, and `LIBRARY_ERR_NOT_INITIALIZED`. Renaming to the
+  current name succeeds and changes nothing.
 
 ### 6. Catalog statistics
 
@@ -180,6 +195,13 @@ Failing tests first, in the crates' existing style:
 - Settings: a `config.toml` with `[auth]` and `[http]` tables still loads.
 - Pin and favorite: set, unset, repeated set, unknown UUID (`NOT_FOUND`), malformed UUID (`INVALID_INPUT`), the flags
   surviving a move and a rescan, and the flags in the list and browse JSON.
+- Rename tests cover:
+  - a new name, which is stored trimmed;
+  - a blank name, which is refused with `INVALID_INPUT` and stores nothing;
+  - an unknown UUID, which answers `NOT_FOUND`;
+  - a rename while the library's run is in progress, which succeeds and leaves the run untouched;
+  - the pin and favorite flags, which are kept;
+  - the new name, which shows in the list and browse JSON.
 - Statistics: an empty catalog (zero libraries, every type `0`), mixed types across two libraries, and soft-deleted
   files not counted.
 - FFI: the existing tests updated for the token-free signatures. No test is left that asserts an `UNAUTHORIZED`
@@ -193,13 +215,13 @@ Failing tests first, in the crates' existing style:
 - CONTRIBUTING: drop anything about running or testing the server.
 - CHANGELOG `[Unreleased]`:
   - Removed: authentication (all three modes), the HTTP server, and the `token` parameters.
-  - Added: pinned and favorite libraries, and catalog statistics.
+  - Added: pinned and favorite libraries, renaming a library, and catalog statistics.
   - Changed: the migration deletes stored credentials.
 - `docs/requirements`:
   - Mark the authentication requirements (FR-AU-*) and the HTTP-only requirements removed. The use cases for
     registration, login, recovery codes, credentials change, Heimdall and Windows login are marked withdrawn, with
     the reason, rather than deleted. This follows how earlier removals were recorded there.
-  - Add the requirements and use cases for pin, favorite and statistics.
+  - Add the requirements and use cases for pin, favorite, rename and statistics.
 - `docs/initial` and `docs/System Behavior Document.md`: the same, where they describe auth or the server.
 
 ## Left to the builder
