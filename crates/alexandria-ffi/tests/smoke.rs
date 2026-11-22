@@ -53,16 +53,17 @@ const ASYNC_RUN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(1
 type VideoMetadataRow = (Option<String>, Option<i64>, Option<String>, Option<String>);
 
 use alexandria_ffi::{
-    alexandria_file_edit_metadata, alexandria_file_playback_source, alexandria_file_purge,
-    alexandria_file_purge_on_disk, alexandria_file_rename, alexandria_file_restore,
-    alexandria_file_soft_delete, alexandria_free_string, alexandria_index_cancel,
-    alexandria_index_count_files, alexandria_index_count_missing, alexandria_index_files_json,
-    alexandria_index_init, alexandria_index_pause, alexandria_index_refresh_start,
-    alexandria_index_resume, alexandria_index_run_failures_json, alexandria_index_run_status_json,
-    alexandria_index_runs_active_json, alexandria_libraries_list, alexandria_library_browse,
-    alexandria_library_index_start, alexandria_library_move, alexandria_library_register,
-    alexandria_library_remove, alexandria_library_rename, alexandria_library_set_favorite,
-    alexandria_library_set_pinned, FileMetadataResult, IndexStartResult,
+    alexandria_catalog_stats_json, alexandria_file_edit_metadata, alexandria_file_playback_source,
+    alexandria_file_purge, alexandria_file_purge_on_disk, alexandria_file_rename,
+    alexandria_file_restore, alexandria_file_soft_delete, alexandria_free_string,
+    alexandria_index_cancel, alexandria_index_count_files, alexandria_index_count_missing,
+    alexandria_index_files_json, alexandria_index_init, alexandria_index_pause,
+    alexandria_index_refresh_start, alexandria_index_resume, alexandria_index_run_failures_json,
+    alexandria_index_run_status_json, alexandria_index_runs_active_json, alexandria_libraries_list,
+    alexandria_library_browse, alexandria_library_index_start, alexandria_library_move,
+    alexandria_library_register, alexandria_library_remove, alexandria_library_rename,
+    alexandria_library_set_favorite, alexandria_library_set_pinned, FileMetadataResult,
+    IndexStartResult,
 };
 
 const STATUS_RUN_OK: i32 = alexandria_ffi::RUN_OK;
@@ -5523,4 +5524,19 @@ fn given_an_unknown_uuid_when_renamed_then_not_found() {
 
     assert_eq!(result.status, STATUS_LIBRARY_NOT_FOUND);
     assert!(result.json.is_null());
+}
+
+#[test]
+fn given_an_initialized_core_when_stats_read_then_status_0_and_json_has_libraries_and_files_by_type(
+) {
+    let _g = serial();
+    let _db = init_temp_db();
+    register_library("Course", &folder(&_db, "/library/course"));
+
+    let value = library_json_ok(alexandria_catalog_stats_json());
+
+    assert_eq!(value["libraries"], 1);
+    let by_type = value["filesByType"].as_object().expect("filesByType");
+    assert_eq!(by_type.len(), 7);
+    assert!(by_type.contains_key("audio") && by_type.contains_key("image"));
 }

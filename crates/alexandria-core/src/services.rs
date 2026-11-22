@@ -46,7 +46,7 @@ use crate::libraries::commands::{
     IndexLibraryHandler, MoveLibraryHandler, RegisterLibraryHandler, RemoveLibraryHandler,
     RenameLibraryHandler, SetLibraryFavoriteHandler, SetLibraryPinnedHandler,
 };
-use crate::libraries::queries::{BrowseLibraryHandler, ListLibrariesHandler};
+use crate::libraries::queries::{BrowseLibraryHandler, CatalogStatsQuery, ListLibrariesHandler};
 use crate::libraries::repos::SqliteLibraryRepository;
 use crate::playback::comic_page::{ComicPageHandler, ZipComicArchive};
 use crate::playback::source::PlaybackSourceHandler;
@@ -286,6 +286,7 @@ pub struct Services {
     pub set_library_favorite_handler: Arc<DefaultSetLibraryFavoriteHandler>,
     pub browse_library_handler: Arc<DefaultBrowseLibraryHandler>,
     pub list_libraries_handler: Arc<DefaultListLibrariesHandler>,
+    pub catalog_stats_query: Arc<CatalogStatsQuery>,
     /// The same registry the two walks publish into, exposed so an embedder
     /// can ask whether this process is executing anything before it tears
     /// these services down. `alexandria_index_init` is the caller: see
@@ -547,6 +548,7 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         reading_list_repo.clone(),
     ));
     let delete_reading_list_handler = Arc::new(DeleteReadingListHandler::new(reading_list_repo));
+    let catalog_stats_query = Arc::new(CatalogStatsQuery::new(pool.clone()));
     let list_libraries_handler = Arc::new(ListLibrariesHandler::new(SqliteLibraryRepository::new(
         pool.clone(),
     )));
@@ -635,6 +637,7 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         set_library_favorite_handler,
         browse_library_handler,
         list_libraries_handler,
+        catalog_stats_query,
         run_registry,
         pool,
     }

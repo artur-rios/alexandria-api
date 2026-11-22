@@ -3871,6 +3871,27 @@ pub extern "C" fn alexandria_libraries_list() -> LibraryJsonResult {
     })
 }
 
+/// The catalog's totals: `{"libraries": n, "filesByType": {...}}`, with all
+/// seven types present. Counts the files the catalog lists (not
+/// soft-deleted).
+#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
+#[no_mangle]
+pub extern "C" fn alexandria_catalog_stats_json() -> LibraryJsonResult {
+    ffi_guard(LibraryJsonResult::err(LIBRARY_ERR_OTHER), || {
+        let services = match locked_services() {
+            Some(s) => s,
+            None => return LibraryJsonResult::err(LIBRARY_ERR_NOT_INITIALIZED),
+        };
+
+        let result = runtime().block_on(async { services.catalog_stats_query.stats().await });
+
+        match result {
+            Ok(stats) => LibraryJsonResult::ok(serde_json::to_string(&stats).unwrap_or_default()),
+            Err(err) => map_library_err(err),
+        }
+    })
+}
+
 /// One level of a library's tree.
 ///
 /// `path` is the folder to list, relative to the library's root; NULL or an
