@@ -7,6 +7,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-11-22
+
 The core has no login any more. It only ever runs locally, for the person at the machine, and the desktop front-end
 calls it in process through its C ABI, so authentication protected nothing and the HTTP server reached a catalog nobody
 reached over a network.
@@ -178,5 +180,6 @@ file type itself stays removed.
   deleted from disk: those calls answer `400` / `*_ERR_INVALID_INPUT` with `file is outside the configured library
   root`. Purging only the record still works. With `filesystem.root` unset nothing changes (`alexandria-core`).
 
-[Unreleased]: https://github.com/artur-rios/alexandria-api/compare/v0.6.0...develop
+[Unreleased]: https://github.com/artur-rios/alexandria-api/compare/v0.7.0...develop
+[0.7.0]: https://github.com/artur-rios/alexandria-api/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/artur-rios/alexandria-api/releases/tag/v0.6.0
