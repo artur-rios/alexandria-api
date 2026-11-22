@@ -1,11 +1,10 @@
 //! The configuration a client needs to render the catalog correctly
 //! (F-00 / FR-FC-30).
 //!
-//! Deliberately narrow. This is not "the config" — most of what the server is
-//! configured with is the operator's business and no client's: bind addresses,
-//! database paths, the filesystem root, auth secrets. What lands here is the
-//! settings a client cannot behave correctly without, and today that is one:
-//! the retention window.
+//! Deliberately narrow. This is not "the config" — most of what the core is
+//! configured with is the operator's business and no client's: database
+//! paths, the filesystem root. What lands here is the settings a client cannot
+//! behave correctly without, and today that is one: the retention window.
 
 use serde::Serialize;
 

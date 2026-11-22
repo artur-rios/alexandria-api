@@ -2,19 +2,6 @@ use std::sync::Arc;
 
 use sqlx::sqlite::SqlitePool;
 
-use crate::auth::commands::account_status::GetLocalAccountHandler;
-use crate::auth::commands::login::LocalLoginHandler;
-use crate::auth::commands::redeem_recovery_code::RedeemRecoveryCodeHandler;
-use crate::auth::commands::regenerate_recovery_codes::RegenerateRecoveryCodesHandler;
-use crate::auth::commands::register::RegisterLocalAccountHandler;
-use crate::auth::commands::set_credentials::SetLocalCredentialsHandler;
-use crate::auth::commands::windows_login::WindowsLoginHandler;
-use crate::auth::heimdall::HeimdallAuthService;
-use crate::auth::local::{
-    LocalAuthService, SqliteLocalCredentialRepository, SqliteRecoveryCodeRepository,
-    SqliteSessionRepository,
-};
-use crate::auth::RuntimeAuthService;
 use crate::bookmarks::commands::create::CreateBookmarkHandler;
 use crate::bookmarks::commands::lifecycle::BookmarkLifecycleHandler;
 use crate::bookmarks::commands::purge::PurgeBookmarkHandler;
@@ -54,7 +41,6 @@ use crate::collections::commands::rename::RenameCollectionHandler;
 use crate::collections::queries::list::ListCollectionsHandler;
 use crate::collections::queries::list_items::ListCollectionItemsHandler;
 use crate::collections::repos::SqliteCollectionRepository;
-use crate::config::AuthMode;
 use crate::config::Settings;
 use crate::libraries::commands::{
     IndexLibraryHandler, MoveLibraryHandler, RegisterLibraryHandler, RemoveLibraryHandler,
@@ -240,41 +226,6 @@ pub type DefaultBrowseLibraryHandler =
 
 pub type DefaultListLibrariesHandler = ListLibrariesHandler<SqliteLibraryRepository>;
 
-pub type DefaultSetLocalCredentialsHandler =
-    SetLocalCredentialsHandler<RuntimeAuthService, SqliteLocalCredentialRepository, SystemClock>;
-
-pub type DefaultLocalLoginHandler =
-    LocalLoginHandler<SqliteLocalCredentialRepository, SqliteSessionRepository, SystemClock>;
-
-pub type DefaultWindowsLoginHandler = WindowsLoginHandler<SqliteSessionRepository, SystemClock>;
-
-pub type DefaultRegisterLocalAccountHandler = RegisterLocalAccountHandler<
-    SqliteLocalCredentialRepository,
-    SqliteSessionRepository,
-    SystemClock,
-    SqliteRecoveryCodeRepository,
->;
-
-pub type DefaultGetLocalAccountHandler = GetLocalAccountHandler<
-    RuntimeAuthService,
-    SqliteLocalCredentialRepository,
-    SqliteRecoveryCodeRepository,
->;
-
-pub type DefaultRedeemRecoveryCodeHandler = RedeemRecoveryCodeHandler<
-    SqliteLocalCredentialRepository,
-    SqliteSessionRepository,
-    SqliteRecoveryCodeRepository,
-    SystemClock,
->;
-
-pub type DefaultRegenerateRecoveryCodesHandler = RegenerateRecoveryCodesHandler<
-    RuntimeAuthService,
-    SqliteLocalCredentialRepository,
-    SqliteRecoveryCodeRepository,
-    SystemClock,
->;
-
 #[derive(Clone)]
 pub struct Services {
     pub index_handler: Arc<DefaultIndexHandler>,
@@ -325,13 +276,6 @@ pub struct Services {
     pub move_library_handler: Arc<DefaultMoveLibraryHandler>,
     pub browse_library_handler: Arc<DefaultBrowseLibraryHandler>,
     pub list_libraries_handler: Arc<DefaultListLibrariesHandler>,
-    pub set_local_credentials_handler: Arc<DefaultSetLocalCredentialsHandler>,
-    pub local_login_handler: Arc<DefaultLocalLoginHandler>,
-    pub windows_login_handler: Arc<DefaultWindowsLoginHandler>,
-    pub register_local_account_handler: Arc<DefaultRegisterLocalAccountHandler>,
-    pub get_local_account_handler: Arc<DefaultGetLocalAccountHandler>,
-    pub redeem_recovery_code_handler: Arc<DefaultRedeemRecoveryCodeHandler>,
-    pub regenerate_recovery_codes_handler: Arc<DefaultRegenerateRecoveryCodesHandler>,
     /// The same registry the two walks publish into, exposed so an embedder
     /// can ask whether this process is executing anything before it tears
     /// these services down. `alexandria_index_init` is the caller: see
@@ -341,8 +285,8 @@ pub struct Services {
 }
 
 /// Build the shared services from the loaded settings and a connected SQLite
-/// pool. Callers (the HTTP server binary, integration tests) are responsible
-/// for running migrations first.
+/// pool. Callers (the FFI, integration tests) are responsible for running
+/// migrations first.
 pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
     let retention_days = settings.deletion.retention_days;
     let repo = SqliteCatalogRepository::new(pool.clone());
@@ -350,9 +294,6 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
     // FR-FC-28: one registry, shared by the handlers that publish live run
     // progress and the query that reads it back.
     let run_registry = RunRegistry::new();
-    let session_repo = SqliteSessionRepository::new(pool.clone());
-    let credential_repo = SqliteLocalCredentialRepository::new(pool.clone());
-    let recovery_code_repo = SqliteRecoveryCodeRepository::new(pool.clone());
     let fs = StdFilesystem;
     let clock = SystemClock;
     // FR-FC-29: any run still recorded as `running` belongs to a process that
@@ -374,28 +315,6 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
             tracing::warn!(error = %err, "could not reconcile runs left by a previous process")
         }
     }
-    // FR-AU-01/FR-AU-03: exactly one auth mode is active, selected once here
-    // from startup configuration. Only the local-account handlers below hold
-    // it: nothing else in the core authenticates.
-    let auth = match settings.auth.mode {
-        AuthMode::Local => {
-            RuntimeAuthService::Local(LocalAuthService::new(session_repo.clone(), clock))
-        }
-        // UC-36: Heimdall signs HS256 with a secret this process is
-        // configured with, so verification is offline and needs no
-        // collaborator. `AuthSettings::validate` has already refused to let a
-        // misconfigured process get this far.
-        AuthMode::External => {
-            RuntimeAuthService::External(HeimdallAuthService::from_settings(&settings.auth))
-        }
-        // UC-45: the account this process runs as was verified at startup,
-        // before this point. What remains is session validation, which is
-        // exactly local mode's — hence the same service behind a different
-        // variant.
-        AuthMode::Windows => {
-            RuntimeAuthService::Windows(LocalAuthService::new(session_repo.clone(), clock))
-        }
-    };
     let audio_tags = LoftyAudioMetadataReader;
     let image_tags = ExifImageMetadataReader;
     let document_tags = PdfEpubMetadataReader;
@@ -645,53 +564,6 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         SqliteCatalogRepository::new(pool.clone()),
     ));
 
-    let set_local_credentials_handler = Arc::new(SetLocalCredentialsHandler::new(
-        auth.clone(),
-        credential_repo.clone(),
-        clock,
-        settings.auth.mode,
-    ));
-    let local_login_handler = Arc::new(LocalLoginHandler::new(
-        credential_repo.clone(),
-        session_repo.clone(),
-        clock,
-        settings.auth.mode,
-        settings.auth.session_ttl_hours,
-    ));
-    let windows_login_handler = Arc::new(WindowsLoginHandler::new(
-        session_repo.clone(),
-        clock,
-        settings.auth.mode,
-        settings.auth.session_ttl_hours,
-    ));
-    let register_local_account_handler = Arc::new(RegisterLocalAccountHandler::new(
-        credential_repo.clone(),
-        session_repo.clone(),
-        recovery_code_repo.clone(),
-        clock,
-        settings.auth.mode,
-        settings.auth.session_ttl_hours,
-    ));
-    let get_local_account_handler = Arc::new(GetLocalAccountHandler::new(
-        auth.clone(),
-        credential_repo.clone(),
-        recovery_code_repo.clone(),
-        settings.auth.mode,
-    ));
-    let redeem_recovery_code_handler = Arc::new(RedeemRecoveryCodeHandler::new(
-        credential_repo.clone(),
-        session_repo,
-        recovery_code_repo.clone(),
-        clock,
-        settings.auth.mode,
-    ));
-    let regenerate_recovery_codes_handler = Arc::new(RegenerateRecoveryCodesHandler::new(
-        auth.clone(),
-        credential_repo,
-        recovery_code_repo,
-        clock,
-        settings.auth.mode,
-    ));
     Services {
         index_handler,
         refresh_handler,
@@ -741,13 +613,6 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         move_library_handler,
         browse_library_handler,
         list_libraries_handler,
-        set_local_credentials_handler,
-        local_login_handler,
-        windows_login_handler,
-        register_local_account_handler,
-        get_local_account_handler,
-        redeem_recovery_code_handler,
-        regenerate_recovery_codes_handler,
         run_registry,
         pool,
     }

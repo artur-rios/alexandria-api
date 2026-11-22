@@ -1,63 +1,10 @@
 # Alexandria example configuration.
-# Copy this file to config.toml and adjust as needed. Most keys can also be set
+# Copy this file to config.toml and adjust as needed. Every key can also be set
 # through an environment variable named ALEXANDRIA_<SECTION>_<KEY> — e.g.
-# ALEXANDRIA_DATABASE_PATH, ALEXANDRIA_AUTH_MODE, ALEXANDRIA_LOGGING_LEVEL. Every
-# key below follows that rule, with no exceptions. Unknown keys are ignored. This file lists every key the
-# server reads — see the Operations & Infrastructure Document §4 for the
-# authoritative table.
-
-[auth]
-# The single active authentication mode. One of: "external", "local", "windows".
-mode = "external"
-
-# External mode only: where Heimdall publishes the public keys it signs its
-# ES256 tokens with. Inside the platform, the internal address:
-# http://heimdall-api.<env>:8080/.well-known/jwks.json. The key set is fetched
-# when first needed and cached; it is fetched again when a token names a key
-# not yet seen (a rotation) or the cached set is five minutes old, at most
-# once a minute. A failed fetch keeps the keys already known. Required in
-# external mode unless heimdall_token_secret is set.
-heimdall_jwks_url = ""
-
-# External mode only, and only while Heimdall still accepts tokens signed with
-# its old shared secret: that HS256 secret, the same value as Heimdall's own
-# HEIMDALL_AUTH_TOKEN_SECRET. Tokens signed with it are accepted while it is
-# set. Leave it empty — or remove it — once Heimdall has dropped the secret,
-# and they are refused here too; no other change is needed. Prefer the
-# ALEXANDRIA_AUTH_HEIMDALL_TOKEN_SECRET environment variable, so a signing key
-# need never be written to disk.
-heimdall_token_secret = ""
-
-# External mode only, for the same overlap: the secret Heimdall was rotating
-# away from (its HEIMDALL_AUTH_TOKEN_SECRET_PREVIOUS). Ignored when equal to
-# heimdall_token_secret.
-heimdall_token_secret_previous = ""
-
-# External mode only: the UUID of the Heimdall scope Alexandria is registered
-# in. A token is accepted when it names this scope — as the scope its holder
-# belongs to, or as one of the scopes they own. Required in external mode.
-heimdall_scope_id = ""
-
-# External mode only: the issuer and audience to require, each checked only
-# when set. Heimdall leaves both empty by default and then signs tokens
-# carrying neither, so requiring them unconditionally would reject every token
-# from a default install.
-heimdall_issuer = ""
-heimdall_audience = ""
-
-# Local mode only: how long the session created by a successful local login
-# (UC-34) stays valid. Callers present that session id on subsequent requests.
-# Ignored when mode = "external".
-session_ttl_hours = 24
-
-# Windows mode only: the SID of the account this process must run as. Startup
-# fails unless the process is running on Windows as this account. Find it with
-# `whoami /user`. Not a secret — it is an identifier, not a credential.
-#
-# Read what this mode does and does not prove before enabling it: it proves the
-# process was launched by this account, never who is calling, so any caller that
-# can reach the port is authorized. Keep `http.bind_addr` on loopback.
-windows_owner_sid = ""
+# ALEXANDRIA_DATABASE_PATH, ALEXANDRIA_LOGGING_LEVEL. Unknown keys and tables
+# are ignored, so a config.toml that still holds the old [auth] or [http]
+# tables keeps loading. This file lists every key the core reads — see the
+# Operations & Infrastructure Document §4 for the authoritative table.
 
 [database]
 # SQLite file path. Bundled beside the desktop app's data directory by default.

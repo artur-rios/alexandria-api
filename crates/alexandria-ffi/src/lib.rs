@@ -6,11 +6,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use tokio::runtime::{Builder, Runtime};
 
-use alexandria_core::auth::windows_identity::{verify_owner, ProcessWindowsIdentity};
 use alexandria_core::catalog::runs::{RunKind, RunPriority};
-use alexandria_core::config::AuthMode;
 use alexandria_core::config::Settings;
-use alexandria_core::errors::{error_body, DomainError};
+use alexandria_core::errors::DomainError;
 use alexandria_core::migrate::migrate_database;
 use alexandria_core::services::{build_services, Services};
 
@@ -27,6 +25,10 @@ static RUNTIME: OnceLock<Runtime> = OnceLock::new();
 static SERVICES: OnceLock<Mutex<Option<Arc<Services>>>> = OnceLock::new();
 
 /// FFI status codes returned by index operations.
+///
+/// Code 2 is missing here and in every family below: it was
+/// `*_ERR_UNAUTHORIZED`, retired with authentication, and is never reused,
+/// so a caller built against an older core cannot read a new failure as it.
 pub const INDEX_OK: c_int = 0;
 pub const INDEX_ERR_INVALID_INPUT: c_int = 1;
 pub const INDEX_ERR_NOT_INITIALIZED: c_int = 3;
@@ -324,24 +326,6 @@ pub extern "C" fn alexandria_index_init(db_path: *const c_char) -> c_int {
         }
         let mut settings = load_settings();
         settings.database.path = path.clone();
-        // Same gate as the HTTP binary: a misconfigured mode is a startup failure
-        // on both surfaces (FR-AU-08).
-        // Both messages are logged rather than discarded: the embedder only gets an
-        // opaque status code back, and FFI is the surface an operator is most
-        // likely to hit a misconfiguration on. A SID names an account rather than
-        // authenticating one, so naming both of them costs nothing (FR-AU-21).
-        if let Err(err) = settings.auth.validate() {
-            tracing::error!(error = %err, "auth configuration is invalid; refusing to initialize");
-            return INDEX_ERR_OTHER;
-        }
-        if settings.auth.mode == AuthMode::Windows {
-            if let Err(err) =
-                verify_owner(&ProcessWindowsIdentity, &settings.auth.windows_owner_sid)
-            {
-                tracing::error!(error = %err, "windows-mode startup check failed");
-                return INDEX_ERR_OTHER;
-            }
-        }
         let _ = runtime();
         let result = runtime().block_on(async {
             let pool = migrate_database(&path).await?;
@@ -806,10 +790,10 @@ pub extern "C" fn alexandria_file_read_content(uuid: *const c_char) -> FileJsonR
 /// `{"uuid":…,"path":…,"mimeType":…,"sizeBytes":…}` and the caller — Flutter
 /// desktop, on the same machine as the file — opens that path directly.
 /// Zero bytes cross this boundary. Parity with HTTP is defined on this
-/// descriptor and on the authorization, state, and error decisions rather
-/// than on byte transfer (FR-MP-06). A file whose path resolves outside the
-/// configured `filesystem.root` gets `PLAYBACK_ERR_INVALID_INPUT` and no
-/// descriptor (FR-FC-26), as HTTP's `400`.
+/// descriptor and on the state and error decisions rather than on byte
+/// transfer (FR-MP-06). A file whose path resolves outside the configured
+/// `filesystem.root` gets `PLAYBACK_ERR_INVALID_INPUT` and no descriptor
+/// (FR-FC-26), as HTTP's `400`.
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
 pub extern "C" fn alexandria_file_playback_source(uuid: *const c_char) -> PlaybackJsonResult {
@@ -3037,465 +3021,6 @@ pub extern "C" fn alexandria_reading_list_delete(uuid: *const c_char) -> Reading
     })
 }
 
-/// FFI status codes returned by local-auth operations (UC-34/UC-35).
-/// Deliberately separate from the other `*_OK == 0` families — per the
-/// convention above — so local-auth use cases can grow their own set
-/// without colliding.
-pub const AUTH_OK: c_int = 0;
-pub const AUTH_ERR_INVALID_INPUT: c_int = 1;
-pub const AUTH_ERR_NOT_INITIALIZED: c_int = 3;
-pub const AUTH_ERR_INVALID_STATE: c_int = 5;
-pub const AUTH_ERR_CONFIG: c_int = 8;
-pub const AUTH_ERR_OTHER: c_int = 9;
-/// UC-41 AF-01/AF-02: the request conflicts with existing state — the
-/// active auth mode is not local, or an account already exists. The FFI
-/// counterpart of HTTP's `409`.
-pub const AUTH_ERR_CONFLICT: c_int = 10;
-/// Refused because it came too soon after some earlier request — a rate
-/// limit. The FFI counterpart of HTTP's `429`. Its own code because it is a
-/// "not yet", not a mistake the caller made.
-pub const AUTH_ERR_RATE_LIMITED: c_int = 11;
-/// A dependency the operation needs is unavailable. The FFI counterpart of
-/// HTTP's `503`; the body's `code` says which.
-pub const AUTH_ERR_SERVICE_UNAVAILABLE: c_int = 12;
-
-/// Result of `alexandria_auth_local_login` / `alexandria_auth_local_set_credentials`
-/// (UC-34/UC-35). On success `status` is `AUTH_OK` and `json` is a
-/// NUL-terminated JSON string of the `LocalLoginResult` /
-/// `LocalCredentialsResult` body — byte-for-byte the same shape HTTP
-/// returns from the matching `/v1/auth/local/*` endpoint (FR-FC-24 /
-/// NFR-09).
-///
-/// On failure `status` carries the mapped error code and `json` carries the
-/// same error envelope HTTP returns for that failure (issue #101):
-/// `{"error": …}`, plus `"code"` and `"params"` when the rejection has a
-/// stable reason. `status` is the coarse class; `code` is the reason — six
-/// distinct password-policy rejections all arrive as
-/// `AUTH_ERR_INVALID_INPUT`, and only `code` tells them apart.
-///
-/// `json` is NULL only when the library was never initialized, so there was
-/// no service to answer at all. The caller must free `json` with
-/// `alexandria_free_string` on every path; freeing NULL is a no-op.
-#[repr(C)]
-#[derive(Debug)]
-pub struct AuthJsonResult {
-    pub status: c_int,
-    pub json: *mut c_char,
-}
-
-impl AuthJsonResult {
-    /// A failure with no readable body — see the NULL case documented above.
-    fn err(status: c_int) -> Self {
-        Self {
-            status,
-            json: std::ptr::null_mut(),
-        }
-    }
-
-    /// A failure carrying the same error envelope HTTP would send.
-    fn err_body(status: c_int, body: String) -> Self {
-        match CString::new(body) {
-            Ok(cstring) => Self {
-                status,
-                json: cstring.into_raw(),
-            },
-            // Unreachable in practice: the envelope is JSON, which never
-            // contains an interior NUL. Degrade to the code-only failure
-            // rather than panicking across an FFI boundary.
-            Err(_) => Self::err(status),
-        }
-    }
-
-    /// A rejection produced by this layer rather than by a handler, rendered
-    /// through the same core renderer so it carries a code like every other.
-    fn rejected(code: &'static str, message: impl Into<String>) -> Self {
-        map_auth_err(DomainError::rejected(code, message))
-    }
-
-    fn ok(json: String) -> Self {
-        let cstring = CString::new(json).unwrap_or_default();
-        Self {
-            status: AUTH_OK,
-            json: cstring.into_raw(),
-        }
-    }
-}
-
-/// Map a `DomainError` to this surface's status code and error body.
-///
-/// The body comes from the core's `error_body`, the same renderer the HTTP
-/// surface uses, so the bytes match (FR-FC-24 / NFR-09). The status stays a
-/// match on the variant rather than on `ErrorClass`: this surface draws
-/// distinctions HTTP does not — `InvalidState` and `Conflict` are both `409`
-/// but different codes here, as are `Config` and the other internal failures —
-/// and collapsing them would be a breaking change to callers for no gain.
-fn map_auth_err(err: DomainError) -> AuthJsonResult {
-    let status = match err {
-        DomainError::InvalidInput(_) | DomainError::Rejected(_) => AUTH_ERR_INVALID_INPUT,
-        DomainError::InvalidState => AUTH_ERR_INVALID_STATE,
-        DomainError::Config(_) => AUTH_ERR_CONFIG,
-        DomainError::Conflict(_) => AUTH_ERR_CONFLICT,
-        DomainError::TooManyRequests(_) => AUTH_ERR_RATE_LIMITED,
-        DomainError::Unavailable(_) => AUTH_ERR_SERVICE_UNAVAILABLE,
-        _ => AUTH_ERR_OTHER,
-    };
-    let (_, body) = error_body(&err);
-    AuthJsonResult::err_body(status, body.to_json())
-}
-
-/// Request body accepted by both `alexandria_auth_local_login` and
-/// `alexandria_auth_local_set_credentials` — the same JSON both
-/// `/v1/auth/local/*` endpoints take: `{"email":"…","password":"…"}`.
-#[derive(Debug)]
-struct LocalCredentialsBody {
-    email: String,
-    password: String,
-}
-
-impl LocalCredentialsBody {
-    fn from_json_str(s: &str) -> Option<Self> {
-        let value: serde_json::Value = serde_json::from_str(s).ok()?;
-        let obj = value.as_object()?;
-        Some(Self {
-            email: obj.get("email")?.as_str()?.to_string(),
-            password: obj.get("password")?.as_str()?.to_string(),
-        })
-    }
-}
-
-/// Local login (UC-34 / FR-AU-04): verify email + password and create a
-/// session. `json_body` is the JSON body HTTP would send (`email`,
-/// `password`). On success `json` carries the `LocalLoginResult` — the
-/// caller presents its `sessionId` on subsequent requests instead of a
-/// bearer token in local mode.
-///
-/// Deliberately takes no `token`: this is how a caller obtains credentials
-/// in the first place (mirrors the HTTP route being outside the auth gate).
-#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
-#[no_mangle]
-pub extern "C" fn alexandria_auth_local_login(json_body: *const c_char) -> AuthJsonResult {
-    ffi_guard(AuthJsonResult::err(AUTH_ERR_OTHER), || {
-        let services = match locked_services() {
-            Some(s) => s,
-            None => return AuthJsonResult::err(AUTH_ERR_NOT_INITIALIZED),
-        };
-
-        let body_str = match cstr_lossy(json_body) {
-            Some(s) => s,
-            None => return AuthJsonResult::rejected("malformed_body", "login body is missing"),
-        };
-        let body = match LocalCredentialsBody::from_json_str(&body_str) {
-            Some(b) => b,
-            None => {
-                return AuthJsonResult::rejected(
-                    "malformed_body",
-                    "invalid login body: expected an object with string 'email' and 'password'",
-                )
-            }
-        };
-
-        let result = runtime().block_on(async {
-            services
-                .local_login_handler
-                .login(&body.email, &body.password)
-                .await
-        });
-
-        match result {
-            Ok(login) => {
-                let json = serde_json::to_string(&login).unwrap_or_default();
-                AuthJsonResult::ok(json)
-            }
-            Err(err) => map_auth_err(err),
-        }
-    })
-}
-
-/// Windows login (UC-45 / FR-AU-20, FR-AU-22): open a session for the
-/// Windows account this process runs as. Takes no credentials — the account
-/// was already verified against the configured SID at startup. `json_body`
-/// is accepted but ignored: it exists only for signature consistency with
-/// this surface's other `alexandria_auth_*` neighbours, which all take a
-/// body. On success `json` carries the `LocalLoginResult`, the same shape
-/// `alexandria_auth_local_login` returns.
-#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
-#[no_mangle]
-pub extern "C" fn alexandria_auth_windows_login(_json_body: *const c_char) -> AuthJsonResult {
-    ffi_guard(AuthJsonResult::err(AUTH_ERR_OTHER), || {
-        let services = match locked_services() {
-            Some(s) => s,
-            None => return AuthJsonResult::err(AUTH_ERR_NOT_INITIALIZED),
-        };
-
-        let result = runtime().block_on(async { services.windows_login_handler.login().await });
-
-        match result {
-            Ok(login) => {
-                let json = serde_json::to_string(&login).unwrap_or_default();
-                AuthJsonResult::ok(json)
-            }
-            Err(err) => map_auth_err(err),
-        }
-    })
-}
-
-/// Set or change local-login credentials (UC-35 / FR-AU-05, FR-AU-06).
-/// `json_body` is the JSON body HTTP would send (`email`, `password`).
-/// `token` is required: this changes existing credentials. Creating the
-/// account is `alexandria_auth_local_register` (UC-41).
-#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
-#[no_mangle]
-pub extern "C" fn alexandria_auth_local_set_credentials(
-    json_body: *const c_char,
-    token: *const c_char,
-) -> AuthJsonResult {
-    ffi_guard(AuthJsonResult::err(AUTH_ERR_OTHER), || {
-        let services = match locked_services() {
-            Some(s) => s,
-            None => return AuthJsonResult::err(AUTH_ERR_NOT_INITIALIZED),
-        };
-
-        let token = cstr_lossy(token).unwrap_or_default();
-
-        let body_str = match cstr_lossy(json_body) {
-            Some(s) => s,
-            None => {
-                return AuthJsonResult::rejected("malformed_body", "credentials body is missing")
-            }
-        };
-        let body = match LocalCredentialsBody::from_json_str(&body_str) {
-            Some(b) => b,
-            None => return AuthJsonResult::rejected(
-                "malformed_body",
-                "invalid credentials body: expected an object with string 'email' and 'password'",
-            ),
-        };
-
-        let result = runtime().block_on(async {
-            services
-                .set_local_credentials_handler
-                .set(body.email, body.password, &token)
-                .await
-        });
-
-        match result {
-            Ok(credentials) => {
-                let json = serde_json::to_string(&credentials).unwrap_or_default();
-                AuthJsonResult::ok(json)
-            }
-            Err(err) => map_auth_err(err),
-        }
-    })
-}
-
-/// Request body for `alexandria_auth_local_register` — the same JSON the
-/// HTTP route takes: `{"email":"…","password":"…","passwordConfirmation":"…"}`.
-#[derive(Debug)]
-struct LocalRegisterBody {
-    email: String,
-    password: String,
-    password_confirmation: String,
-}
-
-impl LocalRegisterBody {
-    fn from_json_str(s: &str) -> Option<Self> {
-        let value: serde_json::Value = serde_json::from_str(s).ok()?;
-        let obj = value.as_object()?;
-        Some(Self {
-            email: obj.get("email")?.as_str()?.to_string(),
-            password: obj.get("password")?.as_str()?.to_string(),
-            password_confirmation: obj.get("passwordConfirmation")?.as_str()?.to_string(),
-        })
-    }
-}
-
-/// Register the local account (UC-41 / FR-AU-10, FR-AU-11): create the
-/// single owner's credentials and open a session. `json_body` is the JSON
-/// body HTTP would send (`email`, `password`, `passwordConfirmation`). On
-/// success `json` carries the `LocalRegisterResult`, whose `sessionId` the
-/// caller presents on subsequent requests.
-///
-/// Deliberately takes no `token`: there is nothing to authenticate with
-/// before an account exists. Succeeds only once — a second call returns
-/// `AUTH_ERR_CONFLICT` (AF-02).
-#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
-#[no_mangle]
-pub extern "C" fn alexandria_auth_local_register(json_body: *const c_char) -> AuthJsonResult {
-    ffi_guard(AuthJsonResult::err(AUTH_ERR_OTHER), || {
-        let services = match locked_services() {
-            Some(s) => s,
-            None => return AuthJsonResult::err(AUTH_ERR_NOT_INITIALIZED),
-        };
-
-        let body_str = match cstr_lossy(json_body) {
-            Some(s) => s,
-            None => return AuthJsonResult::rejected("malformed_body", "register body is missing"),
-        };
-        let body = match LocalRegisterBody::from_json_str(&body_str) {
-            Some(b) => b,
-            None => {
-                return AuthJsonResult::rejected(
-                    "malformed_body",
-                    "invalid register body: expected an object with string 'email', 'password', and 'passwordConfirmation'",
-                )
-            }
-        };
-
-        let result = runtime().block_on(async {
-            services
-                .register_local_account_handler
-                .register(body.email, body.password, body.password_confirmation)
-                .await
-        });
-
-        match result {
-            Ok(registration) => {
-                let json = serde_json::to_string(&registration).unwrap_or_default();
-                AuthJsonResult::ok(json)
-            }
-            Err(err) => map_auth_err(err),
-        }
-    })
-}
-
-/// Report the authenticated owner's account state (FR-AU-18): the same body
-/// `GET /v1/auth/local/account` returns. `token` is the session id.
-///
-/// This is the call a client makes to learn the stored address and how many
-/// recovery codes remain unspent.
-#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
-#[no_mangle]
-pub extern "C" fn alexandria_auth_local_account(token: *const c_char) -> AuthJsonResult {
-    ffi_guard(AuthJsonResult::err(AUTH_ERR_OTHER), || {
-        let services = match locked_services() {
-            Some(s) => s,
-            None => return AuthJsonResult::err(AUTH_ERR_NOT_INITIALIZED),
-        };
-
-        let token = cstr_lossy(token).unwrap_or_default();
-
-        let result =
-            runtime().block_on(async { services.get_local_account_handler.get(&token).await });
-
-        match result {
-            Ok(account) => {
-                let json = serde_json::to_string(&account).unwrap_or_default();
-                AuthJsonResult::ok(json)
-            }
-            Err(err) => map_auth_err(err),
-        }
-    })
-}
-
-/// Request body for `alexandria_auth_local_redeem_recovery_code` — the same
-/// JSON the HTTP route takes.
-#[derive(Debug)]
-struct RedeemRecoveryCodeBody {
-    code: String,
-    new_password: String,
-    password_confirmation: String,
-}
-
-impl RedeemRecoveryCodeBody {
-    fn from_json_str(s: &str) -> Option<Self> {
-        let value: serde_json::Value = serde_json::from_str(s).ok()?;
-        let obj = value.as_object()?;
-        Some(Self {
-            code: obj.get("code")?.as_str()?.to_string(),
-            new_password: obj.get("newPassword")?.as_str()?.to_string(),
-            password_confirmation: obj.get("passwordConfirmation")?.as_str()?.to_string(),
-        })
-    }
-}
-
-/// Redeem a recovery code for a new password (UC-43 / FR-AU-14 … FR-AU-16).
-/// `json_body` is the JSON body HTTP would send: an object with `code`,
-/// `newPassword`, and `passwordConfirmation`.
-///
-/// Deliberately takes no session token: the code is the credential, and this
-/// is the operation a caller who cannot authenticate uses to get back in.
-/// Every session is invalidated on success.
-#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
-#[no_mangle]
-pub extern "C" fn alexandria_auth_local_redeem_recovery_code(
-    json_body: *const c_char,
-) -> AuthJsonResult {
-    ffi_guard(AuthJsonResult::err(AUTH_ERR_OTHER), || {
-        let services = match locked_services() {
-            Some(s) => s,
-            None => return AuthJsonResult::err(AUTH_ERR_NOT_INITIALIZED),
-        };
-
-        let body_str = match cstr_lossy(json_body) {
-            Some(s) => s,
-            None => {
-                return AuthJsonResult::rejected(
-                    "malformed_body",
-                    "recovery redeem body is missing",
-                )
-            }
-        };
-        let body = match RedeemRecoveryCodeBody::from_json_str(&body_str) {
-            Some(b) => b,
-            None => {
-                return AuthJsonResult::rejected(
-                    "malformed_body",
-                    "invalid recovery redeem body: expected an object with string 'code', 'newPassword', and 'passwordConfirmation'",
-                )
-            }
-        };
-
-        let result = runtime().block_on(async {
-            services
-                .redeem_recovery_code_handler
-                .redeem(body.code, body.new_password, body.password_confirmation)
-                .await
-        });
-
-        match result {
-            Ok(redemption) => {
-                let json = serde_json::to_string(&redemption).unwrap_or_default();
-                AuthJsonResult::ok(json)
-            }
-            Err(err) => map_auth_err(err),
-        }
-    })
-}
-
-/// Replace the owner's recovery codes with a fresh set of ten (UC-44 /
-/// FR-AU-17), invalidating every old one. `token` is the session id the
-/// caller authenticates with, exactly as `alexandria_auth_local_account`
-/// takes it.
-#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
-#[no_mangle]
-pub extern "C" fn alexandria_auth_local_regenerate_recovery_codes(
-    token: *const c_char,
-) -> AuthJsonResult {
-    ffi_guard(AuthJsonResult::err(AUTH_ERR_OTHER), || {
-        let services = match locked_services() {
-            Some(s) => s,
-            None => return AuthJsonResult::err(AUTH_ERR_NOT_INITIALIZED),
-        };
-
-        let token = cstr_lossy(token).unwrap_or_default();
-
-        let result = runtime().block_on(async {
-            services
-                .regenerate_recovery_codes_handler
-                .regenerate(&token)
-                .await
-        });
-
-        match result {
-            Ok(regeneration) => {
-                let json = serde_json::to_string(&regeneration).unwrap_or_default();
-                AuthJsonResult::ok(json)
-            }
-            Err(err) => map_auth_err(err),
-        }
-    })
-}
-
 /// FFI status codes returned by the settings read (UC-47 / FR-FC-30).
 /// Deliberately separate from every other family — per the convention above —
 /// so this surface can grow independently; `SETTINGS_OK == INDEX_OK == 0` by
@@ -3568,8 +3093,8 @@ pub extern "C" fn alexandria_settings_json() -> SettingsJsonResult {
 }
 
 /// FFI status codes returned by run-status operations (UC-42, UC-48 / FR-FC-28, FR-FC-32 … FR-FC-35).
-/// Deliberately separate from `INDEX_*`, `FILE_*`, `COLLECTION_*`, `PLAYBACK_*`,
-/// and `AUTH_*` — per the convention established above — so this surface can
+/// Deliberately separate from `INDEX_*`, `FILE_*`, `COLLECTION_*`, and
+/// `PLAYBACK_*` — per the convention established above — so this surface can
 /// grow independently; `RUN_OK == INDEX_OK == 0` by convention.
 pub const RUN_OK: c_int = 0;
 pub const RUN_ERR_INVALID_INPUT: c_int = 1;

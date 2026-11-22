@@ -31,26 +31,23 @@ pub const WRITE_TX: &str = "BEGIN IMMEDIATE";
 pub enum DomainError {
     #[error("entity not found")]
     NotFound,
-    #[error("unauthorized")]
-    Unauthorized,
     #[error("invalid input: {0}")]
     InvalidInput(String),
     /// Input rejected for a reason the caller can act on programmatically
     /// (issue #101). `InvalidInput` plus a stable `code` and the parameters
     /// the message interpolates, so a client can render the rejection in its
-    /// own language with the same bound the core enforced. Maps exactly where
-    /// `InvalidInput` maps — `400` over HTTP, `AUTH_ERR_INVALID_INPUT` over
-    /// FFI; the code is the reason, the status is only the class.
+    /// own language with the same bound the core enforced. Its class is
+    /// `InvalidInput`'s, `BadRequest`; the code is the reason, the class is
+    /// only the kind.
     #[error("invalid input: {0}")]
     Rejected(Rejection),
     #[error("invalid state transition")]
     InvalidState,
     /// A request that cannot be satisfied because it conflicts with state
-    /// that already exists (UC-41 AF-01, AF-02). Distinct from
-    /// `InvalidState`, which carries no message: registration has two
-    /// different 409 conditions — wrong auth mode and account-already-
-    /// exists — and a caller that cannot tell them apart cannot say
-    /// anything useful to the owner.
+    /// that already exists: a folder that is already a library, or a library
+    /// that already has an unfinished run (FR-FC-43). Distinct from
+    /// `InvalidState`, which carries no message, because the message is what
+    /// tells the owner which conflict it was.
     #[error("conflict: {0}")]
     Conflict(String),
     /// A filesystem operation failed (UC-05 AF-02, UC-09 AF-02, UC-32 AF-02,
@@ -111,8 +108,8 @@ impl DomainError {
     ///
     /// ```
     /// # use alexandria_core::errors::DomainError;
-    /// DomainError::rejected("password_too_short", "password must be at least 12 characters")
-    ///     .with_param("min", "12");
+    /// DomainError::rejected("name_too_long", "name must be at most 64 characters")
+    ///     .with_param("max", "64");
     /// ```
     pub fn rejected(code: &'static str, message: impl Into<String>) -> Self {
         Self::Rejected(Rejection::new(code, message))
@@ -122,9 +119,9 @@ impl DomainError {
     /// acts on.
     ///
     /// No producer in the workspace calls this today — the mail port was the
-    /// only one, and recovery codes replaced it. Kept because it is generic
-    /// transport infrastructure the error mapping already carries end to end;
-    /// noted so the next reader does not repeat the search.
+    /// only one, and it went with authentication. Kept because it is generic
+    /// infrastructure `error_body` already renders; noted so the next reader
+    /// does not repeat the search.
     pub fn unavailable(code: &'static str, message: impl Into<String>) -> Self {
         Self::Unavailable(Rejection::new(code, message))
     }
@@ -132,10 +129,9 @@ impl DomainError {
     /// Refuse a request that came too soon, naming the reason and the wait.
     ///
     /// No producer in the workspace calls this today — the resend interval on
-    /// the removed e-mail operations was the only one, which also leaves the
-    /// FFI's `AUTH_ERR_RATE_LIMITED` unreachable. Kept for the same reason as
-    /// `unavailable`: generic transport infrastructure, already mapped on both
-    /// surfaces, waiting for the first throttle that needs it.
+    /// the removed e-mail operations was the only one. Kept for the same
+    /// reason as `unavailable`: generic infrastructure `error_body` already
+    /// renders, waiting for the first throttle that needs it.
     pub fn too_many_requests(code: &'static str, message: impl Into<String>) -> Self {
         Self::TooManyRequests(Rejection::new(code, message))
     }
@@ -199,7 +195,6 @@ impl fmt::Display for Rejection {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorClass {
     NotFound,
-    Unauthorized,
     BadRequest,
     Conflict,
     TooManyRequests,
@@ -241,15 +236,14 @@ impl ErrorBody {
 /// Render a `DomainError` as its class and its wire body.
 ///
 /// The single place that decides what a failure looks like to a caller, so
-/// parity between HTTP and FFI (FR-FC-24, FR-AU-08, NFR-09) is a property of
-/// the code rather than of two `match` arms staying in step. Internal detail
-/// (a disk path, a SQL error, a configuration value) is deliberately not
-/// echoed: those variants render as their fixed class name and are logged, not
+/// parity between HTTP and FFI (FR-FC-24, NFR-09) is a property of the code
+/// rather than of two `match` arms staying in step. Internal detail (a disk
+/// path, a SQL error, a configuration value) is deliberately not echoed:
+/// those variants render as their fixed class name and are logged, not
 /// returned.
 pub fn error_body(err: &DomainError) -> (ErrorClass, ErrorBody) {
     match err {
         DomainError::NotFound => (ErrorClass::NotFound, ErrorBody::plain("not found")),
-        DomainError::Unauthorized => (ErrorClass::Unauthorized, ErrorBody::plain("unauthorized")),
         DomainError::InvalidInput(msg) => (ErrorClass::BadRequest, ErrorBody::plain(msg)),
         DomainError::Rejected(rejection) => (
             ErrorClass::BadRequest,
@@ -307,11 +301,6 @@ mod tests {
         let cases = [
             (DomainError::NotFound, ErrorClass::NotFound, "not found"),
             (
-                DomainError::Unauthorized,
-                ErrorClass::Unauthorized,
-                "unauthorized",
-            ),
-            (
                 DomainError::InvalidInput("title must not be empty".into()),
                 ErrorClass::BadRequest,
                 "title must not be empty",
@@ -322,9 +311,9 @@ mod tests {
                 "invalid state",
             ),
             (
-                DomainError::conflict("an account already exists"),
+                DomainError::conflict("that folder is already a library"),
                 ErrorClass::Conflict,
-                "an account already exists",
+                "that folder is already a library",
             ),
         ];
 
@@ -355,7 +344,7 @@ mod tests {
                 "database error",
             ),
             (
-                DomainError::config("auth.secret = hunter2"),
+                DomainError::config("database.path = /home/owner/catalog.sqlite"),
                 "configuration error",
             ),
             (
@@ -379,18 +368,18 @@ mod tests {
     #[test]
     fn given_a_rejection_when_rendered_then_code_message_and_params_travel_as_a_bad_request() {
         // Arrange
-        let error = DomainError::rejected("password_too_short", "too short")
-            .with_param("min", "12")
-            .with_param("actual", "3");
+        let error = DomainError::rejected("name_too_long", "too long")
+            .with_param("max", "64")
+            .with_param("actual", "80");
 
         // Act
         let (class, body) = error_body(&error);
 
         // Assert
         assert_eq!(class, ErrorClass::BadRequest);
-        assert_eq!(body.error, "too short");
-        assert_eq!(body.code, Some("password_too_short"));
-        assert_eq!(body.params, params(&[("actual", "3"), ("min", "12")]));
+        assert_eq!(body.error, "too long");
+        assert_eq!(body.code, Some("name_too_long"));
+        assert_eq!(body.params, params(&[("actual", "80"), ("max", "64")]));
     }
 
     #[test]

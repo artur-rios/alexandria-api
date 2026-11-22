@@ -2,7 +2,6 @@ use std::sync::Arc;
 
 use uuid::Uuid;
 
-use alexandria_core::auth::AuthService;
 use alexandria_core::catalog::classify::classify_by_extension;
 use alexandria_core::catalog::clock::{Clock, FixedClock};
 use alexandria_core::catalog::comic_tags::{ComicMetadataReader, ComicTags};
@@ -836,23 +835,6 @@ async fn given_a_folder_mixing_audio_video_and_text_when_indexed_then_all_are_ca
         runs.recorded_failures(started.run_id).is_empty(),
         "no file is named as a failure"
     );
-}
-
-#[tokio::test]
-async fn given_bearer_auth_when_authenticated_then_principal_owner() {
-    let principal = alexandria_core::auth::BearerAuthService
-        .authenticate("some-bearer")
-        .await
-        .expect("auth");
-    assert_eq!(principal.user_id, "owner");
-}
-
-#[tokio::test]
-async fn given_bearer_auth_when_empty_token_then_unauthorized() {
-    let result = alexandria_core::auth::BearerAuthService
-        .authenticate("  ")
-        .await;
-    assert!(matches!(result, Err(DomainError::Unauthorized)));
 }
 
 #[test]

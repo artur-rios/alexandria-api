@@ -8,21 +8,21 @@
 //! share one harness that runs them in parallel rather than one binary after
 //! another. The tree under `tests/` still mirrors `src/`.
 //!
-//! Three suites stay top-level files, each in a process of its own, because
+//! Two suites stay top-level files, each in a process of its own, because
 //! they need one:
 //!
-//! - `config.rs` sets and clears `ALEXANDRIA_*` environment variables, which
-//!   are process-wide.
 //! - `browse_batching.rs` installs a process-global tracing subscriber that
 //!   counts every SQL statement; other tests' queries would be noise in it.
 //! - `throughput.rs` is the ignored NFR-01/NFR-02 harness the `performance`
 //!   workflow runs on its own (`--test throughput -- --ignored`).
 //!
+//! `config.rs` is a top-level file too. It needs nothing from `common/` and
+//! no database, so it stays a small binary of its own.
+//!
 //! Run one area with a filter: `cargo test -p alexandria-core --test integration catalog::`.
 
 mod common;
 
-mod auth;
 mod bookmarks;
 mod catalog;
 mod collections;
