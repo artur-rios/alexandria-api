@@ -10,8 +10,7 @@ use tempfile::{tempdir, TempDir};
 static SERIAL: Mutex<()> = Mutex::new(());
 
 fn serial() -> std::sync::MutexGuard<'static, ()> {
-    // Recover from poisoning rather than propagating it, matching
-    // `parity.rs`. The guard protects a process-global services slot, not an
+    // Recover from poisoning rather than propagating it. The guard protects a process-global services slot, not an
     // invariant this lock can corrupt: every test re-initializes it through
     // `init_temp_db`. Unwrapping instead let the *first* panicking test poison
     // the mutex and turn every later test in this file into an opaque
@@ -1916,8 +1915,8 @@ fn given_a_paused_run_when_resumed_over_ffi_then_same_run_id_and_it_finishes() {
 }
 
 /// The FFI twin of the HTTP `..._resumed_with_normal_priority_then_it_is_widened`
-/// case (Task 15). `"low"` over FFI is covered end to end by `parity.rs`, and
-/// NULL by the resume tests above; without this, `"normal"` over FFI rested
+/// case (Task 15). `"low"` over FFI is covered end to end by the test after
+/// this one, and NULL by the resume tests above; without this, `"normal"` over FFI rested
 /// only on a unit test of `parse_resume_priority` plus the shared core
 /// handler — and `"normal"` is the whole reason the wire value is three-valued
 /// rather than a boolean, so it is the one that most needs proving through
@@ -1970,6 +1969,53 @@ fn given_a_low_priority_paused_run_when_resumed_at_normal_over_ffi_then_it_is_wi
         "\"normal\" must widen the run to indexing.concurrency; sending nothing would \
          have left it at 1, which is what makes this a real request rather than a \
          synonym for silence"
+    );
+    assert_eq!(
+        wait_for_run_terminal_or_paused(&run_id, &token)["status"],
+        "complete"
+    );
+}
+
+/// The other direction: a run started at normal width and resumed with
+/// `"low"` is re-paced to `indexing.low_priority_concurrency`, through the
+/// real entry point (ported from the HTTP/FFI parity suite).
+#[test]
+fn given_a_paused_run_when_resumed_at_low_over_ffi_then_it_is_re_paced_low() {
+    let _g = serial();
+    let (_db_dir, db_path) = init_temp_db();
+    let lib = tempdir().unwrap();
+    write_library(lib.path(), 500);
+
+    let root = c(lib.path().to_str().unwrap());
+    let token = c(TEST_TOKEN);
+    let started = index_folder(root.as_ptr(), token.as_ptr(), std::ptr::null());
+    assert_eq!(started.status, STATUS_OK);
+    let run_id = run_id_string(&started);
+    assert_eq!(
+        run_concurrency(&db_path, &run_id),
+        Some(4),
+        "sanity: it started at indexing.concurrency"
+    );
+
+    wait_for_run_cell_live(&run_id, &token);
+    let run_id_c = c(&run_id);
+    assert_eq!(
+        alexandria_index_pause(run_id_c.as_ptr(), token.as_ptr()),
+        STATUS_RUN_OK
+    );
+    assert_eq!(
+        wait_for_run_terminal_or_paused(&run_id, &token)["status"],
+        "paused"
+    );
+
+    let low = c("low");
+    let resumed = alexandria_index_resume(run_id_c.as_ptr(), token.as_ptr(), low.as_ptr());
+    assert_eq!(resumed.status, STATUS_RUN_OK);
+    assert_eq!(run_id_string(&resumed), run_id);
+    assert_eq!(
+        run_concurrency(&db_path, &run_id),
+        Some(1),
+        "\"low\" must re-pace the run to indexing.low_priority_concurrency"
     );
     assert_eq!(
         wait_for_run_terminal_or_paused(&run_id, &token)["status"],
@@ -3115,4 +3161,3013 @@ fn given_the_header_when_read_then_library_register_is_documented_with_its_run()
 
     assert!(doc.contains("runId"), "{doc}");
     assert!(!doc.contains("claimed"), "{doc}");
+}
+
+// ===========================================================================
+// Ported from the HTTP server's tests and the HTTP/FFI parity suite
+// ===========================================================================
+//
+// The HTTP server and `parity.rs` went away together, and these are the
+// behaviours that only their tests checked: the FFI calls with no smoke test
+// of their own, the FFI's reading of filter and body values, and every
+// repository that core's tests exercise only through fakes (collections,
+// bookmarks, watchlists, reading lists). Each one is asserted here on the
+// core's own answer — the FFI status and JSON — and on what it left in the
+// catalog or on disk, against a real database and real files.
+
+/// The status and parsed JSON of any of the FFI's `*JsonResult` structs,
+/// which all carry a `status` and a `json` that is NULL on failure. The
+/// string is freed; a NULL `json` reads as `Value::Null`.
+macro_rules! answer {
+    ($result:expr) => {{
+        let result = $result;
+        take_answer(result.status, result.json)
+    }};
+}
+
+fn take_answer(status: i32, json: *mut c_char) -> (i32, serde_json::Value) {
+    if json.is_null() {
+        return (status, serde_json::Value::Null);
+    }
+    // SAFETY: a non-NULL `json` is a NUL-terminated string this library
+    // allocated, freed exactly once below.
+    let text = unsafe { CStr::from_ptr(json) }
+        .to_string_lossy()
+        .into_owned();
+    unsafe { alexandria_free_string(json) };
+    (status, serde_json::from_str(&text).expect("result json"))
+}
+
+/// Every row `sql` selects from the FFI's catalog, with `args` bound as text.
+fn fetch_all<T>(db_path: &str, sql: &'static str, args: &[&str]) -> Vec<T>
+where
+    T: for<'r> sqlx::FromRow<'r, sqlx::sqlite::SqliteRow> + Send + Unpin + 'static,
+{
+    let args: Vec<String> = args.iter().map(|arg| arg.to_string()).collect();
+    with_db(db_path, move |pool| async move {
+        let mut query = sqlx::query_as::<sqlx::Sqlite, T>(sql);
+        for arg in args {
+            query = query.bind(arg);
+        }
+        query.fetch_all(&pool).await.expect(sql)
+    })
+}
+
+/// The single number a `SELECT COUNT(*) …` answers.
+fn count(db_path: &str, sql: &'static str, args: &[&str]) -> i64 {
+    fetch_all::<(i64,)>(db_path, sql, args)[0].0
+}
+
+/// Run one write against the FFI's catalog, behind its back.
+fn exec(db_path: &str, sql: &'static str, args: &[&str]) {
+    let args: Vec<String> = args.iter().map(|arg| arg.to_string()).collect();
+    with_db(db_path, move |pool| async move {
+        let mut query = sqlx::query(sql);
+        for arg in args {
+            query = query.bind(arg);
+        }
+        query.execute(&pool).await.expect(sql);
+    });
+}
+
+/// One active catalog row of `file_type` named `name`, in a library of its
+/// own, written without indexing: for the operations that never read the
+/// disk, seeded the way the HTTP and parity suites seeded theirs.
+fn seed_file(db_path: &str, file_type: &str, name: &str) -> String {
+    let uuid = uuid::Uuid::new_v4().to_string();
+    exec(
+        db_path,
+        "INSERT OR IGNORE INTO libraries (uuid, name, root_path) \
+         VALUES ('seeded-library', 'Seeded', '/seeded-library')",
+        &[],
+    );
+    let path = format!("/seeded-library/{uuid}-{name}");
+    let now = chrono::Utc::now().to_rfc3339();
+    exec(
+        db_path,
+        "INSERT INTO files (uuid, path, name, type, content_hash, indexed_at, library_id) \
+         VALUES (?, ?, ?, ?, 'hash', ?, (SELECT id FROM libraries WHERE uuid = 'seeded-library'))",
+        &[&uuid, &path, name, file_type, &now],
+    );
+    uuid
+}
+
+/// Write `files` into a fresh folder, add it as a library and wait for its
+/// run: the catalog the HTTP suite built through `POST /v1/libraries`.
+/// Answers the folder.
+fn library_with(db: &(TempDir, String), files: &[(&str, &[u8])], token: &CString) -> String {
+    let root = folder(db, "/library");
+    for (name, bytes) in files {
+        std::fs::write(format!("{root}/{name}"), bytes).unwrap();
+    }
+    register_library("Library", &root, token);
+    root
+}
+
+/// A well-formed uuid that names nothing in the catalog.
+fn unknown_uuid() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
+
+// One wrapper per FFI call: each takes its body as JSON and answers
+// `(status, json)`.
+
+fn files_list(filter: serde_json::Value, token: &CString) -> (i32, serde_json::Value) {
+    let filter = c(&filter.to_string());
+    answer!(alexandria_ffi::alexandria_files_list(
+        filter.as_ptr(),
+        token.as_ptr()
+    ))
+}
+
+fn file_get(uuid: &str, token: &CString) -> (i32, serde_json::Value) {
+    let uuid = c(uuid);
+    answer!(alexandria_ffi::alexandria_file_get_by_uuid(
+        uuid.as_ptr(),
+        token.as_ptr()
+    ))
+}
+
+fn file_edit_metadata(
+    uuid: &str,
+    patch: serde_json::Value,
+    token: &CString,
+) -> (i32, serde_json::Value) {
+    let (uuid, patch) = (c(uuid), c(&patch.to_string()));
+    answer!(alexandria_file_edit_metadata(
+        uuid.as_ptr(),
+        patch.as_ptr(),
+        token.as_ptr()
+    ))
+}
+
+fn file_read_content(uuid: &str, token: &CString) -> (i32, serde_json::Value) {
+    let uuid = c(uuid);
+    answer!(alexandria_ffi::alexandria_file_read_content(
+        uuid.as_ptr(),
+        token.as_ptr()
+    ))
+}
+
+fn file_edit_content(
+    uuid: &str,
+    body: serde_json::Value,
+    token: &CString,
+) -> (i32, serde_json::Value) {
+    let (uuid, body) = (c(uuid), c(&body.to_string()));
+    answer!(alexandria_ffi::alexandria_file_edit_content(
+        uuid.as_ptr(),
+        body.as_ptr(),
+        token.as_ptr()
+    ))
+}
+
+fn file_soft_delete(uuid: &str, token: &CString) -> (i32, serde_json::Value) {
+    let uuid = c(uuid);
+    answer!(alexandria_file_soft_delete(uuid.as_ptr(), token.as_ptr()))
+}
+
+fn playback_source(uuid: &str, token: &CString) -> (i32, serde_json::Value) {
+    let uuid = c(uuid);
+    answer!(alexandria_file_playback_source(
+        uuid.as_ptr(),
+        token.as_ptr()
+    ))
+}
+
+fn comic_page(uuid: &str, page: u32, token: &CString) -> (i32, serde_json::Value) {
+    let uuid = c(uuid);
+    answer!(alexandria_ffi::alexandria_comic_page(
+        uuid.as_ptr(),
+        page,
+        token.as_ptr()
+    ))
+}
+
+fn thumbnail(uuid: &str, token: &CString) -> (i32, serde_json::Value) {
+    let uuid = c(uuid);
+    answer!(alexandria_ffi::alexandria_file_thumbnail(
+        uuid.as_ptr(),
+        token.as_ptr()
+    ))
+}
+
+fn collection_create(body: serde_json::Value, token: &CString) -> (i32, serde_json::Value) {
+    let body = c(&body.to_string());
+    answer!(alexandria_ffi::alexandria_collection_create(
+        body.as_ptr(),
+        token.as_ptr()
+    ))
+}
+
+fn collection_rename(
+    uuid: &str,
+    body: serde_json::Value,
+    token: &CString,
+) -> (i32, serde_json::Value) {
+    let (uuid, body) = (c(uuid), c(&body.to_string()));
+    answer!(alexandria_ffi::alexandria_collection_rename(
+        uuid.as_ptr(),
+        body.as_ptr(),
+        token.as_ptr()
+    ))
+}
+
+fn collection_delete(uuid: &str, token: &CString) -> (i32, serde_json::Value) {
+    let uuid = c(uuid);
+    answer!(alexandria_ffi::alexandria_collection_delete(
+        uuid.as_ptr(),
+        token.as_ptr()
+    ))
+}
+
+fn collection_add_items(
+    uuid: &str,
+    item_uuids: &[&str],
+    token: &CString,
+) -> (i32, serde_json::Value) {
+    let uuid = c(uuid);
+    let body = c(&serde_json::json!({ "itemUuids": item_uuids }).to_string());
+    answer!(alexandria_ffi::alexandria_collection_add_items(
+        uuid.as_ptr(),
+        body.as_ptr(),
+        token.as_ptr()
+    ))
+}
+
+fn collection_remove_item(
+    collection_uuid: &str,
+    item_uuid: &str,
+    token: &CString,
+) -> (i32, serde_json::Value) {
+    let (collection_uuid, item_uuid) = (c(collection_uuid), c(item_uuid));
+    answer!(alexandria_ffi::alexandria_collection_remove_item(
+        collection_uuid.as_ptr(),
+        item_uuid.as_ptr(),
+        token.as_ptr()
+    ))
+}
+
+fn collection_list_items(uuid: &str, token: &CString) -> (i32, serde_json::Value) {
+    let uuid = c(uuid);
+    answer!(alexandria_ffi::alexandria_collection_list_items(
+        uuid.as_ptr(),
+        token.as_ptr()
+    ))
+}
+
+fn collections_list(filter: serde_json::Value, token: &CString) -> (i32, serde_json::Value) {
+    let filter = c(&filter.to_string());
+    answer!(alexandria_ffi::alexandria_collections_list(
+        filter.as_ptr(),
+        token.as_ptr()
+    ))
+}
+
+fn bookmark_create(body: serde_json::Value, token: &CString) -> (i32, serde_json::Value) {
+    let body = c(&body.to_string());
+    answer!(alexandria_ffi::alexandria_bookmark_create(
+        body.as_ptr(),
+        token.as_ptr()
+    ))
+}
+
+fn bookmark_update(
+    uuid: &str,
+    body: serde_json::Value,
+    token: &CString,
+) -> (i32, serde_json::Value) {
+    let (uuid, body) = (c(uuid), c(&body.to_string()));
+    answer!(alexandria_ffi::alexandria_bookmark_update(
+        uuid.as_ptr(),
+        body.as_ptr(),
+        token.as_ptr()
+    ))
+}
+
+fn bookmarks_list(filter: serde_json::Value, token: &CString) -> (i32, serde_json::Value) {
+    let filter = c(&filter.to_string());
+    answer!(alexandria_ffi::alexandria_bookmarks_list(
+        filter.as_ptr(),
+        token.as_ptr()
+    ))
+}
+
+fn bookmark_soft_delete(uuid: &str, token: &CString) -> (i32, serde_json::Value) {
+    let uuid = c(uuid);
+    answer!(alexandria_ffi::alexandria_bookmark_soft_delete(
+        uuid.as_ptr(),
+        token.as_ptr()
+    ))
+}
+
+fn bookmark_restore(uuid: &str, token: &CString) -> (i32, serde_json::Value) {
+    let uuid = c(uuid);
+    answer!(alexandria_ffi::alexandria_bookmark_restore(
+        uuid.as_ptr(),
+        token.as_ptr()
+    ))
+}
+
+fn bookmark_purge(uuid: &str, token: &CString) -> (i32, serde_json::Value) {
+    let uuid = c(uuid);
+    answer!(alexandria_ffi::alexandria_bookmark_purge(
+        uuid.as_ptr(),
+        token.as_ptr()
+    ))
+}
+
+fn watchlist_create(body: serde_json::Value, token: &CString) -> (i32, serde_json::Value) {
+    let body = c(&body.to_string());
+    answer!(alexandria_ffi::alexandria_watchlist_create(
+        body.as_ptr(),
+        token.as_ptr()
+    ))
+}
+
+fn watchlist_add_video(
+    watchlist_uuid: &str,
+    video_uuid: &str,
+    token: &CString,
+) -> (i32, serde_json::Value) {
+    let uuid = c(watchlist_uuid);
+    let body = c(&serde_json::json!({ "videoUuid": video_uuid }).to_string());
+    answer!(alexandria_ffi::alexandria_watchlist_add_video(
+        uuid.as_ptr(),
+        body.as_ptr(),
+        token.as_ptr()
+    ))
+}
+
+fn watchlists_list(filter: serde_json::Value, token: &CString) -> (i32, serde_json::Value) {
+    let filter = c(&filter.to_string());
+    answer!(alexandria_ffi::alexandria_watchlists_list(
+        filter.as_ptr(),
+        token.as_ptr()
+    ))
+}
+
+fn watchlist_update_progress(
+    watchlist_uuid: &str,
+    video_uuid: &str,
+    body: serde_json::Value,
+    token: &CString,
+) -> (i32, serde_json::Value) {
+    let (watchlist_uuid, video_uuid) = (c(watchlist_uuid), c(video_uuid));
+    let body = c(&body.to_string());
+    answer!(alexandria_ffi::alexandria_watchlist_update_progress(
+        watchlist_uuid.as_ptr(),
+        video_uuid.as_ptr(),
+        body.as_ptr(),
+        token.as_ptr()
+    ))
+}
+
+fn watchlist_remove_video(
+    watchlist_uuid: &str,
+    video_uuid: &str,
+    token: &CString,
+) -> (i32, serde_json::Value) {
+    let (watchlist_uuid, video_uuid) = (c(watchlist_uuid), c(video_uuid));
+    answer!(alexandria_ffi::alexandria_watchlist_remove_video(
+        watchlist_uuid.as_ptr(),
+        video_uuid.as_ptr(),
+        token.as_ptr()
+    ))
+}
+
+fn watchlist_delete(uuid: &str, token: &CString) -> (i32, serde_json::Value) {
+    let uuid = c(uuid);
+    answer!(alexandria_ffi::alexandria_watchlist_delete(
+        uuid.as_ptr(),
+        token.as_ptr()
+    ))
+}
+
+fn reading_list_create(body: serde_json::Value, token: &CString) -> (i32, serde_json::Value) {
+    let body = c(&body.to_string());
+    answer!(alexandria_ffi::alexandria_reading_list_create(
+        body.as_ptr(),
+        token.as_ptr()
+    ))
+}
+
+fn reading_list_add_item(
+    reading_list_uuid: &str,
+    item_uuid: &str,
+    token: &CString,
+) -> (i32, serde_json::Value) {
+    let uuid = c(reading_list_uuid);
+    let body = c(&serde_json::json!({ "itemUuid": item_uuid }).to_string());
+    answer!(alexandria_ffi::alexandria_reading_list_add_item(
+        uuid.as_ptr(),
+        body.as_ptr(),
+        token.as_ptr()
+    ))
+}
+
+fn reading_lists_list(filter: serde_json::Value, token: &CString) -> (i32, serde_json::Value) {
+    let filter = c(&filter.to_string());
+    answer!(alexandria_ffi::alexandria_reading_lists_list(
+        filter.as_ptr(),
+        token.as_ptr()
+    ))
+}
+
+fn reading_list_update_progress(
+    reading_list_uuid: &str,
+    item_uuid: &str,
+    body: serde_json::Value,
+    token: &CString,
+) -> (i32, serde_json::Value) {
+    let (reading_list_uuid, item_uuid) = (c(reading_list_uuid), c(item_uuid));
+    let body = c(&body.to_string());
+    answer!(alexandria_ffi::alexandria_reading_list_update_progress(
+        reading_list_uuid.as_ptr(),
+        item_uuid.as_ptr(),
+        body.as_ptr(),
+        token.as_ptr()
+    ))
+}
+
+fn reading_list_remove_item(
+    reading_list_uuid: &str,
+    item_uuid: &str,
+    token: &CString,
+) -> (i32, serde_json::Value) {
+    let (reading_list_uuid, item_uuid) = (c(reading_list_uuid), c(item_uuid));
+    answer!(alexandria_ffi::alexandria_reading_list_remove_item(
+        reading_list_uuid.as_ptr(),
+        item_uuid.as_ptr(),
+        token.as_ptr()
+    ))
+}
+
+fn reading_list_delete(uuid: &str, token: &CString) -> (i32, serde_json::Value) {
+    let uuid = c(uuid);
+    answer!(alexandria_ffi::alexandria_reading_list_delete(
+        uuid.as_ptr(),
+        token.as_ptr()
+    ))
+}
+
+// ---------------- collections (UC-10 to UC-15) ----------------
+
+const COLLECTION_OK: i32 = alexandria_ffi::COLLECTION_OK;
+const COLLECTION_INVALID_INPUT: i32 = alexandria_ffi::COLLECTION_ERR_INVALID_INPUT;
+const COLLECTION_NOT_FOUND: i32 = alexandria_ffi::COLLECTION_ERR_NOT_FOUND;
+
+fn new_collection(name: &str, kind: &str, token: &CString) -> String {
+    let (status, value) =
+        collection_create(serde_json::json!({ "name": name, "kind": kind }), token);
+    assert_eq!(status, COLLECTION_OK, "create {name}: {value}");
+    value["uuid"].as_str().expect("uuid").to_string()
+}
+
+fn new_bookmark(title: &str, collection_uuid: Option<&str>, token: &CString) -> String {
+    let (status, value) = bookmark_create(
+        serde_json::json!({
+            "url": format!("https://example.com/{title}"),
+            "title": title,
+            "collectionUuid": collection_uuid,
+        }),
+        token,
+    );
+    assert_eq!(
+        status,
+        alexandria_ffi::BOOKMARK_OK,
+        "create {title}: {value}"
+    );
+    value["uuid"].as_str().expect("uuid").to_string()
+}
+
+/// `(uuid, name, kind)` of every collection, in creation order.
+fn collection_rows(db_path: &str) -> Vec<(String, String, String)> {
+    fetch_all(
+        db_path,
+        "SELECT uuid, name, kind FROM collections ORDER BY id",
+        &[],
+    )
+}
+
+/// The uuid of the collection a file or bookmark is filed in, if any.
+fn file_collection(db_path: &str, file_uuid: &str) -> Option<String> {
+    fetch_all::<(Option<String>,)>(
+        db_path,
+        "SELECT collections.uuid FROM files \
+         LEFT JOIN collections ON collections.id = files.collection_id WHERE files.uuid = ?",
+        &[file_uuid],
+    )[0]
+    .0
+    .clone()
+}
+
+fn bookmark_collection(db_path: &str, bookmark_uuid: &str) -> Option<String> {
+    fetch_all::<(Option<String>,)>(
+        db_path,
+        "SELECT collections.uuid FROM bookmarks \
+         LEFT JOIN collections ON collections.id = bookmarks.collection_id \
+         WHERE bookmarks.uuid = ?",
+        &[bookmark_uuid],
+    )[0]
+    .0
+    .clone()
+}
+
+#[test]
+fn given_a_file_and_a_bookmark_collection_when_created_over_ffi_then_each_is_answered_and_stored() {
+    let _g = serial();
+    let db = init_temp_db();
+    let token = c(TEST_TOKEN);
+
+    let (file_status, films) = collection_create(
+        serde_json::json!({ "name": "Sci-fi novels", "kind": "file" }),
+        &token,
+    );
+    let (bookmark_status, reading) = collection_create(
+        serde_json::json!({ "name": "Reading", "kind": "bookmark" }),
+        &token,
+    );
+    let (again_status, again) = collection_create(
+        serde_json::json!({ "name": "Sci-fi novels", "kind": "file" }),
+        &token,
+    );
+
+    assert_eq!(
+        (file_status, bookmark_status, again_status),
+        (COLLECTION_OK, COLLECTION_OK, COLLECTION_OK)
+    );
+    assert_eq!(films["name"], "Sci-fi novels");
+    assert_eq!(films["kind"], "file");
+    assert_eq!(reading["kind"], "bookmark");
+    assert!(uuid::Uuid::parse_str(films["uuid"].as_str().unwrap_or_default()).is_ok());
+    assert_ne!(
+        films["uuid"], again["uuid"],
+        "the same name twice is two collections"
+    );
+    let uuid_of = |v: &serde_json::Value| v["uuid"].as_str().unwrap().to_string();
+    assert_eq!(
+        collection_rows(&db.1),
+        vec![
+            (
+                uuid_of(&films),
+                "Sci-fi novels".to_string(),
+                "file".to_string()
+            ),
+            (
+                uuid_of(&reading),
+                "Reading".to_string(),
+                "bookmark".to_string()
+            ),
+            (
+                uuid_of(&again),
+                "Sci-fi novels".to_string(),
+                "file".to_string()
+            ),
+        ]
+    );
+}
+
+#[test]
+fn given_an_unrecognised_kind_when_a_collection_is_created_over_ffi_then_invalid_input_and_nothing_is_stored(
+) {
+    let _g = serial();
+    let db = init_temp_db();
+    let token = c(TEST_TOKEN);
+
+    let (status, value) = collection_create(
+        serde_json::json!({ "name": "Mixed bag", "kind": "not-a-kind" }),
+        &token,
+    );
+
+    assert_eq!(status, COLLECTION_INVALID_INPUT);
+    assert!(value.is_null(), "a refused create carries no body");
+    assert!(collection_rows(&db.1).is_empty());
+}
+
+#[test]
+fn given_a_collection_when_renamed_over_ffi_then_the_new_name_is_answered_and_stored() {
+    let _g = serial();
+    let db = init_temp_db();
+    let token = c(TEST_TOKEN);
+    let uuid = new_collection("Sci-fi novels", "file", &token);
+
+    let (status, value) = collection_rename(
+        &uuid,
+        serde_json::json!({ "name": "Sci-fi & fantasy" }),
+        &token,
+    );
+
+    assert_eq!(status, COLLECTION_OK);
+    assert_eq!(value["uuid"], uuid.as_str());
+    assert_eq!(value["name"], "Sci-fi & fantasy");
+    assert_eq!(
+        collection_rows(&db.1),
+        vec![(uuid, "Sci-fi & fantasy".to_string(), "file".to_string())]
+    );
+}
+
+#[test]
+fn given_a_collection_with_a_file_when_deleted_over_ffi_then_it_is_answered_as_it_was_and_the_file_stays_unfiled(
+) {
+    let _g = serial();
+    let db = init_temp_db();
+    let token = c(TEST_TOKEN);
+    let uuid = new_collection("Sci-fi novels", "file", &token);
+    let file = seed_file(&db.1, "text", "memo.txt");
+    assert_eq!(
+        collection_add_items(&uuid, &[&file], &token).0,
+        COLLECTION_OK
+    );
+
+    let (status, value) = collection_delete(&uuid, &token);
+
+    assert_eq!(status, COLLECTION_OK);
+    assert_eq!(value["uuid"], uuid.as_str());
+    assert_eq!(value["name"], "Sci-fi novels");
+    assert!(collection_rows(&db.1).is_empty());
+    assert_eq!(
+        count(&db.1, "SELECT COUNT(*) FROM files WHERE uuid = ?", &[&file]),
+        1,
+        "the file itself is kept"
+    );
+    assert_eq!(file_collection(&db.1, &file), None, "and filed nowhere");
+}
+
+#[test]
+fn given_an_unknown_collection_when_renamed_deleted_filled_emptied_or_listed_over_ffi_then_not_found(
+) {
+    let _g = serial();
+    let db = init_temp_db();
+    let token = c(TEST_TOKEN);
+    let unknown = unknown_uuid();
+    let file = seed_file(&db.1, "text", "memo.txt");
+
+    assert_eq!(
+        collection_rename(&unknown, serde_json::json!({ "name": "X" }), &token).0,
+        COLLECTION_NOT_FOUND
+    );
+    assert_eq!(collection_delete(&unknown, &token).0, COLLECTION_NOT_FOUND);
+    assert_eq!(
+        collection_add_items(&unknown, &[&file], &token).0,
+        COLLECTION_NOT_FOUND
+    );
+    assert_eq!(
+        collection_remove_item(&unknown, &file, &token).0,
+        COLLECTION_NOT_FOUND
+    );
+    assert_eq!(
+        collection_list_items(&unknown, &token).0,
+        COLLECTION_NOT_FOUND
+    );
+    assert_eq!(file_collection(&db.1, &file), None);
+}
+
+#[test]
+fn given_a_file_and_a_bookmark_collection_when_items_of_their_kind_are_added_over_ffi_then_they_are_filed(
+) {
+    let _g = serial();
+    let db = init_temp_db();
+    let token = c(TEST_TOKEN);
+    let files = new_collection("My files", "file", &token);
+    let links = new_collection("My links", "bookmark", &token);
+    let file = seed_file(&db.1, "text", "memo.txt");
+    let bookmark = new_bookmark("article", None, &token);
+
+    let (file_status, filed) = collection_add_items(&files, &[&file], &token);
+    let (bookmark_status, linked) = collection_add_items(&links, &[&bookmark], &token);
+
+    assert_eq!(
+        (file_status, bookmark_status),
+        (COLLECTION_OK, COLLECTION_OK)
+    );
+    assert_eq!(filed["collectionUuid"], files.as_str());
+    assert_eq!(
+        filed["items"],
+        serde_json::json!([{ "itemUuid": file, "added": true }])
+    );
+    assert_eq!(
+        linked["items"],
+        serde_json::json!([{ "itemUuid": bookmark, "added": true }])
+    );
+    assert_eq!(file_collection(&db.1, &file), Some(files));
+    assert_eq!(bookmark_collection(&db.1, &bookmark), Some(links));
+}
+
+#[test]
+fn given_an_item_of_the_other_kind_and_an_unknown_one_when_added_over_ffi_then_each_is_reported_and_neither_filed(
+) {
+    let _g = serial();
+    let db = init_temp_db();
+    let token = c(TEST_TOKEN);
+    let files = new_collection("My files", "file", &token);
+    let bookmark = new_bookmark("article", None, &token);
+    let unknown = unknown_uuid();
+
+    let (status, value) = collection_add_items(&files, &[&bookmark, &unknown], &token);
+
+    assert_eq!(status, COLLECTION_OK, "a partial add still answers");
+    assert_eq!(
+        value["items"],
+        serde_json::json!([
+            { "itemUuid": bookmark, "added": false, "reason": "wrong_kind" },
+            { "itemUuid": unknown, "added": false, "reason": "not_found" },
+        ])
+    );
+    assert_eq!(bookmark_collection(&db.1, &bookmark), None);
+}
+
+#[test]
+fn given_an_empty_item_list_when_added_to_a_collection_over_ffi_then_invalid_input() {
+    let _g = serial();
+    let _db = init_temp_db();
+    let token = c(TEST_TOKEN);
+    let files = new_collection("My files", "file", &token);
+
+    let (status, value) = collection_add_items(&files, &[], &token);
+
+    assert_eq!(status, COLLECTION_INVALID_INPUT);
+    assert!(value.is_null());
+}
+
+#[test]
+fn given_a_filed_file_and_bookmark_when_removed_over_ffi_then_both_are_unfiled() {
+    let _g = serial();
+    let db = init_temp_db();
+    let token = c(TEST_TOKEN);
+    let files = new_collection("My files", "file", &token);
+    let links = new_collection("My links", "bookmark", &token);
+    let file = seed_file(&db.1, "text", "memo.txt");
+    let bookmark = new_bookmark("article", Some(&links), &token);
+    assert_eq!(
+        collection_add_items(&files, &[&file], &token).0,
+        COLLECTION_OK
+    );
+
+    let (file_status, unfiled) = collection_remove_item(&files, &file, &token);
+    let (bookmark_status, unlinked) = collection_remove_item(&links, &bookmark, &token);
+
+    assert_eq!(
+        (file_status, bookmark_status),
+        (COLLECTION_OK, COLLECTION_OK)
+    );
+    assert_eq!(unfiled["collectionUuid"], files.as_str());
+    assert_eq!(unfiled["itemUuid"], file.as_str());
+    assert_eq!(unlinked["itemUuid"], bookmark.as_str());
+    assert_eq!(file_collection(&db.1, &file), None);
+    assert_eq!(bookmark_collection(&db.1, &bookmark), None);
+}
+
+#[test]
+fn given_an_unknown_item_or_one_not_filed_there_when_removed_over_ffi_then_not_found() {
+    let _g = serial();
+    let db = init_temp_db();
+    let token = c(TEST_TOKEN);
+    let files = new_collection("My files", "file", &token);
+    let elsewhere = new_collection("Elsewhere", "file", &token);
+    let file = seed_file(&db.1, "text", "memo.txt");
+    assert_eq!(
+        collection_add_items(&elsewhere, &[&file], &token).0,
+        COLLECTION_OK
+    );
+
+    assert_eq!(
+        collection_remove_item(&files, &unknown_uuid(), &token).0,
+        COLLECTION_NOT_FOUND
+    );
+    assert_eq!(
+        collection_remove_item(&files, &file, &token).0,
+        COLLECTION_NOT_FOUND
+    );
+    assert_eq!(
+        file_collection(&db.1, &file),
+        Some(elsewhere),
+        "left where it was"
+    );
+}
+
+#[test]
+fn given_collections_with_members_when_their_items_are_listed_over_ffi_then_files_or_bookmarks_come_back(
+) {
+    let _g = serial();
+    let db = init_temp_db();
+    let token = c(TEST_TOKEN);
+    let files = new_collection("My files", "file", &token);
+    let links = new_collection("My links", "bookmark", &token);
+    let empty = new_collection("Nothing yet", "file", &token);
+    let file = seed_file(&db.1, "text", "memo.txt");
+    let bookmark = new_bookmark("article", Some(&links), &token);
+    assert_eq!(
+        collection_add_items(&files, &[&file], &token).0,
+        COLLECTION_OK
+    );
+
+    let (file_status, of_files) = collection_list_items(&files, &token);
+    let (bookmark_status, of_links) = collection_list_items(&links, &token);
+    let (empty_status, of_empty) = collection_list_items(&empty, &token);
+
+    assert_eq!(
+        (file_status, bookmark_status, empty_status),
+        (COLLECTION_OK, COLLECTION_OK, COLLECTION_OK)
+    );
+    assert_eq!(of_files["collectionUuid"], files.as_str());
+    assert_eq!(of_files["kind"], "file");
+    assert_eq!(of_files["items"].as_array().map(Vec::len), Some(1));
+    assert_eq!(of_files["items"][0]["uuid"], file.as_str());
+    assert_eq!(of_links["kind"], "bookmark");
+    assert_eq!(of_links["items"].as_array().map(Vec::len), Some(1));
+    assert_eq!(of_links["items"][0]["uuid"], bookmark.as_str());
+    assert_eq!(of_empty["items"], serde_json::json!([]));
+}
+
+/// `(name, kind)` of each summary a collection listing answers, sorted.
+fn summaries(listed: &serde_json::Value) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = listed
+        .as_array()
+        .expect("array")
+        .iter()
+        .map(|c| {
+            (
+                c["name"].as_str().unwrap().to_string(),
+                c["kind"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+#[test]
+fn given_collections_of_both_kinds_when_listed_over_ffi_then_all_or_only_the_kind_asked_for() {
+    let _g = serial();
+    let _db = init_temp_db();
+    let token = c(TEST_TOKEN);
+
+    let (none_status, none) = collections_list(serde_json::json!({}), &token);
+    assert_eq!(none_status, COLLECTION_OK);
+    assert_eq!(
+        none,
+        serde_json::json!([]),
+        "no collections is an empty array"
+    );
+
+    new_collection("Films", "file", &token);
+    let reading = new_collection("Reading", "bookmark", &token);
+
+    let (all_status, all) = collections_list(serde_json::json!({}), &token);
+    let (empty_kind_status, empty_kind) =
+        collections_list(serde_json::json!({ "kind": "" }), &token);
+    let (kind_status, bookmarks) =
+        collections_list(serde_json::json!({ "kind": "bookmark" }), &token);
+
+    assert_eq!(
+        (all_status, empty_kind_status, kind_status),
+        (COLLECTION_OK, COLLECTION_OK, COLLECTION_OK)
+    );
+    let both = vec![
+        ("Films".to_string(), "file".to_string()),
+        ("Reading".to_string(), "bookmark".to_string()),
+    ];
+    assert_eq!(summaries(&all), both);
+    assert_eq!(summaries(&empty_kind), both, "an empty kind is no filter");
+    assert_eq!(bookmarks.as_array().map(Vec::len), Some(1));
+    assert_eq!(bookmarks[0]["uuid"], reading.as_str());
+}
+
+#[test]
+fn given_only_bookmark_collections_when_file_ones_are_listed_over_ffi_then_an_empty_array() {
+    let _g = serial();
+    let _db = init_temp_db();
+    let token = c(TEST_TOKEN);
+    new_collection("Reading", "bookmark", &token);
+
+    let (status, value) = collections_list(serde_json::json!({ "kind": "file" }), &token);
+
+    assert_eq!(status, COLLECTION_OK);
+    assert_eq!(value, serde_json::json!([]));
+}
+
+#[test]
+fn given_an_unknown_kind_when_collections_are_listed_over_ffi_then_invalid_input() {
+    let _g = serial();
+    let _db = init_temp_db();
+    let token = c(TEST_TOKEN);
+
+    let (status, value) = collections_list(serde_json::json!({ "kind": "playlist" }), &token);
+
+    assert_eq!(status, COLLECTION_INVALID_INPUT);
+    assert!(value.is_null());
+}
+
+#[test]
+fn given_members_some_soft_deleted_when_collections_are_listed_over_ffi_then_only_active_ones_are_counted(
+) {
+    let _g = serial();
+    let db = init_temp_db();
+    let token = c(TEST_TOKEN);
+    let files = new_collection("Films", "file", &token);
+    let links = new_collection("Reading", "bookmark", &token);
+    let kept_a = seed_file(&db.1, "text", "a.txt");
+    let kept_b = seed_file(&db.1, "text", "b.txt");
+    let gone = seed_file(&db.1, "text", "c.txt");
+    assert_eq!(
+        collection_add_items(&files, &[&kept_a, &kept_b, &gone], &token).0,
+        COLLECTION_OK
+    );
+    exec(
+        &db.1,
+        "UPDATE files SET state = 'deleted', deleted_at = ? WHERE uuid = ?",
+        &[&chrono::Utc::now().to_rfc3339(), &gone],
+    );
+    new_bookmark("kept", Some(&links), &token);
+    let deleted = new_bookmark("deleted", Some(&links), &token);
+    assert_eq!(
+        bookmark_soft_delete(&deleted, &token).0,
+        alexandria_ffi::BOOKMARK_OK
+    );
+
+    let (status, listed) = collections_list(serde_json::json!({}), &token);
+
+    assert_eq!(status, COLLECTION_OK);
+    let count_of = |uuid: &str| {
+        listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["uuid"] == uuid)
+            .unwrap_or_else(|| panic!("{uuid} listed: {listed}"))["itemCount"]
+            .clone()
+    };
+    assert_eq!(count_of(&files), 2);
+    assert_eq!(count_of(&links), 1);
+}
+
+// ---------------- bookmarks (UC-16 to UC-21) ----------------
+
+const BOOKMARK_OK: i32 = alexandria_ffi::BOOKMARK_OK;
+const BOOKMARK_INVALID_INPUT: i32 = alexandria_ffi::BOOKMARK_ERR_INVALID_INPUT;
+const BOOKMARK_NOT_FOUND: i32 = alexandria_ffi::BOOKMARK_ERR_NOT_FOUND;
+const BOOKMARK_INVALID_STATE: i32 = alexandria_ffi::BOOKMARK_ERR_INVALID_STATE;
+
+/// `(url, title, state)` of one bookmark row.
+fn bookmark_row(db_path: &str, uuid: &str) -> (String, String, String) {
+    fetch_all(
+        db_path,
+        "SELECT url, title, state FROM bookmarks WHERE uuid = ?",
+        &[uuid],
+    )
+    .pop()
+    .expect("bookmark row")
+}
+
+fn bookmark_count(db_path: &str) -> i64 {
+    count(db_path, "SELECT COUNT(*) FROM bookmarks", &[])
+}
+
+#[test]
+fn given_a_url_and_title_when_bookmarks_are_created_over_ffi_then_each_is_answered_and_stored() {
+    let _g = serial();
+    let db = init_temp_db();
+    let token = c(TEST_TOKEN);
+    let links = new_collection("Reading", "bookmark", &token);
+
+    let (loose_status, loose) = bookmark_create(
+        serde_json::json!({ "url": "https://example.com/article", "title": "An article" }),
+        &token,
+    );
+    let (filed_status, filed) = bookmark_create(
+        serde_json::json!({
+            "url": "https://example.com/paper",
+            "title": "A paper",
+            "collectionUuid": links,
+        }),
+        &token,
+    );
+
+    assert_eq!((loose_status, filed_status), (BOOKMARK_OK, BOOKMARK_OK));
+    let loose_uuid = loose["uuid"].as_str().expect("uuid");
+    assert!(uuid::Uuid::parse_str(loose_uuid).is_ok());
+    assert_eq!(loose["url"], "https://example.com/article");
+    assert_eq!(loose["title"], "An article");
+    assert!(loose["collectionUuid"].is_null());
+    assert_eq!(filed["collectionUuid"], links.as_str());
+    assert_eq!(
+        bookmark_row(&db.1, loose_uuid),
+        (
+            "https://example.com/article".to_string(),
+            "An article".to_string(),
+            "active".to_string()
+        )
+    );
+    assert_eq!(bookmark_collection(&db.1, loose_uuid), None);
+    assert_eq!(
+        bookmark_collection(&db.1, filed["uuid"].as_str().unwrap()),
+        Some(links)
+    );
+}
+
+#[test]
+fn given_an_unknown_collection_when_a_bookmark_is_created_over_ffi_then_not_found_and_nothing_is_stored(
+) {
+    let _g = serial();
+    let db = init_temp_db();
+    let token = c(TEST_TOKEN);
+
+    let (status, value) = bookmark_create(
+        serde_json::json!({
+            "url": "https://example.com",
+            "title": "T",
+            "collectionUuid": unknown_uuid(),
+        }),
+        &token,
+    );
+
+    assert_eq!(status, BOOKMARK_NOT_FOUND);
+    assert!(value.is_null());
+    assert_eq!(bookmark_count(&db.1), 0);
+}
+
+#[test]
+fn given_a_bookmark_when_updated_over_ffi_then_its_new_fields_and_collection_are_stored() {
+    let _g = serial();
+    let db = init_temp_db();
+    let token = c(TEST_TOKEN);
+    let links = new_collection("Reading", "bookmark", &token);
+    let uuid = new_bookmark("old", None, &token);
+
+    let (status, value) = bookmark_update(
+        &uuid,
+        serde_json::json!({
+            "url": "https://example.org",
+            "title": "New title",
+            "collectionUuid": links,
+        }),
+        &token,
+    );
+
+    assert_eq!(status, BOOKMARK_OK);
+    assert_eq!(value["url"], "https://example.org");
+    assert_eq!(value["title"], "New title");
+    assert_eq!(value["collectionUuid"], links.as_str());
+    assert_eq!(
+        bookmark_row(&db.1, &uuid),
+        (
+            "https://example.org".to_string(),
+            "New title".to_string(),
+            "active".to_string()
+        )
+    );
+    assert_eq!(bookmark_collection(&db.1, &uuid), Some(links));
+}
+
+#[test]
+fn given_an_unknown_bookmark_when_updated_deleted_restored_or_purged_over_ffi_then_not_found() {
+    let _g = serial();
+    let _db = init_temp_db();
+    let token = c(TEST_TOKEN);
+    let unknown = unknown_uuid();
+
+    assert_eq!(
+        bookmark_update(
+            &unknown,
+            serde_json::json!({ "url": "https://example.org", "title": "T" }),
+            &token
+        )
+        .0,
+        BOOKMARK_NOT_FOUND
+    );
+    assert_eq!(bookmark_soft_delete(&unknown, &token).0, BOOKMARK_NOT_FOUND);
+    assert_eq!(bookmark_restore(&unknown, &token).0, BOOKMARK_NOT_FOUND);
+    assert_eq!(bookmark_purge(&unknown, &token).0, BOOKMARK_NOT_FOUND);
+}
+
+fn titles(listed: &serde_json::Value) -> Vec<String> {
+    let mut out: Vec<String> = listed
+        .as_array()
+        .expect("array")
+        .iter()
+        .map(|b| b["title"].as_str().unwrap().to_string())
+        .collect();
+    out.sort();
+    out
+}
+
+#[test]
+fn given_bookmarks_when_listed_over_ffi_then_active_ones_by_default_one_collections_or_all() {
+    let _g = serial();
+    let _db = init_temp_db();
+    let token = c(TEST_TOKEN);
+    let links = new_collection("Reading", "bookmark", &token);
+    new_bookmark("A", Some(&links), &token);
+    new_bookmark("B", None, &token);
+    let deleted = new_bookmark("C", None, &token);
+    assert_eq!(bookmark_soft_delete(&deleted, &token).0, BOOKMARK_OK);
+
+    let (default_status, active) = bookmarks_list(serde_json::json!({}), &token);
+    let (filed_status, filed) =
+        bookmarks_list(serde_json::json!({ "collectionUuid": links }), &token);
+    let (all_status, all) = bookmarks_list(serde_json::json!({ "state": "all" }), &token);
+
+    assert_eq!(
+        (default_status, filed_status, all_status),
+        (BOOKMARK_OK, BOOKMARK_OK, BOOKMARK_OK)
+    );
+    assert_eq!(titles(&active), vec!["A", "B"]);
+    assert_eq!(titles(&filed), vec!["A"]);
+    assert_eq!(titles(&all), vec!["A", "B", "C"]);
+}
+
+#[test]
+fn given_unusable_filters_when_bookmarks_are_listed_over_ffi_then_they_are_refused() {
+    let _g = serial();
+    let _db = init_temp_db();
+    let token = c(TEST_TOKEN);
+
+    assert_eq!(
+        bookmarks_list(
+            serde_json::json!({ "collectionUuid": unknown_uuid() }),
+            &token
+        )
+        .0,
+        BOOKMARK_NOT_FOUND
+    );
+    assert_eq!(
+        bookmarks_list(
+            serde_json::json!({ "collectionUuid": "not-a-uuid" }),
+            &token
+        )
+        .0,
+        BOOKMARK_INVALID_INPUT
+    );
+    assert_eq!(
+        bookmarks_list(serde_json::json!({ "state": "archived" }), &token).0,
+        BOOKMARK_INVALID_INPUT
+    );
+}
+
+#[test]
+fn given_a_bookmark_when_soft_deleted_and_restored_over_ffi_then_each_state_is_stored_once() {
+    let _g = serial();
+    let db = init_temp_db();
+    let token = c(TEST_TOKEN);
+    let uuid = new_bookmark("article", None, &token);
+
+    let (restore_active, _) = bookmark_restore(&uuid, &token);
+    let (deleted_status, deleted) = bookmark_soft_delete(&uuid, &token);
+    let deleted_row = bookmark_row(&db.1, &uuid).2;
+    let (again_status, _) = bookmark_soft_delete(&uuid, &token);
+    let (restored_status, restored) = bookmark_restore(&uuid, &token);
+
+    assert_eq!(
+        restore_active, BOOKMARK_INVALID_STATE,
+        "an active one is not restored"
+    );
+    assert_eq!(deleted_status, BOOKMARK_OK);
+    assert_eq!(deleted["state"], "deleted");
+    assert!(deleted["deletedAt"].is_string(), "{deleted}");
+    assert_eq!(deleted_row, "deleted");
+    assert_eq!(
+        again_status, BOOKMARK_INVALID_STATE,
+        "a deleted one is not deleted again"
+    );
+    assert_eq!(restored_status, BOOKMARK_OK);
+    assert_eq!(restored["state"], "active");
+    assert!(restored["deletedAt"].is_null());
+    assert_eq!(bookmark_row(&db.1, &uuid).2, "active");
+}
+
+#[test]
+fn given_bookmarks_when_purged_over_ffi_then_only_one_deleted_past_the_window_goes() {
+    let _g = serial();
+    let db = init_temp_db();
+    let token = c(TEST_TOKEN);
+    let past = new_bookmark("past", None, &token);
+    let recent = new_bookmark("recent", None, &token);
+    let active = new_bookmark("active", None, &token);
+    exec(
+        &db.1,
+        "UPDATE bookmarks SET state = 'deleted', deleted_at = '2024-01-01T00:00:00Z' WHERE uuid = ?",
+        &[&past],
+    );
+    assert_eq!(bookmark_soft_delete(&recent, &token).0, BOOKMARK_OK);
+
+    let (past_status, purged) = bookmark_purge(&past, &token);
+    let (recent_status, _) = bookmark_purge(&recent, &token);
+    let (active_status, _) = bookmark_purge(&active, &token);
+
+    assert_eq!(past_status, BOOKMARK_OK);
+    assert_eq!(purged["uuid"], past.as_str());
+    assert_eq!(
+        recent_status, BOOKMARK_INVALID_STATE,
+        "still inside the window"
+    );
+    assert_eq!(active_status, BOOKMARK_INVALID_STATE, "never deleted");
+    assert_eq!(
+        count(
+            &db.1,
+            "SELECT COUNT(*) FROM bookmarks WHERE uuid = ?",
+            &[&past]
+        ),
+        0
+    );
+    assert_eq!(bookmark_count(&db.1), 2, "the other two are kept");
+}
+
+// ---------------- watchlists (UC-22 to UC-27) ----------------
+
+const WATCHLIST_OK: i32 = alexandria_ffi::WATCHLIST_OK;
+const WATCHLIST_INVALID_INPUT: i32 = alexandria_ffi::WATCHLIST_ERR_INVALID_INPUT;
+const WATCHLIST_NOT_FOUND: i32 = alexandria_ffi::WATCHLIST_ERR_NOT_FOUND;
+const WATCHLIST_INVALID_STATE: i32 = alexandria_ffi::WATCHLIST_ERR_INVALID_STATE;
+
+fn new_watchlist(name: &str, token: &CString) -> String {
+    let (status, value) = watchlist_create(serde_json::json!({ "name": name }), token);
+    assert_eq!(status, WATCHLIST_OK, "create {name}: {value}");
+    value["uuid"].as_str().expect("uuid").to_string()
+}
+
+/// `(watchlist uuid, video uuid, state, current episode, total episodes)`
+/// of every watch_progress row.
+type WatchRow = (String, String, String, Option<i64>, Option<i64>);
+
+fn watch_row(
+    watchlist: &str,
+    video: &str,
+    state: &str,
+    current: Option<i64>,
+    total: Option<i64>,
+) -> WatchRow {
+    (
+        watchlist.to_string(),
+        video.to_string(),
+        state.to_string(),
+        current,
+        total,
+    )
+}
+
+fn watch_rows(db_path: &str) -> Vec<WatchRow> {
+    fetch_all(
+        db_path,
+        "SELECT watchlists.uuid, files.uuid, watch_progress.state, \
+                watch_progress.current_episode, watch_progress.total_episodes \
+         FROM watch_progress \
+         JOIN watchlists ON watchlists.id = watch_progress.watchlist_id \
+         JOIN files ON files.id = watch_progress.video_file_id \
+         ORDER BY watch_progress.id",
+        &[],
+    )
+}
+
+fn file_count(db_path: &str, uuid: &str) -> i64 {
+    count(
+        db_path,
+        "SELECT COUNT(*) FROM files WHERE uuid = ?",
+        &[uuid],
+    )
+}
+
+#[test]
+fn given_a_name_when_watchlists_are_created_over_ffi_then_each_is_answered_and_stored() {
+    let _g = serial();
+    let db = init_temp_db();
+    let token = c(TEST_TOKEN);
+
+    let (status, value) = watchlist_create(serde_json::json!({ "name": "Weekend movies" }), &token);
+    let (again_status, again) =
+        watchlist_create(serde_json::json!({ "name": "Weekend movies" }), &token);
+
+    assert_eq!((status, again_status), (WATCHLIST_OK, WATCHLIST_OK));
+    assert_eq!(value["name"], "Weekend movies");
+    let uuid = value["uuid"].as_str().expect("uuid").to_string();
+    assert!(uuid::Uuid::parse_str(&uuid).is_ok());
+    assert_ne!(value["uuid"], again["uuid"]);
+    let rows: Vec<(String, String)> =
+        fetch_all(&db.1, "SELECT uuid, name FROM watchlists ORDER BY id", &[]);
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0], (uuid, "Weekend movies".to_string()));
+}
+
+#[test]
+fn given_a_video_when_added_to_a_watchlist_over_ffi_then_pending_progress_is_stored_once() {
+    let _g = serial();
+    let db = init_temp_db();
+    let token = c(TEST_TOKEN);
+    let watchlist = new_watchlist("Weekend movies", &token);
+    let video = seed_file(&db.1, "video", "film.mkv");
+
+    let (status, value) = watchlist_add_video(&watchlist, &video, &token);
+    let (again_status, _) = watchlist_add_video(&watchlist, &video, &token);
+
+    assert_eq!((status, again_status), (WATCHLIST_OK, WATCHLIST_OK));
+    assert_eq!(value["watchlistUuid"], watchlist.as_str());
+    assert_eq!(value["videoUuid"], video.as_str());
+    assert_eq!(value["state"], "pending");
+    assert!(value["currentEpisode"].is_null());
+    assert!(value["totalEpisodes"].is_null());
+    assert_eq!(
+        watch_rows(&db.1),
+        vec![watch_row(&watchlist, &video, "pending", None, None)],
+        "adding it again stores no second row"
+    );
+}
+
+#[test]
+fn given_a_non_video_or_an_unknown_target_when_a_video_is_added_over_ffi_then_refused_and_nothing_is_stored(
+) {
+    let _g = serial();
+    let db = init_temp_db();
+    let token = c(TEST_TOKEN);
+    let watchlist = new_watchlist("Weekend movies", &token);
+    let video = seed_file(&db.1, "video", "film.mkv");
+    let memo = seed_file(&db.1, "text", "memo.txt");
+
+    assert_eq!(
+        watchlist_add_video(&watchlist, &memo, &token).0,
+        WATCHLIST_INVALID_INPUT
+    );
+    assert_eq!(
+        watchlist_add_video(&unknown_uuid(), &video, &token).0,
+        WATCHLIST_NOT_FOUND
+    );
+    assert_eq!(
+        watchlist_add_video(&watchlist, &unknown_uuid(), &token).0,
+        WATCHLIST_NOT_FOUND
+    );
+    assert!(watch_rows(&db.1).is_empty());
+}
+
+#[test]
+fn given_watchlists_when_listed_over_ffi_then_each_carries_its_progress() {
+    let _g = serial();
+    let db = init_temp_db();
+    let token = c(TEST_TOKEN);
+    let (none_status, none) = watchlists_list(serde_json::json!({}), &token);
+    let with_video = new_watchlist("Movies", &token);
+    let empty = new_watchlist("Series", &token);
+    let video = seed_file(&db.1, "video", "film.mkv");
+    assert_eq!(
+        watchlist_add_video(&with_video, &video, &token).0,
+        WATCHLIST_OK
+    );
+
+    let (all_status, all) = watchlists_list(serde_json::json!({}), &token);
+    let (one_status, one) =
+        watchlists_list(serde_json::json!({ "watchlistUuid": with_video }), &token);
+
+    assert_eq!(
+        (none_status, all_status, one_status),
+        (WATCHLIST_OK, WATCHLIST_OK, WATCHLIST_OK)
+    );
+    assert_eq!(none, serde_json::json!([]), "none is an empty array");
+    let listed = |uuid: &str| {
+        all.as_array()
+            .unwrap()
+            .iter()
+            .find(|w| w["uuid"] == uuid)
+            .unwrap_or_else(|| panic!("{uuid} listed: {all}"))
+            .clone()
+    };
+    assert_eq!(all.as_array().map(Vec::len), Some(2));
+    let movies = listed(&with_video);
+    assert_eq!(movies["items"].as_array().map(Vec::len), Some(1));
+    assert_eq!(movies["items"][0]["videoUuid"], video.as_str());
+    assert_eq!(movies["items"][0]["state"], "pending");
+    assert_eq!(listed(&empty)["items"], serde_json::json!([]));
+    assert_eq!(one.as_array().map(Vec::len), Some(1));
+    assert_eq!(one[0]["uuid"], with_video.as_str());
+}
+
+#[test]
+fn given_an_unknown_watchlist_when_listed_or_deleted_over_ffi_then_not_found() {
+    let _g = serial();
+    let db = init_temp_db();
+    let token = c(TEST_TOKEN);
+    new_watchlist("Movies", &token);
+
+    assert_eq!(
+        watchlists_list(
+            serde_json::json!({ "watchlistUuid": unknown_uuid() }),
+            &token
+        )
+        .0,
+        WATCHLIST_NOT_FOUND
+    );
+    assert_eq!(
+        watchlist_delete(&unknown_uuid(), &token).0,
+        WATCHLIST_NOT_FOUND
+    );
+    assert_eq!(count(&db.1, "SELECT COUNT(*) FROM watchlists", &[]), 1);
+}
+
+#[test]
+fn given_pending_progress_when_updated_over_ffi_then_the_state_and_episodes_are_stored() {
+    let _g = serial();
+    let db = init_temp_db();
+    let token = c(TEST_TOKEN);
+    let watchlist = new_watchlist("Series", &token);
+    let video = seed_file(&db.1, "video", "show.mkv");
+    assert_eq!(
+        watchlist_add_video(&watchlist, &video, &token).0,
+        WATCHLIST_OK
+    );
+
+    let (status, value) = watchlist_update_progress(
+        &watchlist,
+        &video,
+        serde_json::json!({ "state": "watching", "currentEpisode": 3, "totalEpisodes": 12 }),
+        &token,
+    );
+
+    assert_eq!(status, WATCHLIST_OK);
+    assert_eq!(value["watchlistUuid"], watchlist.as_str());
+    assert_eq!(value["videoUuid"], video.as_str());
+    assert_eq!(value["state"], "watching");
+    assert_eq!(value["currentEpisode"], 3);
+    assert_eq!(value["totalEpisodes"], 12);
+    assert_eq!(
+        watch_rows(&db.1),
+        vec![watch_row(&watchlist, &video, "watching", Some(3), Some(12))]
+    );
+}
+
+#[test]
+fn given_a_refused_progress_update_over_ffi_then_the_row_is_left_pending() {
+    let _g = serial();
+    let db = init_temp_db();
+    let token = c(TEST_TOKEN);
+    let watchlist = new_watchlist("Series", &token);
+    let video = seed_file(&db.1, "video", "show.mkv");
+    let other = seed_file(&db.1, "video", "other.mkv");
+    assert_eq!(
+        watchlist_add_video(&watchlist, &video, &token).0,
+        WATCHLIST_OK
+    );
+
+    let skipped = watchlist_update_progress(
+        &watchlist,
+        &video,
+        serde_json::json!({ "state": "watched" }),
+        &token,
+    );
+    let unknown_state = watchlist_update_progress(
+        &watchlist,
+        &video,
+        serde_json::json!({ "state": "paused" }),
+        &token,
+    );
+    let not_listed = watchlist_update_progress(
+        &watchlist,
+        &other,
+        serde_json::json!({ "state": "watching" }),
+        &token,
+    );
+
+    assert_eq!(
+        skipped.0, WATCHLIST_INVALID_STATE,
+        "pending cannot skip to watched"
+    );
+    assert_eq!(unknown_state.0, WATCHLIST_INVALID_INPUT);
+    assert_eq!(not_listed.0, WATCHLIST_NOT_FOUND);
+    assert_eq!(watch_rows(&db.1)[0].2, "pending");
+}
+
+#[test]
+fn given_a_video_on_a_watchlist_when_removed_over_ffi_then_its_progress_goes_and_the_file_stays() {
+    let _g = serial();
+    let db = init_temp_db();
+    let token = c(TEST_TOKEN);
+    let watchlist = new_watchlist("Movies", &token);
+    let video = seed_file(&db.1, "video", "film.mkv");
+    let never_added = seed_file(&db.1, "video", "other.mkv");
+    assert_eq!(
+        watchlist_add_video(&watchlist, &video, &token).0,
+        WATCHLIST_OK
+    );
+
+    let (status, value) = watchlist_remove_video(&watchlist, &video, &token);
+    let (again_status, _) = watchlist_remove_video(&watchlist, &video, &token);
+    let (never_status, _) = watchlist_remove_video(&watchlist, &never_added, &token);
+
+    assert_eq!(status, WATCHLIST_OK);
+    assert_eq!(value["watchlistUuid"], watchlist.as_str());
+    assert_eq!(value["videoUuid"], video.as_str());
+    assert_eq!(again_status, WATCHLIST_NOT_FOUND, "removed twice");
+    assert_eq!(never_status, WATCHLIST_NOT_FOUND, "never on the list");
+    assert!(watch_rows(&db.1).is_empty());
+    assert_eq!(file_count(&db.1, &video), 1, "the video itself is kept");
+}
+
+#[test]
+fn given_a_watchlist_with_a_video_when_deleted_over_ffi_then_it_and_its_progress_go_and_the_video_stays(
+) {
+    let _g = serial();
+    let db = init_temp_db();
+    let token = c(TEST_TOKEN);
+    let watchlist = new_watchlist("Weekend movies", &token);
+    let video = seed_file(&db.1, "video", "film.mkv");
+    assert_eq!(
+        watchlist_add_video(&watchlist, &video, &token).0,
+        WATCHLIST_OK
+    );
+
+    let (status, value) = watchlist_delete(&watchlist, &token);
+
+    assert_eq!(status, WATCHLIST_OK);
+    assert_eq!(value["uuid"], watchlist.as_str());
+    assert_eq!(value["name"], "Weekend movies");
+    assert_eq!(count(&db.1, "SELECT COUNT(*) FROM watchlists", &[]), 0);
+    assert!(watch_rows(&db.1).is_empty());
+    assert_eq!(file_count(&db.1, &video), 1);
+}
+
+// ---------------- reading lists (UC-28 to UC-31) ----------------
+
+const READING_LIST_OK: i32 = alexandria_ffi::READING_LIST_OK;
+const READING_LIST_INVALID_INPUT: i32 = alexandria_ffi::READING_LIST_ERR_INVALID_INPUT;
+const READING_LIST_NOT_FOUND: i32 = alexandria_ffi::READING_LIST_ERR_NOT_FOUND;
+const READING_LIST_INVALID_STATE: i32 = alexandria_ffi::READING_LIST_ERR_INVALID_STATE;
+
+fn new_reading_list(name: &str, token: &CString) -> String {
+    let (status, value) = reading_list_create(serde_json::json!({ "name": name }), token);
+    assert_eq!(status, READING_LIST_OK, "create {name}: {value}");
+    value["uuid"].as_str().expect("uuid").to_string()
+}
+
+/// `(reading list uuid, item uuid, target kind, state, current issue,
+/// total issues)` of every reading_progress row.
+type ReadingRow = (String, String, String, String, Option<i64>, Option<i64>);
+
+fn reading_row(
+    list: &str,
+    item: &str,
+    kind: &str,
+    state: &str,
+    current: Option<i64>,
+    total: Option<i64>,
+) -> ReadingRow {
+    (
+        list.to_string(),
+        item.to_string(),
+        kind.to_string(),
+        state.to_string(),
+        current,
+        total,
+    )
+}
+
+fn reading_rows(db_path: &str) -> Vec<ReadingRow> {
+    fetch_all(
+        db_path,
+        "SELECT reading_lists.uuid, files.uuid, reading_progress.target_kind, \
+                reading_progress.state, reading_progress.current_issue, \
+                reading_progress.total_issues \
+         FROM reading_progress \
+         JOIN reading_lists ON reading_lists.id = reading_progress.reading_list_id \
+         JOIN files ON files.id = reading_progress.item_file_id \
+         ORDER BY reading_progress.id",
+        &[],
+    )
+}
+
+#[test]
+fn given_a_name_when_reading_lists_are_created_over_ffi_then_each_is_answered_and_stored() {
+    let _g = serial();
+    let db = init_temp_db();
+    let token = c(TEST_TOKEN);
+
+    let (status, value) =
+        reading_list_create(serde_json::json!({ "name": "Summer reads" }), &token);
+    let (again_status, again) =
+        reading_list_create(serde_json::json!({ "name": "Summer reads" }), &token);
+
+    assert_eq!((status, again_status), (READING_LIST_OK, READING_LIST_OK));
+    assert_eq!(value["name"], "Summer reads");
+    let uuid = value["uuid"].as_str().expect("uuid").to_string();
+    assert!(uuid::Uuid::parse_str(&uuid).is_ok());
+    assert_ne!(value["uuid"], again["uuid"]);
+    let rows: Vec<(String, String)> = fetch_all(
+        &db.1,
+        "SELECT uuid, name FROM reading_lists ORDER BY id",
+        &[],
+    );
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0], (uuid, "Summer reads".to_string()));
+}
+
+#[test]
+fn given_a_document_and_a_comic_when_added_to_a_reading_list_over_ffi_then_pending_progress_of_their_kind_is_stored_once(
+) {
+    let _g = serial();
+    let db = init_temp_db();
+    let token = c(TEST_TOKEN);
+    let list = new_reading_list("Summer reads", &token);
+    let book = seed_file(&db.1, "document", "book.pdf");
+    let issue = seed_file(&db.1, "comic", "issue.cbz");
+
+    let (status, value) = reading_list_add_item(&list, &book, &token);
+    let (again_status, _) = reading_list_add_item(&list, &book, &token);
+    let (comic_status, comic) = reading_list_add_item(&list, &issue, &token);
+
+    assert_eq!(
+        (status, again_status, comic_status),
+        (READING_LIST_OK, READING_LIST_OK, READING_LIST_OK)
+    );
+    assert_eq!(value["readingListUuid"], list.as_str());
+    assert_eq!(value["itemUuid"], book.as_str());
+    assert_eq!(value["targetKind"], "document");
+    assert_eq!(value["state"], "pending");
+    assert!(value["currentIssue"].is_null());
+    assert!(value["totalIssues"].is_null());
+    assert_eq!(comic["targetKind"], "comic");
+    assert_eq!(
+        reading_rows(&db.1),
+        vec![
+            reading_row(&list, &book, "document", "pending", None, None),
+            reading_row(&list, &issue, "comic", "pending", None, None),
+        ],
+        "adding the document again stores no second row"
+    );
+}
+
+#[test]
+fn given_an_ineligible_or_unknown_target_when_an_item_is_added_over_ffi_then_refused_and_nothing_is_stored(
+) {
+    let _g = serial();
+    let db = init_temp_db();
+    let token = c(TEST_TOKEN);
+    let list = new_reading_list("Summer reads", &token);
+    let book = seed_file(&db.1, "document", "book.pdf");
+    let film = seed_file(&db.1, "video", "film.mkv");
+
+    assert_eq!(
+        reading_list_add_item(&list, &film, &token).0,
+        READING_LIST_INVALID_INPUT
+    );
+    assert_eq!(
+        reading_list_add_item(&unknown_uuid(), &book, &token).0,
+        READING_LIST_NOT_FOUND
+    );
+    assert_eq!(
+        reading_list_add_item(&list, &unknown_uuid(), &token).0,
+        READING_LIST_NOT_FOUND
+    );
+    assert!(reading_rows(&db.1).is_empty());
+}
+
+#[test]
+fn given_reading_lists_when_listed_over_ffi_then_each_carries_its_progress() {
+    let _g = serial();
+    let db = init_temp_db();
+    let token = c(TEST_TOKEN);
+    let (none_status, none) = reading_lists_list(serde_json::json!({}), &token);
+    let with_book = new_reading_list("Books", &token);
+    let empty = new_reading_list("Comics", &token);
+    let book = seed_file(&db.1, "document", "book.pdf");
+    assert_eq!(
+        reading_list_add_item(&with_book, &book, &token).0,
+        READING_LIST_OK
+    );
+
+    let (all_status, all) = reading_lists_list(serde_json::json!({}), &token);
+    let (one_status, one) =
+        reading_lists_list(serde_json::json!({ "readingListUuid": with_book }), &token);
+
+    assert_eq!(
+        (none_status, all_status, one_status),
+        (READING_LIST_OK, READING_LIST_OK, READING_LIST_OK)
+    );
+    assert_eq!(none, serde_json::json!([]), "none is an empty array");
+    let listed = |uuid: &str| {
+        all.as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["uuid"] == uuid)
+            .unwrap_or_else(|| panic!("{uuid} listed: {all}"))
+            .clone()
+    };
+    assert_eq!(all.as_array().map(Vec::len), Some(2));
+    let books = listed(&with_book);
+    assert_eq!(books["items"].as_array().map(Vec::len), Some(1));
+    assert_eq!(books["items"][0]["itemUuid"], book.as_str());
+    assert_eq!(books["items"][0]["state"], "pending");
+    assert_eq!(listed(&empty)["items"], serde_json::json!([]));
+    assert_eq!(one.as_array().map(Vec::len), Some(1));
+    assert_eq!(one[0]["uuid"], with_book.as_str());
+}
+
+#[test]
+fn given_an_unknown_reading_list_when_listed_or_deleted_over_ffi_then_not_found() {
+    let _g = serial();
+    let db = init_temp_db();
+    let token = c(TEST_TOKEN);
+    new_reading_list("Books", &token);
+
+    assert_eq!(
+        reading_lists_list(
+            serde_json::json!({ "readingListUuid": unknown_uuid() }),
+            &token
+        )
+        .0,
+        READING_LIST_NOT_FOUND
+    );
+    assert_eq!(
+        reading_list_delete(&unknown_uuid(), &token).0,
+        READING_LIST_NOT_FOUND
+    );
+    assert_eq!(count(&db.1, "SELECT COUNT(*) FROM reading_lists", &[]), 1);
+}
+
+#[test]
+fn given_pending_progress_when_updated_over_ffi_then_the_state_and_issues_are_stored() {
+    let _g = serial();
+    let db = init_temp_db();
+    let token = c(TEST_TOKEN);
+    let list = new_reading_list("Comics", &token);
+    let issue = seed_file(&db.1, "comic", "issue.cbz");
+    assert_eq!(
+        reading_list_add_item(&list, &issue, &token).0,
+        READING_LIST_OK
+    );
+
+    let (status, value) = reading_list_update_progress(
+        &list,
+        &issue,
+        serde_json::json!({ "state": "reading", "currentIssue": 3, "totalIssues": 12 }),
+        &token,
+    );
+
+    assert_eq!(status, READING_LIST_OK);
+    assert_eq!(value["readingListUuid"], list.as_str());
+    assert_eq!(value["itemUuid"], issue.as_str());
+    assert_eq!(value["state"], "reading");
+    assert_eq!(value["currentIssue"], 3);
+    assert_eq!(value["totalIssues"], 12);
+    assert_eq!(
+        reading_rows(&db.1),
+        vec![reading_row(
+            &list,
+            &issue,
+            "comic",
+            "reading",
+            Some(3),
+            Some(12)
+        )]
+    );
+}
+
+#[test]
+fn given_a_refused_reading_progress_update_over_ffi_then_the_row_is_left_pending() {
+    let _g = serial();
+    let db = init_temp_db();
+    let token = c(TEST_TOKEN);
+    let list = new_reading_list("Books", &token);
+    let book = seed_file(&db.1, "document", "book.pdf");
+    let other = seed_file(&db.1, "document", "other.pdf");
+    assert_eq!(
+        reading_list_add_item(&list, &book, &token).0,
+        READING_LIST_OK
+    );
+
+    let skipped =
+        reading_list_update_progress(&list, &book, serde_json::json!({ "state": "read" }), &token);
+    let unknown_state = reading_list_update_progress(
+        &list,
+        &book,
+        serde_json::json!({ "state": "skimmed" }),
+        &token,
+    );
+    let not_listed = reading_list_update_progress(
+        &list,
+        &other,
+        serde_json::json!({ "state": "reading" }),
+        &token,
+    );
+
+    assert_eq!(
+        skipped.0, READING_LIST_INVALID_STATE,
+        "pending cannot skip to read"
+    );
+    assert_eq!(unknown_state.0, READING_LIST_INVALID_INPUT);
+    assert_eq!(not_listed.0, READING_LIST_NOT_FOUND);
+    assert_eq!(reading_rows(&db.1)[0].3, "pending");
+}
+
+#[test]
+fn given_an_item_on_a_reading_list_when_removed_over_ffi_then_its_progress_goes_and_the_file_stays()
+{
+    let _g = serial();
+    let db = init_temp_db();
+    let token = c(TEST_TOKEN);
+    let list = new_reading_list("Books", &token);
+    let book = seed_file(&db.1, "document", "book.pdf");
+    let never_added = seed_file(&db.1, "document", "other.pdf");
+    assert_eq!(
+        reading_list_add_item(&list, &book, &token).0,
+        READING_LIST_OK
+    );
+
+    let (status, value) = reading_list_remove_item(&list, &book, &token);
+    let (again_status, _) = reading_list_remove_item(&list, &book, &token);
+    let (never_status, _) = reading_list_remove_item(&list, &never_added, &token);
+
+    assert_eq!(status, READING_LIST_OK);
+    assert_eq!(value["readingListUuid"], list.as_str());
+    assert_eq!(value["itemUuid"], book.as_str());
+    assert_eq!(again_status, READING_LIST_NOT_FOUND, "removed twice");
+    assert_eq!(never_status, READING_LIST_NOT_FOUND, "never on the list");
+    assert!(reading_rows(&db.1).is_empty());
+    assert_eq!(file_count(&db.1, &book), 1, "the document itself is kept");
+}
+
+#[test]
+fn given_a_reading_list_with_an_item_when_deleted_over_ffi_then_it_and_its_progress_go_and_the_item_stays(
+) {
+    let _g = serial();
+    let db = init_temp_db();
+    let token = c(TEST_TOKEN);
+    let list = new_reading_list("Summer reads", &token);
+    let book = seed_file(&db.1, "document", "book.pdf");
+    assert_eq!(
+        reading_list_add_item(&list, &book, &token).0,
+        READING_LIST_OK
+    );
+
+    let (status, value) = reading_list_delete(&list, &token);
+
+    assert_eq!(status, READING_LIST_OK);
+    assert_eq!(value["uuid"], list.as_str());
+    assert_eq!(value["name"], "Summer reads");
+    assert_eq!(count(&db.1, "SELECT COUNT(*) FROM reading_lists", &[]), 0);
+    assert!(reading_rows(&db.1).is_empty());
+    assert_eq!(file_count(&db.1, &book), 1);
+}
+
+// ---------------- files: the catalog behind the listing (UC-01, UC-03, UC-04) ----------------
+
+#[test]
+fn given_files_of_three_types_when_indexed_over_ffi_then_each_has_its_subtype_row() {
+    let _g = serial();
+    let db = init_temp_db();
+    let token = c(TEST_TOKEN);
+
+    library_with(
+        &db,
+        &[("a.txt", b"x"), ("v.mp4", b"y"), ("p.pdf", b"z")],
+        &token,
+    );
+
+    assert_eq!(count(&db.1, "SELECT COUNT(*) FROM text_files", &[]), 1);
+    assert_eq!(count(&db.1, "SELECT COUNT(*) FROM video_files", &[]), 1);
+    assert_eq!(count(&db.1, "SELECT COUNT(*) FROM documents", &[]), 1);
+}
+
+/// A write that touches no row must not be reported as stored.
+#[test]
+fn given_a_video_whose_subtype_row_is_gone_when_its_metadata_is_edited_over_ffi_then_it_is_not_reported_stored(
+) {
+    let _g = serial();
+    let db = init_temp_db();
+    let token = c(TEST_TOKEN);
+    library_with(&db, &[("clip.mkv", b"video bytes")], &token);
+    let uuid = uuid_by_name(&db.1, "clip.mkv");
+    exec(
+        &db.1,
+        "DELETE FROM video_files WHERE file_id = (SELECT id FROM files WHERE uuid = ?)",
+        &[&uuid],
+    );
+
+    let (status, value) = file_edit_metadata(
+        &uuid,
+        serde_json::json!({ "type": "video", "title": "T" }),
+        &token,
+    );
+
+    assert_ne!(status, STATUS_FILE_OK, "{value}");
+    assert!(value.is_null());
+}
+
+/// An unparseable stored uuid used to be read as the nil uuid and served.
+#[test]
+fn given_a_corrupt_stored_uuid_when_files_are_listed_over_ffi_then_it_fails_rather_than_answer_a_nil_uuid(
+) {
+    let _g = serial();
+    let db = init_temp_db();
+    let token = c(TEST_TOKEN);
+    library_with(&db, &[("memo.txt", b"text")], &token);
+    exec(
+        &db.1,
+        "UPDATE files SET uuid = 'definitely-not-a-uuid' WHERE name = 'memo.txt'",
+        &[],
+    );
+
+    let (status, value) = files_list(serde_json::json!({}), &token);
+
+    assert_ne!(status, STATUS_FILE_OK, "{value}");
+    assert!(value.is_null());
+}
+
+/// The names a file listing answers, sorted.
+fn listed_names(listed: &serde_json::Value) -> Vec<String> {
+    let mut names: Vec<String> = listed
+        .as_array()
+        .expect("array")
+        .iter()
+        .map(|view| view["file"]["name"].as_str().unwrap().to_string())
+        .collect();
+    names.sort();
+    names
+}
+
+#[test]
+fn given_a_soft_deleted_file_when_listed_over_ffi_then_the_state_filter_decides_whether_it_is_answered(
+) {
+    let _g = serial();
+    let db = init_temp_db();
+    let token = c(TEST_TOKEN);
+    library_with(&db, &[("a.txt", b"a"), ("b.txt", b"b")], &token);
+    assert_eq!(
+        file_soft_delete(&uuid_by_name(&db.1, "a.txt"), &token).0,
+        STATUS_FILE_OK
+    );
+
+    let (default_status, active) = files_list(serde_json::json!({}), &token);
+    let (deleted_status, deleted) = files_list(serde_json::json!({ "state": "deleted" }), &token);
+    let (all_status, all) = files_list(serde_json::json!({ "state": "all" }), &token);
+
+    assert_eq!(
+        (default_status, deleted_status, all_status),
+        (STATUS_FILE_OK, STATUS_FILE_OK, STATUS_FILE_OK)
+    );
+    assert_eq!(listed_names(&active), vec!["b.txt"]);
+    assert_eq!(active[0]["file"]["state"], "active");
+    assert_eq!(listed_names(&deleted), vec!["a.txt"]);
+    assert_eq!(deleted[0]["file"]["state"], "deleted");
+    assert_eq!(listed_names(&all), vec!["a.txt", "b.txt"]);
+}
+
+#[test]
+fn given_a_type_filter_when_files_are_listed_over_ffi_then_only_that_type_and_an_empty_one_is_no_filter(
+) {
+    let _g = serial();
+    let db = init_temp_db();
+    let token = c(TEST_TOKEN);
+    library_with(
+        &db,
+        &[("memo.txt", b"text"), ("clip.mkv", b"video")],
+        &token,
+    );
+
+    let (text_status, text) = files_list(serde_json::json!({ "type": "text" }), &token);
+    let (empty_status, empty) = files_list(serde_json::json!({ "type": "", "state": "" }), &token);
+
+    assert_eq!(
+        (text_status, empty_status),
+        (STATUS_FILE_OK, STATUS_FILE_OK)
+    );
+    assert_eq!(listed_names(&text), vec!["memo.txt"]);
+    assert_eq!(text[0]["file"]["fileType"], "text");
+    assert_eq!(listed_names(&empty), vec!["clip.mkv", "memo.txt"]);
+}
+
+#[test]
+fn given_a_collection_filter_when_files_are_listed_over_ffi_then_only_its_files_and_an_unknown_one_is_empty(
+) {
+    let _g = serial();
+    let db = init_temp_db();
+    let token = c(TEST_TOKEN);
+    library_with(&db, &[("a.txt", b"a"), ("b.txt", b"b")], &token);
+    let collection = new_collection("Mine", "file", &token);
+    let a = uuid_by_name(&db.1, "a.txt");
+    assert_eq!(
+        collection_add_items(&collection, &[&a], &token).0,
+        COLLECTION_OK
+    );
+
+    let (status, filed) = files_list(serde_json::json!({ "collectionUuid": collection }), &token);
+    let (unknown_status, unknown) = files_list(
+        serde_json::json!({ "collectionUuid": unknown_uuid() }),
+        &token,
+    );
+
+    assert_eq!((status, unknown_status), (STATUS_FILE_OK, STATUS_FILE_OK));
+    assert_eq!(listed_names(&filed), vec!["a.txt"]);
+    assert_eq!(filed[0]["file"]["uuid"], a.as_str());
+    assert_eq!(
+        unknown,
+        serde_json::json!([]),
+        "an unknown collection holds nothing"
+    );
+}
+
+#[test]
+fn given_unusable_filter_values_when_files_are_listed_over_ffi_then_invalid_input() {
+    let _g = serial();
+    let _db = init_temp_db();
+    let token = c(TEST_TOKEN);
+
+    for filter in [
+        serde_json::json!({ "type": "spreadsheet" }),
+        serde_json::json!({ "state": "archived" }),
+        serde_json::json!({ "collectionUuid": "not-a-uuid" }),
+    ] {
+        let (status, value) = files_list(filter.clone(), &token);
+        assert_eq!(status, STATUS_FILE_INVALID_INPUT, "{filter}");
+        assert!(value.is_null(), "{filter}");
+    }
+}
+
+#[test]
+fn given_each_metadata_bearing_type_when_listed_over_ffi_then_its_metadata_and_its_own_scalar_come_back(
+) {
+    let _g = serial();
+    let db = init_temp_db();
+    let token = c(TEST_TOKEN);
+    library_with(
+        &db,
+        &[
+            ("clip.mp4", b"x"),
+            ("book.pdf", b"x"),
+            ("issue1.cbz", b"x"),
+            ("photo.jpg", b"x"),
+            ("memo.txt", b"x"),
+        ],
+        &token,
+    );
+    for (name, sql) in [
+        (
+            "clip.mp4",
+            "UPDATE video_files SET title = 'Clip', resolution = '1080p', media_kind = 'movie', \
+             duration_seconds = 125.5 \
+             FROM files WHERE video_files.file_id = files.id AND files.uuid = ?",
+        ),
+        (
+            "book.pdf",
+            "UPDATE documents SET title = 'Book', author = 'Author', format_kind = 'book', \
+             page_count = 42 \
+             FROM files WHERE documents.file_id = files.id AND files.uuid = ?",
+        ),
+        (
+            "issue1.cbz",
+            "UPDATE comic_books SET title = 'Issue', series = 'Series', issue_number = 1, \
+             page_count = 24 \
+             FROM files WHERE comic_books.file_id = files.id AND files.uuid = ?",
+        ),
+        (
+            "photo.jpg",
+            "UPDATE images SET title = 'Photo', caption = 'Caption', width = 800, height = 600 \
+             FROM files WHERE images.file_id = files.id AND files.uuid = ?",
+        ),
+    ] {
+        exec(&db.1, sql, &[&uuid_by_name(&db.1, name)]);
+    }
+
+    let (status, listed) = files_list(serde_json::json!({}), &token);
+
+    assert_eq!(status, STATUS_FILE_OK);
+    let view = |name: &str| {
+        listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|v| v["file"]["name"] == name)
+            .unwrap_or_else(|| panic!("{name} listed: {listed}"))
+            .clone()
+    };
+    let video = view("clip.mp4");
+    assert_eq!(video["file"]["fileType"], "video");
+    assert_eq!(video["metadata"]["type"], "video");
+    assert_eq!(video["metadata"]["title"], "Clip");
+    assert_eq!(video["metadata"]["resolution"], "1080p");
+    assert_eq!(video["durationSeconds"], 125.5);
+    let document = view("book.pdf");
+    assert_eq!(document["metadata"]["type"], "document");
+    assert_eq!(document["metadata"]["author"], "Author");
+    assert_eq!(document["pageCount"], 42);
+    let comic = view("issue1.cbz");
+    assert_eq!(comic["metadata"]["type"], "comic");
+    assert_eq!(comic["metadata"]["series"], "Series");
+    assert_eq!(comic["comicPageCount"], 24);
+    let image = view("photo.jpg");
+    assert_eq!(image["metadata"]["type"], "image");
+    assert_eq!(image["metadata"]["caption"], "Caption");
+    assert_eq!(image["width"], 800);
+    assert_eq!(image["height"], 600);
+    let text = view("memo.txt");
+    assert_eq!(text["file"]["fileType"], "text");
+    assert!(text["metadata"].is_null(), "text carries no metadata");
+}
+
+#[test]
+fn given_indexed_files_when_fetched_by_uuid_over_ffi_then_their_view_comes_back() {
+    let _g = serial();
+    let db = init_temp_db();
+    let token = c(TEST_TOKEN);
+    library_with(&db, &[("memo.txt", b"text"), ("clip.mkv", b"x")], &token);
+    let memo = uuid_by_name(&db.1, "memo.txt");
+    let clip = uuid_by_name(&db.1, "clip.mkv");
+    exec(
+        &db.1,
+        "UPDATE video_files SET title = 'T', year = 2001, resolution = '720p', media_kind = NULL \
+         FROM files WHERE video_files.file_id = files.id AND files.uuid = ?",
+        &[&clip],
+    );
+
+    let (memo_status, text) = file_get(&memo, &token);
+    let (clip_status, video) = file_get(&clip, &token);
+    let (unknown_status, unknown) = file_get(&unknown_uuid(), &token);
+
+    assert_eq!((memo_status, clip_status), (STATUS_FILE_OK, STATUS_FILE_OK));
+    assert_eq!(text["file"]["uuid"], memo.as_str());
+    assert_eq!(text["file"]["fileType"], "text");
+    assert_eq!(text["file"]["state"], "active");
+    assert!(text["metadata"].is_null());
+    assert_eq!(video["metadata"]["type"], "video");
+    assert_eq!(video["metadata"]["title"], "T");
+    assert_eq!(video["metadata"]["resolution"], "720p");
+    assert_eq!(video["metadata"]["year"], 2001);
+    assert_eq!(unknown_status, STATUS_FILE_NOT_FOUND);
+    assert!(unknown.is_null());
+}
+
+// ---------------- files: what the indexer reads out of real media ----------------
+
+fn write_minimal_jpeg(path: &std::path::Path) {
+    image::RgbImage::from_pixel(4, 3, image::Rgb([128, 64, 32]))
+        .save(path)
+        .expect("encode jpeg");
+}
+
+/// EXIF pixel dimensions and a description, written with `little_exif`. Its
+/// `ExifImageWidth`/`ExifImageHeight` are tags 0xa002/0xa003, which
+/// `kamadak-exif` reads back as `PixelXDimension`/`PixelYDimension`.
+fn write_test_exif(path: &std::path::Path, width: u32, height: u32, description: &str) {
+    use little_exif::exif_tag::ExifTag;
+    use little_exif::metadata::Metadata;
+
+    let mut metadata = Metadata::new();
+    metadata.set_tag(ExifTag::ImageDescription(description.to_string()));
+    metadata.set_tag(ExifTag::ExifImageWidth(vec![width]));
+    metadata.set_tag(ExifTag::ExifImageHeight(vec![height]));
+    metadata.write_to_file(path).expect("write exif");
+}
+
+/// A one-page PDF carrying `title` and `author` in its Info dictionary.
+fn write_minimal_pdf(path: &std::path::Path, title: &str, author: &str) {
+    use lopdf::{dictionary, Document, Object};
+
+    let mut doc = Document::with_version("1.5");
+    let pages_id = doc.new_object_id();
+    let font_id = doc.add_object(dictionary! {
+        "Type" => "Font",
+        "Subtype" => "Type1",
+        "BaseFont" => "Helvetica",
+    });
+    let resources_id = doc.add_object(dictionary! {
+        "Font" => dictionary! { "F1" => font_id },
+    });
+    let content = lopdf::content::Content { operations: vec![] };
+    let content_id = doc.add_object(lopdf::Stream::new(
+        dictionary! {},
+        content.encode().expect("encode content"),
+    ));
+    let page_id = doc.add_object(dictionary! {
+        "Type" => "Page",
+        "Parent" => pages_id,
+        "Contents" => content_id,
+        "Resources" => resources_id,
+        "MediaBox" => vec![0.into(), 0.into(), 200.into(), 200.into()],
+    });
+    doc.objects.insert(
+        pages_id,
+        Object::Dictionary(dictionary! {
+            "Type" => "Pages",
+            "Kids" => vec![page_id.into()],
+            "Count" => 1,
+        }),
+    );
+    let catalog_id = doc.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => pages_id,
+    });
+    doc.trailer.set("Root", catalog_id);
+    let info_id = doc.add_object(dictionary! {
+        "Title" => Object::string_literal(title),
+        "Author" => Object::string_literal(author),
+    });
+    doc.trailer.set("Info", info_id);
+    doc.save(path).expect("save pdf");
+}
+
+/// A real, ffmpeg-encoded MPEG-4 video of ten blank frames at 25 fps,
+/// titled `title` when one is given.
+fn write_mp4(path: &std::path::Path, title: Option<&str>, width: u32, height: u32) {
+    ffmpeg_next::init().expect("ffmpeg init");
+
+    let mut octx = ffmpeg_next::format::output(path).expect("create output context");
+    if let Some(title) = title {
+        let mut dict = ffmpeg_next::Dictionary::new();
+        dict.set("title", title);
+        octx.set_metadata(dict);
+    }
+
+    let codec =
+        ffmpeg_next::encoder::find(ffmpeg_next::codec::Id::MPEG4).expect("mpeg4 encoder available");
+    let mut ost = octx.add_stream(codec).expect("add video stream");
+    let mut encoder = ffmpeg_next::codec::context::Context::new_with_codec(codec)
+        .encoder()
+        .video()
+        .expect("video encoder context");
+    encoder.set_width(width);
+    encoder.set_height(height);
+    encoder.set_format(ffmpeg_next::format::Pixel::YUV420P);
+    encoder.set_time_base(ffmpeg_next::Rational(1, 25));
+    let mut encoder = encoder.open().expect("open encoder");
+    ost.set_parameters(&encoder);
+
+    octx.write_header().expect("write header");
+
+    let mut frame =
+        ffmpeg_next::frame::Video::new(ffmpeg_next::format::Pixel::YUV420P, width, height);
+    for plane in 0..frame.planes() {
+        frame.data_mut(plane).fill(16);
+    }
+    let mut packet = ffmpeg_next::Packet::empty();
+    for i in 0..10 {
+        frame.set_pts(Some(i));
+        encoder.send_frame(&frame).expect("send frame");
+        while encoder.receive_packet(&mut packet).is_ok() {
+            packet.set_stream(0);
+            packet.write_interleaved(&mut octx).expect("write packet");
+        }
+    }
+    encoder.send_eof().expect("send eof");
+    while encoder.receive_packet(&mut packet).is_ok() {
+        packet.set_stream(0);
+        packet.write_interleaved(&mut octx).expect("write packet");
+    }
+    octx.write_trailer().expect("write trailer");
+}
+
+/// A CBZ whose `ComicInfo.xml` names `title`, `series` and `number`, with
+/// `page_count` page entries.
+fn write_tagged_cbz(
+    path: &std::path::Path,
+    title: &str,
+    series: &str,
+    number: &str,
+    page_count: usize,
+) {
+    use std::io::Write;
+    use zip::write::SimpleFileOptions;
+
+    let mut zip = zip::ZipWriter::new(std::fs::File::create(path).expect("create cbz"));
+    let options = SimpleFileOptions::default();
+    zip.start_file("ComicInfo.xml", options)
+        .expect("start ComicInfo.xml");
+    let xml = format!(
+        r#"<?xml version="1.0"?>
+<ComicInfo xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+  <Title>{title}</Title>
+  <Series>{series}</Series>
+  <Number>{number}</Number>
+</ComicInfo>"#
+    );
+    zip.write_all(xml.as_bytes()).expect("write ComicInfo.xml");
+    for i in 0..page_count {
+        zip.start_file(format!("page-{i:03}.jpg"), options)
+            .expect("start page");
+        zip.write_all(b"not-a-real-jpeg-just-bytes")
+            .expect("write page");
+    }
+    zip.finish().expect("finish cbz");
+}
+
+/// Add the folder `write` fills as a library, wait for its run, and answer
+/// `name`'s file view.
+fn indexed_view(
+    db: &(TempDir, String),
+    name: &str,
+    write: impl FnOnce(&std::path::Path),
+    token: &CString,
+) -> serde_json::Value {
+    let root = folder(db, "/library");
+    write(std::path::Path::new(&root).join(name).as_path());
+    register_library("Library", &root, token);
+    let (status, view) = file_get(&uuid_by_name(&db.1, name), token);
+    assert_eq!(status, STATUS_FILE_OK, "{name}");
+    view
+}
+
+#[test]
+fn given_a_tagged_jpeg_when_indexed_over_ffi_then_its_exif_dimensions_and_description_are_read() {
+    let _g = serial();
+    let db = init_temp_db();
+    let token = c(TEST_TOKEN);
+
+    let view = indexed_view(
+        &db,
+        "photo.jpg",
+        |path| {
+            write_minimal_jpeg(path);
+            write_test_exif(path, 800, 600, "Parity Description");
+        },
+        &token,
+    );
+
+    assert_eq!(view["width"], 800);
+    assert_eq!(view["height"], 600);
+    assert_eq!(view["metadata"]["title"], "Parity Description");
+}
+
+#[test]
+fn given_a_tagged_pdf_when_indexed_over_ffi_then_its_title_author_kind_and_pages_are_read() {
+    let _g = serial();
+    let db = init_temp_db();
+    let token = c(TEST_TOKEN);
+
+    let view = indexed_view(
+        &db,
+        "book.pdf",
+        |path| write_minimal_pdf(path, "Parity Title", "Parity Author"),
+        &token,
+    );
+
+    assert_eq!(view["pageCount"], 1);
+    assert_eq!(view["metadata"]["title"], "Parity Title");
+    assert_eq!(view["metadata"]["author"], "Parity Author");
+    assert_eq!(view["metadata"]["formatKind"], "book");
+}
+
+#[test]
+fn given_a_tagged_mp4_when_indexed_over_ffi_then_its_title_resolution_and_duration_are_read() {
+    let _g = serial();
+    let db = init_temp_db();
+    let token = c(TEST_TOKEN);
+
+    let view = indexed_view(
+        &db,
+        "clip.mp4",
+        |path| write_mp4(path, Some("Parity Title"), 320, 240),
+        &token,
+    );
+
+    assert_eq!(view["metadata"]["title"], "Parity Title");
+    assert_eq!(view["metadata"]["resolution"], "320x240");
+    let duration = view["durationSeconds"].as_f64().expect("a duration");
+    assert!(duration > 0.0, "{duration}");
+}
+
+#[test]
+fn given_a_tagged_cbz_when_indexed_over_ffi_then_its_title_series_issue_and_pages_are_read() {
+    let _g = serial();
+    let db = init_temp_db();
+    let token = c(TEST_TOKEN);
+
+    let view = indexed_view(
+        &db,
+        "issue.cbz",
+        |path| write_tagged_cbz(path, "Parity Title", "Parity Series", "3", 24),
+        &token,
+    );
+
+    assert_eq!(view["comicPageCount"], 24);
+    assert_eq!(view["metadata"]["title"], "Parity Title");
+    assert_eq!(view["metadata"]["series"], "Parity Series");
+    assert_eq!(view["metadata"]["issueNumber"], 3);
+}
+
+/// A PCM WAV of `samples` silent 8-bit mono samples at 8 kHz, untagged: its
+/// header is all a reader needs for the duration.
+fn wav(samples: u32) -> Vec<u8> {
+    let mut wav = Vec::new();
+    for chunk in [
+        &b"RIFF"[..],
+        &(36 + samples).to_le_bytes(),
+        b"WAVEfmt ",
+        &16u32.to_le_bytes(),
+        &1u16.to_le_bytes(),
+        &1u16.to_le_bytes(),
+        &8000u32.to_le_bytes(),
+        &8000u32.to_le_bytes(),
+        &1u16.to_le_bytes(),
+        &8u16.to_le_bytes(),
+        b"data",
+        &samples.to_le_bytes(),
+    ] {
+        wav.extend_from_slice(chunk);
+    }
+    wav.extend(std::iter::repeat_n(128u8, samples as usize));
+    wav
+}
+
+fn audio_listing(token: &CString) -> serde_json::Value {
+    let (status, listed) = files_list(serde_json::json!({ "type": "audio" }), token);
+    assert_eq!(status, STATUS_FILE_OK);
+    listed
+}
+
+#[test]
+fn given_an_untagged_audio_file_when_indexed_over_ffi_then_it_is_listed_by_name_with_its_duration()
+{
+    let _g = serial();
+    let db = init_temp_db();
+    let token = c(TEST_TOKEN);
+    library_with(&db, &[("tone.wav", &wav(8000))], &token);
+
+    let listed = audio_listing(&token);
+
+    assert_eq!(listed.as_array().map(Vec::len), Some(1), "{listed}");
+    assert_eq!(listed[0]["file"]["name"], "tone.wav");
+    assert_eq!(listed[0]["file"]["fileType"], "audio");
+    let duration = listed[0]["durationSeconds"].as_f64().expect("a duration");
+    assert!((duration - 1.0).abs() < 0.05, "{duration}");
+}
+
+#[test]
+fn given_an_audio_file_when_fetched_alone_over_ffi_then_it_answers_what_the_listing_answers() {
+    let _g = serial();
+    let db = init_temp_db();
+    let token = c(TEST_TOKEN);
+    library_with(&db, &[("tone.wav", &wav(8000))], &token);
+    let listed = audio_listing(&token);
+
+    let (status, alone) = file_get(listed[0]["file"]["uuid"].as_str().unwrap(), &token);
+
+    assert_eq!(status, STATUS_FILE_OK);
+    assert!(alone["durationSeconds"].as_f64().is_some(), "{alone}");
+    assert_eq!(alone, listed[0]);
+}
+
+#[test]
+fn given_an_audio_file_when_its_metadata_is_edited_over_ffi_then_the_listing_answers_the_edit() {
+    let _g = serial();
+    let db = init_temp_db();
+    let token = c(TEST_TOKEN);
+    library_with(&db, &[("tone.wav", &wav(8000))], &token);
+    let uuid = uuid_by_name(&db.1, "tone.wav");
+
+    let (status, _) = file_edit_metadata(
+        &uuid,
+        serde_json::json!({
+            "type": "audio",
+            "title": "Tone",
+            "artist": "Oscillator",
+            "albumArtist": "Oscillator",
+            "track": 1,
+        }),
+        &token,
+    );
+
+    assert_eq!(status, STATUS_FILE_OK);
+    let listed = audio_listing(&token);
+    assert_eq!(listed[0]["metadata"]["title"], "Tone");
+    assert_eq!(listed[0]["metadata"]["artist"], "Oscillator");
+    assert_eq!(listed[0]["metadata"]["albumArtist"], "Oscillator");
+    assert_eq!(listed[0]["metadata"]["track"], 1);
+    assert!(
+        listed[0]["durationSeconds"].as_f64().is_some(),
+        "the edit leaves the read duration alone"
+    );
+}
+
+// ---------------- text content (UC-32, UC-33) ----------------
+
+#[test]
+fn given_a_text_file_when_read_over_ffi_then_its_content_comes_back() {
+    let _g = serial();
+    let db = init_temp_db();
+    let token = c(TEST_TOKEN);
+    library_with(&db, &[("note.txt", b"hello world")], &token);
+    let uuid = uuid_by_name(&db.1, "note.txt");
+
+    let (status, value) = file_read_content(&uuid, &token);
+
+    assert_eq!(status, STATUS_FILE_OK);
+    assert_eq!(value["uuid"], uuid.as_str());
+    assert_eq!(value["content"], "hello world");
+}
+
+#[test]
+fn given_a_non_text_or_unknown_file_when_read_over_ffi_then_it_is_refused() {
+    let _g = serial();
+    let db = init_temp_db();
+    let token = c(TEST_TOKEN);
+    library_with(&db, &[("cover.png", b"png bytes")], &token);
+
+    let (image_status, _) = file_read_content(&uuid_by_name(&db.1, "cover.png"), &token);
+    let (unknown_status, _) = file_read_content(&unknown_uuid(), &token);
+
+    assert_eq!(image_status, STATUS_FILE_INVALID_INPUT);
+    assert_eq!(unknown_status, STATUS_FILE_NOT_FOUND);
+}
+
+#[test]
+fn given_a_text_file_when_edited_over_ffi_then_the_disk_and_its_stored_hash_are_updated() {
+    let _g = serial();
+    let db = init_temp_db();
+    let token = c(TEST_TOKEN);
+    let root = library_with(&db, &[("note.txt", b"old content")], &token);
+    let uuid = uuid_by_name(&db.1, "note.txt");
+    let stored_hash = |db_path: &str| {
+        fetch_all::<(Option<String>,)>(
+            db_path,
+            "SELECT content_hash FROM files WHERE uuid = ?",
+            &[&uuid],
+        )[0]
+        .0
+        .clone()
+    };
+    let before = stored_hash(&db.1);
+
+    let (status, value) = file_edit_content(
+        &uuid,
+        serde_json::json!({ "content": "new content" }),
+        &token,
+    );
+
+    assert_eq!(status, STATUS_FILE_OK);
+    assert_eq!(value["uuid"], uuid.as_str());
+    assert_eq!(
+        std::fs::read_to_string(format!("{root}/note.txt")).unwrap(),
+        "new content"
+    );
+    let after = stored_hash(&db.1);
+    assert_ne!(after, before);
+    assert_eq!(after.as_deref(), value["contentHash"].as_str());
+}
+
+#[test]
+fn given_a_non_text_or_unknown_file_when_edited_over_ffi_then_it_is_refused_and_the_disk_is_unchanged(
+) {
+    let _g = serial();
+    let db = init_temp_db();
+    let token = c(TEST_TOKEN);
+    let root = library_with(
+        &db,
+        &[("cover.png", b"png bytes"), ("note.txt", b"old content")],
+        &token,
+    );
+    let body = serde_json::json!({ "content": "new content" });
+
+    let (image_status, _) =
+        file_edit_content(&uuid_by_name(&db.1, "cover.png"), body.clone(), &token);
+    let (unknown_status, _) = file_edit_content(&unknown_uuid(), body, &token);
+
+    assert_eq!(image_status, STATUS_FILE_INVALID_INPUT);
+    assert_eq!(unknown_status, STATUS_FILE_NOT_FOUND);
+    assert_eq!(
+        std::fs::read(format!("{root}/cover.png")).unwrap(),
+        b"png bytes"
+    );
+    assert_eq!(
+        std::fs::read(format!("{root}/note.txt")).unwrap(),
+        b"old content"
+    );
+}
+
+// ---------------- playback (UC-38 to UC-40) ----------------
+
+const PLAYBACK_NOT_FOUND: i32 = alexandria_ffi::PLAYBACK_ERR_NOT_FOUND;
+const PLAYBACK_INVALID_STATE: i32 = alexandria_ffi::PLAYBACK_ERR_INVALID_STATE;
+
+/// Like [`init_temp_db`], with UC-40's thumbnail cache inside `cache`.
+///
+/// The cache's default is the relative `"thumbnails"`, which would land in
+/// this crate's folder. `alexandria_index_init` reads its settings from the
+/// environment at init only, so the variable is removed again straight away,
+/// as [`init_bounded_db`] does for the root.
+fn init_with_thumbnail_cache(cache: &std::path::Path) -> (TempDir, String) {
+    std::env::set_var(
+        "ALEXANDRIA_PLAYBACK_THUMBNAIL_CACHE_DIR",
+        cache.to_str().unwrap(),
+    );
+    let db = init_temp_db();
+    std::env::remove_var("ALEXANDRIA_PLAYBACK_THUMBNAIL_CACHE_DIR");
+    db
+}
+
+fn decoded_bytes(value: &serde_json::Value) -> Vec<u8> {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD
+        .decode(value["bytesBase64"].as_str().expect("bytesBase64"))
+        .expect("base64")
+}
+
+/// The `(width, height)` of the JPEG a thumbnail answer carries.
+fn thumbnail_size(value: &serde_json::Value) -> (u32, u32) {
+    assert_eq!(value["mimeType"], "image/jpeg", "{value}");
+    let decoded = image::load_from_memory(&decoded_bytes(value)).expect("a valid jpeg");
+    (decoded.width(), decoded.height())
+}
+
+/// A small JPEG whose pixels depend on `seed`, so two pages differ.
+fn jpeg_bytes_for(seed: &str) -> Vec<u8> {
+    let sum: u32 = seed.bytes().map(u32::from).sum();
+    let pixel = image::Rgb([(sum % 256) as u8, ((sum / 3) % 256) as u8, 128]);
+    let mut out = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new(&mut out)
+        .encode_image(&image::DynamicImage::ImageRgb8(
+            image::RgbImage::from_pixel(4, 4, pixel),
+        ))
+        .expect("encode jpeg");
+    out
+}
+
+/// A CBZ holding one JPEG per entry, in exactly the order given.
+fn cbz_of(entries: &[&str]) -> Vec<u8> {
+    use std::io::Write;
+    use zip::write::SimpleFileOptions;
+
+    let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    for entry in entries {
+        zip.start_file(*entry, SimpleFileOptions::default())
+            .expect("start entry");
+        zip.write_all(&jpeg_bytes_for(entry)).expect("write entry");
+    }
+    zip.finish().expect("finish cbz").into_inner()
+}
+
+/// A raster image of `width` x `height`, encoded as `name`'s extension says.
+fn image_file(name: &str, width: u32, height: u32) -> Vec<u8> {
+    let format = image::ImageFormat::from_path(name).expect("a known image extension");
+    let mut out = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+        width,
+        height,
+        image::Rgb([200, 60, 30]),
+    ))
+    .write_to(&mut out, format)
+    .expect("encode image");
+    out.into_inner()
+}
+
+#[test]
+fn given_a_video_when_its_playback_source_is_asked_over_ffi_then_its_path_mime_type_and_size() {
+    let _g = serial();
+    let db = init_temp_db();
+    let token = c(TEST_TOKEN);
+    let contents = b"0123456789";
+    library_with(&db, &[("sample.mp4", contents)], &token);
+
+    let (status, descriptor) = playback_source(&uuid_by_name(&db.1, "sample.mp4"), &token);
+
+    assert_eq!(status, STATUS_PLAYBACK_OK);
+    assert_eq!(descriptor["mimeType"], "video/mp4");
+    assert_eq!(descriptor["sizeBytes"], 10);
+    assert_eq!(
+        std::fs::read(descriptor["path"].as_str().expect("path")).unwrap(),
+        contents,
+        "the path holds the bytes to play"
+    );
+}
+
+#[test]
+fn given_a_comic_and_audio_files_when_their_playback_source_is_asked_over_ffi_then_each_has_its_catalog_mime_type(
+) {
+    let _g = serial();
+    let db = init_temp_db();
+    let token = c(TEST_TOKEN);
+    library_with(
+        &db,
+        &[
+            ("issue.cbz", b"zip"),
+            ("song.mp3", &[0u8; 64]),
+            ("song.flac", &[0u8; 64]),
+        ],
+        &token,
+    );
+
+    for (name, mime) in [
+        ("issue.cbz", "application/vnd.comicbook+zip"),
+        ("song.mp3", "audio/mpeg"),
+        ("song.flac", "audio/flac"),
+    ] {
+        let (status, descriptor) = playback_source(&uuid_by_name(&db.1, name), &token);
+        assert_eq!(status, STATUS_PLAYBACK_OK, "{name}");
+        assert_eq!(descriptor["mimeType"], mime, "{name}");
+    }
+}
+
+#[test]
+fn given_an_unknown_a_deleted_or_an_unsuitable_file_when_played_over_ffi_then_each_is_refused() {
+    let _g = serial();
+    let cache = tempdir().unwrap();
+    let db = init_with_thumbnail_cache(cache.path());
+    let token = c(TEST_TOKEN);
+    library_with(
+        &db,
+        &[("sample.txt", b"data"), ("gone.txt", b"data")],
+        &token,
+    );
+    let sample = uuid_by_name(&db.1, "sample.txt");
+    let gone = uuid_by_name(&db.1, "gone.txt");
+    assert_eq!(file_soft_delete(&gone, &token).0, STATUS_FILE_OK);
+
+    assert_eq!(
+        playback_source(&unknown_uuid(), &token).0,
+        PLAYBACK_NOT_FOUND
+    );
+    assert_eq!(playback_source(&gone, &token).0, PLAYBACK_INVALID_STATE);
+    assert_eq!(
+        comic_page(&sample, 1, &token).0,
+        STATUS_PLAYBACK_INVALID_INPUT,
+        "a text file has no pages"
+    );
+    assert_eq!(
+        thumbnail(&sample, &token).0,
+        STATUS_PLAYBACK_INVALID_INPUT,
+        "nor a thumbnail"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn given_a_row_reaching_out_through_a_symlink_or_climbing_out_with_dot_dot_when_played_over_ffi_then_invalid_input(
+) {
+    let _g = serial();
+    let parent = tempdir().unwrap();
+    let library = parent.path().join("library");
+    let outside = parent.path().join("secrets");
+    std::fs::create_dir(&library).unwrap();
+    std::fs::create_dir(&outside).unwrap();
+    std::fs::write(outside.join("passwd.txt"), b"the secret").unwrap();
+    std::os::unix::fs::symlink(&outside, library.join("escape")).unwrap();
+    let (_dir, db_path) = init_bounded_db(&library);
+    let token = c(TEST_TOKEN);
+    let through_link = seed_text_row(&db_path, &library.join("escape").join("passwd.txt"));
+    let climbing = seed_text_row(
+        &db_path,
+        &library.join("..").join("secrets").join("passwd.txt"),
+    );
+
+    for uuid in [through_link, climbing] {
+        let (status, value) = playback_source(&uuid, &token);
+        assert_eq!(status, STATUS_PLAYBACK_INVALID_INPUT);
+        assert!(value.is_null());
+    }
+}
+
+#[test]
+fn given_a_cbz_when_its_first_page_is_read_over_ffi_then_the_first_entry_in_name_order_comes_back()
+{
+    let _g = serial();
+    let db = init_temp_db();
+    let token = c(TEST_TOKEN);
+    library_with(
+        &db,
+        &[("issue.cbz", &cbz_of(&["page002.jpg", "page001.jpg"]))],
+        &token,
+    );
+
+    let (status, page) = comic_page(&uuid_by_name(&db.1, "issue.cbz"), 1, &token);
+
+    assert_eq!(status, STATUS_PLAYBACK_OK);
+    assert_eq!(decoded_bytes(&page), jpeg_bytes_for("page001.jpg"));
+    assert_eq!(page["mimeType"], "image/jpeg");
+    assert_eq!(page["page"], 1);
+    assert_eq!(page["pageCount"], 2);
+}
+
+#[test]
+fn given_a_page_out_of_range_or_a_cbr_when_read_over_ffi_then_invalid_input() {
+    let _g = serial();
+    let db = init_temp_db();
+    let token = c(TEST_TOKEN);
+    library_with(
+        &db,
+        &[
+            ("issue.cbz", &cbz_of(&["page001.jpg", "page002.jpg"])),
+            ("issue.cbr", b"Rar!\x1a\x07\x00 not really"),
+        ],
+        &token,
+    );
+
+    assert_eq!(
+        comic_page(&uuid_by_name(&db.1, "issue.cbz"), 3, &token).0,
+        STATUS_PLAYBACK_INVALID_INPUT,
+        "a two-page comic has no page 3"
+    );
+    assert_eq!(
+        comic_page(&uuid_by_name(&db.1, "issue.cbr"), 1, &token).0,
+        STATUS_PLAYBACK_INVALID_INPUT,
+        "nothing here reads RAR"
+    );
+}
+
+#[test]
+fn given_a_png_when_thumbnailed_twice_over_ffi_then_one_cached_jpeg_inside_the_box_both_times() {
+    let _g = serial();
+    let cache = tempdir().unwrap();
+    let db = init_with_thumbnail_cache(cache.path());
+    let token = c(TEST_TOKEN);
+    library_with(
+        &db,
+        &[("photo.png", &image_file("photo.png", 1000, 500))],
+        &token,
+    );
+    let uuid = uuid_by_name(&db.1, "photo.png");
+
+    let (first_status, first) = thumbnail(&uuid, &token);
+    let cached = std::fs::read_dir(cache.path()).unwrap().count();
+    let (second_status, second) = thumbnail(&uuid, &token);
+
+    assert_eq!(
+        (first_status, second_status),
+        (STATUS_PLAYBACK_OK, STATUS_PLAYBACK_OK)
+    );
+    assert_eq!(thumbnail_size(&first), (320, 160), "fits 320 and keeps 2:1");
+    assert_eq!(cached, 1, "the first call fills the cache");
+    assert_eq!(first["bytesBase64"], second["bytesBase64"]);
+}
+
+/// Every raster extension the indexer files as an image has a decoder.
+#[test]
+fn given_a_gif_a_bmp_and_a_tiff_when_thumbnailed_over_ffi_then_each_is_a_jpeg_inside_the_box() {
+    let _g = serial();
+    let cache = tempdir().unwrap();
+    let db = init_with_thumbnail_cache(cache.path());
+    let token = c(TEST_TOKEN);
+    let names = ["holiday.gif", "scan.bmp", "scan.tiff"];
+    let images: Vec<Vec<u8>> = names
+        .iter()
+        .map(|name| image_file(name, 1000, 500))
+        .collect();
+    let files: Vec<(&str, &[u8])> = names
+        .iter()
+        .zip(&images)
+        .map(|(name, bytes)| (*name, bytes.as_slice()))
+        .collect();
+    library_with(&db, &files, &token);
+
+    for name in names {
+        let (status, value) = thumbnail(&uuid_by_name(&db.1, name), &token);
+        assert_eq!(status, STATUS_PLAYBACK_OK, "{name} must thumbnail");
+        assert_eq!(thumbnail_size(&value), (320, 160), "{name}");
+    }
+}
+
+/// A real ffmpeg-encoded video, so the keyframe decode runs for real.
+#[test]
+fn given_a_video_when_thumbnailed_over_ffi_then_its_keyframe_is_a_jpeg_inside_the_box() {
+    let _g = serial();
+    let cache = tempdir().unwrap();
+    let db = init_with_thumbnail_cache(cache.path());
+    let token = c(TEST_TOKEN);
+    let view = indexed_view(
+        &db,
+        "clip.mp4",
+        |path| write_mp4(path, None, 640, 360),
+        &token,
+    );
+
+    let (status, value) = thumbnail(view["file"]["uuid"].as_str().unwrap(), &token);
+
+    assert_eq!(status, STATUS_PLAYBACK_OK);
+    assert_eq!(
+        thumbnail_size(&value),
+        (320, 180),
+        "16:9 inside the 320 box"
+    );
+}
+
+/// A WAV whose ID3v2 tag carries a 640x320 JPEG as its front cover.
+fn write_wav_with_front_cover(path: &std::path::Path) {
+    use lofty::config::WriteOptions;
+    use lofty::picture::{MimeType, Picture, PictureType};
+    use lofty::tag::{Tag, TagExt, TagType};
+
+    std::fs::write(path, wav(800)).unwrap();
+    let mut cover = std::io::Cursor::new(Vec::new());
+    image::RgbImage::from_pixel(640, 320, image::Rgb([200, 30, 30]))
+        .write_to(&mut cover, image::ImageFormat::Jpeg)
+        .unwrap();
+    let mut tag = Tag::new(TagType::Id3v2);
+    tag.push_picture(
+        Picture::unchecked(cover.into_inner())
+            .pic_type(PictureType::CoverFront)
+            .mime_type(MimeType::Jpeg)
+            .build(),
+    );
+    tag.save_to_path(path, WriteOptions::default())
+        .expect("save the cover");
+}
+
+#[test]
+fn given_an_audio_file_with_a_front_cover_when_thumbnailed_over_ffi_then_the_cover_inside_the_box()
+{
+    let _g = serial();
+    let cache = tempdir().unwrap();
+    let db = init_with_thumbnail_cache(cache.path());
+    let token = c(TEST_TOKEN);
+    let view = indexed_view(&db, "song.wav", write_wav_with_front_cover, &token);
+
+    let (status, value) = thumbnail(view["file"]["uuid"].as_str().unwrap(), &token);
+
+    assert_eq!(status, STATUS_PLAYBACK_OK);
+    assert_eq!(thumbnail_size(&value), (320, 160));
+}
+
+#[test]
+fn given_an_svg_a_cbr_a_document_or_coverless_audio_when_thumbnailed_over_ffi_then_invalid_input() {
+    let _g = serial();
+    let cache = tempdir().unwrap();
+    let db = init_with_thumbnail_cache(cache.path());
+    let token = c(TEST_TOKEN);
+    library_with(
+        &db,
+        &[
+            (
+                "logo.svg",
+                br#"<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"></svg>"#,
+            ),
+            ("issue.cbr", b"Rar!\x1a\x07\x00 not really"),
+            ("book.pdf", b"%PDF-1.4"),
+            ("tone.wav", &wav(8000)),
+        ],
+        &token,
+    );
+
+    for name in ["logo.svg", "issue.cbr", "book.pdf", "tone.wav"] {
+        let (status, value) = thumbnail(&uuid_by_name(&db.1, name), &token);
+        assert_eq!(status, STATUS_PLAYBACK_INVALID_INPUT, "{name}");
+        assert!(value.is_null(), "{name}");
+    }
+}
+
+// ---------------- libraries and settings ----------------
+
+#[cfg(unix)]
+#[test]
+fn given_a_symlink_inside_the_root_pointing_out_when_a_library_is_moved_through_it_over_ffi_then_invalid_input(
+) {
+    let _g = serial();
+    let parent = tempdir().unwrap();
+    let library = parent.path().join("library");
+    let outside = parent.path().join("secrets");
+    let course = library.join("course");
+    std::fs::create_dir_all(&course).unwrap();
+    std::fs::create_dir(&outside).unwrap();
+    let link = library.join("escape");
+    std::os::unix::fs::symlink(&outside, &link).unwrap();
+    let _db = init_bounded_db(&library);
+    let token = c(TEST_TOKEN);
+    let registered = register_library("Course", course.to_str().unwrap(), &token);
+    let uuid = c(registered["uuid"].as_str().unwrap());
+
+    for destination in [link.clone(), link.join("not-there-yet")] {
+        let moved =
+            c(&serde_json::json!({ "rootPath": destination.to_str().unwrap() }).to_string());
+        assert_eq!(
+            alexandria_library_move(uuid.as_ptr(), moved.as_ptr(), token.as_ptr()).status,
+            STATUS_LIBRARY_INVALID_INPUT,
+            "{destination:?} escaped through the link"
+        );
+    }
+
+    let listed = library_json_ok(alexandria_libraries_list(token.as_ptr()));
+    assert_eq!(listed[0]["rootPath"], course.to_str().unwrap());
+}
+
+#[test]
+fn given_a_running_run_when_its_library_is_removed_over_ffi_then_conflict_and_the_library_stays() {
+    let _g = serial();
+    let db = init_temp_db();
+    let token = c(TEST_TOKEN);
+    let root = folder(&db, "/library");
+    write_library(std::path::Path::new(&root), 500);
+    let body = c(&serde_json::json!({ "name": "Big", "rootPath": root }).to_string());
+    let registered = library_json_ok(alexandria_library_register(body.as_ptr(), token.as_ptr()));
+    let run_id = registered["runId"].as_str().unwrap().to_string();
+    wait_for_run_cell_live(&run_id, &token);
+    let uuid = c(registered["uuid"].as_str().unwrap());
+
+    let removed = alexandria_library_remove(uuid.as_ptr(), token.as_ptr());
+
+    assert_eq!(removed.status, STATUS_LIBRARY_CONFLICT);
+    assert!(removed.json.is_null());
+    let run_id_c = c(&run_id);
+    assert_eq!(
+        alexandria_index_cancel(run_id_c.as_ptr(), token.as_ptr()),
+        STATUS_RUN_OK
+    );
+    wait_for_run_terminal(&run_id, &token);
+    let listed = library_json_ok(alexandria_libraries_list(token.as_ptr()));
+    assert_eq!(
+        listed.as_array().map(Vec::len),
+        Some(1),
+        "the library stays"
+    );
+}
+
+#[test]
+fn given_the_default_settings_when_read_over_ffi_then_the_deletion_window_is_answered() {
+    let _g = serial();
+    let _db = init_temp_db();
+    let token = c(TEST_TOKEN);
+
+    let (status, value) = answer!(alexandria_ffi::alexandria_settings_json(token.as_ptr()));
+
+    assert_eq!(status, alexandria_ffi::SETTINGS_OK);
+    assert_eq!(value["deletion"]["retentionDays"], 30);
 }

@@ -8,7 +8,6 @@
 # (binaries/application repos keep the lockfile checked in)
 
 # Generated output
-/alexandria-http/dist
 /alexandria-ffi/build
 **/*.o
 **/*.so

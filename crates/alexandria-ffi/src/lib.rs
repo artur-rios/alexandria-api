@@ -309,13 +309,11 @@ pub extern "C" fn alexandria_health_status_code() -> i32 {
 /// succeeds. Pointing at a *different* database is subject to the same rule,
 /// for the same reason.
 ///
-/// Configuration is loaded the same way `alexandria-http` loads it — from the
-/// path in `ALEXANDRIA_CONFIG` (default `config.toml`), with `ALEXANDRIA_*`
-/// environment overrides applied — so a setting such as the auth mode or the
-/// retention window means the same thing on both surfaces (FR-FC-24 / NFR-09).
-/// A missing or unreadable config file falls back to defaults rather than
-/// failing, matching the HTTP binary. `db_path` wins over the config's
-/// `database.path`: the embedder passed it explicitly.
+/// Configuration is loaded from the path in `ALEXANDRIA_CONFIG` (default
+/// `config.toml`), with `ALEXANDRIA_*` environment overrides applied. A
+/// missing or unreadable config file falls back to defaults rather than
+/// failing. `db_path` wins over the config's `database.path`: the embedder
+/// passed it explicitly.
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
 pub extern "C" fn alexandria_index_init(db_path: *const c_char) -> c_int {

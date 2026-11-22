@@ -1,7 +1,6 @@
 [workspace]
 members = [
     "crates/alexandria-core",
-    "crates/alexandria-http",
     "crates/alexandria-ffi",
 ]
 resolver = "2"
@@ -40,7 +39,6 @@ alexandria-core = { path = "crates/alexandria-core" }
 
 anyhow = "1"
 argon2 = "0.6"
-axum = "0.8"
 base64 = "0.23"
 cbindgen = "0.29"
 chrono = { version = "0.4", features = ["serde"] }
@@ -98,8 +96,6 @@ sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio",
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 toml = "1"
-tower = "0.5"
-tower-http = { version = "0.7", features = ["trace", "fs"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4", "serde"] }

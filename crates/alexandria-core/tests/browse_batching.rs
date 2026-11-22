@@ -2,7 +2,7 @@
 // this is a single-threaded-per-test-body serialization guard, not a
 // contended lock protecting shared data, so there's no `tokio::sync::Mutex`
 // to gain here. Same rationale, same pattern, as `alexandria-ffi/tests/
-// parity.rs`'s `SERIAL`.
+// smoke.rs`'s `SERIAL`.
 #![allow(clippy::await_holding_lock)]
 
 //! Integration test for the claim issue #116's design rests on: a catalog

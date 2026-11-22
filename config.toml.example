@@ -1,7 +1,7 @@
 # Alexandria example configuration.
 # Copy this file to config.toml and adjust as needed. Most keys can also be set
 # through an environment variable named ALEXANDRIA_<SECTION>_<KEY> — e.g.
-# ALEXANDRIA_HTTP_PORT, ALEXANDRIA_AUTH_MODE, ALEXANDRIA_LOGGING_LEVEL. Every
+# ALEXANDRIA_DATABASE_PATH, ALEXANDRIA_AUTH_MODE, ALEXANDRIA_LOGGING_LEVEL. Every
 # key below follows that rule, with no exceptions. Unknown keys are ignored. This file lists every key the
 # server reads — see the Operations & Infrastructure Document §4 for the
 # authoritative table.
@@ -58,12 +58,6 @@ session_ttl_hours = 24
 # process was launched by this account, never who is calling, so any caller that
 # can reach the port is authorized. Keep `http.bind_addr` on loopback.
 windows_owner_sid = ""
-
-[http]
-# Bind address. Loopback by default so the API is reachable only from the local
-# machine unless explicitly reconfigured (see IR-03).
-bind_addr = "127.0.0.1"
-port = 8080
 
 [database]
 # SQLite file path. Bundled beside the desktop app's data directory by default.
