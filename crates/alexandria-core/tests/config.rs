@@ -1,4 +1,55 @@
+use std::sync::Mutex;
+
 use alexandria_core::config::Settings;
+
+/// Environment variables are process-global, so any test that sets one races
+/// every other test in this binary — cargo runs them on parallel threads in
+/// one process. Every such test takes this lock, and every one restores the
+/// variables it touched before releasing it, so the environment outside a
+/// guarded section is always the one the process started with.
+static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+/// Restores a set of environment variables to their prior values when
+/// dropped — on the panicking path too, so one failing assertion cannot leave
+/// a variable set for whatever runs next.
+struct EnvGuard {
+    _guard: std::sync::MutexGuard<'static, ()>,
+    previous: Vec<(&'static str, Option<String>)>,
+}
+
+impl EnvGuard {
+    /// Take the lock and set `vars`, remembering what was there before.
+    fn set(vars: &[(&'static str, &str)]) -> Self {
+        // Recover from poisoning rather than propagating it: the lock guards
+        // the environment, which this guard restores on unwind anyway, so a
+        // panicking test must not turn every later one into an opaque
+        // `PoisonError` that buries the real failure.
+        let guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let previous = vars
+            .iter()
+            .map(|(key, value)| {
+                let before = std::env::var(key).ok();
+                std::env::set_var(key, value);
+                (*key, before)
+            })
+            .collect();
+        Self {
+            _guard: guard,
+            previous,
+        }
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        for (key, before) in &self.previous {
+            match before {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
+}
 
 #[test]
 fn given_example_config_when_parsed_then_defaults_and_overrides_match_spec() {
@@ -136,4 +187,39 @@ fn given_a_0_6_config_with_auth_and_http_tables_when_loaded_then_it_loads() {
     let settings = Settings::load(&path).expect("a 0.6 config loads");
 
     assert_eq!(settings.database.path, "data/catalog.sqlite");
+}
+
+/// Every key takes an environment override, so the documented deployment
+/// where nothing but the environment is set has to be configurable: with no
+/// config file at all, the variables still land in `Settings`. Both are set
+/// in one test, under one lock, because they share the process-global
+/// environment; see `EnvGuard`.
+#[test]
+fn given_only_environment_variables_when_settings_loaded_then_they_apply() {
+    let _env = EnvGuard::set(&[
+        ("ALEXANDRIA_DELETION_RETENTION_DAYS", "7"),
+        ("ALEXANDRIA_LOGGING_LEVEL", "debug"),
+    ]);
+
+    let settings = Settings::load_or_default(std::path::Path::new(
+        "no-such-config-file-for-this-test.toml",
+    ));
+
+    assert_eq!(settings.deletion.retention_days, 7);
+    assert_eq!(settings.logging.level.as_str(), "debug");
+}
+
+/// The environment wins over a file that sets the same key, so an owner with
+/// a `config.toml` can still change one value for a single run.
+#[test]
+fn given_a_key_in_both_file_and_environment_when_settings_loaded_then_the_environment_wins() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    std::fs::write(&path, "[deletion]\nretention_days = 14\n").unwrap();
+
+    let _env = EnvGuard::set(&[("ALEXANDRIA_DELETION_RETENTION_DAYS", "7")]);
+
+    let settings = Settings::load(&path).expect("config parses");
+
+    assert_eq!(settings.deletion.retention_days, 7);
 }
