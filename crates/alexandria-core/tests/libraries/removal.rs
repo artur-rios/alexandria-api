@@ -14,7 +14,7 @@ use chrono::Utc;
 use sqlx::sqlite::SqlitePool;
 use uuid::Uuid;
 
-use crate::common::{seed_library, FakeAuth};
+use crate::common::seed_library;
 
 async fn migrated(dir: &tempfile::TempDir) -> SqlitePool {
     migrate_database(dir.path().join("a.sqlite").to_str().unwrap())
@@ -55,9 +55,8 @@ async fn ids(pool: &SqlitePool, sql: &str) -> Vec<i64> {
 
 fn remover(
     pool: &SqlitePool,
-) -> RemoveLibraryHandler<FakeAuth, SqliteLibraryRepository, SqliteCatalogRunRepository> {
+) -> RemoveLibraryHandler<SqliteLibraryRepository, SqliteCatalogRunRepository> {
     RemoveLibraryHandler::new(
-        FakeAuth::Allowing,
         SqliteLibraryRepository::new(pool.clone()),
         SqliteCatalogRunRepository::new(pool.clone()),
     )
@@ -88,7 +87,7 @@ async fn given_a_library_in_a_collection_and_lists_when_removed_then_its_items_g
     .await
     .expect("seed");
 
-    remover(&pool).remove(a, "token").await.expect("remove");
+    remover(&pool).remove(a).await.expect("remove");
 
     assert_eq!(
         ids(&pool, "SELECT id FROM files ORDER BY id").await,
@@ -133,10 +132,7 @@ async fn given_a_library_when_removed_then_every_file_stays_on_disk() {
     let path = root.join("notes.md");
     file(&pool, library, path.to_str().unwrap(), FileType::Text).await;
 
-    remover(&pool)
-        .remove(library, "token")
-        .await
-        .expect("remove");
+    remover(&pool).remove(library).await.expect("remove");
 
     assert_eq!(std::fs::read(&path).unwrap(), b"# notes");
     assert!(ids(&pool, "SELECT id FROM files").await.is_empty());
@@ -161,7 +157,7 @@ async fn given_a_running_run_when_the_library_is_removed_then_conflict_and_nothi
         .await
         .unwrap();
 
-    let result = remover(&pool).remove(library, "token").await;
+    let result = remover(&pool).remove(library).await;
 
     match result {
         Err(DomainError::Conflict(message)) => {
@@ -199,10 +195,7 @@ async fn given_a_paused_run_when_the_library_is_removed_then_the_run_is_gone() {
         .await
         .unwrap();
 
-    remover(&pool)
-        .remove(library, "token")
-        .await
-        .expect("remove");
+    remover(&pool).remove(library).await.expect("remove");
 
     assert!(runs.get(run_id).await.unwrap().is_none());
     assert!(ids(&pool, "SELECT id FROM catalog_run_failures")
@@ -228,7 +221,7 @@ async fn given_a_refresh_run_when_a_library_is_removed_then_the_refresh_run_rema
         .await
         .unwrap();
 
-    remover(&pool).remove(a, "token").await.expect("remove");
+    remover(&pool).remove(a).await.expect("remove");
 
     assert!(runs.get(refresh).await.unwrap().is_some());
     let failures: Vec<String> =
@@ -248,7 +241,7 @@ async fn given_an_unknown_library_when_removed_then_not_found() {
     let dir = tempfile::tempdir().unwrap();
     let pool = migrated(&dir).await;
 
-    let result = remover(&pool).remove(Uuid::new_v4(), "token").await;
+    let result = remover(&pool).remove(Uuid::new_v4()).await;
 
     assert!(matches!(result, Err(DomainError::NotFound)), "{result:?}");
 }

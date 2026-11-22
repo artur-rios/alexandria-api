@@ -1,32 +1,9 @@
 use std::env;
-use std::fmt;
 use std::path::Path;
 
 use serde::Deserialize;
-use uuid::Uuid;
 
 use crate::errors::DomainError;
-
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum AuthMode {
-    External,
-    Local,
-    /// The Windows account this process runs as is the credential (UC-45 /
-    /// FR-AU-20). Mutually exclusive with the other two: exactly one mode is
-    /// active at runtime (FR-AU-01).
-    Windows,
-}
-
-impl AuthMode {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            AuthMode::External => "external",
-            AuthMode::Local => "local",
-            AuthMode::Windows => "windows",
-        }
-    }
-}
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -47,235 +24,6 @@ impl LogLevel {
             LogLevel::Debug => "debug",
             LogLevel::Trace => "trace",
         }
-    }
-}
-
-/// A configuration value that must never reach a log.
-///
-/// `Debug` prints a marker instead of the value, so a config dump or a
-/// `tracing` span cannot emit a signing secret. This is FR-AU-06's ban on
-/// logging passwords applied to the other secret that grants the whole
-/// catalog — with the difference that this one is *shared* with Heimdall, so
-/// leaking it compromises more than Alexandria.
-#[derive(Clone, Default, Deserialize, PartialEq, Eq)]
-#[serde(transparent)]
-pub struct Secret(String);
-
-impl Secret {
-    pub fn new(value: impl Into<String>) -> Self {
-        Self(value.into())
-    }
-
-    /// The plaintext. Named so that every read site is obvious at a glance.
-    pub fn expose(&self) -> &str {
-        &self.0
-    }
-
-    /// Whether the secret is unset. Whitespace counts as unset: a key
-    /// configured to `" "` is a mistake, not a secret.
-    pub fn is_empty(&self) -> bool {
-        self.0.trim().is_empty()
-    }
-}
-
-impl fmt::Debug for Secret {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(if self.0.is_empty() {
-            "Secret(unset)"
-        } else {
-            "Secret(redacted)"
-        })
-    }
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct AuthSettings {
-    #[serde(default = "default_auth_mode")]
-    pub mode: AuthMode,
-    /// External mode only: where Heimdall publishes the public keys it signs
-    /// its ES256 tokens with, its `/.well-known/jwks.json`. Inside the
-    /// platform this is the internal address,
-    /// `http://heimdall-api.<env>:8080/.well-known/jwks.json`.
-    #[serde(default)]
-    pub heimdall_jwks_url: String,
-    /// External mode only, and only for the overlap: the HS256 secret
-    /// Heimdall signed its tokens with before it moved to ES256 (its
-    /// `HEIMDALL_AUTH_TOKEN_SECRET`). Tokens signed with it are accepted while
-    /// it is set; once Heimdall stops accepting them, remove it and they are
-    /// refused here too.
-    #[serde(default)]
-    pub heimdall_token_secret: Secret,
-    /// External mode only, and only for the overlap: the secret Heimdall was
-    /// rotating away from (its `HEIMDALL_AUTH_TOKEN_SECRET_PREVIOUS`).
-    /// Accepted alongside the current one, mirroring Heimdall's own two-key
-    /// scheme. Ignored when equal to the current secret: the same value under
-    /// two names is not a rotation.
-    #[serde(default)]
-    pub heimdall_token_secret_previous: Secret,
-    /// External mode only: the UUID of the Heimdall scope Alexandria is
-    /// registered in. A token is accepted when it names this scope.
-    #[serde(default)]
-    pub heimdall_scope_id: String,
-    /// External mode only: the `iss` claim to require, checked only when set.
-    /// Heimdall reads its issuer from an environment variable that defaults
-    /// to empty and then signs tokens carrying no `iss` at all, so requiring
-    /// one unconditionally would reject every token from a default install.
-    #[serde(default)]
-    pub heimdall_issuer: String,
-    /// External mode only: the `aud` claim to require, checked only when set,
-    /// for the same reason as `heimdall_issuer`.
-    #[serde(default)]
-    pub heimdall_audience: String,
-    /// How long a session created by local login (UC-34) stays valid.
-    #[serde(default = "default_session_ttl_hours")]
-    pub session_ttl_hours: u32,
-    /// Windows mode only: the SID of the account this process must run as,
-    /// e.g. `S-1-5-21-1004336348-1177238915-682003330-1001`.
-    ///
-    /// A SID rather than a username because usernames are renameable and
-    /// reusable, while a SID is neither. Not a secret — an identifier — so it
-    /// is a plain `String` rather than a `Secret`.
-    #[serde(default)]
-    pub windows_owner_sid: String,
-}
-
-fn default_auth_mode() -> AuthMode {
-    AuthMode::External
-}
-
-fn default_session_ttl_hours() -> u32 {
-    24
-}
-
-impl Default for AuthSettings {
-    fn default() -> Self {
-        Self {
-            mode: default_auth_mode(),
-            heimdall_jwks_url: String::new(),
-            heimdall_token_secret: Secret::default(),
-            heimdall_token_secret_previous: Secret::default(),
-            heimdall_scope_id: String::new(),
-            heimdall_issuer: String::new(),
-            heimdall_audience: String::new(),
-            session_ttl_hours: default_session_ttl_hours(),
-            windows_owner_sid: String::new(),
-        }
-    }
-}
-
-impl AuthSettings {
-    /// Startup validation for external mode (UC-36). Each binary calls this
-    /// before building services: a process that cannot verify a token must
-    /// refuse to start, rather than answer `401` to every request forever
-    /// with nothing to say why. Heimdall makes the same choice about the same
-    /// secret, and for the same reason.
-    ///
-    /// Local mode reads none of these keys and always passes.
-    pub fn validate(&self) -> Result<(), DomainError> {
-        match self.mode {
-            AuthMode::Local => Ok(()),
-            AuthMode::External => {
-                let jwks_url = self.heimdall_jwks_url.trim();
-                if jwks_url.is_empty() && self.heimdall_token_secret.is_empty() {
-                    return Err(DomainError::Config(
-                        "auth.heimdall_jwks_url is unset: external mode verifies Heimdall's \
-                         tokens against the key set it publishes at \
-                         /.well-known/jwks.json (or, during the move off HS256, against \
-                         auth.heimdall_token_secret), so it must name one"
-                            .to_string(),
-                    ));
-                }
-                if !jwks_url.is_empty()
-                    && !(jwks_url.starts_with("http://") || jwks_url.starts_with("https://"))
-                {
-                    return Err(DomainError::Config(format!(
-                        "auth.heimdall_jwks_url is not an http or https URL: {jwks_url:?}"
-                    )));
-                }
-
-                let scope_id = Uuid::parse_str(self.heimdall_scope_id.trim()).map_err(|_| {
-                    DomainError::Config(format!(
-                        "auth.heimdall_scope_id is not a UUID: {:?}. External mode accepts a \
-                         token on membership of this Heimdall scope, so it must name one.",
-                        self.heimdall_scope_id
-                    ))
-                })?;
-
-                // The nil UUID parses, so it would otherwise start a process
-                // that accepts any token whose `scopeId` is also nil. It is a
-                // placeholder an operator leaves behind, never a scope
-                // Heimdall issued.
-                if scope_id.is_nil() {
-                    return Err(DomainError::Config(
-                        "auth.heimdall_scope_id is the nil UUID: that is a placeholder, not \
-                         the Heimdall scope Alexandria is registered in"
-                            .to_string(),
-                    ));
-                }
-
-                Ok(())
-            }
-            AuthMode::Windows => {
-                if self.windows_owner_sid.trim().is_empty() {
-                    return Err(DomainError::Config(
-                        "auth.windows_owner_sid is unset: Windows mode authenticates by the \
-                         account this process runs as, so it must name the account it expects"
-                            .to_string(),
-                    ));
-                }
-                Ok(())
-            }
-        }
-    }
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct HttpSettings {
-    #[serde(default = "default_bind_addr")]
-    pub bind_addr: String,
-    #[serde(default = "default_http_port")]
-    pub port: u16,
-}
-
-fn default_bind_addr() -> String {
-    "127.0.0.1".to_string()
-}
-
-fn default_http_port() -> u16 {
-    8080
-}
-
-impl Default for HttpSettings {
-    fn default() -> Self {
-        Self {
-            bind_addr: default_bind_addr(),
-            port: default_http_port(),
-        }
-    }
-}
-
-impl HttpSettings {
-    /// The address to listen on: `bind_addr` and `port` together.
-    ///
-    /// The address is parsed on its own and paired with the port, rather than
-    /// the two being joined into `"addr:port"` and parsed as one. That join
-    /// made an IPv6 address — `"::1"`, or `"::"` for every interface — into
-    /// `"::1:8080"`, which is not a socket address, and the binary panicked at
-    /// startup instead of reporting the setting. The bracketed form a URL
-    /// would use (`"[::1]"`) is accepted too, since it is what worked before.
-    pub fn socket_addr(&self) -> Result<std::net::SocketAddr, DomainError> {
-        let host = self.bind_addr.trim();
-        let host = host
-            .strip_prefix('[')
-            .and_then(|inner| inner.strip_suffix(']'))
-            .unwrap_or(host);
-        let ip: std::net::IpAddr = host.parse().map_err(|_| {
-            DomainError::config(format!(
-                "http.bind_addr {:?} is not an IP address",
-                self.bind_addr
-            ))
-        })?;
-        Ok(std::net::SocketAddr::new(ip, self.port))
     }
 }
 
@@ -358,10 +106,10 @@ impl Default for DeletionSettings {
     }
 }
 
-/// The on-disk library root the health check probes for reachability
-/// (UC-37 / IR-03). Distinct from the per-request `root` UC-01/UC-02 take —
-/// this is the single configured location an operator points the health
-/// probe at.
+/// The on-disk library root that bounds what the catalog can reach
+/// (FR-FC-26): the folders libraries may be added at or moved to, and the
+/// cataloged files playback and the file-content operations will touch.
+/// Empty turns the bound off.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct FilesystemSettings {
     #[serde(default)]
@@ -418,10 +166,6 @@ impl Default for PlaybackSettings {
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct Settings {
     #[serde(default)]
-    pub auth: AuthSettings,
-    #[serde(default)]
-    pub http: HttpSettings,
-    #[serde(default)]
     pub database: DatabaseSettings,
     #[serde(default)]
     pub indexing: IndexingSettings,
@@ -461,50 +205,6 @@ impl Settings {
     }
 
     fn apply_env_overrides(&mut self) {
-        if let Ok(mode) = env::var("ALEXANDRIA_AUTH_MODE") {
-            if let Ok(parsed) = match_mode(&mode) {
-                self.auth.mode = parsed;
-            }
-        }
-        if let Ok(hours) = env::var("ALEXANDRIA_AUTH_SESSION_TTL_HOURS") {
-            if let Ok(parsed) = hours.parse::<u32>() {
-                self.auth.session_ttl_hours = parsed;
-            }
-        }
-        if let Ok(sid) = env::var("ALEXANDRIA_AUTH_WINDOWS_OWNER_SID") {
-            self.auth.windows_owner_sid = sid;
-        }
-        // The external-mode keys take the same overrides as everything else,
-        // and the two overlap secrets especially: a deployment must be able to
-        // hand Alexandria the shared signing key through the environment
-        // rather than write to disk the one value that can mint a token every
-        // Heimdall-backed application will accept.
-        if let Ok(url) = env::var("ALEXANDRIA_AUTH_HEIMDALL_JWKS_URL") {
-            self.auth.heimdall_jwks_url = url;
-        }
-        if let Ok(secret) = env::var("ALEXANDRIA_AUTH_HEIMDALL_TOKEN_SECRET") {
-            self.auth.heimdall_token_secret = Secret::new(secret);
-        }
-        if let Ok(secret) = env::var("ALEXANDRIA_AUTH_HEIMDALL_TOKEN_SECRET_PREVIOUS") {
-            self.auth.heimdall_token_secret_previous = Secret::new(secret);
-        }
-        if let Ok(scope_id) = env::var("ALEXANDRIA_AUTH_HEIMDALL_SCOPE_ID") {
-            self.auth.heimdall_scope_id = scope_id;
-        }
-        if let Ok(issuer) = env::var("ALEXANDRIA_AUTH_HEIMDALL_ISSUER") {
-            self.auth.heimdall_issuer = issuer;
-        }
-        if let Ok(audience) = env::var("ALEXANDRIA_AUTH_HEIMDALL_AUDIENCE") {
-            self.auth.heimdall_audience = audience;
-        }
-        if let Ok(addr) = env::var("ALEXANDRIA_HTTP_BIND_ADDR") {
-            self.http.bind_addr = addr;
-        }
-        if let Ok(port) = env::var("ALEXANDRIA_HTTP_PORT") {
-            if let Ok(parsed) = port.parse::<u16>() {
-                self.http.port = parsed;
-            }
-        }
         if let Ok(path) = env::var("ALEXANDRIA_DATABASE_PATH") {
             self.database.path = path;
         }
@@ -537,15 +237,6 @@ impl Settings {
     }
 }
 
-fn match_mode(value: &str) -> Result<AuthMode, ()> {
-    match value.trim() {
-        "external" => Ok(AuthMode::External),
-        "local" => Ok(AuthMode::Local),
-        "windows" => Ok(AuthMode::Windows),
-        _ => Err(()),
-    }
-}
-
 fn match_log_level(value: &str) -> Result<LogLevel, ()> {
     match value.trim() {
         "error" => Ok(LogLevel::Error),
@@ -562,23 +253,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn given_auth_mode_when_external_lowercase_then_parses() {
-        assert_eq!(match_mode("external").unwrap(), AuthMode::External);
-        assert_eq!(match_mode("local").unwrap(), AuthMode::Local);
-        assert_eq!(match_mode("windows").unwrap(), AuthMode::Windows);
-        assert!(match_mode("bogus").is_err());
-        assert_eq!(AuthMode::External.as_str(), "external");
-        assert_eq!(AuthMode::Local.as_str(), "local");
-        assert_eq!(AuthMode::Windows.as_str(), "windows");
-    }
-
-    #[test]
-    fn given_default_settings_when_socket_addr_built_then_is_loopback() {
-        let settings = Settings::default();
-        let addr = settings.http.socket_addr().expect("default bind address");
-        assert!(addr.ip().is_loopback());
-        assert_eq!(addr.port(), 8080);
-        assert_eq!(settings.logging.level.as_str(), "info");
+    fn given_default_settings_when_read_then_the_log_level_is_info() {
+        assert_eq!(Settings::default().logging.level.as_str(), "info");
     }
 
     #[test]

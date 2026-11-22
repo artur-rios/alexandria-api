@@ -1,6 +1,5 @@
 use uuid::Uuid;
 
-use crate::auth::AuthService;
 use crate::collections::model::Collection;
 use crate::collections::repos::CollectionRepository;
 use crate::errors::DomainError;
@@ -12,28 +11,21 @@ use crate::errors::DomainError;
 /// Like the other collection handlers the command is the handler itself: no
 /// `Clock` or `Filesystem` collaborator, since a collection carries no
 /// timestamps and nothing on disk to compensate on failure.
-pub struct DeleteCollectionHandler<A, R> {
-    auth: A,
+pub struct DeleteCollectionHandler<R> {
     repo: R,
 }
 
-impl<A, R> DeleteCollectionHandler<A, R>
+impl<R> DeleteCollectionHandler<R>
 where
-    A: AuthService,
     R: CollectionRepository,
 {
-    pub fn new(auth: A, repo: R) -> Self {
-        Self { auth, repo }
+    pub fn new(repo: R) -> Self {
+        Self { repo }
     }
 
     /// Delete the collection identified by `uuid`, unlinking its items, and
     /// return the pre-delete record as confirmation.
-    pub async fn delete(&self, uuid: Uuid, token: &str) -> Result<Collection, DomainError> {
-        // AF-02: the caller must be authenticated. Evaluated before the
-        // collection is looked up (FR-AU-07 / SRD §7), so an unauthenticated
-        // caller learns nothing about whether the uuid exists.
-        self.auth.authenticate(token).await?;
-
+    pub async fn delete(&self, uuid: Uuid) -> Result<Collection, DomainError> {
         // AF-01: the collection must exist.
         let collection = self
             .repo

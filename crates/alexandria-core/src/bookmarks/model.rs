@@ -29,8 +29,7 @@ impl BookmarkState {
 }
 
 /// A bookmark about to be persisted (UC-15). The `uuid` is minted by the
-/// handler, not the repository, so the value is decided by the same code on
-/// both transports and a unit test can assert it against a fake.
+/// handler, not the repository, so a unit test can assert it against a fake.
 #[derive(Debug, Clone)]
 pub struct NewBookmark {
     pub uuid: Uuid,

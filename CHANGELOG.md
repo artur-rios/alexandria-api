@@ -7,6 +7,53 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+The core has no login any more. It only ever runs locally, for the person at the machine, and the desktop front-end
+calls it in process through its C ABI, so authentication protected nothing and the HTTP server reached a catalog nobody
+reached over a network.
+
+### Added
+
+- Pinned and favorite libraries: `alexandria_library_set_pinned(uuid, pinned)` and
+  `alexandria_library_set_favorite(uuid, favorite)` set each flag on its own, and every library JSON (the listing,
+  browse, register, rename) carries `pinned` and `favorite`. Both answer `0`, `LIBRARY_ERR_INVALID_INPUT` for a
+  malformed uuid, `LIBRARY_ERR_NOT_INITIALIZED`, or `LIBRARY_ERR_NOT_FOUND`; setting the value a library already has
+  changes nothing. Moving, renaming or re-indexing a library keeps its flags (`alexandria-core`, `alexandria-ffi`).
+- Renaming a library: `alexandria_library_rename(uuid, {"name": "..."})` answers the updated library. The name is
+  stored trimmed and a blank one is refused with `LIBRARY_ERR_INVALID_INPUT`. It is allowed at any time, including
+  while the library's run is in progress or paused (`alexandria-core`, `alexandria-ffi`).
+- Catalog statistics: `alexandria_catalog_stats_json()` answers `{"libraries": n, "filesByType": {...}}` with all
+  seven file types, `0` for an empty one. Files count as the default file listing shows them: files marked missing on
+  disk count, soft-deleted ones do not (`alexandria-core`, `alexandria-ffi`).
+
+### Changed
+
+- `alexandria_index_init` no longer checks the Windows account it runs as. It validates no settings any more; its
+  remaining failures are a NULL or non-UTF-8 database path (`INDEX_ERR_INVALID_INPUT`), `INDEX_ERR_BUSY`, and a failed
+  migration or a panic (both `INDEX_ERR_OTHER`) (`alexandria-ffi`).
+- A `config.toml` that still holds `[auth]` or `[http]` tables keeps loading; they are ignored, and so are the
+  `ALEXANDRIA_AUTH_*` and `ALEXANDRIA_HTTP_*` environment variables (`alexandria-core`).
+- Breaking for clients: the FFI changes shape, so a client built against 0.6 cannot use this core.
+
+### Upgrade
+
+Starting this version deletes the stored local-login credential, every session and every recovery code (migration 30),
+and adds the pinned and favorite flags to every library, both off. No catalog data is lost: libraries, files, runs,
+progress, collections and bookmarks are untouched, and so are files on disk.
+
+### Removed
+
+- The `token` parameter of every FFI call. Every function that took one has lost it, and its other parameters keep
+  their order: `alexandria_files_list(json_filters, token)` is `alexandria_files_list(json_filters)`
+  (`alexandria-ffi`).
+- Authentication, in all three modes: the local account with its recovery codes, external Heimdall JWTs, and the
+  Windows account. The `alexandria_auth_*` FFI functions go with it (`local_login`, `windows_login`,
+  `local_set_credentials`, `local_register`, `local_account`, `local_redeem_recovery_code`,
+  `local_regenerate_recovery_codes`), and so do `AUTH_ERR_*` and their result struct.
+- `*_ERR_UNAUTHORIZED` in every result family. Code 2 is retired and never reused; every other code keeps its value.
+- The HTTP REST/JSON server, `alexandria-http`, with every `/v1/*` route and `/health`. The core is used only through
+  its C ABI (`alexandria-ffi`).
+- The `[auth]` and `[http]` configuration sections and their `ALEXANDRIA_AUTH_*` and `ALEXANDRIA_HTTP_*` overrides.
+
 ## [0.6.0] - 2026-11-20
 
 The first tagged release. The workspace version in `Cargo.toml` tracks client compatibility with the desktop

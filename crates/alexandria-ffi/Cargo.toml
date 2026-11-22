@@ -24,16 +24,16 @@ cbindgen.workspace = true
 
 [dev-dependencies]
 alexandria-core = { path = "../alexandria-core" }
-alexandria-http = { path = "../alexandria-http" }
-axum = { workspace = true }
 chrono.workspace = true
 ffmpeg-next.workspace = true
 image.workspace = true
 little_exif.workspace = true
+# An audio file's thumbnail is the front cover in its own tag, so the test
+# of it writes one with `lofty`, the reader the core uses.
+lofty.workspace = true
 lopdf.workspace = true
 serde_json.workspace = true
 sqlx.workspace = true
 tempfile.workspace = true
 tokio.workspace = true
-tower.workspace = true
 zip.workspace = true

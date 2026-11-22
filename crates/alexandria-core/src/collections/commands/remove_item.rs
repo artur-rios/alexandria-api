@@ -1,6 +1,5 @@
 use uuid::Uuid;
 
-use crate::auth::AuthService;
 use crate::bookmarks::repos::BookmarkRepository;
 use crate::catalog::repos::CatalogRepository;
 use crate::collections::model::{CollectionItemResult, CollectionKind};
@@ -13,23 +12,20 @@ use crate::errors::DomainError;
 /// Generic over the same three repositories `AddItemsToCollectionHandler`
 /// uses, for the same reason: which one performs the unlink depends on the
 /// collection's `kind`.
-pub struct RemoveItemFromCollectionHandler<A, CR, CATR, BR> {
-    auth: A,
+pub struct RemoveItemFromCollectionHandler<CR, CATR, BR> {
     collection_repo: CR,
     catalog_repo: CATR,
     bookmark_repo: BR,
 }
 
-impl<A, CR, CATR, BR> RemoveItemFromCollectionHandler<A, CR, CATR, BR>
+impl<CR, CATR, BR> RemoveItemFromCollectionHandler<CR, CATR, BR>
 where
-    A: AuthService,
     CR: CollectionRepository,
     CATR: CatalogRepository,
     BR: BookmarkRepository,
 {
-    pub fn new(auth: A, collection_repo: CR, catalog_repo: CATR, bookmark_repo: BR) -> Self {
+    pub fn new(collection_repo: CR, catalog_repo: CATR, bookmark_repo: BR) -> Self {
         Self {
-            auth,
             collection_repo,
             catalog_repo,
             bookmark_repo,
@@ -42,12 +38,7 @@ where
         &self,
         collection_uuid: Uuid,
         item_uuid: Uuid,
-        token: &str,
     ) -> Result<CollectionItemResult, DomainError> {
-        // AF-03: the caller must be authenticated. Evaluated before the
-        // collection or item are looked up (FR-AU-07 / SRD §7).
-        self.auth.authenticate(token).await?;
-
         // AF-02: the collection must exist.
         let collection = self
             .collection_repo

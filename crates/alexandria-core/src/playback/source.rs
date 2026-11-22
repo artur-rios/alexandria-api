@@ -2,7 +2,6 @@
 
 use uuid::Uuid;
 
-use crate::auth::AuthService;
 use crate::catalog::library_root::LibraryRoot;
 use crate::catalog::repos::CatalogRepository;
 use crate::errors::DomainError;
@@ -11,42 +10,37 @@ use crate::playback::{resolve_playable, FileStat, PlaybackSource};
 
 /// UC-38 — resolve a catalog UUID to everything needed to play its bytes.
 ///
-/// Generic over auth, catalog repository, and stat so the decision logic is
-/// unit-tested against trait fakes, then wired with concrete collaborators
-/// at runtime (services.rs). Both surfaces call this handler: HTTP takes the
-/// resolved path and streams it through `ServeFile`, FFI serializes the
-/// `PlaybackSource` and lets the local client open the file itself.
-pub struct PlaybackSourceHandler<A, R, S> {
-    auth: A,
+/// Generic over the catalog repository and stat so the decision logic is
+/// unit-tested against trait fakes, then wired with concrete collaborators at
+/// runtime (services.rs). The FFI serializes the `PlaybackSource` and lets the
+/// local client open the file itself.
+pub struct PlaybackSourceHandler<R, S> {
     repo: R,
     stat: S,
     /// `filesystem.root` (FR-FC-26): see `resolve_playable`.
     library_root: LibraryRoot,
 }
 
-impl<A, R, S> PlaybackSourceHandler<A, R, S>
+impl<R, S> PlaybackSourceHandler<R, S>
 where
-    A: AuthService,
     R: CatalogRepository,
     S: FileStat,
 {
-    pub fn new(auth: A, repo: R, stat: S, library_root: LibraryRoot) -> Self {
+    pub fn new(repo: R, stat: S, library_root: LibraryRoot) -> Self {
         Self {
-            auth,
             repo,
             stat,
             library_root,
         }
     }
 
-    pub async fn resolve(&self, uuid: Uuid, token: &str) -> Result<PlaybackSource, DomainError> {
-        let file =
-            resolve_playable(&self.auth, &self.repo, &self.library_root, uuid, token).await?;
+    pub async fn resolve(&self, uuid: Uuid) -> Result<PlaybackSource, DomainError> {
+        let file = resolve_playable(&self.repo, &self.library_root, uuid).await?;
 
         // The stat is load-bearing twice: it supplies `size_bytes` for the
         // FFI descriptor, and it is what turns a file that vanished without
-        // a re-index into a `Disk` error. Without it, HTTP's `ServeFile`
-        // would answer its own 404 and misreport the catalog.
+        // a re-index into a `Disk` error. Without it, the client would be
+        // handed a path that opens nothing.
         let size_bytes = self.stat.size_bytes(&file.path).await?;
 
         Ok(PlaybackSource {
@@ -62,7 +56,7 @@ where
 mod tests {
     use super::*;
     use crate::catalog::model::{FileState, FileType};
-    use crate::playback::test_support::{a_file, FakeAuth, FakeRepo};
+    use crate::playback::test_support::{a_file, FakeRepo};
 
     #[derive(Clone)]
     struct FakeStat {
@@ -86,7 +80,6 @@ mod tests {
             None,
         ));
         let handler = PlaybackSourceHandler::new(
-            FakeAuth { good: "t" },
             repo,
             FakeStat {
                 size: Ok(2_097_152),
@@ -95,7 +88,7 @@ mod tests {
         );
 
         // Act
-        let source = handler.resolve(Uuid::nil(), "t").await.expect("resolves");
+        let source = handler.resolve(Uuid::nil()).await.expect("resolves");
 
         // Assert
         assert_eq!(source.path, "/lib/movie.mp4");
@@ -107,7 +100,7 @@ mod tests {
     async fn given_file_that_cannot_be_stat_when_resolved_then_disk_error() {
         // Arrange — the record is active and not marked missing, but the
         // file vanished since the last re-index. This must be a disk error,
-        // not a 404: the catalog record is valid.
+        // not a not-found: the catalog record is valid.
         let repo = FakeRepo::with_file(a_file(
             "/lib/gone.mp4",
             FileType::Video,
@@ -115,14 +108,13 @@ mod tests {
             None,
         ));
         let handler = PlaybackSourceHandler::new(
-            FakeAuth { good: "t" },
             repo,
             FakeStat { size: Err(()) },
             LibraryRoot::unconfigured(),
         );
 
         // Act
-        let result = handler.resolve(Uuid::nil(), "t").await;
+        let result = handler.resolve(Uuid::nil()).await;
 
         // Assert
         assert!(matches!(result, Err(DomainError::Disk(_))));
@@ -138,14 +130,13 @@ mod tests {
             None,
         ));
         let handler = PlaybackSourceHandler::new(
-            FakeAuth { good: "t" },
             repo,
             FakeStat { size: Ok(10) },
             LibraryRoot::unconfigured(),
         );
 
         // Act
-        let source = handler.resolve(Uuid::nil(), "t").await.expect("resolves");
+        let source = handler.resolve(Uuid::nil()).await.expect("resolves");
 
         // Assert
         assert_eq!(source.mime_type, "application/octet-stream");

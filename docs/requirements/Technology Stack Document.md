@@ -37,7 +37,7 @@ choices instead of restating them, so that:
 | Runtime | **tokio async runtime** | latest stable at implementation time |
 | Language | **Rust (edition 2021)** | toolchain tracked to latest stable at implementation time |
 | Language features | `#![deny(unsafe_code)]` applied project-wide | enforced in every crate so the whole workspace is memory-safe by audit |
-| Workspace | **Cargo workspace**, three library/server crates + tests | see the [Operations & Infrastructure Document](Operations%20%26%20Infrastructure%20Document.md) §2.3 for layout |
+| Workspace | **Cargo workspace**, two library crates (the core and its C ABI) + tests | see the [Operations & Infrastructure Document](Operations%20%26%20Infrastructure%20Document.md) §2.3 for layout |
 
 ---
 
@@ -45,19 +45,13 @@ choices instead of restating them, so that:
 
 | Package | Version | Used by | Role |
 | --- | --- | --- | --- |
-| **tokio** | latest stable at implementation time | all crates | async runtime for indexing, HTTP, and DB I/O |
-| **axum** | latest stable at implementation time | alexandria-http | HTTP/REST-JSON server framework, tower middleware, extractors |
-| **tower** / **tower-http** | latest stable at implementation time | alexandria-http | middleware pipeline (logging, auth, error mapping, CORS) |
+| **tokio** | latest stable at implementation time | all crates | async runtime for indexing and DB I/O |
 | **sqlx** | latest stable at implementation time | alexandria-core | async SQLite driver with compile-time SQL verification; migrations |
 | **uuid** | latest stable at implementation time | alexandria-core | public UUID identifiers for entities (`Uuid` v4) |
-| **serde** / **serde_json** | latest stable at implementation time | all crates | JSON serialization for the HTTP/REST contract and FFI boundary |
+| **serde** / **serde_json** | latest stable at implementation time | all crates | JSON serialization across the FFI boundary |
 | **tracing** / **tracing-subscriber** | latest stable at implementation time | all crates | structured, span-aware logging |
 | **anyhow** | latest stable at implementation time | all crates | error propagation across crate boundaries |
 | **thiserror** | latest stable at implementation time | alexandria-core | typed domain error enums per command/query |
-| **argon2** | latest stable at implementation time | alexandria-core (auth) | salted password hashing for local-login mode |
-| **jsonwebtoken** | latest stable at implementation time | alexandria-core (auth) | ES256 verification of Heimdall-issued JWTs against its published key set for external-auth mode, and HS256 during the move off the shared secret |
-| **reqwest** | latest stable at implementation time | alexandria-core (auth) | fetching Heimdall's key set (`/.well-known/jwks.json`) in external-auth mode; rustls, so it adds no system TLS dependency |
-| **windows-sys** | latest stable at implementation time | alexandria-core (auth) | reading the process token needs the Win32 bindings; this is the thinnest available — raw FFI declarations with no wrapper layer — and it is declared under `[target.'cfg(windows)'.dependencies]`, so it enters the graph only on Windows targets and no other platform's build is affected |
 | **toml** | latest stable at implementation time | all crates | `config.toml` parsing with env-var overrides |
 | **cbindgen** | latest stable at implementation time | alexandria-ffi (build) | generates the C header consumed by Flutter FFI |
 | **sha2** | latest stable at implementation time | alexandria-core | SHA-256 of the bytes a text edit wrote back (FR-TX-03). Not on the scan path: indexing and re-index compute no hash (FR-FC-09, FR-FC-10). |
@@ -73,15 +67,14 @@ buy real parallelism instead of interleaved waiting.
 Input validation is **hand-written** per command handler (a `validate_*`
 function beside the handler it guards, unit-tested against its own table of
 rejected inputs) rather than derived from a validation crate. The rules are
-cross-transport invariants — no leading/trailing whitespace, no NUL that would
-truncate at the FFI boundary, byte-length caps — that both the HTTP and FFI
-surfaces have to apply identically (NFR-09), and keeping them as plain
-functions is what lets both call the same code.
+invariants of the stored value — no leading/trailing whitespace, no NUL that
+would truncate at the FFI boundary, byte-length caps — and keeping them as plain
+functions is what lets every handler that stores the value call the same code.
 
-There is no OpenAPI specification. The REST contract is defined by §5 of the
+The FFI contract is defined by §5 of the
 [System Requirements Document](System%20Requirements%20Document.md) and the
-route-level documentation in `alexandria-http`; generating a machine-readable
-spec is a possible future addition, not a current dependency.
+doc comment on each `extern "C"` function, which cbindgen carries into the C
+header.
 
 ### 3.1 Metadata extraction (FR-FC-25)
 
@@ -104,10 +97,10 @@ never fails the file's indexing.
 
 | Concern | Choice |
 | --- | --- |
-| Catalog database | **SQLite** — embedded, file-based, ships with the desktop bundle; stores catalog metadata, collections, bookmarks, watchlists, reading lists, deletion state, and local-login credentials (password stored as a salted Argon2 hash, never plaintext). |
+| Catalog database | **SQLite** — embedded, file-based, ships with the desktop bundle; stores catalog metadata, collections, bookmarks, watchlists, reading lists, and deletion state. No credential: the core has no login (migration 30 deleted what older catalogs stored). |
 | Connection configuration | path from `config.toml` / env override; a single connection pool sized for a single-user workload. **WAL journal mode**, so reads proceed against a snapshot while an indexing run writes (FR-FC-08); sqlx leaves the journal mode alone by default, so this is set explicitly at pool construction. Every explicit transaction begins `IMMEDIATE`: they all write, and a deferred transaction that reads first gets an un-retryable `SQLITE_BUSY` when it tries to upgrade under contention. |
 | Foreign keys | enforced — sqlx sets `PRAGMA foreign_keys = ON` per connection. The subtype tables cascade from `files`; `watch_progress`, `reading_progress`, and the two `collection_id` columns declare no foreign key (SQLite cannot add one via `ALTER TABLE`), so their cleanup is explicit in the repositories. |
-| Migrations | **sqlx migrate**; migrations live in `alexandria-core/migrations` and run at startup. |
+| Migrations | **sqlx migrate**; migrations live in `alexandria-core/migrations` and run when the core is initialized (`alexandria_index_init`). |
 | Same engine in tests | yes — every environment including tests uses an on-disk or in-memory SQLite database; see the [Testing Specification Document](Testing%20Specification%20Document.md). |
 
 The API stores **only metadata and a reference to the file on disk** — its
@@ -136,12 +129,11 @@ unit tests substitute in-memory fakes (see the
 
 | Concern | Technology | Version | How it is used |
 | --- | --- | --- | --- |
-| Input validation | hand-written `validate_*` functions in alexandria-core | — | one function per validated value, called by the handler and shared by both transports (see §3) |
+| Input validation | hand-written `validate_*` functions in alexandria-core | — | one function per validated value, called by the handler (see §3) |
 | Logging | **tracing** / **tracing-subscriber** | latest stable at implementation time | structured span-aware logs; see the [Operations & Infrastructure Document](Operations%20%26%20Infrastructure%20Document.md) §4 |
-| Authentication / authorization | pluggable auth module (external JWT via **jsonwebtoken**, local login via **argon2**, Windows account via **windows-sys**) | latest stable at implementation time | selected at startup from config; exactly one mode active |
-| Error / result model | typed domain errors via **thiserror**; **anyhow** at crate boundaries; `Result<T, E>` everywhere | latest stable at implementation time | commands/queries return `Result<T, DomainError>`; the HTTP layer maps `DomainError` to status codes |
-| API documentation | System Requirements Document §5 + rustdoc on each route | — | the endpoint table is the contract; the FFI surface mirrors the same operations. No generated OpenAPI spec (see §3). |
-| Configuration | **toml** + env overrides | latest stable at implementation time | `config.toml` read at startup; the `ALEXANDRIA_*` env namespace overrides keys |
+| Error / result model | typed domain errors via **thiserror**; **anyhow** at crate boundaries; `Result<T, E>` everywhere | latest stable at implementation time | commands/queries return `Result<T, DomainError>`; the FFI layer maps `DomainError` to each call family's status codes |
+| API documentation | System Requirements Document §5 + rustdoc on each `extern "C"` function | — | the FFI calls table is the contract; cbindgen carries the doc comments into the C header (see §3). |
+| Configuration | **toml** + env overrides | latest stable at implementation time | `config.toml` read when the core is initialized; the `ALEXANDRIA_*` env namespace overrides keys |
 | Content hashing | **sha2** (SHA-256) | latest stable at implementation time | verifying and recording the bytes a text edit wrote back (FR-TX-03); indexing and re-index detect change from size and modification time instead (FR-FC-09, FR-FC-10) |
 
 ---
@@ -156,12 +148,11 @@ section is the canonical list of the tools and versions.
 | Concern | Technology | Version | How it is used |
 | --- | --- | --- | --- |
 | Test framework | Rust built-in `#[test]` | — (std) | unit and integration tests in the standard cargo layout |
-| Test runner / SDK | **cargo test** | latest stable at implementation time | runs the full suite; parity tests gated by a test trait |
+| Test runner / SDK | **cargo test** | latest stable at implementation time | runs the full suite |
 | Coverage | **cargo-tarpaulin** | latest stable at implementation time | optional line/branch coverage reporting |
-| Mocking / test doubles | hand-written trait fakes; **mockall** for trait mocks only when needed | latest stable at implementation time | repository and auth-service traits faked in unit tests |
+| Mocking / test doubles | hand-written trait fakes; **mockall** for trait mocks only when needed | latest stable at implementation time | repository traits faked in unit tests |
 | Test data generation | factory helpers in the tests crate | — | builders for entities and commands |
-| Integration dependencies | on-disk or in-memory SQLite; temp-dir filesystem fakes; auth service fake | — | see the Testing Specification §7.2 |
-| HTTP/FFI parity | a parity test harness asserting identical results across both surfaces | — | built on top of the integration suite |
+| Integration dependencies | on-disk or in-memory SQLite; temp-dir filesystem fakes | — | see the Testing Specification §7.2 |
 
 ---
 
@@ -171,8 +162,6 @@ section is the canonical list of the tools and versions.
 | --- | --- | --- |
 | Platform | tokio | latest stable at implementation time |
 | Language | Rust (edition 2021) | latest stable at implementation time |
-| HTTP | axum | latest stable at implementation time |
-| HTTP middleware | tower / tower-http | latest stable at implementation time |
 | Database driver | sqlx | latest stable at implementation time |
 | UUIDs | uuid | latest stable at implementation time |
 | Serialization | serde / serde_json | latest stable at implementation time |
@@ -180,8 +169,6 @@ section is the canonical list of the tools and versions.
 | Error handling | anyhow | latest stable at implementation time |
 | Domain errors | thiserror | latest stable at implementation time |
 | Validation | validator | latest stable at implementation time |
-| Password hashing | argon2 | latest stable at implementation time |
-| JWT | jsonwebtoken | latest stable at implementation time |
 | Configuration | toml | latest stable at implementation time |
 | FFI headers | cbindgen | latest stable at implementation time |
 | Content hashing | sha2 | latest stable at implementation time |

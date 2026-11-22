@@ -8,10 +8,9 @@ use crate::catalog::model::File;
 /// files or a grouping of bookmarks; the discriminator is fixed at creation
 /// (UC-10 / FR-CO-01, FR-CO-02) and decides which items UC-13 will accept.
 ///
-/// Serialized lowercase so the HTTP JSON body (`{"kind":"file"}`) and the FFI
-/// JSON body carry the same value (FR-FC-24 / NFR-09). Deserialization is what
-/// rejects an unrecognised `kind` as invalid input on both surfaces (AF-01) —
-/// there is no variant for it to land in.
+/// Serialized lowercase, so the FFI JSON body carries `{"kind":"file"}`.
+/// Deserialization is what rejects an unrecognised `kind` as invalid input
+/// (AF-01) — there is no variant for it to land in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum CollectionKind {
@@ -43,8 +42,7 @@ impl std::fmt::Display for CollectionKind {
 }
 
 /// A collection about to be persisted (UC-10). The `uuid` is minted by the
-/// handler, not the repository, so the value is decided by the same code on
-/// both transports and a unit test can assert it against a fake.
+/// handler, not the repository, so a unit test can assert it against a fake.
 #[derive(Debug, Clone)]
 pub struct NewCollection {
     pub uuid: Uuid,
@@ -130,8 +128,7 @@ pub struct CollectionItemsResult {
 
 /// Result of UC-14's remove (FR-CO-06): the collection and the single item
 /// uuid the request just unlinked. The interface is per-item
-/// (`DELETE /v1/collections/{uuid}/items/{itemUuid}`, SRD §5.4), unlike
-/// UC-13's batch add.
+/// (`alexandria_collection_remove_item`), unlike UC-13's batch add.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CollectionItemResult {

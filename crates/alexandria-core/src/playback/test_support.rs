@@ -13,40 +13,11 @@
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
-use crate::auth::{AuthService, Principal};
 use crate::catalog::model::{
     File, FileState, FileType, FileView, NewFile, StateFilter, SubtypeMetadata,
 };
 use crate::catalog::repos::CatalogRepository;
-use crate::config::AuthMode;
 use crate::errors::DomainError;
-
-/// Auth fake: accepts exactly one token, rejects everything else.
-///
-/// `mod`'s tests exercise both branches (a good token and a bad one);
-/// `source`, `comic_page`, and `thumbnail` only ever pass the good token, so
-/// for them this behaves exactly like the accept-anything fake they used to
-/// define separately.
-#[derive(Clone)]
-pub(crate) struct FakeAuth {
-    pub(crate) good: &'static str,
-}
-
-impl AuthService for FakeAuth {
-    async fn authenticate(&self, token: &str) -> Result<Principal, DomainError> {
-        if token == self.good {
-            Ok(Principal {
-                user_id: "owner".to_string(),
-            })
-        } else {
-            Err(DomainError::Unauthorized)
-        }
-    }
-
-    fn mode(&self) -> AuthMode {
-        AuthMode::External
-    }
-}
 
 /// Catalog repo fake returning one canned file, or none. This guard calls
 /// exactly one `CatalogRepository` method (`find_by_uuid`); every other

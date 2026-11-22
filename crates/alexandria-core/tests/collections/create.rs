@@ -1,8 +1,7 @@
 //! Unit tests for the UC-10 CreateCollectionHandler (Testing Specification
 //! §6). Each test exercises exactly the handler against trait fakes — no real
-//! DB or auth service. Coverage follows §6.3: happy path for each `kind`,
-//! every name-validation failure (AF-01), the unauthorized branch (AF-02),
-//! and the repository-write-failure branch.
+//! DB. Coverage follows §6.3: happy path for each `kind`, every
+//! name-validation failure (AF-01), and the repository-write-failure branch.
 //!
 //! There is no not-found or invalid-state case: UC-10 creates a new record, so
 //! it references no existing entity and the collection has no lifecycle.
@@ -11,24 +10,19 @@ use alexandria_core::collections::commands::create::CreateCollectionHandler;
 use alexandria_core::collections::model::CollectionKind;
 use alexandria_core::errors::DomainError;
 
-use crate::common::{FakeAuth, FakeCollectionRepository};
+use crate::common::FakeCollectionRepository;
 
-const TOKEN: &str = "bearer-token";
-
-fn handler(
-    auth: FakeAuth,
-    repo: FakeCollectionRepository,
-) -> CreateCollectionHandler<FakeAuth, FakeCollectionRepository> {
-    CreateCollectionHandler::new(auth, repo)
+fn handler(repo: FakeCollectionRepository) -> CreateCollectionHandler<FakeCollectionRepository> {
+    CreateCollectionHandler::new(repo)
 }
 
 /// An allowing handler over a fresh fake repo, plus the repo to inspect.
 fn seeded() -> (
     FakeCollectionRepository,
-    CreateCollectionHandler<FakeAuth, FakeCollectionRepository>,
+    CreateCollectionHandler<FakeCollectionRepository>,
 ) {
     let repo = FakeCollectionRepository::new();
-    let h = handler(FakeAuth::Allowing, repo.clone());
+    let h = handler(repo.clone());
     (repo, h)
 }
 
@@ -39,7 +33,7 @@ async fn given_valid_name_and_file_kind_when_create_then_collection_persisted_an
     let (repo, h) = seeded();
 
     let result = h
-        .create("Sci-fi novels", CollectionKind::File, TOKEN)
+        .create("Sci-fi novels", CollectionKind::File)
         .await
         .expect("create");
 
@@ -57,7 +51,7 @@ async fn given_valid_name_and_bookmark_kind_when_create_then_kind_persisted_as_b
     let (repo, h) = seeded();
 
     let result = h
-        .create("Rust reading", CollectionKind::Bookmark, TOKEN)
+        .create("Rust reading", CollectionKind::Bookmark)
         .await
         .expect("create");
 
@@ -75,11 +69,11 @@ async fn given_two_collections_with_same_name_when_create_then_both_get_distinct
     let (repo, h) = seeded();
 
     let first = h
-        .create("Favorites", CollectionKind::File, TOKEN)
+        .create("Favorites", CollectionKind::File)
         .await
         .expect("first");
     let second = h
-        .create("Favorites", CollectionKind::File, TOKEN)
+        .create("Favorites", CollectionKind::File)
         .await
         .expect("second");
 
@@ -93,7 +87,7 @@ async fn given_two_collections_with_same_name_when_create_then_both_get_distinct
 async fn given_empty_name_when_create_then_invalid_input_and_nothing_persisted() {
     let (repo, h) = seeded();
 
-    let result = h.create("", CollectionKind::File, TOKEN).await;
+    let result = h.create("", CollectionKind::File).await;
 
     assert!(matches!(result, Err(DomainError::InvalidInput(_))));
     assert_eq!(repo.count(), 0);
@@ -103,7 +97,7 @@ async fn given_empty_name_when_create_then_invalid_input_and_nothing_persisted()
 async fn given_whitespace_only_name_when_create_then_invalid_input_and_nothing_persisted() {
     let (repo, h) = seeded();
 
-    let result = h.create("   ", CollectionKind::File, TOKEN).await;
+    let result = h.create("   ", CollectionKind::File).await;
 
     assert!(matches!(result, Err(DomainError::InvalidInput(_))));
     assert_eq!(repo.count(), 0);
@@ -116,7 +110,7 @@ async fn given_untrimmed_name_when_create_then_invalid_input_rather_than_silent_
     // rejection is what keeps HTTP and FFI agreeing (FR-FC-24 / NFR-09).
     let (repo, h) = seeded();
 
-    let result = h.create("  Favorites  ", CollectionKind::File, TOKEN).await;
+    let result = h.create("  Favorites  ", CollectionKind::File).await;
 
     assert!(matches!(result, Err(DomainError::InvalidInput(_))));
     assert_eq!(repo.count(), 0);
@@ -127,7 +121,7 @@ async fn given_name_longer_than_255_bytes_when_create_then_invalid_input() {
     let (repo, h) = seeded();
     let long = "n".repeat(256);
 
-    let result = h.create(&long, CollectionKind::File, TOKEN).await;
+    let result = h.create(&long, CollectionKind::File).await;
 
     assert!(matches!(result, Err(DomainError::InvalidInput(_))));
     assert_eq!(repo.count(), 0);
@@ -140,7 +134,7 @@ async fn given_name_of_exactly_255_bytes_when_create_then_accepted() {
     let at_limit = "n".repeat(255);
 
     let result = h
-        .create(&at_limit, CollectionKind::File, TOKEN)
+        .create(&at_limit, CollectionKind::File)
         .await
         .expect("create");
 
@@ -154,36 +148,9 @@ async fn given_name_containing_nul_when_create_then_invalid_input() {
     // whole name, so the two surfaces would store different things.
     let (repo, h) = seeded();
 
-    let result = h.create("Favo\0rites", CollectionKind::File, TOKEN).await;
+    let result = h.create("Favo\0rites", CollectionKind::File).await;
 
     assert!(matches!(result, Err(DomainError::InvalidInput(_))));
-    assert_eq!(repo.count(), 0);
-}
-
-// ---------------- AF-02: unauthorized ----------------
-
-#[tokio::test]
-async fn given_unauthenticated_when_create_then_unauthorized_and_nothing_persisted() {
-    let repo = FakeCollectionRepository::new();
-    let h = handler(FakeAuth::Denying, repo.clone());
-
-    let result = h.create("Sci-fi novels", CollectionKind::File, "").await;
-
-    assert!(matches!(result, Err(DomainError::Unauthorized)));
-    assert_eq!(repo.count(), 0);
-}
-
-#[tokio::test]
-async fn given_unauthenticated_and_invalid_name_when_create_then_unauthorized_not_invalid_input() {
-    // Authentication is evaluated before the payload (FR-AU-07 / SRD §7): an
-    // unauthenticated caller must not learn that its name would have been
-    // rejected.
-    let repo = FakeCollectionRepository::new();
-    let h = handler(FakeAuth::Denying, repo.clone());
-
-    let result = h.create("", CollectionKind::File, "").await;
-
-    assert!(matches!(result, Err(DomainError::Unauthorized)));
     assert_eq!(repo.count(), 0);
 }
 
@@ -193,9 +160,9 @@ async fn given_unauthenticated_and_invalid_name_when_create_then_unauthorized_no
 async fn given_create_when_repo_write_fails_then_error_propagated_and_nothing_persisted() {
     let repo = FakeCollectionRepository::new();
     repo.fail_inserts();
-    let h = handler(FakeAuth::Allowing, repo.clone());
+    let h = handler(repo.clone());
 
-    let result = h.create("Sci-fi novels", CollectionKind::File, TOKEN).await;
+    let result = h.create("Sci-fi novels", CollectionKind::File).await;
 
     assert!(matches!(result, Err(DomainError::Internal(_))));
     assert_eq!(repo.count(), 0);

@@ -25,17 +25,17 @@ in the delivery flow is defined in the
    behavior must not require test changes.
 2. **Test at the right layer.** Command/Query handlers and pure domain logic are
    unit-tested against repository **traits**; persistence and filesystem behavior
-   are integration-tested through the real surface; HTTP/FFI parity is asserted
-   across both transports.
-3. **Isolation in unit tests.** Repository and auth-service collaborators are
+   are integration-tested through the real surface, the FFI's C calls.
+3. **Isolation in unit tests.** Repository collaborators are
    replaced by hand-written fakes (or `mockall` mocks where stateful expectations
    help); no real database, no real filesystem, no real network in unit tests.
-4. **Realism in integration tests.** SQLite (on-disk or in-memory), a real temp
-   directory for the filesystem, and the real HTTP server are exercised
-   end-to-end through the REST contract.
-5. **Parity is a first-class category.** Because HTTP and FFI must return
-   identical results (NFR-09), every use case that exposes an operation over both
-   surfaces gets a parity assertion that runs both and compares.
+4. **Realism in integration tests.** SQLite (on-disk or in-memory) and a real
+   temp directory for the filesystem are exercised end-to-end through the FFI's
+   C calls, asserting on their status codes and JSON and on the catalog and disk
+   they leave behind.
+5. **Parity** between an HTTP surface and the FFI is no longer a category: the
+   HTTP server is removed, and the core is used only through its C ABI (NFR-09
+   is removed).
 6. **Same pattern every time.** The per-use-case workflow in §8 is applied
    identically to every use case.
 
@@ -45,11 +45,8 @@ in the delivery flow is defined in the
 | --- | --- | --- |
 | Command/Query handler (domain logic) | Unit | `alexandria-core` crate `tests/` mirrors |
 | Repository implementation (SQLite) | Integration | `alexandria-core/tests/` (sqlite feature) |
-| HTTP endpoint | Integration / functional | `alexandria-http/tests/` |
-| FFI function | Integration | `alexandria-ffi/tests/` |
-| HTTP ↔ FFI parity for an operation | Parity (contract) | `alexandria-ffi/tests/parity.rs` |
+| FFI function | Integration | `alexandria-ffi/tests/smoke.rs` |
 | Filesystem interactions (indexing, rename, text content) | Integration | integration tests using a temp dir |
-| Auth service (local + external + Windows) | Unit + integration | `alexandria-core/tests/auth/` |
 
 **Deliberately untested:** plain data-holder structs with no behavior, generated
 OpenAPI scaffolding, and the cbindgen-produced C header (validated at build time
@@ -77,28 +74,20 @@ alexandria-core/
       commands/
       queries/
       repos.rs      # repository traits + sqlx impl
-    auth/
     playback/
   tests/
     integration.rs  # the one binary: declares common and every area below
     common/mod.rs   # shared fixtures: temp db, temp fs, factories
     catalog/        # mirrors src/catalog (mod.rs lists its files)
-    auth/
+    libraries/
     playback/
     config.rs           # own process: sets ALEXANDRIA_* environment variables
     browse_batching.rs  # own process: a global subscriber counts every query
     throughput.rs       # own process: the ignored NFR harness (§9)
-alexandria-http/
-  tests/
-    api/
-      main.rs       # the one binary: declares common and every file below
-      catalog_api.rs
-      auth_api.rs
-      common/mod.rs
 alexandria-ffi/
   tests/
-    parity.rs       # HTTP vs FFI parity
-    smoke.rs
+    smoke.rs          # every C call against a real database and temp folder
+    playback_smoke.rs # own process: a call before alexandria_index_init
 ```
 
 ## 5. Naming & structure
@@ -108,7 +97,7 @@ Every test is named with the **GivenWhenThen** pattern, snake_cased:
 ```
 given_active_watchlist_when_add_video_then_progress_pending
 given_deleted_file_when_restore_after_retention_then_not_found
-given_local_mode_when_external_jwt_presented_then_unauthorized
+given_a_library_when_renamed_to_blank_then_refused_and_the_name_stays
 ```
 
 Every test body follows the **Arrange / Act / Assert** shape:
@@ -144,9 +133,7 @@ commands it issues to collaborators.
 | Collaborator | Double |
 | --- | --- |
 | Repository trait (catalog, collections, bookmarks, watchlists, reading lists) | hand-written in-memory fake implementing the trait |
-| Recovery code repository | hand-written in-memory fake implementing the trait |
 | Filesystem port | fake filesystem returning canned bytes / recording writes |
-| Auth service | fake returning canned principal or an unauthorized error; `mockall` for stateful expectations |
 | Time | a `Clock` trait with a fixed faked clock (for retention-window tests) |
 
 Do not introduce a second mocking library; use `mockall` (see the
@@ -160,17 +147,15 @@ For each handler, walk this checklist when writing its tests:
 - [ ] Happy path — the main flow succeeds and produces the expected state/result.
 - [ ] Each validation failure (invalid input) — one test per invalid field/shape.
 - [ ] Not-found — the referenced entity does not exist.
-- [ ] Unauthorized — the caller is not authenticated (or the inactive auth mode was used).
 - [ ] Invalid state / transition (where the entity has a lifecycle: deleted state, watch/read state transitions).
-- [ ] Authorization — the owner is authorized; an unauthenticated caller is rejected.
 - [ ] Boundaries — retention window boundary (just before / just after), per-episode/per-issue increments.
 
-## 7. Integration & parity testing standard
+## 7. Integration testing standard
 
 ### 7.1 Scope
 
-One integration test exercises a use case through a real entry point (HTTP
-endpoint or FFI function) backed by a real SQLite database and, where relevant, a
+One integration test exercises a use case through a real entry point (an FFI
+function) backed by a real SQLite database and, where relevant, a
 real temp filesystem. It asserts both the response and the resulting persisted
 state.
 
@@ -180,8 +165,6 @@ state.
 | --- | --- |
 | SQLite | in-memory (or on-disk temp) SQLite via sqlx; migrations run at setup. |
 | Filesystem | a per-test temp directory (the `tempfile` crate) holding sample files. Files reach the catalog only through a library (UC-51), so a test indexes its folder by adding it as a library and waiting for that run; a test that writes file rows directly first seeds the library they belong to, since a file without one is refused. |
-| External auth service | fixed ES256 test keys and an in-memory key set standing in for Heimdall's `/.well-known/jwks.json`, plus a fixed HS256 test secret for the overlap; no network beyond a loopback server for the key set fetch itself. |
-| Local-login credentials | seeded into the test DB with an Argon2 hash of a known password. |
 
 A migration that deletes or rewrites rows is tested from the version before it,
 seeded with raw SQL, and stops at that migration: later migrations rewrite the
@@ -191,20 +174,19 @@ the module's `apply_through` helper.
 
 ### 7.3 HTTP / FFI parity
 
-For every use case exposed over both surfaces, a parity test in
-`alexandria-ffi/tests/parity.rs` drove both the HTTP client and the FFI entry with
-the same inputs and asserts byte-equivalent JSON results (modulo serialization
-ordering). Parity failures point at exactly one place: a divergence between the
-HTTP and FFI thin layers over the shared core handler.
+**Removed (the core only runs locally for the person at the machine)**
+
+The parity suite went with the HTTP server. Every behaviour it alone covered
+was ported to `alexandria-ffi/tests/smoke.rs` first.
 
 ### 7.4 Coverage per entry point
 
-For each endpoint / FFI function, assert:
+For each FFI function, assert:
 
 - [ ] Main flow — the response and the resulting persisted state.
-- [ ] Each `AF-xx` alternative flow from the use case (not-found, unauthorized,
-      invalid-input, invalid-transition, disk/IO failure, auth-mode mismatch,
-      content-hash integrity).
+- [ ] Each `AF-xx` alternative flow from the use case (not-found,
+      invalid-input, invalid-transition, disk/IO failure, content-hash
+      integrity).
 
 ## 8. Per-use-case workflow
 
@@ -213,10 +195,9 @@ Apply this every time a use case is implemented:
 1. Read the use case and its traced `FR-xx` requirements from the
    [Use Case Specification Document](Use%20Case%20Specification%20Document.md).
 2. Write unit tests for each Command/Query handler covering §6.3.
-3. Write integration tests for the HTTP endpoint and the FFI function covering §7.4.
-4. Add or extend a parity test asserting the two surfaces agree.
-5. Run the suite; fix failures; re-run until green.
-6. Commit the implementation and its tests together on the feature branch.
+3. Write integration tests for the FFI function covering §7.4.
+4. Run the suite; fix failures; re-run until green.
+5. Commit the implementation and its tests together on the feature branch.
 
 ## 9. Performance requirements (NFR-01, NFR-02)
 
@@ -379,11 +360,9 @@ cargo test
 | All suites | `cargo test` |
 | Unit tests only | `cargo test --lib` |
 | Integration tests | `cargo test --test '*'` |
-| Parity tests | `cargo test --package alexandria-ffi --test parity` |
-| Auth tests | `cargo test --package alexandria-core --test integration auth::` |
+| FFI smoke tests | `cargo test --package alexandria-ffi --test smoke` |
 | Performance (§9) | `cargo test -p alexandria-core --test throughput -- --ignored --nocapture` |
 | With coverage | `cargo tarpaulin` (optional) |
 
-Categories are separated by crate and test target; parity tests live in their
-own test target so they can be run in isolation, and auth tests are grouped in
-`alexandria-core/tests/auth/`, run on their own by the `auth::` filter.
+Categories are separated by crate and test target, so each can be run in
+isolation.

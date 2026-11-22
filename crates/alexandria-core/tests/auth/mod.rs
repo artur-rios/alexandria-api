@@ -1,9 +1,0 @@
-mod account_status;
-mod login;
-mod password;
-mod recovery_redeem;
-mod recovery_regenerate;
-mod recovery_repo;
-mod register;
-mod set_credentials;
-mod windows_login;

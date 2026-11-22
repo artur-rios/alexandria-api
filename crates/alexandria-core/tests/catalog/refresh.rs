@@ -2,7 +2,6 @@ use std::sync::Arc;
 
 use uuid::Uuid;
 
-use alexandria_core::auth::AuthService;
 use alexandria_core::catalog::clock::Clock;
 use alexandria_core::catalog::commands::refresh::{RefreshHandler, RefreshStarted};
 use alexandria_core::catalog::commands::run_control::RunControlHandler;
@@ -16,19 +15,16 @@ use alexandria_core::catalog::runs::{
     CatalogRunRepository, RunCounts, RunKind, RunPriority, RunStatus,
 };
 use alexandria_core::catalog::video_tags::VideoTags;
-use alexandria_core::errors::DomainError;
 use alexandria_core::migrate::run_migrations;
 use sqlx::sqlite::SqlitePoolOptions;
 
 use crate::common::{
     a_cataloged_file, a_cataloged_file_with_hash, a_cataloged_missing_file, fixed_clock, interrupt,
-    now, FailingCatalogRepository, FailingCatalogRunRepository, FakeAudioMetadataReader, FakeAuth,
+    now, FailingCatalogRepository, FailingCatalogRunRepository, FakeAudioMetadataReader,
     FakeCatalogRepository, FakeCatalogRunRepository, FakeComicMetadataReader,
     FakeDocumentMetadataReader, FakeFilesystem, FakeImageMetadataReader, FakeVideoMetadataReader,
     InterruptingFilesystem, Seam,
 };
-
-const TOKEN: &str = "bearer-token";
 
 /// Deliberately > 1 so these tests exercise the concurrent walk — the outcome
 /// tallies must not depend on how many paths are in flight.
@@ -61,14 +57,12 @@ fn no_readers() -> TestReaders {
     )
 }
 
-fn refresh_handler<A, R, F, C, RR>(
-    auth: A,
+fn refresh_handler<R, F, C, RR>(
     repo: R,
     fs: F,
     clock: C,
     runs: RR,
 ) -> RefreshHandler<
-    A,
     R,
     F,
     C,
@@ -80,7 +74,6 @@ fn refresh_handler<A, R, F, C, RR>(
     FakeComicMetadataReader,
 >
 where
-    A: AuthService,
     R: CatalogRepository,
     F: Filesystem,
     C: Clock,
@@ -88,7 +81,6 @@ where
 {
     let (image, document, video, comic) = no_readers();
     RefreshHandler::new(
-        auth,
         repo,
         fs,
         clock,
@@ -107,20 +99,16 @@ where
 }
 
 #[tokio::test]
-async fn given_authenticated_when_refresh_start_then_returns_run_id() {
+async fn given_a_refresh_when_started_then_returns_run_id() {
     let fs = FakeFilesystem::builder().build();
     let handler = refresh_handler(
-        FakeAuth::Allowing,
         FakeCatalogRepository::new(),
         fs,
         fixed_clock(now()),
         FakeCatalogRunRepository::new(),
     );
 
-    let started: RefreshStarted = handler
-        .start(RunPriority::Normal, TOKEN)
-        .await
-        .expect("start");
+    let started: RefreshStarted = handler.start(RunPriority::Normal).await.expect("start");
     assert_ne!(started.run_id, Uuid::nil());
 }
 
@@ -134,34 +122,18 @@ async fn given_a_low_priority_refresh_when_started_then_the_run_records_the_low_
     let runs = FakeCatalogRunRepository::new();
     let fs = FakeFilesystem::builder().build();
     let handler = refresh_handler(
-        FakeAuth::Allowing,
         FakeCatalogRepository::new(),
         fs,
         fixed_clock(now()),
         runs.clone(),
     );
 
-    let started: RefreshStarted = handler.start(RunPriority::Low, TOKEN).await.expect("start");
+    let started: RefreshStarted = handler.start(RunPriority::Low).await.expect("start");
 
     assert_eq!(
         runs.get_recorded(started.run_id).unwrap().concurrency,
         Some(TEST_LOW_PRIORITY_CONCURRENCY)
     );
-}
-
-#[tokio::test]
-async fn given_unauthenticated_when_refresh_start_then_unauthorized() {
-    let fs = FakeFilesystem::builder().build();
-    let handler = refresh_handler(
-        FakeAuth::Denying,
-        FakeCatalogRepository::new(),
-        fs,
-        fixed_clock(now()),
-        FakeCatalogRunRepository::new(),
-    );
-
-    let result = handler.start(RunPriority::Normal, "").await;
-    assert!(matches!(result, Err(DomainError::Unauthorized)));
 }
 
 // ---------------- Metadata backfill (UC-02) ----------------
@@ -173,7 +145,6 @@ fn refresh_handler_reading(
     fs: FakeFilesystem,
     video: FakeVideoMetadataReader,
 ) -> RefreshHandler<
-    FakeAuth,
     FakeCatalogRepository,
     FakeFilesystem,
     impl Clock,
@@ -185,7 +156,6 @@ fn refresh_handler_reading(
     FakeComicMetadataReader,
 > {
     RefreshHandler::new(
-        FakeAuth::Allowing,
         repo,
         fs,
         fixed_clock(now()),
@@ -531,7 +501,6 @@ async fn given_an_unchanged_file_when_refreshed_then_it_is_unchanged_and_no_byte
         .with_stat("/library/notes.txt", 4096, Some(now()))
         .build();
     let handler = refresh_handler(
-        FakeAuth::Allowing,
         repo,
         fs.clone(),
         fixed_clock(now()),
@@ -571,7 +540,6 @@ async fn given_a_file_whose_size_changed_when_refreshed_then_it_is_refreshed_and
         .with_stat("/library/notes.txt", 8192, Some(now()))
         .build();
     let handler = refresh_handler(
-        FakeAuth::Allowing,
         repo,
         fs.clone(),
         fixed_clock(now()),
@@ -608,7 +576,6 @@ async fn given_a_file_whose_mtime_changed_when_refreshed_then_it_is_refreshed() 
         .with_stat("/library/notes.txt", 4096, Some(later))
         .build();
     let handler = refresh_handler(
-        FakeAuth::Allowing,
         repo,
         fs.clone(),
         fixed_clock(now()),
@@ -637,7 +604,6 @@ async fn given_disk_missing_path_when_execute_then_marked_missing_record_kept() 
     // The file is NOT registered with the filesystem -> stat reports None.
     let fs = FakeFilesystem::builder().build();
     let handler = refresh_handler(
-        FakeAuth::Allowing,
         repo,
         fs.clone(),
         fixed_clock(now()),
@@ -688,7 +654,6 @@ async fn given_missing_file_returned_on_disk_with_matching_stat_when_execute_the
         .with_stat("/library/back.txt", 4096, Some(now()))
         .build();
     let handler = refresh_handler(
-        FakeAuth::Allowing,
         repo,
         fs.clone(),
         fixed_clock(now()),
@@ -732,7 +697,6 @@ async fn given_already_missing_and_still_gone_when_execute_then_left_as_is() {
 
     let fs = FakeFilesystem::builder().build(); // file still absent
     let handler = refresh_handler(
-        FakeAuth::Allowing,
         repo,
         fs,
         fixed_clock(now()),
@@ -776,7 +740,6 @@ async fn given_a_repository_write_failure_when_execute_then_refresh_continues_an
         .with_stat("/library/b.txt", 8192, Some(now()))
         .build();
     let handler = refresh_handler(
-        FakeAuth::Allowing,
         repo,
         fs,
         fixed_clock(now()),
@@ -851,7 +814,6 @@ async fn given_any_concurrency_when_execute_then_same_outcome_tallies() {
             .with_stat("/library/d.txt", 8192, Some(now()))
             .build();
         let handler = RefreshHandler::new(
-            FakeAuth::Allowing,
             repo,
             fs,
             fixed_clock(now()),
@@ -890,7 +852,6 @@ async fn given_zero_concurrency_when_execute_then_runs_sequentially_rather_than_
         .with_stat("/library/a.txt", 8192, Some(now()))
         .build();
     let handler = RefreshHandler::new(
-        FakeAuth::Allowing,
         repo,
         fs,
         fixed_clock(now()),
@@ -915,7 +876,6 @@ async fn given_no_cataloged_files_when_execute_then_empty_outcome() {
     let repo = FakeCatalogRepository::new();
     let fs = FakeFilesystem::builder().build();
     let handler = refresh_handler(
-        FakeAuth::Allowing,
         repo,
         fs,
         fixed_clock(now()),
@@ -960,7 +920,6 @@ async fn given_mixed_cataloged_files_when_execute_then_each_handled_correctly() 
         // c.pdf absent on disk
         .build();
     let handler = refresh_handler(
-        FakeAuth::Allowing,
         repo,
         fs,
         fixed_clock(now()),
@@ -996,17 +955,13 @@ async fn given_mixed_cataloged_files_when_execute_then_each_handled_correctly() 
 async fn given_a_started_refresh_when_started_then_the_run_is_recorded_running() {
     let runs = FakeCatalogRunRepository::new();
     let handler = refresh_handler(
-        FakeAuth::Allowing,
         FakeCatalogRepository::new(),
         FakeFilesystem::builder().build(),
         fixed_clock(now()),
         runs.clone(),
     );
 
-    let started = handler
-        .start(RunPriority::Normal, TOKEN)
-        .await
-        .expect("start");
+    let started = handler.start(RunPriority::Normal).await.expect("start");
 
     let recorded = runs.get_recorded(started.run_id).expect("run recorded");
     assert_eq!(recorded.kind, RunKind::Refresh);
@@ -1030,18 +985,9 @@ async fn given_a_refresh_that_walks_when_executed_then_the_run_is_recorded_compl
         .with_file("/lib", "/library/a.txt", "a.txt", "unused")
         .with_stat("/library/a.txt", 8192, Some(now()))
         .build();
-    let handler = refresh_handler(
-        FakeAuth::Allowing,
-        repo,
-        fs,
-        fixed_clock(now()),
-        runs.clone(),
-    );
+    let handler = refresh_handler(repo, fs, fixed_clock(now()), runs.clone());
 
-    let started = handler
-        .start(RunPriority::Normal, TOKEN)
-        .await
-        .expect("start");
+    let started = handler.start(RunPriority::Normal).await.expect("start");
     let outcome = handler.execute(started.run_id).await.expect("execute");
 
     let recorded = runs.get_recorded(started.run_id).expect("run recorded");
@@ -1064,17 +1010,13 @@ async fn given_a_catalog_that_cannot_be_listed_when_executed_then_the_run_is_rec
     // could not proceed at all.
     let runs = FakeCatalogRunRepository::new();
     let handler = refresh_handler(
-        FakeAuth::Allowing,
         FailingCatalogRepository,
         FakeFilesystem::builder().build(),
         fixed_clock(now()),
         runs.clone(),
     );
 
-    let started = handler
-        .start(RunPriority::Normal, TOKEN)
-        .await
-        .expect("start");
+    let started = handler.start(RunPriority::Normal).await.expect("start");
     let err = handler
         .execute(started.run_id)
         .await
@@ -1109,7 +1051,6 @@ async fn given_run_completion_cannot_be_recorded_when_executed_then_the_outcome_
         .with_stat("/library/a.txt", 8192, Some(now()))
         .build();
     let handler = refresh_handler(
-        FakeAuth::Allowing,
         repo,
         fs,
         fixed_clock(now()),
@@ -1147,7 +1088,6 @@ async fn given_the_run_lookup_fails_when_executed_then_the_walk_still_completes_
         .with_stat("/library/a.txt", 8192, Some(now()))
         .build();
     let handler = refresh_handler(
-        FakeAuth::Allowing,
         repo,
         fs,
         fixed_clock(now()),
@@ -1173,14 +1113,13 @@ async fn given_run_cannot_be_started_when_start_then_the_error_propagates() {
     // reach the caller as an `Err`, not a run id.
     let fs = FakeFilesystem::builder().build();
     let handler = refresh_handler(
-        FakeAuth::Allowing,
         FakeCatalogRepository::new(),
         fs,
         fixed_clock(now()),
         FailingCatalogRunRepository::StartFails,
     );
 
-    let result = handler.start(RunPriority::Normal, TOKEN).await;
+    let result = handler.start(RunPriority::Normal).await;
 
     assert!(
         result.is_err(),
@@ -1204,7 +1143,6 @@ async fn given_a_completed_refresh_when_execute_then_the_final_progress_is_flush
     let runs = FakeCatalogRunRepository::new();
     let registry = RunRegistry::new();
     let handler = RefreshHandler::new(
-        FakeAuth::Allowing,
         repo,
         fs,
         fixed_clock(now()),
@@ -1255,13 +1193,7 @@ async fn given_a_progress_flush_that_fails_when_execute_then_the_refresh_still_c
         .with_stat("/library/a.txt", 8192, Some(now()))
         .build();
     let runs = FakeCatalogRunRepository::with_failing_progress();
-    let handler = refresh_handler(
-        FakeAuth::Allowing,
-        repo,
-        fs,
-        fixed_clock(now()),
-        runs.clone(),
-    );
+    let handler = refresh_handler(repo, fs, fixed_clock(now()), runs.clone());
     let run_id = Uuid::new_v4();
     runs.start(
         run_id,
@@ -1316,7 +1248,6 @@ async fn given_a_refresh_walk_in_flight_when_paused_then_it_stops_with_paths_unp
     .await
     .unwrap();
     let control = Arc::new(RunControlHandler::new(
-        FakeAuth::Allowing,
         runs.clone(),
         fixed_clock(now()),
         registry.clone(),
@@ -1325,10 +1256,9 @@ async fn given_a_refresh_walk_in_flight_when_paused_then_it_stops_with_paths_unp
     ));
     let pause_mid_walk = interrupt(move || {
         let control = Arc::clone(&control);
-        async move { control.pause(run_id, TOKEN).await.expect("pause") }
+        async move { control.pause(run_id).await.expect("pause") }
     });
     let handler = RefreshHandler::new(
-        FakeAuth::Allowing,
         repo.clone(),
         InterruptingFilesystem::new(
             FakeFilesystem::builder().build(),
@@ -1408,7 +1338,6 @@ async fn given_a_run_resumed_before_a_refreshs_pause_lands_when_it_lands_then_th
     .await
     .unwrap();
     let control = Arc::new(RunControlHandler::new(
-        FakeAuth::Allowing,
         runs.clone(),
         fixed_clock(now()),
         registry.clone(),
@@ -1417,10 +1346,9 @@ async fn given_a_run_resumed_before_a_refreshs_pause_lands_when_it_lands_then_th
     ));
     let pause_mid_walk = interrupt(move || {
         let control = Arc::clone(&control);
-        async move { control.pause(run_id, TOKEN).await.expect("pause") }
+        async move { control.pause(run_id).await.expect("pause") }
     });
     let handler = RefreshHandler::new(
-        FakeAuth::Allowing,
         repo.clone(),
         InterruptingFilesystem::new(
             FakeFilesystem::builder().build(),
@@ -1479,7 +1407,6 @@ async fn given_a_run_resumed_before_a_refreshs_cancel_lands_when_it_lands_then_i
     .await
     .unwrap();
     let control = Arc::new(RunControlHandler::new(
-        FakeAuth::Allowing,
         runs.clone(),
         fixed_clock(now()),
         registry.clone(),
@@ -1488,10 +1415,9 @@ async fn given_a_run_resumed_before_a_refreshs_cancel_lands_when_it_lands_then_i
     ));
     let cancel_mid_walk = interrupt(move || {
         let control = Arc::clone(&control);
-        async move { control.cancel(run_id, TOKEN).await.expect("cancel") }
+        async move { control.cancel(run_id).await.expect("cancel") }
     });
     let handler = RefreshHandler::new(
-        FakeAuth::Allowing,
         repo.clone(),
         InterruptingFilesystem::new(
             FakeFilesystem::builder().build(),
@@ -1548,15 +1474,8 @@ async fn given_a_refresh_cancelled_before_its_walk_began_when_executed_then_noth
         .with_file("/lib", "/library/a.txt", "a.txt", "unused")
         .with_stat("/library/a.txt", 8192, Some(now()))
         .build();
-    let handler = refresh_handler(
-        FakeAuth::Allowing,
-        repo,
-        fs,
-        fixed_clock(now()),
-        runs.clone(),
-    );
+    let handler = refresh_handler(repo, fs, fixed_clock(now()), runs.clone());
     let control = RunControlHandler::new(
-        FakeAuth::Allowing,
         runs.clone(),
         fixed_clock(now()),
         RunRegistry::new(),
@@ -1564,11 +1483,8 @@ async fn given_a_refresh_cancelled_before_its_walk_began_when_executed_then_noth
         TEST_LOW_PRIORITY_CONCURRENCY,
     );
 
-    let started = handler
-        .start(RunPriority::Normal, TOKEN)
-        .await
-        .expect("start");
-    control.cancel(started.run_id, TOKEN).await.expect("cancel");
+    let started = handler.start(RunPriority::Normal).await.expect("start");
+    control.cancel(started.run_id).await.expect("cancel");
     let outcome = handler.execute(started.run_id).await.expect("execute");
 
     assert_eq!(

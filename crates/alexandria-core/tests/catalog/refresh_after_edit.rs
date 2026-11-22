@@ -17,7 +17,6 @@
 //! `catalog/hashing.rs` for touching the real filesystem directly.
 
 use crate::common::FakeAudioMetadataReader;
-use alexandria_core::auth::BearerAuthService;
 use alexandria_core::catalog::clock::SystemClock;
 use alexandria_core::catalog::comic_tags::CbzComicMetadataReader;
 use alexandria_core::catalog::commands::edit_content::EditTextFileContentHandler;
@@ -33,8 +32,6 @@ use alexandria_core::catalog::video_tags::FfmpegVideoMetadataReader;
 use alexandria_core::migrate::run_migrations;
 use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
 use uuid::Uuid;
-
-const TOKEN: &str = "bearer-token";
 
 async fn migrated_pool() -> SqlitePool {
     let pool = SqlitePoolOptions::new()
@@ -78,18 +75,13 @@ async fn given_a_just_edited_text_file_when_refreshed_then_it_is_unchanged_and_i
     // Act 1: UC-33 edits the file's content — this is a real write, so the
     // file's on-disk size and mtime genuinely change.
     let editor = EditTextFileContentHandler::new(
-        BearerAuthService,
         repo.clone(),
         StdFilesystem,
         SystemClock,
         alexandria_core::catalog::library_root::LibraryRoot::unconfigured(),
     );
     let edited = editor
-        .edit(
-            uuid,
-            "after — deliberately longer than before".to_string(),
-            TOKEN,
-        )
+        .edit(uuid, "after — deliberately longer than before".to_string())
         .await
         .expect("edit");
     assert!(
@@ -100,7 +92,6 @@ async fn given_a_just_edited_text_file_when_refreshed_then_it_is_unchanged_and_i
     // Act 2: re-index runs immediately afterward, as it would on the next
     // scheduled pass — nothing else has touched the file in between.
     let refresher = RefreshHandler::new(
-        BearerAuthService,
         repo.clone(),
         StdFilesystem,
         SystemClock,
@@ -114,10 +105,7 @@ async fn given_a_just_edited_text_file_when_refreshed_then_it_is_unchanged_and_i
         runs,
         RunRegistry::new(),
     );
-    let started = refresher
-        .start(RunPriority::Normal, TOKEN)
-        .await
-        .expect("start");
+    let started = refresher.start(RunPriority::Normal).await.expect("start");
     let outcome = refresher.execute(started.run_id).await.expect("execute");
 
     // Assert: the edit's own post-write stat already matches what re-index

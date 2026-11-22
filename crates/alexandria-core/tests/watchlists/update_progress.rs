@@ -1,9 +1,8 @@
-//! Unit tests for the UC-23 UpdateWatchProgressHandler (Testing
-//! Specification §6). Each test exercises exactly the handler against trait
-//! fakes — no real DB or auth service. Coverage follows §6.3: happy path
-//! (both valid transitions, episode tracking), every invalid transition
-//! (AF-01), not-found (AF-02, video not on the watchlist), and the
-//! unauthorized branch (AF-03).
+//! Unit tests for the UC-23 UpdateWatchProgressHandler (Testing Specification
+//! §6). Each test exercises exactly the handler against trait fakes — no real
+//! DB. Coverage follows §6.3: happy path (both valid transitions, episode
+//! tracking), every invalid transition (AF-01), and not-found (AF-02, video
+//! not on the watchlist).
 
 use alexandria_core::catalog::model::FileType;
 use alexandria_core::errors::DomainError;
@@ -14,15 +13,10 @@ use alexandria_core::watchlists::commands::update_progress::{
 };
 use alexandria_core::watchlists::model::WatchState;
 
-use crate::common::{existing_file, FakeAuth, FakeCatalogRepository, FakeWatchlistRepository};
+use crate::common::{existing_file, FakeCatalogRepository, FakeWatchlistRepository};
 
-const TOKEN: &str = "bearer-token";
-
-fn handler(
-    auth: FakeAuth,
-    repo: FakeWatchlistRepository,
-) -> UpdateWatchProgressHandler<FakeAuth, FakeWatchlistRepository> {
-    UpdateWatchProgressHandler::new(auth, repo)
+fn handler(repo: FakeWatchlistRepository) -> UpdateWatchProgressHandler<FakeWatchlistRepository> {
+    UpdateWatchProgressHandler::new(repo)
 }
 
 /// A watchlist with one linked (Pending) video, ready for a transition.
@@ -30,19 +24,18 @@ async fn seeded_pending(
     watchlist_repo: &FakeWatchlistRepository,
     catalog_repo: FakeCatalogRepository,
 ) -> (uuid::Uuid, uuid::Uuid) {
-    let create_handler = CreateWatchlistHandler::new(FakeAuth::Allowing, watchlist_repo.clone());
+    let create_handler = CreateWatchlistHandler::new(watchlist_repo.clone());
     let watchlist = create_handler
-        .create("Weekend movies", TOKEN)
+        .create("Weekend movies")
         .await
         .expect("create watchlist");
 
     let video = existing_file("/videos/a.mp4", FileType::Video);
     let video_uuid = video.uuid;
     catalog_repo.seed(video);
-    let add_handler =
-        AddVideoToWatchlistHandler::new(FakeAuth::Allowing, watchlist_repo.clone(), catalog_repo);
+    let add_handler = AddVideoToWatchlistHandler::new(watchlist_repo.clone(), catalog_repo);
     add_handler
-        .add(watchlist.uuid, video_uuid, TOKEN)
+        .add(watchlist.uuid, video_uuid)
         .await
         .expect("link video");
 
@@ -113,17 +106,10 @@ async fn given_pending_when_updated_to_watching_then_state_updated() {
     let watchlist_repo = FakeWatchlistRepository::new();
     let catalog_repo = FakeCatalogRepository::new();
     let (watchlist_uuid, video_uuid) = seeded_pending(&watchlist_repo, catalog_repo).await;
-    let h = handler(FakeAuth::Allowing, watchlist_repo);
+    let h = handler(watchlist_repo);
 
     let result = h
-        .update(
-            watchlist_uuid,
-            video_uuid,
-            WatchState::Watching,
-            None,
-            None,
-            TOKEN,
-        )
+        .update(watchlist_uuid, video_uuid, WatchState::Watching, None, None)
         .await
         .expect("update");
 
@@ -135,27 +121,13 @@ async fn given_watching_when_updated_to_watched_then_state_updated() {
     let watchlist_repo = FakeWatchlistRepository::new();
     let catalog_repo = FakeCatalogRepository::new();
     let (watchlist_uuid, video_uuid) = seeded_pending(&watchlist_repo, catalog_repo).await;
-    let h = handler(FakeAuth::Allowing, watchlist_repo);
-    h.update(
-        watchlist_uuid,
-        video_uuid,
-        WatchState::Watching,
-        None,
-        None,
-        TOKEN,
-    )
-    .await
-    .expect("first update");
+    let h = handler(watchlist_repo);
+    h.update(watchlist_uuid, video_uuid, WatchState::Watching, None, None)
+        .await
+        .expect("first update");
 
     let result = h
-        .update(
-            watchlist_uuid,
-            video_uuid,
-            WatchState::Watched,
-            None,
-            None,
-            TOKEN,
-        )
+        .update(watchlist_uuid, video_uuid, WatchState::Watched, None, None)
         .await
         .expect("second update");
 
@@ -167,7 +139,7 @@ async fn given_series_episode_when_updated_then_episode_recorded() {
     let watchlist_repo = FakeWatchlistRepository::new();
     let catalog_repo = FakeCatalogRepository::new();
     let (watchlist_uuid, video_uuid) = seeded_pending(&watchlist_repo, catalog_repo).await;
-    let h = handler(FakeAuth::Allowing, watchlist_repo);
+    let h = handler(watchlist_repo);
 
     let result = h
         .update(
@@ -176,7 +148,6 @@ async fn given_series_episode_when_updated_then_episode_recorded() {
             WatchState::Watching,
             Some(3),
             Some(12),
-            TOKEN,
         )
         .await
         .expect("update");
@@ -194,7 +165,7 @@ async fn given_series_watched_episode_by_episode_then_each_episode_recorded() {
     let watchlist_repo = FakeWatchlistRepository::new();
     let catalog_repo = FakeCatalogRepository::new();
     let (watchlist_uuid, video_uuid) = seeded_pending(&watchlist_repo, catalog_repo).await;
-    let h = handler(FakeAuth::Allowing, watchlist_repo);
+    let h = handler(watchlist_repo);
 
     for episode in 1..=11 {
         let result = h
@@ -204,7 +175,6 @@ async fn given_series_watched_episode_by_episode_then_each_episode_recorded() {
                 WatchState::Watching,
                 Some(episode),
                 Some(12),
-                TOKEN,
             )
             .await
             .unwrap_or_else(|e| panic!("episode {episode} rejected: {e}"));
@@ -220,7 +190,6 @@ async fn given_series_watched_episode_by_episode_then_each_episode_recorded() {
             WatchState::Watched,
             Some(12),
             Some(12),
-            TOKEN,
         )
         .await
         .expect("finish the series");
@@ -234,27 +203,19 @@ async fn given_episode_fields_omitted_when_updated_then_cleared_not_left_untouch
     let watchlist_repo = FakeWatchlistRepository::new();
     let catalog_repo = FakeCatalogRepository::new();
     let (watchlist_uuid, video_uuid) = seeded_pending(&watchlist_repo, catalog_repo).await;
-    let h = handler(FakeAuth::Allowing, watchlist_repo);
+    let h = handler(watchlist_repo);
     h.update(
         watchlist_uuid,
         video_uuid,
         WatchState::Watching,
         Some(3),
         Some(12),
-        TOKEN,
     )
     .await
     .expect("first update");
 
     let result = h
-        .update(
-            watchlist_uuid,
-            video_uuid,
-            WatchState::Watched,
-            None,
-            None,
-            TOKEN,
-        )
+        .update(watchlist_uuid, video_uuid, WatchState::Watched, None, None)
         .await
         .expect("second update");
 
@@ -269,17 +230,10 @@ async fn given_backward_transition_when_updated_then_invalid_state() {
     let watchlist_repo = FakeWatchlistRepository::new();
     let catalog_repo = FakeCatalogRepository::new();
     let (watchlist_uuid, video_uuid) = seeded_pending(&watchlist_repo, catalog_repo).await;
-    let h = handler(FakeAuth::Allowing, watchlist_repo);
+    let h = handler(watchlist_repo);
 
     let result = h
-        .update(
-            watchlist_uuid,
-            video_uuid,
-            WatchState::Watched,
-            None,
-            None,
-            TOKEN,
-        )
+        .update(watchlist_uuid, video_uuid, WatchState::Watched, None, None)
         .await;
 
     assert!(matches!(result, Err(DomainError::InvalidState)));
@@ -290,17 +244,10 @@ async fn given_resubmitted_pending_when_updated_then_invalid_state() {
     let watchlist_repo = FakeWatchlistRepository::new();
     let catalog_repo = FakeCatalogRepository::new();
     let (watchlist_uuid, video_uuid) = seeded_pending(&watchlist_repo, catalog_repo).await;
-    let h = handler(FakeAuth::Allowing, watchlist_repo);
+    let h = handler(watchlist_repo);
 
     let result = h
-        .update(
-            watchlist_uuid,
-            video_uuid,
-            WatchState::Pending,
-            None,
-            None,
-            TOKEN,
-        )
+        .update(watchlist_uuid, video_uuid, WatchState::Pending, None, None)
         .await;
 
     assert!(matches!(result, Err(DomainError::InvalidState)));
@@ -311,12 +258,12 @@ async fn given_resubmitted_pending_when_updated_then_invalid_state() {
 #[tokio::test]
 async fn given_video_not_on_watchlist_when_updated_then_not_found() {
     let watchlist_repo = FakeWatchlistRepository::new();
-    let create_handler = CreateWatchlistHandler::new(FakeAuth::Allowing, watchlist_repo.clone());
+    let create_handler = CreateWatchlistHandler::new(watchlist_repo.clone());
     let watchlist = create_handler
-        .create("Weekend movies", TOKEN)
+        .create("Weekend movies")
         .await
         .expect("create watchlist");
-    let h = handler(FakeAuth::Allowing, watchlist_repo);
+    let h = handler(watchlist_repo);
 
     let result = h
         .update(
@@ -325,49 +272,8 @@ async fn given_video_not_on_watchlist_when_updated_then_not_found() {
             WatchState::Watching,
             None,
             None,
-            TOKEN,
         )
         .await;
 
     assert!(matches!(result, Err(DomainError::NotFound)));
-}
-
-// ---------------- AF-03: unauthorized ----------------
-
-#[tokio::test]
-async fn given_unauthenticated_when_updated_then_unauthorized() {
-    let watchlist_repo = FakeWatchlistRepository::new();
-    let h = handler(FakeAuth::Denying, watchlist_repo);
-
-    let result = h
-        .update(
-            uuid::Uuid::new_v4(),
-            uuid::Uuid::new_v4(),
-            WatchState::Watching,
-            None,
-            None,
-            "",
-        )
-        .await;
-
-    assert!(matches!(result, Err(DomainError::Unauthorized)));
-}
-
-#[tokio::test]
-async fn given_unauthenticated_and_unknown_progress_when_updated_then_unauthorized_not_not_found() {
-    let watchlist_repo = FakeWatchlistRepository::new();
-    let h = handler(FakeAuth::Denying, watchlist_repo);
-
-    let result = h
-        .update(
-            uuid::Uuid::new_v4(),
-            uuid::Uuid::new_v4(),
-            WatchState::Watching,
-            None,
-            None,
-            "",
-        )
-        .await;
-
-    assert!(matches!(result, Err(DomainError::Unauthorized)));
 }

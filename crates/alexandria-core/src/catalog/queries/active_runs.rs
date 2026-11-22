@@ -1,4 +1,3 @@
-use crate::auth::AuthService;
 use crate::catalog::clock::Clock;
 use crate::catalog::queries::run_status::overlay_live_state;
 use crate::catalog::run_registry::RunRegistry;
@@ -23,26 +22,23 @@ use crate::errors::DomainError;
 /// finished, whichever way they finished, and none of them are what a
 /// "something is still going" indicator or a resume offer is for.
 ///
-/// Generic over the auth service, the run repository, and the clock for the
-/// same reason as `GetRunStatusHandler`: the decision logic is unit-tested
-/// against trait fakes, then wired with the concrete
-/// Runtime/Sqlite/System collaborators at runtime (services.rs).
-pub struct GetActiveRunsHandler<A, RR, C> {
-    auth: A,
+/// Generic over the run repository and the clock for the same reason as
+/// `GetRunStatusHandler`: the decision logic is unit-tested against trait
+/// fakes, then wired with the concrete Sqlite/System collaborators at runtime
+/// (services.rs).
+pub struct GetActiveRunsHandler<RR, C> {
     runs: RR,
     clock: C,
     registry: RunRegistry,
 }
 
-impl<A, RR, C> GetActiveRunsHandler<A, RR, C>
+impl<RR, C> GetActiveRunsHandler<RR, C>
 where
-    A: AuthService,
     RR: CatalogRunRepository,
     C: Clock,
 {
-    pub fn new(auth: A, runs: RR, clock: C, registry: RunRegistry) -> Self {
+    pub fn new(runs: RR, clock: C, registry: RunRegistry) -> Self {
         Self {
-            auth,
             runs,
             clock,
             registry,
@@ -55,9 +51,7 @@ where
     /// the last flush.
     ///
     /// [`GetRunStatusHandler::get`]: crate::catalog::queries::run_status::GetRunStatusHandler::get
-    pub async fn list(&self, token: &str) -> Result<Vec<CatalogRun>, DomainError> {
-        // AF-02: every catalog operation authenticates the owner.
-        self.auth.authenticate(token).await?;
+    pub async fn list(&self) -> Result<Vec<CatalogRun>, DomainError> {
         // No outstanding runs is the normal case for an idle library, not an
         // error — the repository already answers with an empty list rather
         // than `NotFound`, and there is nothing here that would turn that

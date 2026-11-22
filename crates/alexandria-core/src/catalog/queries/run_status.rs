@@ -1,6 +1,5 @@
 use uuid::Uuid;
 
-use crate::auth::AuthService;
 use crate::catalog::clock::Clock;
 use crate::catalog::run_registry::RunRegistry;
 use crate::catalog::runs::{CatalogRun, CatalogRunRepository, RunFailure};
@@ -21,27 +20,24 @@ use crate::errors::DomainError;
 ///   * the row's own last flushed progress otherwise, which is what lets a
 ///     run this process is no longer executing still report its tally.
 ///
-/// Generic over the auth service, the run repository, and the clock so the
-/// decision logic is unit-tested against trait fakes, then wired with the
-/// concrete Runtime/Sqlite/System collaborators at runtime (services.rs). The
-/// registry is concrete: it is a process-local map of atomics with no I/O
-/// behind it, so there is nothing to fake.
-pub struct GetRunStatusHandler<A, RR, C> {
-    auth: A,
+/// Generic over the run repository and the clock so the decision logic is
+/// unit-tested against trait fakes, then wired with the concrete Sqlite/System
+/// collaborators at runtime (services.rs). The registry is concrete: it is a
+/// process-local map of atomics with no I/O behind it, so there is nothing to
+/// fake.
+pub struct GetRunStatusHandler<RR, C> {
     runs: RR,
     clock: C,
     registry: RunRegistry,
 }
 
-impl<A, RR, C> GetRunStatusHandler<A, RR, C>
+impl<RR, C> GetRunStatusHandler<RR, C>
 where
-    A: AuthService,
     RR: CatalogRunRepository,
     C: Clock,
 {
-    pub fn new(auth: A, runs: RR, clock: C, registry: RunRegistry) -> Self {
+    pub fn new(runs: RR, clock: C, registry: RunRegistry) -> Self {
         Self {
-            auth,
             runs,
             clock,
             registry,
@@ -49,9 +45,7 @@ where
     }
 
     /// The recorded run for `run_id`, with live progress overlaid.
-    pub async fn get(&self, run_id: Uuid, token: &str) -> Result<CatalogRun, DomainError> {
-        // AF-02: every catalog operation authenticates the owner.
-        self.auth.authenticate(token).await?;
+    pub async fn get(&self, run_id: Uuid) -> Result<CatalogRun, DomainError> {
         // AF-01: an id naming no run.
         let mut run = self.runs.get(run_id).await?.ok_or(DomainError::NotFound)?;
 
@@ -67,13 +61,7 @@ where
     /// travels with it would be re-sent on every poll to be looked at once,
     /// if ever. This is asked for when the owner asks which files, which is
     /// the only moment it is wanted.
-    pub async fn failures(
-        &self,
-        run_id: Uuid,
-        token: &str,
-    ) -> Result<Vec<RunFailure>, DomainError> {
-        self.auth.authenticate(token).await?;
-
+    pub async fn failures(&self, run_id: Uuid) -> Result<Vec<RunFailure>, DomainError> {
         // AF-01, before the list: an id naming no run answers not-found
         // rather than an empty list, which would read as "this run failed on
         // nothing" about a run that does not exist.

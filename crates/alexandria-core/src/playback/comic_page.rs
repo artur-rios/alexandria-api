@@ -3,7 +3,6 @@
 use serde::Serialize;
 use uuid::Uuid;
 
-use crate::auth::AuthService;
 use crate::catalog::comic_tags::is_page_entry;
 use crate::catalog::library_root::LibraryRoot;
 use crate::catalog::model::FileType;
@@ -156,10 +155,10 @@ pub(crate) fn read_entry_capped<R: std::io::Read>(
 /// caller asked for something specific, so it is told the format is
 /// unsupported rather than silently getting nothing.
 ///
-/// Shared by UC-39's page route and UC-40's comic thumbnail, and called by
+/// Shared by UC-39's page call and UC-40's comic thumbnail, and called by
 /// both *handlers* rather than by the archive port: a `.cbr` must never reach
 /// `ZipComicArchive`, where a failure to open would surface as a `Disk` error
-/// and a 500 where the error table promises a 400. The two had already
+/// where an unsupported source promises `InvalidInput`. The two had already
 /// drifted apart once on exactly this point.
 pub fn ensure_cbz(uuid: Uuid, path: &str) -> Result<(), DomainError> {
     if !path.to_ascii_lowercase().ends_with(".cbz") {
@@ -176,7 +175,7 @@ pub fn ensure_cbz(uuid: Uuid, path: &str) -> Result<(), DomainError> {
 /// `ComicArchive` — the real ZIP reader and every test fake — resolves the
 /// page number through this one function, so the ordering rule cannot drift
 /// between them and stays directly unit-testable without a filesystem. UC-39's
-/// page route and UC-40's comic thumbnail therefore always agree on what page
+/// page call and UC-40's comic thumbnail therefore always agree on what page
 /// 1 is, which is the whole reason the thumbnail sits on the UC-39 path.
 ///
 /// Two rules:
@@ -214,37 +213,28 @@ pub fn select_page(names: &[String], page: u32) -> Result<(usize, u32), DomainEr
 }
 
 /// UC-39 — return page `page` (1-based) of a CBZ ComicBook.
-pub struct ComicPageHandler<A, R, C> {
-    auth: A,
+pub struct ComicPageHandler<R, C> {
     repo: R,
     archive: C,
     /// `filesystem.root` (FR-FC-26): see `resolve_playable`.
     library_root: LibraryRoot,
 }
 
-impl<A, R, C> ComicPageHandler<A, R, C>
+impl<R, C> ComicPageHandler<R, C>
 where
-    A: AuthService,
     R: CatalogRepository,
     C: ComicArchive,
 {
-    pub fn new(auth: A, repo: R, archive: C, library_root: LibraryRoot) -> Self {
+    pub fn new(repo: R, archive: C, library_root: LibraryRoot) -> Self {
         Self {
-            auth,
             repo,
             archive,
             library_root,
         }
     }
 
-    pub async fn read_page(
-        &self,
-        uuid: Uuid,
-        page: u32,
-        token: &str,
-    ) -> Result<ComicPage, DomainError> {
-        let file =
-            resolve_playable(&self.auth, &self.repo, &self.library_root, uuid, token).await?;
+    pub async fn read_page(&self, uuid: Uuid, page: u32) -> Result<ComicPage, DomainError> {
+        let file = resolve_playable(&self.repo, &self.library_root, uuid).await?;
 
         if file.file_type != FileType::Comic {
             return Err(DomainError::InvalidInput(format!(
@@ -252,8 +242,8 @@ where
             )));
         }
 
-        // Before the archive is opened, so a `.cbr` is a 400 and never a ZIP
-        // reader failure.
+        // Before the archive is opened, so a `.cbr` is `InvalidInput` and
+        // never a ZIP reader failure.
         ensure_cbz(uuid, &file.path)?;
 
         // One call, one open: ordering, bounds and bytes all come from the
@@ -274,7 +264,7 @@ where
 mod tests {
     use super::*;
     use crate::catalog::model::FileState;
-    use crate::playback::test_support::{a_file, FakeAuth, FakeRepo};
+    use crate::playback::test_support::{a_file, FakeRepo};
 
     /// Archive fake: entries deliberately supplied out of order, to prove
     /// the ordering rule is applied rather than archive order trusted. It
@@ -310,17 +300,13 @@ mod tests {
             None,
         ));
         let handler = ComicPageHandler::new(
-            FakeAuth { good: "t" },
             repo,
             FakeArchive,
             crate::catalog::library_root::LibraryRoot::unconfigured(),
         );
 
         // Act
-        let page = handler
-            .read_page(Uuid::nil(), 1, "t")
-            .await
-            .expect("page 1");
+        let page = handler.read_page(Uuid::nil(), 1).await.expect("page 1");
 
         // Assert
         assert_eq!(page.bytes, b"page001.jpg".to_vec());
@@ -339,17 +325,13 @@ mod tests {
             None,
         ));
         let handler = ComicPageHandler::new(
-            FakeAuth { good: "t" },
             repo,
             FakeArchive,
             crate::catalog::library_root::LibraryRoot::unconfigured(),
         );
 
         // Act
-        let page = handler
-            .read_page(Uuid::nil(), 2, "t")
-            .await
-            .expect("page 2");
+        let page = handler.read_page(Uuid::nil(), 2).await.expect("page 2");
 
         // Assert
         assert_eq!(page.mime_type, "image/png");
@@ -365,15 +347,14 @@ mod tests {
             None,
         ));
         let handler = ComicPageHandler::new(
-            FakeAuth { good: "t" },
             repo,
             FakeArchive,
             crate::catalog::library_root::LibraryRoot::unconfigured(),
         );
 
         // Act
-        let zero = handler.read_page(Uuid::nil(), 0, "t").await;
-        let past_end = handler.read_page(Uuid::nil(), 4, "t").await;
+        let zero = handler.read_page(Uuid::nil(), 0).await;
+        let past_end = handler.read_page(Uuid::nil(), 4).await;
 
         // Assert
         assert!(matches!(zero, Err(DomainError::InvalidInput(_))));
@@ -464,14 +445,13 @@ mod tests {
             None,
         ));
         let handler = ComicPageHandler::new(
-            FakeAuth { good: "t" },
             repo,
             FakeArchive,
             crate::catalog::library_root::LibraryRoot::unconfigured(),
         );
 
         // Act
-        let result = handler.read_page(Uuid::nil(), 1, "t").await;
+        let result = handler.read_page(Uuid::nil(), 1).await;
 
         // Assert
         assert!(matches!(result, Err(DomainError::InvalidInput(_))));
@@ -489,14 +469,13 @@ mod tests {
             None,
         ));
         let handler = ComicPageHandler::new(
-            FakeAuth { good: "t" },
             repo,
             FakeArchive,
             crate::catalog::library_root::LibraryRoot::unconfigured(),
         );
 
         // Act
-        let result = handler.read_page(Uuid::nil(), 1, "t").await;
+        let result = handler.read_page(Uuid::nil(), 1).await;
 
         // Assert
         assert!(matches!(result, Err(DomainError::InvalidInput(_))));

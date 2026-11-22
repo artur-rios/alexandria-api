@@ -30,8 +30,8 @@ impl FileType {
     /// The inverse of [`FileType::as_str`]: the wire name a client reads back
     /// is the one it may spell, so a caller never has to learn a second
     /// vocabulary for the same seven types. `None` for anything else, which
-    /// every caller (an index scope, a listing's type filter on either
-    /// surface) refuses as invalid input.
+    /// every caller (an index scope, a listing's type filter) refuses as
+    /// invalid input.
     pub fn from_wire(name: &str) -> Option<Self> {
         Some(match name {
             "audio" => FileType::Audio,
@@ -94,7 +94,7 @@ pub struct NewFile {
 
 /// Video `mediaKind` discriminator (FR-FC-15). A video file is either a
 /// standalone movie or an episode of a series; the field is editable via
-/// UC-04. Serialized lowercase to match the REST/FFI contract.
+/// UC-04. Serialized lowercase to match the FFI contract.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum MediaKind {
@@ -120,7 +120,7 @@ impl MediaKind {
 }
 
 /// Document `formatKind` discriminator (FR-FC-16). Editable via UC-04.
-/// Serialized lowercase to match the REST/FFI contract.
+/// Serialized lowercase to match the FFI contract.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum FormatKind {
@@ -158,7 +158,7 @@ impl FormatKind {
 /// (`episodeCount`, `pageCount`, `width`, `height`, `sourceUrl`, `savedAt`)
 /// are never touched.
 ///
-/// The enum is internally tagged by `type` so the REST/FFI JSON body carries
+/// The enum is internally tagged by `type` so the FFI JSON body carries
 /// the discriminator (`{"type":"audio","title":…}`), which the handler checks
 /// against the file's actual `FileType` (AF-01).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -234,8 +234,7 @@ impl SubtypeMetadata {
 }
 
 /// Response of UC-04 (and later UC-03): the file record plus its updated
-/// subtype metadata. Serialized as `{"file": …, "metadata": …}` over both
-/// the HTTP and FFI surfaces so the two stay at parity (FR-FC-24 / NFR-09).
+/// subtype metadata. Serialized as `{"file": …, "metadata": …}`.
 #[derive(Debug, Clone, Serialize)]
 pub struct FileMetadata {
     pub file: File,
@@ -246,8 +245,8 @@ pub struct FileMetadata {
 /// default view excludes soft-deleted records (`Active`); the owner may
 /// explicitly request `Deleted` (only soft-deleted) or `All` (both).
 ///
-/// Serialized lowercase so the HTTP query-string value (`?state=active`) and
-/// the FFI JSON filter body stay at parity with the REST contract.
+/// Serialized lowercase, as the FFI JSON filter body spells it
+/// (`{"state":"active"}`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum StateFilter {
@@ -282,8 +281,7 @@ impl StateFilter {
 /// Response of UC-03 single-file view (FR-FC-13): the file record plus its
 /// stored subtype metadata, when the subtype has one. Text and Html files
 /// have no `SubtypeMetadata` variant, so `metadata` is `None` for them.
-/// Serialized as `{"file": …, "metadata": …}` over both the HTTP and FFI
-/// surfaces so the two stay at parity (FR-FC-24 / NFR-09).
+/// Serialized as `{"file": …, "metadata": …}`.
 ///
 /// Also the element type of UC-03's listing (FR-FC-12, issue #116): a
 /// listing answers each matching file as this same record rather than the

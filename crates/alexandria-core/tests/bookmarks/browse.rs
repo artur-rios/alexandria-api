@@ -1,9 +1,8 @@
-//! Unit tests for the UC-17 BrowseBookmarksHandler (Testing Specification
-//! §6). Each test exercises exactly the handler against trait fakes — no
-//! real DB or auth service. Coverage follows §6.3: happy path (unfiltered,
-//! collection-filtered, state-filtered), the default-excludes-deleted
-//! behavior required by the use case's main-flow step 2, AF-01 (unknown
-//! collection), and AF-02 (unauthorized).
+//! Unit tests for the UC-17 BrowseBookmarksHandler (Testing Specification §6).
+//! Each test exercises exactly the handler against trait fakes — no real DB.
+//! Coverage follows §6.3: happy path (unfiltered, collection-filtered,
+//! state-filtered), the default-excludes-deleted behavior required by the use
+//! case's main-flow step 2, and AF-01 (unknown collection).
 
 use uuid::Uuid;
 
@@ -13,16 +12,13 @@ use alexandria_core::catalog::model::StateFilter;
 use alexandria_core::collections::model::{Collection, CollectionKind};
 use alexandria_core::errors::DomainError;
 
-use crate::common::{FakeAuth, FakeBookmarkRepository, FakeCollectionRepository};
-
-const TOKEN: &str = "bearer-token";
+use crate::common::{FakeBookmarkRepository, FakeCollectionRepository};
 
 fn handler(
-    auth: FakeAuth,
     bookmark_repo: FakeBookmarkRepository,
     collection_repo: FakeCollectionRepository,
-) -> BrowseBookmarksHandler<FakeAuth, FakeBookmarkRepository, FakeCollectionRepository> {
-    BrowseBookmarksHandler::new(auth, bookmark_repo, collection_repo)
+) -> BrowseBookmarksHandler<FakeBookmarkRepository, FakeCollectionRepository> {
+    BrowseBookmarksHandler::new(bookmark_repo, collection_repo)
 }
 
 fn a_bookmark(title: &str, collection_uuid: Option<Uuid>) -> Bookmark {
@@ -45,13 +41,9 @@ async fn given_mixed_bookmarks_when_list_default_then_active_only_excludes_delet
     let mut deleted = a_bookmark("b", None);
     deleted.state = BookmarkState::Deleted;
     bookmark_repo.seed(deleted);
-    let h = handler(
-        FakeAuth::Allowing,
-        bookmark_repo,
-        FakeCollectionRepository::new(),
-    );
+    let h = handler(bookmark_repo, FakeCollectionRepository::new());
 
-    let bookmarks = h.list(BookmarkFilter::new(), TOKEN).await.expect("list");
+    let bookmarks = h.list(BookmarkFilter::new()).await.expect("list");
 
     assert_eq!(bookmarks.len(), 1);
     assert_eq!(bookmarks[0].title, "a");
@@ -69,10 +61,10 @@ async fn given_bookmarks_when_list_filtered_by_collection_then_only_linked_retur
     });
     bookmark_repo.seed(a_bookmark("a", Some(collection_uuid)));
     bookmark_repo.seed(a_bookmark("b", None));
-    let h = handler(FakeAuth::Allowing, bookmark_repo, collection_repo);
+    let h = handler(bookmark_repo, collection_repo);
 
     let filter = BookmarkFilter::new().with_collection(collection_uuid);
-    let bookmarks = h.list(filter, TOKEN).await.expect("list");
+    let bookmarks = h.list(filter).await.expect("list");
 
     assert_eq!(bookmarks.len(), 1);
     assert_eq!(bookmarks[0].title, "a");
@@ -85,14 +77,10 @@ async fn given_bookmarks_when_list_state_all_then_both_active_and_deleted_return
     let mut deleted = a_bookmark("b", None);
     deleted.state = BookmarkState::Deleted;
     bookmark_repo.seed(deleted);
-    let h = handler(
-        FakeAuth::Allowing,
-        bookmark_repo,
-        FakeCollectionRepository::new(),
-    );
+    let h = handler(bookmark_repo, FakeCollectionRepository::new());
 
     let filter = BookmarkFilter::new().with_state(StateFilter::All);
-    let bookmarks = h.list(filter, TOKEN).await.expect("list");
+    let bookmarks = h.list(filter).await.expect("list");
 
     assert_eq!(bookmarks.len(), 2);
 }
@@ -100,12 +88,11 @@ async fn given_bookmarks_when_list_state_all_then_both_active_and_deleted_return
 #[tokio::test]
 async fn given_no_bookmarks_when_list_then_empty_list_returned() {
     let h = handler(
-        FakeAuth::Allowing,
         FakeBookmarkRepository::new(),
         FakeCollectionRepository::new(),
     );
 
-    let bookmarks = h.list(BookmarkFilter::new(), TOKEN).await.expect("list");
+    let bookmarks = h.list(BookmarkFilter::new()).await.expect("list");
 
     assert!(bookmarks.is_empty());
 }
@@ -115,28 +102,12 @@ async fn given_no_bookmarks_when_list_then_empty_list_returned() {
 #[tokio::test]
 async fn given_unknown_collection_uuid_when_list_filtered_then_not_found() {
     let h = handler(
-        FakeAuth::Allowing,
         FakeBookmarkRepository::new(),
         FakeCollectionRepository::new(),
     );
 
     let filter = BookmarkFilter::new().with_collection(Uuid::new_v4());
-    let result = h.list(filter, TOKEN).await;
+    let result = h.list(filter).await;
 
     assert!(matches!(result, Err(DomainError::NotFound)));
-}
-
-// ---------------- AF-02: unauthorized ----------------
-
-#[tokio::test]
-async fn given_unauthenticated_when_list_then_unauthorized() {
-    let h = handler(
-        FakeAuth::Denying,
-        FakeBookmarkRepository::new(),
-        FakeCollectionRepository::new(),
-    );
-
-    let result = h.list(BookmarkFilter::new(), "").await;
-
-    assert!(matches!(result, Err(DomainError::Unauthorized)));
 }

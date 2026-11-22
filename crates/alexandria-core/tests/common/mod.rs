@@ -1,7 +1,6 @@
 //! Shared test doubles for alexandria-core integration tests (Testing
 //! Specification §6.2): hand-written fakes implementing the catalog and
-//! collections collaborators with no real database, filesystem, or auth
-//! service.
+//! collections collaborators with no real database or filesystem.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -10,11 +9,6 @@ use std::sync::{Arc, Mutex};
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
-use alexandria_core::auth::local::{
-    LocalCredential, LocalCredentialRepository, RecoveryCodeOutcome, RecoveryCodeRepository,
-    SessionRepository,
-};
-use alexandria_core::auth::{AuthService, Principal};
 use alexandria_core::bookmarks::model::{Bookmark, BookmarkState, NewBookmark};
 use alexandria_core::bookmarks::repos::BookmarkRepository;
 use alexandria_core::catalog::audio_tags::{AudioMetadataReader, AudioTags};
@@ -36,7 +30,6 @@ use alexandria_core::collections::model::{
     Collection, CollectionKind, CollectionSummary, NewCollection,
 };
 use alexandria_core::collections::repos::CollectionRepository;
-use alexandria_core::config::AuthMode;
 use alexandria_core::errors::DomainError;
 use alexandria_core::reading_lists::model::{
     NewReadingList, ReadingList, ReadingProgress, ReadingState, ReadingTargetKind,
@@ -44,31 +37,6 @@ use alexandria_core::reading_lists::model::{
 use alexandria_core::reading_lists::repos::ReadingListRepository;
 use alexandria_core::watchlists::model::{NewWatchlist, WatchProgress, WatchState, Watchlist};
 use alexandria_core::watchlists::repos::WatchlistRepository;
-
-/// Fake auth service. `Denying` rejects every caller (AF-02); `Allowing`
-/// authenticates any token as the owner.
-#[derive(Debug, Clone, Copy, Default)]
-pub enum FakeAuth {
-    #[default]
-    Allowing,
-    #[allow(dead_code)]
-    Denying,
-}
-
-impl AuthService for FakeAuth {
-    async fn authenticate(&self, _token: &str) -> Result<Principal, DomainError> {
-        match self {
-            FakeAuth::Allowing => Ok(Principal {
-                user_id: "owner".to_string(),
-            }),
-            FakeAuth::Denying => Err(DomainError::Unauthorized),
-        }
-    }
-
-    fn mode(&self) -> AuthMode {
-        AuthMode::External
-    }
-}
 
 /// In-memory catalog repository. `find_by_path` answers from an internal map;
 /// `insert_file` records the file and surfaced the subtype decision via the
@@ -1996,228 +1964,6 @@ impl ReadingListRepository for FakeReadingListRepository {
     }
 }
 
-/// In-memory local-login credentials repository (UC-34/UC-35). Starts with no
-/// row — `get()` answers `None` until `upsert` is called, mirroring
-/// first-time setup.
-#[derive(Debug, Default, Clone)]
-pub struct FakeLocalCredentialRepository {
-    credential: Arc<Mutex<Option<LocalCredential>>>,
-}
-
-impl FakeLocalCredentialRepository {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Seed a credential row directly, as if a prior UC-35 call had set it.
-    pub fn seed(&self, email: &str, password_hash: &str) {
-        *self.credential.lock().unwrap() = Some(LocalCredential {
-            email: email.to_string(),
-            password_hash: password_hash.to_string(),
-        });
-    }
-
-    /// The stored password hash, for a test that only needs to know whether
-    /// it changed rather than what it is.
-    pub fn stored_hash(&self) -> String {
-        self.credential
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map(|c| c.password_hash.clone())
-            .unwrap_or_default()
-    }
-}
-
-impl LocalCredentialRepository for FakeLocalCredentialRepository {
-    async fn get(&self) -> Result<Option<LocalCredential>, DomainError> {
-        Ok(self.credential.lock().unwrap().clone())
-    }
-
-    async fn upsert(
-        &self,
-        email: &str,
-        password_hash: &str,
-        _updated_at: DateTime<Utc>,
-    ) -> Result<(), DomainError> {
-        *self.credential.lock().unwrap() = Some(LocalCredential {
-            email: email.to_string(),
-            password_hash: password_hash.to_string(),
-        });
-        Ok(())
-    }
-
-    async fn insert_if_absent(
-        &self,
-        email: &str,
-        password_hash: &str,
-        _updated_at: DateTime<Utc>,
-    ) -> Result<bool, DomainError> {
-        let mut guard = self.credential.lock().unwrap();
-        if guard.is_some() {
-            return Ok(false);
-        }
-        *guard = Some(LocalCredential {
-            email: email.to_string(),
-            password_hash: password_hash.to_string(),
-        });
-        Ok(true)
-    }
-
-    async fn set_password_hash(
-        &self,
-        password_hash: &str,
-        _updated_at: DateTime<Utc>,
-    ) -> Result<(), DomainError> {
-        if let Some(credential) = self.credential.lock().unwrap().as_mut() {
-            credential.password_hash = password_hash.to_string();
-        }
-        Ok(())
-    }
-}
-
-/// A `LocalCredentialRepository` that simulates a row appearing between the
-/// existence check and the write (UC-41 fix for the check-then-act race):
-/// `get()` always answers `None`, as if the check ran before the
-/// concurrent write landed, while `insert_if_absent` sees the row that is
-/// "already there" at the storage layer and refuses to overwrite it. Lets a
-/// test drive the race without two real concurrent tasks.
-#[derive(Debug, Clone)]
-pub struct RacingLocalCredentialRepository {
-    credential: Arc<Mutex<LocalCredential>>,
-}
-
-impl RacingLocalCredentialRepository {
-    /// Pre-seed the row that "wins" the race.
-    pub fn new(email: &str, password_hash: &str) -> Self {
-        Self {
-            credential: Arc::new(Mutex::new(LocalCredential {
-                email: email.to_string(),
-                password_hash: password_hash.to_string(),
-            })),
-        }
-    }
-
-    pub fn stored(&self) -> LocalCredential {
-        self.credential.lock().unwrap().clone()
-    }
-}
-
-impl LocalCredentialRepository for RacingLocalCredentialRepository {
-    async fn get(&self) -> Result<Option<LocalCredential>, DomainError> {
-        // Simulates the existence check having run before the concurrent
-        // write landed.
-        Ok(None)
-    }
-
-    async fn upsert(
-        &self,
-        email: &str,
-        password_hash: &str,
-        _updated_at: DateTime<Utc>,
-    ) -> Result<(), DomainError> {
-        *self.credential.lock().unwrap() = LocalCredential {
-            email: email.to_string(),
-            password_hash: password_hash.to_string(),
-        };
-        Ok(())
-    }
-
-    async fn insert_if_absent(
-        &self,
-        _email: &str,
-        _password_hash: &str,
-        _updated_at: DateTime<Utc>,
-    ) -> Result<bool, DomainError> {
-        // The row is already there at the storage layer, regardless of what
-        // `get()` answered — this is the whole point of the fake.
-        Ok(false)
-    }
-
-    async fn set_password_hash(
-        &self,
-        password_hash: &str,
-        _updated_at: DateTime<Utc>,
-    ) -> Result<(), DomainError> {
-        self.credential.lock().unwrap().password_hash = password_hash.to_string();
-        Ok(())
-    }
-}
-
-/// In-memory session repository (UC-34's postcondition: "a session must be
-/// created to keep track of the login").
-#[derive(Debug, Default, Clone)]
-pub struct FakeSessionRepository {
-    sessions: Arc<Mutex<HashMap<Uuid, DateTime<Utc>>>>,
-}
-
-impl FakeSessionRepository {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn count(&self) -> usize {
-        self.sessions.lock().unwrap().len()
-    }
-
-    /// Whether every session is gone — the postcondition a redemption or a
-    /// reset must leave behind.
-    pub fn all_deleted(&self) -> bool {
-        self.count() == 0
-    }
-}
-
-impl SessionRepository for FakeSessionRepository {
-    async fn create_session(
-        &self,
-        id: Uuid,
-        _created_at: DateTime<Utc>,
-        expires_at: DateTime<Utc>,
-    ) -> Result<(), DomainError> {
-        self.sessions.lock().unwrap().insert(id, expires_at);
-        Ok(())
-    }
-
-    async fn is_valid(&self, id: Uuid, now: DateTime<Utc>) -> Result<bool, DomainError> {
-        Ok(self
-            .sessions
-            .lock()
-            .unwrap()
-            .get(&id)
-            .is_some_and(|expires_at| now < *expires_at))
-    }
-
-    async fn delete_all(&self) -> Result<(), DomainError> {
-        self.sessions.lock().unwrap().clear();
-        Ok(())
-    }
-}
-
-/// A `SessionRepository` whose writes always fail (UC-41 AF-06). Lets a
-/// test drive the "credential row written, session creation failed" path
-/// without a real database.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct FailingSessionRepository;
-
-impl SessionRepository for FailingSessionRepository {
-    async fn create_session(
-        &self,
-        _id: Uuid,
-        _created_at: DateTime<Utc>,
-        _expires_at: DateTime<Utc>,
-    ) -> Result<(), DomainError> {
-        Err(DomainError::Disk("session store unavailable".into()))
-    }
-
-    async fn is_valid(&self, _id: Uuid, _now: DateTime<Utc>) -> Result<bool, DomainError> {
-        Err(DomainError::Disk("session store unavailable".into()))
-    }
-
-    async fn delete_all(&self) -> Result<(), DomainError> {
-        Err(DomainError::Disk("session store unavailable".into()))
-    }
-}
-
 /// In-memory audio-tag reader (issue #44 pilot). `read()` answers `None`
 /// for any path with no seeded tags, mirroring "no tags found / couldn't
 /// parse" — the same outcome `LoftyAudioMetadataReader` produces for those
@@ -3461,75 +3207,6 @@ impl VideoMetadataReader for ConcurrencyTrackingVideoMetadataReader {
     }
 }
 
-/// One stored recovery-code hash and, once spent, when it was consumed.
-type RecoveryCodeEntry = (String, Option<DateTime<Utc>>);
-
-/// In-memory recovery-code repository (UC-43/UC-44), in the style of
-/// `FakeSessionRepository`. Each stored entry is a `(hash, consumed_at)`
-/// pair, so `consume` can distinguish "never issued" from "already spent" —
-/// the same two failure states `SqliteRecoveryCodeRepository` distinguishes.
-#[derive(Debug, Default, Clone)]
-pub struct FakeRecoveryCodeRepository {
-    codes: Arc<Mutex<Vec<RecoveryCodeEntry>>>,
-}
-
-impl FakeRecoveryCodeRepository {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Every hash currently stored, consumed or not — lets a test prove no
-    /// plaintext code was ever written.
-    pub fn stored_hashes(&self) -> Vec<String> {
-        self.codes
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|(hash, _)| hash.clone())
-            .collect()
-    }
-}
-
-impl RecoveryCodeRepository for FakeRecoveryCodeRepository {
-    async fn replace_all(
-        &self,
-        code_hashes: &[String],
-        _created_at: DateTime<Utc>,
-    ) -> Result<(), DomainError> {
-        *self.codes.lock().unwrap() = code_hashes
-            .iter()
-            .map(|hash| (hash.clone(), None))
-            .collect();
-        Ok(())
-    }
-
-    async fn consume(
-        &self,
-        code_hash: &str,
-        now: DateTime<Utc>,
-    ) -> Result<RecoveryCodeOutcome, DomainError> {
-        let mut codes = self.codes.lock().unwrap();
-        let Some((_, consumed_at)) = codes.iter_mut().find(|(hash, _)| hash == code_hash) else {
-            return Ok(RecoveryCodeOutcome::Unknown);
-        };
-        if consumed_at.is_some() {
-            return Ok(RecoveryCodeOutcome::AlreadyUsed);
-        }
-        *consumed_at = Some(now);
-        Ok(RecoveryCodeOutcome::Consumed)
-    }
-
-    async fn remaining(&self) -> Result<u32, DomainError> {
-        Ok(self
-            .codes
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|(_, consumed_at)| consumed_at.is_none())
-            .count() as u32)
-    }
-}
-
 /// A run starter that opens nothing and always succeeds: for library tests
 /// about what is stored, whose folders are paths written by hand rather than
 /// folders on disk a real run could walk.
@@ -3544,7 +3221,6 @@ impl alexandria_core::catalog::commands::index::LibraryRunStarter for AlwaysStar
         &self,
         _library: &alexandria_core::libraries::model::Library,
         _priority: alexandria_core::catalog::runs::RunPriority,
-        _token: &str,
     ) -> Result<alexandria_core::catalog::commands::index::IndexStarted, DomainError> {
         Ok(alexandria_core::catalog::commands::index::IndexStarted {
             run_id: Uuid::new_v4(),

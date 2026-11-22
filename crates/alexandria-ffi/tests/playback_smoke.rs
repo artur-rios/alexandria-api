@@ -14,10 +14,9 @@ use alexandria_ffi::{alexandria_file_playback_source, PLAYBACK_ERR_NOT_INITIALIZ
 fn given_uninitialized_services_when_playback_called_then_not_initialized() {
     // Arrange — no `alexandria_index_init` has run in this process.
     let uuid = CString::new("00000000-0000-0000-0000-000000000000").unwrap();
-    let token = CString::new("t").unwrap();
 
     // Act
-    let result = alexandria_file_playback_source(uuid.as_ptr(), token.as_ptr());
+    let result = alexandria_file_playback_source(uuid.as_ptr());
 
     // Assert
     assert_eq!(result.status, PLAYBACK_ERR_NOT_INITIALIZED);

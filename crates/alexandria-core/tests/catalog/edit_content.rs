@@ -1,10 +1,9 @@
-//! Unit tests for the UC-33 EditTextFileContentHandler (Testing
-//! Specification §6). Each test exercises exactly the handler against
-//! trait fakes — no real DB, filesystem, or auth service. Coverage follows
-//! §6.3: happy path, wrong file type (AF-01), disk write failure (AF-02),
-//! integrity mismatch after retry (AF-03), not-found (AF-04), the
-//! unauthorized branch (AF-05), and the soft-deleted-record guard mirrored
-//! from `EditMetadataHandler`.
+//! Unit tests for the UC-33 EditTextFileContentHandler (Testing Specification
+//! §6). Each test exercises exactly the handler against trait fakes — no real
+//! DB or filesystem. Coverage follows §6.3: happy path, wrong file type
+//! (AF-01), disk write failure (AF-02), integrity mismatch after retry
+//! (AF-03), not-found (AF-04), and the soft-deleted-record guard mirrored from
+//! `EditMetadataHandler`.
 
 use uuid::Uuid;
 
@@ -13,23 +12,18 @@ use alexandria_core::catalog::model::FileType;
 use alexandria_core::errors::DomainError;
 
 use crate::common::{
-    deleted_file, existing_file, fixed_clock, now, FakeAuth, FakeCatalogRepository, FakeFilesystem,
+    deleted_file, existing_file, fixed_clock, now, FakeCatalogRepository, FakeFilesystem,
 };
 
-const TOKEN: &str = "bearer-token";
-
 fn handler(
-    auth: FakeAuth,
     repo: FakeCatalogRepository,
     fs: FakeFilesystem,
 ) -> EditTextFileContentHandler<
-    FakeAuth,
     FakeCatalogRepository,
     FakeFilesystem,
     alexandria_core::catalog::clock::FixedClock,
 > {
     EditTextFileContentHandler::new(
-        auth,
         repo,
         fs,
         fixed_clock(now()),
@@ -48,12 +42,9 @@ async fn given_text_file_when_edited_then_content_written_and_hash_refreshed() {
     let fs = FakeFilesystem::builder()
         .with_text_content("/lib/notes.txt", "old content")
         .build();
-    let h = handler(FakeAuth::Allowing, repo.clone(), fs.clone());
+    let h = handler(repo.clone(), fs.clone());
 
-    let result = h
-        .edit(uuid, "new content".to_string(), TOKEN)
-        .await
-        .expect("edit");
+    let result = h.edit(uuid, "new content".to_string()).await.expect("edit");
 
     assert_eq!(result.uuid, uuid);
     assert_eq!(
@@ -83,9 +74,9 @@ async fn given_a_file_with_no_stored_hash_when_content_is_edited_then_the_hash_i
     let fs = FakeFilesystem::builder()
         .with_text_content("/lib/notes.txt", "hello")
         .build();
-    let h = handler(FakeAuth::Allowing, repo.clone(), fs);
+    let h = handler(repo.clone(), fs);
 
-    h.edit(uuid, "goodbye".to_string(), TOKEN)
+    h.edit(uuid, "goodbye".to_string())
         .await
         .expect("edit should succeed");
 
@@ -105,9 +96,9 @@ async fn given_non_text_file_when_edited_then_invalid_input() {
     let uuid = file.uuid;
     repo.seed(file);
     let fs = FakeFilesystem::builder().build();
-    let h = handler(FakeAuth::Allowing, repo, fs);
+    let h = handler(repo, fs);
 
-    let result = h.edit(uuid, "new content".to_string(), TOKEN).await;
+    let result = h.edit(uuid, "new content".to_string()).await;
 
     assert!(matches!(result, Err(DomainError::InvalidInput(_))));
 }
@@ -124,9 +115,9 @@ async fn given_write_failure_when_edited_then_disk_error_and_catalog_unchanged()
         .with_text_content("/lib/notes.txt", "old content")
         .build();
     fs.fail_write_to("/lib/notes.txt");
-    let h = handler(FakeAuth::Allowing, repo.clone(), fs);
+    let h = handler(repo.clone(), fs);
 
-    let result = h.edit(uuid, "new content".to_string(), TOKEN).await;
+    let result = h.edit(uuid, "new content".to_string()).await;
 
     assert!(matches!(result, Err(DomainError::Disk(_))));
     assert_eq!(
@@ -147,9 +138,9 @@ async fn given_corrupted_write_when_edited_then_integrity_error_after_retry() {
         .with_text_content("/lib/notes.txt", "old content")
         .build();
     fs.corrupt_write_to("/lib/notes.txt");
-    let h = handler(FakeAuth::Allowing, repo.clone(), fs);
+    let h = handler(repo.clone(), fs);
 
-    let result = h.edit(uuid, "new content".to_string(), TOKEN).await;
+    let result = h.edit(uuid, "new content".to_string()).await;
 
     assert!(matches!(result, Err(DomainError::Integrity(_))));
     assert_eq!(
@@ -164,11 +155,9 @@ async fn given_corrupted_write_when_edited_then_integrity_error_after_retry() {
 async fn given_unknown_uuid_when_edited_then_not_found() {
     let repo = FakeCatalogRepository::new();
     let fs = FakeFilesystem::builder().build();
-    let h = handler(FakeAuth::Allowing, repo, fs);
+    let h = handler(repo, fs);
 
-    let result = h
-        .edit(Uuid::new_v4(), "new content".to_string(), TOKEN)
-        .await;
+    let result = h.edit(Uuid::new_v4(), "new content".to_string()).await;
 
     assert!(matches!(result, Err(DomainError::NotFound)));
 }
@@ -182,35 +171,11 @@ async fn given_deleted_file_when_edited_then_invalid_state() {
     let uuid = file.uuid;
     repo.seed(file);
     let fs = FakeFilesystem::builder().build();
-    let h = handler(FakeAuth::Allowing, repo, fs);
+    let h = handler(repo, fs);
 
-    let result = h.edit(uuid, "new content".to_string(), TOKEN).await;
+    let result = h.edit(uuid, "new content".to_string()).await;
 
     assert!(matches!(result, Err(DomainError::InvalidState)));
-}
-
-// ---------------- AF-05: unauthorized ----------------
-
-#[tokio::test]
-async fn given_unauthenticated_when_edited_then_unauthorized() {
-    let repo = FakeCatalogRepository::new();
-    let fs = FakeFilesystem::builder().build();
-    let h = handler(FakeAuth::Denying, repo, fs);
-
-    let result = h.edit(Uuid::new_v4(), "new content".to_string(), "").await;
-
-    assert!(matches!(result, Err(DomainError::Unauthorized)));
-}
-
-#[tokio::test]
-async fn given_unauthenticated_and_unknown_uuid_when_edited_then_unauthorized_not_not_found() {
-    let repo = FakeCatalogRepository::new();
-    let fs = FakeFilesystem::builder().build();
-    let h = handler(FakeAuth::Denying, repo, fs);
-
-    let result = h.edit(Uuid::new_v4(), "new content".to_string(), "").await;
-
-    assert!(matches!(result, Err(DomainError::Unauthorized)));
 }
 
 // ---------------- FR-FC-26: the configured library root ----------------
@@ -229,14 +194,13 @@ async fn given_a_row_outside_the_configured_root_when_edited_then_invalid_input_
         .with_text_content("/lib/notes.txt", "old content")
         .build();
     let h = EditTextFileContentHandler::new(
-        FakeAuth::Allowing,
         repo,
         fs.clone(),
         fixed_clock(now()),
         alexandria_core::catalog::library_root::LibraryRoot::new(library.path().to_str().unwrap()),
     );
 
-    let result = h.edit(uuid, "overwritten".to_string(), TOKEN).await;
+    let result = h.edit(uuid, "overwritten".to_string()).await;
 
     assert!(matches!(result, Err(DomainError::InvalidInput(_))));
     assert_ne!(
@@ -260,16 +224,13 @@ async fn given_a_row_inside_the_configured_root_when_edited_then_it_is_written()
         .with_text_content(path, "old content")
         .build();
     let h = EditTextFileContentHandler::new(
-        FakeAuth::Allowing,
         repo,
         fs.clone(),
         fixed_clock(now()),
         alexandria_core::catalog::library_root::LibraryRoot::new(library.path().to_str().unwrap()),
     );
 
-    h.edit(uuid, "new content".to_string(), TOKEN)
-        .await
-        .expect("edit");
+    h.edit(uuid, "new content".to_string()).await.expect("edit");
 
     assert_eq!(fs.written_content(path).as_deref(), Some("new content"));
 }

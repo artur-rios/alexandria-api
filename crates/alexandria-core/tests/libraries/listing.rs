@@ -4,12 +4,14 @@
 use alexandria_core::catalog::model::{FileType, NewFile};
 use alexandria_core::catalog::queries::browse::{BrowseFilesHandler, FileFilter};
 use alexandria_core::catalog::repos::{CatalogRepository, SqliteCatalogRepository};
+use alexandria_core::libraries::model::CatalogStats;
+use alexandria_core::libraries::queries::CatalogStatsQuery;
 use alexandria_core::migrate::migrate_database;
 use chrono::Utc;
 use sqlx::sqlite::SqlitePool;
 use uuid::Uuid;
 
-use crate::common::{seed_library, FakeAuth};
+use crate::common::seed_library;
 
 async fn migrated(dir: &tempfile::TempDir) -> SqlitePool {
     migrate_database(dir.path().join("a.sqlite").to_str().unwrap())
@@ -18,13 +20,17 @@ async fn migrated(dir: &tempfile::TempDir) -> SqlitePool {
 }
 
 async fn file(pool: &SqlitePool, library: Uuid, path: &str) {
+    typed_file(pool, library, path, FileType::Text).await;
+}
+
+async fn typed_file(pool: &SqlitePool, library: Uuid, path: &str, file_type: FileType) {
     SqliteCatalogRepository::new(pool.clone())
         .insert_file(NewFile {
             uuid: Uuid::new_v4(),
             library_uuid: library,
             path: path.to_string(),
             name: path.rsplit('/').next().unwrap().to_string(),
-            file_type: FileType::Text,
+            file_type,
             content_hash: None,
             size_bytes: None,
             mtime: None,
@@ -35,16 +41,14 @@ async fn file(pool: &SqlitePool, library: Uuid, path: &str) {
 }
 
 async fn listed(pool: &SqlitePool, filter: FileFilter) -> Vec<String> {
-    let mut paths: Vec<String> = BrowseFilesHandler::new(
-        FakeAuth::Allowing,
-        SqliteCatalogRepository::new(pool.clone()),
-    )
-    .list(filter, "token")
-    .await
-    .expect("list")
-    .into_iter()
-    .map(|view| view.file.path)
-    .collect();
+    let mut paths: Vec<String> =
+        BrowseFilesHandler::new(SqliteCatalogRepository::new(pool.clone()))
+            .list(filter)
+            .await
+            .expect("list")
+            .into_iter()
+            .map(|view| view.file.path)
+            .collect();
     paths.sort();
     paths
 }
@@ -121,4 +125,80 @@ async fn given_a_library_and_a_type_and_a_collection_when_listed_then_every_filt
         .with_library(a);
 
     assert_eq!(listed(&pool, filter).await, vec!["/a/one.md"]);
+}
+
+const TYPES: [&str; 7] = [
+    "audio", "video", "html", "text", "document", "comic", "image",
+];
+
+async fn stats(pool: &SqlitePool) -> CatalogStats {
+    CatalogStatsQuery::new(pool.clone())
+        .stats()
+        .await
+        .expect("stats")
+}
+
+#[tokio::test]
+async fn given_an_empty_catalog_when_stats_read_then_zero_libraries_and_every_type_zero() {
+    let dir = tempfile::tempdir().unwrap();
+    let pool = migrated(&dir).await;
+
+    let stats = stats(&pool).await;
+
+    assert_eq!(stats.libraries, 0);
+    let keys: Vec<&str> = stats.files_by_type.keys().map(String::as_str).collect();
+    let mut expected = TYPES.to_vec();
+    expected.sort();
+    assert_eq!(keys, expected);
+    assert!(stats.files_by_type.values().all(|n| *n == 0));
+}
+
+#[tokio::test]
+async fn given_two_libraries_with_mixed_files_when_stats_read_then_counts_match() {
+    let dir = tempfile::tempdir().unwrap();
+    let pool = migrated(&dir).await;
+    let (a, b) = two_libraries(&pool).await;
+    typed_file(&pool, a, "/a/song.mp3", FileType::Audio).await;
+    typed_file(&pool, b, "/b/song.mp3", FileType::Audio).await;
+    typed_file(&pool, b, "/b/clip.mp4", FileType::Video).await;
+
+    let stats = stats(&pool).await;
+
+    assert_eq!(stats.libraries, 2);
+    assert_eq!(stats.files_by_type["text"], 3);
+    assert_eq!(stats.files_by_type["audio"], 2);
+    assert_eq!(stats.files_by_type["video"], 1);
+    assert_eq!(stats.files_by_type["image"], 0);
+    assert_eq!(stats.files_by_type.len(), 7);
+}
+
+#[tokio::test]
+async fn given_a_soft_deleted_file_when_stats_read_then_it_is_not_counted() {
+    let dir = tempfile::tempdir().unwrap();
+    let pool = migrated(&dir).await;
+    two_libraries(&pool).await;
+    sqlx::query("UPDATE files SET state = 'deleted', deleted_at = ? WHERE path = '/a/one.md'")
+        .bind(Utc::now().to_rfc3339())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    assert_eq!(stats(&pool).await.files_by_type["text"], 2);
+}
+
+#[tokio::test]
+async fn given_a_missing_file_when_stats_read_then_it_counts_as_files_list_lists_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let pool = migrated(&dir).await;
+    two_libraries(&pool).await;
+    SqliteCatalogRepository::new(pool.clone())
+        .mark_missing("/a/one.md", Utc::now())
+        .await
+        .unwrap();
+
+    let listed = listed(&pool, FileFilter::new()).await;
+    let counted: u64 = stats(&pool).await.files_by_type.values().sum();
+
+    assert_eq!(counted, listed.len() as u64);
+    assert!(listed.contains(&"/a/one.md".to_string()));
 }

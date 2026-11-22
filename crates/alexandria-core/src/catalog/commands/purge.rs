@@ -1,7 +1,6 @@
 use chrono::Duration;
 use uuid::Uuid;
 
-use crate::auth::AuthService;
 use crate::catalog::clock::Clock;
 use crate::catalog::model::{File, FileState};
 use crate::catalog::repos::CatalogRepository;
@@ -12,33 +11,30 @@ use crate::errors::DomainError;
 /// window has elapsed. The on-disk file is untouched (NFR-07); only the
 /// catalog rows are deleted.
 ///
-/// Same shape as [`RestoreFileHandler`](crate::catalog::commands::restore::RestoreFileHandler):
-/// construction wires the collaborators (`AuthService`, `CatalogRepository`,
-/// `Clock`) plus the configured soft-delete retention window in days
-/// (`retention_days`, NFR-10; default 30 in
-/// `Settings::deletion::retention_days`). The `purge` method is the domain
-/// entry point.
+/// Same shape as
+/// [`RestoreFileHandler`](crate::catalog::commands::restore::RestoreFileHandler):
+/// construction wires the collaborators (`CatalogRepository`, `Clock`) plus
+/// the configured soft-delete retention window in days (`retention_days`,
+/// NFR-10; default 30 in `Settings::deletion::retention_days`). The `purge`
+/// method is the domain entry point.
 ///
 /// The retention boundary here is the exact complement of UC-07's: UC-07
 /// restores while `elapsed <= retention_days` (inclusive), so UC-08 purges
 /// only once `elapsed > retention_days` — at exactly `retention_days` the
 /// record is still restorable and *not* yet purgeable.
-pub struct PurgeFileHandler<A, R, C> {
-    auth: A,
+pub struct PurgeFileHandler<R, C> {
     repo: R,
     clock: C,
     retention_days: u32,
 }
 
-impl<A, R, C> PurgeFileHandler<A, R, C>
+impl<R, C> PurgeFileHandler<R, C>
 where
-    A: AuthService,
     R: CatalogRepository,
     C: Clock,
 {
-    pub fn new(auth: A, repo: R, clock: C, retention_days: u32) -> Self {
+    pub fn new(repo: R, clock: C, retention_days: u32) -> Self {
         Self {
-            auth,
             repo,
             clock,
             retention_days,
@@ -48,12 +44,7 @@ where
     /// Hard-purge `uuid`'s catalog row and return the `File` as it was
     /// immediately before deletion (a confirmation snapshot; the row itself
     /// no longer exists once this returns `Ok`).
-    pub async fn purge(&self, uuid: Uuid, token: &str) -> Result<File, DomainError> {
-        // AF-03: the caller must be authenticated, evaluated before any
-        // payload is consulted (FR-AU-07 / SRD §7), matching the
-        // auth-before-payload ordering of the other file-lifecycle handlers.
-        self.auth.authenticate(token).await?;
-
+    pub async fn purge(&self, uuid: Uuid) -> Result<File, DomainError> {
         // AF-02: the file must exist.
         let file = self
             .repo

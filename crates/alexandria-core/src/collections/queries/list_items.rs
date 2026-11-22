@@ -1,6 +1,5 @@
 use uuid::Uuid;
 
-use crate::auth::AuthService;
 use crate::bookmarks::repos::BookmarkRepository;
 use crate::catalog::model::StateFilter;
 use crate::catalog::repos::CatalogRepository;
@@ -16,23 +15,20 @@ use crate::errors::DomainError;
 /// `StateFilter::Active`, matching UC-03's own default (soft-deleted members
 /// excluded unless explicitly requested — which this read path does not yet
 /// support).
-pub struct ListCollectionItemsHandler<A, CR, CATR, BR> {
-    auth: A,
+pub struct ListCollectionItemsHandler<CR, CATR, BR> {
     collection_repo: CR,
     catalog_repo: CATR,
     bookmark_repo: BR,
 }
 
-impl<A, CR, CATR, BR> ListCollectionItemsHandler<A, CR, CATR, BR>
+impl<CR, CATR, BR> ListCollectionItemsHandler<CR, CATR, BR>
 where
-    A: AuthService,
     CR: CollectionRepository,
     CATR: CatalogRepository,
     BR: BookmarkRepository,
 {
-    pub fn new(auth: A, collection_repo: CR, catalog_repo: CATR, bookmark_repo: BR) -> Self {
+    pub fn new(collection_repo: CR, catalog_repo: CATR, bookmark_repo: BR) -> Self {
         Self {
-            auth,
             collection_repo,
             catalog_repo,
             bookmark_repo,
@@ -44,12 +40,7 @@ where
     pub async fn list(
         &self,
         collection_uuid: Uuid,
-        token: &str,
     ) -> Result<CollectionMembersResult, DomainError> {
-        // AF-02: the caller must be authenticated. Evaluated before the
-        // collection is looked up (FR-AU-07 / SRD §7).
-        self.auth.authenticate(token).await?;
-
         // AF-01 (per the use case's own read path): the collection must
         // exist.
         let collection = self

@@ -21,8 +21,8 @@ pub async fn migrate_database(database_path: &str) -> Result<SqlitePool, DomainE
     // default: a rollback journal, where a writer takes an exclusive lock over
     // the whole database and readers block behind it. That was survivable while
     // indexing was sequential. It is not a good fit now that UC-01/UC-02 walk
-    // several files at a time (`indexing.concurrency`) while the HTTP surface
-    // is meant to keep answering reads (FR-FC-08). WAL lets readers proceed
+    // several files at a time (`indexing.concurrency`) while the FFI is
+    // meant to keep answering reads (FR-FC-08). WAL lets readers proceed
     // against a snapshot while one writer works.
     //
     // WAL is a *persistent* property of the database file, not a per-connection

@@ -1,27 +1,21 @@
-//! Unit tests for the UC-05 RenameFileHandler (Testing Specification §6).
-//! Each test exercises exactly the handler against trait fakes — no real DB,
-//! filesystem, or auth service. Coverage follows §6.3: happy path, every
-//! `AF-xx` alternative flow, the deleted-state precondition, and the disk
-//! rollback when the catalog write fails after a successful on-disk rename.
+//! Unit tests for the UC-05 RenameFileHandler (Testing Specification §6). Each
+//! test exercises exactly the handler against trait fakes — no real DB or
+//! filesystem. Coverage follows §6.3: happy path, every `AF-xx` alternative
+//! flow, the deleted-state precondition, and the disk rollback when the
+//! catalog write fails after a successful on-disk rename.
 
 use uuid::Uuid;
 
 use alexandria_core::catalog::commands::rename::{validate_file_name, RenameFileHandler};
 use alexandria_core::errors::DomainError;
 
-use crate::common::{
-    deleted_file, existing_file_with_hash, FakeAuth, FakeCatalogRepository, FakeFilesystem,
-};
-
-const TOKEN: &str = "bearer-token";
+use crate::common::{deleted_file, existing_file_with_hash, FakeCatalogRepository, FakeFilesystem};
 
 fn handler(
-    auth: FakeAuth,
     repo: FakeCatalogRepository,
     fs: FakeFilesystem,
-) -> RenameFileHandler<FakeAuth, FakeCatalogRepository, FakeFilesystem> {
+) -> RenameFileHandler<FakeCatalogRepository, FakeFilesystem> {
     RenameFileHandler::new(
-        auth,
         repo,
         fs,
         alexandria_core::catalog::library_root::LibraryRoot::unconfigured(),
@@ -45,7 +39,7 @@ fn seeded(
     Uuid,
     FakeCatalogRepository,
     FakeFilesystem,
-    RenameFileHandler<FakeAuth, FakeCatalogRepository, FakeFilesystem>,
+    RenameFileHandler<FakeCatalogRepository, FakeFilesystem>,
 ) {
     let repo = FakeCatalogRepository::new();
     let file = existing_file_with_hash(
@@ -57,7 +51,7 @@ fn seeded(
     let uuid = file.uuid;
     repo.seed(file);
     let fs = fs_with_file(path);
-    let h = handler(FakeAuth::Allowing, repo.clone(), fs.clone());
+    let h = handler(repo.clone(), fs.clone());
     (uuid, repo, fs, h)
 }
 
@@ -70,7 +64,7 @@ async fn given_active_file_when_rename_then_disk_moved_catalog_updated_returned_
     let expected_new_path = "/lib/new-name.txt";
 
     let result = h
-        .rename(uuid, "new-name.txt".to_string(), TOKEN)
+        .rename(uuid, "new-name.txt".to_string())
         .await
         .expect("rename");
 
@@ -90,14 +84,14 @@ async fn given_active_file_when_rename_then_disk_moved_catalog_updated_returned_
 #[tokio::test]
 async fn given_empty_name_when_rename_then_invalid_input() {
     let (uuid, _repo, _fs, h) = seeded("/lib/memo.txt", "memo.txt");
-    let result = h.rename(uuid, "".to_string(), TOKEN).await;
+    let result = h.rename(uuid, "".to_string()).await;
     assert!(matches!(result, Err(DomainError::InvalidInput(_))));
 }
 
 #[tokio::test]
 async fn given_whitespace_only_name_when_rename_then_invalid_input() {
     let (uuid, _repo, _fs, h) = seeded("/lib/memo.txt", "memo.txt");
-    let result = h.rename(uuid, "   ".to_string(), TOKEN).await;
+    let result = h.rename(uuid, "   ".to_string()).await;
     assert!(matches!(result, Err(DomainError::InvalidInput(_))));
 }
 
@@ -105,7 +99,7 @@ async fn given_whitespace_only_name_when_rename_then_invalid_input() {
 async fn given_name_with_path_separator_when_rename_then_invalid_input() {
     let (uuid, _repo, _fs, h) = seeded("/lib/memo.txt", "memo.txt");
     for bad in ["a/b", "a\\b"] {
-        let err = h.rename(uuid, bad.to_string(), TOKEN).await;
+        let err = h.rename(uuid, bad.to_string()).await;
         assert!(
             matches!(err, Err(DomainError::InvalidInput(_))),
             "name {bad:?} should be rejected"
@@ -117,7 +111,7 @@ async fn given_name_with_path_separator_when_rename_then_invalid_input() {
 async fn given_dot_or_dot_dot_name_when_rename_then_invalid_input() {
     let (uuid, _repo, _fs, h) = seeded("/lib/memo.txt", "memo.txt");
     for bad in [".", ".."] {
-        let err = h.rename(uuid, bad.to_string(), TOKEN).await;
+        let err = h.rename(uuid, bad.to_string()).await;
         assert!(matches!(err, Err(DomainError::InvalidInput(_))));
     }
 }
@@ -127,7 +121,7 @@ async fn given_name_with_reserved_char_when_rename_then_invalid_input() {
     let (uuid, _repo, _fs, h) = seeded("/lib/memo.txt", "memo.txt");
     for bad in ['<', '>', ':', '"', '|', '?', '*'] {
         let name = format!("a{bad}b");
-        let err = h.rename(uuid, name, TOKEN).await;
+        let err = h.rename(uuid, name).await;
         assert!(
             matches!(err, Err(DomainError::InvalidInput(_))),
             "reserved {bad:?} rejected"
@@ -139,7 +133,7 @@ async fn given_name_with_reserved_char_when_rename_then_invalid_input() {
 async fn given_name_trailing_dot_or_leading_trailing_space_when_rename_then_invalid_input() {
     let (uuid, _repo, _fs, h) = seeded("/lib/memo.txt", "memo.txt");
     for bad in ["name.", "name ", " name", " name "] {
-        let err = h.rename(uuid, bad.to_string(), TOKEN).await;
+        let err = h.rename(uuid, bad.to_string()).await;
         assert!(
             matches!(err, Err(DomainError::InvalidInput(_))),
             "name {bad:?} should be rejected"
@@ -151,14 +145,14 @@ async fn given_name_trailing_dot_or_leading_trailing_space_when_rename_then_inva
 async fn given_name_longer_than_255_bytes_when_rename_then_invalid_input() {
     let (uuid, _repo, _fs, h) = seeded("/lib/memo.txt", "memo.txt");
     let name = "a".repeat(256);
-    let err = h.rename(uuid, name, TOKEN).await;
+    let err = h.rename(uuid, name).await;
     assert!(matches!(err, Err(DomainError::InvalidInput(_))));
 }
 
 #[tokio::test]
 async fn given_valid_name_with_inner_spaces_and_dots_when_rename_then_succeeds() {
     let (uuid, _repo, _fs, h) = seeded("/lib/memo.txt", "memo.txt");
-    let result = h.rename(uuid, "my memo v2.txt".to_string(), TOKEN).await;
+    let result = h.rename(uuid, "my memo v2.txt".to_string()).await;
     assert!(result.is_ok(), "name with spaces/dots is valid");
     let result = result.unwrap();
     assert_eq!(result.name, "my memo v2.txt");
@@ -171,9 +165,9 @@ async fn given_valid_name_with_inner_spaces_and_dots_when_rename_then_succeeds()
 async fn given_disk_rename_fails_when_rename_then_disk_error_and_catalog_unchanged() {
     let (uuid, repo, mut fs, _h) = seeded("/lib/memo.txt", "memo.txt");
     fs.fail_rename_from("/lib/memo.txt");
-    let h = handler(FakeAuth::Allowing, repo.clone(), fs.clone());
+    let h = handler(repo.clone(), fs.clone());
 
-    let result = h.rename(uuid, "new-name.txt".to_string(), TOKEN).await;
+    let result = h.rename(uuid, "new-name.txt".to_string()).await;
     assert!(
         matches!(result, Err(DomainError::Disk(_))),
         "a disk rename failure must surface as DomainError::Disk (AF-02)"
@@ -204,10 +198,10 @@ async fn given_target_path_cataloged_for_other_file_when_rename_then_disk_error_
     repo.seed(a);
     repo.seed(b);
     let fs = fs_with_file("/lib/a.txt");
-    let h = handler(FakeAuth::Allowing, repo, fs.clone());
+    let h = handler(repo, fs.clone());
 
     // Rename a onto b's path would collide with b's cataloged path.
-    let result = h.rename(uuid_a, "b.txt".to_string(), TOKEN).await;
+    let result = h.rename(uuid_a, "b.txt".to_string()).await;
     assert!(matches!(result, Err(DomainError::Disk(_))));
     assert_eq!(
         fs.rename_count(),
@@ -230,9 +224,9 @@ async fn given_target_path_exists_on_disk_when_rename_then_disk_error_no_disk_mo
     let mut fs = fs_with_file("/lib/memo.txt");
     // An on-disk entry already sits at the target path (not cataloged).
     fs.place_disk_file("/lib/new-name.txt");
-    let h = handler(FakeAuth::Allowing, repo, fs.clone());
+    let h = handler(repo, fs.clone());
 
-    let result = h.rename(uuid, "new-name.txt".to_string(), TOKEN).await;
+    let result = h.rename(uuid, "new-name.txt".to_string()).await;
     assert!(matches!(result, Err(DomainError::Disk(_))));
     assert_eq!(
         fs.rename_count(),
@@ -260,9 +254,9 @@ async fn given_disk_rename_succeeds_but_catalog_fails_when_rename_then_disk_roll
     repo.seed(file);
     repo.fail_rename_file(uuid);
     let fs = fs_with_file("/lib/memo.txt");
-    let h = handler(FakeAuth::Allowing, repo.clone(), fs.clone());
+    let h = handler(repo.clone(), fs.clone());
 
-    let result = h.rename(uuid, "new-name.txt".to_string(), TOKEN).await;
+    let result = h.rename(uuid, "new-name.txt".to_string()).await;
     assert!(
         matches!(result, Err(DomainError::Internal(_))),
         "the catalog write must surface its failure to the caller"
@@ -287,32 +281,11 @@ async fn given_disk_rename_succeeds_but_catalog_fails_when_rename_then_disk_roll
 async fn given_missing_uuid_when_rename_then_not_found() {
     let repo = FakeCatalogRepository::new();
     let fs = FakeFilesystem::default();
-    let h = handler(FakeAuth::Allowing, repo, fs);
+    let h = handler(repo, fs);
     let uuid = Uuid::new_v4();
 
-    let result = h.rename(uuid, "new.txt".to_string(), TOKEN).await;
+    let result = h.rename(uuid, "new.txt".to_string()).await;
     assert!(matches!(result, Err(DomainError::NotFound)));
-}
-
-// ---------------- AF-04: caller not authenticated ----------------
-
-#[tokio::test]
-async fn given_unauthenticated_when_rename_then_unauthorized_and_no_disk_move() {
-    let repo = FakeCatalogRepository::new();
-    let file = existing_file_with_hash(
-        "/lib/memo.txt",
-        "memo.txt",
-        alexandria_core::catalog::model::FileType::Text,
-        "h",
-    );
-    let uuid = file.uuid;
-    repo.seed(file);
-    let fs = fs_with_file("/lib/memo.txt");
-    let h = handler(FakeAuth::Denying, repo, fs.clone());
-
-    let result = h.rename(uuid, "new.txt".to_string(), "").await;
-    assert!(matches!(result, Err(DomainError::Unauthorized)));
-    assert_eq!(fs.rename_count(), 0, "no disk move when unauthenticated");
 }
 
 // ---------------- Precondition: deleted state ----------------
@@ -328,9 +301,9 @@ async fn given_deleted_file_when_rename_then_invalid_state() {
     let uuid = file.uuid;
     repo.seed(file);
     let fs = fs_with_file("/lib/d.txt");
-    let h = handler(FakeAuth::Allowing, repo, fs);
+    let h = handler(repo, fs);
 
-    let result = h.rename(uuid, "new.txt".to_string(), TOKEN).await;
+    let result = h.rename(uuid, "new.txt".to_string()).await;
     assert!(
         matches!(result, Err(DomainError::InvalidState)),
         "renaming a deleted file must require restore (UC-07)"
@@ -343,10 +316,7 @@ async fn given_deleted_file_when_rename_then_invalid_state() {
 async fn given_new_name_equals_current_when_rename_then_no_move_no_write_unchanged_file() {
     let (uuid, repo, fs, h) = seeded("/lib/memo.txt", "memo.txt");
 
-    let result = h
-        .rename(uuid, "memo.txt".to_string(), TOKEN)
-        .await
-        .expect("noop");
+    let result = h.rename(uuid, "memo.txt".to_string()).await.expect("noop");
 
     assert_eq!(result.name, "memo.txt");
     assert_eq!(result.path, "/lib/memo.txt");
@@ -383,13 +353,12 @@ async fn given_a_row_outside_the_configured_root_when_renamed_then_invalid_input
     repo.seed(file);
     let fs = fs_with_file("/lib/memo.txt");
     let h = RenameFileHandler::new(
-        FakeAuth::Allowing,
         repo.clone(),
         fs.clone(),
         alexandria_core::catalog::library_root::LibraryRoot::new(library.path().to_str().unwrap()),
     );
 
-    let result = h.rename(uuid, "renamed.txt".to_string(), TOKEN).await;
+    let result = h.rename(uuid, "renamed.txt".to_string()).await;
 
     assert!(matches!(result, Err(DomainError::InvalidInput(_))));
     assert!(!fs.renamed_to("/lib/memo.txt", "/lib/renamed.txt"));

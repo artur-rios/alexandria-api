@@ -1,15 +1,13 @@
 //! The configuration a client needs to render the catalog correctly
 //! (F-00 / FR-FC-30).
 //!
-//! Deliberately narrow. This is not "the config" — most of what the server is
-//! configured with is the operator's business and no client's: bind addresses,
-//! database paths, the filesystem root, auth secrets. What lands here is the
-//! settings a client cannot behave correctly without, and today that is one:
-//! the retention window.
+//! Deliberately narrow. This is not "the config" — most of what the core is
+//! configured with is the operator's business and no client's: database
+//! paths, the filesystem root. What lands here is the settings a client cannot
+//! behave correctly without, and today that is one: the retention window.
 
 use serde::Serialize;
 
-use crate::auth::AuthService;
 use crate::config::Settings;
 use crate::errors::DomainError;
 
@@ -41,18 +39,13 @@ pub struct SettingsView {
 /// It reads the settings this process was started with, so it costs no
 /// database round trip and cannot disagree with what the restore and purge
 /// handlers enforce: they are handed the same value from the same place.
-pub struct GetSettingsHandler<A> {
-    auth: A,
+pub struct GetSettingsHandler {
     settings: SettingsView,
 }
 
-impl<A> GetSettingsHandler<A>
-where
-    A: AuthService,
-{
-    pub fn new(auth: A, settings: &Settings) -> Self {
+impl GetSettingsHandler {
+    pub fn new(settings: &Settings) -> Self {
         Self {
-            auth,
             settings: SettingsView {
                 deletion: DeletionSettingsView {
                     retention_days: settings.deletion.retention_days,
@@ -62,12 +55,7 @@ where
     }
 
     /// Report the settings.
-    pub async fn get(&self, token: &str) -> Result<SettingsView, DomainError> {
-        // AF-01: the caller must be authenticated. The window is not a secret,
-        // but every other `/v1` read takes a token and an exception here would
-        // be one more thing to remember.
-        self.auth.authenticate(token).await?;
-
+    pub async fn get(&self) -> Result<SettingsView, DomainError> {
         Ok(self.settings)
     }
 }

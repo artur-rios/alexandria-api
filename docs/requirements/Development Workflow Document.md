@@ -111,8 +111,8 @@ As soon as the branch exists and work starts, set the issue `Status` to
 Implement per the use case's specification (main flow **and** every alternative
 flow) and the project's architecture and technology stack (see the
 [Technology Stack Document](Technology%20Stack%20Document.md)). The core library
-follows SOLID and Command/Query (CQRS-style) handlers; both the HTTP and FFI
-entry points must stay consistent (parity). All commits go on the branch.
+follows SOLID and Command/Query (CQRS-style) handlers, and the FFI stays a thin
+layer over them. All commits go on the branch.
 
 ### Step 4 — Move the issue to **Testing**
 
@@ -125,7 +125,7 @@ gate is now in progress.
 Following the [Testing Specification Document](Testing%20Specification%20Document.md):
 
 1. Write the tests for the main flow and each applicable `AF-xx` alternative flow,
-   plus an HTTP/FFI parity assertion for the use case.
+   through the handler and through the FFI call.
 2. **Run the tests**:
 
    ```bash
@@ -168,7 +168,7 @@ A use case is done only when **all** of the following hold:
 
 - [ ] Implemented on a `feature/uc-##-use-case-name` branch created from `develop`.
 - [ ] Main flow and every alternative flow from the specification are implemented.
-- [ ] Tests cover it per the Testing Specification (main flow + each `AF-xx` + a parity assertion).
+- [ ] Tests cover it per the Testing Specification (main flow + each `AF-xx`, through the handler and the FFI call).
 - [ ] The full test suite passes (`cargo test`).
 - [ ] A pull request was merged into `develop` — reviewed by a human, unless merged
       under the batch carve-out (§4.1).
