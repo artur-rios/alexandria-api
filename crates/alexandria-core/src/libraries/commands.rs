@@ -267,6 +267,39 @@ where
     }
 }
 
+/// Change a library's name, whenever the owner likes.
+pub struct RenameLibraryHandler<R> {
+    repo: R,
+}
+
+impl<R> RenameLibraryHandler<R>
+where
+    R: LibraryRepository,
+{
+    pub fn new(repo: R) -> Self {
+        Self { repo }
+    }
+
+    /// Store `name`, trimmed, as the name of the library `uuid` names, and
+    /// answer the library as stored.
+    ///
+    /// Allowed while the library's run is in progress or paused: the name is
+    /// not part of anything a run reads, so nothing here consults runs or
+    /// waits for one. Renaming to the current name succeeds and changes
+    /// nothing, and two libraries may share a name. `InvalidInput` for a
+    /// blank name, `NotFound` when no library has the uuid.
+    pub async fn rename(&self, uuid: Uuid, name: &str) -> Result<Library, DomainError> {
+        if let Some(reason) = validate_library_name(name) {
+            return Err(DomainError::InvalidInput(reason.to_string()));
+        }
+
+        self.repo
+            .rename(uuid, name.trim())
+            .await?
+            .ok_or(DomainError::NotFound)
+    }
+}
+
 /// Pin a library to the top of the menu, or unpin it.
 pub struct SetLibraryPinnedHandler<R> {
     repo: R,

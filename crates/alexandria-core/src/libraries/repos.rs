@@ -52,6 +52,11 @@ pub trait LibraryRepository: Send + Sync {
     /// Returns the moved library and how many files came with it.
     async fn move_root(&self, uuid: Uuid, new_root: &str) -> Result<(Library, u32), DomainError>;
 
+    /// Store `name` as the library's name and answer the library as stored,
+    /// or `None` when no library has the uuid. The name is written as given:
+    /// the handler trims and validates it first.
+    async fn rename(&self, uuid: Uuid, name: &str) -> Result<Option<Library>, DomainError>;
+
     /// Pin or unpin the library, answering whether a library matched. Setting
     /// the value it already has still matches: the answer is about the row.
     async fn set_pinned(&self, uuid: Uuid, pinned: bool) -> Result<bool, DomainError>;
@@ -306,6 +311,22 @@ impl LibraryRepository for SqliteLibraryRepository {
             },
             u32::try_from(moved).unwrap_or(u32::MAX),
         ))
+    }
+
+    async fn rename(&self, uuid: Uuid, name: &str) -> Result<Option<Library>, DomainError> {
+        // One statement, so the row answered is the row written and no run
+        // or lock is consulted: a name is not part of anything a run reads.
+        let row = sqlx::query(
+            "UPDATE libraries SET name = ? WHERE uuid = ?
+             RETURNING uuid, name, root_path, pinned, favorite",
+        )
+        .bind(name)
+        .bind(uuid.to_string())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| DomainError::Disk(e.to_string()))?;
+
+        row.map(|row| parse_library(&row)).transpose()
     }
 
     async fn set_pinned(&self, uuid: Uuid, pinned: bool) -> Result<bool, DomainError> {

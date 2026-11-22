@@ -19,7 +19,7 @@ use alexandria_core::catalog::runs::SqliteCatalogRunRepository;
 use alexandria_core::catalog::runs::{CatalogRunRepository, RunKind, RunPriority, RunStatus};
 use alexandria_core::errors::DomainError;
 use alexandria_core::libraries::commands::{
-    IndexLibraryHandler, MoveLibraryHandler, RegisterLibraryHandler,
+    IndexLibraryHandler, MoveLibraryHandler, RegisterLibraryHandler, RenameLibraryHandler,
 };
 use alexandria_core::libraries::model::{LibraryListing, RegisteredLibrary};
 use alexandria_core::libraries::queries::BrowseLibraryHandler;
@@ -627,4 +627,44 @@ async fn given_a_library_that_does_not_exist_when_its_run_is_started_then_not_fo
 
     assert!(matches!(result, Err(DomainError::NotFound)), "{result:?}");
     assert!(runs.list_active().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn given_a_library_with_a_run_in_progress_when_renamed_then_it_succeeds_and_the_run_is_unchanged(
+) {
+    // The name is not part of anything a run reads, so renaming never waits
+    // for one. The status is forced in the row rather than raced against a
+    // live walk that may finish first.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = course(dir.path());
+    let pool = migrated(dir.path()).await;
+    let registered = registrar(&pool, "")
+        .register("Course", root.to_str().expect("root"), RunPriority::Normal)
+        .await
+        .expect("register");
+    let run_id = registered.run_id;
+    sqlx::query("UPDATE catalog_runs SET status = 'running' WHERE id = ?")
+        .bind(run_id.to_string())
+        .execute(&pool)
+        .await
+        .expect("force running");
+    let run_row = || async {
+        sqlx::query_as::<_, (String, Option<i64>)>(
+            "SELECT status, library_id FROM catalog_runs WHERE id = ?",
+        )
+        .bind(run_id.to_string())
+        .fetch_one(&pool)
+        .await
+        .expect("run row")
+    };
+    let before = run_row().await;
+    assert_eq!(before.0, "running");
+
+    let renamed = RenameLibraryHandler::new(SqliteLibraryRepository::new(pool.clone()))
+        .rename(registered.library.uuid, "Renamed while running")
+        .await
+        .expect("rename");
+
+    assert_eq!(renamed.name, "Renamed while running");
+    assert_eq!(run_row().await, before, "the run changed");
 }

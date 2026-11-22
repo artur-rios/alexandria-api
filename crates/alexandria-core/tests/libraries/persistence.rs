@@ -903,3 +903,125 @@ mod flags {
         assert!(library.pinned && library.favorite);
     }
 }
+
+/// A library's name can change whenever the owner likes; nothing else about
+/// the library does.
+mod renaming {
+    use super::*;
+    use alexandria_core::libraries::commands::{
+        RenameLibraryHandler, SetLibraryFavoriteHandler, SetLibraryPinnedHandler,
+    };
+    use alexandria_core::libraries::model::Library;
+    use alexandria_core::libraries::repos::LibraryRepository;
+
+    async fn registered(pool: &sqlx::sqlite::SqlitePool, name: &str, root: &str) -> Uuid {
+        RegisterLibraryHandler::new(
+            SqliteLibraryRepository::new(pool.clone()),
+            AlwaysStartsRun,
+            LibraryRoot::unconfigured(),
+        )
+        .register(name, root, RunPriority::Normal)
+        .await
+        .expect("register")
+        .library
+        .uuid
+    }
+
+    async fn rename(
+        pool: &sqlx::sqlite::SqlitePool,
+        uuid: Uuid,
+        name: &str,
+    ) -> Result<Library, DomainError> {
+        RenameLibraryHandler::new(SqliteLibraryRepository::new(pool.clone()))
+            .rename(uuid, name)
+            .await
+    }
+
+    async fn stored(pool: &sqlx::sqlite::SqlitePool, uuid: Uuid) -> Library {
+        SqliteLibraryRepository::new(pool.clone())
+            .find_by_uuid(uuid)
+            .await
+            .expect("find")
+            .expect("library")
+    }
+
+    #[tokio::test]
+    async fn given_a_library_when_renamed_with_padding_then_the_trimmed_name_is_stored() {
+        let (pool, _catalog, _dir) = fixtures().await;
+        let uuid = registered(&pool, "Course", ROOT).await;
+
+        let renamed = rename(&pool, uuid, "  Rust course \t")
+            .await
+            .expect("rename");
+
+        assert_eq!(renamed.name, "Rust course");
+        assert_eq!(stored(&pool, uuid).await.name, "Rust course");
+    }
+
+    #[tokio::test]
+    async fn given_a_library_when_renamed_to_blank_then_refused_and_the_name_stays() {
+        let (pool, _catalog, _dir) = fixtures().await;
+        let uuid = registered(&pool, "Course", ROOT).await;
+
+        let result = rename(&pool, uuid, "  ").await;
+
+        assert!(
+            matches!(result, Err(DomainError::InvalidInput(_))),
+            "{result:?}"
+        );
+        assert_eq!(stored(&pool, uuid).await.name, "Course");
+    }
+
+    #[tokio::test]
+    async fn given_an_unknown_uuid_when_renamed_then_not_found() {
+        let (pool, _catalog, _dir) = fixtures().await;
+
+        let result = rename(&pool, Uuid::new_v4(), "Anything").await;
+
+        assert!(matches!(result, Err(DomainError::NotFound)), "{result:?}");
+    }
+
+    #[tokio::test]
+    async fn given_a_pinned_favorite_library_when_renamed_then_both_flags_stay() {
+        let (pool, _catalog, _dir) = fixtures().await;
+        let uuid = registered(&pool, "Course", ROOT).await;
+        SetLibraryPinnedHandler::new(SqliteLibraryRepository::new(pool.clone()))
+            .set(uuid, true)
+            .await
+            .expect("pin");
+        SetLibraryFavoriteHandler::new(SqliteLibraryRepository::new(pool.clone()))
+            .set(uuid, true)
+            .await
+            .expect("favorite");
+
+        let renamed = rename(&pool, uuid, "Renamed").await.expect("rename");
+
+        assert!(renamed.pinned && renamed.favorite, "answered {renamed:?}");
+        let library = stored(&pool, uuid).await;
+        assert!(library.pinned && library.favorite, "stored {library:?}");
+        assert_eq!(library.root_path, ROOT);
+    }
+
+    #[tokio::test]
+    async fn given_two_libraries_when_one_is_renamed_to_the_others_name_then_both_exist() {
+        let (pool, _catalog, _dir) = fixtures().await;
+        let first = registered(&pool, "First", "/library/first").await;
+        let second = registered(&pool, "Second", "/library/second").await;
+
+        rename(&pool, second, "First").await.expect("rename");
+
+        assert_eq!(stored(&pool, first).await.name, "First");
+        assert_eq!(stored(&pool, second).await.name, "First");
+    }
+
+    #[tokio::test]
+    async fn given_a_library_when_renamed_to_its_current_name_then_it_succeeds_unchanged() {
+        let (pool, _catalog, _dir) = fixtures().await;
+        let uuid = registered(&pool, "Course", ROOT).await;
+
+        let renamed = rename(&pool, uuid, "Course").await.expect("rename");
+
+        assert_eq!(renamed.name, "Course");
+        assert_eq!(stored(&pool, uuid).await.name, "Course");
+    }
+}

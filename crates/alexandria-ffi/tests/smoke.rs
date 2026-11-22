@@ -61,8 +61,8 @@ use alexandria_ffi::{
     alexandria_index_resume, alexandria_index_run_failures_json, alexandria_index_run_status_json,
     alexandria_index_runs_active_json, alexandria_libraries_list, alexandria_library_browse,
     alexandria_library_index_start, alexandria_library_move, alexandria_library_register,
-    alexandria_library_remove, alexandria_library_set_favorite, alexandria_library_set_pinned,
-    FileMetadataResult, IndexStartResult,
+    alexandria_library_remove, alexandria_library_rename, alexandria_library_set_favorite,
+    alexandria_library_set_pinned, FileMetadataResult, IndexStartResult,
 };
 
 const STATUS_RUN_OK: i32 = alexandria_ffi::RUN_OK;
@@ -5473,4 +5473,54 @@ fn given_a_pinned_library_when_browsed_then_the_listing_library_says_pinned_true
 
     assert_eq!(listing["library"]["pinned"], true);
     assert_eq!(listing["library"]["favorite"], false);
+}
+
+/// Renaming answers the updated library, and the list then carries the new
+/// name.
+#[test]
+fn given_a_library_when_renamed_then_status_0_and_the_json_and_list_carry_the_new_name() {
+    let _g = serial();
+    let _db = init_temp_db();
+    let library = register_library("Course", &folder(&_db, "/library/course"));
+    let uuid = c(library["uuid"].as_str().unwrap());
+    let body = c(&serde_json::json!({ "name": "  Rust course " }).to_string());
+
+    let renamed = library_json_ok(alexandria_library_rename(uuid.as_ptr(), body.as_ptr()));
+
+    assert_eq!(renamed["name"], "Rust course");
+    assert_eq!(renamed["uuid"], library["uuid"]);
+    let listed = library_json_ok(alexandria_libraries_list());
+    assert_eq!(listed[0]["name"], "Rust course");
+}
+
+/// A body that does not carry a string name is the caller's mistake.
+#[test]
+fn given_a_body_without_name_when_renamed_then_invalid_input() {
+    let _g = serial();
+    let _db = init_temp_db();
+    let library = register_library("Course", &folder(&_db, "/library/course"));
+    let uuid = c(library["uuid"].as_str().unwrap());
+
+    for body in [r#"{}"#, r#"{"name": 7}"#, "not json"] {
+        let body = c(body);
+        let result = alexandria_library_rename(uuid.as_ptr(), body.as_ptr());
+        assert_eq!(result.status, STATUS_LIBRARY_INVALID_INPUT);
+        assert!(result.json.is_null());
+    }
+    let listed = library_json_ok(alexandria_libraries_list());
+    assert_eq!(listed[0]["name"], "Course");
+}
+
+/// A well formed uuid no library has is reported as not found.
+#[test]
+fn given_an_unknown_uuid_when_renamed_then_not_found() {
+    let _g = serial();
+    let _db = init_temp_db();
+    let uuid = c(&uuid::Uuid::new_v4().to_string());
+    let body = c(r#"{"name": "Anything"}"#);
+
+    let result = alexandria_library_rename(uuid.as_ptr(), body.as_ptr());
+
+    assert_eq!(result.status, STATUS_LIBRARY_NOT_FOUND);
+    assert!(result.json.is_null());
 }

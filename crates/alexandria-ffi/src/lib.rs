@@ -3906,6 +3906,49 @@ pub extern "C" fn alexandria_library_browse(
     })
 }
 
+/// Rename a library, whenever the owner likes, including while its run is in
+/// progress or paused. `json_body` is `{"name": "..."}`; the answer is the
+/// updated library's JSON. `LIBRARY_ERR_INVALID_INPUT` for a `uuid` that is
+/// not one, a body that is not JSON or has no string `name`, or a blank name;
+/// `LIBRARY_ERR_NOT_INITIALIZED` before init; `LIBRARY_ERR_NOT_FOUND` for a
+/// uuid no library has.
+#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
+#[no_mangle]
+pub extern "C" fn alexandria_library_rename(
+    uuid: *const c_char,
+    json_body: *const c_char,
+) -> LibraryJsonResult {
+    ffi_guard(LibraryJsonResult::err(LIBRARY_ERR_OTHER), || {
+        let services = match locked_services() {
+            Some(s) => s,
+            None => return LibraryJsonResult::err(LIBRARY_ERR_NOT_INITIALIZED),
+        };
+
+        let uuid = match cstr_lossy(uuid).and_then(|s| uuid::Uuid::parse_str(&s).ok()) {
+            Some(u) => u,
+            None => return LibraryJsonResult::err(LIBRARY_ERR_INVALID_INPUT),
+        };
+
+        let name = match cstr_lossy(json_body)
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+            .and_then(|body| body.get("name").and_then(|v| v.as_str()).map(str::to_owned))
+        {
+            Some(name) => name,
+            None => return LibraryJsonResult::err(LIBRARY_ERR_INVALID_INPUT),
+        };
+
+        let result =
+            runtime().block_on(async { services.rename_library_handler.rename(uuid, &name).await });
+
+        match result {
+            Ok(library) => {
+                LibraryJsonResult::ok(serde_json::to_string(&library).unwrap_or_default())
+            }
+            Err(err) => map_library_err(err),
+        }
+    })
+}
+
 /// Pin a library to the top of the menu, or unpin it. Answers `LIBRARY_OK`,
 /// `LIBRARY_ERR_INVALID_INPUT` when `uuid` is not a uuid,
 /// `LIBRARY_ERR_NOT_INITIALIZED` before init, and `LIBRARY_ERR_NOT_FOUND`

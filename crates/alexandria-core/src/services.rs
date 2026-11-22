@@ -44,7 +44,7 @@ use crate::collections::repos::SqliteCollectionRepository;
 use crate::config::Settings;
 use crate::libraries::commands::{
     IndexLibraryHandler, MoveLibraryHandler, RegisterLibraryHandler, RemoveLibraryHandler,
-    SetLibraryFavoriteHandler, SetLibraryPinnedHandler,
+    RenameLibraryHandler, SetLibraryFavoriteHandler, SetLibraryPinnedHandler,
 };
 use crate::libraries::queries::{BrowseLibraryHandler, ListLibrariesHandler};
 use crate::libraries::repos::SqliteLibraryRepository;
@@ -222,6 +222,8 @@ pub type DefaultRemoveLibraryHandler =
 pub type DefaultMoveLibraryHandler =
     MoveLibraryHandler<SqliteLibraryRepository, SqliteCatalogRunRepository>;
 
+pub type DefaultRenameLibraryHandler = RenameLibraryHandler<SqliteLibraryRepository>;
+
 pub type DefaultSetLibraryPinnedHandler = SetLibraryPinnedHandler<SqliteLibraryRepository>;
 
 pub type DefaultSetLibraryFavoriteHandler = SetLibraryFavoriteHandler<SqliteLibraryRepository>;
@@ -279,6 +281,7 @@ pub struct Services {
     pub index_library_handler: Arc<DefaultIndexLibraryHandler>,
     pub remove_library_handler: Arc<DefaultRemoveLibraryHandler>,
     pub move_library_handler: Arc<DefaultMoveLibraryHandler>,
+    pub rename_library_handler: Arc<DefaultRenameLibraryHandler>,
     pub set_library_pinned_handler: Arc<DefaultSetLibraryPinnedHandler>,
     pub set_library_favorite_handler: Arc<DefaultSetLibraryFavoriteHandler>,
     pub browse_library_handler: Arc<DefaultBrowseLibraryHandler>,
@@ -566,6 +569,9 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         library_root.clone(),
         SqliteCatalogRunRepository::new(pool.clone()),
     ));
+    let rename_library_handler = Arc::new(RenameLibraryHandler::new(SqliteLibraryRepository::new(
+        pool.clone(),
+    )));
     let set_library_pinned_handler = Arc::new(SetLibraryPinnedHandler::new(
         SqliteLibraryRepository::new(pool.clone()),
     ));
@@ -624,6 +630,7 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         index_library_handler,
         remove_library_handler,
         move_library_handler,
+        rename_library_handler,
         set_library_pinned_handler,
         set_library_favorite_handler,
         browse_library_handler,
