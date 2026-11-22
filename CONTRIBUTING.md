@@ -14,8 +14,7 @@ Reading order for a new contributor: `docs/initial/Project Overview.md` →
 alexandria-api/
 ├── Cargo.toml                 # workspace
 ├── crates/
-│   ├── alexandria-core/       # domain: commands, queries, repos, auth, config
-│   ├── alexandria-http/       # axum routes + middleware
+│   ├── alexandria-core/       # domain: commands, queries, repos, config
 │   └── alexandria-ffi/        # extern "C" + cbindgen header
 ├── config.toml.example
 ├── docs/
@@ -240,11 +239,8 @@ them. Flagging the distinction, not giving legal advice.
 ## Building
 
 ```bash
-# Build the whole workspace (core + http + ffi)
+# Build the whole workspace (core + ffi)
 cargo build --workspace --release
-
-# Build the HTTP server binary
-cargo build --release -p alexandria-http
 
 # Build the FFI dynamic library + regenerate the C header via cbindgen
 cargo build --release -p alexandria-ffi
@@ -255,8 +251,8 @@ The workspace enforces `#![deny(unsafe_code)]` in every crate.
 ## Testing
 
 Tests are organized by crate and split into **unit** (handler logic against
-trait fakes), **integration** (HTTP/FFI end-to-end against real SQLite and a
-temp filesystem), and **parity** (HTTP vs FFI must return identical results).
+trait fakes) and **integration** (the core's handlers and the FFI's C calls
+end-to-end against real SQLite and a temp filesystem).
 See [`docs/requirements/Testing Specification Document.md`](docs/requirements/Testing%20Specification%20Document.md)
 for the full standard.
 
@@ -270,8 +266,8 @@ cargo test --workspace --lib
 # Run only integration tests
 cargo test --workspace --test '*'
 
-# Run the HTTP / FFI parity suite alone
-cargo test -p alexandria-ffi --test parity
+# Run the FFI smoke suite alone
+cargo test -p alexandria-ffi --test smoke
 
 # Optional: line/branch coverage
 cargo tarpaulin --workspace --out Html
@@ -296,7 +292,7 @@ not apply and the upstream release that will let it be removed; check those cond
 ## Migrations
 
 Migrations live in `crates/alexandria-core/migrations` and are applied on
-startup by both the server and the FFI. Once a migration has been applied
+startup by the FFI's `alexandria_index_init`. Once a migration has been applied
 anywhere it is frozen; corrections go in a new migration. Until the first
 packaged release, the baseline migrations (`00000000000001_catalog.sql`,
 `00000000000011_catalog_runs.sql`) may be amended in place instead, and every
@@ -353,16 +349,16 @@ Record every change a client or operator would notice under `## [Unreleased]` in
 ## Versioning
 
 The project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
-Alexandria API is a service and a library at once — an HTTP server and the core
-the desktop front-end links in process — so its contract is the HTTP API, the
-FFI surface and its C header, the configuration keys and their environment
-overrides, and the database the migrations build. From 1.0 on:
+Alexandria API is a library: the core the desktop front-end links in process
+and calls through its C ABI. Its contract is the FFI surface and its C header,
+the configuration keys and their environment overrides, and the database the
+migrations build. From 1.0 on:
 
-- **Major** — a change a client or an operator has to act on: an HTTP endpoint
-  or an FFI call removed or changed in shape, a configuration key renamed or
+- **Major** — a change a client or an operator has to act on: an FFI call
+  removed or changed in shape, a configuration key renamed or
   removed, a database that has to be rebuilt rather than migrated.
 - **Minor** — something added that existing clients and configurations keep
-  working alongside: a new endpoint or FFI call, a new optional configuration
+  working alongside: a new FFI call, a new optional configuration
   key, a migration that only adds.
 - **Patch** — a fix that changes no part of that contract.
 
@@ -376,7 +372,7 @@ work with — a schema addition, or a call added or changed in shape. Everything
 else takes a patch bump.
 
 The workspace version lives in `[workspace.package]` in the root `Cargo.toml`
-and is shared by all three crates; it is edited by hand, with a note on the
+and is shared by both crates; it is edited by hand, with a note on the
 comment above it saying what the bump is for. It is also what the core reports
 as its own version over FFI and what the release is tagged with.
 

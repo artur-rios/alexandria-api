@@ -20,8 +20,8 @@ here rather than duplicated.
 ### 1.2 Scope
 
 This document covers the technical foundation and repository layout, platform
-requirements, configuration, logging and monitoring, the health endpoint,
-environments, and build and delivery.
+requirements, configuration, logging and monitoring, environments, and build
+and delivery. The health endpoint is removed with the HTTP server (§5).
 
 ---
 
@@ -29,11 +29,12 @@ environments, and build and delivery.
 
 ### 2.1 Overview
 
-Alexandria is a three-crate Cargo workspace built on a Rust core library. The
+Alexandria is a two-crate Cargo workspace built on a Rust core library. The
 core library carries the domain logic (Command/Query handlers, repository traits
-and the sqlx implementation, the auth service, text-file port); an HTTP crate
-exposes it as a REST/JSON server; an FFI crate exposes the same operations to the
-Flutter desktop front-end. The domain documents describe *what* the system does;
+and the sqlx implementation, text-file port); an FFI crate exposes its
+operations to the Flutter desktop front-end through a C ABI, called in process.
+There is no server and no login: the core only runs locally, for the person at
+the machine. The domain documents describe *what* the system does;
 this section describes the structural foundation those features are built on.
 
 ### 2.2 Solution Architecture
@@ -42,24 +43,16 @@ this section describes the structural foundation those features are built on.
 graph TD
     subgraph "Desktop bundle (user machine)"
         FL["Flutter Desktop Front-end"]
-        HTTP["alexandria-http<br/>axum REST/JSON server"]
         FFI["alexandria-ffi<br/>C ABI surface"]
-        CORE["alexandria-core<br/>Command/Query + repos + auth"]
+        CORE["alexandria-core<br/>Command/Query + repos"]
         DB[("SQLite")]
-    end
-
-    subgraph "External"
-        AUTH["External Auth Service<br/>(external mode)"]
         FS["Local Filesystem"]
     end
 
-    FL -->|HTTP / REST-JSON| HTTP
     FL -->|FFI in-process| FFI
-    HTTP --> CORE
     FFI --> CORE
     CORE --> DB
     CORE -->|index / rename / text write| FS
-    CORE -->|validate JWT| AUTH
 ```
 
 ### 2.3 Repository Layout
@@ -71,21 +64,16 @@ alexandria-api/
 │   ├── alexandria-core/
 │   │   ├── src/
 │   │   │   ├── catalog/       # commands, queries, repos (File + subtypes)
+│   │   │   ├── libraries/
 │   │   │   ├── collections/
 │   │   │   ├── bookmarks/
 │   │   │   ├── watchlists/
 │   │   │   ├── reading_lists/
-│   │   │   ├── text/          # TextFile content port
-│   │   │   ├── auth/          # external JWT + local login + Windows account
+│   │   │   ├── playback/
+│   │   │   ├── settings/
 │   │   │   ├── errors.rs      # thiserror domain errors
 │   │   │   └── lib.rs
 │   │   ├── migrations/        # sqlx migrations
-│   │   └── tests/
-│   ├── alexandria-http/
-│   │   ├── src/
-│   │   │   ├── routes/        # /v1/* handlers
-│   │   │   ├── middleware/    # auth, logging, error mapping
-│   │   │   └── lib.rs
 │   │   └── tests/
 │   └── alexandria-ffi/
 │       ├── src/
@@ -103,11 +91,11 @@ alexandria-api/
 
 | ID | Requirement |
 | --- | --- |
-| IR-01 | The solution shall be a Cargo workspace with three crates — `alexandria-core`, `alexandria-http`, `alexandria-ffi` — sharing the core library so HTTP and FFI cannot drift. |
+| IR-01 | The solution shall be a Cargo workspace with two crates — `alexandria-core`, and `alexandria-ffi`, a thin C ABI over the core library. |
 | IR-02 | The workspace shall enforce `#![deny(unsafe_code)]` in every crate. |
-| IR-03 | The HTTP server shall bind to a loopback address by default so the API is reachable only from the local machine unless explicitly reconfigured. |
-| IR-04 | The core library shall expose domain operations through repository and auth-service **traits**, so the HTTP and FFI layers depend on the same abstractions and remain independently testable. |
-| IR-05 | Database migrations shall run at startup before the server begins serving requests. |
+| IR-03 | **Removed (the core only runs locally for the person at the machine)** |
+| IR-04 | The core library shall expose domain operations through repository **traits**, so the handlers depend on abstractions and remain independently testable, and the FFI layer stays a thin transport over them. |
+| IR-05 | Database migrations shall run when the core is initialized (`alexandria_index_init`), before it answers any other call. |
 | IR-06 | The solution shall generate a C header for the FFI surface (via cbindgen) as part of the build, for the Flutter front-end to consume. |
 
 ### 2.5 Migrations are append-only — with one pre-release exception
@@ -116,9 +104,9 @@ sqlx records a checksum of every applied migration's **file content** and
 refuses to run against a database whose stored checksum no longer matches,
 failing with `VersionMismatch`. Editing a migration that has already run —
 including changing only a comment — therefore breaks every existing database,
-not just schema-relevant edits. IR-05 runs migrations before the server
-serves, so such a database does not degrade: it fails startup outright, with
-`DomainError::Migration`.
+not just schema-relevant edits. IR-05 runs migrations before the core answers
+any call, so such a database does not degrade: it fails initialization
+outright, with `DomainError::Migration`.
 
 The rule: once a migration has been applied anywhere it must be treated as
 frozen; corrections go in a new migration. A database that has drifted (because
@@ -152,7 +140,7 @@ Two facts make this the cheaper answer for now, and both expire:
 
 What the exception costs, stated plainly: **an existing database is deleted
 and rebuilt, not migrated.** A user who upgrades across an amendment gets
-`DomainError::Migration` at startup and must delete the database file, losing
+`DomainError::Migration` at initialization and must delete the database file, losing
 their catalog and re-indexing. That is acceptable only because the catalog is
 derived from files on disk and can be rebuilt by re-running the index. Every
 amendment must therefore be announced as a breaking change in the README's
@@ -165,85 +153,30 @@ is unconditional and the baselines are frozen like everything else.
 
 ## 3. Configuration
 
-Configuration is read from `config.toml` at startup, with `ALEXANDRIA_*`
-environment variables overriding a key. Unknown keys are ignored; invalid
-values for required keys fail startup. The table below is the complete set of
+Configuration is read from `config.toml` (or the file `ALEXANDRIA_CONFIG`
+names) when the core is initialized, with `ALEXANDRIA_*` environment variables
+overriding a key. Unknown keys and tables are ignored; invalid values for
+required keys fail initialization. The table below is the complete set of
 keys — a key not listed here does not exist, and only the keys showing an
 `ALEXANDRIA_*` name have an environment override.
 
 | Concern | Mechanism | Notes |
 | --- | --- | --- |
-| `auth.mode` | config / `ALEXANDRIA_AUTH_MODE` | one of `external`, `local`, `windows`; selects the single active auth mode (FR-AU-01). |
-| `auth.heimdall_jwks_url` | config / `ALEXANDRIA_AUTH_HEIMDALL_JWKS_URL` | external mode only; Heimdall's key set, `http://heimdall-api.<env>:8080/.well-known/jwks.json` inside the platform. ES256 tokens verify against the key their `kid` names. Required unless `auth.heimdall_token_secret` is set — startup fails with neither, or with a value that is not an `http`/`https` URL. |
-| `auth.heimdall_token_secret` | config / `ALEXANDRIA_AUTH_HEIMDALL_TOKEN_SECRET` | external mode only, during the move off HS256; the shared secret Heimdall signed with. HS256 tokens are accepted while it is set and refused once it is removed. Prefer the environment variable; never commit it. |
-| `auth.heimdall_token_secret_previous` | config / `ALEXANDRIA_AUTH_HEIMDALL_TOKEN_SECRET_PREVIOUS` | external mode only, during the same overlap; the secret Heimdall was rotating away from. |
-| `auth.heimdall_scope_id` | config / `ALEXANDRIA_AUTH_HEIMDALL_SCOPE_ID` | external mode only; UUID of the Heimdall scope whose members are accepted as the owner. Required — startup fails without it. |
-| `auth.heimdall_issuer` | config / `ALEXANDRIA_AUTH_HEIMDALL_ISSUER` | external mode only; checked only when set. |
-| `auth.heimdall_audience` | config / `ALEXANDRIA_AUTH_HEIMDALL_AUDIENCE` | external mode only; checked only when set. |
-| `auth.session_ttl_hours` | config / `ALEXANDRIA_AUTH_SESSION_TTL_HOURS` | local mode only; how long a login session stays valid; default `24` (FR-AU-09). |
-| `auth.windows_owner_sid` | config / `ALEXANDRIA_AUTH_WINDOWS_OWNER_SID` | Windows mode only; required — startup fails unless the process runs on Windows as this account. Find it with `whoami /user`. Not a secret: it is an identifier, not a credential (FR-AU-21). |
-| `http.bind_addr` | config / `ALEXANDRIA_HTTP_BIND_ADDR` | default `127.0.0.1`; loopback by default (IR-03). |
-| `http.port` | config / `ALEXANDRIA_HTTP_PORT` | default `8080`. |
 | `database.path` | config / `ALEXANDRIA_DATABASE_PATH` | SQLite file path; bundled beside the desktop app's data dir. |
-| `filesystem.root` | config / `ALEXANDRIA_FILESYSTEM_ROOT` | the library root, in two roles. The health check probes it for reachability (IR-03 / UC-37), and it **bounds what the catalog can reach** (FR-FC-26): adding a library (UC-51) and indexing one (UC-01) reject a folder that is neither it nor a descendant of it, correcting a library's root (UC-51) rejects a folder outside it (a folder that does not exist yet is judged by its nearest existing ancestor, so an unplugged drive mounted inside the root is still accepted), and streaming, comic pages, thumbnails, text reads and edits, renames, and purge-on-disk refuse a cataloged file whose path resolves outside it. Empty — the default — turns both roles off: the probe reports the filesystem unreachable, and nothing is bounded, so any absolute folder a caller supplies can be added as a library and a library can be corrected to any folder. Startup logs a warning while it is unset. Setting it on an installation whose libraries lie elsewhere leaves their files refused until those libraries are removed and their folders added under the root. UC-02 takes no root and is unaffected either way. |
+| `filesystem.root` | config / `ALEXANDRIA_FILESYSTEM_ROOT` | the library root. It **bounds what the catalog can reach** (FR-FC-26): adding a library (UC-51) and indexing one (UC-01) reject a folder that is neither it nor a descendant of it, correcting a library's root (UC-51) rejects a folder outside it (a folder that does not exist yet is judged by its nearest existing ancestor, so an unplugged drive mounted inside the root is still accepted), and streaming, comic pages, thumbnails, text reads and edits, renames, and purge-on-disk refuse a cataloged file whose path resolves outside it. Empty — the default — turns the bound off: nothing is bounded, so any absolute folder a caller supplies can be added as a library and a library can be corrected to any folder. Initialization logs a warning while it is unset. Setting it on an installation whose libraries lie elsewhere leaves their files refused until those libraries are removed and their folders added under the root. UC-02 takes no root and is unaffected either way. |
 | `indexing.concurrency` | config / `ALEXANDRIA_INDEXING_CONCURRENCY` | how many files a `normal`-priority UC-01 index or UC-02 re-index walk processes at a time (FR-FC-08, FR-FC-31); default `4`, `0` is treated as `1`. The filesystem half runs on the blocking pool, so this is real parallelism; the DB half still serializes behind SQLite's single writer and the 8-connection pool, so values far above that buy nothing. |
 | `indexing.low_priority_concurrency` | config / `ALEXANDRIA_INDEXING_LOW_PRIORITY_CONCURRENCY` | the same width for a run started — or resumed (FR-FC-33) — at `low` priority (FR-FC-31); default `1`, `0` is treated as `1`. A low-priority scan is meant to stay out of the way of browsing and playback rather than to finish fast, which is why the default is sequential. |
 | `deletion.retention_days` | config / `ALEXANDRIA_DELETION_RETENTION_DAYS` | soft-delete retention window; default `30` (NFR-10). |
 | `logging.level` | config / `ALEXANDRIA_LOGGING_LEVEL` | `error` / `warn` / `info` / `debug` / `trace`; default `info`. |
 | `playback.thumbnail_cache_dir` | config / `ALEXANDRIA_PLAYBACK_THUMBNAIL_CACHE_DIR` | directory holding thumbnails generated by UC-40, created on first use; default `thumbnails`. Entries are keyed by the file's UUID, its recorded modification time, and the target dimension (UC-40), so a re-index that picks up a new modification time invalidates that file's thumbnail for free; nothing evicts old entries. |
 
-**Secrets:** local-login credentials live only in the SQLite credential row
-(never in config or env), and the password is held there only as a one-way
-salted Argon2 hash — the row cannot be reversed back to the plaintext. In
-external mode, Alexandria verifies Heimdall's ES256 tokens against the public
-keys Heimdall publishes, fetched from `auth.heimdall_jwks_url` and cached —
-there is no shared signing secret to hold. During the move off HS256 it also
-accepts tokens signed with the old secret in `auth.heimdall_token_secret`
-(and `auth.heimdall_token_secret_previous`), until that secret is removed.
-
-#### Registering Alexandria with Heimdall (external mode)
-
-1. In Heimdall, as a Scope Admin who owns the scope, `POST /api/scopes/{scopeId}/applications` with Alexandria's name. This records the relationship; it issues no credential, and Alexandria needs none.
-2. Point `ALEXANDRIA_AUTH_HEIMDALL_JWKS_URL` at Heimdall's key set — inside the platform, `http://heimdall-api.<env>:8080/.well-known/jwks.json` — and put the scope's UUID in `ALEXANDRIA_AUTH_HEIMDALL_SCOPE_ID`.
-3. Smoke-check the pair: log in to Heimdall as a person in that scope (`POST /api/auth/login`, completing two-factor if enabled) and call any authenticated Alexandria endpoint with the returned token. A `200` confirms the key set is reachable and the claim names match; a `401` means one of them does not.
-4. Key rotation needs nothing here: Heimdall publishes the new key beside the old one, and the first token naming it makes Alexandria fetch the set again (at most once a minute).
-5. While Heimdall still accepts HS256 tokens, also copy its `HEIMDALL_AUTH_TOKEN_SECRET` into `ALEXANDRIA_AUTH_HEIMDALL_TOKEN_SECRET` so those tokens keep working. When Heimdall removes the secret, unset it here too, and restart.
-
-#### Recovery codes (local mode)
-
-Registration returns ten single-use recovery codes. They are shown once and
-stored only as hashes, so there is no way to recover them afterwards — an
-owner who loses both their password and their codes has no route back into
-the catalog short of editing the database by hand.
-
-Redeeming a code sets a new password and signs every session out. An owner who
-is running low regenerates from `POST /v1/auth/local/recovery/regenerate`,
-which invalidates the whole previous set, used codes and unused alike.
-
-An account created before this feature holds no codes:
-`GET /v1/auth/local/account` reports `recoveryCodesRemaining: 0`. Its owner
-should log in and regenerate while they still know their password.
-
-#### The Windows account mode
-
-`auth.mode = "windows"` makes the Windows account the server process runs as the
-credential. Nothing is typed and nothing is stored: the owner's Windows sign-in
-is the authentication, and `POST /v1/auth/windows/login` exchanges it for a
-session.
-
-Be clear about what this proves before enabling it. It proves the **process was
-launched by the configured account** — it does not identify the caller. Once the
-process is running, any caller that can reach the port is the owner. The security
-boundary in this mode is the loopback bind (IR-03), not the credential, and
-startup warns when `http.bind_addr` is anything else.
-
-Startup fails, rather than warns, when the SID is unset, when the platform is not
-Windows, or when the process runs as a different account — the last naming both
-SIDs, since a mismatch is yours to diagnose and neither value is a secret.
-
-In this mode there is no local account: registration, credential changes, and
-recovery-code redemption and regeneration all refuse, exactly as they do in
-external mode.
+**Secrets:** the core holds none. Authentication is removed (the core only
+runs locally for the person at the machine), and with it the local-login
+credential, the sessions, the recovery codes and every Heimdall and Windows
+setting. Migration 30 deletes what an older catalog stored. The `[auth]` and
+`[http]` sections are gone from the table above: a `config.toml` that still
+holds them loads, and they are ignored, as are the `ALEXANDRIA_AUTH_*` and
+`ALEXANDRIA_HTTP_*` environment variables.
 
 ---
 
@@ -257,11 +190,11 @@ Logging uses structured, span-aware logs via `tracing` / `tracing-subscriber`
 | Log format | structured (JSON to file; human-readable to console in dev) |
 | Destination | console in development; rotating log file in the desktop app's data directory |
 | Span fields | `use_case`, `request_id`, `file_uuid`, `operation` on relevant spans |
-| Never logged | plaintext passwords, password hashes, JWT contents, full credential values, file contents |
+| Never logged | file contents |
 
 A log line is emitted for indexing progress (files indexed, skipped, already
-cataloged, failed) and for every catalog write at `info`; validation and auth
-denials are `warn`; disk and integrity failures are `error`. Startup logs how
+cataloged, failed) and for every catalog write at `info`; validation denials
+are `warn`; disk and integrity failures are `error`. Initialization logs how
 many runs it found still marked `running` and recorded `paused` for resume
 (FR-FC-29), so an operator can see that a previous process stopped mid-scan.
 
@@ -269,55 +202,16 @@ many runs it found still marked `running` and recorded `paused` for resume
 
 ## 5. Health & Monitoring Endpoints
 
-### 5.1 Endpoints
+**Removed (the core only runs locally for the person at the machine)**
 
-| Endpoint | Purpose | Authorization |
-| --- | --- | --- |
-| GET /health | liveness + readiness: indicates the HTTP server is up and the SQLite database + filesystem root are reachable | public (liveness only) |
-
-### 5.2 Response Contract
-
-```json
-{
-  "status": "ok",
-  "database": "reachable",
-  "filesystem": "reachable",
-  "authMode": "external"
-}
-```
-
-`status` is `ok` when both the database and the configured filesystem root are
-reachable; otherwise `degraded`. The response leaks no credentials or token
-material.
+There is no server to probe. The client loads the core in process, and
+`alexandria_index_init` reports a database it cannot open or migrate.
+`alexandria_health_status_code()` still answers `200` once the library is
+loaded; it probes nothing.
 
 ### 5.3 Use Case — UC-37: Health check
 
-| Field | Value |
-| --- | --- |
-| **ID** | UC-37 |
-| **Name** | Health check |
-| **Actors** | Client (local monitor or desktop front-end) |
-| **Description** | Report liveness and reachability of the database and filesystem. |
-| **Preconditions** | The HTTP server is running. |
-| **Postconditions** | The caller receives the health status. |
-| **Requirements** | IR-03, IR-04, IR-05 |
-
-**Main Flow**
-
-1. The caller requests `GET /health`.
-2. The system probes the SQLite database and the configured filesystem root.
-3. The system returns the health contract above with the active auth mode.
-
-**Alternative Flows**
-
-| ID | Condition | Outcome |
-| --- | --- | --- |
-| AF-01 | The database is unreachable | The system returns `status: degraded` with `database: unreachable`. |
-| AF-02 | The filesystem root is unreachable | The system returns `status: degraded` with `filesystem: unreachable`. |
-
-Continues the use case numbering from the
-[Use Case Specification Document](Use%20Case%20Specification%20Document.md)
-(UC-01 … UC-36).
+**Withdrawn (the core only runs locally for the person at the machine)**
 
 ---
 
@@ -325,28 +219,25 @@ Continues the use case numbering from the
 
 | Environment | Purpose | Differences |
 | --- | --- | --- |
-| **Local** | single-user desktop use; the API runs bundled with the Flutter app | loopback bind, SQLite file in the app's data dir, migrations run at startup |
-| **Test** | automated tests | in-memory or temp-file SQLite, temp filesystem root, fake auth service, fixed clock |
+| **Local** | single-user desktop use; the Flutter app loads the core in process | SQLite file in the app's data dir, migrations run at initialization |
+| **Test** | automated tests | in-memory or temp-file SQLite, temp filesystem root, fixed clock |
 
 There is no staging or multi-instance production environment; Alexandria is a
-single-user, single-process desktop deployment. If the FFI surface is used
-in-process, the HTTP crate is optional at runtime (the core library is the
-shared dependency either way).
+single-user, single-process desktop deployment.
 
 ---
 
 ## 7. Build & Delivery
 
-- **Build:** `cargo build --workspace` produces the HTTP server binary and the
-  FFI dynamic library; `cbindgen` generates the C header consumed by Flutter.
+- **Build:** `cargo build --workspace` produces the FFI dynamic library;
+  `cbindgen` generates the C header consumed by Flutter.
 - **Tests:** `cargo test` (see the
   [Testing Specification Document](Testing%20Specification%20Document.md)).
 - **Packaging:** this repository publishes no packages of its own. The FFI
   library travels inside the desktop application's packages, which
   [alexandria-ui](https://github.com/artur-rios/alexandria-ui)'s release
-  workflow builds from a pinned commit of this repository (its `CORE_REF`); the
-  HTTP binary is not packaged and is built from source (`cargo build --release
-  -p alexandria-http`). In the desktop application the SQLite database file
+  workflow builds from a pinned commit of this repository (its `CORE_REF`). In
+  the desktop application the SQLite database file
   lives in its per-user application-support directory. Installer formats and
   bundling are documented in that repository.
 - **Releases:** a release is the tag `vx.y.z` on the merge commit of a
@@ -360,9 +251,9 @@ shared dependency either way).
 
 | Platform capability | Requirements |
 | --- | --- |
-| Three-crate workspace with shared core | IR-01, IR-04 |
+| Two-crate workspace: the core and its C ABI | IR-01, IR-04 |
 | Memory safety | IR-02 |
-| Loopback HTTP binding | IR-03 |
+| Loopback HTTP binding | **Removed (the core only runs locally for the person at the machine)** |
 | Startup migrations | IR-05 |
 | FFI header generation | IR-06 |
-| Health endpoint | IR-03, IR-04, IR-05 (UC-37) |
+| Health endpoint | **Removed (the core only runs locally for the person at the machine)** (UC-37 withdrawn) |

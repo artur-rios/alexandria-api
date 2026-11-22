@@ -36,67 +36,56 @@ because they are the ones with real machinery behind them: **indexing** (§5) an
 
 ## 2. Shape of the system
 
-Three crates. One core library holds every decision; two transport layers carry
-it to callers and hold none of their own.
+Two crates. One core library holds every decision; a thin C ABI carries it to
+the one caller and holds none of its own.
 
 ```mermaid
 graph TD
-    subgraph clients["Callers"]
+    subgraph clients["Caller"]
         FL["Flutter desktop front-end"]
-        OT["Any HTTP client"]
     end
 
     subgraph api["alexandria-api"]
-        HTTP["alexandria-http<br/>axum, REST/JSON"]
         FFI["alexandria-ffi<br/>C ABI, cbindgen"]
-        CORE["alexandria-core<br/>commands · queries · repositories · auth"]
+        CORE["alexandria-core<br/>commands · queries · repositories"]
     end
 
     subgraph infra["Outside the process"]
-        DB[("SQLite<br/>catalog · sessions · credentials · runs")]
+        DB[("SQLite<br/>catalog · runs")]
         FS["Local filesystem<br/>the library"]
-        HD["Heimdall<br/>identity API, external mode only"]
     end
 
     FL -->|"in process, C ABI"| FFI
-    FL -.->|"or over the network"| HTTP
-    OT --> HTTP
-    HTTP --> CORE
     FFI --> CORE
     CORE --> DB
     CORE -->|"walk · stat · rename · read · write"| FS
-    CORE -->|"verify JWT signature and scope"| HD
 ```
 
-The desktop application uses the FFI path: one process, no network hop, no
-second thing to install. The HTTP server is for any other client and has no
-packaged release.
+The desktop application loads the core in process: one process, no network
+hop, no second thing to install. There is no server and no login. The core only
+runs locally, for the person at the machine, so the HTTP server and the
+authentication it guarded are removed (`FR-FC-24`, `NFR-09` and every `FR-AU`
+requirement).
 
 ### 2.1 Why both surfaces answer alike
 
-`FR-FC-24`, `FR-AU-08`, and `NFR-09` require the two surfaces to return
-identical results. That holds because neither surface contains a decision:
+**Removed (the core only runs locally for the person at the machine)**
 
-- Every operation is a **handler** in `alexandria-core`, generic over its
-  collaborators (auth service, repositories, filesystem, clock).
-- `alexandria-http` maps a request onto a handler call and a `DomainError` onto
-  a status code. `alexandria-ffi` maps a C call onto the same handler and the
-  same `DomainError` onto an integer.
-- The error **body** is built by the core's own `error_body`, not by either
-  transport, so the failure path is shared code rather than two `match` arms
-  kept in step by hand.
+There is one surface. Every operation is still a **handler** in
+`alexandria-core`, generic over its collaborators (repositories, filesystem,
+clock), and `alexandria-ffi` maps a C call onto that handler and a
+`DomainError` onto the call family's integer code. The FFI holds no decision of
+its own.
 
-A `parity` test suite asserts this operation by operation.
-
-The single exception is byte transfer (`FR-MP-06`): the C ABI cannot carry a
-stream, so `alexandria_file_playback_source` returns a descriptor and the client
-opens the file itself. See §6.4.
+Byte transfer is the one thing the C ABI cannot do (`FR-MP-06`):
+`alexandria_file_playback_source` returns a descriptor and the client opens the
+file itself. See §6.4.
 
 ---
 
 ## 3. Startup
 
-Both surfaces run the same sequence before serving anything.
+`alexandria_index_init` runs this sequence before the core answers anything else.
 
 ```mermaid
 sequenceDiagram
@@ -105,7 +94,6 @@ sequenceDiagram
     participant C as Configuration
     participant DB as SQLite
     participant R as catalog_runs
-    participant A as Auth mode
 
     P->>C: read ALEXANDRIA_CONFIG (default config.toml)
     C-->>P: settings
@@ -115,29 +103,26 @@ sequenceDiagram
     P->>R: pause_running(now)
     R-->>P: n runs reconciled
     Note over R: FR-FC-29 — a `running` row has no process behind it
-    P->>A: select exactly one mode from configuration
-    Note over A: FR-AU-01 / FR-AU-03
-    A-->>P: ready
-    P->>P: bind / return handle
+    P->>P: return INDEX_OK
 ```
 
 ### 3.1 Configuration
 
 Read once from `config.toml`, then overridden per key from the environment. The
-naming rule is `ALEXANDRIA_<SECTION>_<KEY>` — `ALEXANDRIA_HTTP_PORT`,
-`ALEXANDRIA_AUTH_MODE`, `ALEXANDRIA_LOGGING_LEVEL` — and every key follows it,
-with no exceptions.
+naming rule is `ALEXANDRIA_<SECTION>_<KEY>` — `ALEXANDRIA_DATABASE_PATH`,
+`ALEXANDRIA_LOGGING_LEVEL` — and every key follows it, with no exceptions.
 
-Unknown keys are ignored, so a stale key left in a config file is inert rather
-than fatal. Every key is listed in
+Unknown keys and tables are ignored, so a stale key left in a config file — or
+the `[auth]` and `[http]` tables an older core read — is inert rather than
+fatal. Every key is listed in
 [`config.toml.example`](../config.toml.example).
 
 ### 3.2 Migrations
 
-Applied by both the server and `alexandria_index_init` before any request is
-served (`IR-05`). While the project is pre-release the two baseline migrations
+Applied by `alexandria_index_init` before the core answers any other call
+(`IR-05`). While the project is pre-release the two baseline migrations
 are **amended in place** rather than corrected by a new migration, so an
-existing database can fail startup with:
+existing database can fail initialization with:
 
 ```
 database migration error: migration 1 was previously applied but has been modified
@@ -156,60 +141,45 @@ reconciled on the next boot.
 
 ---
 
-## 4. Every request
+## 4. Every call
 
 ### 4.1 The authorization gate
 
-`/health` is open. Every `/v1` route sits behind a `route_layer` that runs
-**before the matched route's extractors**, so an unauthenticated caller is
-rejected without its path or body ever being parsed (`FR-AU-07`). Without that
-ordering a malformed body would answer `400` to a caller holding no credentials
-at all, telling it something about the request it was not entitled to learn.
+**Removed (the core only runs locally for the person at the machine)**
 
-Handlers still authenticate themselves. The layer is the transport gate; the
-domain check stays inside the handler where it is unit-testable.
-
-Four auth endpoints are deliberately outside the gate, because a caller has no
-credentials yet by definition: `register`, `local/login`, `windows/login`, and
-`recovery/redeem` — the presented code *is* the credential. `credentials`,
-`account`, and `recovery/regenerate` are routed outside it but authenticate in
-their own handlers.
+There is no gate. Every call acts: a handler that once checked a session or a
+token before acting simply acts. No call takes a `token`.
 
 ### 4.2 Credential extraction
 
-`Authorization: Bearer <token>`, prefix matched case-insensitively. A missing or
-malformed header yields an empty token, which every auth service rejects as
-`Unauthorized` — never a distinct "header malformed" answer.
+**Removed (the core only runs locally for the person at the machine)**
 
 ### 4.3 The error model
 
-One `DomainError` per failure, mapped to a class, then to a transport code.
+One `DomainError` per failure, mapped to the calling family's integer code.
+On a failure the result's `json` is NULL: there is no error body.
 
-| `DomainError` | Class | HTTP | Meaning |
-| --- | --- | :---: | --- |
-| `NotFound` | NotFound | 404 | No entity by that id |
-| `Unauthorized` | Unauthorized | 401 | Absent, expired, or rejected credential |
-| `InvalidInput` | BadRequest | 400 | Input the domain refuses |
-| `Rejected` | BadRequest | 400 | Same, plus a stable machine-readable reason code (`FR-AU-12`) |
-| `InvalidState` | Conflict | 409 | Illegal transition for the entity's current state |
-| `Conflict` | Conflict | 409 | Collides with state that already exists |
-| `Disk` | Internal | 500 | A filesystem operation failed; nothing was committed |
-| `Integrity` | Internal | 500 | A write's post-write verification failed |
-| `ServiceUnavailable` | ServiceUnavailable | 503 | A dependency could not be reached |
+| `DomainError` | FFI code | Meaning |
+| --- | --- | --- |
+| `NotFound` | `*_ERR_NOT_FOUND` | No entity by that id |
+| `InvalidInput` | `*_ERR_INVALID_INPUT` (1) | Input the domain refuses, or an argument that does not parse |
+| `InvalidState` | `*_ERR_INVALID_STATE` | Illegal transition for the entity's current state |
+| `Conflict` | `*_ERR_CONFLICT` (index, library) | Collides with state that already exists |
+| `Disk` | `*_ERR_DISK` (file, playback) | A filesystem operation failed; nothing was committed |
+| `Integrity` | `*_ERR_INTEGRITY` (file) | A write's post-write verification failed |
+| any other | `*_ERR_OTHER` | A database, migration, configuration or internal failure, or a panic caught at the boundary |
 
-An extractor rejection is folded into `Rejected("malformed_body")` so it answers
-`400` with the project's `{"error": …}` envelope rather than axum's bare-text
-`422`.
-
-`Rejected` exists so a client can distinguish the individual rejections and
-render each in its own language without parsing English (`FR-AU-12`).
+A call made before `alexandria_index_init` answers `*_ERR_NOT_INITIALIZED` (3).
+A family without a code for a variant answers `*_ERR_OTHER`. Code 2 was
+`*_ERR_UNAUTHORIZED` and is retired in every family, never reused, so a client
+built against an older core cannot read a new failure as it.
 
 ---
 
 ## 5. Indexing
 
 The largest subsystem, and the one whose behavior is least guessable from the
-API surface.
+FFI calls.
 
 ### 5.1 What a scan costs, and why
 
@@ -298,14 +268,13 @@ A scan takes minutes. The call that begins one returns in milliseconds.
 sequenceDiagram
     autonumber
     participant CL as Client
-    participant T as Transport
+    participant T as FFI
     participant H as IndexHandler
     participant R as catalog_runs
     participant W as Walk task
 
-    CL->>T: POST /v1/libraries {name, rootPath, priority}
-    T->>H: register → start(library, token)
-    H->>H: authenticate
+    CL->>T: alexandria_library_register({name, rootPath, priority})
+    T->>H: register → start(library)
     H->>H: folder inside filesystem.root? (FR-FC-26)
     H->>H: overlaps no library?
     H->>R: insert library
@@ -314,17 +283,17 @@ sequenceDiagram
     Note over R: FR-FC-27 — the run opens only after<br/>validation; a run that cannot open<br/>removes the library again
     H-->>T: library + run id
     T->>W: spawn execute(root, run_id, library)
-    T-->>CL: 201 Created {…library, runId}
+    T-->>CL: LIBRARY_OK {…library, runId}
     W->>W: walk, classify, stat, persist
 ```
 
-Re-indexing a library (`POST /v1/libraries/{uuid}/index`) takes the same path
+Re-indexing a library (`alexandria_library_index_start`) takes the same path
 from "insert run" on, after refusing a library that already has a `running` or
-`paused` run (`FR-FC-43`), and answers `202 Accepted {runId}`. A library's folder
+`paused` run (`FR-FC-43`), and answers `INDEX_OK` with the run id. A library's folder
 is the only root ever walked: there is no indexing a folder that is not a
 library.
 
-Validation happens before the run opens, so a rejected request never leaves a
+Validation happens before the run opens, so a rejected call never leaves a
 run record behind. The run id is handed back only once a record exists to query — the one
 write in this handler whose failure is *not* swallowed, because a caller must
 never receive an id it can never look up.
@@ -359,7 +328,7 @@ not plugged in — so the path is not required to exist. It is resolved through
 its **longest existing ancestor**, which is canonicalized, and the remaining
 segments are normalised lexically (`..` pops, `.` drops). Nothing below a
 missing folder can be a symbolic link, so that is exact. A segment that exists
-but cannot be resolved — a dangling symbolic link, a folder the server may not
+but cannot be resolved — a dangling symbolic link, a folder the core may not
 look into, a link loop — makes the whole path count as outside.
 
 Two distinct rejections, deliberately:
@@ -368,7 +337,7 @@ Two distinct rejections, deliberately:
 | --- | --- |
 | The requested root — to index, or to correct a library to — is genuinely outside | `root path is outside the configured library root` |
 | A cataloged file to serve or change resolves outside | `file is outside the configured library root` |
-| The server's own `filesystem.root` cannot be resolved | `the server's configured library root could not be resolved; contact the operator` |
+| The configured `filesystem.root` itself cannot be resolved | `the server's configured library root could not be resolved; contact the operator` |
 
 The last is a misconfiguration, not a caller error, and every bounded operation is **refused**
 rather than degraded to unconstrained. A security bound that disappears when its
@@ -446,9 +415,8 @@ configuration into a width:
 
 Zero is clamped to 1 for both — a stream buffered zero deep makes no progress.
 
-An absent or unrecognised priority is **`normal`**, on both surfaces, rather than
-a rejected call. The HTTP deserializer and the FFI parser agree byte for byte,
-including on values that are not strings at all.
+An absent or unrecognised priority is **`normal`** rather than a rejected call,
+including a value that is not a string at all.
 
 The width is read from **the run's own row**, not from a field on the handler.
 `IndexHandler` is built once at startup and serves both fresh and resumed runs,
@@ -516,13 +484,12 @@ sequenceDiagram
     participant W as Walk
     participant R as catalog_runs
 
-    CL->>RC: POST /v1/index/runs/{id}/pause
-    RC->>RC: authenticate (before the lookup)
+    CL->>RC: alexandria_index_pause(run_id)
     RC->>R: get(run_id)
     R-->>RC: status
     RC->>RC: does this status permit pause?
     RC->>REG: cell.raise(Pause)
-    RC-->>CL: 202 Accepted
+    RC-->>CL: RUN_OK
     Note over W: the in-flight window drains —<br/>milliseconds, since per-file work is<br/>a stat and a metadata read
     W->>W: read the signal once, after draining
     W->>R: flush the final progress
@@ -534,10 +501,6 @@ Why a signal rather than an abort: the walk owns a tally and a row, and dropping
 it mid-flight would leave both half-written. Draining costs milliseconds and buys
 a run that records its stopping point exactly once, in the same place it would
 have recorded its completion.
-
-**Authentication runs ahead of the lookup.** Everything after it discloses
-whether the run exists and what state it is in; a caller with a bad token must
-learn neither.
 
 Which transitions each verb permits:
 
@@ -560,7 +523,7 @@ the run has already stopped, so the only question is what it may become, and
 
 #### What a resume does
 
-`resume` records the state change and returns; it spawns nothing. The transport
+`resume` records the state change and returns; it spawns nothing. The FFI
 layer owns the runtime, and a handler that spawned would force `Send + 'static`
 onto collaborators with no other reason to carry it.
 
@@ -664,8 +627,8 @@ Two queries, one overlay.
 
 | Call | Answers |
 | --- | --- |
-| `GET /v1/index/runs/{runId}` | one run (`FR-FC-28`) |
-| `GET /v1/index/runs` | every **outstanding** run — `running` or `paused` — newest first (`FR-FC-35`) |
+| `alexandria_index_run_status_json(run_id)` | one run (`FR-FC-28`) |
+| `alexandria_index_runs_active_json()` | every **outstanding** run — `running` or `paused` — newest first (`FR-FC-35`) |
 
 Both overlay the live cell onto the stored row through the same code. A run this
 process is no longer executing still reports its last flushed progress, so a run
@@ -761,6 +724,42 @@ Upgrading to this model (migration 28) deleted every row outside a library and
 the index runs over roots no library holds, and rebuilt `files` with the
 library required and `audio` back in its type CHECK.
 
+### 5.15 Library names, flags and totals
+
+A library's **name** is the owner's label, not derived from its folder.
+`alexandria_library_rename` checks it by the rule adding uses — a blank name is
+invalid input and stores nothing — and stores it trimmed (`FR-FC-46`). It is
+allowed at any time, a run in progress or paused included: no run reads the
+name, so the rename takes no run lock and consults no run. Two libraries may
+share a name.
+
+Each library carries two flags, **`pinned`** and **`favorite`**, both off when
+it is added and on every library migration 30 found (`FR-FC-44`, `FR-FC-45`).
+`alexandria_library_set_pinned` and `alexandria_library_set_favorite` set one
+each and answer a bare status code: `LIBRARY_OK`, `LIBRARY_ERR_INVALID_INPUT`
+for a malformed uuid, `LIBRARY_ERR_NOT_INITIALIZED`, or
+`LIBRARY_ERR_NOT_FOUND`. Setting the value a library already has succeeds and
+changes nothing. Every library JSON — the listing, a browse, register, rename —
+carries both. A correction of the root, a rename and a re-index keep them; a
+removal deletes them with the row. The core puts no order on the listing:
+pinned-first is the client's presentation.
+
+**`alexandria_catalog_stats_json()`** answers the catalog's totals in one call
+(`FR-FC-47`):
+
+```json
+{"libraries": 3,
+ "filesByType": {"audio": 120, "video": 40, "html": 0, "text": 12,
+                 "document": 30, "comic": 8, "image": 500}}
+```
+
+It counts libraries, and files grouped by type over `state = 'active'` — what
+the default file listing shows. A file marked missing on disk is still
+`active`, so it counts; a soft-deleted file does not. Every one of the seven
+types is present, `0` when the catalog holds none, so a client never has to
+tell "none" from "missing". It answers `LIBRARY_ERR_NOT_INITIALIZED` before
+`alexandria_index_init` and `LIBRARY_ERR_OTHER` when the query fails.
+
 ---
 
 ## 6. Playback
@@ -769,105 +768,48 @@ Three operations, one resolution path, one MIME table.
 
 ### 6.1 Resolving a playable file
 
-Every playback call resolves and guards **before any byte is written**, so a
-failure is always a clean error envelope and never a truncated `200`.
+Every playback call resolves and guards **before it answers anything**, so a
+failure is always a status code and never a half-built answer.
 
 ```mermaid
 flowchart TD
-    A["uuid + token"] --> B["authenticate"]
-    B --> C{"record exists?"}
-    C -->|"no"| N["404 NotFound"]
+    A["uuid"] --> C{"record exists?"}
+    C -->|"no"| N["NotFound"]
     C -->|"yes"| D{"state is active?"}
-    D -->|"deleted"| CF["409 Conflict — restore first"]
+    D -->|"deleted"| CF["InvalidState — restore first"]
     D -->|"yes"| E{"stat succeeds?"}
-    E -->|"no"| DK["500 Disk"]
+    E -->|"no"| DK["Disk"]
     E -->|"yes"| F["PlaybackSource<br/>path · mimeType · sizeBytes"]
 ```
 
 The `stat` is load-bearing twice: it supplies `sizeBytes` for the FFI descriptor,
 and it turns a file that vanished without a re-index into a `Disk` error rather
-than letting the HTTP file server answer its own bare `404` and misreport the
-catalog.
+than handing the client a path that opens nothing.
 
 MIME comes from the **catalog's own extension table**, which mirrors the
 classification table exactly. An extension absent from it yields
-`application/octet-stream` rather than an error: the bytes are still perfectly
-streamable, and refusing to serve a file the catalog happily indexed would be
+`application/octet-stream` rather than an error: the file is still perfectly
+playable, and refusing to serve a file the catalog happily indexed would be
 inconsistent.
 
-### 6.2 Streaming — `GET /v1/files/{uuid}/stream`
+### 6.2 Streaming
 
-```mermaid
-sequenceDiagram
-    autonumber
-    participant PL as Player
-    participant H as alexandria-http
-    participant CO as PlaybackSourceHandler
-    participant SF as ServeFile
-    participant FS as Disk
+**Removed (the core only runs locally for the person at the machine)**
 
-    PL->>H: GET .../stream<br/>Authorization: Bearer …<br/>Range: bytes=1048576-2097151
-    H->>CO: resolve(uuid, token)
-    CO->>FS: stat
-    CO-->>H: path · mimeType · sizeBytes
-    H->>SF: oneshot(request)
-    SF->>FS: open, seek, read the range
-    SF-->>H: 206 with its own headers
-    H->>H: overwrite content-type from the catalog table
-    H->>H: add accept-ranges: bytes
-    H->>H: add x-content-type-options: nosniff
-    H-->>PL: 206 Partial Content
-```
-
-Byte ranges are handled by `tower-http`'s file service rather than parsed by this
-surface (`FR-MP-02`). The bytes are never re-encoded, transcoded, or modified in
-any way (`FR-MP-03`).
-
-Response shaping:
-
-| Status | Meaning | Playback headers stamped? |
-| :---: | --- | :---: |
-| 200 | whole file | yes |
-| 206 | a satisfied range | yes |
-| 416 | unsatisfiable range | **no** |
-| 304 | not modified | **no** |
-| 404 from the file service | the file vanished between the stat and the open | converted to a `Disk` 500 |
-
-A `416` or `304` is an answer about the *request*, carries no bytes from the file,
-and has no business claiming its content type.
-
-The `404` conversion closes a residual window. The core stats first, so a file
-already gone is a clean JSON error; but the file can still vanish between that
-stat and the open. The file service answers its own bare `404` — no body, nothing
-in this API's envelope — and stamping `content-type: video/mp4` onto it would
-hand the client a response that is neither a valid error nor valid video. It
-becomes the same `Disk` error the stat guard would have produced. (The same
-service answers `404` for `PermissionDenied`, which belongs in the same bucket:
-the bytes are there but unreadable.)
-
-**`accept-ranges: bytes` is advertised even on a full-file `200`**, so a player
-knows it may seek.
-
-#### `nosniff`
-
-These three routes are the API's only byte-serving surface, and what they serve
-includes `text/html`, `multipart/related`, and `image/svg+xml` straight from the
-library. A library HTML or SVG file containing a script, opened in a webview at
-its stream URL, would otherwise execute in the API's origin. Impact is bounded —
-authentication is a bearer header, so there is no cookie for such a script to
-steal — but the header also holds browsers to the catalog's MIME answer rather
-than letting them re-sniff the bytes.
+Byte-range streaming (`FR-MP-02`) went with the HTTP server. The client plays a
+file from the path the descriptor names (§6.4), and the bytes are never
+re-encoded, transcoded, or modified in any way (`FR-MP-03`).
 
 ### 6.3 Comic pages and thumbnails
 
-**`GET /v1/files/{uuid}/pages/{page}`** returns one page of a CBZ, 1-based
-(`FR-MP-04`), as the archive entry's **own bytes, undecoded**. Not a comic, not a
-CBZ, or a page out of range is a `400`.
+**`alexandria_comic_page(uuid, page)`** returns one page of a CBZ, 1-based
+(`FR-MP-04`), as the archive entry's **own bytes, undecoded**, base64 in the
+JSON answer. Not a comic, not a CBZ, or a page out of range is invalid input.
 
-**`GET /v1/files/{uuid}/thumbnail`** returns a downscaled JPEG for a video, image,
-comic, or audio File (`FR-MP-05`) — for audio, the front cover embedded in the
-file's tag. A type with no thumbnail, or an audio file with no cover, is a
-`400`. SVG is
+**`alexandria_file_thumbnail(uuid)`** returns a downscaled JPEG for a video,
+image, comic, or audio File (`FR-MP-05`), base64 in the JSON answer — for
+audio, the front cover embedded in the file's tag. A type with no thumbnail, or
+an audio file with no cover, is invalid input. SVG is
 rejected explicitly: it is vector, the raster decoder cannot read it, and
 rasterizing it would mean a new dependency.
 
@@ -885,9 +827,9 @@ returns a **playback descriptor** — resolved absolute path, MIME type, and byt
 size — and the client, which is local by construction, opens the file itself
 (`FR-MP-06`).
 
-Parity for streaming is defined on that descriptor and on the authorization,
-state, and error decisions, not on byte transfer. Comic pages and thumbnails
-return their bytes over **both** surfaces and are byte-exact across them.
+No byte of the file itself crosses the boundary. Comic pages and thumbnails
+are bounded and have no path of their own, so their bytes travel in the
+answer.
 
 ---
 
@@ -923,9 +865,10 @@ stateDiagram-v2
 | Purge record | removed, with its subtype row | **untouched** | yes — `deletion.retention_days` |
 | Purge on disk | removed, with its subtype row | **deleted** | no |
 
-All four are `DELETE /v1/files/{uuid}`, discriminated by query string:
-`?purge=true`, `?purge-on-disk=true`, or neither. Setting both is a `400` — they
-are distinct operations and the caller must pick one.
+Each is a call of its own — `alexandria_file_soft_delete`,
+`alexandria_file_restore`, `alexandria_file_purge` and
+`alexandria_file_purge_on_disk` — so the caller always names which one it
+means.
 
 Purge-on-disk has no retention gate: an `active` record is purgeable too. When no
 on-disk file was there to delete it still succeeds, reporting
@@ -934,110 +877,26 @@ on-disk file was there to delete it still succeeds, reporting
 ### 7.1 One partial failure worth knowing about
 
 On the purge-on-disk path, if the on-disk delete succeeds but the catalog write
-then fails, the response is the generic `{"error": "database error"}` — which is
+then fails, the call answers the generic `FILE_ERR_OTHER` — which is
 **indistinguishable from "nothing happened"**, even though the file is already
 gone.
 
 A client must not read it as such. Retrying the same call is safe and is the
 intended recovery: the second attempt finds no on-disk file, removes the
-now-orphaned row, and returns `200` with `diskFilePresent: false`.
+now-orphaned row, and answers `FILE_OK` with `diskFilePresent: false`.
 
 ---
 
 ## 8. Authentication
 
-Exactly one mode is active, chosen at startup (`FR-AU-01`, `FR-AU-03`).
-Credentials presented for an inactive mode are rejected.
+**Removed (the core only runs locally for the person at the machine)**
 
-| Mode | Credential | Who verifies | Bearer token |
-| --- | --- | --- | --- |
-| `external` | a Heimdall JWT | Alexandria verifies signature and scope | the JWT itself |
-| `local` | email + password | Alexandria, against an Argon2 hash | a session id |
-| `windows` | the OS account the process runs as | the OS | a session id |
-
-### 8.1 External mode
-
-The client logs in against [Heimdall](https://github.com/artur-rios/heimdall-api)
-directly — completing two-factor there if asked — and presents the resulting JWT.
-Alexandria verifies the ES256 signature against the key the token's `kid` names
-in Heimdall's published key set (`/.well-known/jwks.json`), and accepts the
-caller as the owner only when the token names the configured scope, as the
-holder's scope or as one they own.
-
-The key set is fetched when first needed and cached, so a verification costs no
-network call. It is fetched again when a token names a key not yet seen — how a
-rotation on the Heimdall side arrives — or when the cached set is five minutes
-old, so a withdrawn key stops verifying; either at most once a minute, and a
-failed fetch keeps the keys already known. The algorithm is pinned: an ES256
-token verifies only against a published EC key, and nothing in a token's header
-can make a public key serve as an HMAC secret.
-
-While Heimdall still accepts the HS256 tokens it signed with its old shared
-secret, Alexandria accepts them too, as long as that secret (and, mid-rotation,
-the previous one) is configured; removing it refuses them. Issuer and audience
-are each checked only when configured, because Heimdall signs tokens carrying
-neither by default.
-
-Alexandria never sees a password, proxies no login, and gains no endpoints of its
-own. Everyone Heimdall places in the scope acts as the same single owner:
-Alexandria keeps no per-person state and honours none of Heimdall's roles.
-
-### 8.2 Local mode
-
-```mermaid
-sequenceDiagram
-    autonumber
-    participant O as Owner
-    participant A as Alexandria
-
-    O->>A: POST /v1/auth/local/register<br/>{email, password, passwordConfirmation}
-    Note over A: succeeds exactly once (FR-AU-10)
-    A-->>O: sessionId + ten recovery codes
-    Note over O: the codes are shown once and never again
-
-    O->>A: POST /v1/auth/local/login {email, password}
-    A-->>O: sessionId
-    O->>A: any /v1 call, Authorization: Bearer <sessionId>
-
-    O->>A: POST /v1/auth/local/recovery/redeem<br/>{code, newPassword}
-    A-->>O: the code is consumed, every session invalidated
-```
-
-Sessions expire after `auth.session_ttl_hours` (default 24). An unknown or
-expired session id is `Unauthorized` (`FR-AU-09`).
-
-Passwords are rejected (`FR-AU-11`) when shorter than 12 characters, longer than
-128, entirely whitespace, a single repeated character, equal to or containing the
-submitted email, or on a common-password list. Each rejection carries a distinct
-machine-readable reason code so a client can render it in its own language
-(`FR-AU-12`).
-
-**Recovery codes.** Ten, minted at registration, returned exactly once; only
-their hashes are stored (`FR-AU-13`, `FR-AU-19`). Redeeming one replaces the
-password, consumes that code, and invalidates every existing session. A rejected
-code is reported in a way that distinguishes *unrecognised* from *already
-consumed*, and a redemption that fails for any other reason does **not** consume
-the code. An authenticated owner can regenerate the full set, which invalidates
-the old ones, and can ask how many remain.
-
-There is **no mail of any kind**. The address is a login identifier and nothing
-else.
-
-### 8.3 Windows mode
-
-The credential is the OS account the process runs as. Startup **fails** unless
-the process is running on Windows as the account named by
-`auth.windows_owner_sid` (`FR-AU-21`). `POST /v1/auth/windows/login` takes no
-body and returns a session id with the same TTL local mode uses.
-
-Read what this proves before enabling it: **it proves the process was launched by
-that account, never who is calling.** Any caller that can reach the port is
-authorized. Startup only *warns* when `http.bind_addr` is not loopback
-(`FR-AU-24`) — it does not refuse — so keeping the bind address on loopback is
-the operator's responsibility.
-
-Every local-mode credential and recovery operation is refused in this mode, since
-no credential is stored (`FR-AU-23`).
+The three modes — the local account with its recovery codes, Heimdall JWTs, and
+the Windows account — are gone, and so is the Windows owner check
+`alexandria_index_init` used to make. Migration 30 drops the credential,
+session and recovery-code tables, deleting what an older catalog stored, and
+leaves every other table as it was. A `config.toml` that still holds an
+`[auth]` table loads; the table is ignored.
 
 ---
 
@@ -1057,8 +916,10 @@ A summary of decisions a reader is most likely to assume the other way.
 | Cancelling a run that already finished succeeds | It is refused as a conflict |
 | Purging a record deletes the file | It does not. Only purge-on-disk touches the disk |
 | `filesystem.root` being unset is safe by default | It disables the bound entirely — on indexing, library corrections, and file access |
-| Windows mode authenticates the caller | It authenticates the *process*; anyone reaching the port is the owner |
 | The FFI surface can stream bytes | It returns a path descriptor instead |
+| The core lists pinned libraries first | It puts no order on the listing; it reports `pinned` and `favorite`, and the order is the client's |
+| Renaming a library waits for its run | It does not: no run reads the name, so a rename is allowed while a run is in progress or paused |
+| Catalog statistics leave out files missing on disk | They count what the default file listing shows: missing files count, soft-deleted ones do not |
 
 ---
 
@@ -1072,20 +933,9 @@ Structured logging through `tracing`, at `logging.level` (default `info`).
 | `warn` | per-file indexing failures, refused terminal writes, swallowed bookkeeping failures, best-effort extraction failures |
 | `error` | an unresolvable `filesystem.root` |
 
-Credentials are never logged (`FR-AU-06`).
-
-`GET /health` is unauthenticated and reports database and filesystem
-reachability plus the active auth mode:
-
-```json
-{"status":"ok","database":"reachable","filesystem":"reachable","authMode":"external"}
-```
-
-`status` is `ok` only when both probes succeed, and `degraded` otherwise. The
-response is always `200` — the body carries the verdict, not the status line, so
-a probe can read the detail rather than only the fact that something is wrong.
-
-The filesystem probe requires `filesystem.root` to resolve to a **directory**, so
-an unset root reports `unreachable` and the whole check reports `degraded`. That
-is the same configuration in which the indexing bound is off (§5.5), which makes
-a `degraded` health response the visible symptom of an unset library root.
+There is no health endpoint: the `/health` route went with the HTTP server.
+`alexandria_index_init` reports a database it cannot open or migrate, and
+initialization logs a warning while `filesystem.root` is unset — the
+configuration in which the indexing bound is off (§5.5).
+`alexandria_health_status_code()` answers `200` once the library is loaded and
+probes nothing.

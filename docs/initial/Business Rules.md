@@ -46,8 +46,8 @@ The owner is a single implicit principal; entities carry no per-user foreign key
 | **BR-04** | The API does not perform complex media editing. No video re-encoding, no image manipulation. It manages metadata, names, organization, and (for text) content only. | Scope guard — this is a catalog, not a media editor. |
 | **BR-05** | Watchlists apply only to VideoFiles (movies and series). Non-video files cannot be watchlisted. | Watchlists track media consumption, which is meaningful only for video. |
 | **BR-06** | For a series, watch progress is tracked per episode; for a movie, as a single item. | Reflects how movies and series are consumed. |
-| **BR-07** | The domain logic lives in a Rust core library and is exposed over HTTP/REST-JSON and via a Flutter FFI surface. Both transports produce identical results for the same operation. | The owner chooses HTTP or FFI per client without behavioral drift. |
-| **BR-08** | Authorization is pluggable and configured at startup; exactly one auth mode is active at runtime. The **external mode** validates JWTs issued by an external authentication service (issuance is never self-performed; provider integration is wired later). The **local-login mode** validates credentials (email + salted/hashed password) stored in a SQLite row on the local machine. No plaintext credentials are ever stored — only the one-way password hash. The **Windows mode** treats the Windows account the server process runs as the credential: nothing is typed and nothing is stored, and the process reads its own account at startup and compares it to the configured owner. | Defer identity to a dedicated external service when available; offer a self-contained local alternative for single-user desktop use; offer a zero-setup alternative when the process itself already runs as the owner. |
+| **BR-07** | The domain logic lives in a Rust core library, used through its C ABI (a Flutter FFI surface) in process. The HTTP/REST-JSON surface it was once also exposed over is removed. | The desktop front-end is the only client, and it runs on the owner's machine. |
+| **BR-08** | **Removed (the core only runs locally for the person at the machine)** | — |
 | **BR-09** | Indexing runs asynchronously and must not block read/query operations. | The owner indexes thousands of files while still browsing and editing. |
 | **BR-10** | Record deletion is two-phase. Soft delete hides a record and keeps it restorable; a hard purge removes it permanently only after a configurable retention period has elapsed. | Protect the owner from accidental data loss. |
 | **BR-11** | A hard purge removes a catalog record without touching the on-disk file. Removing the on-disk file is a separate, explicit *purge-on-disk* operation that removes both the record and the physical file. | Disk deletions must be intentional and never a side effect of catalog cleanup. |
@@ -56,8 +56,8 @@ The owner is a single implicit principal; entities carry no per-user foreign key
 | **BR-14** | SOLID principles and a Command/Query (CQRS-style) organization are the baseline for the core library's operations. | Mandated design approach from the brainstorm. |
 | **BR-15** | Reading lists apply only to book Documents and ComicBooks. Watchlists apply only to VideoFiles. Reading lists and watchlists never overlap their target file kinds. | Each kind of consumption tracking is meaningful only for its matching media. |
 | **BR-16** | For a comic book series, reading progress is tracked per issue; for a single book, as a single item. | Reflects how books and comics are consumed (parallel to BR-06). |
-| **BR-17** | Exactly one auth mode (external JWT, local login, or Windows account) is active at a time, selected by startup configuration. A caller authenticated by an inactive mode is rejected. | Avoid ambiguity in the trust boundary; keep the model simple per deployment. |
-| **BR-18** | Local-login credentials (email and a salted/hashed password) live in a single SQLite row and are set or changed via a local setup command. The plaintext password is never stored and never logged. | Protect the single user's credentials on a local-only desktop deployment. |
+| **BR-17** | **Removed (the core only runs locally for the person at the machine)** | — |
+| **BR-18** | **Removed (the core only runs locally for the person at the machine)** | — |
 | **BR-19** | Deleting a ReadingList removes its ReadingProgress entries only. Its target Documents and ComicBooks are preserved. | Removing a tracking list should not remove the catalogued items. |
 | **BR-20** | A Library is the only way a file enters the catalog. The owner adds a folder as a library; every file in it Alexandria can read is indexed, its folder structure is kept, and every catalogued file belongs to exactly one library. Libraries never nest or overlap. | The owner manages folder structures they built on disk; a folder that is not a library is not Alexandria's. |
 | **BR-21** | Removing a Library deletes its catalog records — its files with their progress and collection membership, and its runs — and never touches a file on disk. | No file can exist outside a library, and disk deletions must never be a side effect (BR-11). |
@@ -82,18 +82,19 @@ The owner is a single implicit principal; entities carry no per-user foreign key
 | **series** | ComicBook | Optional. Series name when the comic is part of a series. |
 | **mediaKind** | ReadingProgress target | Required. One of `Document` or `ComicBook`. |
 | **state** | ReadingProgress | Required. One of `Pending`, `Reading`, `Read`. |
-| **email** | Local login | Required when local-login mode is active. Valid email format. Unique (single owner). |
-| **passwordHash** | Local login | Required when local-login mode is active. Salted hash; never plaintext. |
+| **name** | Library | Required. Non-blank; stored trimmed. Not unique. |
+| **pinned** | Library | Required. Boolean, off by default. |
+| **favorite** | Library | Required. Boolean, off by default; independent of `pinned`. |
 
 ## Permissions
 
 | Role | Operations |
 | --- | --- |
-| **Owner (authenticated caller)** | All CRUD on files, bookmarks, collections, watchlists, watch progress, reading lists, and reading progress; initiate indexing; soft and hard delete; explicit purge-on-disk. In local-login mode, also setting/changing the local credentials via a local setup command. |
-| **Unauthenticated caller** | None. Every operation requires a valid credential (a JWT in external mode, local-login credentials in local mode, or a session opened via the Windows account in Windows mode). |
+| **Owner (the person at the machine)** | All CRUD on libraries, files, bookmarks, collections, watchlists, watch progress, reading lists, and reading progress; initiate indexing; soft and hard delete; explicit purge-on-disk. |
 
-There is a single role — the authenticated owner. No administrative or
-read-only role is distinguished in this scope.
+There is a single role — the owner — and no login: the core only runs locally,
+for the person at the machine. No administrative or read-only role is
+distinguished in this scope.
 
 ## Lifecycle
 
@@ -131,10 +132,10 @@ reading list; transitions `Pending → Reading → Read`; for a comic series,
 tracked per issue; deleted when the item is removed from the reading list or the
 reading list is deleted.
 
-**Local-login credentials** — set or changed via a local setup command; the
-password stored in SQLite only as a salted one-way hash; not soft/hard-deleted
-through the catalog lifecycle (their
-management is part of the auth module, not the catalog).
+**Library** — added (which indexes it), renamed, pinned or unpinned, marked or
+unmarked as a favorite, corrected when its folder moves, re-indexed, and
+removed with its catalog records. Renaming, a correction and a re-index keep
+its pinned and favorite flags.
 
 ## Prohibitions
 
@@ -144,8 +145,5 @@ management is part of the auth module, not the catalog).
 - Removing an on-disk file as a side effect of a catalog delete (only the
   explicit purge-on-disk operation may touch the file).
 - Hard-purging a record before its soft-delete retention window has elapsed.
-- Issuing JWTs from within Alexandria (only the external auth service issues
-  them, in external mode).
-- Storing plaintext passwords, logging credentials, or accepting the inactive
-  auth mode's credentials.
+- Reaching a catalog over a network: the core is used only in process.
 - Auto-advancing work through workflow stage boundaries without human approval.
