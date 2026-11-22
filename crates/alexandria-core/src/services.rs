@@ -69,9 +69,7 @@ use crate::watchlists::queries::browse::BrowseWatchlistsHandler;
 use crate::watchlists::repos::SqliteWatchlistRepository;
 
 /// Concrete index handler wired with the runtime collaborators: the Sqlite
-/// catalog repository, the on-disk filesystem, and the system clock. Both the
-/// HTTP and FFI surfaces depend on the same `Services` instance so the two
-/// transports stay at parity (NFR-09).
+/// catalog repository, the on-disk filesystem, and the system clock.
 pub type DefaultIndexHandler = IndexHandler<
     SqliteCatalogRepository,
     StdFilesystem,
@@ -340,11 +338,10 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
     // FR-FC-26: `filesystem.root` bounds which trees UC-01 will index, where
     // UC-51 may move a library to, and which cataloged files playback and the
     // file-content operations will read or change. It is logged here, once
-    // per process, because this is the single startup path both transports go
-    // through — the HTTP binary and `alexandria_index_init` — so the two
-    // surfaces cannot disagree about whether the bound is on. UC-02 takes no
-    // root (it re-walks paths already in the catalog), so it needs no
-    // equivalent.
+    // per process, because this is the single startup path
+    // (`alexandria_index_init` comes through it), so the log always says
+    // whether the bound is on. UC-02 takes no root (it re-walks paths already
+    // in the catalog), so it needs no equivalent.
     let library_root = LibraryRoot::new(&settings.filesystem.root);
     if !library_root.is_configured() {
         tracing::warn!(

@@ -30,9 +30,8 @@ where
     /// error.
     ///
     /// AF-02 does not appear here: an unrecognised `kind` cannot reach this
-    /// handler, because the parameter is the domain enum. Both transports
-    /// reject the unknown value while parsing their own request, which is what
-    /// keeps the two answers identical (FR-FC-24 / NFR-09).
+    /// handler, because the parameter is the domain enum. The FFI rejects the
+    /// unknown value while parsing its filter.
     pub async fn list(
         &self,
         kind: Option<CollectionKind>,

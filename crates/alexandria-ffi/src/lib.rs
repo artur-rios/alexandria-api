@@ -42,9 +42,9 @@ pub const INDEX_ERR_OTHER: c_int = 4;
 /// takes effect when the scan finishes" instead of reporting an error for
 /// something that is going to work.
 pub const INDEX_ERR_BUSY: c_int = 5;
-/// `alexandria_library_index_start` named no library (HTTP's `404`).
+/// `alexandria_library_index_start` named no library.
 pub const INDEX_ERR_NOT_FOUND: c_int = 6;
-/// The library already has an unfinished run (FR-FC-43; HTTP's `409`).
+/// The library already has an unfinished run (FR-FC-43).
 pub const INDEX_ERR_CONFLICT: c_int = 7;
 
 /// FFI status codes returned by file operations (UC-04+). Deliberately
@@ -230,9 +230,9 @@ fn cstr_utf8(ptr: *const c_char) -> Option<String> {
 /// `"low"` maps to `RunPriority::Low`; anything else — NULL, `"normal"`, an
 /// unrecognised word, or malformed UTF-8 lossily decoded to garbage — maps to
 /// `RunPriority::Normal`. A client that cannot spell the value gets the safe
-/// default rather than a rejected call; the same lenient rule the HTTP body
-/// (Task 12) uses, so the two surfaces agree on what an unreadable priority
-/// means as well as on the words they both accept (FR-FC-24).
+/// default rather than a rejected call. `alexandria_library_register` and
+/// `alexandria_library_index_start` both use it, so every start agrees on what
+/// an unreadable priority means as well as on the words it accepts.
 fn parse_priority(raw: Option<String>) -> RunPriority {
     match raw.as_deref() {
         Some("low") => RunPriority::Low,
@@ -249,11 +249,10 @@ fn parse_priority(raw: Option<String>) -> RunPriority {
 /// [`parse_priority`], and it is deliberate rather than an inconsistency:
 /// starting a run must produce *some* width, so an unreadable priority there
 /// has to fall to a default, but a run being resumed already has one. Folding
-/// NULL into `Normal` here would silently speed every low-priority run back
-/// up the moment a caller written before this parameter existed passed the
-/// NULL it has always passed. Same lenient rule as `parse_priority` about
-/// *how* an unreadable value is treated — quietly, never as a rejected call —
-/// and the same rule the HTTP body uses (FR-FC-24).
+/// NULL into `Normal` here would silently speed every low-priority run back up
+/// the moment a caller written before this parameter existed passed the NULL
+/// it has always passed. Same lenient rule as `parse_priority` about *how* an
+/// unreadable value is treated — quietly, never as a rejected call.
 fn parse_resume_priority(raw: Option<String>) -> Option<RunPriority> {
     match raw.as_deref() {
         Some("low") => Some(RunPriority::Low),
@@ -361,8 +360,8 @@ pub extern "C" fn alexandria_index_init(db_path: *const c_char) -> c_int {
     })
 }
 
-/// Load settings exactly as the HTTP binary does: `ALEXANDRIA_CONFIG` or
-/// `config.toml`, then `ALEXANDRIA_*` environment overrides.
+/// Load settings from `ALEXANDRIA_CONFIG` or `config.toml`, then the
+/// `ALEXANDRIA_*` environment overrides.
 fn load_settings() -> Settings {
     let config_path = std::env::var("ALEXANDRIA_CONFIG")
         .map(std::path::PathBuf::from)
@@ -372,9 +371,8 @@ fn load_settings() -> Settings {
 
 /// Start an asynchronous re-index/refresh of every cataloged path (UC-02).
 /// Takes no root — refresh touches everything cataloged — and returns a
-/// `IndexStartResult` with a `run_id` and `status` (parity with the HTTP
-/// `POST /v1/index/refresh` 202 body). The refresh runs in the background
-/// on the FFI runtime; read results via the accessor functions.
+/// `IndexStartResult` with a `run_id` and `status`. The refresh runs in the
+/// background on the FFI runtime; read results via the accessor functions.
 ///
 /// `priority` is parsed exactly as `alexandria_library_index_start`'s is — see that
 /// function's doc comment for the accepted spellings and the NULL/garbage
@@ -433,10 +431,8 @@ pub extern "C" fn alexandria_index_count_files() -> i64 {
 
 /// Result of `alexandria_file_edit_metadata` (UC-04). On success `status` is
 /// `FILE_OK` and `json` is a NUL-terminated JSON string of the `FileMetadata`
-/// body — byte-for-byte the same shape HTTP returns from
-/// `PATCH /v1/files/{uuid}/metadata` (FR-FC-24 / NFR-09). On failure `json`
-/// is NULL and `status` carries the mapped error code. The caller must free
-/// `json` with `alexandria_free_string`.
+/// body. On failure `json` is NULL and `status` carries the mapped error code.
+/// The caller must free `json` with `alexandria_free_string`.
 #[repr(C)]
 #[derive(Debug)]
 pub struct FileMetadataResult {
@@ -464,11 +460,9 @@ impl FileMetadataResult {
 /// Edit a file's type-specific metadata (UC-04 / FR-FC-15..18).
 ///
 /// `uuid` is the file's public UUID string; `json_patch` is the JSON body (the
-/// `SubtypeMetadata` enum, internally tagged by `type`) that HTTP would send.
-/// The function deserializes it, calls the same `EditMetadataHandler` the HTTP
-/// route uses, and on success serializes the returned `FileMetadata` back to
-/// JSON — so the FFI and HTTP surfaces agree byte-for-byte modulo key ordering
-/// (parity, FR-FC-24 / NFR-09).
+/// `SubtypeMetadata` enum, internally tagged by `type`). The function
+/// deserializes it, calls `EditMetadataHandler`, and on success serializes the
+/// returned `FileMetadata` back to JSON.
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
 pub extern "C" fn alexandria_file_edit_metadata(
@@ -518,14 +512,12 @@ pub extern "C" fn alexandria_file_edit_metadata(
     })
 }
 
-/// Result of `alexandria_files_list` and `alexandria_file_get_by_uuid` (UC-03).
-/// On success `status` is `FILE_OK` and `json` is a NUL-terminated JSON string
-/// — byte-for-byte the same shape HTTP returns from `GET /v1/files` (a JSON
-/// array of `FileView` objects, issue #116) or `GET /v1/files/{uuid}` (a
-/// single `FileView` object), so the FFI and HTTP surfaces agree modulo key
-/// ordering (parity, FR-FC-24 / NFR-09). On failure `json` is NULL and
-/// `status` carries the mapped error code. The caller must free `json` with
-/// `alexandria_free_string`.
+/// Result of `alexandria_files_list` and `alexandria_file_get_by_uuid`
+/// (UC-03). On success `status` is `FILE_OK` and `json` is a NUL-terminated
+/// JSON string: an array of `FileView` objects for the listing (issue #116),
+/// or a single `FileView` object for the lookup. On failure `json` is NULL
+/// and `status` carries the mapped error code. The caller must free `json`
+/// with `alexandria_free_string`.
 #[repr(C)]
 #[derive(Debug)]
 pub struct FileJsonResult {
@@ -590,8 +582,7 @@ fn map_playback_err(err: DomainError) -> PlaybackJsonResult {
 /// Both fields optional; an empty/null body, omitted fields, or empty-string
 /// values use the defaults (`file_type = None`, `state = "active"` — excludes
 /// deleted records per the use case's main-flow step 2). An unrecognised
-/// `type` or `state` value is rejected as `FILE_ERR_INVALID_INPUT`, matching
-/// the HTTP surface's `400` (FR-FC-24 / NFR-09).
+/// `type` or `state` value is rejected as `FILE_ERR_INVALID_INPUT`.
 #[derive(Debug, Default)]
 struct FilesListFilter {
     file_type: Option<String>,
@@ -635,13 +626,11 @@ impl FilesListFilter {
 ///
 /// `json_filters` is a JSON string `{"type":"video","state":"all"}` (empty
 /// string or NULL for defaults), answered across every library unless
-/// `"libraryUuid"` names one. The
-/// function deserializes it, calls the same
-/// `BrowseFilesHandler` the HTTP route uses, and on success serializes the
-/// returned `Vec<FileView>` back to a JSON array — each element the same
-/// `{"file": …, "metadata": …, …}` shape `alexandria_file_get_by_uuid` answers
-/// for one file (issue #116) — so the FFI and HTTP surfaces agree
-/// byte-for-byte modulo key ordering (parity, FR-FC-24 / NFR-09).
+/// `"libraryUuid"` names one. The function deserializes it, calls
+/// `BrowseFilesHandler`, and on success serializes the returned
+/// `Vec<FileView>` back to a JSON array — each element the same
+/// `{"file": …, "metadata": …, …}` shape `alexandria_file_get_by_uuid`
+/// answers for one file (issue #116).
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
 pub extern "C" fn alexandria_files_list(json_filters: *const c_char) -> FileJsonResult {
@@ -657,9 +646,9 @@ pub extern "C" fn alexandria_files_list(json_filters: *const c_char) -> FileJson
             None => return FileJsonResult::err(FILE_ERR_INVALID_INPUT),
         };
 
-        // An unrecognised filter value is invalid input, not a silently dropped
-        // filter — HTTP answers `400` for these and the two surfaces must agree
-        // (FR-FC-24 / NFR-09). An empty string means "no filter", as on HTTP.
+        // An unrecognised filter value is invalid input, not a silently
+        // dropped filter: a caller that misspells a type must hear about it
+        // rather than get every file. An empty string means "no filter".
         let file_type = match parsed.file_type.as_deref().filter(|s| !s.is_empty()) {
             Some(t) => match alexandria_core::catalog::model::FileType::from_wire(t) {
                 Some(ft) => Some(ft),
@@ -687,8 +676,8 @@ pub extern "C" fn alexandria_files_list(json_filters: *const c_char) -> FileJson
             };
             filter = filter.with_collection(collection_uuid);
         }
-        // One library's files, parsed as `collectionUuid` is (FR-FC-24):
-        // malformed is invalid input, unknown answers `[]`.
+        // One library's files, parsed as `collectionUuid` is: malformed is
+        // invalid input, unknown answers `[]`.
         if let Some(l) = parsed.library_uuid.as_deref().filter(|s| !s.is_empty()) {
             let library_uuid = match uuid::Uuid::parse_str(l) {
                 Ok(u) => u,
@@ -711,10 +700,9 @@ pub extern "C" fn alexandria_files_list(json_filters: *const c_char) -> FileJson
 
 /// Get a single file's metadata by its public UUID (UC-03 / FR-FC-13).
 ///
-/// `uuid` is the file's public UUID string. The function calls the same
-/// `BrowseFilesHandler::get_by_uuid` the HTTP route uses, and on success
-/// serializes the returned `FileView` back to JSON — the same shape HTTP
-/// returns from `GET /v1/files/{uuid}` (parity, FR-FC-24 / NFR-09).
+/// `uuid` is the file's public UUID string. The function calls
+/// `BrowseFilesHandler::get_by_uuid`, and on success serializes the returned
+/// `FileView` back to JSON.
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
 pub extern "C" fn alexandria_file_get_by_uuid(uuid: *const c_char) -> FileJsonResult {
@@ -749,8 +737,7 @@ pub extern "C" fn alexandria_file_get_by_uuid(uuid: *const c_char) -> FileJsonRe
 /// Read a TextFile's content from disk (UC-32 / FR-TX-01).
 ///
 /// `uuid` is the file's public UUID (NUL-terminated string). On success `json`
-/// carries the `FileContent` — byte-for-byte the same shape HTTP returns from
-/// `GET /v1/files/{uuid}/content` (parity, FR-FC-24 / NFR-09).
+/// carries the `FileContent`.
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
 pub extern "C" fn alexandria_file_read_content(uuid: *const c_char) -> FileJsonResult {
@@ -785,15 +772,12 @@ pub extern "C" fn alexandria_file_read_content(uuid: *const c_char) -> FileJsonR
 /// Resolve a File to everything a local player needs to open it
 /// (UC-38 / FR-MP-01, FR-MP-06).
 ///
-/// The FFI surface cannot carry a byte stream, so where HTTP streams
-/// `GET /v1/files/{uuid}/stream`, this returns
-/// `{"uuid":…,"path":…,"mimeType":…,"sizeBytes":…}` and the caller — Flutter
-/// desktop, on the same machine as the file — opens that path directly.
-/// Zero bytes cross this boundary. Parity with HTTP is defined on this
-/// descriptor and on the state and error decisions rather than on byte
-/// transfer (FR-MP-06). A file whose path resolves outside the configured
-/// `filesystem.root` gets `PLAYBACK_ERR_INVALID_INPUT` and no descriptor
-/// (FR-FC-26), as HTTP's `400`.
+/// The FFI surface cannot carry a byte stream, so rather than stream the
+/// file, this returns `{"uuid":…,"path":…,"mimeType":…,"sizeBytes":…}` and
+/// the caller — Flutter desktop, on the same machine as the file — opens that
+/// path directly. Zero bytes cross this boundary (FR-MP-06). A file whose
+/// path resolves outside the configured `filesystem.root` gets
+/// `PLAYBACK_ERR_INVALID_INPUT` and no descriptor (FR-FC-26).
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
 pub extern "C" fn alexandria_file_playback_source(uuid: *const c_char) -> PlaybackJsonResult {
@@ -827,7 +811,7 @@ pub extern "C" fn alexandria_file_playback_source(uuid: *const c_char) -> Playba
 /// Unlike UC-38, the bytes *do* cross the boundary: a comic page has no path
 /// of its own — it lives inside an archive — and it is bounded, so
 /// base64 inside the existing JSON payload keeps the FFI shape intact while
-/// staying byte-exact with HTTP.
+/// staying byte-exact with the page in the archive.
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
 pub extern "C" fn alexandria_comic_page(uuid: *const c_char, page: u32) -> PlaybackJsonResult {
@@ -901,8 +885,7 @@ pub extern "C" fn alexandria_file_thumbnail(uuid: *const c_char) -> PlaybackJson
     })
 }
 
-/// Request body accepted by `alexandria_file_edit_content` — the same JSON
-/// `PUT /v1/files/{uuid}/content` takes: `{"content":"…"}`.
+/// Request body accepted by `alexandria_file_edit_content`: `{"content":"…"}`.
 #[derive(Debug)]
 struct EditContentBody {
     content: String,
@@ -921,11 +904,9 @@ impl EditContentBody {
 /// FR-TX-03).
 ///
 /// `uuid` is the file's public UUID (NUL-terminated string). `json_body` is
-/// the JSON body HTTP would send (`content`). The function deserializes it,
-/// calls the same `EditTextFileContentHandler` the HTTP route uses, and on
-/// success serializes the returned `File` back to JSON — so the FFI and HTTP
-/// surfaces agree byte-for-byte modulo key ordering (parity, FR-FC-24 /
-/// NFR-09).
+/// the JSON body (`content`). The function deserializes it, calls
+/// `EditTextFileContentHandler`, and on success serializes the returned `File`
+/// back to JSON.
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
 pub extern "C" fn alexandria_file_edit_content(
@@ -976,12 +957,9 @@ pub extern "C" fn alexandria_file_edit_content(
 /// Rename a file (and its on-disk file) (UC-05 / FR-FC-19).
 ///
 /// `uuid` is the file's public UUID string; `name` is the new file name. The
-/// function calls the same `RenameFileHandler` the HTTP route uses and on
-/// success serializes the returned `File` back to JSON — the same shape HTTP
-/// returns from `POST /v1/files/{uuid}/rename`, so the FFI and HTTP surfaces
-/// agree byte-for-byte modulo key ordering (parity, FR-FC-24 / NFR-09). A disk
-/// failure (AF-02) maps to `FILE_ERR_DISK`; the catalog is left untouched in
-/// that case.
+/// function calls `RenameFileHandler` and on success serializes the returned
+/// `File` back to JSON. A disk failure (AF-02) maps to `FILE_ERR_DISK`; the
+/// catalog is left untouched in that case.
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
 pub extern "C" fn alexandria_file_rename(
@@ -1007,8 +985,8 @@ pub extern "C" fn alexandria_file_rename(
             Some(s) => s,
             None => return FileJsonResult::err(FILE_ERR_INVALID_INPUT),
         };
-        // An empty/whitespace name is rejected by the handler's validator, so it
-        // surfaces as `FILE_ERR_INVALID_INPUT` — consistent with the HTTP `400`.
+        // An empty/whitespace name is rejected by the handler's validator, so
+        // it surfaces as `FILE_ERR_INVALID_INPUT`.
 
         let result =
             runtime().block_on(async { services.rename_file_handler.rename(uuid, name).await });
@@ -1025,12 +1003,10 @@ pub extern "C" fn alexandria_file_rename(
 
 /// Soft-delete a file (UC-06 / FR-FC-20).
 ///
-/// `uuid` is the file's public UUID string. The function calls the same
-/// `SoftDeleteFileHandler` the HTTP route uses and on success serializes the
-/// returned `File` back to JSON — the same shape HTTP returns from
-/// `DELETE /v1/files/{uuid}`, so the FFI and HTTP surfaces agree byte-for-byte
-/// modulo key ordering (parity, FR-FC-24 / NFR-09). The on-disk file is
-/// untouched (only `state` and `deleted_at` change on the catalog row).
+/// `uuid` is the file's public UUID string. The function calls
+/// `SoftDeleteFileHandler` and on success serializes the returned `File` back
+/// to JSON. The on-disk file is untouched (only `state` and `deleted_at`
+/// change on the catalog row).
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
 pub extern "C" fn alexandria_file_soft_delete(uuid: *const c_char) -> FileJsonResult {
@@ -1064,15 +1040,12 @@ pub extern "C" fn alexandria_file_soft_delete(uuid: *const c_char) -> FileJsonRe
 
 /// Restore a soft-deleted file (UC-07 / FR-FC-21).
 ///
-/// `uuid` is the file's public UUID string. The function calls the same
-/// `RestoreFileHandler` the HTTP route uses and on success serializes the
-/// returned `File` back to JSON — the same shape HTTP returns from
-/// `POST /v1/files/{uuid}/restore`, so the FFI and HTTP surfaces agree
-/// byte-for-byte modulo key ordering (parity, FR-FC-24 / NFR-09). The on-disk
-/// file is untouched (only `state` and `deleted_at` change on the catalog
-/// row). The retention window (default 30 days, NFR-10) is enforced; a record
-/// past it is reported as `NotFound` (`FILE_ERR_NOT_FOUND`) since UC-08 owns
-/// the actual hard purge.
+/// `uuid` is the file's public UUID string. The function calls
+/// `RestoreFileHandler` and on success serializes the returned `File` back to
+/// JSON. The on-disk file is untouched (only `state` and `deleted_at` change
+/// on the catalog row). The retention window (default 30 days, NFR-10) is
+/// enforced; a record past it is reported as `NotFound` (`FILE_ERR_NOT_FOUND`)
+/// since UC-08 owns the actual hard purge.
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
 pub extern "C" fn alexandria_file_restore(uuid: *const c_char) -> FileJsonResult {
@@ -1106,15 +1079,12 @@ pub extern "C" fn alexandria_file_restore(uuid: *const c_char) -> FileJsonResult
 
 /// Hard-purge a soft-deleted file's catalog row (UC-08 / FR-FC-22).
 ///
-/// `uuid` is the file's public UUID string. The function calls the same
-/// `PurgeFileHandler` the HTTP route uses
-/// (`DELETE /v1/files/{uuid}?purge=true`) and on success serializes the
-/// pre-delete `File` back to JSON as confirmation — the same shape HTTP
-/// returns, so the FFI and HTTP surfaces agree byte-for-byte modulo key
-/// ordering (parity, FR-FC-24 / NFR-09). Only the catalog row (and its subtype
-/// row) is removed; the on-disk file is untouched (NFR-07). The retention
-/// window (default 30 days, NFR-10) is enforced: a record still within it, or
-/// not `deleted`, is reported as `FILE_ERR_INVALID_STATE`.
+/// `uuid` is the file's public UUID string. The function calls
+/// `PurgeFileHandler` and on success serializes the pre-delete `File` back to
+/// JSON as confirmation. Only the catalog row (and its subtype row) is
+/// removed; the on-disk file is untouched (NFR-07). The retention window
+/// (default 30 days, NFR-10) is enforced: a record still within it, or not
+/// `deleted`, is reported as `FILE_ERR_INVALID_STATE`.
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
 pub extern "C" fn alexandria_file_purge(uuid: *const c_char) -> FileJsonResult {
@@ -1147,12 +1117,9 @@ pub extern "C" fn alexandria_file_purge(uuid: *const c_char) -> FileJsonResult {
 
 /// Purge a file both on disk and in the catalog (UC-09 / FR-FC-23).
 ///
-/// `uuid` is the file's public UUID string. The function calls the same
-/// `PurgeFileOnDiskHandler` the HTTP route uses
-/// (`DELETE /v1/files/{uuid}?purge-on-disk=true`) and on success serializes
-/// the returned [`PurgeOnDiskOutcome`] back to JSON — the same shape HTTP
-/// returns, so the FFI and HTTP surfaces agree byte-for-byte modulo key
-/// ordering (parity, FR-FC-24 / NFR-09). Unlike UC-08 there is no retention
+/// `uuid` is the file's public UUID string. The function calls
+/// `PurgeFileOnDiskHandler` and on success serializes the returned
+/// [`PurgeOnDiskOutcome`] back to JSON. Unlike UC-08 there is no retention
 /// gate: an `active` or `deleted` record is purgeable, the only precondition
 /// is that it exists. A missing on-disk file is still a success, reported via
 /// `diskFilePresent: false` (AF-01); a disk failure is reported as
@@ -1194,9 +1161,8 @@ pub extern "C" fn alexandria_file_purge_on_disk(uuid: *const c_char) -> FileJson
 
 /// Result of `alexandria_collection_create` (UC-10). On success `status` is
 /// `COLLECTION_OK` and `json` is a NUL-terminated JSON string of the
-/// `Collection` body — byte-for-byte the same shape HTTP returns from
-/// `POST /v1/collections` (FR-FC-24 / NFR-09). On failure `json` is NULL and
-/// `status` carries the mapped error code. The caller must free `json` with
+/// `Collection` body. On failure `json` is NULL and `status` carries the
+/// mapped error code. The caller must free `json` with
 /// `alexandria_free_string`.
 #[repr(C)]
 #[derive(Debug)]
@@ -1222,17 +1188,15 @@ impl CollectionJsonResult {
     }
 }
 
-/// Request body accepted by `alexandria_collection_create` — the same JSON
-/// `POST /v1/collections` takes: `{"name":"Sci-fi novels","kind":"file"}`.
+/// Request body accepted by `alexandria_collection_create`:
+/// `{"name":"Sci-fi novels","kind":"file"}`.
 /// Parsing here is what rejects a missing field or an unrecognised `kind` as
-/// `COLLECTION_ERR_INVALID_INPUT`, matching the HTTP surface's `400`
-/// (FR-FC-24 / NFR-09).
+/// `COLLECTION_ERR_INVALID_INPUT`.
 ///
 /// Parsed field-by-field off a `serde_json::Value` rather than by `derive`,
 /// like `FilesListFilter` above: this crate depends on `serde_json` but not on
 /// `serde` itself. Both fields are required and must be strings, and unknown
-/// fields are ignored — the same three decisions axum's `Json` extractor makes
-/// for the HTTP body.
+/// fields are ignored.
 #[derive(Debug)]
 struct CreateCollectionBody {
     name: String,
@@ -1252,11 +1216,9 @@ impl CreateCollectionBody {
 
 /// Create a flat file or bookmark collection (UC-10 / FR-CO-01, FR-CO-02).
 ///
-/// `json_body` is the JSON body HTTP would send (`name` + `kind`). The
-/// function deserializes it, calls the same `CreateCollectionHandler` the HTTP
-/// route uses, and on success serializes the returned `Collection` back to
-/// JSON — so the FFI and HTTP surfaces agree byte-for-byte modulo key ordering
-/// (parity, FR-FC-24 / NFR-09).
+/// `json_body` is the JSON body (`name` + `kind`). The function deserializes
+/// it, calls `CreateCollectionHandler`, and on success serializes the returned
+/// `Collection` back to JSON.
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
 pub extern "C" fn alexandria_collection_create(json_body: *const c_char) -> CollectionJsonResult {
@@ -1275,8 +1237,7 @@ pub extern "C" fn alexandria_collection_create(json_body: *const c_char) -> Coll
             None => return CollectionJsonResult::err(COLLECTION_ERR_INVALID_INPUT),
         };
         // An empty or otherwise invalid name is rejected by the handler's
-        // validator, so it surfaces as `COLLECTION_ERR_INVALID_INPUT` —
-        // consistent with the HTTP `400`.
+        // validator, so it surfaces as `COLLECTION_ERR_INVALID_INPUT`.
 
         let result = runtime().block_on(async {
             services
@@ -1304,10 +1265,10 @@ fn map_collection_err(err: DomainError) -> CollectionJsonResult {
     }
 }
 
-/// Request body accepted by `alexandria_collection_rename` — the same JSON
-/// `PATCH /v1/collections/{uuid}` takes: `{"name":"Sci-fi novels"}`. Parsed
-/// field-by-field for the same reason `CreateCollectionBody` is: this crate
-/// depends on `serde_json` but not `serde`'s derive.
+/// Request body accepted by `alexandria_collection_rename`:
+/// `{"name":"Sci-fi novels"}`. Parsed field-by-field for the same reason
+/// `CreateCollectionBody` is: this crate depends on `serde_json` but not
+/// `serde`'s derive.
 #[derive(Debug)]
 struct RenameCollectionBody {
     name: String,
@@ -1325,11 +1286,9 @@ impl RenameCollectionBody {
 /// Rename a collection (UC-11 / FR-CO-03).
 ///
 /// `uuid` is the collection's public UUID (NUL-terminated string). `json_body`
-/// is the JSON body HTTP would send (`{"name": …}`). The function deserializes
-/// it, calls the same `RenameCollectionHandler` the HTTP route uses, and on
-/// success serializes the returned `Collection` back to JSON — so the FFI and
-/// HTTP surfaces agree byte-for-byte modulo key ordering (parity, FR-FC-24 /
-/// NFR-09).
+/// is the JSON body (`{"name": …}`). The function deserializes it, calls
+/// `RenameCollectionHandler`, and on success serializes the returned
+/// `Collection` back to JSON.
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
 pub extern "C" fn alexandria_collection_rename(
@@ -1380,9 +1339,7 @@ pub extern "C" fn alexandria_collection_rename(
 /// Delete a collection, unlinking its items (UC-12 / FR-CO-04).
 ///
 /// `uuid` is the collection's public UUID (NUL-terminated string). On success
-/// `json` carries the pre-delete `Collection` as confirmation — byte-for-byte
-/// the same shape HTTP returns from `DELETE /v1/collections/{uuid}` (parity,
-/// FR-FC-24 / NFR-09).
+/// `json` carries the pre-delete `Collection` as confirmation.
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
 pub extern "C" fn alexandria_collection_delete(uuid: *const c_char) -> CollectionJsonResult {
@@ -1414,8 +1371,7 @@ pub extern "C" fn alexandria_collection_delete(uuid: *const c_char) -> Collectio
     })
 }
 
-/// Request body accepted by `alexandria_collection_add_items` — the same
-/// JSON `POST /v1/collections/{uuid}/items` takes:
+/// Request body accepted by `alexandria_collection_add_items`:
 /// `{"itemUuids":["…","…"]}`. Parsed field-by-field for the same reason
 /// `CreateCollectionBody` is: this crate depends on `serde_json` but not
 /// `serde`'s derive.
@@ -1440,11 +1396,9 @@ impl AddItemsBody {
 /// Add items to a collection (UC-13 / FR-CO-05).
 ///
 /// `uuid` is the collection's public UUID (NUL-terminated string). `json_body`
-/// is the JSON body HTTP would send (`itemUuids`). The function deserializes
-/// it, calls the same `AddItemsToCollectionHandler` the HTTP route uses, and
-/// on success serializes the returned `CollectionItemsResult` back to JSON —
-/// so the FFI and HTTP surfaces agree byte-for-byte modulo key ordering
-/// (parity, FR-FC-24 / NFR-09).
+/// is the JSON body (`itemUuids`). The function deserializes it, calls
+/// `AddItemsToCollectionHandler`, and on success serializes the returned
+/// `CollectionItemsResult` back to JSON.
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
 pub extern "C" fn alexandria_collection_add_items(
@@ -1496,9 +1450,7 @@ pub extern "C" fn alexandria_collection_add_items(
 ///
 /// `collection_uuid` and `item_uuid` are the collection's and item's public
 /// UUIDs (NUL-terminated strings). On success `json` carries the
-/// `collectionUuid`/`itemUuid` confirmation — byte-for-byte the same shape
-/// HTTP returns from `DELETE /v1/collections/{uuid}/items/{itemUuid}` (parity,
-/// FR-FC-24 / NFR-09).
+/// `collectionUuid`/`itemUuid` confirmation.
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
 pub extern "C" fn alexandria_collection_remove_item(
@@ -1541,9 +1493,7 @@ pub extern "C" fn alexandria_collection_remove_item(
 /// List the items in a collection (UC-14 / FR-CO-07).
 ///
 /// `uuid` is the collection's public UUID (NUL-terminated string). On success
-/// `json` carries the `kind` and current members — byte-for-byte the same
-/// shape HTTP returns from `GET /v1/collections/{uuid}/items` (parity,
-/// FR-FC-24 / NFR-09).
+/// `json` carries the `kind` and current members.
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
 pub extern "C" fn alexandria_collection_list_items(uuid: *const c_char) -> CollectionJsonResult {
@@ -1571,9 +1521,8 @@ pub extern "C" fn alexandria_collection_list_items(uuid: *const c_char) -> Colle
     })
 }
 
-/// Filters accepted by `alexandria_collections_list` (UC-46). Mirrors the
-/// query string HTTP takes on the same route, so a caller writes the same
-/// filter for either surface (FR-FC-24 / NFR-09).
+/// Filters accepted by `alexandria_collections_list` (UC-46): an optional
+/// `kind`.
 #[derive(Debug, Default)]
 struct CollectionsListFilter {
     kind: Option<String>,
@@ -1603,11 +1552,9 @@ impl CollectionsListFilter {
 
 /// List the owner's collections (UC-46 / FR-CO-08).
 ///
-/// `json_filters` is the JSON filter HTTP would build from its query string
-/// (`kind`); an empty string or `null` means every collection. On success
-/// `json` carries a JSON array of `CollectionSummary` — each collection with
-/// the number of items it holds — byte-for-byte the same shape HTTP returns
-/// from `GET /v1/collections` (parity, FR-FC-24 / NFR-09).
+/// `json_filters` is a JSON filter (`kind`); an empty string or `null` means
+/// every collection. On success `json` carries a JSON array of
+/// `CollectionSummary` — each collection with the number of items it holds.
 ///
 /// An owner with no collections gets an empty array and `COLLECTION_OK`, not
 /// an error (AF-01). An unrecognised `kind` is `COLLECTION_ERR_INVALID_INPUT`
@@ -1627,8 +1574,8 @@ pub extern "C" fn alexandria_collections_list(json_filters: *const c_char) -> Co
             None => return CollectionJsonResult::err(COLLECTION_ERR_INVALID_INPUT),
         };
 
-        // AF-02: refused before the handler is reached, exactly as HTTP refuses
-        // the same value while parsing its query string.
+        // AF-02: refused before the handler is reached, while the filter is
+        // parsed.
         let kind = match parsed.kind.as_deref().filter(|k| !k.is_empty()) {
             None => None,
             Some(value) => {
@@ -1666,10 +1613,8 @@ pub const BOOKMARK_ERR_OTHER: c_int = 9;
 
 /// Result of `alexandria_bookmark_create` (UC-15). On success `status` is
 /// `BOOKMARK_OK` and `json` is a NUL-terminated JSON string of the `Bookmark`
-/// body — byte-for-byte the same shape HTTP returns from `POST
-/// /v1/bookmarks` (FR-FC-24 / NFR-09). On failure `json` is NULL and `status`
-/// carries the mapped error code. The caller must free `json` with
-/// `alexandria_free_string`.
+/// body. On failure `json` is NULL and `status` carries the mapped error code.
+/// The caller must free `json` with `alexandria_free_string`.
 #[repr(C)]
 #[derive(Debug)]
 pub struct BookmarkJsonResult {
@@ -1703,11 +1648,11 @@ fn map_bookmark_err(err: DomainError) -> BookmarkJsonResult {
     }
 }
 
-/// Request body accepted by `alexandria_bookmark_create` — the same JSON
-/// `POST /v1/bookmarks` takes: `{"url":"…","title":"…","collectionUuid":"…"}`
-/// (`collectionUuid` optional/nullable). Parsed field-by-field for the same
-/// reason `CreateCollectionBody` is: this crate depends on `serde_json` but
-/// not `serde`'s derive.
+/// Request body accepted by `alexandria_bookmark_create`:
+/// `{"url":"…","title":"…","collectionUuid":"…"}` (`collectionUuid`
+/// optional/nullable). Parsed field-by-field for the same reason
+/// `CreateCollectionBody` is: this crate depends on `serde_json` but not
+/// `serde`'s derive.
 #[derive(Debug)]
 struct CreateBookmarkBody {
     url: String,
@@ -1736,11 +1681,9 @@ impl CreateBookmarkBody {
 /// Create a browser bookmark, optionally in an existing bookmark collection
 /// (UC-15 / FR-BM-01).
 ///
-/// `json_body` is the JSON body HTTP would send (`url` + `title` +
-/// `collectionUuid`). The function deserializes it, calls the same
-/// `CreateBookmarkHandler` the HTTP route uses, and on success serializes the
-/// returned `Bookmark` back to JSON — so the FFI and HTTP surfaces agree
-/// byte-for-byte modulo key ordering (parity, FR-FC-24 / NFR-09).
+/// `json_body` is the JSON body (`url` + `title` + `collectionUuid`). The
+/// function deserializes it, calls `CreateBookmarkHandler`, and on success
+/// serializes the returned `Bookmark` back to JSON.
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
 pub extern "C" fn alexandria_bookmark_create(json_body: *const c_char) -> BookmarkJsonResult {
@@ -1776,8 +1719,7 @@ pub extern "C" fn alexandria_bookmark_create(json_body: *const c_char) -> Bookma
     })
 }
 
-/// Request body accepted by `alexandria_bookmark_update` — the same JSON
-/// `PATCH /v1/bookmarks/{uuid}` takes:
+/// Request body accepted by `alexandria_bookmark_update`:
 /// `{"url":"…","title":"…","collectionUuid":"…"}` (`collectionUuid`
 /// optional/nullable; absent or null clears the link).
 #[derive(Debug)]
@@ -1809,11 +1751,9 @@ impl UpdateBookmarkBody {
 /// FR-BM-02).
 ///
 /// `uuid` is the bookmark's public UUID (NUL-terminated string). `json_body`
-/// is the JSON body HTTP would send (`url` + `title` + `collectionUuid`). The
-/// function deserializes it, calls the same `UpdateBookmarkHandler` the HTTP
-/// route uses, and on success serializes the returned `Bookmark` back to JSON
-/// — so the FFI and HTTP surfaces agree byte-for-byte modulo key ordering
-/// (parity, FR-FC-24 / NFR-09).
+/// is the JSON body (`url` + `title` + `collectionUuid`). The function
+/// deserializes it, calls `UpdateBookmarkHandler`, and on success serializes
+/// the returned `Bookmark` back to JSON.
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
 pub extern "C" fn alexandria_bookmark_update(
@@ -1860,10 +1800,9 @@ pub extern "C" fn alexandria_bookmark_update(
 /// JSON filter body accepted by `alexandria_bookmarks_list` (UC-17 /
 /// FR-BM-06). Both fields optional; an empty/null body, omitted fields, or
 /// empty-string values use the defaults (`collectionUuid = None`, `state =
-/// "active"` — excludes deleted records per the use case's main-flow step
-/// 2). An unrecognised `state` or malformed `collectionUuid` is rejected as
-/// `BOOKMARK_ERR_INVALID_INPUT`, matching the HTTP surface's `400`
-/// (FR-FC-24 / NFR-09).
+/// "active"` — excludes deleted records per the use case's main-flow step 2).
+/// An unrecognised `state` or malformed `collectionUuid` is rejected as
+/// `BOOKMARK_ERR_INVALID_INPUT`.
 #[derive(Debug, Default)]
 struct BookmarksListFilter {
     collection_uuid: Option<String>,
@@ -1898,10 +1837,8 @@ impl BookmarksListFilter {
 ///
 /// `json_filters` is a JSON string `{"collectionUuid":"…","state":"all"}`
 /// (empty string or NULL for defaults). The function deserializes it, calls
-/// the same `BrowseBookmarksHandler` the HTTP route uses, and on success
-/// serializes the returned `Vec<Bookmark>` back to a JSON array — so the FFI
-/// and HTTP surfaces agree byte-for-byte modulo key ordering (parity, FR-FC-24
-/// / NFR-09).
+/// `BrowseBookmarksHandler`, and on success serializes the returned
+/// `Vec<Bookmark>` back to a JSON array.
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
 pub extern "C" fn alexandria_bookmarks_list(json_filters: *const c_char) -> BookmarkJsonResult {
@@ -1950,8 +1887,7 @@ pub extern "C" fn alexandria_bookmarks_list(json_filters: *const c_char) -> Book
 /// Soft-delete a bookmark (UC-18 / FR-BM-03).
 ///
 /// `uuid` is the bookmark's public UUID (NUL-terminated string). On success
-/// `json` carries the updated `Bookmark` — byte-for-byte the same shape HTTP
-/// returns from `DELETE /v1/bookmarks/{uuid}` (parity, FR-FC-24 / NFR-09).
+/// `json` carries the updated `Bookmark`.
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
 pub extern "C" fn alexandria_bookmark_soft_delete(uuid: *const c_char) -> BookmarkJsonResult {
@@ -1982,9 +1918,7 @@ pub extern "C" fn alexandria_bookmark_soft_delete(uuid: *const c_char) -> Bookma
 /// Restore a soft-deleted bookmark (UC-18 / FR-BM-05).
 ///
 /// `uuid` is the bookmark's public UUID (NUL-terminated string). On success
-/// `json` carries the restored `Bookmark` — byte-for-byte the same shape HTTP
-/// returns from `POST /v1/bookmarks/{uuid}/restore` (parity, FR-FC-24 /
-/// NFR-09).
+/// `json` carries the restored `Bookmark`.
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
 pub extern "C" fn alexandria_bookmark_restore(uuid: *const c_char) -> BookmarkJsonResult {
@@ -2015,9 +1949,7 @@ pub extern "C" fn alexandria_bookmark_restore(uuid: *const c_char) -> BookmarkJs
 /// Hard-purge a bookmark (UC-19 / FR-BM-04).
 ///
 /// `uuid` is the bookmark's public UUID (NUL-terminated string). On success
-/// `json` carries the pre-purge `Bookmark` as confirmation — byte-for-byte the
-/// same shape HTTP returns from `DELETE /v1/bookmarks/{uuid}?purge=true`
-/// (parity, FR-FC-24 / NFR-09).
+/// `json` carries the pre-purge `Bookmark` as confirmation.
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
 pub extern "C" fn alexandria_bookmark_purge(uuid: *const c_char) -> BookmarkJsonResult {
@@ -2058,10 +1990,8 @@ pub const WATCHLIST_ERR_OTHER: c_int = 9;
 
 /// Result of `alexandria_watchlist_create` (UC-20). On success `status` is
 /// `WATCHLIST_OK` and `json` is a NUL-terminated JSON string of the
-/// `Watchlist` body — byte-for-byte the same shape HTTP returns from `POST
-/// /v1/watchlists` (FR-FC-24 / NFR-09). On failure `json` is NULL and
-/// `status` carries the mapped error code. The caller must free `json` with
-/// `alexandria_free_string`.
+/// `Watchlist` body. On failure `json` is NULL and `status` carries the mapped
+/// error code. The caller must free `json` with `alexandria_free_string`.
 #[repr(C)]
 #[derive(Debug)]
 pub struct WatchlistJsonResult {
@@ -2095,10 +2025,10 @@ fn map_watchlist_err(err: DomainError) -> WatchlistJsonResult {
     }
 }
 
-/// Request body accepted by `alexandria_watchlist_create` — the same JSON
-/// `POST /v1/watchlists` takes: `{"name":"Weekend movies"}`. Parsed
-/// field-by-field for the same reason `CreateCollectionBody` is: this crate
-/// depends on `serde_json` but not `serde`'s derive.
+/// Request body accepted by `alexandria_watchlist_create`:
+/// `{"name":"Weekend movies"}`. Parsed field-by-field for the same reason
+/// `CreateCollectionBody` is: this crate depends on `serde_json` but not
+/// `serde`'s derive.
 #[derive(Debug)]
 struct CreateWatchlistBody {
     name: String,
@@ -2116,11 +2046,9 @@ impl CreateWatchlistBody {
 /// Create a named watchlist for tracking video consumption (UC-20 /
 /// FR-WL-01).
 ///
-/// `json_body` is the JSON body HTTP would send (`name`). The function
-/// deserializes it, calls the same `CreateWatchlistHandler` the HTTP route
-/// uses, and on success serializes the returned `Watchlist` back to JSON — so
-/// the FFI and HTTP surfaces agree byte-for-byte modulo key ordering (parity,
-/// FR-FC-24 / NFR-09).
+/// `json_body` is the JSON body (`name`). The function deserializes it, calls
+/// `CreateWatchlistHandler`, and on success serializes the returned
+/// `Watchlist` back to JSON.
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
 pub extern "C" fn alexandria_watchlist_create(json_body: *const c_char) -> WatchlistJsonResult {
@@ -2152,8 +2080,8 @@ pub extern "C" fn alexandria_watchlist_create(json_body: *const c_char) -> Watch
     })
 }
 
-/// Request body accepted by `alexandria_watchlist_add_video` — the same JSON
-/// `POST /v1/watchlists/{uuid}/items` takes: `{"videoUuid":"…"}`.
+/// Request body accepted by `alexandria_watchlist_add_video`:
+/// `{"videoUuid":"…"}`.
 #[derive(Debug)]
 struct AddVideoBody {
     video_uuid: uuid::Uuid,
@@ -2173,11 +2101,9 @@ impl AddVideoBody {
 /// Add a video to a watchlist (UC-22 / FR-WL-02, FR-WL-03).
 ///
 /// `uuid` is the watchlist's public UUID (NUL-terminated string). `json_body`
-/// is the JSON body HTTP would send (`videoUuid`). The function deserializes
-/// it, calls the same `AddVideoToWatchlistHandler` the HTTP route uses, and on
-/// success serializes the returned `WatchProgress` back to JSON — so the FFI
-/// and HTTP surfaces agree byte-for-byte modulo key ordering (parity, FR-FC-24
-/// / NFR-09).
+/// is the JSON body (`videoUuid`). The function deserializes it, calls
+/// `AddVideoToWatchlistHandler`, and on success serializes the returned
+/// `WatchProgress` back to JSON.
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
 pub extern "C" fn alexandria_watchlist_add_video(
@@ -2225,9 +2151,8 @@ pub extern "C" fn alexandria_watchlist_add_video(
     })
 }
 
-/// Filter accepted by `alexandria_watchlists_list` — the same JSON `GET
-/// /v1/watchlists?watchlistUuid=…` takes: `{"watchlistUuid":"…"}`. An empty
-/// or absent `watchlistUuid` means every watchlist.
+/// Filter accepted by `alexandria_watchlists_list`: `{"watchlistUuid":"…"}`.
+/// An empty or absent `watchlistUuid` means every watchlist.
 #[derive(Debug, Default)]
 struct WatchlistsListFilter {
     watchlist_uuid: Option<String>,
@@ -2254,11 +2179,9 @@ impl WatchlistsListFilter {
 
 /// Browse watchlists and their items' watch progress (UC-21 / FR-WL-08).
 ///
-/// `json_filters` is the JSON filter HTTP would build from its query string
-/// (`watchlistUuid`); an empty string or `null` means every watchlist. On
-/// success `json` carries a JSON array of `WatchlistWithProgress` — byte-for-
-/// byte the same shape HTTP returns from `GET /v1/watchlists` (parity,
-/// FR-FC-24 / NFR-09).
+/// `json_filters` is a JSON filter (`watchlistUuid`); an empty string or
+/// `null` means every watchlist. On success `json` carries a JSON array of
+/// `WatchlistWithProgress`.
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
 pub extern "C" fn alexandria_watchlists_list(json_filters: *const c_char) -> WatchlistJsonResult {
@@ -2299,8 +2222,7 @@ pub extern "C" fn alexandria_watchlists_list(json_filters: *const c_char) -> Wat
     })
 }
 
-/// Request body accepted by `alexandria_watchlist_update_progress` — the
-/// same JSON `PATCH /v1/watchlists/{uuid}/items/{videoUuid}` takes:
+/// Request body accepted by `alexandria_watchlist_update_progress`:
 /// `{"state":"…","currentEpisode":…,"totalEpisodes":…}` (episode fields
 /// optional/nullable; absent or null clears them).
 #[derive(Debug)]
@@ -2325,11 +2247,9 @@ impl UpdateWatchProgressBody {
 /// Update watch progress (UC-23 / FR-WL-04, FR-WL-05).
 ///
 /// `watchlist_uuid` and `video_uuid` are the watchlist's and video's public
-/// UUIDs (NUL-terminated strings). `json_body` is the JSON body HTTP would
-/// send (`state`, optional `currentEpisode`/`totalEpisodes`). On success
-/// `json` carries the updated `WatchProgress` — byte-for-byte the same shape
-/// HTTP returns from `PATCH /v1/watchlists/{uuid}/items/{videoUuid}` (parity,
-/// FR-FC-24 / NFR-09).
+/// UUIDs (NUL-terminated strings). `json_body` is the JSON body (`state`,
+/// optional `currentEpisode`/`totalEpisodes`). On success `json` carries the
+/// updated `WatchProgress`.
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
 pub extern "C" fn alexandria_watchlist_update_progress(
@@ -2401,9 +2321,7 @@ pub extern "C" fn alexandria_watchlist_update_progress(
 ///
 /// `watchlist_uuid` and `video_uuid` are the watchlist's and video's public
 /// UUIDs (NUL-terminated strings). On success `json` carries the
-/// `watchlistUuid`/`videoUuid` confirmation — byte-for-byte the same shape
-/// HTTP returns from `DELETE /v1/watchlists/{uuid}/items/{videoUuid}` (parity,
-/// FR-FC-24 / NFR-09).
+/// `watchlistUuid`/`videoUuid` confirmation.
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
 pub extern "C" fn alexandria_watchlist_remove_video(
@@ -2446,9 +2364,7 @@ pub extern "C" fn alexandria_watchlist_remove_video(
 /// Delete a watchlist (UC-25 / FR-WL-07).
 ///
 /// `uuid` is the watchlist's public UUID (NUL-terminated string). On success
-/// `json` carries the pre-delete `Watchlist` — byte-for-byte the same shape
-/// HTTP returns from `DELETE /v1/watchlists/{uuid}` (parity, FR-FC-24 /
-/// NFR-09).
+/// `json` carries the pre-delete `Watchlist`.
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
 pub extern "C" fn alexandria_watchlist_delete(uuid: *const c_char) -> WatchlistJsonResult {
@@ -2517,13 +2433,12 @@ pub extern "C" fn alexandria_index_count_missing() -> i64 {
 /// `content_hash` is nullable (Task 3: indexing never computes one; Task 4:
 /// neither does refresh) and is decoded as `Option<String>` — not `String` —
 /// so a `NULL` row serializes as JSON `null` here, matching what the shared
-/// `File`/`FileView` model emits over HTTP for the same column
-/// (`GET /v1/files`, `catalog/model.rs`). Decoding it as a bare `String`
-/// used to silently turn a SQL `NULL` into `""` instead (sqlx does not error
-/// on that mismatch for this driver), which was a byte-for-byte parity
-/// violation (FR-FC-24) for every indexed or refreshed file — not an edge
-/// case, since neither indexing nor refresh have computed a hash since
-/// Task 3/4.
+/// `File`/`FileView` model emits for the same column (`alexandria_files_list`,
+/// `catalog/model.rs`). Decoding it as a bare `String` used to silently turn a
+/// SQL `NULL` into `""` instead (sqlx does not error on that mismatch for this
+/// driver), so the two listings disagreed for every indexed or refreshed file
+/// — not an edge case, since neither indexing nor refresh have computed a hash
+/// since Task 3/4.
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
 pub extern "C" fn alexandria_index_files_json() -> *mut c_char {
@@ -2583,12 +2498,11 @@ pub const READING_LIST_ERR_NOT_FOUND: c_int = 4;
 pub const READING_LIST_ERR_INVALID_STATE: c_int = 5;
 pub const READING_LIST_ERR_OTHER: c_int = 9;
 
-/// Result of `alexandria_reading_list_create` (UC-26). On success `status`
-/// is `READING_LIST_OK` and `json` is a NUL-terminated JSON string of the
-/// `ReadingList` body — byte-for-byte the same shape HTTP returns from
-/// `POST /v1/reading-lists` (FR-FC-24 / NFR-09). On failure `json` is NULL
-/// and `status` carries the mapped error code. The caller must free `json`
-/// with `alexandria_free_string`.
+/// Result of `alexandria_reading_list_create` (UC-26). On success `status` is
+/// `READING_LIST_OK` and `json` is a NUL-terminated JSON string of the
+/// `ReadingList` body. On failure `json` is NULL and `status` carries the
+/// mapped error code. The caller must free `json` with
+/// `alexandria_free_string`.
 #[repr(C)]
 #[derive(Debug)]
 pub struct ReadingListJsonResult {
@@ -2622,10 +2536,10 @@ fn map_reading_list_err(err: DomainError) -> ReadingListJsonResult {
     }
 }
 
-/// Request body accepted by `alexandria_reading_list_create` — the same
-/// JSON `POST /v1/reading-lists` takes: `{"name":"Summer reads"}`. Parsed
-/// field-by-field for the same reason `CreateWatchlistBody` is: this crate
-/// depends on `serde_json` but not `serde`'s derive.
+/// Request body accepted by `alexandria_reading_list_create`:
+/// `{"name":"Summer reads"}`. Parsed field-by-field for the same reason
+/// `CreateWatchlistBody` is: this crate depends on `serde_json` but not
+/// `serde`'s derive.
 #[derive(Debug)]
 struct CreateReadingListBody {
     name: String,
@@ -2643,11 +2557,9 @@ impl CreateReadingListBody {
 /// Create a named reading list for tracking book/comic consumption (UC-26 /
 /// FR-RL-01).
 ///
-/// `json_body` is the JSON body HTTP would send (`name`). The function
-/// deserializes it, calls the same `CreateReadingListHandler` the HTTP route
-/// uses, and on success serializes the returned `ReadingList` back to JSON —
-/// so the FFI and HTTP surfaces agree byte-for-byte modulo key ordering
-/// (parity, FR-FC-24 / NFR-09).
+/// `json_body` is the JSON body (`name`). The function deserializes it, calls
+/// `CreateReadingListHandler`, and on success serializes the returned
+/// `ReadingList` back to JSON.
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
 pub extern "C" fn alexandria_reading_list_create(
@@ -2685,8 +2597,8 @@ pub extern "C" fn alexandria_reading_list_create(
     })
 }
 
-/// Request body accepted by `alexandria_reading_list_add_item` — the same
-/// JSON `POST /v1/reading-lists/{uuid}/items` takes: `{"itemUuid":"…"}`.
+/// Request body accepted by `alexandria_reading_list_add_item`:
+/// `{"itemUuid":"…"}`.
 #[derive(Debug)]
 struct AddItemToReadingListBody {
     item_uuid: uuid::Uuid,
@@ -2706,11 +2618,9 @@ impl AddItemToReadingListBody {
 /// Add a book or comic to a reading list (UC-28 / FR-RL-02, FR-RL-03).
 ///
 /// `uuid` is the reading list's public UUID (NUL-terminated string).
-/// `json_body` is the JSON body HTTP would send (`itemUuid`). The function
-/// deserializes it, calls the same `AddItemToReadingListHandler` the HTTP
-/// route uses, and on success serializes the returned `ReadingProgress` back
-/// to JSON — so the FFI and HTTP surfaces agree byte-for-byte modulo key
-/// ordering (parity, FR-FC-24 / NFR-09).
+/// `json_body` is the JSON body (`itemUuid`). The function deserializes it,
+/// calls `AddItemToReadingListHandler`, and on success serializes the returned
+/// `ReadingProgress` back to JSON.
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
 pub extern "C" fn alexandria_reading_list_add_item(
@@ -2758,10 +2668,9 @@ pub extern "C" fn alexandria_reading_list_add_item(
     })
 }
 
-/// Filter accepted by `alexandria_reading_lists_list` — the same JSON `GET
-/// /v1/reading-lists?readingListUuid=…` takes:
-/// `{"readingListUuid":"…"}`. An empty or absent `readingListUuid` means
-/// every reading list.
+/// Filter accepted by `alexandria_reading_lists_list`:
+/// `{"readingListUuid":"…"}`. An empty or absent `readingListUuid` means every
+/// reading list.
 #[derive(Debug, Default)]
 struct ReadingListsListFilter {
     reading_list_uuid: Option<String>,
@@ -2788,11 +2697,9 @@ impl ReadingListsListFilter {
 
 /// Browse reading lists and their items' read progress (UC-27 / FR-RL-08).
 ///
-/// `json_filters` is the JSON filter HTTP would build from its query string
-/// (`readingListUuid`); an empty string or `null` means every reading list.
-/// On success `json` carries a JSON array of `ReadingListWithProgress` —
-/// byte-for-byte the same shape HTTP returns from `GET /v1/reading-lists`
-/// (parity, FR-FC-24 / NFR-09).
+/// `json_filters` is a JSON filter (`readingListUuid`); an empty string or
+/// `null` means every reading list. On success `json` carries a JSON array of
+/// `ReadingListWithProgress`.
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
 pub extern "C" fn alexandria_reading_lists_list(
@@ -2839,8 +2746,7 @@ pub extern "C" fn alexandria_reading_lists_list(
     })
 }
 
-/// Request body accepted by `alexandria_reading_list_update_progress` — the
-/// same JSON `PATCH /v1/reading-lists/{uuid}/items/{itemUuid}` takes:
+/// Request body accepted by `alexandria_reading_list_update_progress`:
 /// `{"state":"…","currentIssue":…,"totalIssues":…}` (issue fields
 /// optional/nullable; absent or null clears them).
 #[derive(Debug)]
@@ -2865,11 +2771,9 @@ impl UpdateReadingProgressBody {
 /// Update reading progress (UC-29 / FR-RL-04, FR-RL-05).
 ///
 /// `reading_list_uuid` and `item_uuid` are the reading list's and item's
-/// public UUIDs (NUL-terminated strings). `json_body` is the JSON body HTTP
-/// would send (`state`, optional `currentIssue`/`totalIssues`). On success
-/// `json` carries the updated `ReadingProgress` — byte-for-byte the same shape
-/// HTTP returns from `PATCH /v1/reading-lists/{uuid}/items/{itemUuid}`
-/// (parity, FR-FC-24 / NFR-09).
+/// public UUIDs (NUL-terminated strings). `json_body` is the JSON body
+/// (`state`, optional `currentIssue`/`totalIssues`). On success `json` carries
+/// the updated `ReadingProgress`.
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
 pub extern "C" fn alexandria_reading_list_update_progress(
@@ -2942,9 +2846,7 @@ pub extern "C" fn alexandria_reading_list_update_progress(
 ///
 /// `reading_list_uuid` and `item_uuid` are the reading list's and item's
 /// public UUIDs (NUL-terminated strings). On success `json` carries the
-/// `readingListUuid`/`itemUuid` confirmation — byte-for-byte the same shape
-/// HTTP returns from `DELETE /v1/reading-lists/{uuid}/items/{itemUuid}`
-/// (parity, FR-FC-24 / NFR-09).
+/// `readingListUuid`/`itemUuid` confirmation.
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
 pub extern "C" fn alexandria_reading_list_remove_item(
@@ -2987,9 +2889,7 @@ pub extern "C" fn alexandria_reading_list_remove_item(
 /// Delete a reading list (UC-31 / FR-RL-07).
 ///
 /// `uuid` is the reading list's public UUID (NUL-terminated string). On
-/// success `json` carries the pre-delete `ReadingList` — byte-for-byte the
-/// same shape HTTP returns from `DELETE /v1/reading-lists/{uuid}` (parity,
-/// FR-FC-24 / NFR-09).
+/// success `json` carries the pre-delete `ReadingList`.
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
 pub extern "C" fn alexandria_reading_list_delete(uuid: *const c_char) -> ReadingListJsonResult {
@@ -3031,10 +2931,8 @@ pub const SETTINGS_ERR_OTHER: c_int = 9;
 
 /// Result of `alexandria_settings_json` (UC-47). On success `status` is
 /// `SETTINGS_OK` and `json` is a NUL-terminated JSON string of the settings
-/// body — byte-for-byte the same shape HTTP returns from `GET /v1/settings`
-/// (FR-FC-24 / NFR-09). On failure `json` is NULL and `status` carries the
-/// mapped error code. The caller must free `json` with
-/// `alexandria_free_string`.
+/// body. On failure `json` is NULL and `status` carries the mapped error code.
+/// The caller must free `json` with `alexandria_free_string`.
 #[repr(C)]
 #[derive(Debug)]
 pub struct SettingsJsonResult {
@@ -3061,10 +2959,9 @@ impl SettingsJsonResult {
 
 /// Report the client-relevant configuration (UC-47 / FR-FC-30).
 ///
-/// On success `json` carries the same body HTTP returns from
-/// `GET /v1/settings` — today `{"deletion":{"retentionDays":30}}`, the
-/// soft-delete retention window this server enforces on every restore and
-/// purge.
+/// On success `json` carries the settings body — today
+/// `{"deletion":{"retentionDays":30}}`, the soft-delete retention window this
+/// core enforces on every restore and purge.
 ///
 /// The boundary the number describes is the core's own: elapsed time up to and
 /// including `retentionDays` leaves a record restorable and not yet purgeable;
@@ -3112,10 +3009,8 @@ pub const RUN_ERR_OTHER: c_int = 9;
 
 /// Result of `alexandria_index_run_status_json` (UC-42). On success `status`
 /// is `RUN_OK` and `json` is a NUL-terminated JSON string of the `CatalogRun`
-/// body — byte-for-byte the same shape HTTP returns from
-/// `GET /v1/index/runs/{runId}` (FR-FC-24 / NFR-09). On failure `json` is
-/// NULL and `status` carries the mapped error code. The caller must free
-/// `json` with `alexandria_free_string`.
+/// body. On failure `json` is NULL and `status` carries the mapped error code.
+/// The caller must free `json` with `alexandria_free_string`.
 #[repr(C)]
 #[derive(Debug)]
 pub struct RunJsonResult {
@@ -3163,7 +3058,7 @@ fn map_run_err(err: DomainError) -> RunJsonResult {
 /// Report an index or re-index run's status and outcome (UC-42 / FR-FC-28).
 /// `run_id` is the id `alexandria_library_index_start` or
 /// `alexandria_index_refresh_start` returned. On success `json` carries the
-/// same body the HTTP `GET /v1/index/runs/{runId}` route returns (FR-FC-24).
+/// run's `CatalogRun` body.
 ///
 /// Returns `RUN_ERR_NOT_FOUND` for an id naming no run (AF-01), and
 /// `RUN_ERR_INVALID_INPUT` when `run_id` is not a uuid.
@@ -3197,10 +3092,9 @@ pub extern "C" fn alexandria_index_run_status_json(run_id: *const c_char) -> Run
     })
 }
 
-/// The files a run could not record, oldest first (FR-FC-42). `run_id` is
-/// the id `alexandria_library_index_start` or `alexandria_index_refresh_start`
-/// returned. On success `json` carries the same array the HTTP
-/// `GET /v1/index/runs/{runId}/failures` route returns (FR-FC-24).
+/// The files a run could not record, oldest first (FR-FC-42). `run_id` is the
+/// id `alexandria_library_index_start` or `alexandria_index_refresh_start`
+/// returned. On success `json` carries the array of failures.
 ///
 /// A call of its own rather than a field on the status above: status is
 /// polled every second while a run is in flight, and this is wanted once, if
@@ -3245,8 +3139,8 @@ pub extern "C" fn alexandria_index_run_failures_json(run_id: *const c_char) -> R
 
 /// Pause a running index or re-index run where it stands, leaving it resumable
 /// (UC-48 / FR-FC-32). `run_id` is the id `alexandria_library_index_start` or
-/// `alexandria_index_refresh_start` returned. Calls the same
-/// `RunControlHandler::pause` the HTTP route (Task 12) calls.
+/// `alexandria_index_refresh_start` returned. Calls
+/// `RunControlHandler::pause`.
 ///
 /// Returns `RUN_ERR_NOT_FOUND` for an id naming no run (AF-01),
 /// `RUN_ERR_INVALID_INPUT` when `run_id` is not a uuid, and
@@ -3280,8 +3174,7 @@ pub extern "C" fn alexandria_index_pause(run_id: *const c_char) -> c_int {
 /// Abandon a running or paused index or re-index run (UC-48 / FR-FC-34).
 /// Terminal — a cancelled run is never resumed. `run_id` is the id
 /// `alexandria_library_index_start` or `alexandria_index_refresh_start`
-/// returned. Calls the same `RunControlHandler::cancel` the HTTP route (Task
-/// 12) calls.
+/// returned. Calls `RunControlHandler::cancel`.
 ///
 /// Returns `RUN_ERR_NOT_FOUND` for an id naming no run (AF-01),
 /// `RUN_ERR_INVALID_INPUT` when `run_id` is not a uuid, and
@@ -3390,7 +3283,7 @@ pub extern "C" fn alexandria_index_resume(
                     }
                 };
                 // Every index run is its library's; one without cannot be
-                // resumed into anything (HTTP refuses it the same way).
+                // resumed into anything.
                 let Some(library_uuid) = resumed.library_uuid else {
                     tracing::error!(
                         run_id = %resumed.run_id,
@@ -3429,9 +3322,8 @@ pub extern "C" fn alexandria_index_resume(
 /// each with live progress overlaid exactly as
 /// `alexandria_index_run_status_json` overlays a single run (UC-42 /
 /// FR-FC-35). On success `json` is a NUL-terminated JSON array of `CatalogRun`
-/// bodies, newest first — byte-for-byte the same shape the HTTP
-/// `GET /v1/index/runs?status=active` route (Task 12) returns (FR-FC-24 / NFR-09).
-/// The caller must free `json` with `alexandria_free_string`.
+/// bodies, newest first. The caller must free `json` with
+/// `alexandria_free_string`.
 ///
 /// A caller with nothing outstanding gets `RUN_OK` and an empty JSON array,
 /// not an error — an idle library is the normal case, not a failure.
@@ -3564,10 +3456,9 @@ mod tests {
 
     #[test]
     fn given_uppercase_low_when_priority_parsed_then_normal() {
-        // Case-sensitive on purpose — the HTTP body Task 12 adds spells it
-        // lowercase, and matching that spelling exactly is what keeps the
-        // two surfaces at parity (FR-FC-24) rather than accepting a wider
-        // set FFI understands and HTTP does not.
+        // Case-sensitive on purpose — the documented spelling is lowercase,
+        // and accepting a wider set would make a second spelling the app
+        // could come to depend on.
         assert_eq!(parse_priority(Some("Low".to_string())), RunPriority::Normal);
     }
 
@@ -3651,9 +3542,8 @@ pub const LIBRARY_ERR_CONFLICT: c_int = 6;
 pub const LIBRARY_ERR_OTHER: c_int = 9;
 
 /// Result of every library FFI function. On success `status` is `LIBRARY_OK`
-/// and `json` is a NUL-terminated JSON string of the same body HTTP returns
-/// from the matching `/v1/libraries*` route (FR-FC-24 / NFR-09). The caller
-/// must free `json` with `alexandria_free_string`.
+/// and `json` is a NUL-terminated JSON string of the library body the call
+/// answers. The caller must free `json` with `alexandria_free_string`.
 #[repr(C)]
 #[derive(Debug)]
 pub struct LibraryJsonResult {
@@ -3687,8 +3577,8 @@ fn map_library_err(err: DomainError) -> LibraryJsonResult {
     }
 }
 
-/// Walk `library`'s folder for the run `run_id` on the runtime, as
-/// HTTP's `spawn_walk` does — the call that opened the run has answered.
+/// Walk `library`'s folder for the run `run_id` on the runtime, in the
+/// background — the call that opened the run has answered.
 fn spawn_library_walk(
     services: &Services,
     library: &alexandria_core::libraries::model::Library,
@@ -3710,7 +3600,7 @@ fn spawn_library_walk(
 /// Answers `INDEX_OK` with the run id, `INDEX_ERR_NOT_FOUND` for an unknown
 /// library, `INDEX_ERR_CONFLICT` while it has an unfinished run (FR-FC-43),
 /// `INDEX_ERR_INVALID_INPUT` for a malformed uuid or
-/// `INDEX_ERR_NOT_INITIALIZED` — HTTP's `202`, `404`, `409`, `400`.
+/// `INDEX_ERR_NOT_INITIALIZED`.
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
 pub extern "C" fn alexandria_library_index_start(
@@ -3745,14 +3635,14 @@ pub extern "C" fn alexandria_library_index_start(
 
 /// Add a folder as a library and start indexing it (FR-FC-36).
 ///
-/// `json_body` is the JSON body `POST /v1/libraries` takes: `name`,
-/// `rootPath`, and an optional `priority` (`"low"`; anything else is normal)
-/// for the first run. On success `json` is the library with the `runId` of
-/// its first index run beside its fields; follow it with
-/// `alexandria_index_run_status_json`. Answers `LIBRARY_ERR_INVALID_INPUT` for
-/// a blank name or folder, a folder that does not exist or is not a folder,
-/// or one outside `filesystem.root`; `LIBRARY_ERR_CONFLICT` when the folder
-/// overlaps an existing library. A refusal stores nothing.
+/// `json_body` carries `name`, `rootPath`, and an optional `priority`
+/// (`"low"`; anything else is normal) for the first run. On success `json` is
+/// the library with the `runId` of its first index run beside its fields;
+/// follow it with `alexandria_index_run_status_json`. Answers
+/// `LIBRARY_ERR_INVALID_INPUT` for a blank name or folder, a folder that does
+/// not exist or is not a folder, or one outside `filesystem.root`;
+/// `LIBRARY_ERR_CONFLICT` when the folder overlaps an existing library. A
+/// refusal stores nothing.
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
 pub extern "C" fn alexandria_library_register(json_body: *const c_char) -> LibraryJsonResult {
@@ -3776,8 +3666,8 @@ pub extern "C" fn alexandria_library_register(json_body: *const c_char) -> Libra
             .get("rootPath")
             .and_then(|v| v.as_str())
             .unwrap_or_default();
-        // Lenient, as HTTP's `deserialize_priority` is (FR-FC-24): only the
-        // string `"low"` asks for a gentle first run.
+        // Lenient, as every start is: only the string `"low"` asks for a
+        // gentle first run.
         let priority = parse_priority(
             body.get("priority")
                 .and_then(|v| v.as_str())
@@ -3804,12 +3694,11 @@ pub extern "C" fn alexandria_library_register(json_body: *const c_char) -> Libra
 
 /// Point a library at the folder it moved to (libraries design).
 ///
-/// `json_body` is the JSON body `PATCH /v1/libraries/{uuid}` takes
-/// (`rootPath`). The library's files move with it, keeping their uuids and
+/// `json_body` is `{"rootPath": …}`. The library's files move with it, keeping their uuids and
 /// everything that points at them. Answers `LIBRARY_ERR_CONFLICT` when the
 /// destination overlaps another library, or when the catalog already holds
 /// files there, and `LIBRARY_ERR_INVALID_INPUT` when `rootPath` is blank or
-/// lies outside the configured `filesystem.root` (FR-FC-26), as HTTP's `400`.
+/// lies outside the configured `filesystem.root` (FR-FC-26).
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
 pub extern "C" fn alexandria_library_move(
@@ -3872,8 +3761,10 @@ pub extern "C" fn alexandria_libraries_list() -> LibraryJsonResult {
 }
 
 /// The catalog's totals: `{"libraries": n, "filesByType": {...}}`, with all
-/// seven types present. Counts the files the catalog lists (not
-/// soft-deleted).
+/// seven types present and `0` for an empty one. Counts what the default file
+/// listing shows: active files, including those marked missing on disk;
+/// soft-deleted files are not counted. `LIBRARY_ERR_NOT_INITIALIZED` before
+/// `alexandria_index_init`, `LIBRARY_ERR_OTHER` when the query fails.
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
 pub extern "C" fn alexandria_catalog_stats_json() -> LibraryJsonResult {
@@ -3895,8 +3786,9 @@ pub extern "C" fn alexandria_catalog_stats_json() -> LibraryJsonResult {
 /// One level of a library's tree.
 ///
 /// `path` is the folder to list, relative to the library's root; NULL or an
-/// empty string is the top. One level rather than the whole tree — see the
-/// matching HTTP route.
+/// empty string is the top. One level rather than the whole tree (FR-FC-39):
+/// a course of two hundred classes is a large document to build and parse
+/// when the owner is looking at one folder.
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
 pub extern "C" fn alexandria_library_browse(
@@ -4031,9 +3923,8 @@ pub extern "C" fn alexandria_library_set_favorite(uuid: *const c_char, favorite:
 
 /// Remove a library and its catalog records (FR-FC-40); nothing on disk is
 /// touched. `LIBRARY_ERR_CONFLICT` while one of its runs is running
-/// (FR-FC-43), as HTTP answers `409`. On success `json`
-/// carries an empty object rather than NULL, so a caller can tell success
-/// from the failure codes without a special case.
+/// (FR-FC-43). On success `json` carries an empty object rather than NULL, so
+/// a caller can tell success from the failure codes without a special case.
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
 pub extern "C" fn alexandria_library_remove(uuid: *const c_char) -> LibraryJsonResult {

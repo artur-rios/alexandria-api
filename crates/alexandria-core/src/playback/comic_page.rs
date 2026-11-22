@@ -155,10 +155,10 @@ pub(crate) fn read_entry_capped<R: std::io::Read>(
 /// caller asked for something specific, so it is told the format is
 /// unsupported rather than silently getting nothing.
 ///
-/// Shared by UC-39's page route and UC-40's comic thumbnail, and called by
+/// Shared by UC-39's page call and UC-40's comic thumbnail, and called by
 /// both *handlers* rather than by the archive port: a `.cbr` must never reach
 /// `ZipComicArchive`, where a failure to open would surface as a `Disk` error
-/// and a 500 where the error table promises a 400. The two had already
+/// where an unsupported source promises `InvalidInput`. The two had already
 /// drifted apart once on exactly this point.
 pub fn ensure_cbz(uuid: Uuid, path: &str) -> Result<(), DomainError> {
     if !path.to_ascii_lowercase().ends_with(".cbz") {
@@ -175,7 +175,7 @@ pub fn ensure_cbz(uuid: Uuid, path: &str) -> Result<(), DomainError> {
 /// `ComicArchive` — the real ZIP reader and every test fake — resolves the
 /// page number through this one function, so the ordering rule cannot drift
 /// between them and stays directly unit-testable without a filesystem. UC-39's
-/// page route and UC-40's comic thumbnail therefore always agree on what page
+/// page call and UC-40's comic thumbnail therefore always agree on what page
 /// 1 is, which is the whole reason the thumbnail sits on the UC-39 path.
 ///
 /// Two rules:
@@ -242,8 +242,8 @@ where
             )));
         }
 
-        // Before the archive is opened, so a `.cbr` is a 400 and never a ZIP
-        // reader failure.
+        // Before the archive is opened, so a `.cbr` is `InvalidInput` and
+        // never a ZIP reader failure.
         ensure_cbz(uuid, &file.path)?;
 
         // One call, one open: ordering, bounds and bytes all come from the

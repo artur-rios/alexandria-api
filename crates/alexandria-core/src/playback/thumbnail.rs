@@ -148,10 +148,11 @@ where
                 // CBZ guard is `ensure_cbz`, and the case-insensitive sort
                 // and range check live in `select_page`, which every
                 // `ComicArchive` resolves through. A comic's thumbnail is
-                // therefore the same image `GET /pages/1` returns, by
+                // therefore the same image `alexandria_comic_page(uuid, 1)`
+                // returns, by
                 // construction, and a `.cbr` is rejected here — before the
                 // archive is opened — with the same `InvalidInput` the page
-                // route gives instead of failing inside the ZIP reader as a
+                // call gives instead of failing inside the ZIP reader as a
                 // `Disk` error.
                 crate::playback::comic_page::ensure_cbz(uuid, &file.path)?;
                 let first = self.archive.read_page(&file.path, 1).await?;
@@ -211,7 +212,7 @@ where
         // failure as a miss — "a cache that cannot answer is a miss, never
         // an error" — and `put` is the same bargain from the other side: a
         // full disk or a read-only cache directory costs the next caller a
-        // re-render, not this caller a 500.
+        // re-render, not this caller a failure.
         if let Err(e) = self.cache.put(&key, &bytes).await {
             tracing::warn!(
                 uuid = %file.uuid,
@@ -811,11 +812,10 @@ mod tests {
 
     #[tokio::test]
     async fn given_cbr_comic_when_thumbnailed_then_invalid_input() {
-        // Arrange — CBR has no viable pure-Rust reader. The page route has
+        // Arrange — CBR has no viable pure-Rust reader. The page call has
         // always said so; before the selection was shared, the thumbnail
-        // instead reached the ZIP reader and failed as `Disk`, which the
-        // HTTP surface renders as 500. The error table promises 400 on both
-        // routes.
+        // instead reached the ZIP reader and failed as `Disk`. Both calls
+        // promise `InvalidInput` for an unsupported source.
         let repo = FakeRepo::with_file(a_file(
             "/lib/issue.cbr",
             FileType::Comic,
@@ -843,7 +843,7 @@ mod tests {
     #[tokio::test]
     async fn given_comic_when_thumbnailed_then_same_entry_as_page_one() {
         // Arrange — one archive, two handlers. The thumbnail must be
-        // derived from exactly the entry the `pages/1` route serves, or a
+        // derived from exactly the entry page 1 serves, or a
         // future change to page ordering would silently make "the
         // thumbnail" and "page 1" different images.
         use crate::playback::comic_page::ComicPageHandler;
@@ -871,7 +871,7 @@ mod tests {
 
         // Assert — `FakeArchive::read_page` echoes the entry name, and
         // `FakeRenderer` logs the bytes it was handed, so both sides name
-        // the entry each route chose.
+        // the entry each call chose.
         assert_eq!(
             *calls.lock().unwrap(),
             vec![format!(

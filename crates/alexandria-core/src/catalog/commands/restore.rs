@@ -56,8 +56,8 @@ where
 
         // AF-02 (not-deleted): the file-lifecycle state diagram (Use Case
         // Spec §4.1) only allows `deleted → active`; restoring an already
-        // `active` record is rejected as a state conflict (409 over HTTP /
-        // FILE_ERR_INVALID_STATE over FFI) so the caller is not handed back
+        // `active` record is rejected as a state conflict
+        // (`FILE_ERR_INVALID_STATE` over FFI) so the caller is not handed back
         // an "restored" row that was never deleted.
         if file.state != FileState::Deleted {
             return Err(DomainError::InvalidState);

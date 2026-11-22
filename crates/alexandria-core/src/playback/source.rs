@@ -12,9 +12,8 @@ use crate::playback::{resolve_playable, FileStat, PlaybackSource};
 ///
 /// Generic over the catalog repository and stat so the decision logic is
 /// unit-tested against trait fakes, then wired with concrete collaborators at
-/// runtime (services.rs). Both surfaces call this handler: HTTP takes the
-/// resolved path and streams it through `ServeFile`, FFI serializes the
-/// `PlaybackSource` and lets the local client open the file itself.
+/// runtime (services.rs). The FFI serializes the `PlaybackSource` and lets the
+/// local client open the file itself.
 pub struct PlaybackSourceHandler<R, S> {
     repo: R,
     stat: S,
@@ -40,8 +39,8 @@ where
 
         // The stat is load-bearing twice: it supplies `size_bytes` for the
         // FFI descriptor, and it is what turns a file that vanished without
-        // a re-index into a `Disk` error. Without it, HTTP's `ServeFile`
-        // would answer its own 404 and misreport the catalog.
+        // a re-index into a `Disk` error. Without it, the client would be
+        // handed a path that opens nothing.
         let size_bytes = self.stat.size_bytes(&file.path).await?;
 
         Ok(PlaybackSource {
@@ -101,7 +100,7 @@ mod tests {
     async fn given_file_that_cannot_be_stat_when_resolved_then_disk_error() {
         // Arrange — the record is active and not marked missing, but the
         // file vanished since the last re-index. This must be a disk error,
-        // not a 404: the catalog record is valid.
+        // not a not-found: the catalog record is valid.
         let repo = FakeRepo::with_file(a_file(
             "/lib/gone.mp4",
             FileType::Video,

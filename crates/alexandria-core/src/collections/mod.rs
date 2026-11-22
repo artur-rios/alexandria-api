@@ -2,8 +2,7 @@
 //!
 //! Laid out like `catalog`: a `model` of the domain types, a `repos` port with
 //! its Sqlite implementation, and one Command/Query handler per use case, so
-//! the handlers stay unit-testable against trait fakes and both transports
-//! call the same decision logic (FR-FC-24 / NFR-09).
+//! the handlers stay unit-testable against trait fakes.
 pub mod commands;
 pub mod model;
 pub mod queries;

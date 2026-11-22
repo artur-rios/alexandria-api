@@ -207,7 +207,7 @@ impl AudioMetadataReader for LoftyAudioMetadataReader {
 /// picture. Not a plain `Option`: the two ways a caller ends up with no
 /// picture bytes need different handling downstream. A file that parses
 /// fine but simply carries no picture is "not supported for this file" —
-/// `InvalidInput`, the same 400 the SVG and `.cbr` rejections already use.
+/// `InvalidInput`, the same answer the SVG and `.cbr` rejections already give.
 /// A file that could not be opened, stat'd, or parsed as audio at all —
 /// missing on disk despite being marked present, corrupt, or a format
 /// `lofty` does not support (`.wma`) — is a property of the file on disk,
@@ -684,10 +684,8 @@ mod tests {
     }
 
     /// A tiny, real, decodable JPEG, one distinct picture per `seed`. Local
-    /// to this module rather than reused from the HTTP test suite's helper
-    /// of the same name — this crate has no dependency on that one, and its
-    /// `&str` seed is not needed here, where a `u8` is enough to keep two
-    /// pictures in the same test apart.
+    /// to this module rather than shared with another test suite — a `u8`
+    /// seed is enough to keep two pictures in the same test apart.
     fn jpeg_bytes_for(seed: u8) -> Vec<u8> {
         let img = image::RgbImage::from_pixel(4, 4, image::Rgb([seed, 100, 200]));
         let mut out = Vec::new();

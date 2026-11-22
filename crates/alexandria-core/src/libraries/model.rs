@@ -5,8 +5,8 @@ use uuid::Uuid;
 
 use crate::catalog::model::FileView;
 
-/// A library about to be persisted. The `uuid` is minted by the handler so
-/// the value is decided by the same code on both transports.
+/// A library about to be persisted. The `uuid` is minted by the handler, not
+/// the repository.
 #[derive(Debug, Clone)]
 pub struct NewLibrary {
     pub uuid: Uuid,

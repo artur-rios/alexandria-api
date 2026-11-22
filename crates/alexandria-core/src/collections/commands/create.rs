@@ -6,12 +6,12 @@ use crate::errors::DomainError;
 
 /// Validate a collection name (UC-10 / FR-CO-01, FR-CO-02, AF-01). The
 /// specification requires only "non-empty"; the extra rules below exist to keep
-/// the two transports storing the same bytes for the same request (NFR-09).
+/// the stored name exactly the one the caller sent.
 ///
 /// Rejects: empty; whitespace-only; leading/trailing whitespace (trimming would
 /// silently store a name different from the one the caller sent); names
-/// containing a NUL (which would truncate the string at the FFI boundary, so
-/// HTTP and FFI would disagree); names longer than 255 bytes.
+/// containing a NUL (which would truncate the string at the FFI boundary);
+/// names longer than 255 bytes.
 ///
 /// Unlike a file name this is a label, not a path — separators and characters
 /// such as `:` or `*` are legitimate in a collection name and are allowed.
@@ -74,13 +74,12 @@ where
         kind: CollectionKind,
     ) -> Result<Collection, DomainError> {
         // AF-01: the name must be valid. An invalid `kind` cannot reach here —
-        // it is a typed enum, so both transports reject an unrecognised value
-        // while deserializing the request body.
+        // it is a typed enum, so the FFI rejects an unrecognised value while
+        // deserializing the request body.
         let name = validate_collection_name(name)?;
 
-        // The uuid is minted here rather than in the repository so both
-        // transports mint it the same way and a unit test can assert the
-        // returned record against what the fake stored.
+        // The uuid is minted here rather than in the repository so a unit
+        // test can assert the returned record against what the fake stored.
         self.repo
             .insert_collection(NewCollection {
                 uuid: Uuid::new_v4(),

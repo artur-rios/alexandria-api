@@ -6,7 +6,7 @@ use crate::reading_lists::repos::ReadingListRepository;
 
 /// Validate a reading list name (UC-26 / FR-RL-01, AF-01). The specification
 /// requires only "non-empty"; the extra rules below exist for the same
-/// reasons `validate_watchlist_name` applies them (NFR-09 parity).
+/// reasons `validate_watchlist_name` applies them.
 ///
 /// Rejects: empty; whitespace-only; leading/trailing whitespace; names
 /// containing a NUL; names longer than 255 bytes.

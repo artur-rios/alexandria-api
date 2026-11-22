@@ -46,8 +46,8 @@ where
         // The file-lifecycle state diagram (Use Case Spec §4.1) only allows
         // `active → deleted`; a record already `deleted` is restored via
         // UC-07, not re-soft-deleted. Re-issuing a soft-delete on an already
-        // deleted record is rejected as a state conflict (409 over HTTP /
-        // FILE_ERR_INVALID_STATE over FFI) so the caller is not silently
+        // deleted record is rejected as a state conflict
+        // (`FILE_ERR_INVALID_STATE` over FFI) so the caller is not silently
         // re-stamped with a later `deleted_at` (which would reset the
         // retention window without the caller asking).
         if file.state == FileState::Deleted {

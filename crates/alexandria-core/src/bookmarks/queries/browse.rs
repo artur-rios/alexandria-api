@@ -42,9 +42,7 @@ impl BookmarkFilter {
 /// question open (see the comment on `FileFilter::collection_uuid`). Generic
 /// over the bookmark repository and the collection repository so the same
 /// decision logic is unit-tested against trait fakes, then wired with the
-/// concrete Sqlite collaborators at runtime (services.rs). Both the HTTP and
-/// FFI surfaces call this handler so the two stay at parity (FR-FC-24 /
-/// NFR-09).
+/// concrete Sqlite collaborators at runtime (services.rs).
 pub struct BrowseBookmarksHandler<BR, CR> {
     bookmark_repo: BR,
     collection_repo: CR,

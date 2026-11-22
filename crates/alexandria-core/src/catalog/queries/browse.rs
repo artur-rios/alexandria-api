@@ -68,9 +68,7 @@ impl FileFilter {
 ///
 /// Generic over the catalog repository so the same decision logic is
 /// unit-tested against trait fakes (no real DB in unit tests), then wired with
-/// the concrete Sqlite collaborators at runtime (services.rs). Both the HTTP
-/// and FFI surfaces call this handler so the two stay at parity (FR-FC-24 /
-/// NFR-09).
+/// the concrete Sqlite collaborators at runtime (services.rs).
 pub struct BrowseFilesHandler<R> {
     repo: R,
 }

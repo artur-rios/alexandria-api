@@ -47,10 +47,9 @@ pub const MAX_PLAYBACK_READ_BYTES: u64 = 256 * 1024 * 1024;
 /// garbage thumbnail, which is worse than an error.
 ///
 /// Over-cap is `InvalidInput`, not `Disk`: nothing failed to read. The file is
-/// simply not something this route can work with, the same classification the
-/// SVG and CBR rejections already use, and the same `400` the error table
-/// promises for an unsupported source. The message names no path: an
-/// `InvalidInput` message is rendered into the client's error envelope.
+/// simply not something this call can work with, the same classification the
+/// SVG and CBR rejections already use for an unsupported source. The message
+/// names no path: an `InvalidInput` message can reach the client.
 ///
 /// `cap` is a parameter rather than a read of [`MAX_PLAYBACK_READ_BYTES`], so
 /// a test can drive the over-cap branch against a fixture of a few bytes.
@@ -125,7 +124,7 @@ impl FileStat for StdFileStat {
 /// (`filesystem.root`, FR-FC-26) when one is set. Indexing and moving a
 /// library are both bounded by it, but a row can still point outside — one
 /// indexed before the bound was configured, or reached through a symbolic
-/// link swapped in since — and every playback route serves, decodes or hands
+/// link swapped in since — and every playback call serves, decodes or hands
 /// out whatever path the row holds. The check resolves the path the way the
 /// index check does (`LibraryRoot`), and is an `InvalidInput` that names no
 /// path.
@@ -251,7 +250,7 @@ mod tests {
 
     #[tokio::test]
     async fn given_a_row_outside_the_configured_root_when_resolved_then_invalid_input() {
-        // Arrange — every playback route runs this guard, so a row already
+        // Arrange — every playback call runs this guard, so a row already
         // pointing outside `filesystem.root` is refused for all of them.
         let library = tempfile::tempdir().expect("tempdir");
         let repo = FakeRepo::with_file(a_file(

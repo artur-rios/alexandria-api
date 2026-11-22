@@ -7,10 +7,9 @@ use crate::catalog::repos::CatalogRepository;
 use crate::errors::DomainError;
 
 /// Validate a new file name as a host-OS file name (UC-05 / FR-FC-19, AF-01).
-/// Conservative enough to be valid on both Windows and POSIX so the HTTP and
-/// FFI surfaces — and the cross-platform embedder — stay at parity (NFR-09)
-/// without platform-specific rules leaking through one surface but not the
-/// other.
+/// Conservative enough to be valid on both Windows and POSIX, so the
+/// cross-platform embedder gets one rule on every host rather than
+/// platform-specific rules leaking through on one of them.
 ///
 /// Rejects: empty; leading/trailing whitespace (the trimmed form would differ
 /// from what the caller typed, silently coercing a typo to a real file name);
@@ -67,9 +66,8 @@ pub fn validate_file_name(name: &str) -> Result<String, DomainError> {
 /// Compute `parent(old_path).join(new_name)` as a string, preserving the
 /// separator the indexer already stored in `old_path`. Using `Path::parent` +
 /// `join` here would normalize to the OS separator (backslashes on Windows),
-/// which desyncs from the catalog's stored `path` string and the FFI's
-/// parity check; doing the slice entirely in `str` keeps the separator
-/// end-to-end identical over both transports (FR-FC-24 / NFR-09).
+/// which desyncs from the catalog's stored `path` string; doing the slice
+/// entirely in `str` keeps the separator the catalog already holds.
 fn sibling_path(old_path: &str, new_name: &str) -> String {
     match old_path.rfind(['/', '\\']) {
         Some(i) => {
@@ -100,9 +98,7 @@ fn sibling_path(old_path: &str, new_name: &str) -> String {
 ///
 /// Generic over the catalog repository and filesystem so the same decision
 /// logic is unit-tested against trait fakes (no real DB or fs in unit tests),
-/// then wired with the concrete collaborators at runtime (services.rs). Both
-/// the HTTP and FFI surfaces call this handler so the two stay at parity
-/// (FR-FC-24 / NFR-09).
+/// then wired with the concrete collaborators at runtime (services.rs).
 pub struct RenameFileHandler<R, F> {
     repo: R,
     fs: F,

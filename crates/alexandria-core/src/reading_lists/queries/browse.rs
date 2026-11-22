@@ -8,8 +8,7 @@ use crate::reading_lists::repos::ReadingListRepository;
 ///
 /// Generic over the reading list repository, so the decision logic is
 /// unit-tested against a trait fake, then wired with the concrete Sqlite
-/// collaborators at runtime (services.rs). Both the HTTP and FFI surfaces call
-/// this handler so the two stay at parity (FR-FC-24 / NFR-09).
+/// collaborators at runtime (services.rs).
 pub struct BrowseReadingListsHandler<R> {
     repo: R,
 }

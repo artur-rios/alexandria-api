@@ -2126,7 +2126,7 @@ impl CatalogRepository for SqliteCatalogRepository {
 ///
 /// A value the domain cannot represent — an unparseable UUID or timestamp, an
 /// unknown `type` — means the row is corrupt. Returning an error surfaces that
-/// as a `500`; silently substituting the nil UUID or `text` would hand the
+/// as a failure; silently substituting the nil UUID or `text` would hand the
 /// caller a plausible-looking record that does not correspond to reality.
 /// Nullable columns (`deleted_at`, `missing_at`, `content_hash`) are
 /// absent-or-valid: a NULL is legitimately `None`, but a present-and-

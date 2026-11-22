@@ -132,8 +132,8 @@ where
 /// fresh run id immediately. The heavy `execute` walk stats, classifies, and
 /// persists each supported file, skipping already-cataloged paths — no file
 /// bytes are read (FR-FC-09/FR-FC-10). `start` and `execute` are separated so
-/// the HTTP/FFI layer can spawn `execute` in the background (FR-FC-08) while
-/// `start` returns `202` right away.
+/// the FFI layer can spawn `execute` in the background (FR-FC-08) while
+/// `start` returns the run id right away.
 ///
 /// `execute` processes up to `concurrency` files at a time, where
 /// `concurrency` is the width the run's own `RunPriority` resolved to at
@@ -213,7 +213,7 @@ enum EntryOutcome {
 ///
 /// `last_flush` rides along in the fold's accumulator rather than sitting in a
 /// `Cell` outside it because the resulting future has to be `Send` — the
-/// HTTP and FFI layers spawn `execute` onto the runtime — and a shared
+/// FFI layer spawns `execute` onto the runtime — and a shared
 /// `Cell` is not.
 struct IndexTally {
     indexed: usize,

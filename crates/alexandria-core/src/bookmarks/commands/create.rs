@@ -14,7 +14,7 @@ use crate::errors::DomainError;
 ///
 /// Rejects: empty; leading/trailing whitespace (silently trimming would store
 /// a value different from what the caller sent); a NUL byte (would truncate
-/// the string at the FFI boundary, desyncing the two transports); no
+/// the string at the FFI boundary); no
 /// `scheme://` separator; an empty or non-alphanumeric scheme; nothing after
 /// the separator.
 pub fn validate_url(url: &str) -> Result<String, DomainError> {
@@ -60,7 +60,7 @@ pub fn validate_url(url: &str) -> Result<String, DomainError> {
 /// Validate a bookmark title (UC-15 / FR-BM-01, AF-01). Rejects: empty;
 /// whitespace-only; leading/trailing whitespace; a NUL byte; longer than 255
 /// bytes — the same rules `validate_collection_name` applies, for the same
-/// reasons (NFR-09 parity).
+/// reasons.
 pub fn validate_title(title: &str) -> Result<String, DomainError> {
     if title.is_empty() {
         return Err(DomainError::InvalidInput(

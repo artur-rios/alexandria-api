@@ -6,8 +6,8 @@ use crate::catalog::model::PurgeOnDiskOutcome;
 use crate::catalog::repos::CatalogRepository;
 use crate::errors::DomainError;
 
-/// UC-09 — Purge a file both on disk and in the catalog (FR-FC-23,
-/// FR-FC-24). Unlike UC-08 there is no retention gate: the file's record may
+/// UC-09 — Purge a file both on disk and in the catalog (FR-FC-23).
+/// Unlike UC-08 there is no retention gate: the file's record may
 /// be `active` or `deleted` — the only precondition is that it exists
 /// (BR-11: purge-on-disk is a distinct operation from the retention-gated
 /// hard purge and does not share its restriction).

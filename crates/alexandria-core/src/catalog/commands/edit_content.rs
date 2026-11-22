@@ -39,8 +39,7 @@ use crate::errors::DomainError;
 /// Generic over the catalog repository, filesystem, and clock so the same
 /// decision logic is unit-tested against trait fakes (no real DB or fs in unit
 /// tests), then wired with the concrete collaborators at runtime
-/// (services.rs). Both the HTTP and FFI surfaces call this handler so the two
-/// stay at parity (FR-FC-24 / NFR-09).
+/// (services.rs).
 pub struct EditTextFileContentHandler<R, F, C> {
     repo: R,
     fs: F,

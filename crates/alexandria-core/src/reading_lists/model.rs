@@ -2,8 +2,8 @@ use serde::Serialize;
 use uuid::Uuid;
 
 /// A reading list about to be persisted (UC-26). The `uuid` is minted by
-/// the handler, not the repository, so the value is decided by the same
-/// code on both transports and a unit test can assert it against a fake.
+/// the handler, not the repository, so a unit test can assert it against a
+/// fake.
 #[derive(Debug, Clone)]
 pub struct NewReadingList {
     pub uuid: Uuid,

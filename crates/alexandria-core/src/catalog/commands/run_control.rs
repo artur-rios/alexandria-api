@@ -48,8 +48,8 @@ pub struct RunControlHandler<RR, C> {
 ///
 /// `resume` records the state change and hands this back rather than spawning
 /// anything, mirroring how `start` and `execute` are already separated: the
-/// FFI and HTTP layers own the runtime, and a handler that spawned would take
-/// that decision away from them and force `Send + 'static` onto collaborators
+/// FFI layer owns the runtime, and a handler that spawned would take
+/// that decision away from it and force `Send + 'static` onto collaborators
 /// that have no other reason to carry it.
 ///
 /// `kind` is what says which handler's `execute` to spawn, and `root` is

@@ -106,10 +106,10 @@ impl Default for DeletionSettings {
     }
 }
 
-/// The on-disk library root the health check probes for reachability
-/// (UC-37 / IR-03). Distinct from the per-request `root` UC-01/UC-02 take —
-/// this is the single configured location an operator points the health
-/// probe at.
+/// The on-disk library root that bounds what the catalog can reach
+/// (FR-FC-26): the folders libraries may be added at or moved to, and the
+/// cataloged files playback and the file-content operations will touch.
+/// Empty turns the bound off.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct FilesystemSettings {
     #[serde(default)]
