@@ -5141,6 +5141,20 @@ fn given_an_unknown_a_deleted_or_an_unsuitable_file_when_played_over_ffi_then_ea
     );
 }
 
+#[test]
+fn given_a_cataloged_file_deleted_from_disk_when_playback_source_requested_then_disk_error() {
+    let _g = serial();
+    let db = init_temp_db();
+    let root = library_with(&db, &[("vanished.mp4", b"0123456789")]);
+    let uuid = uuid_by_name(&db.1, "vanished.mp4");
+    std::fs::remove_file(format!("{root}/vanished.mp4")).unwrap();
+
+    let (status, value) = playback_source(&uuid);
+
+    assert_eq!(status, alexandria_ffi::PLAYBACK_ERR_DISK);
+    assert!(value.is_null());
+}
+
 #[cfg(unix)]
 #[test]
 fn given_a_row_reaching_out_through_a_symlink_or_climbing_out_with_dot_dot_when_played_over_ffi_then_invalid_input(
