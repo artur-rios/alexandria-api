@@ -31,9 +31,8 @@ dependencies = [
 
 [[package]]
 name = "alexandria-core"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
- "anyhow",
  "chrono",
  "epub",
  "ffmpeg-next",
@@ -61,7 +60,7 @@ dependencies = [
 
 [[package]]
 name = "alexandria-ffi"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "alexandria-core",
  "base64 0.23.1",
@@ -160,12 +159,6 @@ dependencies = [
  "once_cell_polyfill",
  "windows-sys",
 ]
-
-[[package]]
-name = "anyhow"
-version = "1.0.104"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
 name = "atoi"

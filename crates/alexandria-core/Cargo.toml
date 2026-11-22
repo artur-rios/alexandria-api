@@ -8,7 +8,6 @@ license-file.workspace = true
 repository.workspace = true
 
 [dependencies]
-anyhow.workspace = true
 chrono.workspace = true
 epub.workspace = true
 ffmpeg-next.workspace = true
