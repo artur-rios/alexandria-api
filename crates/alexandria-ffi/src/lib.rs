@@ -6,12 +6,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use tokio::runtime::{Builder, Runtime};
 
-use alexandria_core::auth::windows_identity::{verify_owner, ProcessWindowsIdentity};
-use alexandria_core::auth::AuthService;
 use alexandria_core::catalog::runs::{RunKind, RunPriority};
-use alexandria_core::config::AuthMode;
 use alexandria_core::config::Settings;
-use alexandria_core::errors::{error_body, DomainError};
+use alexandria_core::errors::DomainError;
 use alexandria_core::migrate::migrate_database;
 use alexandria_core::services::{build_services, Services};
 
@@ -28,9 +25,12 @@ static RUNTIME: OnceLock<Runtime> = OnceLock::new();
 static SERVICES: OnceLock<Mutex<Option<Arc<Services>>>> = OnceLock::new();
 
 /// FFI status codes returned by index operations.
+///
+/// Code 2 is missing here and in every family below: it was
+/// `*_ERR_UNAUTHORIZED`, retired with authentication, and is never reused,
+/// so a caller built against an older core cannot read a new failure as it.
 pub const INDEX_OK: c_int = 0;
 pub const INDEX_ERR_INVALID_INPUT: c_int = 1;
-pub const INDEX_ERR_UNAUTHORIZED: c_int = 2;
 pub const INDEX_ERR_NOT_INITIALIZED: c_int = 3;
 pub const INDEX_ERR_OTHER: c_int = 4;
 /// `alexandria_index_init` only: this core is executing a run, so it will not
@@ -42,9 +42,9 @@ pub const INDEX_ERR_OTHER: c_int = 4;
 /// takes effect when the scan finishes" instead of reporting an error for
 /// something that is going to work.
 pub const INDEX_ERR_BUSY: c_int = 5;
-/// `alexandria_library_index_start` named no library (HTTP's `404`).
+/// `alexandria_library_index_start` named no library.
 pub const INDEX_ERR_NOT_FOUND: c_int = 6;
-/// The library already has an unfinished run (FR-FC-43; HTTP's `409`).
+/// The library already has an unfinished run (FR-FC-43).
 pub const INDEX_ERR_CONFLICT: c_int = 7;
 
 /// FFI status codes returned by file operations (UC-04+). Deliberately
@@ -52,7 +52,6 @@ pub const INDEX_ERR_CONFLICT: c_int = 7;
 /// colliding; `FILE_OK == INDEX_OK == 0` by convention.
 pub const FILE_OK: c_int = 0;
 pub const FILE_ERR_INVALID_INPUT: c_int = 1;
-pub const FILE_ERR_UNAUTHORIZED: c_int = 2;
 pub const FILE_ERR_NOT_INITIALIZED: c_int = 3;
 pub const FILE_ERR_NOT_FOUND: c_int = 4;
 pub const FILE_ERR_INVALID_STATE: c_int = 5;
@@ -67,7 +66,6 @@ pub const FILE_ERR_OTHER: c_int = 9;
 /// collection is catalog-only metadata with nothing on disk.
 pub const COLLECTION_OK: c_int = 0;
 pub const COLLECTION_ERR_INVALID_INPUT: c_int = 1;
-pub const COLLECTION_ERR_UNAUTHORIZED: c_int = 2;
 pub const COLLECTION_ERR_NOT_INITIALIZED: c_int = 3;
 pub const COLLECTION_ERR_NOT_FOUND: c_int = 4;
 pub const COLLECTION_ERR_INVALID_STATE: c_int = 5;
@@ -79,7 +77,6 @@ pub const COLLECTION_ERR_OTHER: c_int = 9;
 /// `PLAYBACK_OK == FILE_OK == 0` by convention.
 pub const PLAYBACK_OK: c_int = 0;
 pub const PLAYBACK_ERR_INVALID_INPUT: c_int = 1;
-pub const PLAYBACK_ERR_UNAUTHORIZED: c_int = 2;
 pub const PLAYBACK_ERR_NOT_INITIALIZED: c_int = 3;
 pub const PLAYBACK_ERR_NOT_FOUND: c_int = 4;
 pub const PLAYBACK_ERR_INVALID_STATE: c_int = 5;
@@ -146,17 +143,6 @@ fn ffi_guard<T>(on_panic: T, body: impl FnOnce() -> T) -> T {
         Ok(value) => value,
         Err(_) => on_panic,
     }
-}
-
-/// Authenticate the caller before any payload is looked at.
-///
-/// The handlers authenticate too, but they can only do so *after* their
-/// arguments have been parsed — which let a caller with no credentials learn
-/// that its UUID or JSON was malformed. SRD §7 and FR-AU-07 deny an
-/// unauthenticated call outright, and the HTTP surface gates the same way in
-/// its `require_auth` middleware (FR-FC-24 / NFR-09).
-fn authenticated(services: &Services, token: &str) -> bool {
-    runtime().block_on(async { services.auth.authenticate(token).await.is_ok() })
 }
 
 /// Result of starting an index run. `run_id` is a NUL-terminated UUID string
@@ -244,9 +230,9 @@ fn cstr_utf8(ptr: *const c_char) -> Option<String> {
 /// `"low"` maps to `RunPriority::Low`; anything else — NULL, `"normal"`, an
 /// unrecognised word, or malformed UTF-8 lossily decoded to garbage — maps to
 /// `RunPriority::Normal`. A client that cannot spell the value gets the safe
-/// default rather than a rejected call; the same lenient rule the HTTP body
-/// (Task 12) uses, so the two surfaces agree on what an unreadable priority
-/// means as well as on the words they both accept (FR-FC-24).
+/// default rather than a rejected call. `alexandria_library_register` and
+/// `alexandria_library_index_start` both use it, so every start agrees on what
+/// an unreadable priority means as well as on the words it accepts.
 fn parse_priority(raw: Option<String>) -> RunPriority {
     match raw.as_deref() {
         Some("low") => RunPriority::Low,
@@ -263,11 +249,10 @@ fn parse_priority(raw: Option<String>) -> RunPriority {
 /// [`parse_priority`], and it is deliberate rather than an inconsistency:
 /// starting a run must produce *some* width, so an unreadable priority there
 /// has to fall to a default, but a run being resumed already has one. Folding
-/// NULL into `Normal` here would silently speed every low-priority run back
-/// up the moment a caller written before this parameter existed passed the
-/// NULL it has always passed. Same lenient rule as `parse_priority` about
-/// *how* an unreadable value is treated — quietly, never as a rejected call —
-/// and the same rule the HTTP body uses (FR-FC-24).
+/// NULL into `Normal` here would silently speed every low-priority run back up
+/// the moment a caller written before this parameter existed passed the NULL
+/// it has always passed. Same lenient rule as `parse_priority` about *how* an
+/// unreadable value is treated — quietly, never as a rejected call.
 fn parse_resume_priority(raw: Option<String>) -> Option<RunPriority> {
     match raw.as_deref() {
         Some("low") => Some(RunPriority::Low),
@@ -309,13 +294,11 @@ pub extern "C" fn alexandria_health_status_code() -> i32 {
 /// succeeds. Pointing at a *different* database is subject to the same rule,
 /// for the same reason.
 ///
-/// Configuration is loaded the same way `alexandria-http` loads it — from the
-/// path in `ALEXANDRIA_CONFIG` (default `config.toml`), with `ALEXANDRIA_*`
-/// environment overrides applied — so a setting such as the auth mode or the
-/// retention window means the same thing on both surfaces (FR-FC-24 / NFR-09).
-/// A missing or unreadable config file falls back to defaults rather than
-/// failing, matching the HTTP binary. `db_path` wins over the config's
-/// `database.path`: the embedder passed it explicitly.
+/// Configuration is loaded from the path in `ALEXANDRIA_CONFIG` (default
+/// `config.toml`), with `ALEXANDRIA_*` environment overrides applied. A
+/// missing or unreadable config file falls back to defaults rather than
+/// failing. `db_path` wins over the config's `database.path`: the embedder
+/// passed it explicitly.
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
 pub extern "C" fn alexandria_index_init(db_path: *const c_char) -> c_int {
@@ -342,24 +325,6 @@ pub extern "C" fn alexandria_index_init(db_path: *const c_char) -> c_int {
         }
         let mut settings = load_settings();
         settings.database.path = path.clone();
-        // Same gate as the HTTP binary: a misconfigured mode is a startup failure
-        // on both surfaces (FR-AU-08).
-        // Both messages are logged rather than discarded: the embedder only gets an
-        // opaque status code back, and FFI is the surface an operator is most
-        // likely to hit a misconfiguration on. A SID names an account rather than
-        // authenticating one, so naming both of them costs nothing (FR-AU-21).
-        if let Err(err) = settings.auth.validate() {
-            tracing::error!(error = %err, "auth configuration is invalid; refusing to initialize");
-            return INDEX_ERR_OTHER;
-        }
-        if settings.auth.mode == AuthMode::Windows {
-            if let Err(err) =
-                verify_owner(&ProcessWindowsIdentity, &settings.auth.windows_owner_sid)
-            {
-                tracing::error!(error = %err, "windows-mode startup check failed");
-                return INDEX_ERR_OTHER;
-            }
-        }
         let _ = runtime();
         let result = runtime().block_on(async {
             let pool = migrate_database(&path).await?;
@@ -395,8 +360,8 @@ pub extern "C" fn alexandria_index_init(db_path: *const c_char) -> c_int {
     })
 }
 
-/// Load settings exactly as the HTTP binary does: `ALEXANDRIA_CONFIG` or
-/// `config.toml`, then `ALEXANDRIA_*` environment overrides.
+/// Load settings from `ALEXANDRIA_CONFIG` or `config.toml`, then the
+/// `ALEXANDRIA_*` environment overrides.
 fn load_settings() -> Settings {
     let config_path = std::env::var("ALEXANDRIA_CONFIG")
         .map(std::path::PathBuf::from)
@@ -405,30 +370,25 @@ fn load_settings() -> Settings {
 }
 
 /// Start an asynchronous re-index/refresh of every cataloged path (UC-02).
-/// Takes only a token (no root — refresh touches everything cataloged) and
-/// returns a `IndexStartResult` with a `run_id` and `status` (parity with the
-/// HTTP `POST /v1/index/refresh` 202 body). The refresh runs in the background
-/// on the FFI runtime; read results via the accessor functions.
+/// Takes no root — refresh touches everything cataloged — and returns a
+/// `IndexStartResult` with a `run_id` and `status`. The refresh runs in the
+/// background on the FFI runtime; read results via the accessor functions.
 ///
 /// `priority` is parsed exactly as `alexandria_library_index_start`'s is — see that
 /// function's doc comment for the accepted spellings and the NULL/garbage
 /// fallback.
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
-pub extern "C" fn alexandria_index_refresh_start(
-    token: *const c_char,
-    priority: *const c_char,
-) -> IndexStartResult {
+pub extern "C" fn alexandria_index_refresh_start(priority: *const c_char) -> IndexStartResult {
     ffi_guard(IndexStartResult::err(INDEX_ERR_OTHER), || {
         let services = match locked_services() {
             Some(s) => s,
             None => return IndexStartResult::err(INDEX_ERR_NOT_INITIALIZED),
         };
-        let token = cstr_lossy(token).unwrap_or_default();
         let priority = parse_priority(cstr_lossy(priority));
         let rt = runtime();
 
-        let started = rt.block_on(async { services.refresh_handler.start(priority, &token).await });
+        let started = rt.block_on(async { services.refresh_handler.start(priority).await });
 
         match started {
             Ok(s) => {
@@ -446,7 +406,6 @@ pub extern "C" fn alexandria_index_refresh_start(
                 });
                 IndexStartResult::ok(&s.run_id.to_string())
             }
-            Err(DomainError::Unauthorized) => IndexStartResult::err(INDEX_ERR_UNAUTHORIZED),
             Err(_) => IndexStartResult::err(INDEX_ERR_OTHER),
         }
     })
@@ -472,10 +431,8 @@ pub extern "C" fn alexandria_index_count_files() -> i64 {
 
 /// Result of `alexandria_file_edit_metadata` (UC-04). On success `status` is
 /// `FILE_OK` and `json` is a NUL-terminated JSON string of the `FileMetadata`
-/// body — byte-for-byte the same shape HTTP returns from
-/// `PATCH /v1/files/{uuid}/metadata` (FR-FC-24 / NFR-09). On failure `json`
-/// is NULL and `status` carries the mapped error code. The caller must free
-/// `json` with `alexandria_free_string`.
+/// body. On failure `json` is NULL and `status` carries the mapped error code.
+/// The caller must free `json` with `alexandria_free_string`.
 #[repr(C)]
 #[derive(Debug)]
 pub struct FileMetadataResult {
@@ -502,31 +459,21 @@ impl FileMetadataResult {
 
 /// Edit a file's type-specific metadata (UC-04 / FR-FC-15..18).
 ///
-/// `uuid` is the file's public UUID string; `json_patch` is the JSON body
-/// (the `SubtypeMetadata` enum, internally tagged by `type`) that HTTP would
-/// send. The function deserializes it, calls the same `EditMetadataHandler`
-/// the HTTP route uses, and on success serializes the returned `FileMetadata`
-/// back to JSON — so the FFI and HTTP surfaces agree byte-for-byte modulo key
-/// ordering (parity, FR-FC-24 / NFR-09). `token` is the bearer auth token.
+/// `uuid` is the file's public UUID string; `json_patch` is the JSON body (the
+/// `SubtypeMetadata` enum, internally tagged by `type`). The function
+/// deserializes it, calls `EditMetadataHandler`, and on success serializes the
+/// returned `FileMetadata` back to JSON.
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
 pub extern "C" fn alexandria_file_edit_metadata(
     uuid: *const c_char,
     json_patch: *const c_char,
-    token: *const c_char,
 ) -> FileMetadataResult {
     ffi_guard(FileMetadataResult::err(FILE_ERR_OTHER), || {
         let services = match locked_services() {
             Some(s) => s,
             None => return FileMetadataResult::err(FILE_ERR_NOT_INITIALIZED),
         };
-
-        // Deny before touching the payload — an unauthenticated caller must
-        // not learn whether its uuid or body would have parsed.
-        let token = cstr_lossy(token).unwrap_or_default();
-        if !authenticated(&services, &token) {
-            return FileMetadataResult::err(FILE_ERR_UNAUTHORIZED);
-        }
 
         let uuid_str = match cstr_lossy(uuid) {
             Some(s) => s,
@@ -547,12 +494,8 @@ pub extern "C" fn alexandria_file_edit_metadata(
                 Err(_) => return FileMetadataResult::err(FILE_ERR_INVALID_INPUT),
             };
 
-        let result = runtime().block_on(async {
-            services
-                .edit_metadata_handler
-                .edit(uuid, metadata, &token)
-                .await
-        });
+        let result =
+            runtime().block_on(async { services.edit_metadata_handler.edit(uuid, metadata).await });
 
         match result {
             Ok(file_metadata) => {
@@ -561,7 +504,6 @@ pub extern "C" fn alexandria_file_edit_metadata(
             }
             Err(err) => match err {
                 DomainError::NotFound => FileMetadataResult::err(FILE_ERR_NOT_FOUND),
-                DomainError::Unauthorized => FileMetadataResult::err(FILE_ERR_UNAUTHORIZED),
                 DomainError::InvalidInput(_) => FileMetadataResult::err(FILE_ERR_INVALID_INPUT),
                 DomainError::InvalidState => FileMetadataResult::err(FILE_ERR_INVALID_STATE),
                 _ => FileMetadataResult::err(FILE_ERR_OTHER),
@@ -570,14 +512,12 @@ pub extern "C" fn alexandria_file_edit_metadata(
     })
 }
 
-/// Result of `alexandria_files_list` and `alexandria_file_get_by_uuid` (UC-03).
-/// On success `status` is `FILE_OK` and `json` is a NUL-terminated JSON string
-/// — byte-for-byte the same shape HTTP returns from `GET /v1/files` (a JSON
-/// array of `FileView` objects, issue #116) or `GET /v1/files/{uuid}` (a
-/// single `FileView` object), so the FFI and HTTP surfaces agree modulo key
-/// ordering (parity, FR-FC-24 / NFR-09). On failure `json` is NULL and
-/// `status` carries the mapped error code. The caller must free `json` with
-/// `alexandria_free_string`.
+/// Result of `alexandria_files_list` and `alexandria_file_get_by_uuid`
+/// (UC-03). On success `status` is `FILE_OK` and `json` is a NUL-terminated
+/// JSON string: an array of `FileView` objects for the listing (issue #116),
+/// or a single `FileView` object for the lookup. On failure `json` is NULL
+/// and `status` carries the mapped error code. The caller must free `json`
+/// with `alexandria_free_string`.
 #[repr(C)]
 #[derive(Debug)]
 pub struct FileJsonResult {
@@ -631,7 +571,6 @@ impl PlaybackJsonResult {
 fn map_playback_err(err: DomainError) -> PlaybackJsonResult {
     match err {
         DomainError::NotFound => PlaybackJsonResult::err(PLAYBACK_ERR_NOT_FOUND),
-        DomainError::Unauthorized => PlaybackJsonResult::err(PLAYBACK_ERR_UNAUTHORIZED),
         DomainError::InvalidInput(_) => PlaybackJsonResult::err(PLAYBACK_ERR_INVALID_INPUT),
         DomainError::InvalidState => PlaybackJsonResult::err(PLAYBACK_ERR_INVALID_STATE),
         DomainError::Disk(_) => PlaybackJsonResult::err(PLAYBACK_ERR_DISK),
@@ -643,8 +582,7 @@ fn map_playback_err(err: DomainError) -> PlaybackJsonResult {
 /// Both fields optional; an empty/null body, omitted fields, or empty-string
 /// values use the defaults (`file_type = None`, `state = "active"` — excludes
 /// deleted records per the use case's main-flow step 2). An unrecognised
-/// `type` or `state` value is rejected as `FILE_ERR_INVALID_INPUT`, matching
-/// the HTTP surface's `400` (FR-FC-24 / NFR-09).
+/// `type` or `state` value is rejected as `FILE_ERR_INVALID_INPUT`.
 #[derive(Debug, Default)]
 struct FilesListFilter {
     file_type: Option<String>,
@@ -688,32 +626,19 @@ impl FilesListFilter {
 ///
 /// `json_filters` is a JSON string `{"type":"video","state":"all"}` (empty
 /// string or NULL for defaults), answered across every library unless
-/// `"libraryUuid"` names one. The
-/// function deserializes it, calls the same
-/// `BrowseFilesHandler` the HTTP route uses, and on success serializes the
-/// returned `Vec<FileView>` back to a JSON array — each element the same
+/// `"libraryUuid"` names one. The function deserializes it, calls
+/// `BrowseFilesHandler`, and on success serializes the returned
+/// `Vec<FileView>` back to a JSON array — each element the same
 /// `{"file": …, "metadata": …, …}` shape `alexandria_file_get_by_uuid`
-/// answers for one file (issue #116) — so the FFI and HTTP surfaces agree
-/// byte-for-byte modulo key ordering (parity, FR-FC-24 / NFR-09). `token` is
-/// the bearer auth token.
+/// answers for one file (issue #116).
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
-pub extern "C" fn alexandria_files_list(
-    json_filters: *const c_char,
-    token: *const c_char,
-) -> FileJsonResult {
+pub extern "C" fn alexandria_files_list(json_filters: *const c_char) -> FileJsonResult {
     ffi_guard(FileJsonResult::err(FILE_ERR_OTHER), || {
         let services = match locked_services() {
             Some(s) => s,
             None => return FileJsonResult::err(FILE_ERR_NOT_INITIALIZED),
         };
-
-        // Deny before touching the payload — an unauthenticated caller must
-        // not learn whether its filters would have validated.
-        let token = cstr_lossy(token).unwrap_or_default();
-        if !authenticated(&services, &token) {
-            return FileJsonResult::err(FILE_ERR_UNAUTHORIZED);
-        }
 
         let filter_str = cstr_lossy(json_filters).unwrap_or_default();
         let parsed = match FilesListFilter::from_json_str(&filter_str) {
@@ -721,9 +646,9 @@ pub extern "C" fn alexandria_files_list(
             None => return FileJsonResult::err(FILE_ERR_INVALID_INPUT),
         };
 
-        // An unrecognised filter value is invalid input, not a silently dropped
-        // filter — HTTP answers `400` for these and the two surfaces must agree
-        // (FR-FC-24 / NFR-09). An empty string means "no filter", as on HTTP.
+        // An unrecognised filter value is invalid input, not a silently
+        // dropped filter: a caller that misspells a type must hear about it
+        // rather than get every file. An empty string means "no filter".
         let file_type = match parsed.file_type.as_deref().filter(|s| !s.is_empty()) {
             Some(t) => match alexandria_core::catalog::model::FileType::from_wire(t) {
                 Some(ft) => Some(ft),
@@ -751,8 +676,8 @@ pub extern "C" fn alexandria_files_list(
             };
             filter = filter.with_collection(collection_uuid);
         }
-        // One library's files, parsed as `collectionUuid` is (FR-FC-24):
-        // malformed is invalid input, unknown answers `[]`.
+        // One library's files, parsed as `collectionUuid` is: malformed is
+        // invalid input, unknown answers `[]`.
         if let Some(l) = parsed.library_uuid.as_deref().filter(|s| !s.is_empty()) {
             let library_uuid = match uuid::Uuid::parse_str(l) {
                 Ok(u) => u,
@@ -761,8 +686,7 @@ pub extern "C" fn alexandria_files_list(
             filter = filter.with_library(library_uuid);
         }
 
-        let result =
-            runtime().block_on(async { services.browse_files_handler.list(filter, &token).await });
+        let result = runtime().block_on(async { services.browse_files_handler.list(filter).await });
 
         match result {
             Ok(files) => {
@@ -776,29 +700,17 @@ pub extern "C" fn alexandria_files_list(
 
 /// Get a single file's metadata by its public UUID (UC-03 / FR-FC-13).
 ///
-/// `uuid` is the file's public UUID string. The function calls the same
-/// `BrowseFilesHandler::get_by_uuid` the HTTP route uses, and on success
-/// serializes the returned `FileView` back to JSON — the same shape HTTP
-/// returns from `GET /v1/files/{uuid}` (parity, FR-FC-24 / NFR-09). `token`
-/// is the bearer auth token.
+/// `uuid` is the file's public UUID string. The function calls
+/// `BrowseFilesHandler::get_by_uuid`, and on success serializes the returned
+/// `FileView` back to JSON.
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
-pub extern "C" fn alexandria_file_get_by_uuid(
-    uuid: *const c_char,
-    token: *const c_char,
-) -> FileJsonResult {
+pub extern "C" fn alexandria_file_get_by_uuid(uuid: *const c_char) -> FileJsonResult {
     ffi_guard(FileJsonResult::err(FILE_ERR_OTHER), || {
         let services = match locked_services() {
             Some(s) => s,
             None => return FileJsonResult::err(FILE_ERR_NOT_INITIALIZED),
         };
-
-        // Deny before touching the payload — an unauthenticated caller must
-        // not learn whether its uuid would have parsed.
-        let token = cstr_lossy(token).unwrap_or_default();
-        if !authenticated(&services, &token) {
-            return FileJsonResult::err(FILE_ERR_UNAUTHORIZED);
-        }
 
         let uuid_str = match cstr_lossy(uuid) {
             Some(s) => s,
@@ -809,12 +721,8 @@ pub extern "C" fn alexandria_file_get_by_uuid(
             Err(_) => return FileJsonResult::err(FILE_ERR_INVALID_INPUT),
         };
 
-        let result = runtime().block_on(async {
-            services
-                .browse_files_handler
-                .get_by_uuid(uuid, &token)
-                .await
-        });
+        let result =
+            runtime().block_on(async { services.browse_files_handler.get_by_uuid(uuid).await });
 
         match result {
             Ok(view) => {
@@ -828,28 +736,16 @@ pub extern "C" fn alexandria_file_get_by_uuid(
 
 /// Read a TextFile's content from disk (UC-32 / FR-TX-01).
 ///
-/// `uuid` is the file's public UUID (NUL-terminated string). On success
-/// `json` carries the `FileContent` — byte-for-byte the same shape HTTP
-/// returns from `GET /v1/files/{uuid}/content` (parity, FR-FC-24 / NFR-09).
-/// `token` is the bearer auth token.
+/// `uuid` is the file's public UUID (NUL-terminated string). On success `json`
+/// carries the `FileContent`.
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
-pub extern "C" fn alexandria_file_read_content(
-    uuid: *const c_char,
-    token: *const c_char,
-) -> FileJsonResult {
+pub extern "C" fn alexandria_file_read_content(uuid: *const c_char) -> FileJsonResult {
     ffi_guard(FileJsonResult::err(FILE_ERR_OTHER), || {
         let services = match locked_services() {
             Some(s) => s,
             None => return FileJsonResult::err(FILE_ERR_NOT_INITIALIZED),
         };
-
-        // Deny before touching the payload — an unauthenticated caller must
-        // not learn whether its uuid would have parsed.
-        let token = cstr_lossy(token).unwrap_or_default();
-        if !authenticated(&services, &token) {
-            return FileJsonResult::err(FILE_ERR_UNAUTHORIZED);
-        }
 
         let uuid_str = match cstr_lossy(uuid) {
             Some(s) => s,
@@ -860,12 +756,8 @@ pub extern "C" fn alexandria_file_read_content(
             Err(_) => return FileJsonResult::err(FILE_ERR_INVALID_INPUT),
         };
 
-        let result = runtime().block_on(async {
-            services
-                .read_text_file_content_handler
-                .read(uuid, &token)
-                .await
-        });
+        let result =
+            runtime().block_on(async { services.read_text_file_content_handler.read(uuid).await });
 
         match result {
             Ok(content) => {
@@ -880,41 +772,28 @@ pub extern "C" fn alexandria_file_read_content(
 /// Resolve a File to everything a local player needs to open it
 /// (UC-38 / FR-MP-01, FR-MP-06).
 ///
-/// The FFI surface cannot carry a byte stream, so where HTTP streams
-/// `GET /v1/files/{uuid}/stream`, this returns
-/// `{"uuid":…,"path":…,"mimeType":…,"sizeBytes":…}` and the caller — Flutter
-/// desktop, on the same machine as the file — opens that path directly.
-/// Zero bytes cross this boundary. Parity with HTTP is defined on this
-/// descriptor and on the authorization, state, and error decisions rather
-/// than on byte transfer (FR-MP-06). A file whose path resolves outside the
-/// configured `filesystem.root` gets `PLAYBACK_ERR_INVALID_INPUT` and no
-/// descriptor (FR-FC-26), as HTTP's `400`.
+/// The FFI surface cannot carry a byte stream, so rather than stream the
+/// file, this returns `{"uuid":…,"path":…,"mimeType":…,"sizeBytes":…}` and
+/// the caller — Flutter desktop, on the same machine as the file — opens that
+/// path directly. Zero bytes cross this boundary (FR-MP-06). A file whose
+/// path resolves outside the configured `filesystem.root` gets
+/// `PLAYBACK_ERR_INVALID_INPUT` and no descriptor (FR-FC-26).
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
-pub extern "C" fn alexandria_file_playback_source(
-    uuid: *const c_char,
-    token: *const c_char,
-) -> PlaybackJsonResult {
+pub extern "C" fn alexandria_file_playback_source(uuid: *const c_char) -> PlaybackJsonResult {
     ffi_guard(PlaybackJsonResult::err(PLAYBACK_ERR_OTHER), || {
         let services = match locked_services() {
             Some(s) => s,
             None => return PlaybackJsonResult::err(PLAYBACK_ERR_NOT_INITIALIZED),
         };
 
-        // Deny before touching the payload — an unauthenticated caller must not
-        // learn whether its uuid would have parsed.
-        let token = cstr_lossy(token).unwrap_or_default();
-        if !authenticated(&services, &token) {
-            return PlaybackJsonResult::err(PLAYBACK_ERR_UNAUTHORIZED);
-        }
-
         let uuid = match cstr_lossy(uuid).and_then(|s| uuid::Uuid::parse_str(&s).ok()) {
             Some(u) => u,
             None => return PlaybackJsonResult::err(PLAYBACK_ERR_INVALID_INPUT),
         };
 
-        let result = runtime()
-            .block_on(async { services.playback_source_handler.resolve(uuid, &token).await });
+        let result =
+            runtime().block_on(async { services.playback_source_handler.resolve(uuid).await });
 
         match result {
             Ok(source) => {
@@ -932,36 +811,23 @@ pub extern "C" fn alexandria_file_playback_source(
 /// Unlike UC-38, the bytes *do* cross the boundary: a comic page has no path
 /// of its own — it lives inside an archive — and it is bounded, so
 /// base64 inside the existing JSON payload keeps the FFI shape intact while
-/// staying byte-exact with HTTP.
+/// staying byte-exact with the page in the archive.
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
-pub extern "C" fn alexandria_comic_page(
-    uuid: *const c_char,
-    page: u32,
-    token: *const c_char,
-) -> PlaybackJsonResult {
+pub extern "C" fn alexandria_comic_page(uuid: *const c_char, page: u32) -> PlaybackJsonResult {
     ffi_guard(PlaybackJsonResult::err(PLAYBACK_ERR_OTHER), || {
         let services = match locked_services() {
             Some(s) => s,
             None => return PlaybackJsonResult::err(PLAYBACK_ERR_NOT_INITIALIZED),
         };
 
-        let token = cstr_lossy(token).unwrap_or_default();
-        if !authenticated(&services, &token) {
-            return PlaybackJsonResult::err(PLAYBACK_ERR_UNAUTHORIZED);
-        }
-
         let uuid = match cstr_lossy(uuid).and_then(|s| uuid::Uuid::parse_str(&s).ok()) {
             Some(u) => u,
             None => return PlaybackJsonResult::err(PLAYBACK_ERR_INVALID_INPUT),
         };
 
-        let result = runtime().block_on(async {
-            services
-                .comic_page_handler
-                .read_page(uuid, page, &token)
-                .await
-        });
+        let result =
+            runtime().block_on(async { services.comic_page_handler.read_page(uuid, page).await });
 
         match result {
             Ok(comic_page) => {
@@ -988,28 +854,19 @@ pub extern "C" fn alexandria_comic_page(
 /// bytes, so the same base64 rule as `alexandria_comic_page` applies.
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
-pub extern "C" fn alexandria_file_thumbnail(
-    uuid: *const c_char,
-    token: *const c_char,
-) -> PlaybackJsonResult {
+pub extern "C" fn alexandria_file_thumbnail(uuid: *const c_char) -> PlaybackJsonResult {
     ffi_guard(PlaybackJsonResult::err(PLAYBACK_ERR_OTHER), || {
         let services = match locked_services() {
             Some(s) => s,
             None => return PlaybackJsonResult::err(PLAYBACK_ERR_NOT_INITIALIZED),
         };
 
-        let token = cstr_lossy(token).unwrap_or_default();
-        if !authenticated(&services, &token) {
-            return PlaybackJsonResult::err(PLAYBACK_ERR_UNAUTHORIZED);
-        }
-
         let uuid = match cstr_lossy(uuid).and_then(|s| uuid::Uuid::parse_str(&s).ok()) {
             Some(u) => u,
             None => return PlaybackJsonResult::err(PLAYBACK_ERR_INVALID_INPUT),
         };
 
-        let result =
-            runtime().block_on(async { services.thumbnail_handler.thumbnail(uuid, &token).await });
+        let result = runtime().block_on(async { services.thumbnail_handler.thumbnail(uuid).await });
 
         match result {
             Ok(thumb) => {
@@ -1028,8 +885,7 @@ pub extern "C" fn alexandria_file_thumbnail(
     })
 }
 
-/// Request body accepted by `alexandria_file_edit_content` — the same JSON
-/// `PUT /v1/files/{uuid}/content` takes: `{"content":"…"}`.
+/// Request body accepted by `alexandria_file_edit_content`: `{"content":"…"}`.
 #[derive(Debug)]
 struct EditContentBody {
     content: String,
@@ -1048,28 +904,20 @@ impl EditContentBody {
 /// FR-TX-03).
 ///
 /// `uuid` is the file's public UUID (NUL-terminated string). `json_body` is
-/// the JSON body HTTP would send (`content`). The function deserializes it,
-/// calls the same `EditTextFileContentHandler` the HTTP route uses, and on
-/// success serializes the returned `File` back to JSON — so the FFI and
-/// HTTP surfaces agree byte-for-byte modulo key ordering (parity,
-/// FR-FC-24 / NFR-09). `token` is the bearer auth token.
+/// the JSON body (`content`). The function deserializes it, calls
+/// `EditTextFileContentHandler`, and on success serializes the returned `File`
+/// back to JSON.
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
 pub extern "C" fn alexandria_file_edit_content(
     uuid: *const c_char,
     json_body: *const c_char,
-    token: *const c_char,
 ) -> FileJsonResult {
     ffi_guard(FileJsonResult::err(FILE_ERR_OTHER), || {
         let services = match locked_services() {
             Some(s) => s,
             None => return FileJsonResult::err(FILE_ERR_NOT_INITIALIZED),
         };
-
-        let token = cstr_lossy(token).unwrap_or_default();
-        if !authenticated(&services, &token) {
-            return FileJsonResult::err(FILE_ERR_UNAUTHORIZED);
-        }
 
         let uuid_str = match cstr_lossy(uuid) {
             Some(s) => s,
@@ -1092,7 +940,7 @@ pub extern "C" fn alexandria_file_edit_content(
         let result = runtime().block_on(async {
             services
                 .edit_text_file_content_handler
-                .edit(uuid, body.content, &token)
+                .edit(uuid, body.content)
                 .await
         });
 
@@ -1109,31 +957,20 @@ pub extern "C" fn alexandria_file_edit_content(
 /// Rename a file (and its on-disk file) (UC-05 / FR-FC-19).
 ///
 /// `uuid` is the file's public UUID string; `name` is the new file name. The
-/// function calls the same `RenameFileHandler` the HTTP route uses and on
-/// success serializes the returned `File` back to JSON — the same shape HTTP
-/// returns from `POST /v1/files/{uuid}/rename`, so the FFI and HTTP surfaces
-/// agree byte-for-byte modulo key ordering (parity, FR-FC-24 / NFR-09).
-/// `token` is the bearer auth token. A disk failure (AF-02) maps to
-/// `FILE_ERR_DISK`; the catalog is left untouched in that case.
+/// function calls `RenameFileHandler` and on success serializes the returned
+/// `File` back to JSON. A disk failure (AF-02) maps to `FILE_ERR_DISK`; the
+/// catalog is left untouched in that case.
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
 pub extern "C" fn alexandria_file_rename(
     uuid: *const c_char,
     name: *const c_char,
-    token: *const c_char,
 ) -> FileJsonResult {
     ffi_guard(FileJsonResult::err(FILE_ERR_OTHER), || {
         let services = match locked_services() {
             Some(s) => s,
             None => return FileJsonResult::err(FILE_ERR_NOT_INITIALIZED),
         };
-
-        // Deny before touching the payload — an unauthenticated caller must
-        // not learn whether its uuid or name would have parsed.
-        let token = cstr_lossy(token).unwrap_or_default();
-        if !authenticated(&services, &token) {
-            return FileJsonResult::err(FILE_ERR_UNAUTHORIZED);
-        }
 
         let uuid_str = match cstr_lossy(uuid) {
             Some(s) => s,
@@ -1148,15 +985,11 @@ pub extern "C" fn alexandria_file_rename(
             Some(s) => s,
             None => return FileJsonResult::err(FILE_ERR_INVALID_INPUT),
         };
-        // An empty/whitespace name is rejected by the handler's validator, so it
-        // surfaces as `FILE_ERR_INVALID_INPUT` — consistent with the HTTP `400`.
+        // An empty/whitespace name is rejected by the handler's validator, so
+        // it surfaces as `FILE_ERR_INVALID_INPUT`.
 
-        let result = runtime().block_on(async {
-            services
-                .rename_file_handler
-                .rename(uuid, name, &token)
-                .await
-        });
+        let result =
+            runtime().block_on(async { services.rename_file_handler.rename(uuid, name).await });
 
         match result {
             Ok(file) => {
@@ -1170,31 +1003,18 @@ pub extern "C" fn alexandria_file_rename(
 
 /// Soft-delete a file (UC-06 / FR-FC-20).
 ///
-/// `uuid` is the file's public UUID string; `token` is the bearer auth token.
-/// The function calls the same `SoftDeleteFileHandler` the HTTP route uses
-/// and on success serializes the returned `File` back to JSON — the same
-/// shape HTTP returns from `DELETE /v1/files/{uuid}`, so the FFI and HTTP
-/// surfaces agree byte-for-byte modulo key ordering (parity, FR-FC-24 /
-/// NFR-09). The on-disk file is untouched (only `state` and `deleted_at`
+/// `uuid` is the file's public UUID string. The function calls
+/// `SoftDeleteFileHandler` and on success serializes the returned `File` back
+/// to JSON. The on-disk file is untouched (only `state` and `deleted_at`
 /// change on the catalog row).
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
-pub extern "C" fn alexandria_file_soft_delete(
-    uuid: *const c_char,
-    token: *const c_char,
-) -> FileJsonResult {
+pub extern "C" fn alexandria_file_soft_delete(uuid: *const c_char) -> FileJsonResult {
     ffi_guard(FileJsonResult::err(FILE_ERR_OTHER), || {
         let services = match locked_services() {
             Some(s) => s,
             None => return FileJsonResult::err(FILE_ERR_NOT_INITIALIZED),
         };
-
-        // Deny before touching the payload — an unauthenticated caller must not
-        // learn whether its uuid would have parsed.
-        let token = cstr_lossy(token).unwrap_or_default();
-        if !authenticated(&services, &token) {
-            return FileJsonResult::err(FILE_ERR_UNAUTHORIZED);
-        }
 
         let uuid_str = match cstr_lossy(uuid) {
             Some(s) => s,
@@ -1205,12 +1025,8 @@ pub extern "C" fn alexandria_file_soft_delete(
             Err(_) => return FileJsonResult::err(FILE_ERR_INVALID_INPUT),
         };
 
-        let result = runtime().block_on(async {
-            services
-                .soft_delete_file_handler
-                .soft_delete(uuid, &token)
-                .await
-        });
+        let result =
+            runtime().block_on(async { services.soft_delete_file_handler.soft_delete(uuid).await });
 
         match result {
             Ok(file) => {
@@ -1224,33 +1040,20 @@ pub extern "C" fn alexandria_file_soft_delete(
 
 /// Restore a soft-deleted file (UC-07 / FR-FC-21).
 ///
-/// `uuid` is the file's public UUID string; `token` is the bearer auth token.
-/// The function calls the same `RestoreFileHandler` the HTTP route uses and
-/// on success serializes the returned `File` back to JSON — the same shape
-/// HTTP returns from `POST /v1/files/{uuid}/restore`, so the FFI and HTTP
-/// surfaces agree byte-for-byte modulo key ordering (parity, FR-FC-24 /
-/// NFR-09). The on-disk file is untouched (only `state` and `deleted_at`
-/// change on the catalog row). The retention window (default 30 days,
-/// NFR-10) is enforced; a record past it is reported as `NotFound`
-/// (`FILE_ERR_NOT_FOUND`) since UC-08 owns the actual hard purge.
+/// `uuid` is the file's public UUID string. The function calls
+/// `RestoreFileHandler` and on success serializes the returned `File` back to
+/// JSON. The on-disk file is untouched (only `state` and `deleted_at` change
+/// on the catalog row). The retention window (default 30 days, NFR-10) is
+/// enforced; a record past it is reported as `NotFound` (`FILE_ERR_NOT_FOUND`)
+/// since UC-08 owns the actual hard purge.
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
-pub extern "C" fn alexandria_file_restore(
-    uuid: *const c_char,
-    token: *const c_char,
-) -> FileJsonResult {
+pub extern "C" fn alexandria_file_restore(uuid: *const c_char) -> FileJsonResult {
     ffi_guard(FileJsonResult::err(FILE_ERR_OTHER), || {
         let services = match locked_services() {
             Some(s) => s,
             None => return FileJsonResult::err(FILE_ERR_NOT_INITIALIZED),
         };
-
-        // Deny before touching the payload — an unauthenticated caller must not
-        // learn whether its uuid would have parsed.
-        let token = cstr_lossy(token).unwrap_or_default();
-        if !authenticated(&services, &token) {
-            return FileJsonResult::err(FILE_ERR_UNAUTHORIZED);
-        }
 
         let uuid_str = match cstr_lossy(uuid) {
             Some(s) => s,
@@ -1262,7 +1065,7 @@ pub extern "C" fn alexandria_file_restore(
         };
 
         let result =
-            runtime().block_on(async { services.restore_file_handler.restore(uuid, &token).await });
+            runtime().block_on(async { services.restore_file_handler.restore(uuid).await });
 
         match result {
             Ok(file) => {
@@ -1276,33 +1079,20 @@ pub extern "C" fn alexandria_file_restore(
 
 /// Hard-purge a soft-deleted file's catalog row (UC-08 / FR-FC-22).
 ///
-/// `uuid` is the file's public UUID string; `token` is the bearer auth
-/// token. The function calls the same `PurgeFileHandler` the HTTP route
-/// uses (`DELETE /v1/files/{uuid}?purge=true`) and on success serializes
-/// the pre-delete `File` back to JSON as confirmation — the same shape
-/// HTTP returns, so the FFI and HTTP surfaces agree byte-for-byte modulo
-/// key ordering (parity, FR-FC-24 / NFR-09). Only the catalog row (and its
-/// subtype row) is removed; the on-disk file is untouched (NFR-07). The
-/// retention window (default 30 days, NFR-10) is enforced: a record still
-/// within it, or not `deleted`, is reported as `FILE_ERR_INVALID_STATE`.
+/// `uuid` is the file's public UUID string. The function calls
+/// `PurgeFileHandler` and on success serializes the pre-delete `File` back to
+/// JSON as confirmation. Only the catalog row (and its subtype row) is
+/// removed; the on-disk file is untouched (NFR-07). The retention window
+/// (default 30 days, NFR-10) is enforced: a record still within it, or not
+/// `deleted`, is reported as `FILE_ERR_INVALID_STATE`.
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
-pub extern "C" fn alexandria_file_purge(
-    uuid: *const c_char,
-    token: *const c_char,
-) -> FileJsonResult {
+pub extern "C" fn alexandria_file_purge(uuid: *const c_char) -> FileJsonResult {
     ffi_guard(FileJsonResult::err(FILE_ERR_OTHER), || {
         let services = match locked_services() {
             Some(s) => s,
             None => return FileJsonResult::err(FILE_ERR_NOT_INITIALIZED),
         };
-
-        // Deny before touching the payload — an unauthenticated caller must not
-        // learn whether its uuid would have parsed.
-        let token = cstr_lossy(token).unwrap_or_default();
-        if !authenticated(&services, &token) {
-            return FileJsonResult::err(FILE_ERR_UNAUTHORIZED);
-        }
 
         let uuid_str = match cstr_lossy(uuid) {
             Some(s) => s,
@@ -1313,8 +1103,7 @@ pub extern "C" fn alexandria_file_purge(
             Err(_) => return FileJsonResult::err(FILE_ERR_INVALID_INPUT),
         };
 
-        let result =
-            runtime().block_on(async { services.purge_file_handler.purge(uuid, &token).await });
+        let result = runtime().block_on(async { services.purge_file_handler.purge(uuid).await });
 
         match result {
             Ok(file) => {
@@ -1328,34 +1117,21 @@ pub extern "C" fn alexandria_file_purge(
 
 /// Purge a file both on disk and in the catalog (UC-09 / FR-FC-23).
 ///
-/// `uuid` is the file's public UUID string; `token` is the bearer auth
-/// token. The function calls the same `PurgeFileOnDiskHandler` the HTTP
-/// route uses (`DELETE /v1/files/{uuid}?purge-on-disk=true`) and on success
-/// serializes the returned [`PurgeOnDiskOutcome`] back to JSON — the same
-/// shape HTTP returns, so the FFI and HTTP surfaces agree byte-for-byte
-/// modulo key ordering (parity, FR-FC-24 / NFR-09). Unlike UC-08 there is no
-/// retention gate: an `active` or `deleted` record is purgeable, the only
-/// precondition is that it exists. A missing on-disk file is still a
-/// success, reported via `diskFilePresent: false` (AF-01); a disk failure
-/// is reported as `FILE_ERR_DISK` (AF-02) and leaves the record untouched.
+/// `uuid` is the file's public UUID string. The function calls
+/// `PurgeFileOnDiskHandler` and on success serializes the returned
+/// [`PurgeOnDiskOutcome`] back to JSON. Unlike UC-08 there is no retention
+/// gate: an `active` or `deleted` record is purgeable, the only precondition
+/// is that it exists. A missing on-disk file is still a success, reported via
+/// `diskFilePresent: false` (AF-01); a disk failure is reported as
+/// `FILE_ERR_DISK` (AF-02) and leaves the record untouched.
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
-pub extern "C" fn alexandria_file_purge_on_disk(
-    uuid: *const c_char,
-    token: *const c_char,
-) -> FileJsonResult {
+pub extern "C" fn alexandria_file_purge_on_disk(uuid: *const c_char) -> FileJsonResult {
     ffi_guard(FileJsonResult::err(FILE_ERR_OTHER), || {
         let services = match locked_services() {
             Some(s) => s,
             None => return FileJsonResult::err(FILE_ERR_NOT_INITIALIZED),
         };
-
-        // Deny before touching the payload — an unauthenticated caller must not
-        // learn whether its uuid would have parsed.
-        let token = cstr_lossy(token).unwrap_or_default();
-        if !authenticated(&services, &token) {
-            return FileJsonResult::err(FILE_ERR_UNAUTHORIZED);
-        }
 
         let uuid_str = match cstr_lossy(uuid) {
             Some(s) => s,
@@ -1369,7 +1145,7 @@ pub extern "C" fn alexandria_file_purge_on_disk(
         let result = runtime().block_on(async {
             services
                 .purge_file_on_disk_handler
-                .purge_on_disk(uuid, &token)
+                .purge_on_disk(uuid)
                 .await
         });
 
@@ -1385,9 +1161,8 @@ pub extern "C" fn alexandria_file_purge_on_disk(
 
 /// Result of `alexandria_collection_create` (UC-10). On success `status` is
 /// `COLLECTION_OK` and `json` is a NUL-terminated JSON string of the
-/// `Collection` body — byte-for-byte the same shape HTTP returns from
-/// `POST /v1/collections` (FR-FC-24 / NFR-09). On failure `json` is NULL and
-/// `status` carries the mapped error code. The caller must free `json` with
+/// `Collection` body. On failure `json` is NULL and `status` carries the
+/// mapped error code. The caller must free `json` with
 /// `alexandria_free_string`.
 #[repr(C)]
 #[derive(Debug)]
@@ -1413,17 +1188,15 @@ impl CollectionJsonResult {
     }
 }
 
-/// Request body accepted by `alexandria_collection_create` — the same JSON
-/// `POST /v1/collections` takes: `{"name":"Sci-fi novels","kind":"file"}`.
+/// Request body accepted by `alexandria_collection_create`:
+/// `{"name":"Sci-fi novels","kind":"file"}`.
 /// Parsing here is what rejects a missing field or an unrecognised `kind` as
-/// `COLLECTION_ERR_INVALID_INPUT`, matching the HTTP surface's `400`
-/// (FR-FC-24 / NFR-09).
+/// `COLLECTION_ERR_INVALID_INPUT`.
 ///
 /// Parsed field-by-field off a `serde_json::Value` rather than by `derive`,
 /// like `FilesListFilter` above: this crate depends on `serde_json` but not on
 /// `serde` itself. Both fields are required and must be strings, and unknown
-/// fields are ignored — the same three decisions axum's `Json` extractor makes
-/// for the HTTP body.
+/// fields are ignored.
 #[derive(Debug)]
 struct CreateCollectionBody {
     name: String,
@@ -1443,29 +1216,17 @@ impl CreateCollectionBody {
 
 /// Create a flat file or bookmark collection (UC-10 / FR-CO-01, FR-CO-02).
 ///
-/// `json_body` is the JSON body HTTP would send (`name` + `kind`). The
-/// function deserializes it, calls the same `CreateCollectionHandler` the HTTP
-/// route uses, and on success serializes the returned `Collection` back to
-/// JSON — so the FFI and HTTP surfaces agree byte-for-byte modulo key ordering
-/// (parity, FR-FC-24 / NFR-09). `token` is the bearer auth token.
+/// `json_body` is the JSON body (`name` + `kind`). The function deserializes
+/// it, calls `CreateCollectionHandler`, and on success serializes the returned
+/// `Collection` back to JSON.
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
-pub extern "C" fn alexandria_collection_create(
-    json_body: *const c_char,
-    token: *const c_char,
-) -> CollectionJsonResult {
+pub extern "C" fn alexandria_collection_create(json_body: *const c_char) -> CollectionJsonResult {
     ffi_guard(CollectionJsonResult::err(COLLECTION_ERR_OTHER), || {
         let services = match locked_services() {
             Some(s) => s,
             None => return CollectionJsonResult::err(COLLECTION_ERR_NOT_INITIALIZED),
         };
-
-        // Deny before touching the payload — an unauthenticated caller must not
-        // learn whether its body would have parsed.
-        let token = cstr_lossy(token).unwrap_or_default();
-        if !authenticated(&services, &token) {
-            return CollectionJsonResult::err(COLLECTION_ERR_UNAUTHORIZED);
-        }
 
         let body_str = match cstr_lossy(json_body) {
             Some(s) => s,
@@ -1476,13 +1237,12 @@ pub extern "C" fn alexandria_collection_create(
             None => return CollectionJsonResult::err(COLLECTION_ERR_INVALID_INPUT),
         };
         // An empty or otherwise invalid name is rejected by the handler's
-        // validator, so it surfaces as `COLLECTION_ERR_INVALID_INPUT` —
-        // consistent with the HTTP `400`.
+        // validator, so it surfaces as `COLLECTION_ERR_INVALID_INPUT`.
 
         let result = runtime().block_on(async {
             services
                 .create_collection_handler
-                .create(&body.name, body.kind, &token)
+                .create(&body.name, body.kind)
                 .await
         });
 
@@ -1499,17 +1259,16 @@ pub extern "C" fn alexandria_collection_create(
 fn map_collection_err(err: DomainError) -> CollectionJsonResult {
     match err {
         DomainError::NotFound => CollectionJsonResult::err(COLLECTION_ERR_NOT_FOUND),
-        DomainError::Unauthorized => CollectionJsonResult::err(COLLECTION_ERR_UNAUTHORIZED),
         DomainError::InvalidInput(_) => CollectionJsonResult::err(COLLECTION_ERR_INVALID_INPUT),
         DomainError::InvalidState => CollectionJsonResult::err(COLLECTION_ERR_INVALID_STATE),
         _ => CollectionJsonResult::err(COLLECTION_ERR_OTHER),
     }
 }
 
-/// Request body accepted by `alexandria_collection_rename` — the same JSON
-/// `PATCH /v1/collections/{uuid}` takes: `{"name":"Sci-fi novels"}`. Parsed
-/// field-by-field for the same reason `CreateCollectionBody` is: this crate
-/// depends on `serde_json` but not `serde`'s derive.
+/// Request body accepted by `alexandria_collection_rename`:
+/// `{"name":"Sci-fi novels"}`. Parsed field-by-field for the same reason
+/// `CreateCollectionBody` is: this crate depends on `serde_json` but not
+/// `serde`'s derive.
 #[derive(Debug)]
 struct RenameCollectionBody {
     name: String,
@@ -1527,30 +1286,20 @@ impl RenameCollectionBody {
 /// Rename a collection (UC-11 / FR-CO-03).
 ///
 /// `uuid` is the collection's public UUID (NUL-terminated string). `json_body`
-/// is the JSON body HTTP would send (`{"name": …}`). The function
-/// deserializes it, calls the same `RenameCollectionHandler` the HTTP route
-/// uses, and on success serializes the returned `Collection` back to JSON —
-/// so the FFI and HTTP surfaces agree byte-for-byte modulo key ordering
-/// (parity, FR-FC-24 / NFR-09). `token` is the bearer auth token.
+/// is the JSON body (`{"name": …}`). The function deserializes it, calls
+/// `RenameCollectionHandler`, and on success serializes the returned
+/// `Collection` back to JSON.
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
 pub extern "C" fn alexandria_collection_rename(
     uuid: *const c_char,
     json_body: *const c_char,
-    token: *const c_char,
 ) -> CollectionJsonResult {
     ffi_guard(CollectionJsonResult::err(COLLECTION_ERR_OTHER), || {
         let services = match locked_services() {
             Some(s) => s,
             None => return CollectionJsonResult::err(COLLECTION_ERR_NOT_INITIALIZED),
         };
-
-        // Deny before touching the payload — an unauthenticated caller must not
-        // learn whether its uuid or body would have parsed.
-        let token = cstr_lossy(token).unwrap_or_default();
-        if !authenticated(&services, &token) {
-            return CollectionJsonResult::err(COLLECTION_ERR_UNAUTHORIZED);
-        }
 
         let uuid_str = match cstr_lossy(uuid) {
             Some(s) => s,
@@ -1573,7 +1322,7 @@ pub extern "C" fn alexandria_collection_rename(
         let result = runtime().block_on(async {
             services
                 .rename_collection_handler
-                .rename(uuid, &body.name, &token)
+                .rename(uuid, &body.name)
                 .await
         });
 
@@ -1590,27 +1339,15 @@ pub extern "C" fn alexandria_collection_rename(
 /// Delete a collection, unlinking its items (UC-12 / FR-CO-04).
 ///
 /// `uuid` is the collection's public UUID (NUL-terminated string). On success
-/// `json` carries the pre-delete `Collection` as confirmation — byte-for-byte
-/// the same shape HTTP returns from `DELETE /v1/collections/{uuid}` (parity,
-/// FR-FC-24 / NFR-09). `token` is the bearer auth token.
+/// `json` carries the pre-delete `Collection` as confirmation.
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
-pub extern "C" fn alexandria_collection_delete(
-    uuid: *const c_char,
-    token: *const c_char,
-) -> CollectionJsonResult {
+pub extern "C" fn alexandria_collection_delete(uuid: *const c_char) -> CollectionJsonResult {
     ffi_guard(CollectionJsonResult::err(COLLECTION_ERR_OTHER), || {
         let services = match locked_services() {
             Some(s) => s,
             None => return CollectionJsonResult::err(COLLECTION_ERR_NOT_INITIALIZED),
         };
-
-        // Deny before touching the payload — an unauthenticated caller must not
-        // learn whether the uuid would have parsed.
-        let token = cstr_lossy(token).unwrap_or_default();
-        if !authenticated(&services, &token) {
-            return CollectionJsonResult::err(COLLECTION_ERR_UNAUTHORIZED);
-        }
 
         let uuid_str = match cstr_lossy(uuid) {
             Some(s) => s,
@@ -1621,12 +1358,8 @@ pub extern "C" fn alexandria_collection_delete(
             Err(_) => return CollectionJsonResult::err(COLLECTION_ERR_INVALID_INPUT),
         };
 
-        let result = runtime().block_on(async {
-            services
-                .delete_collection_handler
-                .delete(uuid, &token)
-                .await
-        });
+        let result =
+            runtime().block_on(async { services.delete_collection_handler.delete(uuid).await });
 
         match result {
             Ok(collection) => {
@@ -1638,8 +1371,7 @@ pub extern "C" fn alexandria_collection_delete(
     })
 }
 
-/// Request body accepted by `alexandria_collection_add_items` — the same
-/// JSON `POST /v1/collections/{uuid}/items` takes:
+/// Request body accepted by `alexandria_collection_add_items`:
 /// `{"itemUuids":["…","…"]}`. Parsed field-by-field for the same reason
 /// `CreateCollectionBody` is: this crate depends on `serde_json` but not
 /// `serde`'s derive.
@@ -1664,30 +1396,20 @@ impl AddItemsBody {
 /// Add items to a collection (UC-13 / FR-CO-05).
 ///
 /// `uuid` is the collection's public UUID (NUL-terminated string). `json_body`
-/// is the JSON body HTTP would send (`itemUuids`). The function deserializes
-/// it, calls the same `AddItemsToCollectionHandler` the HTTP route uses, and
-/// on success serializes the returned `CollectionItemsResult` back to JSON —
-/// so the FFI and HTTP surfaces agree byte-for-byte modulo key ordering
-/// (parity, FR-FC-24 / NFR-09). `token` is the bearer auth token.
+/// is the JSON body (`itemUuids`). The function deserializes it, calls
+/// `AddItemsToCollectionHandler`, and on success serializes the returned
+/// `CollectionItemsResult` back to JSON.
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
 pub extern "C" fn alexandria_collection_add_items(
     uuid: *const c_char,
     json_body: *const c_char,
-    token: *const c_char,
 ) -> CollectionJsonResult {
     ffi_guard(CollectionJsonResult::err(COLLECTION_ERR_OTHER), || {
         let services = match locked_services() {
             Some(s) => s,
             None => return CollectionJsonResult::err(COLLECTION_ERR_NOT_INITIALIZED),
         };
-
-        // Deny before touching the payload — an unauthenticated caller must not
-        // learn whether its uuid or body would have parsed.
-        let token = cstr_lossy(token).unwrap_or_default();
-        if !authenticated(&services, &token) {
-            return CollectionJsonResult::err(COLLECTION_ERR_UNAUTHORIZED);
-        }
 
         let uuid_str = match cstr_lossy(uuid) {
             Some(s) => s,
@@ -1710,7 +1432,7 @@ pub extern "C" fn alexandria_collection_add_items(
         let result = runtime().block_on(async {
             services
                 .add_items_to_collection_handler
-                .add(uuid, body.item_uuids, &token)
+                .add(uuid, body.item_uuids)
                 .await
         });
 
@@ -1728,26 +1450,18 @@ pub extern "C" fn alexandria_collection_add_items(
 ///
 /// `collection_uuid` and `item_uuid` are the collection's and item's public
 /// UUIDs (NUL-terminated strings). On success `json` carries the
-/// `collectionUuid`/`itemUuid` confirmation — byte-for-byte the same shape
-/// HTTP returns from `DELETE /v1/collections/{uuid}/items/{itemUuid}`
-/// (parity, FR-FC-24 / NFR-09). `token` is the bearer auth token.
+/// `collectionUuid`/`itemUuid` confirmation.
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
 pub extern "C" fn alexandria_collection_remove_item(
     collection_uuid: *const c_char,
     item_uuid: *const c_char,
-    token: *const c_char,
 ) -> CollectionJsonResult {
     ffi_guard(CollectionJsonResult::err(COLLECTION_ERR_OTHER), || {
         let services = match locked_services() {
             Some(s) => s,
             None => return CollectionJsonResult::err(COLLECTION_ERR_NOT_INITIALIZED),
         };
-
-        let token = cstr_lossy(token).unwrap_or_default();
-        if !authenticated(&services, &token) {
-            return CollectionJsonResult::err(COLLECTION_ERR_UNAUTHORIZED);
-        }
 
         let collection_uuid =
             match cstr_lossy(collection_uuid).and_then(|s| uuid::Uuid::parse_str(&s).ok()) {
@@ -1762,7 +1476,7 @@ pub extern "C" fn alexandria_collection_remove_item(
         let result = runtime().block_on(async {
             services
                 .remove_item_from_collection_handler
-                .remove(collection_uuid, item_uuid, &token)
+                .remove(collection_uuid, item_uuid)
                 .await
         });
 
@@ -1778,38 +1492,24 @@ pub extern "C" fn alexandria_collection_remove_item(
 
 /// List the items in a collection (UC-14 / FR-CO-07).
 ///
-/// `uuid` is the collection's public UUID (NUL-terminated string). On
-/// success `json` carries the `kind` and current members — byte-for-byte
-/// the same shape HTTP returns from `GET /v1/collections/{uuid}/items`
-/// (parity, FR-FC-24 / NFR-09). `token` is the bearer auth token.
+/// `uuid` is the collection's public UUID (NUL-terminated string). On success
+/// `json` carries the `kind` and current members.
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
-pub extern "C" fn alexandria_collection_list_items(
-    uuid: *const c_char,
-    token: *const c_char,
-) -> CollectionJsonResult {
+pub extern "C" fn alexandria_collection_list_items(uuid: *const c_char) -> CollectionJsonResult {
     ffi_guard(CollectionJsonResult::err(COLLECTION_ERR_OTHER), || {
         let services = match locked_services() {
             Some(s) => s,
             None => return CollectionJsonResult::err(COLLECTION_ERR_NOT_INITIALIZED),
         };
 
-        let token = cstr_lossy(token).unwrap_or_default();
-        if !authenticated(&services, &token) {
-            return CollectionJsonResult::err(COLLECTION_ERR_UNAUTHORIZED);
-        }
-
         let uuid = match cstr_lossy(uuid).and_then(|s| uuid::Uuid::parse_str(&s).ok()) {
             Some(u) => u,
             None => return CollectionJsonResult::err(COLLECTION_ERR_INVALID_INPUT),
         };
 
-        let result = runtime().block_on(async {
-            services
-                .list_collection_items_handler
-                .list(uuid, &token)
-                .await
-        });
+        let result =
+            runtime().block_on(async { services.list_collection_items_handler.list(uuid).await });
 
         match result {
             Ok(members) => {
@@ -1821,9 +1521,8 @@ pub extern "C" fn alexandria_collection_list_items(
     })
 }
 
-/// Filters accepted by `alexandria_collections_list` (UC-46). Mirrors the
-/// query string HTTP takes on the same route, so a caller writes the same
-/// filter for either surface (FR-FC-24 / NFR-09).
+/// Filters accepted by `alexandria_collections_list` (UC-46): an optional
+/// `kind`.
 #[derive(Debug, Default)]
 struct CollectionsListFilter {
     kind: Option<String>,
@@ -1853,32 +1552,21 @@ impl CollectionsListFilter {
 
 /// List the owner's collections (UC-46 / FR-CO-08).
 ///
-/// `json_filters` is the JSON filter HTTP would build from its query string
-/// (`kind`); an empty string or `null` means every collection. On success
-/// `json` carries a JSON array of `CollectionSummary` — each collection with
-/// the number of items it holds — byte-for-byte the same shape HTTP returns
-/// from `GET /v1/collections` (parity, FR-FC-24 / NFR-09). `token` is the
-/// bearer auth token.
+/// `json_filters` is a JSON filter (`kind`); an empty string or `null` means
+/// every collection. On success `json` carries a JSON array of
+/// `CollectionSummary` — each collection with the number of items it holds.
 ///
 /// An owner with no collections gets an empty array and `COLLECTION_OK`, not
 /// an error (AF-01). An unrecognised `kind` is `COLLECTION_ERR_INVALID_INPUT`
 /// and nothing is queried (AF-02).
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
-pub extern "C" fn alexandria_collections_list(
-    json_filters: *const c_char,
-    token: *const c_char,
-) -> CollectionJsonResult {
+pub extern "C" fn alexandria_collections_list(json_filters: *const c_char) -> CollectionJsonResult {
     ffi_guard(CollectionJsonResult::err(COLLECTION_ERR_OTHER), || {
         let services = match locked_services() {
             Some(s) => s,
             None => return CollectionJsonResult::err(COLLECTION_ERR_NOT_INITIALIZED),
         };
-
-        let token = cstr_lossy(token).unwrap_or_default();
-        if !authenticated(&services, &token) {
-            return CollectionJsonResult::err(COLLECTION_ERR_UNAUTHORIZED);
-        }
 
         let filter_str = cstr_lossy(json_filters).unwrap_or_default();
         let parsed = match CollectionsListFilter::from_json_str(&filter_str) {
@@ -1886,8 +1574,8 @@ pub extern "C" fn alexandria_collections_list(
             None => return CollectionJsonResult::err(COLLECTION_ERR_INVALID_INPUT),
         };
 
-        // AF-02: refused before the handler is reached, exactly as HTTP refuses
-        // the same value while parsing its query string.
+        // AF-02: refused before the handler is reached, while the filter is
+        // parsed.
         let kind = match parsed.kind.as_deref().filter(|k| !k.is_empty()) {
             None => None,
             Some(value) => {
@@ -1898,8 +1586,8 @@ pub extern "C" fn alexandria_collections_list(
             }
         };
 
-        let result = runtime()
-            .block_on(async { services.list_collections_handler.list(kind, &token).await });
+        let result =
+            runtime().block_on(async { services.list_collections_handler.list(kind).await });
 
         match result {
             Ok(collections) => {
@@ -1918,7 +1606,6 @@ pub extern "C" fn alexandria_collections_list(
 /// catalog-only metadata with nothing on disk.
 pub const BOOKMARK_OK: c_int = 0;
 pub const BOOKMARK_ERR_INVALID_INPUT: c_int = 1;
-pub const BOOKMARK_ERR_UNAUTHORIZED: c_int = 2;
 pub const BOOKMARK_ERR_NOT_INITIALIZED: c_int = 3;
 pub const BOOKMARK_ERR_NOT_FOUND: c_int = 4;
 pub const BOOKMARK_ERR_INVALID_STATE: c_int = 5;
@@ -1926,10 +1613,8 @@ pub const BOOKMARK_ERR_OTHER: c_int = 9;
 
 /// Result of `alexandria_bookmark_create` (UC-15). On success `status` is
 /// `BOOKMARK_OK` and `json` is a NUL-terminated JSON string of the `Bookmark`
-/// body — byte-for-byte the same shape HTTP returns from `POST
-/// /v1/bookmarks` (FR-FC-24 / NFR-09). On failure `json` is NULL and `status`
-/// carries the mapped error code. The caller must free `json` with
-/// `alexandria_free_string`.
+/// body. On failure `json` is NULL and `status` carries the mapped error code.
+/// The caller must free `json` with `alexandria_free_string`.
 #[repr(C)]
 #[derive(Debug)]
 pub struct BookmarkJsonResult {
@@ -1957,18 +1642,17 @@ impl BookmarkJsonResult {
 fn map_bookmark_err(err: DomainError) -> BookmarkJsonResult {
     match err {
         DomainError::NotFound => BookmarkJsonResult::err(BOOKMARK_ERR_NOT_FOUND),
-        DomainError::Unauthorized => BookmarkJsonResult::err(BOOKMARK_ERR_UNAUTHORIZED),
         DomainError::InvalidInput(_) => BookmarkJsonResult::err(BOOKMARK_ERR_INVALID_INPUT),
         DomainError::InvalidState => BookmarkJsonResult::err(BOOKMARK_ERR_INVALID_STATE),
         _ => BookmarkJsonResult::err(BOOKMARK_ERR_OTHER),
     }
 }
 
-/// Request body accepted by `alexandria_bookmark_create` — the same JSON
-/// `POST /v1/bookmarks` takes: `{"url":"…","title":"…","collectionUuid":"…"}`
-/// (`collectionUuid` optional/nullable). Parsed field-by-field for the same
-/// reason `CreateCollectionBody` is: this crate depends on `serde_json` but
-/// not `serde`'s derive.
+/// Request body accepted by `alexandria_bookmark_create`:
+/// `{"url":"…","title":"…","collectionUuid":"…"}` (`collectionUuid`
+/// optional/nullable). Parsed field-by-field for the same reason
+/// `CreateCollectionBody` is: this crate depends on `serde_json` but not
+/// `serde`'s derive.
 #[derive(Debug)]
 struct CreateBookmarkBody {
     url: String,
@@ -1997,30 +1681,17 @@ impl CreateBookmarkBody {
 /// Create a browser bookmark, optionally in an existing bookmark collection
 /// (UC-15 / FR-BM-01).
 ///
-/// `json_body` is the JSON body HTTP would send (`url` + `title` +
-/// `collectionUuid`). The function deserializes it, calls the same
-/// `CreateBookmarkHandler` the HTTP route uses, and on success serializes the
-/// returned `Bookmark` back to JSON — so the FFI and HTTP surfaces agree
-/// byte-for-byte modulo key ordering (parity, FR-FC-24 / NFR-09). `token` is
-/// the bearer auth token.
+/// `json_body` is the JSON body (`url` + `title` + `collectionUuid`). The
+/// function deserializes it, calls `CreateBookmarkHandler`, and on success
+/// serializes the returned `Bookmark` back to JSON.
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
-pub extern "C" fn alexandria_bookmark_create(
-    json_body: *const c_char,
-    token: *const c_char,
-) -> BookmarkJsonResult {
+pub extern "C" fn alexandria_bookmark_create(json_body: *const c_char) -> BookmarkJsonResult {
     ffi_guard(BookmarkJsonResult::err(BOOKMARK_ERR_OTHER), || {
         let services = match locked_services() {
             Some(s) => s,
             None => return BookmarkJsonResult::err(BOOKMARK_ERR_NOT_INITIALIZED),
         };
-
-        // Deny before touching the payload — an unauthenticated caller must not
-        // learn whether its body would have parsed.
-        let token = cstr_lossy(token).unwrap_or_default();
-        if !authenticated(&services, &token) {
-            return BookmarkJsonResult::err(BOOKMARK_ERR_UNAUTHORIZED);
-        }
 
         let body_str = match cstr_lossy(json_body) {
             Some(s) => s,
@@ -2034,7 +1705,7 @@ pub extern "C" fn alexandria_bookmark_create(
         let result = runtime().block_on(async {
             services
                 .create_bookmark_handler
-                .create(&body.url, &body.title, body.collection_uuid, &token)
+                .create(&body.url, &body.title, body.collection_uuid)
                 .await
         });
 
@@ -2048,8 +1719,7 @@ pub extern "C" fn alexandria_bookmark_create(
     })
 }
 
-/// Request body accepted by `alexandria_bookmark_update` — the same JSON
-/// `PATCH /v1/bookmarks/{uuid}` takes:
+/// Request body accepted by `alexandria_bookmark_update`:
 /// `{"url":"…","title":"…","collectionUuid":"…"}` (`collectionUuid`
 /// optional/nullable; absent or null clears the link).
 #[derive(Debug)]
@@ -2081,28 +1751,20 @@ impl UpdateBookmarkBody {
 /// FR-BM-02).
 ///
 /// `uuid` is the bookmark's public UUID (NUL-terminated string). `json_body`
-/// is the JSON body HTTP would send (`url` + `title` + `collectionUuid`).
-/// The function deserializes it, calls the same `UpdateBookmarkHandler` the
-/// HTTP route uses, and on success serializes the returned `Bookmark` back
-/// to JSON — so the FFI and HTTP surfaces agree byte-for-byte modulo key
-/// ordering (parity, FR-FC-24 / NFR-09). `token` is the bearer auth token.
+/// is the JSON body (`url` + `title` + `collectionUuid`). The function
+/// deserializes it, calls `UpdateBookmarkHandler`, and on success serializes
+/// the returned `Bookmark` back to JSON.
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
 pub extern "C" fn alexandria_bookmark_update(
     uuid: *const c_char,
     json_body: *const c_char,
-    token: *const c_char,
 ) -> BookmarkJsonResult {
     ffi_guard(BookmarkJsonResult::err(BOOKMARK_ERR_OTHER), || {
         let services = match locked_services() {
             Some(s) => s,
             None => return BookmarkJsonResult::err(BOOKMARK_ERR_NOT_INITIALIZED),
         };
-
-        let token = cstr_lossy(token).unwrap_or_default();
-        if !authenticated(&services, &token) {
-            return BookmarkJsonResult::err(BOOKMARK_ERR_UNAUTHORIZED);
-        }
 
         let uuid = match cstr_lossy(uuid).and_then(|s| uuid::Uuid::parse_str(&s).ok()) {
             Some(u) => u,
@@ -2121,7 +1783,7 @@ pub extern "C" fn alexandria_bookmark_update(
         let result = runtime().block_on(async {
             services
                 .update_bookmark_handler
-                .update(uuid, &body.url, &body.title, body.collection_uuid, &token)
+                .update(uuid, &body.url, &body.title, body.collection_uuid)
                 .await
         });
 
@@ -2138,10 +1800,9 @@ pub extern "C" fn alexandria_bookmark_update(
 /// JSON filter body accepted by `alexandria_bookmarks_list` (UC-17 /
 /// FR-BM-06). Both fields optional; an empty/null body, omitted fields, or
 /// empty-string values use the defaults (`collectionUuid = None`, `state =
-/// "active"` — excludes deleted records per the use case's main-flow step
-/// 2). An unrecognised `state` or malformed `collectionUuid` is rejected as
-/// `BOOKMARK_ERR_INVALID_INPUT`, matching the HTTP surface's `400`
-/// (FR-FC-24 / NFR-09).
+/// "active"` — excludes deleted records per the use case's main-flow step 2).
+/// An unrecognised `state` or malformed `collectionUuid` is rejected as
+/// `BOOKMARK_ERR_INVALID_INPUT`.
 #[derive(Debug, Default)]
 struct BookmarksListFilter {
     collection_uuid: Option<String>,
@@ -2176,26 +1837,16 @@ impl BookmarksListFilter {
 ///
 /// `json_filters` is a JSON string `{"collectionUuid":"…","state":"all"}`
 /// (empty string or NULL for defaults). The function deserializes it, calls
-/// the same `BrowseBookmarksHandler` the HTTP route uses, and on success
-/// serializes the returned `Vec<Bookmark>` back to a JSON array — so the FFI
-/// and HTTP surfaces agree byte-for-byte modulo key ordering (parity,
-/// FR-FC-24 / NFR-09). `token` is the bearer auth token.
+/// `BrowseBookmarksHandler`, and on success serializes the returned
+/// `Vec<Bookmark>` back to a JSON array.
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
-pub extern "C" fn alexandria_bookmarks_list(
-    json_filters: *const c_char,
-    token: *const c_char,
-) -> BookmarkJsonResult {
+pub extern "C" fn alexandria_bookmarks_list(json_filters: *const c_char) -> BookmarkJsonResult {
     ffi_guard(BookmarkJsonResult::err(BOOKMARK_ERR_OTHER), || {
         let services = match locked_services() {
             Some(s) => s,
             None => return BookmarkJsonResult::err(BOOKMARK_ERR_NOT_INITIALIZED),
         };
-
-        let token = cstr_lossy(token).unwrap_or_default();
-        if !authenticated(&services, &token) {
-            return BookmarkJsonResult::err(BOOKMARK_ERR_UNAUTHORIZED);
-        }
 
         let filter_str = cstr_lossy(json_filters).unwrap_or_default();
         let parsed = match BookmarksListFilter::from_json_str(&filter_str) {
@@ -2220,8 +1871,8 @@ pub extern "C" fn alexandria_bookmarks_list(
             filter = filter.with_collection(collection_uuid);
         }
 
-        let result = runtime()
-            .block_on(async { services.browse_bookmarks_handler.list(filter, &token).await });
+        let result =
+            runtime().block_on(async { services.browse_bookmarks_handler.list(filter).await });
 
         match result {
             Ok(bookmarks) => {
@@ -2236,37 +1887,23 @@ pub extern "C" fn alexandria_bookmarks_list(
 /// Soft-delete a bookmark (UC-18 / FR-BM-03).
 ///
 /// `uuid` is the bookmark's public UUID (NUL-terminated string). On success
-/// `json` carries the updated `Bookmark` — byte-for-byte the same shape HTTP
-/// returns from `DELETE /v1/bookmarks/{uuid}` (parity, FR-FC-24 / NFR-09).
-/// `token` is the bearer auth token.
+/// `json` carries the updated `Bookmark`.
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
-pub extern "C" fn alexandria_bookmark_soft_delete(
-    uuid: *const c_char,
-    token: *const c_char,
-) -> BookmarkJsonResult {
+pub extern "C" fn alexandria_bookmark_soft_delete(uuid: *const c_char) -> BookmarkJsonResult {
     ffi_guard(BookmarkJsonResult::err(BOOKMARK_ERR_OTHER), || {
         let services = match locked_services() {
             Some(s) => s,
             None => return BookmarkJsonResult::err(BOOKMARK_ERR_NOT_INITIALIZED),
         };
 
-        let token = cstr_lossy(token).unwrap_or_default();
-        if !authenticated(&services, &token) {
-            return BookmarkJsonResult::err(BOOKMARK_ERR_UNAUTHORIZED);
-        }
-
         let uuid = match cstr_lossy(uuid).and_then(|s| uuid::Uuid::parse_str(&s).ok()) {
             Some(u) => u,
             None => return BookmarkJsonResult::err(BOOKMARK_ERR_INVALID_INPUT),
         };
 
-        let result = runtime().block_on(async {
-            services
-                .bookmark_lifecycle_handler
-                .soft_delete(uuid, &token)
-                .await
-        });
+        let result = runtime()
+            .block_on(async { services.bookmark_lifecycle_handler.soft_delete(uuid).await });
 
         match result {
             Ok(bookmark) => {
@@ -2281,37 +1918,23 @@ pub extern "C" fn alexandria_bookmark_soft_delete(
 /// Restore a soft-deleted bookmark (UC-18 / FR-BM-05).
 ///
 /// `uuid` is the bookmark's public UUID (NUL-terminated string). On success
-/// `json` carries the restored `Bookmark` — byte-for-byte the same shape
-/// HTTP returns from `POST /v1/bookmarks/{uuid}/restore` (parity,
-/// FR-FC-24 / NFR-09). `token` is the bearer auth token.
+/// `json` carries the restored `Bookmark`.
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
-pub extern "C" fn alexandria_bookmark_restore(
-    uuid: *const c_char,
-    token: *const c_char,
-) -> BookmarkJsonResult {
+pub extern "C" fn alexandria_bookmark_restore(uuid: *const c_char) -> BookmarkJsonResult {
     ffi_guard(BookmarkJsonResult::err(BOOKMARK_ERR_OTHER), || {
         let services = match locked_services() {
             Some(s) => s,
             None => return BookmarkJsonResult::err(BOOKMARK_ERR_NOT_INITIALIZED),
         };
 
-        let token = cstr_lossy(token).unwrap_or_default();
-        if !authenticated(&services, &token) {
-            return BookmarkJsonResult::err(BOOKMARK_ERR_UNAUTHORIZED);
-        }
-
         let uuid = match cstr_lossy(uuid).and_then(|s| uuid::Uuid::parse_str(&s).ok()) {
             Some(u) => u,
             None => return BookmarkJsonResult::err(BOOKMARK_ERR_INVALID_INPUT),
         };
 
-        let result = runtime().block_on(async {
-            services
-                .bookmark_lifecycle_handler
-                .restore(uuid, &token)
-                .await
-        });
+        let result =
+            runtime().block_on(async { services.bookmark_lifecycle_handler.restore(uuid).await });
 
         match result {
             Ok(bookmark) => {
@@ -2326,25 +1949,15 @@ pub extern "C" fn alexandria_bookmark_restore(
 /// Hard-purge a bookmark (UC-19 / FR-BM-04).
 ///
 /// `uuid` is the bookmark's public UUID (NUL-terminated string). On success
-/// `json` carries the pre-purge `Bookmark` as confirmation — byte-for-byte
-/// the same shape HTTP returns from `DELETE /v1/bookmarks/{uuid}?purge=true`
-/// (parity, FR-FC-24 / NFR-09). `token` is the bearer auth token.
+/// `json` carries the pre-purge `Bookmark` as confirmation.
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
-pub extern "C" fn alexandria_bookmark_purge(
-    uuid: *const c_char,
-    token: *const c_char,
-) -> BookmarkJsonResult {
+pub extern "C" fn alexandria_bookmark_purge(uuid: *const c_char) -> BookmarkJsonResult {
     ffi_guard(BookmarkJsonResult::err(BOOKMARK_ERR_OTHER), || {
         let services = match locked_services() {
             Some(s) => s,
             None => return BookmarkJsonResult::err(BOOKMARK_ERR_NOT_INITIALIZED),
         };
-
-        let token = cstr_lossy(token).unwrap_or_default();
-        if !authenticated(&services, &token) {
-            return BookmarkJsonResult::err(BOOKMARK_ERR_UNAUTHORIZED);
-        }
 
         let uuid = match cstr_lossy(uuid).and_then(|s| uuid::Uuid::parse_str(&s).ok()) {
             Some(u) => u,
@@ -2352,7 +1965,7 @@ pub extern "C" fn alexandria_bookmark_purge(
         };
 
         let result =
-            runtime().block_on(async { services.purge_bookmark_handler.purge(uuid, &token).await });
+            runtime().block_on(async { services.purge_bookmark_handler.purge(uuid).await });
 
         match result {
             Ok(bookmark) => {
@@ -2370,7 +1983,6 @@ pub extern "C" fn alexandria_bookmark_purge(
 /// BOOKMARK_OK == 0` by convention.
 pub const WATCHLIST_OK: c_int = 0;
 pub const WATCHLIST_ERR_INVALID_INPUT: c_int = 1;
-pub const WATCHLIST_ERR_UNAUTHORIZED: c_int = 2;
 pub const WATCHLIST_ERR_NOT_INITIALIZED: c_int = 3;
 pub const WATCHLIST_ERR_NOT_FOUND: c_int = 4;
 pub const WATCHLIST_ERR_INVALID_STATE: c_int = 5;
@@ -2378,10 +1990,8 @@ pub const WATCHLIST_ERR_OTHER: c_int = 9;
 
 /// Result of `alexandria_watchlist_create` (UC-20). On success `status` is
 /// `WATCHLIST_OK` and `json` is a NUL-terminated JSON string of the
-/// `Watchlist` body — byte-for-byte the same shape HTTP returns from `POST
-/// /v1/watchlists` (FR-FC-24 / NFR-09). On failure `json` is NULL and
-/// `status` carries the mapped error code. The caller must free `json` with
-/// `alexandria_free_string`.
+/// `Watchlist` body. On failure `json` is NULL and `status` carries the mapped
+/// error code. The caller must free `json` with `alexandria_free_string`.
 #[repr(C)]
 #[derive(Debug)]
 pub struct WatchlistJsonResult {
@@ -2409,17 +2019,16 @@ impl WatchlistJsonResult {
 fn map_watchlist_err(err: DomainError) -> WatchlistJsonResult {
     match err {
         DomainError::NotFound => WatchlistJsonResult::err(WATCHLIST_ERR_NOT_FOUND),
-        DomainError::Unauthorized => WatchlistJsonResult::err(WATCHLIST_ERR_UNAUTHORIZED),
         DomainError::InvalidInput(_) => WatchlistJsonResult::err(WATCHLIST_ERR_INVALID_INPUT),
         DomainError::InvalidState => WatchlistJsonResult::err(WATCHLIST_ERR_INVALID_STATE),
         _ => WatchlistJsonResult::err(WATCHLIST_ERR_OTHER),
     }
 }
 
-/// Request body accepted by `alexandria_watchlist_create` — the same JSON
-/// `POST /v1/watchlists` takes: `{"name":"Weekend movies"}`. Parsed
-/// field-by-field for the same reason `CreateCollectionBody` is: this crate
-/// depends on `serde_json` but not `serde`'s derive.
+/// Request body accepted by `alexandria_watchlist_create`:
+/// `{"name":"Weekend movies"}`. Parsed field-by-field for the same reason
+/// `CreateCollectionBody` is: this crate depends on `serde_json` but not
+/// `serde`'s derive.
 #[derive(Debug)]
 struct CreateWatchlistBody {
     name: String,
@@ -2437,27 +2046,17 @@ impl CreateWatchlistBody {
 /// Create a named watchlist for tracking video consumption (UC-20 /
 /// FR-WL-01).
 ///
-/// `json_body` is the JSON body HTTP would send (`name`). The function
-/// deserializes it, calls the same `CreateWatchlistHandler` the HTTP route
-/// uses, and on success serializes the returned `Watchlist` back to JSON —
-/// so the FFI and HTTP surfaces agree byte-for-byte modulo key ordering
-/// (parity, FR-FC-24 / NFR-09). `token` is the bearer auth token.
+/// `json_body` is the JSON body (`name`). The function deserializes it, calls
+/// `CreateWatchlistHandler`, and on success serializes the returned
+/// `Watchlist` back to JSON.
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
-pub extern "C" fn alexandria_watchlist_create(
-    json_body: *const c_char,
-    token: *const c_char,
-) -> WatchlistJsonResult {
+pub extern "C" fn alexandria_watchlist_create(json_body: *const c_char) -> WatchlistJsonResult {
     ffi_guard(WatchlistJsonResult::err(WATCHLIST_ERR_OTHER), || {
         let services = match locked_services() {
             Some(s) => s,
             None => return WatchlistJsonResult::err(WATCHLIST_ERR_NOT_INITIALIZED),
         };
-
-        let token = cstr_lossy(token).unwrap_or_default();
-        if !authenticated(&services, &token) {
-            return WatchlistJsonResult::err(WATCHLIST_ERR_UNAUTHORIZED);
-        }
 
         let body_str = match cstr_lossy(json_body) {
             Some(s) => s,
@@ -2468,12 +2067,8 @@ pub extern "C" fn alexandria_watchlist_create(
             None => return WatchlistJsonResult::err(WATCHLIST_ERR_INVALID_INPUT),
         };
 
-        let result = runtime().block_on(async {
-            services
-                .create_watchlist_handler
-                .create(&body.name, &token)
-                .await
-        });
+        let result = runtime()
+            .block_on(async { services.create_watchlist_handler.create(&body.name).await });
 
         match result {
             Ok(watchlist) => {
@@ -2485,8 +2080,8 @@ pub extern "C" fn alexandria_watchlist_create(
     })
 }
 
-/// Request body accepted by `alexandria_watchlist_add_video` — the same JSON
-/// `POST /v1/watchlists/{uuid}/items` takes: `{"videoUuid":"…"}`.
+/// Request body accepted by `alexandria_watchlist_add_video`:
+/// `{"videoUuid":"…"}`.
 #[derive(Debug)]
 struct AddVideoBody {
     video_uuid: uuid::Uuid,
@@ -2506,28 +2101,20 @@ impl AddVideoBody {
 /// Add a video to a watchlist (UC-22 / FR-WL-02, FR-WL-03).
 ///
 /// `uuid` is the watchlist's public UUID (NUL-terminated string). `json_body`
-/// is the JSON body HTTP would send (`videoUuid`). The function deserializes
-/// it, calls the same `AddVideoToWatchlistHandler` the HTTP route uses, and
-/// on success serializes the returned `WatchProgress` back to JSON — so the
-/// FFI and HTTP surfaces agree byte-for-byte modulo key ordering (parity,
-/// FR-FC-24 / NFR-09). `token` is the bearer auth token.
+/// is the JSON body (`videoUuid`). The function deserializes it, calls
+/// `AddVideoToWatchlistHandler`, and on success serializes the returned
+/// `WatchProgress` back to JSON.
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
 pub extern "C" fn alexandria_watchlist_add_video(
     uuid: *const c_char,
     json_body: *const c_char,
-    token: *const c_char,
 ) -> WatchlistJsonResult {
     ffi_guard(WatchlistJsonResult::err(WATCHLIST_ERR_OTHER), || {
         let services = match locked_services() {
             Some(s) => s,
             None => return WatchlistJsonResult::err(WATCHLIST_ERR_NOT_INITIALIZED),
         };
-
-        let token = cstr_lossy(token).unwrap_or_default();
-        if !authenticated(&services, &token) {
-            return WatchlistJsonResult::err(WATCHLIST_ERR_UNAUTHORIZED);
-        }
 
         let uuid_str = match cstr_lossy(uuid) {
             Some(s) => s,
@@ -2550,7 +2137,7 @@ pub extern "C" fn alexandria_watchlist_add_video(
         let result = runtime().block_on(async {
             services
                 .add_video_to_watchlist_handler
-                .add(uuid, body.video_uuid, &token)
+                .add(uuid, body.video_uuid)
                 .await
         });
 
@@ -2564,9 +2151,8 @@ pub extern "C" fn alexandria_watchlist_add_video(
     })
 }
 
-/// Filter accepted by `alexandria_watchlists_list` — the same JSON `GET
-/// /v1/watchlists?watchlistUuid=…` takes: `{"watchlistUuid":"…"}`. An empty
-/// or absent `watchlistUuid` means every watchlist.
+/// Filter accepted by `alexandria_watchlists_list`: `{"watchlistUuid":"…"}`.
+/// An empty or absent `watchlistUuid` means every watchlist.
 #[derive(Debug, Default)]
 struct WatchlistsListFilter {
     watchlist_uuid: Option<String>,
@@ -2593,27 +2179,17 @@ impl WatchlistsListFilter {
 
 /// Browse watchlists and their items' watch progress (UC-21 / FR-WL-08).
 ///
-/// `json_filters` is the JSON filter HTTP would build from its query string
-/// (`watchlistUuid`); an empty string or `null` means every watchlist. On
-/// success `json` carries a JSON array of `WatchlistWithProgress` — byte-for-
-/// byte the same shape HTTP returns from `GET /v1/watchlists` (parity,
-/// FR-FC-24 / NFR-09). `token` is the bearer auth token.
+/// `json_filters` is a JSON filter (`watchlistUuid`); an empty string or
+/// `null` means every watchlist. On success `json` carries a JSON array of
+/// `WatchlistWithProgress`.
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
-pub extern "C" fn alexandria_watchlists_list(
-    json_filters: *const c_char,
-    token: *const c_char,
-) -> WatchlistJsonResult {
+pub extern "C" fn alexandria_watchlists_list(json_filters: *const c_char) -> WatchlistJsonResult {
     ffi_guard(WatchlistJsonResult::err(WATCHLIST_ERR_OTHER), || {
         let services = match locked_services() {
             Some(s) => s,
             None => return WatchlistJsonResult::err(WATCHLIST_ERR_NOT_INITIALIZED),
         };
-
-        let token = cstr_lossy(token).unwrap_or_default();
-        if !authenticated(&services, &token) {
-            return WatchlistJsonResult::err(WATCHLIST_ERR_UNAUTHORIZED);
-        }
 
         let filter_str = cstr_lossy(json_filters).unwrap_or_default();
         let parsed = match WatchlistsListFilter::from_json_str(&filter_str) {
@@ -2632,7 +2208,7 @@ pub extern "C" fn alexandria_watchlists_list(
         let result = runtime().block_on(async {
             services
                 .browse_watchlists_handler
-                .list(watchlist_uuid, &token)
+                .list(watchlist_uuid)
                 .await
         });
 
@@ -2646,8 +2222,7 @@ pub extern "C" fn alexandria_watchlists_list(
     })
 }
 
-/// Request body accepted by `alexandria_watchlist_update_progress` — the
-/// same JSON `PATCH /v1/watchlists/{uuid}/items/{videoUuid}` takes:
+/// Request body accepted by `alexandria_watchlist_update_progress`:
 /// `{"state":"…","currentEpisode":…,"totalEpisodes":…}` (episode fields
 /// optional/nullable; absent or null clears them).
 #[derive(Debug)]
@@ -2672,29 +2247,21 @@ impl UpdateWatchProgressBody {
 /// Update watch progress (UC-23 / FR-WL-04, FR-WL-05).
 ///
 /// `watchlist_uuid` and `video_uuid` are the watchlist's and video's public
-/// UUIDs (NUL-terminated strings). `json_body` is the JSON body HTTP would
-/// send (`state`, optional `currentEpisode`/`totalEpisodes`). On success
-/// `json` carries the updated `WatchProgress` — byte-for-byte the same shape
-/// HTTP returns from `PATCH /v1/watchlists/{uuid}/items/{videoUuid}`
-/// (parity, FR-FC-24 / NFR-09). `token` is the bearer auth token.
+/// UUIDs (NUL-terminated strings). `json_body` is the JSON body (`state`,
+/// optional `currentEpisode`/`totalEpisodes`). On success `json` carries the
+/// updated `WatchProgress`.
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
 pub extern "C" fn alexandria_watchlist_update_progress(
     watchlist_uuid: *const c_char,
     video_uuid: *const c_char,
     json_body: *const c_char,
-    token: *const c_char,
 ) -> WatchlistJsonResult {
     ffi_guard(WatchlistJsonResult::err(WATCHLIST_ERR_OTHER), || {
         let services = match locked_services() {
             Some(s) => s,
             None => return WatchlistJsonResult::err(WATCHLIST_ERR_NOT_INITIALIZED),
         };
-
-        let token = cstr_lossy(token).unwrap_or_default();
-        if !authenticated(&services, &token) {
-            return WatchlistJsonResult::err(WATCHLIST_ERR_UNAUTHORIZED);
-        }
 
         let watchlist_uuid_str = match cstr_lossy(watchlist_uuid) {
             Some(s) => s,
@@ -2736,7 +2303,6 @@ pub extern "C" fn alexandria_watchlist_update_progress(
                     new_state,
                     body.current_episode,
                     body.total_episodes,
-                    &token,
                 )
                 .await
         });
@@ -2755,26 +2321,18 @@ pub extern "C" fn alexandria_watchlist_update_progress(
 ///
 /// `watchlist_uuid` and `video_uuid` are the watchlist's and video's public
 /// UUIDs (NUL-terminated strings). On success `json` carries the
-/// `watchlistUuid`/`videoUuid` confirmation — byte-for-byte the same shape
-/// HTTP returns from `DELETE /v1/watchlists/{uuid}/items/{videoUuid}`
-/// (parity, FR-FC-24 / NFR-09). `token` is the bearer auth token.
+/// `watchlistUuid`/`videoUuid` confirmation.
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
 pub extern "C" fn alexandria_watchlist_remove_video(
     watchlist_uuid: *const c_char,
     video_uuid: *const c_char,
-    token: *const c_char,
 ) -> WatchlistJsonResult {
     ffi_guard(WatchlistJsonResult::err(WATCHLIST_ERR_OTHER), || {
         let services = match locked_services() {
             Some(s) => s,
             None => return WatchlistJsonResult::err(WATCHLIST_ERR_NOT_INITIALIZED),
         };
-
-        let token = cstr_lossy(token).unwrap_or_default();
-        if !authenticated(&services, &token) {
-            return WatchlistJsonResult::err(WATCHLIST_ERR_UNAUTHORIZED);
-        }
 
         let watchlist_uuid =
             match cstr_lossy(watchlist_uuid).and_then(|s| uuid::Uuid::parse_str(&s).ok()) {
@@ -2789,7 +2347,7 @@ pub extern "C" fn alexandria_watchlist_remove_video(
         let result = runtime().block_on(async {
             services
                 .remove_video_from_watchlist_handler
-                .remove(watchlist_uuid, video_uuid, &token)
+                .remove(watchlist_uuid, video_uuid)
                 .await
         });
 
@@ -2806,27 +2364,15 @@ pub extern "C" fn alexandria_watchlist_remove_video(
 /// Delete a watchlist (UC-25 / FR-WL-07).
 ///
 /// `uuid` is the watchlist's public UUID (NUL-terminated string). On success
-/// `json` carries the pre-delete `Watchlist` — byte-for-byte the same shape
-/// HTTP returns from `DELETE /v1/watchlists/{uuid}` (parity, FR-FC-24 /
-/// NFR-09). `token` is the bearer auth token.
+/// `json` carries the pre-delete `Watchlist`.
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
-pub extern "C" fn alexandria_watchlist_delete(
-    uuid: *const c_char,
-    token: *const c_char,
-) -> WatchlistJsonResult {
+pub extern "C" fn alexandria_watchlist_delete(uuid: *const c_char) -> WatchlistJsonResult {
     ffi_guard(WatchlistJsonResult::err(WATCHLIST_ERR_OTHER), || {
         let services = match locked_services() {
             Some(s) => s,
             None => return WatchlistJsonResult::err(WATCHLIST_ERR_NOT_INITIALIZED),
         };
-
-        // Deny before touching the payload — an unauthenticated caller must not
-        // learn whether the uuid would have parsed.
-        let token = cstr_lossy(token).unwrap_or_default();
-        if !authenticated(&services, &token) {
-            return WatchlistJsonResult::err(WATCHLIST_ERR_UNAUTHORIZED);
-        }
 
         let uuid_str = match cstr_lossy(uuid) {
             Some(s) => s,
@@ -2837,8 +2383,8 @@ pub extern "C" fn alexandria_watchlist_delete(
             Err(_) => return WatchlistJsonResult::err(WATCHLIST_ERR_INVALID_INPUT),
         };
 
-        let result = runtime()
-            .block_on(async { services.delete_watchlist_handler.delete(uuid, &token).await });
+        let result =
+            runtime().block_on(async { services.delete_watchlist_handler.delete(uuid).await });
 
         match result {
             Ok(watchlist) => {
@@ -2853,7 +2399,6 @@ pub extern "C" fn alexandria_watchlist_delete(
 fn map_file_err(err: DomainError) -> FileJsonResult {
     match err {
         DomainError::NotFound => FileJsonResult::err(FILE_ERR_NOT_FOUND),
-        DomainError::Unauthorized => FileJsonResult::err(FILE_ERR_UNAUTHORIZED),
         DomainError::InvalidInput(_) => FileJsonResult::err(FILE_ERR_INVALID_INPUT),
         DomainError::InvalidState => FileJsonResult::err(FILE_ERR_INVALID_STATE),
         DomainError::Disk(_) => FileJsonResult::err(FILE_ERR_DISK),
@@ -2888,13 +2433,12 @@ pub extern "C" fn alexandria_index_count_missing() -> i64 {
 /// `content_hash` is nullable (Task 3: indexing never computes one; Task 4:
 /// neither does refresh) and is decoded as `Option<String>` — not `String` —
 /// so a `NULL` row serializes as JSON `null` here, matching what the shared
-/// `File`/`FileView` model emits over HTTP for the same column
-/// (`GET /v1/files`, `catalog/model.rs`). Decoding it as a bare `String`
-/// used to silently turn a SQL `NULL` into `""` instead (sqlx does not error
-/// on that mismatch for this driver), which was a byte-for-byte parity
-/// violation (FR-FC-24) for every indexed or refreshed file — not an edge
-/// case, since neither indexing nor refresh have computed a hash since
-/// Task 3/4.
+/// `File`/`FileView` model emits for the same column (`alexandria_files_list`,
+/// `catalog/model.rs`). Decoding it as a bare `String` used to silently turn a
+/// SQL `NULL` into `""` instead (sqlx does not error on that mismatch for this
+/// driver), so the two listings disagreed for every indexed or refreshed file
+/// — not an edge case, since neither indexing nor refresh have computed a hash
+/// since Task 3/4.
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
 pub extern "C" fn alexandria_index_files_json() -> *mut c_char {
@@ -2949,18 +2493,16 @@ pub extern "C" fn alexandria_index_files_json() -> *mut c_char {
 /// `READING_LIST_OK == WATCHLIST_OK == 0` by convention.
 pub const READING_LIST_OK: c_int = 0;
 pub const READING_LIST_ERR_INVALID_INPUT: c_int = 1;
-pub const READING_LIST_ERR_UNAUTHORIZED: c_int = 2;
 pub const READING_LIST_ERR_NOT_INITIALIZED: c_int = 3;
 pub const READING_LIST_ERR_NOT_FOUND: c_int = 4;
 pub const READING_LIST_ERR_INVALID_STATE: c_int = 5;
 pub const READING_LIST_ERR_OTHER: c_int = 9;
 
-/// Result of `alexandria_reading_list_create` (UC-26). On success `status`
-/// is `READING_LIST_OK` and `json` is a NUL-terminated JSON string of the
-/// `ReadingList` body — byte-for-byte the same shape HTTP returns from
-/// `POST /v1/reading-lists` (FR-FC-24 / NFR-09). On failure `json` is NULL
-/// and `status` carries the mapped error code. The caller must free `json`
-/// with `alexandria_free_string`.
+/// Result of `alexandria_reading_list_create` (UC-26). On success `status` is
+/// `READING_LIST_OK` and `json` is a NUL-terminated JSON string of the
+/// `ReadingList` body. On failure `json` is NULL and `status` carries the
+/// mapped error code. The caller must free `json` with
+/// `alexandria_free_string`.
 #[repr(C)]
 #[derive(Debug)]
 pub struct ReadingListJsonResult {
@@ -2988,17 +2530,16 @@ impl ReadingListJsonResult {
 fn map_reading_list_err(err: DomainError) -> ReadingListJsonResult {
     match err {
         DomainError::NotFound => ReadingListJsonResult::err(READING_LIST_ERR_NOT_FOUND),
-        DomainError::Unauthorized => ReadingListJsonResult::err(READING_LIST_ERR_UNAUTHORIZED),
         DomainError::InvalidInput(_) => ReadingListJsonResult::err(READING_LIST_ERR_INVALID_INPUT),
         DomainError::InvalidState => ReadingListJsonResult::err(READING_LIST_ERR_INVALID_STATE),
         _ => ReadingListJsonResult::err(READING_LIST_ERR_OTHER),
     }
 }
 
-/// Request body accepted by `alexandria_reading_list_create` — the same
-/// JSON `POST /v1/reading-lists` takes: `{"name":"Summer reads"}`. Parsed
-/// field-by-field for the same reason `CreateWatchlistBody` is: this crate
-/// depends on `serde_json` but not `serde`'s derive.
+/// Request body accepted by `alexandria_reading_list_create`:
+/// `{"name":"Summer reads"}`. Parsed field-by-field for the same reason
+/// `CreateWatchlistBody` is: this crate depends on `serde_json` but not
+/// `serde`'s derive.
 #[derive(Debug)]
 struct CreateReadingListBody {
     name: String,
@@ -3016,27 +2557,19 @@ impl CreateReadingListBody {
 /// Create a named reading list for tracking book/comic consumption (UC-26 /
 /// FR-RL-01).
 ///
-/// `json_body` is the JSON body HTTP would send (`name`). The function
-/// deserializes it, calls the same `CreateReadingListHandler` the HTTP
-/// route uses, and on success serializes the returned `ReadingList` back to
-/// JSON — so the FFI and HTTP surfaces agree byte-for-byte modulo key
-/// ordering (parity, FR-FC-24 / NFR-09). `token` is the bearer auth token.
+/// `json_body` is the JSON body (`name`). The function deserializes it, calls
+/// `CreateReadingListHandler`, and on success serializes the returned
+/// `ReadingList` back to JSON.
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
 pub extern "C" fn alexandria_reading_list_create(
     json_body: *const c_char,
-    token: *const c_char,
 ) -> ReadingListJsonResult {
     ffi_guard(ReadingListJsonResult::err(READING_LIST_ERR_OTHER), || {
         let services = match locked_services() {
             Some(s) => s,
             None => return ReadingListJsonResult::err(READING_LIST_ERR_NOT_INITIALIZED),
         };
-
-        let token = cstr_lossy(token).unwrap_or_default();
-        if !authenticated(&services, &token) {
-            return ReadingListJsonResult::err(READING_LIST_ERR_UNAUTHORIZED);
-        }
 
         let body_str = match cstr_lossy(json_body) {
             Some(s) => s,
@@ -3050,7 +2583,7 @@ pub extern "C" fn alexandria_reading_list_create(
         let result = runtime().block_on(async {
             services
                 .create_reading_list_handler
-                .create(&body.name, &token)
+                .create(&body.name)
                 .await
         });
 
@@ -3064,8 +2597,8 @@ pub extern "C" fn alexandria_reading_list_create(
     })
 }
 
-/// Request body accepted by `alexandria_reading_list_add_item` — the same
-/// JSON `POST /v1/reading-lists/{uuid}/items` takes: `{"itemUuid":"…"}`.
+/// Request body accepted by `alexandria_reading_list_add_item`:
+/// `{"itemUuid":"…"}`.
 #[derive(Debug)]
 struct AddItemToReadingListBody {
     item_uuid: uuid::Uuid,
@@ -3085,29 +2618,20 @@ impl AddItemToReadingListBody {
 /// Add a book or comic to a reading list (UC-28 / FR-RL-02, FR-RL-03).
 ///
 /// `uuid` is the reading list's public UUID (NUL-terminated string).
-/// `json_body` is the JSON body HTTP would send (`itemUuid`). The function
-/// deserializes it, calls the same `AddItemToReadingListHandler` the HTTP
-/// route uses, and on success serializes the returned `ReadingProgress`
-/// back to JSON — so the FFI and HTTP surfaces agree byte-for-byte modulo
-/// key ordering (parity, FR-FC-24 / NFR-09). `token` is the bearer auth
-/// token.
+/// `json_body` is the JSON body (`itemUuid`). The function deserializes it,
+/// calls `AddItemToReadingListHandler`, and on success serializes the returned
+/// `ReadingProgress` back to JSON.
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
 pub extern "C" fn alexandria_reading_list_add_item(
     uuid: *const c_char,
     json_body: *const c_char,
-    token: *const c_char,
 ) -> ReadingListJsonResult {
     ffi_guard(ReadingListJsonResult::err(READING_LIST_ERR_OTHER), || {
         let services = match locked_services() {
             Some(s) => s,
             None => return ReadingListJsonResult::err(READING_LIST_ERR_NOT_INITIALIZED),
         };
-
-        let token = cstr_lossy(token).unwrap_or_default();
-        if !authenticated(&services, &token) {
-            return ReadingListJsonResult::err(READING_LIST_ERR_UNAUTHORIZED);
-        }
 
         let uuid_str = match cstr_lossy(uuid) {
             Some(s) => s,
@@ -3130,7 +2654,7 @@ pub extern "C" fn alexandria_reading_list_add_item(
         let result = runtime().block_on(async {
             services
                 .add_item_to_reading_list_handler
-                .add(uuid, body.item_uuid, &token)
+                .add(uuid, body.item_uuid)
                 .await
         });
 
@@ -3144,10 +2668,9 @@ pub extern "C" fn alexandria_reading_list_add_item(
     })
 }
 
-/// Filter accepted by `alexandria_reading_lists_list` — the same JSON `GET
-/// /v1/reading-lists?readingListUuid=…` takes:
-/// `{"readingListUuid":"…"}`. An empty or absent `readingListUuid` means
-/// every reading list.
+/// Filter accepted by `alexandria_reading_lists_list`:
+/// `{"readingListUuid":"…"}`. An empty or absent `readingListUuid` means every
+/// reading list.
 #[derive(Debug, Default)]
 struct ReadingListsListFilter {
     reading_list_uuid: Option<String>,
@@ -3174,27 +2697,19 @@ impl ReadingListsListFilter {
 
 /// Browse reading lists and their items' read progress (UC-27 / FR-RL-08).
 ///
-/// `json_filters` is the JSON filter HTTP would build from its query string
-/// (`readingListUuid`); an empty string or `null` means every reading list.
-/// On success `json` carries a JSON array of `ReadingListWithProgress` —
-/// byte-for-byte the same shape HTTP returns from `GET /v1/reading-lists`
-/// (parity, FR-FC-24 / NFR-09). `token` is the bearer auth token.
+/// `json_filters` is a JSON filter (`readingListUuid`); an empty string or
+/// `null` means every reading list. On success `json` carries a JSON array of
+/// `ReadingListWithProgress`.
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
 pub extern "C" fn alexandria_reading_lists_list(
     json_filters: *const c_char,
-    token: *const c_char,
 ) -> ReadingListJsonResult {
     ffi_guard(ReadingListJsonResult::err(READING_LIST_ERR_OTHER), || {
         let services = match locked_services() {
             Some(s) => s,
             None => return ReadingListJsonResult::err(READING_LIST_ERR_NOT_INITIALIZED),
         };
-
-        let token = cstr_lossy(token).unwrap_or_default();
-        if !authenticated(&services, &token) {
-            return ReadingListJsonResult::err(READING_LIST_ERR_UNAUTHORIZED);
-        }
 
         let filter_str = cstr_lossy(json_filters).unwrap_or_default();
         let parsed = match ReadingListsListFilter::from_json_str(&filter_str) {
@@ -3217,7 +2732,7 @@ pub extern "C" fn alexandria_reading_lists_list(
         let result = runtime().block_on(async {
             services
                 .browse_reading_lists_handler
-                .list(reading_list_uuid, &token)
+                .list(reading_list_uuid)
                 .await
         });
 
@@ -3231,8 +2746,7 @@ pub extern "C" fn alexandria_reading_lists_list(
     })
 }
 
-/// Request body accepted by `alexandria_reading_list_update_progress` — the
-/// same JSON `PATCH /v1/reading-lists/{uuid}/items/{itemUuid}` takes:
+/// Request body accepted by `alexandria_reading_list_update_progress`:
 /// `{"state":"…","currentIssue":…,"totalIssues":…}` (issue fields
 /// optional/nullable; absent or null clears them).
 #[derive(Debug)]
@@ -3257,29 +2771,21 @@ impl UpdateReadingProgressBody {
 /// Update reading progress (UC-29 / FR-RL-04, FR-RL-05).
 ///
 /// `reading_list_uuid` and `item_uuid` are the reading list's and item's
-/// public UUIDs (NUL-terminated strings). `json_body` is the JSON body HTTP
-/// would send (`state`, optional `currentIssue`/`totalIssues`). On success
-/// `json` carries the updated `ReadingProgress` — byte-for-byte the same
-/// shape HTTP returns from `PATCH /v1/reading-lists/{uuid}/items/{itemUuid}`
-/// (parity, FR-FC-24 / NFR-09). `token` is the bearer auth token.
+/// public UUIDs (NUL-terminated strings). `json_body` is the JSON body
+/// (`state`, optional `currentIssue`/`totalIssues`). On success `json` carries
+/// the updated `ReadingProgress`.
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
 pub extern "C" fn alexandria_reading_list_update_progress(
     reading_list_uuid: *const c_char,
     item_uuid: *const c_char,
     json_body: *const c_char,
-    token: *const c_char,
 ) -> ReadingListJsonResult {
     ffi_guard(ReadingListJsonResult::err(READING_LIST_ERR_OTHER), || {
         let services = match locked_services() {
             Some(s) => s,
             None => return ReadingListJsonResult::err(READING_LIST_ERR_NOT_INITIALIZED),
         };
-
-        let token = cstr_lossy(token).unwrap_or_default();
-        if !authenticated(&services, &token) {
-            return ReadingListJsonResult::err(READING_LIST_ERR_UNAUTHORIZED);
-        }
 
         let reading_list_uuid_str = match cstr_lossy(reading_list_uuid) {
             Some(s) => s,
@@ -3322,7 +2828,6 @@ pub extern "C" fn alexandria_reading_list_update_progress(
                     new_state,
                     body.current_issue,
                     body.total_issues,
-                    &token,
                 )
                 .await
         });
@@ -3341,26 +2846,18 @@ pub extern "C" fn alexandria_reading_list_update_progress(
 ///
 /// `reading_list_uuid` and `item_uuid` are the reading list's and item's
 /// public UUIDs (NUL-terminated strings). On success `json` carries the
-/// `readingListUuid`/`itemUuid` confirmation — byte-for-byte the same shape
-/// HTTP returns from `DELETE /v1/reading-lists/{uuid}/items/{itemUuid}`
-/// (parity, FR-FC-24 / NFR-09). `token` is the bearer auth token.
+/// `readingListUuid`/`itemUuid` confirmation.
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
 pub extern "C" fn alexandria_reading_list_remove_item(
     reading_list_uuid: *const c_char,
     item_uuid: *const c_char,
-    token: *const c_char,
 ) -> ReadingListJsonResult {
     ffi_guard(ReadingListJsonResult::err(READING_LIST_ERR_OTHER), || {
         let services = match locked_services() {
             Some(s) => s,
             None => return ReadingListJsonResult::err(READING_LIST_ERR_NOT_INITIALIZED),
         };
-
-        let token = cstr_lossy(token).unwrap_or_default();
-        if !authenticated(&services, &token) {
-            return ReadingListJsonResult::err(READING_LIST_ERR_UNAUTHORIZED);
-        }
 
         let reading_list_uuid =
             match cstr_lossy(reading_list_uuid).and_then(|s| uuid::Uuid::parse_str(&s).ok()) {
@@ -3375,7 +2872,7 @@ pub extern "C" fn alexandria_reading_list_remove_item(
         let result = runtime().block_on(async {
             services
                 .remove_item_from_reading_list_handler
-                .remove(reading_list_uuid, item_uuid, &token)
+                .remove(reading_list_uuid, item_uuid)
                 .await
         });
 
@@ -3392,27 +2889,15 @@ pub extern "C" fn alexandria_reading_list_remove_item(
 /// Delete a reading list (UC-31 / FR-RL-07).
 ///
 /// `uuid` is the reading list's public UUID (NUL-terminated string). On
-/// success `json` carries the pre-delete `ReadingList` — byte-for-byte the
-/// same shape HTTP returns from `DELETE /v1/reading-lists/{uuid}` (parity,
-/// FR-FC-24 / NFR-09). `token` is the bearer auth token.
+/// success `json` carries the pre-delete `ReadingList`.
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
-pub extern "C" fn alexandria_reading_list_delete(
-    uuid: *const c_char,
-    token: *const c_char,
-) -> ReadingListJsonResult {
+pub extern "C" fn alexandria_reading_list_delete(uuid: *const c_char) -> ReadingListJsonResult {
     ffi_guard(ReadingListJsonResult::err(READING_LIST_ERR_OTHER), || {
         let services = match locked_services() {
             Some(s) => s,
             None => return ReadingListJsonResult::err(READING_LIST_ERR_NOT_INITIALIZED),
         };
-
-        // Deny before touching the payload — an unauthenticated caller must not
-        // learn whether the uuid would have parsed.
-        let token = cstr_lossy(token).unwrap_or_default();
-        if !authenticated(&services, &token) {
-            return ReadingListJsonResult::err(READING_LIST_ERR_UNAUTHORIZED);
-        }
 
         let uuid_str = match cstr_lossy(uuid) {
             Some(s) => s,
@@ -3423,12 +2908,8 @@ pub extern "C" fn alexandria_reading_list_delete(
             Err(_) => return ReadingListJsonResult::err(READING_LIST_ERR_INVALID_INPUT),
         };
 
-        let result = runtime().block_on(async {
-            services
-                .delete_reading_list_handler
-                .delete(uuid, &token)
-                .await
-        });
+        let result =
+            runtime().block_on(async { services.delete_reading_list_handler.delete(uuid).await });
 
         match result {
             Ok(reading_list) => {
@@ -3440,482 +2921,18 @@ pub extern "C" fn alexandria_reading_list_delete(
     })
 }
 
-/// FFI status codes returned by local-auth operations (UC-34/UC-35).
-/// Deliberately separate from the other `*_OK == 0` families — per the
-/// convention above — so local-auth use cases can grow their own set
-/// without colliding.
-pub const AUTH_OK: c_int = 0;
-pub const AUTH_ERR_INVALID_INPUT: c_int = 1;
-pub const AUTH_ERR_UNAUTHORIZED: c_int = 2;
-pub const AUTH_ERR_NOT_INITIALIZED: c_int = 3;
-pub const AUTH_ERR_INVALID_STATE: c_int = 5;
-pub const AUTH_ERR_CONFIG: c_int = 8;
-pub const AUTH_ERR_OTHER: c_int = 9;
-/// UC-41 AF-01/AF-02: the request conflicts with existing state — the
-/// active auth mode is not local, or an account already exists. The FFI
-/// counterpart of HTTP's `409`.
-pub const AUTH_ERR_CONFLICT: c_int = 10;
-/// Refused because it came too soon after some earlier request — a rate
-/// limit. The FFI counterpart of HTTP's `429`. Its own code because it is a
-/// "not yet", not a mistake the caller made.
-pub const AUTH_ERR_RATE_LIMITED: c_int = 11;
-/// A dependency the operation needs is unavailable. The FFI counterpart of
-/// HTTP's `503`; the body's `code` says which.
-pub const AUTH_ERR_SERVICE_UNAVAILABLE: c_int = 12;
-
-/// Result of `alexandria_auth_local_login` / `alexandria_auth_local_set_credentials`
-/// (UC-34/UC-35). On success `status` is `AUTH_OK` and `json` is a
-/// NUL-terminated JSON string of the `LocalLoginResult` /
-/// `LocalCredentialsResult` body — byte-for-byte the same shape HTTP
-/// returns from the matching `/v1/auth/local/*` endpoint (FR-FC-24 /
-/// NFR-09).
-///
-/// On failure `status` carries the mapped error code and `json` carries the
-/// same error envelope HTTP returns for that failure (issue #101):
-/// `{"error": …}`, plus `"code"` and `"params"` when the rejection has a
-/// stable reason. `status` is the coarse class; `code` is the reason — six
-/// distinct password-policy rejections all arrive as
-/// `AUTH_ERR_INVALID_INPUT`, and only `code` tells them apart.
-///
-/// `json` is NULL only when the library was never initialized, so there was
-/// no service to answer at all. The caller must free `json` with
-/// `alexandria_free_string` on every path; freeing NULL is a no-op.
-#[repr(C)]
-#[derive(Debug)]
-pub struct AuthJsonResult {
-    pub status: c_int,
-    pub json: *mut c_char,
-}
-
-impl AuthJsonResult {
-    /// A failure with no readable body — see the NULL case documented above.
-    fn err(status: c_int) -> Self {
-        Self {
-            status,
-            json: std::ptr::null_mut(),
-        }
-    }
-
-    /// A failure carrying the same error envelope HTTP would send.
-    fn err_body(status: c_int, body: String) -> Self {
-        match CString::new(body) {
-            Ok(cstring) => Self {
-                status,
-                json: cstring.into_raw(),
-            },
-            // Unreachable in practice: the envelope is JSON, which never
-            // contains an interior NUL. Degrade to the code-only failure
-            // rather than panicking across an FFI boundary.
-            Err(_) => Self::err(status),
-        }
-    }
-
-    /// A rejection produced by this layer rather than by a handler, rendered
-    /// through the same core renderer so it carries a code like every other.
-    fn rejected(code: &'static str, message: impl Into<String>) -> Self {
-        map_auth_err(DomainError::rejected(code, message))
-    }
-
-    fn ok(json: String) -> Self {
-        let cstring = CString::new(json).unwrap_or_default();
-        Self {
-            status: AUTH_OK,
-            json: cstring.into_raw(),
-        }
-    }
-}
-
-/// Map a `DomainError` to this surface's status code and error body.
-///
-/// The body comes from the core's `error_body`, the same renderer the HTTP
-/// surface uses, so the bytes match (FR-FC-24 / NFR-09). The status stays a
-/// match on the variant rather than on `ErrorClass`: this surface draws
-/// distinctions HTTP does not — `InvalidState` and `Conflict` are both `409`
-/// but different codes here, as are `Config` and the other internal failures —
-/// and collapsing them would be a breaking change to callers for no gain.
-fn map_auth_err(err: DomainError) -> AuthJsonResult {
-    let status = match err {
-        DomainError::Unauthorized => AUTH_ERR_UNAUTHORIZED,
-        DomainError::InvalidInput(_) | DomainError::Rejected(_) => AUTH_ERR_INVALID_INPUT,
-        DomainError::InvalidState => AUTH_ERR_INVALID_STATE,
-        DomainError::Config(_) => AUTH_ERR_CONFIG,
-        DomainError::Conflict(_) => AUTH_ERR_CONFLICT,
-        DomainError::TooManyRequests(_) => AUTH_ERR_RATE_LIMITED,
-        DomainError::Unavailable(_) => AUTH_ERR_SERVICE_UNAVAILABLE,
-        _ => AUTH_ERR_OTHER,
-    };
-    let (_, body) = error_body(&err);
-    AuthJsonResult::err_body(status, body.to_json())
-}
-
-/// Request body accepted by both `alexandria_auth_local_login` and
-/// `alexandria_auth_local_set_credentials` — the same JSON both
-/// `/v1/auth/local/*` endpoints take: `{"email":"…","password":"…"}`.
-#[derive(Debug)]
-struct LocalCredentialsBody {
-    email: String,
-    password: String,
-}
-
-impl LocalCredentialsBody {
-    fn from_json_str(s: &str) -> Option<Self> {
-        let value: serde_json::Value = serde_json::from_str(s).ok()?;
-        let obj = value.as_object()?;
-        Some(Self {
-            email: obj.get("email")?.as_str()?.to_string(),
-            password: obj.get("password")?.as_str()?.to_string(),
-        })
-    }
-}
-
-/// Local login (UC-34 / FR-AU-04): verify email + password and create a
-/// session. `json_body` is the JSON body HTTP would send (`email`,
-/// `password`). On success `json` carries the `LocalLoginResult` — the
-/// caller presents its `sessionId` on subsequent requests instead of a
-/// bearer token in local mode.
-///
-/// Deliberately takes no `token`: this is how a caller obtains credentials
-/// in the first place (mirrors the HTTP route being outside the auth gate).
-#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
-#[no_mangle]
-pub extern "C" fn alexandria_auth_local_login(json_body: *const c_char) -> AuthJsonResult {
-    ffi_guard(AuthJsonResult::err(AUTH_ERR_OTHER), || {
-        let services = match locked_services() {
-            Some(s) => s,
-            None => return AuthJsonResult::err(AUTH_ERR_NOT_INITIALIZED),
-        };
-
-        let body_str = match cstr_lossy(json_body) {
-            Some(s) => s,
-            None => return AuthJsonResult::rejected("malformed_body", "login body is missing"),
-        };
-        let body = match LocalCredentialsBody::from_json_str(&body_str) {
-            Some(b) => b,
-            None => {
-                return AuthJsonResult::rejected(
-                    "malformed_body",
-                    "invalid login body: expected an object with string 'email' and 'password'",
-                )
-            }
-        };
-
-        let result = runtime().block_on(async {
-            services
-                .local_login_handler
-                .login(&body.email, &body.password)
-                .await
-        });
-
-        match result {
-            Ok(login) => {
-                let json = serde_json::to_string(&login).unwrap_or_default();
-                AuthJsonResult::ok(json)
-            }
-            Err(err) => map_auth_err(err),
-        }
-    })
-}
-
-/// Windows login (UC-45 / FR-AU-20, FR-AU-22): open a session for the
-/// Windows account this process runs as. Takes no credentials — the account
-/// was already verified against the configured SID at startup. `json_body`
-/// is accepted but ignored: it exists only for signature consistency with
-/// this surface's other `alexandria_auth_*` neighbours, which all take a
-/// body. On success `json` carries the `LocalLoginResult`, the same shape
-/// `alexandria_auth_local_login` returns.
-#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
-#[no_mangle]
-pub extern "C" fn alexandria_auth_windows_login(_json_body: *const c_char) -> AuthJsonResult {
-    ffi_guard(AuthJsonResult::err(AUTH_ERR_OTHER), || {
-        let services = match locked_services() {
-            Some(s) => s,
-            None => return AuthJsonResult::err(AUTH_ERR_NOT_INITIALIZED),
-        };
-
-        let result = runtime().block_on(async { services.windows_login_handler.login().await });
-
-        match result {
-            Ok(login) => {
-                let json = serde_json::to_string(&login).unwrap_or_default();
-                AuthJsonResult::ok(json)
-            }
-            Err(err) => map_auth_err(err),
-        }
-    })
-}
-
-/// Set or change local-login credentials (UC-35 / FR-AU-05, FR-AU-06).
-/// `json_body` is the JSON body HTTP would send (`email`, `password`).
-/// `token` is required: this changes existing credentials. Creating the
-/// account is `alexandria_auth_local_register` (UC-41).
-#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
-#[no_mangle]
-pub extern "C" fn alexandria_auth_local_set_credentials(
-    json_body: *const c_char,
-    token: *const c_char,
-) -> AuthJsonResult {
-    ffi_guard(AuthJsonResult::err(AUTH_ERR_OTHER), || {
-        let services = match locked_services() {
-            Some(s) => s,
-            None => return AuthJsonResult::err(AUTH_ERR_NOT_INITIALIZED),
-        };
-
-        let token = cstr_lossy(token).unwrap_or_default();
-
-        let body_str = match cstr_lossy(json_body) {
-            Some(s) => s,
-            None => {
-                return AuthJsonResult::rejected("malformed_body", "credentials body is missing")
-            }
-        };
-        let body = match LocalCredentialsBody::from_json_str(&body_str) {
-            Some(b) => b,
-            None => return AuthJsonResult::rejected(
-                "malformed_body",
-                "invalid credentials body: expected an object with string 'email' and 'password'",
-            ),
-        };
-
-        let result = runtime().block_on(async {
-            services
-                .set_local_credentials_handler
-                .set(body.email, body.password, &token)
-                .await
-        });
-
-        match result {
-            Ok(credentials) => {
-                let json = serde_json::to_string(&credentials).unwrap_or_default();
-                AuthJsonResult::ok(json)
-            }
-            Err(err) => map_auth_err(err),
-        }
-    })
-}
-
-/// Request body for `alexandria_auth_local_register` — the same JSON the
-/// HTTP route takes: `{"email":"…","password":"…","passwordConfirmation":"…"}`.
-#[derive(Debug)]
-struct LocalRegisterBody {
-    email: String,
-    password: String,
-    password_confirmation: String,
-}
-
-impl LocalRegisterBody {
-    fn from_json_str(s: &str) -> Option<Self> {
-        let value: serde_json::Value = serde_json::from_str(s).ok()?;
-        let obj = value.as_object()?;
-        Some(Self {
-            email: obj.get("email")?.as_str()?.to_string(),
-            password: obj.get("password")?.as_str()?.to_string(),
-            password_confirmation: obj.get("passwordConfirmation")?.as_str()?.to_string(),
-        })
-    }
-}
-
-/// Register the local account (UC-41 / FR-AU-10, FR-AU-11): create the
-/// single owner's credentials and open a session. `json_body` is the JSON
-/// body HTTP would send (`email`, `password`, `passwordConfirmation`). On
-/// success `json` carries the `LocalRegisterResult`, whose `sessionId` the
-/// caller presents on subsequent requests.
-///
-/// Deliberately takes no `token`: there is nothing to authenticate with
-/// before an account exists. Succeeds only once — a second call returns
-/// `AUTH_ERR_CONFLICT` (AF-02).
-#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
-#[no_mangle]
-pub extern "C" fn alexandria_auth_local_register(json_body: *const c_char) -> AuthJsonResult {
-    ffi_guard(AuthJsonResult::err(AUTH_ERR_OTHER), || {
-        let services = match locked_services() {
-            Some(s) => s,
-            None => return AuthJsonResult::err(AUTH_ERR_NOT_INITIALIZED),
-        };
-
-        let body_str = match cstr_lossy(json_body) {
-            Some(s) => s,
-            None => return AuthJsonResult::rejected("malformed_body", "register body is missing"),
-        };
-        let body = match LocalRegisterBody::from_json_str(&body_str) {
-            Some(b) => b,
-            None => {
-                return AuthJsonResult::rejected(
-                    "malformed_body",
-                    "invalid register body: expected an object with string 'email', 'password', and 'passwordConfirmation'",
-                )
-            }
-        };
-
-        let result = runtime().block_on(async {
-            services
-                .register_local_account_handler
-                .register(body.email, body.password, body.password_confirmation)
-                .await
-        });
-
-        match result {
-            Ok(registration) => {
-                let json = serde_json::to_string(&registration).unwrap_or_default();
-                AuthJsonResult::ok(json)
-            }
-            Err(err) => map_auth_err(err),
-        }
-    })
-}
-
-/// Report the authenticated owner's account state (FR-AU-18): the same body
-/// `GET /v1/auth/local/account` returns. `token` is the session id.
-///
-/// This is the call a client makes to learn the stored address and how many
-/// recovery codes remain unspent.
-#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
-#[no_mangle]
-pub extern "C" fn alexandria_auth_local_account(token: *const c_char) -> AuthJsonResult {
-    ffi_guard(AuthJsonResult::err(AUTH_ERR_OTHER), || {
-        let services = match locked_services() {
-            Some(s) => s,
-            None => return AuthJsonResult::err(AUTH_ERR_NOT_INITIALIZED),
-        };
-
-        let token = cstr_lossy(token).unwrap_or_default();
-
-        let result =
-            runtime().block_on(async { services.get_local_account_handler.get(&token).await });
-
-        match result {
-            Ok(account) => {
-                let json = serde_json::to_string(&account).unwrap_or_default();
-                AuthJsonResult::ok(json)
-            }
-            Err(err) => map_auth_err(err),
-        }
-    })
-}
-
-/// Request body for `alexandria_auth_local_redeem_recovery_code` — the same
-/// JSON the HTTP route takes.
-#[derive(Debug)]
-struct RedeemRecoveryCodeBody {
-    code: String,
-    new_password: String,
-    password_confirmation: String,
-}
-
-impl RedeemRecoveryCodeBody {
-    fn from_json_str(s: &str) -> Option<Self> {
-        let value: serde_json::Value = serde_json::from_str(s).ok()?;
-        let obj = value.as_object()?;
-        Some(Self {
-            code: obj.get("code")?.as_str()?.to_string(),
-            new_password: obj.get("newPassword")?.as_str()?.to_string(),
-            password_confirmation: obj.get("passwordConfirmation")?.as_str()?.to_string(),
-        })
-    }
-}
-
-/// Redeem a recovery code for a new password (UC-43 / FR-AU-14 … FR-AU-16).
-/// `json_body` is the JSON body HTTP would send: an object with `code`,
-/// `newPassword`, and `passwordConfirmation`.
-///
-/// Deliberately takes no session token: the code is the credential, and this
-/// is the operation a caller who cannot authenticate uses to get back in.
-/// Every session is invalidated on success.
-#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
-#[no_mangle]
-pub extern "C" fn alexandria_auth_local_redeem_recovery_code(
-    json_body: *const c_char,
-) -> AuthJsonResult {
-    ffi_guard(AuthJsonResult::err(AUTH_ERR_OTHER), || {
-        let services = match locked_services() {
-            Some(s) => s,
-            None => return AuthJsonResult::err(AUTH_ERR_NOT_INITIALIZED),
-        };
-
-        let body_str = match cstr_lossy(json_body) {
-            Some(s) => s,
-            None => {
-                return AuthJsonResult::rejected(
-                    "malformed_body",
-                    "recovery redeem body is missing",
-                )
-            }
-        };
-        let body = match RedeemRecoveryCodeBody::from_json_str(&body_str) {
-            Some(b) => b,
-            None => {
-                return AuthJsonResult::rejected(
-                    "malformed_body",
-                    "invalid recovery redeem body: expected an object with string 'code', 'newPassword', and 'passwordConfirmation'",
-                )
-            }
-        };
-
-        let result = runtime().block_on(async {
-            services
-                .redeem_recovery_code_handler
-                .redeem(body.code, body.new_password, body.password_confirmation)
-                .await
-        });
-
-        match result {
-            Ok(redemption) => {
-                let json = serde_json::to_string(&redemption).unwrap_or_default();
-                AuthJsonResult::ok(json)
-            }
-            Err(err) => map_auth_err(err),
-        }
-    })
-}
-
-/// Replace the owner's recovery codes with a fresh set of ten (UC-44 /
-/// FR-AU-17), invalidating every old one. `token` is the session id the
-/// caller authenticates with, exactly as `alexandria_auth_local_account`
-/// takes it.
-#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
-#[no_mangle]
-pub extern "C" fn alexandria_auth_local_regenerate_recovery_codes(
-    token: *const c_char,
-) -> AuthJsonResult {
-    ffi_guard(AuthJsonResult::err(AUTH_ERR_OTHER), || {
-        let services = match locked_services() {
-            Some(s) => s,
-            None => return AuthJsonResult::err(AUTH_ERR_NOT_INITIALIZED),
-        };
-
-        let token = cstr_lossy(token).unwrap_or_default();
-
-        let result = runtime().block_on(async {
-            services
-                .regenerate_recovery_codes_handler
-                .regenerate(&token)
-                .await
-        });
-
-        match result {
-            Ok(regeneration) => {
-                let json = serde_json::to_string(&regeneration).unwrap_or_default();
-                AuthJsonResult::ok(json)
-            }
-            Err(err) => map_auth_err(err),
-        }
-    })
-}
-
 /// FFI status codes returned by the settings read (UC-47 / FR-FC-30).
 /// Deliberately separate from every other family — per the convention above —
 /// so this surface can grow independently; `SETTINGS_OK == INDEX_OK == 0` by
 /// convention.
 pub const SETTINGS_OK: c_int = 0;
-pub const SETTINGS_ERR_UNAUTHORIZED: c_int = 2;
 pub const SETTINGS_ERR_NOT_INITIALIZED: c_int = 3;
 pub const SETTINGS_ERR_OTHER: c_int = 9;
 
 /// Result of `alexandria_settings_json` (UC-47). On success `status` is
 /// `SETTINGS_OK` and `json` is a NUL-terminated JSON string of the settings
-/// body — byte-for-byte the same shape HTTP returns from `GET /v1/settings`
-/// (FR-FC-24 / NFR-09). On failure `json` is NULL and `status` carries the
-/// mapped error code. The caller must free `json` with
-/// `alexandria_free_string`.
+/// body. On failure `json` is NULL and `status` carries the mapped error code.
+/// The caller must free `json` with `alexandria_free_string`.
 #[repr(C)]
 #[derive(Debug)]
 pub struct SettingsJsonResult {
@@ -3942,47 +2959,42 @@ impl SettingsJsonResult {
 
 /// Report the client-relevant configuration (UC-47 / FR-FC-30).
 ///
-/// On success `json` carries the same body HTTP returns from
-/// `GET /v1/settings` — today `{"deletion":{"retentionDays":30}}`, the
-/// soft-delete retention window this server enforces on every restore and
-/// purge. `token` is the bearer auth token.
+/// On success `json` carries the settings body — today
+/// `{"deletion":{"retentionDays":30}}`, the soft-delete retention window this
+/// core enforces on every restore and purge.
 ///
 /// The boundary the number describes is the core's own: elapsed time up to and
 /// including `retentionDays` leaves a record restorable and not yet purgeable;
 /// strictly past it, the record is purgeable and no longer restorable.
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
-pub extern "C" fn alexandria_settings_json(token: *const c_char) -> SettingsJsonResult {
+pub extern "C" fn alexandria_settings_json() -> SettingsJsonResult {
     ffi_guard(SettingsJsonResult::err(SETTINGS_ERR_OTHER), || {
         let services = match locked_services() {
             Some(s) => s,
             None => return SettingsJsonResult::err(SETTINGS_ERR_NOT_INITIALIZED),
         };
 
-        let token = cstr_lossy(token).unwrap_or_default();
-
-        let result = runtime().block_on(async { services.get_settings_handler.get(&token).await });
+        let result = runtime().block_on(async { services.get_settings_handler.get().await });
 
         match result {
             Ok(settings) => {
                 let json = serde_json::to_string(&settings).unwrap_or_default();
                 SettingsJsonResult::ok(json)
             }
-            // AF-01 is the only failure this read has: it reads a value the
-            // process already holds, so there is nothing else to go wrong.
-            Err(DomainError::Unauthorized) => SettingsJsonResult::err(SETTINGS_ERR_UNAUTHORIZED),
+            // Nothing can go wrong: it reads a value the process already
+            // holds. The arm stays because the handler's answer is a `Result`.
             Err(_) => SettingsJsonResult::err(SETTINGS_ERR_OTHER),
         }
     })
 }
 
 /// FFI status codes returned by run-status operations (UC-42, UC-48 / FR-FC-28, FR-FC-32 … FR-FC-35).
-/// Deliberately separate from `INDEX_*`, `FILE_*`, `COLLECTION_*`, `PLAYBACK_*`,
-/// and `AUTH_*` — per the convention established above — so this surface can
+/// Deliberately separate from `INDEX_*`, `FILE_*`, `COLLECTION_*`, and
+/// `PLAYBACK_*` — per the convention established above — so this surface can
 /// grow independently; `RUN_OK == INDEX_OK == 0` by convention.
 pub const RUN_OK: c_int = 0;
 pub const RUN_ERR_INVALID_INPUT: c_int = 1;
-pub const RUN_ERR_UNAUTHORIZED: c_int = 2;
 pub const RUN_ERR_NOT_INITIALIZED: c_int = 3;
 pub const RUN_ERR_NOT_FOUND: c_int = 4;
 /// The run exists but is not in a state the requested verb permits — pausing
@@ -3997,10 +3009,8 @@ pub const RUN_ERR_OTHER: c_int = 9;
 
 /// Result of `alexandria_index_run_status_json` (UC-42). On success `status`
 /// is `RUN_OK` and `json` is a NUL-terminated JSON string of the `CatalogRun`
-/// body — byte-for-byte the same shape HTTP returns from
-/// `GET /v1/index/runs/{runId}` (FR-FC-24 / NFR-09). On failure `json` is
-/// NULL and `status` carries the mapped error code. The caller must free
-/// `json` with `alexandria_free_string`.
+/// body. On failure `json` is NULL and `status` carries the mapped error code.
+/// The caller must free `json` with `alexandria_free_string`.
 #[repr(C)]
 #[derive(Debug)]
 pub struct RunJsonResult {
@@ -4035,7 +3045,6 @@ impl RunJsonResult {
 fn map_run_err_code(err: DomainError) -> c_int {
     match err {
         DomainError::NotFound => RUN_ERR_NOT_FOUND,
-        DomainError::Unauthorized => RUN_ERR_UNAUTHORIZED,
         DomainError::InvalidInput(_) => RUN_ERR_INVALID_INPUT,
         DomainError::InvalidState => RUN_ERR_INVALID_STATE,
         _ => RUN_ERR_OTHER,
@@ -4049,29 +3058,18 @@ fn map_run_err(err: DomainError) -> RunJsonResult {
 /// Report an index or re-index run's status and outcome (UC-42 / FR-FC-28).
 /// `run_id` is the id `alexandria_library_index_start` or
 /// `alexandria_index_refresh_start` returned. On success `json` carries the
-/// same body the HTTP `GET /v1/index/runs/{runId}` route returns (FR-FC-24).
+/// run's `CatalogRun` body.
 ///
-/// Returns `RUN_ERR_NOT_FOUND` for an id naming no run (AF-01),
-/// `RUN_ERR_UNAUTHORIZED` for an unauthenticated caller (AF-02), and
+/// Returns `RUN_ERR_NOT_FOUND` for an id naming no run (AF-01), and
 /// `RUN_ERR_INVALID_INPUT` when `run_id` is not a uuid.
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
-pub extern "C" fn alexandria_index_run_status_json(
-    run_id: *const c_char,
-    token: *const c_char,
-) -> RunJsonResult {
+pub extern "C" fn alexandria_index_run_status_json(run_id: *const c_char) -> RunJsonResult {
     ffi_guard(RunJsonResult::err(RUN_ERR_OTHER), || {
         let services = match locked_services() {
             Some(s) => s,
             None => return RunJsonResult::err(RUN_ERR_NOT_INITIALIZED),
         };
-
-        // Deny before touching the payload — an unauthenticated caller must
-        // not learn whether its run id would have parsed.
-        let token = cstr_lossy(token).unwrap_or_default();
-        if !authenticated(&services, &token) {
-            return RunJsonResult::err(RUN_ERR_UNAUTHORIZED);
-        }
 
         let raw = match cstr_lossy(run_id) {
             Some(s) => s,
@@ -4082,7 +3080,7 @@ pub extern "C" fn alexandria_index_run_status_json(
         };
 
         let result =
-            runtime().block_on(async { services.get_run_status_handler.get(run_id, &token).await });
+            runtime().block_on(async { services.get_run_status_handler.get(run_id).await });
 
         match result {
             Ok(run) => {
@@ -4094,35 +3092,25 @@ pub extern "C" fn alexandria_index_run_status_json(
     })
 }
 
-/// The files a run could not record, oldest first (FR-FC-42). `run_id` is
-/// the id `alexandria_library_index_start` or `alexandria_index_refresh_start`
-/// returned. On success `json` carries the same array the HTTP
-/// `GET /v1/index/runs/{runId}/failures` route returns (FR-FC-24).
+/// The files a run could not record, oldest first (FR-FC-42). `run_id` is the
+/// id `alexandria_library_index_start` or `alexandria_index_refresh_start`
+/// returned. On success `json` carries the array of failures.
 ///
 /// A call of its own rather than a field on the status above: status is
 /// polled every second while a run is in flight, and this is wanted once, if
 /// ever — when the owner asks which files. The list is bounded per run; the
 /// run's own `failed` tally stays the authority on how many.
 ///
-/// Returns `RUN_ERR_NOT_FOUND` for an id naming no run (AF-01),
-/// `RUN_ERR_UNAUTHORIZED` for an unauthenticated caller (AF-02), and
+/// Returns `RUN_ERR_NOT_FOUND` for an id naming no run (AF-01), and
 /// `RUN_ERR_INVALID_INPUT` when `run_id` is not a uuid.
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
-pub extern "C" fn alexandria_index_run_failures_json(
-    run_id: *const c_char,
-    token: *const c_char,
-) -> RunJsonResult {
+pub extern "C" fn alexandria_index_run_failures_json(run_id: *const c_char) -> RunJsonResult {
     ffi_guard(RunJsonResult::err(RUN_ERR_OTHER), || {
         let services = match locked_services() {
             Some(s) => s,
             None => return RunJsonResult::err(RUN_ERR_NOT_INITIALIZED),
         };
-
-        let token = cstr_lossy(token).unwrap_or_default();
-        if !authenticated(&services, &token) {
-            return RunJsonResult::err(RUN_ERR_UNAUTHORIZED);
-        }
 
         let raw = match cstr_lossy(run_id) {
             Some(s) => s,
@@ -4132,12 +3120,8 @@ pub extern "C" fn alexandria_index_run_failures_json(
             return RunJsonResult::err(RUN_ERR_INVALID_INPUT);
         };
 
-        let result = runtime().block_on(async {
-            services
-                .get_run_status_handler
-                .failures(run_id, &token)
-                .await
-        });
+        let result =
+            runtime().block_on(async { services.get_run_status_handler.failures(run_id).await });
 
         match result {
             // Reported rather than answered as `[]`. An empty array here is a
@@ -4153,33 +3137,24 @@ pub extern "C" fn alexandria_index_run_failures_json(
     })
 }
 
-/// Pause a running index or re-index run where it stands, leaving it
-/// resumable (UC-48 / FR-FC-32). `run_id` is the id `alexandria_library_index_start`
-/// or `alexandria_index_refresh_start` returned; `token` is the bearer auth
-/// token. Calls the same `RunControlHandler::pause` the HTTP route (Task 12)
-/// calls.
+/// Pause a running index or re-index run where it stands, leaving it resumable
+/// (UC-48 / FR-FC-32). `run_id` is the id `alexandria_library_index_start` or
+/// `alexandria_index_refresh_start` returned. Calls
+/// `RunControlHandler::pause`.
 ///
 /// Returns `RUN_ERR_NOT_FOUND` for an id naming no run (AF-01),
-/// `RUN_ERR_UNAUTHORIZED` for an unauthenticated caller (AF-02),
 /// `RUN_ERR_INVALID_INPUT` when `run_id` is not a uuid, and
 /// `RUN_ERR_INVALID_STATE` when the run is not currently `running` — pausing
 /// an already-paused or already-finished run is refused rather than silently
 /// accepted.
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
-pub extern "C" fn alexandria_index_pause(run_id: *const c_char, token: *const c_char) -> c_int {
+pub extern "C" fn alexandria_index_pause(run_id: *const c_char) -> c_int {
     ffi_guard(RUN_ERR_OTHER, || {
         let services = match locked_services() {
             Some(s) => s,
             None => return RUN_ERR_NOT_INITIALIZED,
         };
-
-        // Deny before touching the payload — an unauthenticated caller must
-        // not learn whether its run id would have parsed.
-        let token = cstr_lossy(token).unwrap_or_default();
-        if !authenticated(&services, &token) {
-            return RUN_ERR_UNAUTHORIZED;
-        }
 
         let raw = match cstr_lossy(run_id) {
             Some(s) => s,
@@ -4189,8 +3164,7 @@ pub extern "C" fn alexandria_index_pause(run_id: *const c_char, token: *const c_
             return RUN_ERR_INVALID_INPUT;
         };
 
-        match runtime().block_on(async { services.run_control_handler.pause(run_id, &token).await })
-        {
+        match runtime().block_on(async { services.run_control_handler.pause(run_id).await }) {
             Ok(()) => RUN_OK,
             Err(err) => map_run_err_code(err),
         }
@@ -4199,30 +3173,21 @@ pub extern "C" fn alexandria_index_pause(run_id: *const c_char, token: *const c_
 
 /// Abandon a running or paused index or re-index run (UC-48 / FR-FC-34).
 /// Terminal — a cancelled run is never resumed. `run_id` is the id
-/// `alexandria_library_index_start` or `alexandria_index_refresh_start` returned;
-/// `token` is the bearer auth token. Calls the same
-/// `RunControlHandler::cancel` the HTTP route (Task 12) calls.
+/// `alexandria_library_index_start` or `alexandria_index_refresh_start`
+/// returned. Calls `RunControlHandler::cancel`.
 ///
 /// Returns `RUN_ERR_NOT_FOUND` for an id naming no run (AF-01),
-/// `RUN_ERR_UNAUTHORIZED` for an unauthenticated caller (AF-02),
 /// `RUN_ERR_INVALID_INPUT` when `run_id` is not a uuid, and
 /// `RUN_ERR_INVALID_STATE` when the run is already terminal (`complete`,
 /// `failed`, or already `cancelled`) — there is nothing left to abandon.
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
-pub extern "C" fn alexandria_index_cancel(run_id: *const c_char, token: *const c_char) -> c_int {
+pub extern "C" fn alexandria_index_cancel(run_id: *const c_char) -> c_int {
     ffi_guard(RUN_ERR_OTHER, || {
         let services = match locked_services() {
             Some(s) => s,
             None => return RUN_ERR_NOT_INITIALIZED,
         };
-
-        // Deny before touching the payload — an unauthenticated caller must
-        // not learn whether its run id would have parsed.
-        let token = cstr_lossy(token).unwrap_or_default();
-        if !authenticated(&services, &token) {
-            return RUN_ERR_UNAUTHORIZED;
-        }
 
         let raw = match cstr_lossy(run_id) {
             Some(s) => s,
@@ -4232,9 +3197,7 @@ pub extern "C" fn alexandria_index_cancel(run_id: *const c_char, token: *const c
             return RUN_ERR_INVALID_INPUT;
         };
 
-        match runtime()
-            .block_on(async { services.run_control_handler.cancel(run_id, &token).await })
-        {
+        match runtime().block_on(async { services.run_control_handler.cancel(run_id).await }) {
             Ok(()) => RUN_OK,
             Err(err) => map_run_err_code(err),
         }
@@ -4242,8 +3205,8 @@ pub extern "C" fn alexandria_index_cancel(run_id: *const c_char, token: *const c
 }
 
 /// Put a paused index or re-index run back to work (UC-48 / FR-FC-33).
-/// `run_id` is the id `alexandria_library_index_start` or `alexandria_index_refresh_start`
-/// returned; `token` is the bearer auth token. Returns the *same* `run_id` on
+/// `run_id` is the id `alexandria_library_index_start` or
+/// `alexandria_index_refresh_start` returned. Returns the *same* `run_id` on
 /// success — a resume does not mint a fresh run, it continues the one it was
 /// given — wrapped in the same `IndexStartResult` `alexandria_library_index_start`
 /// returns (parity of shape, not of meaning: `status` here is a `RUN_ERR_*`
@@ -4271,14 +3234,12 @@ pub extern "C" fn alexandria_index_cancel(run_id: *const c_char, token: *const c
 /// to speed a low-priority run back up. See `parse_resume_priority`.
 ///
 /// Returns `RUN_ERR_NOT_FOUND` for an id naming no run (AF-01),
-/// `RUN_ERR_UNAUTHORIZED` for an unauthenticated caller (AF-02),
 /// `RUN_ERR_INVALID_INPUT` when `run_id` is not a uuid, and
 /// `RUN_ERR_INVALID_STATE` when the run is not currently `paused`.
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
 pub extern "C" fn alexandria_index_resume(
     run_id: *const c_char,
-    token: *const c_char,
     priority: *const c_char,
 ) -> IndexStartResult {
     ffi_guard(IndexStartResult::err(RUN_ERR_OTHER), || {
@@ -4286,13 +3247,6 @@ pub extern "C" fn alexandria_index_resume(
             Some(s) => s,
             None => return IndexStartResult::err(RUN_ERR_NOT_INITIALIZED),
         };
-
-        // Deny before touching the payload — an unauthenticated caller must
-        // not learn whether its run id would have parsed.
-        let token = cstr_lossy(token).unwrap_or_default();
-        if !authenticated(&services, &token) {
-            return IndexStartResult::err(RUN_ERR_UNAUTHORIZED);
-        }
 
         let raw = match cstr_lossy(run_id) {
             Some(s) => s,
@@ -4305,12 +3259,9 @@ pub extern "C" fn alexandria_index_resume(
         let priority = parse_resume_priority(cstr_lossy(priority));
 
         let rt = runtime();
-        let resumed = match rt.block_on(async {
-            services
-                .run_control_handler
-                .resume(run_id, &token, priority)
-                .await
-        }) {
+        let resumed = match rt
+            .block_on(async { services.run_control_handler.resume(run_id, priority).await })
+        {
             Ok(resumed) => resumed,
             Err(err) => return IndexStartResult::err(map_run_err_code(err)),
         };
@@ -4332,7 +3283,7 @@ pub extern "C" fn alexandria_index_resume(
                     }
                 };
                 // Every index run is its library's; one without cannot be
-                // resumed into anything (HTTP refuses it the same way).
+                // resumed into anything.
                 let Some(library_uuid) = resumed.library_uuid else {
                     tracing::error!(
                         run_id = %resumed.run_id,
@@ -4368,35 +3319,24 @@ pub extern "C" fn alexandria_index_resume(
 }
 
 /// Every outstanding (`running` or `paused`) index and re-index run at once,
-/// each with live progress overlaid exactly as `alexandria_index_run_status_json`
-/// overlays a single run (UC-42 / FR-FC-35). `token` is the bearer auth
-/// token. On success `json` is a NUL-terminated JSON array of `CatalogRun`
-/// bodies, newest first — byte-for-byte the same shape the HTTP
-/// `GET /v1/index/runs?status=active` route (Task 12) returns (FR-FC-24 / NFR-09).
-/// The caller must free `json` with `alexandria_free_string`.
+/// each with live progress overlaid exactly as
+/// `alexandria_index_run_status_json` overlays a single run (UC-42 /
+/// FR-FC-35). On success `json` is a NUL-terminated JSON array of `CatalogRun`
+/// bodies, newest first. The caller must free `json` with
+/// `alexandria_free_string`.
 ///
 /// A caller with nothing outstanding gets `RUN_OK` and an empty JSON array,
 /// not an error — an idle library is the normal case, not a failure.
-///
-/// Returns `RUN_ERR_UNAUTHORIZED` for an unauthenticated caller (AF-02).
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
-pub extern "C" fn alexandria_index_runs_active_json(token: *const c_char) -> RunJsonResult {
+pub extern "C" fn alexandria_index_runs_active_json() -> RunJsonResult {
     ffi_guard(RunJsonResult::err(RUN_ERR_OTHER), || {
         let services = match locked_services() {
             Some(s) => s,
             None => return RunJsonResult::err(RUN_ERR_NOT_INITIALIZED),
         };
 
-        // Deny before touching the payload, same as every other run-control call
-        // in this section.
-        let token = cstr_lossy(token).unwrap_or_default();
-        if !authenticated(&services, &token) {
-            return RunJsonResult::err(RUN_ERR_UNAUTHORIZED);
-        }
-
-        let result =
-            runtime().block_on(async { services.get_active_runs_handler.list(&token).await });
+        let result = runtime().block_on(async { services.get_active_runs_handler.list().await });
 
         match result {
             Ok(runs) => {
@@ -4516,10 +3456,9 @@ mod tests {
 
     #[test]
     fn given_uppercase_low_when_priority_parsed_then_normal() {
-        // Case-sensitive on purpose — the HTTP body Task 12 adds spells it
-        // lowercase, and matching that spelling exactly is what keeps the
-        // two surfaces at parity (FR-FC-24) rather than accepting a wider
-        // set FFI understands and HTTP does not.
+        // Case-sensitive on purpose — the documented spelling is lowercase,
+        // and accepting a wider set would make a second spelling the app
+        // could come to depend on.
         assert_eq!(parse_priority(Some("Low".to_string())), RunPriority::Normal);
     }
 
@@ -4579,14 +3518,6 @@ mod tests {
     }
 
     #[test]
-    fn given_unauthorized_when_run_err_mapped_then_run_err_unauthorized() {
-        assert_eq!(
-            map_run_err_code(DomainError::Unauthorized),
-            RUN_ERR_UNAUTHORIZED
-        );
-    }
-
-    #[test]
     fn given_invalid_input_when_run_err_mapped_then_run_err_invalid_input() {
         assert_eq!(
             map_run_err_code(DomainError::InvalidInput("bad".into())),
@@ -4599,7 +3530,6 @@ mod tests {
 /// own set, per the convention above; `LIBRARY_OK == FILE_OK == 0`.
 pub const LIBRARY_OK: c_int = 0;
 pub const LIBRARY_ERR_INVALID_INPUT: c_int = 1;
-pub const LIBRARY_ERR_UNAUTHORIZED: c_int = 2;
 pub const LIBRARY_ERR_NOT_INITIALIZED: c_int = 3;
 pub const LIBRARY_ERR_NOT_FOUND: c_int = 4;
 /// The folder overlaps a library that already exists.
@@ -4612,9 +3542,8 @@ pub const LIBRARY_ERR_CONFLICT: c_int = 6;
 pub const LIBRARY_ERR_OTHER: c_int = 9;
 
 /// Result of every library FFI function. On success `status` is `LIBRARY_OK`
-/// and `json` is a NUL-terminated JSON string of the same body HTTP returns
-/// from the matching `/v1/libraries*` route (FR-FC-24 / NFR-09). The caller
-/// must free `json` with `alexandria_free_string`.
+/// and `json` is a NUL-terminated JSON string of the library body the call
+/// answers. The caller must free `json` with `alexandria_free_string`.
 #[repr(C)]
 #[derive(Debug)]
 pub struct LibraryJsonResult {
@@ -4642,15 +3571,14 @@ impl LibraryJsonResult {
 fn map_library_err(err: DomainError) -> LibraryJsonResult {
     match err {
         DomainError::NotFound => LibraryJsonResult::err(LIBRARY_ERR_NOT_FOUND),
-        DomainError::Unauthorized => LibraryJsonResult::err(LIBRARY_ERR_UNAUTHORIZED),
         DomainError::InvalidInput(_) => LibraryJsonResult::err(LIBRARY_ERR_INVALID_INPUT),
         DomainError::Conflict(_) => LibraryJsonResult::err(LIBRARY_ERR_CONFLICT),
         _ => LibraryJsonResult::err(LIBRARY_ERR_OTHER),
     }
 }
 
-/// Walk `library`'s folder for the run `run_id` on the runtime, as
-/// HTTP's `spawn_walk` does — the call that opened the run has answered.
+/// Walk `library`'s folder for the run `run_id` on the runtime, in the
+/// background — the call that opened the run has answered.
 fn spawn_library_walk(
     services: &Services,
     library: &alexandria_core::libraries::model::Library,
@@ -4671,13 +3599,12 @@ fn spawn_library_walk(
 ///
 /// Answers `INDEX_OK` with the run id, `INDEX_ERR_NOT_FOUND` for an unknown
 /// library, `INDEX_ERR_CONFLICT` while it has an unfinished run (FR-FC-43),
-/// `INDEX_ERR_INVALID_INPUT` for a malformed uuid, `INDEX_ERR_UNAUTHORIZED`
-/// or `INDEX_ERR_NOT_INITIALIZED` — HTTP's `202`, `404`, `409`, `400`, `401`.
+/// `INDEX_ERR_INVALID_INPUT` for a malformed uuid or
+/// `INDEX_ERR_NOT_INITIALIZED`.
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
 pub extern "C" fn alexandria_library_index_start(
     uuid: *const c_char,
-    token: *const c_char,
     priority: *const c_char,
 ) -> IndexStartResult {
     ffi_guard(IndexStartResult::err(INDEX_ERR_OTHER), || {
@@ -4685,21 +3612,13 @@ pub extern "C" fn alexandria_library_index_start(
             Some(s) => s,
             None => return IndexStartResult::err(INDEX_ERR_NOT_INITIALIZED),
         };
-        let token = cstr_lossy(token).unwrap_or_default();
-        if !authenticated(&services, &token) {
-            return IndexStartResult::err(INDEX_ERR_UNAUTHORIZED);
-        }
         let Some(uuid) = cstr_lossy(uuid).and_then(|raw| uuid::Uuid::parse_str(&raw).ok()) else {
             return IndexStartResult::err(INDEX_ERR_INVALID_INPUT);
         };
         let priority = parse_priority(cstr_lossy(priority));
 
-        let started = runtime().block_on(async {
-            services
-                .index_library_handler
-                .index(uuid, priority, &token)
-                .await
-        });
+        let started = runtime()
+            .block_on(async { services.index_library_handler.index(uuid, priority).await });
 
         match started {
             Ok((library, started)) => {
@@ -4709,7 +3628,6 @@ pub extern "C" fn alexandria_library_index_start(
             Err(DomainError::NotFound) => IndexStartResult::err(INDEX_ERR_NOT_FOUND),
             Err(DomainError::Conflict(_)) => IndexStartResult::err(INDEX_ERR_CONFLICT),
             Err(DomainError::InvalidInput(_)) => IndexStartResult::err(INDEX_ERR_INVALID_INPUT),
-            Err(DomainError::Unauthorized) => IndexStartResult::err(INDEX_ERR_UNAUTHORIZED),
             Err(_) => IndexStartResult::err(INDEX_ERR_OTHER),
         }
     })
@@ -4717,30 +3635,22 @@ pub extern "C" fn alexandria_library_index_start(
 
 /// Add a folder as a library and start indexing it (FR-FC-36).
 ///
-/// `json_body` is the JSON body `POST /v1/libraries` takes: `name`,
-/// `rootPath`, and an optional `priority` (`"low"`; anything else is normal)
-/// for the first run. On success `json` is the library with the `runId` of
-/// its first index run beside its fields; follow it with
-/// `alexandria_index_run_status_json`. Answers `LIBRARY_ERR_INVALID_INPUT` for
-/// a blank name or folder, a folder that does not exist or is not a folder,
-/// or one outside `filesystem.root`; `LIBRARY_ERR_CONFLICT` when the folder
-/// overlaps an existing library. A refusal stores nothing.
+/// `json_body` carries `name`, `rootPath`, and an optional `priority`
+/// (`"low"`; anything else is normal) for the first run. On success `json` is
+/// the library with the `runId` of its first index run beside its fields;
+/// follow it with `alexandria_index_run_status_json`. Answers
+/// `LIBRARY_ERR_INVALID_INPUT` for a blank name or folder, a folder that does
+/// not exist or is not a folder, or one outside `filesystem.root`;
+/// `LIBRARY_ERR_CONFLICT` when the folder overlaps an existing library. A
+/// refusal stores nothing.
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
-pub extern "C" fn alexandria_library_register(
-    json_body: *const c_char,
-    token: *const c_char,
-) -> LibraryJsonResult {
+pub extern "C" fn alexandria_library_register(json_body: *const c_char) -> LibraryJsonResult {
     ffi_guard(LibraryJsonResult::err(LIBRARY_ERR_OTHER), || {
         let services = match locked_services() {
             Some(s) => s,
             None => return LibraryJsonResult::err(LIBRARY_ERR_NOT_INITIALIZED),
         };
-
-        let token = cstr_lossy(token).unwrap_or_default();
-        if !authenticated(&services, &token) {
-            return LibraryJsonResult::err(LIBRARY_ERR_UNAUTHORIZED);
-        }
 
         let body = match cstr_lossy(json_body)
             .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
@@ -4756,8 +3666,8 @@ pub extern "C" fn alexandria_library_register(
             .get("rootPath")
             .and_then(|v| v.as_str())
             .unwrap_or_default();
-        // Lenient, as HTTP's `deserialize_priority` is (FR-FC-24): only the
-        // string `"low"` asks for a gentle first run.
+        // Lenient, as every start is: only the string `"low"` asks for a
+        // gentle first run.
         let priority = parse_priority(
             body.get("priority")
                 .and_then(|v| v.as_str())
@@ -4768,7 +3678,7 @@ pub extern "C" fn alexandria_library_register(
         let result = rt.block_on(async {
             services
                 .register_library_handler
-                .register(name, root_path, priority, &token)
+                .register(name, root_path, priority)
                 .await
         });
 
@@ -4784,29 +3694,22 @@ pub extern "C" fn alexandria_library_register(
 
 /// Point a library at the folder it moved to (libraries design).
 ///
-/// `json_body` is the JSON body `PATCH /v1/libraries/{uuid}` takes
-/// (`rootPath`). The library's files move with it, keeping their uuids and
+/// `json_body` is `{"rootPath": …}`. The library's files move with it, keeping their uuids and
 /// everything that points at them. Answers `LIBRARY_ERR_CONFLICT` when the
 /// destination overlaps another library, or when the catalog already holds
 /// files there, and `LIBRARY_ERR_INVALID_INPUT` when `rootPath` is blank or
-/// lies outside the configured `filesystem.root` (FR-FC-26), as HTTP's `400`.
+/// lies outside the configured `filesystem.root` (FR-FC-26).
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
 pub extern "C" fn alexandria_library_move(
     uuid: *const c_char,
     json_body: *const c_char,
-    token: *const c_char,
 ) -> LibraryJsonResult {
     ffi_guard(LibraryJsonResult::err(LIBRARY_ERR_OTHER), || {
         let services = match locked_services() {
             Some(s) => s,
             None => return LibraryJsonResult::err(LIBRARY_ERR_NOT_INITIALIZED),
         };
-
-        let token = cstr_lossy(token).unwrap_or_default();
-        if !authenticated(&services, &token) {
-            return LibraryJsonResult::err(LIBRARY_ERR_UNAUTHORIZED);
-        }
 
         let uuid = match cstr_lossy(uuid).and_then(|s| uuid::Uuid::parse_str(&s).ok()) {
             Some(u) => u,
@@ -4824,12 +3727,8 @@ pub extern "C" fn alexandria_library_move(
             .and_then(|v| v.as_str())
             .unwrap_or_default();
 
-        let result = runtime().block_on(async {
-            services
-                .move_library_handler
-                .move_to(uuid, root_path, &token)
-                .await
-        });
+        let result = runtime()
+            .block_on(async { services.move_library_handler.move_to(uuid, root_path).await });
 
         match result {
             Ok(library) => {
@@ -4843,20 +3742,14 @@ pub extern "C" fn alexandria_library_move(
 /// Every registered library.
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
-pub extern "C" fn alexandria_libraries_list(token: *const c_char) -> LibraryJsonResult {
+pub extern "C" fn alexandria_libraries_list() -> LibraryJsonResult {
     ffi_guard(LibraryJsonResult::err(LIBRARY_ERR_OTHER), || {
         let services = match locked_services() {
             Some(s) => s,
             None => return LibraryJsonResult::err(LIBRARY_ERR_NOT_INITIALIZED),
         };
 
-        let token = cstr_lossy(token).unwrap_or_default();
-        if !authenticated(&services, &token) {
-            return LibraryJsonResult::err(LIBRARY_ERR_UNAUTHORIZED);
-        }
-
-        let result =
-            runtime().block_on(async { services.list_libraries_handler.list(&token).await });
+        let result = runtime().block_on(async { services.list_libraries_handler.list().await });
 
         match result {
             Ok(libraries) => {
@@ -4867,17 +3760,40 @@ pub extern "C" fn alexandria_libraries_list(token: *const c_char) -> LibraryJson
     })
 }
 
+/// The catalog's totals: `{"libraries": n, "filesByType": {...}}`, with all
+/// seven types present and `0` for an empty one. Counts what the default file
+/// listing shows: active files, including those marked missing on disk;
+/// soft-deleted files are not counted. `LIBRARY_ERR_NOT_INITIALIZED` before
+/// `alexandria_index_init`, `LIBRARY_ERR_OTHER` when the query fails.
+#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
+#[no_mangle]
+pub extern "C" fn alexandria_catalog_stats_json() -> LibraryJsonResult {
+    ffi_guard(LibraryJsonResult::err(LIBRARY_ERR_OTHER), || {
+        let services = match locked_services() {
+            Some(s) => s,
+            None => return LibraryJsonResult::err(LIBRARY_ERR_NOT_INITIALIZED),
+        };
+
+        let result = runtime().block_on(async { services.catalog_stats_query.stats().await });
+
+        match result {
+            Ok(stats) => LibraryJsonResult::ok(serde_json::to_string(&stats).unwrap_or_default()),
+            Err(err) => map_library_err(err),
+        }
+    })
+}
+
 /// One level of a library's tree.
 ///
 /// `path` is the folder to list, relative to the library's root; NULL or an
-/// empty string is the top. One level rather than the whole tree — see the
-/// matching HTTP route.
+/// empty string is the top. One level rather than the whole tree (FR-FC-39):
+/// a course of two hundred classes is a large document to build and parse
+/// when the owner is looking at one folder.
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
 pub extern "C" fn alexandria_library_browse(
     uuid: *const c_char,
     path: *const c_char,
-    token: *const c_char,
 ) -> LibraryJsonResult {
     ffi_guard(LibraryJsonResult::err(LIBRARY_ERR_OTHER), || {
         let services = match locked_services() {
@@ -4885,23 +3801,14 @@ pub extern "C" fn alexandria_library_browse(
             None => return LibraryJsonResult::err(LIBRARY_ERR_NOT_INITIALIZED),
         };
 
-        let token = cstr_lossy(token).unwrap_or_default();
-        if !authenticated(&services, &token) {
-            return LibraryJsonResult::err(LIBRARY_ERR_UNAUTHORIZED);
-        }
-
         let uuid = match cstr_lossy(uuid).and_then(|s| uuid::Uuid::parse_str(&s).ok()) {
             Some(u) => u,
             None => return LibraryJsonResult::err(LIBRARY_ERR_INVALID_INPUT),
         };
         let path = cstr_lossy(path).unwrap_or_default();
 
-        let result = runtime().block_on(async {
-            services
-                .browse_library_handler
-                .browse(uuid, &path, &token)
-                .await
-        });
+        let result =
+            runtime().block_on(async { services.browse_library_handler.browse(uuid, &path).await });
 
         match result {
             Ok(listing) => {
@@ -4912,16 +3819,17 @@ pub extern "C" fn alexandria_library_browse(
     })
 }
 
-/// Remove a library and its catalog records (FR-FC-40); nothing on disk is
-/// touched. `LIBRARY_ERR_CONFLICT` while one of its runs is running
-/// (FR-FC-43), as HTTP answers `409`. On success `json`
-/// carries an empty object rather than NULL, so a caller can tell success
-/// from the failure codes without a special case.
+/// Rename a library, whenever the owner likes, including while its run is in
+/// progress or paused. `json_body` is `{"name": "..."}`; the answer is the
+/// updated library's JSON. `LIBRARY_ERR_INVALID_INPUT` for a `uuid` that is
+/// not one, a body that is not JSON or has no string `name`, or a blank name;
+/// `LIBRARY_ERR_NOT_INITIALIZED` before init; `LIBRARY_ERR_NOT_FOUND` for a
+/// uuid no library has.
 #[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
 #[no_mangle]
-pub extern "C" fn alexandria_library_remove(
+pub extern "C" fn alexandria_library_rename(
     uuid: *const c_char,
-    token: *const c_char,
+    json_body: *const c_char,
 ) -> LibraryJsonResult {
     ffi_guard(LibraryJsonResult::err(LIBRARY_ERR_OTHER), || {
         let services = match locked_services() {
@@ -4929,18 +3837,110 @@ pub extern "C" fn alexandria_library_remove(
             None => return LibraryJsonResult::err(LIBRARY_ERR_NOT_INITIALIZED),
         };
 
-        let token = cstr_lossy(token).unwrap_or_default();
-        if !authenticated(&services, &token) {
-            return LibraryJsonResult::err(LIBRARY_ERR_UNAUTHORIZED);
+        let uuid = match cstr_lossy(uuid).and_then(|s| uuid::Uuid::parse_str(&s).ok()) {
+            Some(u) => u,
+            None => return LibraryJsonResult::err(LIBRARY_ERR_INVALID_INPUT),
+        };
+
+        let name = match cstr_lossy(json_body)
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+            .and_then(|body| body.get("name").and_then(|v| v.as_str()).map(str::to_owned))
+        {
+            Some(name) => name,
+            None => return LibraryJsonResult::err(LIBRARY_ERR_INVALID_INPUT),
+        };
+
+        let result =
+            runtime().block_on(async { services.rename_library_handler.rename(uuid, &name).await });
+
+        match result {
+            Ok(library) => {
+                LibraryJsonResult::ok(serde_json::to_string(&library).unwrap_or_default())
+            }
+            Err(err) => map_library_err(err),
         }
+    })
+}
+
+/// Pin a library to the top of the menu, or unpin it. Answers `LIBRARY_OK`,
+/// `LIBRARY_ERR_INVALID_INPUT` when `uuid` is not a uuid,
+/// `LIBRARY_ERR_NOT_INITIALIZED` before init, and `LIBRARY_ERR_NOT_FOUND`
+/// for a uuid no library has. Setting the value a library already has is
+/// not an error.
+#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
+#[no_mangle]
+pub extern "C" fn alexandria_library_set_pinned(uuid: *const c_char, pinned: bool) -> c_int {
+    ffi_guard(LIBRARY_ERR_OTHER, || {
+        let services = match locked_services() {
+            Some(s) => s,
+            None => return LIBRARY_ERR_NOT_INITIALIZED,
+        };
+
+        let uuid = match cstr_lossy(uuid).and_then(|s| uuid::Uuid::parse_str(&s).ok()) {
+            Some(u) => u,
+            None => return LIBRARY_ERR_INVALID_INPUT,
+        };
+
+        let result = runtime()
+            .block_on(async { services.set_library_pinned_handler.set(uuid, pinned).await });
+
+        match result {
+            Ok(()) => LIBRARY_OK,
+            Err(err) => map_library_err(err).status,
+        }
+    })
+}
+
+/// Mark a library as a favorite, or unmark it, independently of pinning.
+/// Answers the same codes as `alexandria_library_set_pinned`.
+#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
+#[no_mangle]
+pub extern "C" fn alexandria_library_set_favorite(uuid: *const c_char, favorite: bool) -> c_int {
+    ffi_guard(LIBRARY_ERR_OTHER, || {
+        let services = match locked_services() {
+            Some(s) => s,
+            None => return LIBRARY_ERR_NOT_INITIALIZED,
+        };
+
+        let uuid = match cstr_lossy(uuid).and_then(|s| uuid::Uuid::parse_str(&s).ok()) {
+            Some(u) => u,
+            None => return LIBRARY_ERR_INVALID_INPUT,
+        };
+
+        let result = runtime().block_on(async {
+            services
+                .set_library_favorite_handler
+                .set(uuid, favorite)
+                .await
+        });
+
+        match result {
+            Ok(()) => LIBRARY_OK,
+            Err(err) => map_library_err(err).status,
+        }
+    })
+}
+
+/// Remove a library and its catalog records (FR-FC-40); nothing on disk is
+/// touched. `LIBRARY_ERR_CONFLICT` while one of its runs is running
+/// (FR-FC-43). On success `json` carries an empty object rather than NULL, so
+/// a caller can tell success from the failure codes without a special case.
+#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
+#[no_mangle]
+pub extern "C" fn alexandria_library_remove(uuid: *const c_char) -> LibraryJsonResult {
+    ffi_guard(LibraryJsonResult::err(LIBRARY_ERR_OTHER), || {
+        let services = match locked_services() {
+            Some(s) => s,
+            None => return LibraryJsonResult::err(LIBRARY_ERR_NOT_INITIALIZED),
+        };
 
         let uuid = match cstr_lossy(uuid).and_then(|s| uuid::Uuid::parse_str(&s).ok()) {
             Some(u) => u,
             None => return LibraryJsonResult::err(LIBRARY_ERR_INVALID_INPUT),
         };
 
-        let result = runtime()
-            .block_on(async { services.remove_library_handler.remove(uuid, &token).await });
+        let result =
+            runtime().block_on(async { services.remove_library_handler.remove(uuid).await });
 
         match result {
             Ok(()) => LibraryJsonResult::ok("{}".to_string()),

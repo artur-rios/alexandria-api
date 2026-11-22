@@ -1,29 +1,24 @@
 use uuid::Uuid;
 
-use crate::auth::AuthService;
 use crate::errors::DomainError;
 use crate::watchlists::model::WatchlistWithProgress;
 use crate::watchlists::repos::WatchlistRepository;
 
 /// Browse watchlists and their items' watch progress (UC-21 / FR-WL-08).
 ///
-/// Generic over the auth service and the watchlist repository, so the
-/// decision logic is unit-tested against a trait fake, then wired with the
-/// concrete Bearer/Sqlite collaborators at runtime (services.rs). Both the
-/// HTTP and FFI surfaces call this handler so the two stay at parity
-/// (FR-FC-24 / NFR-09).
-pub struct BrowseWatchlistsHandler<A, R> {
-    auth: A,
+/// Generic over the watchlist repository, so the decision logic is unit-tested
+/// against a trait fake, then wired with the concrete Sqlite collaborators at
+/// runtime (services.rs).
+pub struct BrowseWatchlistsHandler<R> {
     repo: R,
 }
 
-impl<A, R> BrowseWatchlistsHandler<A, R>
+impl<R> BrowseWatchlistsHandler<R>
 where
-    A: AuthService,
     R: WatchlistRepository,
 {
-    pub fn new(auth: A, repo: R) -> Self {
-        Self { auth, repo }
+    pub fn new(repo: R) -> Self {
+        Self { repo }
     }
 
     /// List watchlists with their items' progress. When `watchlist_uuid` is
@@ -32,11 +27,7 @@ where
     pub async fn list(
         &self,
         watchlist_uuid: Option<Uuid>,
-        token: &str,
     ) -> Result<Vec<WatchlistWithProgress>, DomainError> {
-        // AF-02: the caller must be authenticated.
-        self.auth.authenticate(token).await?;
-
         let watchlists = match watchlist_uuid {
             Some(uuid) => {
                 // AF-01: the requested watchlist must exist.

@@ -16,9 +16,7 @@ identifier defined in [System Requirements Document](System%20Requirements%20Doc
 
 | Actor | Description |
 | --- | --- |
-| **Owner** | The single authenticated user performing catalog operations. Authenticated via the active auth mode (external JWT, local login, or Windows account). |
-| **External Auth Service** | An external system that issues JWTs and, via a signing secret shared with Alexandria, lets Alexandria verify them offline. Actor in external mode only. |
-| **Operating System** | The Windows account the server process runs as, whose identity the process reads at startup and compares to the configured owner. Actor in Windows mode only. |
+| **Owner** | The single person at the machine, performing catalog operations through the desktop front-end, which calls the core in process. There is no login: the core only runs locally, for that person. |
 | **Local Filesystem** | The on-disk store the system indexes, renames into, and writes text content back to. |
 
 ### 1.3 Use Case Overview
@@ -27,7 +25,6 @@ identifier defined in [System Requirements Document](System%20Requirements%20Doc
 graph LR
     subgraph Actors
         O(("Owner"))
-        AUTH(("External Auth Service"))
         FS(("Local Filesystem"))
     end
 
@@ -57,9 +54,12 @@ graph LR
         UC33[UC-33 Edit content]
     end
 
-    subgraph "Auth"
-        UC34[UC-34 Local login]
-        UC36[UC-36 External JWT]
+    subgraph "Libraries"
+        UC51[UC-51 Add a library]
+        UC53[UC-53 Pin]
+        UC54[UC-54 Favorite]
+        UC55[UC-55 Rename]
+        UC56[UC-56 Statistics]
     end
 
     subgraph "Playback"
@@ -83,9 +83,12 @@ graph LR
     UC01 --> FS
     UC09 --> FS
     UC33 --> FS
-    O --> UC34
-    O --> UC36
-    UC36 --> AUTH
+    O --> UC51
+    O --> UC53
+    O --> UC54
+    O --> UC55
+    O --> UC56
+    UC51 --> FS
     O --> UC38
     O --> UC39
     O --> UC40
@@ -107,9 +110,9 @@ graph LR
 | **Name** | Index a library |
 | **Actors** | Owner, Local Filesystem |
 | **Description** | Walk a library's folder and create type-aware catalog records, in that library, for every file of a type the system can read. Started by adding the library (UC-51) or by re-indexing it. |
-| **Preconditions** | The caller is authenticated as the owner; the library exists and has no unfinished run (FR-FC-43); its folder exists and sits inside the configured `filesystem.root` when one is configured (FR-FC-26). |
+| **Preconditions** | The library exists and has no unfinished run (FR-FC-43); its folder exists and sits inside the configured `filesystem.root` when one is configured (FR-FC-26). |
 | **Postconditions** | A File record exists in the library for each readable file found, each carrying that file's path, name, type, size, and modification time, plus a subtype record prefilled with whatever metadata could be extracted from the file itself; indexing runs without blocking reads. |
-| **Requirements** | FR-FC-01, FR-FC-02, FR-FC-03, FR-FC-04, FR-FC-05, FR-FC-06, FR-FC-07, FR-FC-08, FR-FC-09, FR-FC-14, FR-FC-24, FR-FC-25, FR-FC-26, FR-FC-27, FR-FC-31, FR-FC-37, FR-FC-43 |
+| **Requirements** | FR-FC-01, FR-FC-02, FR-FC-03, FR-FC-04, FR-FC-05, FR-FC-06, FR-FC-07, FR-FC-08, FR-FC-09, FR-FC-14, FR-FC-25, FR-FC-26, FR-FC-27, FR-FC-31, FR-FC-37, FR-FC-43 |
 
 **Main Flow**
 
@@ -128,7 +131,6 @@ its status and live progress, and UC-48 pauses, resumes, or cancels it.
 | ID | Condition | Outcome |
 | --- | --- | --- |
 | AF-01 | The library's folder does not exist on disk | The system rejects the request with an invalid-input error, and no run record is opened. |
-| AF-02 | The caller is not authenticated | The system denies with an unauthorized error. |
 | AF-09 | The library to re-index does not exist | The system answers not found. |
 | AF-10 | The library already has a `running` or `paused` run (FR-FC-43) | The system refuses with a conflict naming the run; the owner resumes, finishes or cancels it first (UC-48). |
 | AF-03 | A file path is already cataloged | The system creates no duplicate and counts the entry in `alreadyCataloged`, kept apart from `skipped` (an unsupported extension) so that a resumed run's tally stays honest (FR-FC-27); a refresh is handled by UC-02. |
@@ -148,9 +150,9 @@ its status and live progress, and UC-48 pauses, resumes, or cancels it.
 | **Name** | Re-index and refresh the catalog |
 | **Actors** | Owner, Local Filesystem |
 | **Description** | Re-visit every cataloged path, detect the ones that changed on disk, and mark the ones that are gone. |
-| **Preconditions** | The caller is authenticated; at least one indexing run has occurred. |
+| **Preconditions** | At least one indexing run has occurred. |
 | **Postconditions** | Changed files carry their new size, modification time, and `indexedAt`, and no stale content hash; missing-on-disk files carry a `missingAt` marker but are not deleted. |
-| **Requirements** | FR-FC-08, FR-FC-10, FR-FC-11, FR-FC-24, FR-FC-27, FR-FC-31 |
+| **Requirements** | FR-FC-08, FR-FC-10, FR-FC-11, FR-FC-27, FR-FC-31 |
 
 **Main Flow**
 
@@ -165,7 +167,6 @@ its status and live progress, and UC-48 pauses, resumes, or cancels it.
 | ID | Condition | Outcome |
 | --- | --- | --- |
 | AF-01 | A path on disk was deleted since indexing | The system sets `missingAt` (per main flow step 5); the record is neither deleted nor moved to the `deleted` state. (Explicit deletion is UC-06.) |
-| AF-02 | The caller is not authenticated | The system denies with an unauthorized error. |
 | AF-03 | A single cataloged path cannot be read or written | The system counts it as failed, logs a warning naming the path, and continues the run; the remaining paths are still refreshed. |
 | AF-04 | The owner pauses or cancels the run while it is in flight (UC-48) | As UC-01 AF-08. A resumed re-index re-visits every cataloged path from the start; that is safe because the comparison is idempotent and each path costs one stat. |
 
@@ -186,9 +187,9 @@ its status and live progress, and UC-48 pauses, resumes, or cancels it.
 | **Name** | Browse and view file metadata |
 | **Actors** | Owner |
 | **Description** | List/query files across every library — to search, or to review the trash — and view a single file's metadata. Browsing one library as its folder tree is UC-51's. |
-| **Preconditions** | The caller is authenticated. |
+| **Preconditions** | None. |
 | **Postconditions** | The caller receives filtered list results or a single file's metadata, each carrying the library it belongs to. |
-| **Requirements** | FR-FC-12, FR-FC-13, FR-FC-24, FR-FC-38 |
+| **Requirements** | FR-FC-12, FR-FC-13, FR-FC-38 |
 
 **Main Flow**
 
@@ -201,7 +202,6 @@ its status and live progress, and UC-48 pauses, resumes, or cancels it.
 | ID | Condition | Outcome |
 | --- | --- | --- |
 | AF-01 | The requested UUID does not exist | The system responds with a not-found error. |
-| AF-02 | The caller is not authenticated | The system denies with an unauthorized error. |
 | AF-03 | A filter value is not a recognised type or lifecycle state, or a library or collection identifier is malformed | The system rejects with an invalid-input error rather than ignoring the filter. An empty value means "no filter"; a well-formed identifier naming nothing matches no files. |
 
 ---
@@ -214,9 +214,9 @@ its status and live progress, and UC-48 pauses, resumes, or cancels it.
 | **Name** | Edit file metadata |
 | **Actors** | Owner |
 | **Description** | Edit the type-specific metadata of a file (audio, video, document, comic-book, or image fields). |
-| **Preconditions** | The caller is authenticated; the target file exists and is `active`. |
+| **Preconditions** | The target file exists and is `active`. |
 | **Postconditions** | The file's subtype metadata is updated. |
-| **Requirements** | FR-FC-14, FR-FC-15, FR-FC-16, FR-FC-17, FR-FC-18, FR-FC-24 |
+| **Requirements** | FR-FC-14, FR-FC-15, FR-FC-16, FR-FC-17, FR-FC-18 |
 
 **Main Flow**
 
@@ -230,7 +230,6 @@ its status and live progress, and UC-48 pauses, resumes, or cancels it.
 | --- | --- | --- |
 | AF-01 | The fields do not match the file's subtype (e.g. image fields on a video) | The system rejects with an invalid-input error. |
 | AF-02 | The file UUID does not exist | The system responds with a not-found error. |
-| AF-03 | The caller is not authenticated | The system denies with an unauthorized error. |
 | AF-04 | The file is in `deleted` state | The system rejects with an invalid-state error (restore first via UC-07). |
 
 ---
@@ -243,9 +242,9 @@ its status and live progress, and UC-48 pauses, resumes, or cancels it.
 | **Name** | Rename a file |
 | **Actors** | Owner, Local Filesystem |
 | **Description** | Rename a file, which renames the underlying file on disk. |
-| **Preconditions** | The caller is authenticated; the target file exists and is `active`. |
+| **Preconditions** | The target file exists and is `active`. |
 | **Postconditions** | The file's name and on-disk path are updated. |
-| **Requirements** | FR-FC-19, FR-FC-24, FR-FC-26 |
+| **Requirements** | FR-FC-19, FR-FC-26 |
 
 **Main Flow**
 
@@ -261,7 +260,6 @@ its status and live progress, and UC-48 pauses, resumes, or cancels it.
 | AF-01 | The new name is not a valid file name | The system rejects with an invalid-input error. |
 | AF-02 | The on-disk rename fails (permission denied / target exists) | The system rolls back the catalog change, returns a disk-error, and leaves the on-disk file untouched. |
 | AF-03 | The file UUID does not exist | The system responds with a not-found error. |
-| AF-04 | The caller is not authenticated | The system denies with an unauthorized error. |
 | AF-05 | `filesystem.root` is configured and the file's recorded path resolves outside it (FR-FC-26) | The system rejects with an invalid-input error and renames nothing. As UC-38 AF-06. |
 
 ---
@@ -274,9 +272,9 @@ its status and live progress, and UC-48 pauses, resumes, or cancels it.
 | **Name** | Soft-delete a file |
 | **Actors** | Owner |
 | **Description** | Mark a file record as deleted, hiding it from active views while keeping it restorable. |
-| **Preconditions** | The caller is authenticated; the target file exists. |
+| **Preconditions** | The target file exists. |
 | **Postconditions** | The file's state is `deleted` and `deletedAt` is set. |
-| **Requirements** | FR-FC-20, FR-FC-24 |
+| **Requirements** | FR-FC-20 |
 
 **Main Flow**
 
@@ -289,7 +287,6 @@ its status and live progress, and UC-48 pauses, resumes, or cancels it.
 | ID | Condition | Outcome |
 | --- | --- | --- |
 | AF-01 | The file UUID does not exist | The system responds with a not-found error. |
-| AF-02 | The caller is not authenticated | The system denies with an unauthorized error. |
 
 ---
 
@@ -301,9 +298,9 @@ its status and live progress, and UC-48 pauses, resumes, or cancels it.
 | **Name** | Restore a soft-deleted file |
 | **Actors** | Owner |
 | **Description** | Restore a soft-deleted file to `active`. |
-| **Preconditions** | The caller is authenticated; the target file is in `deleted` state and its retention window has not elapsed. |
+| **Preconditions** | The target file is in `deleted` state and its retention window has not elapsed. |
 | **Postconditions** | The file's state is `active` and `deletedAt` is cleared. |
-| **Requirements** | FR-FC-21, FR-FC-24 |
+| **Requirements** | FR-FC-21 |
 
 **Main Flow**
 
@@ -317,7 +314,6 @@ its status and live progress, and UC-48 pauses, resumes, or cancels it.
 | --- | --- | --- |
 | AF-01 | The record was already hard-purged (past retention) | The system responds with a not-found error. |
 | AF-02 | The file UUID does not exist or is not deleted | The system responds with a not-found / invalid-state error. |
-| AF-03 | The caller is not authenticated | The system denies with an unauthorized error. |
 
 ---
 
@@ -329,9 +325,9 @@ its status and live progress, and UC-48 pauses, resumes, or cancels it.
 | **Name** | Hard-purge a file record |
 | **Actors** | Owner |
 | **Description** | Permanently remove a file record from the catalog (on-disk file untouched). |
-| **Preconditions** | The caller is authenticated; the target file's retention window has elapsed. |
+| **Preconditions** | The target file's retention window has elapsed. |
 | **Postconditions** | The file record is permanently removed; the on-disk file is untouched. |
-| **Requirements** | FR-FC-22, FR-FC-24, NFR-07 |
+| **Requirements** | FR-FC-22, NFR-07 |
 
 **Main Flow**
 
@@ -346,7 +342,6 @@ its status and live progress, and UC-48 pauses, resumes, or cancels it.
 | --- | --- | --- |
 | AF-01 | The retention window has not elapsed | The system rejects with an invalid-operation error. |
 | AF-02 | The file UUID does not exist | The system responds with a not-found error. |
-| AF-03 | The caller is not authenticated | The system denies with an unauthorized error. |
 
 ---
 
@@ -358,9 +353,9 @@ its status and live progress, and UC-48 pauses, resumes, or cancels it.
 | **Name** | Purge a file on disk |
 | **Actors** | Owner, Local Filesystem |
 | **Description** | Remove a file record and delete the underlying file on disk. |
-| **Preconditions** | The caller is authenticated; the target file record exists. |
+| **Preconditions** | The target file record exists. |
 | **Postconditions** | The file record is removed and the on-disk file is deleted. |
-| **Requirements** | FR-FC-23, FR-FC-24, FR-FC-26 |
+| **Requirements** | FR-FC-23, FR-FC-26 |
 
 **Main Flow**
 
@@ -376,7 +371,6 @@ its status and live progress, and UC-48 pauses, resumes, or cancels it.
 | AF-01 | The on-disk file is already missing | The system removes the record and returns confirmation with a note that no on-disk file was present. |
 | AF-02 | The on-disk delete fails (permission denied) | The system rolls back, leaves the record, and returns a disk-error. |
 | AF-03 | The file UUID does not exist | The system responds with a not-found error. |
-| AF-04 | The caller is not authenticated | The system denies with an unauthorized error. |
 | AF-05 | `filesystem.root` is configured and the file's recorded path resolves outside it (FR-FC-26) | The system rejects with an invalid-input error, deletes nothing, and keeps the record. As UC-38 AF-06. Purging the record alone (UC-08) does not touch the disk and is unaffected, so such a record can still be removed. |
 
 ---
@@ -389,9 +383,9 @@ its status and live progress, and UC-48 pauses, resumes, or cancels it.
 | **Name** | Create a collection |
 | **Actors** | Owner |
 | **Description** | Create a flat file or bookmark collection. |
-| **Preconditions** | The caller is authenticated. |
+| **Preconditions** | None. |
 | **Postconditions** | A new Collection with the given name and `kind` exists. |
-| **Requirements** | FR-CO-01, FR-CO-02, FR-FC-24 |
+| **Requirements** | FR-CO-01, FR-CO-02 |
 
 **Main Flow**
 
@@ -404,7 +398,6 @@ its status and live progress, and UC-48 pauses, resumes, or cancels it.
 | ID | Condition | Outcome |
 | --- | --- | --- |
 | AF-01 | The name is empty or the `kind` is invalid | The system rejects with an invalid-input error. |
-| AF-02 | The caller is not authenticated | The system denies with an unauthorized error. |
 
 ---
 
@@ -416,9 +409,9 @@ its status and live progress, and UC-48 pauses, resumes, or cancels it.
 | **Name** | Rename a collection |
 | **Actors** | Owner |
 | **Description** | Rename an existing collection. |
-| **Preconditions** | The caller is authenticated; the collection exists. |
+| **Preconditions** | The collection exists. |
 | **Postconditions** | The collection's name is updated. |
-| **Requirements** | FR-CO-03, FR-FC-24 |
+| **Requirements** | FR-CO-03 |
 
 **Main Flow**
 
@@ -432,7 +425,6 @@ its status and live progress, and UC-48 pauses, resumes, or cancels it.
 | --- | --- | --- |
 | AF-01 | The name is empty | The system rejects with an invalid-input error. |
 | AF-02 | The collection UUID does not exist | The system responds with a not-found error. |
-| AF-03 | The caller is not authenticated | The system denies with an unauthorized error. |
 
 ---
 
@@ -444,9 +436,9 @@ its status and live progress, and UC-48 pauses, resumes, or cancels it.
 | **Name** | Delete a collection |
 | **Actors** | Owner |
 | **Description** | Delete a collection, preserving (unlinking) its contained items. |
-| **Preconditions** | The caller is authenticated; the collection exists. |
+| **Preconditions** | The collection exists. |
 | **Postconditions** | The collection is removed; its items keep their `active`/`deleted` state and are no longer grouped. |
-| **Requirements** | FR-CO-04, FR-FC-24 |
+| **Requirements** | FR-CO-04 |
 
 **Main Flow**
 
@@ -459,7 +451,6 @@ its status and live progress, and UC-48 pauses, resumes, or cancels it.
 | ID | Condition | Outcome |
 | --- | --- | --- |
 | AF-01 | The collection UUID does not exist | The system responds with a not-found error. |
-| AF-02 | The caller is not authenticated | The system denies with an unauthorized error. |
 
 ---
 
@@ -471,9 +462,9 @@ its status and live progress, and UC-48 pauses, resumes, or cancels it.
 | **Name** | Add items to a collection |
 | **Actors** | Owner |
 | **Description** | Add one or more items of the matching `kind` to a collection, reporting what became of each. |
-| **Preconditions** | The caller is authenticated; the collection exists. |
+| **Preconditions** | The collection exists. |
 | **Postconditions** | Each accepted item's `collectionId` references the collection. A rejected item is unchanged. |
-| **Requirements** | FR-CO-05, FR-FC-24 |
+| **Requirements** | FR-CO-05 |
 
 **Main Flow**
 
@@ -488,7 +479,6 @@ its status and live progress, and UC-48 pauses, resumes, or cancels it.
 | AF-01 | An item's type does not match the collection's `kind` | The system reports that item as not added, because it is of the other kind, and links the rest. |
 | AF-02 | A referenced item UUID does not exist | The system reports that item as not added, because there is no such item, and links the rest. |
 | AF-03 | The collection UUID does not exist | The system responds with a not-found error. |
-| AF-04 | The caller is not authenticated | The system denies with an unauthorized error. |
 | AF-05 | Every submitted item is rejected | The system succeeds, carrying a report that says so. Nothing was linked, and the caller is told why for each. |
 
 > AF-01 and AF-02 were request-level errors until the report existed. They are
@@ -499,7 +489,7 @@ its status and live progress, and UC-48 pauses, resumes, or cancels it.
 > A batch that failed whole gave a caller one reason for the lot — "none of
 > them, because one was wrong" — which is not an answer anybody can act on. The
 > Alexandria UI worked around it by sending one call per item, which is a batch
-> endpoint used one row at a time to recover what it had discarded.
+> call used one row at a time to recover what it had discarded.
 
 ---
 
@@ -511,9 +501,9 @@ its status and live progress, and UC-48 pauses, resumes, or cancels it.
 | **Name** | Remove and list items in a collection |
 | **Actors** | Owner |
 | **Description** | Remove items from a collection (unlink only), list the items in a collection, and enable the by-collection file filter deferred from UC-03. |
-| **Preconditions** | The caller is authenticated; the collection exists. |
+| **Preconditions** | The collection exists. |
 | **Postconditions** | Removed items' `collectionId` are cleared; list requests return current members; the UC-03 file list accepts a collection filter (FR-FC-12). |
-| **Requirements** | FR-CO-06, FR-CO-07, FR-FC-12 (collection filter), FR-FC-24 |
+| **Requirements** | FR-CO-06, FR-CO-07, FR-FC-12 (collection filter) |
 
 **Main Flow**
 
@@ -527,7 +517,6 @@ its status and live progress, and UC-48 pauses, resumes, or cancels it.
 | --- | --- | --- |
 | AF-01 | An item UUID does not exist or was not in the collection | The system responds with a not-found error. |
 | AF-02 | The collection UUID does not exist | The system responds with a not-found error. |
-| AF-03 | The caller is not authenticated | The system denies with an unauthorized error. |
 
 ---
 
@@ -539,9 +528,9 @@ its status and live progress, and UC-48 pauses, resumes, or cancels it.
 | **Name** | Create a bookmark |
 | **Actors** | Owner |
 | **Description** | Create a browser bookmark in a bookmark collection. |
-| **Preconditions** | The caller is authenticated. |
+| **Preconditions** | None. |
 | **Postconditions** | A new Bookmark exists in the specified collection. |
-| **Requirements** | FR-BM-01, FR-FC-24 |
+| **Requirements** | FR-BM-01 |
 
 **Main Flow**
 
@@ -555,7 +544,6 @@ its status and live progress, and UC-48 pauses, resumes, or cancels it.
 | --- | --- | --- |
 | AF-01 | The url is not a valid URL or the title is empty | The system rejects with an invalid-input error. |
 | AF-02 | The referenced collection is not a bookmark collection | The system rejects with an invalid-input error. |
-| AF-03 | The caller is not authenticated | The system denies with an unauthorized error. |
 
 ---
 
@@ -567,9 +555,9 @@ its status and live progress, and UC-48 pauses, resumes, or cancels it.
 | **Name** | Update a bookmark |
 | **Actors** | Owner |
 | **Description** | Update a bookmark's url, title, or containing collection. |
-| **Preconditions** | The caller is authenticated; the bookmark exists and is `active`. |
+| **Preconditions** | The bookmark exists and is `active`. |
 | **Postconditions** | The bookmark's fields are updated. |
-| **Requirements** | FR-BM-02, FR-FC-24 |
+| **Requirements** | FR-BM-02 |
 
 **Main Flow**
 
@@ -583,7 +571,6 @@ its status and live progress, and UC-48 pauses, resumes, or cancels it.
 | --- | --- | --- |
 | AF-01 | The new url is invalid or the title is empty | The system rejects with an invalid-input error. |
 | AF-02 | The bookmark UUID does not exist | The system responds with a not-found error. |
-| AF-03 | The caller is not authenticated | The system denies with an unauthorized error. |
 
 ---
 
@@ -595,9 +582,9 @@ its status and live progress, and UC-48 pauses, resumes, or cancels it.
 | **Name** | Browse bookmarks |
 | **Actors** | Owner |
 | **Description** | List and query bookmarks organized by bookmark collection. |
-| **Preconditions** | The caller is authenticated. |
+| **Preconditions** | None. |
 | **Postconditions** | The caller receives the bookmarks matching the requested collection filter. |
-| **Requirements** | FR-BM-06, FR-FC-24 |
+| **Requirements** | FR-BM-06 |
 
 **Main Flow**
 
@@ -610,7 +597,6 @@ its status and live progress, and UC-48 pauses, resumes, or cancels it.
 | ID | Condition | Outcome |
 | --- | --- | --- |
 | AF-01 | The referenced bookmark collection does not exist | The system responds with a not-found error. |
-| AF-02 | The caller is not authenticated | The system denies with an unauthorized error. |
 
 ---
 
@@ -622,9 +608,9 @@ its status and live progress, and UC-48 pauses, resumes, or cancels it.
 | **Name** | Soft-delete and restore a bookmark |
 | **Actors** | Owner |
 | **Description** | Mark a bookmark deleted (restorable) or restore it. |
-| **Preconditions** | The caller is authenticated; the bookmark exists. |
+| **Preconditions** | The bookmark exists. |
 | **Postconditions** | The bookmark's state changes to `deleted` (and back to `active` on restore). |
-| **Requirements** | FR-BM-03, FR-BM-05, FR-FC-24 |
+| **Requirements** | FR-BM-03, FR-BM-05 |
 
 **Main Flow**
 
@@ -637,7 +623,6 @@ its status and live progress, and UC-48 pauses, resumes, or cancels it.
 | ID | Condition | Outcome |
 | --- | --- | --- |
 | AF-01 | The bookmark UUID does not exist | The system responds with a not-found error. |
-| AF-02 | The caller is not authenticated | The system denies with an unauthorized error. |
 
 ---
 
@@ -649,9 +634,9 @@ its status and live progress, and UC-48 pauses, resumes, or cancels it.
 | **Name** | Hard-purge a bookmark |
 | **Actors** | Owner |
 | **Description** | Permanently remove a bookmark record after retention. |
-| **Preconditions** | The caller is authenticated; the bookmark's retention window has elapsed. |
+| **Preconditions** | The bookmark's retention window has elapsed. |
 | **Postconditions** | The bookmark record is permanently removed. |
-| **Requirements** | FR-BM-04, FR-FC-24 |
+| **Requirements** | FR-BM-04 |
 
 **Main Flow**
 
@@ -665,7 +650,6 @@ its status and live progress, and UC-48 pauses, resumes, or cancels it.
 | --- | --- | --- |
 | AF-01 | The retention window has not elapsed | The system rejects with an invalid-operation error. |
 | AF-02 | The bookmark UUID does not exist | The system responds with a not-found error. |
-| AF-03 | The caller is not authenticated | The system denies with an unauthorized error. |
 
 ---
 
@@ -677,9 +661,9 @@ its status and live progress, and UC-48 pauses, resumes, or cancels it.
 | **Name** | Create a watchlist |
 | **Actors** | Owner |
 | **Description** | Create a named watchlist for tracking video consumption. |
-| **Preconditions** | The caller is authenticated. |
+| **Preconditions** | None. |
 | **Postconditions** | A new Watchlist exists. |
-| **Requirements** | FR-WL-01, FR-FC-24 |
+| **Requirements** | FR-WL-01 |
 
 **Main Flow**
 
@@ -692,7 +676,6 @@ its status and live progress, and UC-48 pauses, resumes, or cancels it.
 | ID | Condition | Outcome |
 | --- | --- | --- |
 | AF-01 | The name is empty | The system rejects with an invalid-input error. |
-| AF-02 | The caller is not authenticated | The system denies with an unauthorized error. |
 
 ---
 
@@ -704,9 +687,9 @@ its status and live progress, and UC-48 pauses, resumes, or cancels it.
 | **Name** | Browse watchlists and progress |
 | **Actors** | Owner |
 | **Description** | List watchlists and the watch progress of their items. |
-| **Preconditions** | The caller is authenticated. |
+| **Preconditions** | None. |
 | **Postconditions** | The caller receives the watchlists with their items' progress. |
-| **Requirements** | FR-WL-08, FR-FC-24 |
+| **Requirements** | FR-WL-08 |
 
 **Main Flow**
 
@@ -718,7 +701,6 @@ its status and live progress, and UC-48 pauses, resumes, or cancels it.
 | ID | Condition | Outcome |
 | --- | --- | --- |
 | AF-01 | The requested watchlist UUID does not exist | The system responds with a not-found error. |
-| AF-02 | The caller is not authenticated | The system denies with an unauthorized error. |
 
 ---
 
@@ -730,9 +712,9 @@ its status and live progress, and UC-48 pauses, resumes, or cancels it.
 | **Name** | Add a video to a watchlist |
 | **Actors** | Owner |
 | **Description** | Add a VideoFile to a watchlist, starting watch progress as Pending. |
-| **Preconditions** | The caller is authenticated; the watchlist exists. |
+| **Preconditions** | The watchlist exists. |
 | **Postconditions** | A WatchProgress in `Pending` state links the video to the watchlist. |
-| **Requirements** | FR-WL-02, FR-WL-03, FR-FC-24 |
+| **Requirements** | FR-WL-02, FR-WL-03 |
 
 **Main Flow**
 
@@ -746,7 +728,6 @@ its status and live progress, and UC-48 pauses, resumes, or cancels it.
 | --- | --- | --- |
 | AF-01 | The target file is not a VideoFile | The system rejects with an invalid-input error (non-video cannot be watchlisted). |
 | AF-02 | The video or watchlist UUID does not exist | The system responds with a not-found error. |
-| AF-03 | The caller is not authenticated | The system denies with an unauthorized error. |
 
 ---
 
@@ -758,9 +739,9 @@ its status and live progress, and UC-48 pauses, resumes, or cancels it.
 | **Name** | Update watch progress |
 | **Actors** | Owner |
 | **Description** | Advance a video's watch state on a watchlist (per episode for series). |
-| **Preconditions** | The caller is authenticated; a WatchProgress exists for the video on that watchlist. |
+| **Preconditions** | A WatchProgress exists for the video on that watchlist. |
 | **Postconditions** | The WatchProgress state (and current episode for series) is updated. |
-| **Requirements** | FR-WL-04, FR-WL-05, FR-FC-24 |
+| **Requirements** | FR-WL-04, FR-WL-05 |
 
 **Main Flow**
 
@@ -778,7 +759,6 @@ its status and live progress, and UC-48 pauses, resumes, or cancels it.
 | --- | --- | --- |
 | AF-01 | The requested transition is invalid — backward (`Watched` → `Pending`), skipping a state (`Pending` → `Watched`), or resubmitting a state that carries no progress (`Pending` → `Pending`, `Watched` → `Watched`) | The system rejects with an invalid-transition error. |
 | AF-02 | The WatchProgress does not exist (video not on the list) | The system responds with a not-found error. |
-| AF-03 | The caller is not authenticated | The system denies with an unauthorized error. |
 
 ---
 
@@ -790,9 +770,9 @@ its status and live progress, and UC-48 pauses, resumes, or cancels it.
 | **Name** | Remove a video from a watchlist |
 | **Actors** | Owner |
 | **Description** | Remove a video from a watchlist, deleting its WatchProgress. |
-| **Preconditions** | The caller is authenticated; the WatchProgress exists. |
+| **Preconditions** | The WatchProgress exists. |
 | **Postconditions** | The WatchProgress is deleted; the VideoFile is preserved. |
-| **Requirements** | FR-WL-06, FR-FC-24 |
+| **Requirements** | FR-WL-06 |
 
 **Main Flow**
 
@@ -805,7 +785,6 @@ its status and live progress, and UC-48 pauses, resumes, or cancels it.
 | ID | Condition | Outcome |
 | --- | --- | --- |
 | AF-01 | The WatchProgress does not exist | The system responds with a not-found error. |
-| AF-02 | The caller is not authenticated | The system denies with an unauthorized error. |
 
 ---
 
@@ -817,9 +796,9 @@ its status and live progress, and UC-48 pauses, resumes, or cancels it.
 | **Name** | Delete a watchlist |
 | **Actors** | Owner |
 | **Description** | Delete a watchlist, removing its WatchProgress entries only and preserving its videos. |
-| **Preconditions** | The caller is authenticated; the watchlist exists. |
+| **Preconditions** | The watchlist exists. |
 | **Postconditions** | The Watchlist and its WatchProgress entries are removed; its VideoFiles are preserved. |
-| **Requirements** | FR-WL-07, FR-FC-24 |
+| **Requirements** | FR-WL-07 |
 
 **Main Flow**
 
@@ -832,7 +811,6 @@ its status and live progress, and UC-48 pauses, resumes, or cancels it.
 | ID | Condition | Outcome |
 | --- | --- | --- |
 | AF-01 | The watchlist UUID does not exist | The system responds with a not-found error. |
-| AF-02 | The caller is not authenticated | The system denies with an unauthorized error. |
 
 ---
 
@@ -844,9 +822,9 @@ its status and live progress, and UC-48 pauses, resumes, or cancels it.
 | **Name** | Create a reading list |
 | **Actors** | Owner |
 | **Description** | Create a named reading list for tracking book/comic consumption. |
-| **Preconditions** | The caller is authenticated. |
+| **Preconditions** | None. |
 | **Postconditions** | A new ReadingList exists. |
-| **Requirements** | FR-RL-01, FR-FC-24 |
+| **Requirements** | FR-RL-01 |
 
 **Main Flow**
 
@@ -859,7 +837,6 @@ its status and live progress, and UC-48 pauses, resumes, or cancels it.
 | ID | Condition | Outcome |
 | --- | --- | --- |
 | AF-01 | The name is empty | The system rejects with an invalid-input error. |
-| AF-02 | The caller is not authenticated | The system denies with an unauthorized error. |
 
 ---
 
@@ -871,9 +848,9 @@ its status and live progress, and UC-48 pauses, resumes, or cancels it.
 | **Name** | Browse reading lists and progress |
 | **Actors** | Owner |
 | **Description** | List reading lists and the read progress of their items. |
-| **Preconditions** | The caller is authenticated. |
+| **Preconditions** | None. |
 | **Postconditions** | The caller receives the reading lists with their items' progress. |
-| **Requirements** | FR-RL-08, FR-FC-24 |
+| **Requirements** | FR-RL-08 |
 
 **Main Flow**
 
@@ -885,7 +862,6 @@ its status and live progress, and UC-48 pauses, resumes, or cancels it.
 | ID | Condition | Outcome |
 | --- | --- | --- |
 | AF-01 | The requested reading list UUID does not exist | The system responds with a not-found error. |
-| AF-02 | The caller is not authenticated | The system denies with an unauthorized error. |
 
 ---
 
@@ -897,9 +873,9 @@ its status and live progress, and UC-48 pauses, resumes, or cancels it.
 | **Name** | Add an item to a reading list |
 | **Actors** | Owner |
 | **Description** | Add a book (Document) or ComicBook to a reading list, starting read progress as Pending. |
-| **Preconditions** | The caller is authenticated; the reading list exists. |
+| **Preconditions** | The reading list exists. |
 | **Postconditions** | A ReadingProgress in `Pending` state links the item to the reading list. |
-| **Requirements** | FR-RL-02, FR-RL-03, FR-FC-24 |
+| **Requirements** | FR-RL-02, FR-RL-03 |
 
 **Main Flow**
 
@@ -913,7 +889,6 @@ its status and live progress, and UC-48 pauses, resumes, or cancels it.
 | --- | --- | --- |
 | AF-01 | The target file is neither a Document nor a ComicBook | The system rejects with an invalid-input error (ineligible for reading lists). |
 | AF-02 | The item or reading list UUID does not exist | The system responds with a not-found error. |
-| AF-03 | The caller is not authenticated | The system denies with an unauthorized error. |
 
 ---
 
@@ -925,9 +900,9 @@ its status and live progress, and UC-48 pauses, resumes, or cancels it.
 | **Name** | Update reading progress |
 | **Actors** | Owner |
 | **Description** | Advance an item's read state on a reading list (per issue for comic series). |
-| **Preconditions** | The caller is authenticated; a ReadingProgress exists for the item on that list. |
+| **Preconditions** | A ReadingProgress exists for the item on that list. |
 | **Postconditions** | The ReadingProgress state (and current issue for comic series) is updated. |
-| **Requirements** | FR-RL-04, FR-RL-05, FR-FC-24 |
+| **Requirements** | FR-RL-04, FR-RL-05 |
 
 **Main Flow**
 
@@ -945,7 +920,6 @@ its status and live progress, and UC-48 pauses, resumes, or cancels it.
 | --- | --- | --- |
 | AF-01 | The requested transition is invalid — backward (`Read` → `Pending`), skipping a state (`Pending` → `Read`), or resubmitting a state that carries no progress (`Pending` → `Pending`, `Read` → `Read`) | The system rejects with an invalid-transition error. |
 | AF-02 | The ReadingProgress does not exist | The system responds with a not-found error. |
-| AF-03 | The caller is not authenticated | The system denies with an unauthorized error. |
 
 ---
 
@@ -957,9 +931,9 @@ its status and live progress, and UC-48 pauses, resumes, or cancels it.
 | **Name** | Remove an item from a reading list |
 | **Actors** | Owner |
 | **Description** | Remove an item from a reading list, deleting its ReadingProgress. |
-| **Preconditions** | The caller is authenticated; the ReadingProgress exists. |
+| **Preconditions** | The ReadingProgress exists. |
 | **Postconditions** | The ReadingProgress is deleted; the file is preserved. |
-| **Requirements** | FR-RL-06, FR-FC-24 |
+| **Requirements** | FR-RL-06 |
 
 **Main Flow**
 
@@ -972,7 +946,6 @@ its status and live progress, and UC-48 pauses, resumes, or cancels it.
 | ID | Condition | Outcome |
 | --- | --- | --- |
 | AF-01 | The ReadingProgress does not exist | The system responds with a not-found error. |
-| AF-02 | The caller is not authenticated | The system denies with an unauthorized error. |
 
 ---
 
@@ -984,9 +957,9 @@ its status and live progress, and UC-48 pauses, resumes, or cancels it.
 | **Name** | Delete a reading list |
 | **Actors** | Owner |
 | **Description** | Delete a reading list, removing its ReadingProgress entries only and preserving its items. |
-| **Preconditions** | The caller is authenticated; the reading list exists. |
+| **Preconditions** | The reading list exists. |
 | **Postconditions** | The ReadingList and its ReadingProgress entries are removed; its files are preserved. |
-| **Requirements** | FR-RL-07, FR-FC-24 |
+| **Requirements** | FR-RL-07 |
 
 **Main Flow**
 
@@ -999,7 +972,6 @@ its status and live progress, and UC-48 pauses, resumes, or cancels it.
 | ID | Condition | Outcome |
 | --- | --- | --- |
 | AF-01 | The reading list UUID does not exist | The system responds with a not-found error. |
-| AF-02 | The caller is not authenticated | The system denies with an unauthorized error. |
 
 ---
 
@@ -1011,9 +983,9 @@ its status and live progress, and UC-48 pauses, resumes, or cancels it.
 | **Name** | Read text file content |
 | **Actors** | Owner, Local Filesystem |
 | **Description** | Read the content of a TextFile from disk. |
-| **Preconditions** | The caller is authenticated; the target file is a TextFile and is `active`. |
+| **Preconditions** | The target file is a TextFile and is `active`. |
 | **Postconditions** | The caller receives the file's current on-disk content. |
-| **Requirements** | FR-TX-01, FR-FC-24, FR-FC-26 |
+| **Requirements** | FR-TX-01, FR-FC-26 |
 
 **Main Flow**
 
@@ -1028,7 +1000,6 @@ its status and live progress, and UC-48 pauses, resumes, or cancels it.
 | AF-01 | The file is not a TextFile | The system rejects with an invalid-input error. |
 | AF-02 | The on-disk file cannot be read (missing / permission) | The system responds with a disk-error. |
 | AF-03 | The file UUID does not exist | The system responds with a not-found error. |
-| AF-04 | The caller is not authenticated | The system denies with an unauthorized error. |
 | AF-05 | `filesystem.root` is configured and the file's recorded path resolves outside it (FR-FC-26) | The system rejects with an invalid-input error and reads nothing. As UC-38 AF-06. |
 
 ---
@@ -1041,9 +1012,9 @@ its status and live progress, and UC-48 pauses, resumes, or cancels it.
 | **Name** | Edit text file content |
 | **Actors** | Owner, Local Filesystem |
 | **Description** | Write edited content back to the TextFile on disk. |
-| **Preconditions** | The caller is authenticated; the target file is a TextFile and is `active`. |
+| **Preconditions** | The target file is a TextFile and is `active`. |
 | **Postconditions** | The on-disk file holds the new content and the File's content hash is refreshed. |
-| **Requirements** | FR-TX-02, FR-TX-03, FR-FC-24, FR-FC-26 |
+| **Requirements** | FR-TX-02, FR-TX-03, FR-FC-26 |
 
 **Main Flow**
 
@@ -1061,111 +1032,25 @@ its status and live progress, and UC-48 pauses, resumes, or cancels it.
 | AF-02 | The on-disk write fails (disk full / permission denied) | The system does not update the catalog and returns a disk-error; the file is left in its prior on-disk state. |
 | AF-03 | The post-write content hash does not match the written bytes | The system re-attempts once, then returns an integrity error. |
 | AF-04 | The file UUID does not exist | The system responds with a not-found error. |
-| AF-05 | The caller is not authenticated | The system denies with an unauthorized error. |
 | AF-06 | `filesystem.root` is configured and the file's recorded path resolves outside it (FR-FC-26) | The system rejects with an invalid-input error before writing anything. As UC-38 AF-06. |
 
 ---
 
 ### UC-34: Local login
 
-| Field | Value |
-| --- | --- |
-| **ID** | UC-34 |
-| **Name** | Local login |
-| **Actors** | Owner |
-| **Description** | Verify email and password against the stored local credential row and open a session (local auth mode). |
-| **Preconditions** | The active auth mode is local login; local credentials have been set. |
-| **Postconditions** | On success a Session exists and its id is returned to the caller, who presents it on every subsequent request to be authenticated as the owner; on failure no session is created and the caller is not authenticated. |
-| **Requirements** | FR-AU-01, FR-AU-04, FR-AU-07, FR-AU-08, FR-AU-09 |
-
-**Main Flow**
-
-1. The caller submits email and password.
-2. The system confirms the active auth mode is local login.
-3. The system verifies the submitted password against the stored salted Argon2 hash.
-4. The system creates a Session with an expiry `sessionTtlHours` in the future (configurable, default 24) and returns its id.
-5. The caller presents that session id in place of a bearer token on subsequent requests; the system authenticates it as the owner until the session expires.
-
-Local mode has no bearer token of its own — the session id **is** the credential
-for every operation after login. Sessions are the local-mode counterpart of
-UC-36's externally issued JWT.
-
-**Alternative Flows**
-
-| ID | Condition | Outcome |
-| --- | --- | --- |
-| AF-01 | The active auth mode is not local login | The system rejects the local credentials with an unauthorized error. |
-| AF-02 | The email or password is wrong | The system denies with an unauthorized error; no plaintext is logged. |
-| AF-03 | Local credentials have not been set | The system responds with a configuration error (run UC-35 first). |
-| AF-04 | A later request presents a session id that is unknown or has expired | The system denies that request with an unauthorized error; the caller logs in again to obtain a new session. |
+**Withdrawn (the core only runs locally for the person at the machine)**
 
 ---
 
 ### UC-35: Set or change local login credentials
 
-| Field | Value |
-| --- | --- |
-| **ID** | UC-35 |
-| **Name** | Set or change local login credentials |
-| **Actors** | Owner |
-| **Description** | Set or change the local-login email and password. |
-| **Preconditions** | The active auth mode is local login; the caller is authenticated as the owner; local credentials already exist. |
-| **Postconditions** | The credential row holds the new email and the new salted password hash. |
-| **Requirements** | FR-AU-05, FR-AU-06, FR-AU-07, FR-AU-08, FR-AU-11 |
-
-**Main Flow**
-
-1. The owner submits a new email and password.
-2. The system validates the email format and the password against the strength policy.
-3. The system salts and hashes the password (Argon2) and writes/updates the credential row. Only the hash is stored — the plaintext is never persisted, so the row is not reversible back to the password.
-4. The system returns confirmation; the plaintext password is never stored or logged.
-
-**Alternative Flows**
-
-| ID | Condition | Outcome |
-| --- | --- | --- |
-| AF-01 | The active auth mode is not local login | The system rejects with an invalid-operation error. |
-| AF-02 | The email format is invalid | The system rejects with an invalid-input error. |
-| AF-03 | The caller is not authenticated | The system denies with an unauthorized error. Creating the account is UC-41, not this use case. |
-| AF-04 | The password does not satisfy the strength policy | The system rejects with an invalid-input error naming the unmet rule; no plaintext is logged. |
+**Withdrawn (the core only runs locally for the person at the machine)**
 
 ---
 
 ### UC-36: Authenticate via external JWT
 
-| Field | Value |
-| --- | --- |
-| **ID** | UC-36 |
-| **Name** | Authenticate via external JWT |
-| **Actors** | Owner, External Auth Service |
-| **Description** | Verify the caller's bearer JWT offline, on each request, against a configured signing secret shared with the external auth service. |
-| **Preconditions** | The active auth mode is external JWT. |
-| **Postconditions** | On success the caller is authenticated as the owner for the requested operation; on failure the request is denied. |
-| **Requirements** | FR-AU-01, FR-AU-02, FR-AU-03, FR-AU-07, FR-AU-08 |
-
-**Main Flow**
-
-1. The caller presents a bearer JWT on a request.
-2. The system confirms the active auth mode is external JWT.
-3. The system verifies the JWT's signature against the configured signing secret, requiring the configured algorithm rather than the one the token's header names, and validates its expiry and not-before times (and its issuer and audience when those are configured).
-4. The system confirms the token is a full authentication token rather than a two-factor challenge, and that it names the configured scope — as the scope its holder belongs to, or as one of the scopes they own.
-5. The system authenticates the caller as the owner and proceeds with the requested operation.
-
-**Alternative Flows**
-
-| ID | Condition | Outcome |
-| --- | --- | --- |
-| AF-01 | The active auth mode is not external JWT | The system rejects the JWT with an unauthorized error. |
-| AF-02 | The JWT is missing, malformed, expired, not yet valid, signed with an unconfigured key, or names an algorithm other than the configured one | The system denies with an unauthorized error. |
-| AF-03 | The JWT is a two-factor challenge token rather than a full authentication token | The system denies with an unauthorized error. |
-| AF-04 | The JWT is valid but names no scope, or a scope other than the configured one | The system denies with an unauthorized error. |
-
-> Every alternative flow answers identically — an unauthorized error with no
-> reason code — so a caller cannot learn which check refused them. External
-> mode makes no call to the external service, so there is no unreachable-service
-> outcome: verification is offline against a configured secret, and Alexandria
-> authenticates whether or not that service is running. Configuration that
-> makes verification impossible is a startup failure, not a per-request one.
+**Withdrawn (the core only runs locally for the person at the machine)**
 
 ---
 
@@ -1176,17 +1061,17 @@ UC-36's externally issued JWT.
 | **ID** | UC-38 |
 | **Name** | Stream file content |
 | **Actors** | Owner, Local Filesystem |
-| **Description** | Serve the bytes of an active File from its recorded path for playback. Over HTTP the bytes are streamed with `Range` support; over FFI the system returns a playback descriptor instead, since the FFI surface cannot carry a byte stream. |
-| **Preconditions** | The caller is authenticated; the target file is `active` and present on disk. |
-| **Postconditions** | Over HTTP, the caller receives the file's bytes (in full or as the requested range). Over FFI, the caller receives the file's resolved path, MIME type, and byte size. |
-| **Requirements** | FR-MP-01, FR-MP-02, FR-MP-03, FR-MP-06, FR-FC-26 |
+| **Description** | Give a local client what it needs to play an active File from its recorded path. The FFI cannot carry a byte stream, so the system returns a playback descriptor instead, and the client, on the same machine, opens the file itself. |
+| **Preconditions** | The target file is `active` and present on disk. |
+| **Postconditions** | The caller receives the file's resolved path, MIME type, and byte size. |
+| **Requirements** | FR-MP-01, FR-MP-03, FR-MP-06, FR-FC-26 |
 
 **Main Flow**
 
-1. The owner requests the bytes of a File UUID, optionally with an HTTP `Range` header.
+1. The owner asks to play a File UUID.
 2. The system verifies the file is `active` and confirms it is present on disk.
 3. The system derives the MIME type from the file's extension.
-4. Over HTTP, the system streams the bytes from the recorded path unmodified, honouring the `Range` header — a full response, or a partial response for a mid-file range. Over FFI, the system returns a playback descriptor (resolved path, MIME type, byte size) and the local client opens the path directly (FR-MP-06).
+4. The system returns a playback descriptor (resolved path, MIME type, byte size) and the local client opens the path directly (FR-MP-06). No byte crosses the boundary, so nothing can be re-encoded on the way (FR-MP-03).
 
 **Alternative Flows**
 
@@ -1195,9 +1080,7 @@ UC-36's externally issued JWT.
 | AF-01 | The file UUID does not exist | The system responds with a not-found error. |
 | AF-02 | The file is soft-deleted | The system rejects with an invalid-state error (restore via UC-07 first). |
 | AF-03 | The file is marked missing on disk, or its path cannot be stat'd | The system responds with a disk-error. |
-| AF-04 | The requested `Range` is unsatisfiable | The system responds with a range-not-satisfiable error. |
-| AF-05 | The caller is not authenticated | The system denies with an unauthorized error. |
-| AF-06 | `filesystem.root` is configured and the file's recorded path resolves outside it (FR-FC-26) | The system rejects with an invalid-input error saying the file is outside the configured library root; over HTTP no byte is sent, and over FFI no descriptor is returned. Indexing and library corrections are bounded by the same root, but a record can still point outside — one catalogued before the bound was configured, or reached through a symbolic link swapped in since — and this is the check that keeps it unserved. The path is resolved as FR-FC-26 describes; the message names no path. |
+| AF-06 | `filesystem.root` is configured and the file's recorded path resolves outside it (FR-FC-26) | The system rejects with an invalid-input error saying the file is outside the configured library root, and no descriptor is returned. Indexing and library corrections are bounded by the same root, but a record can still point outside — one catalogued before the bound was configured, or reached through a symbolic link swapped in since — and this is the check that keeps it unserved. The path is resolved as FR-FC-26 describes; the message names no path. |
 
 ---
 
@@ -1209,7 +1092,7 @@ UC-36's externally issued JWT.
 | **Name** | Read a comic book page |
 | **Actors** | Owner, Local Filesystem |
 | **Description** | Return a single page of a CBZ ComicBook as an image, addressed by 1-based page index. |
-| **Preconditions** | The caller is authenticated; the target file is `active`, present on disk, a ComicBook, and stored as a CBZ archive. |
+| **Preconditions** | The target file is `active`, present on disk, a ComicBook, and stored as a CBZ archive. |
 | **Postconditions** | The caller receives the requested page's raw bytes, its MIME type, and the comic's total page count. |
 | **Requirements** | FR-MP-03, FR-MP-04, FR-MP-06, FR-FC-26 |
 
@@ -1231,7 +1114,6 @@ UC-36's externally issued JWT.
 | AF-04 | The file UUID does not exist | The system responds with a not-found error. |
 | AF-05 | The file is soft-deleted | The system rejects with an invalid-state error (restore via UC-07 first). |
 | AF-06 | The file is marked missing on disk, or the archive cannot be opened or read | The system responds with a disk-error. |
-| AF-07 | The caller is not authenticated | The system denies with an unauthorized error. |
 | AF-08 | `filesystem.root` is configured and the file's recorded path resolves outside it (FR-FC-26) | The system rejects with an invalid-input error saying the file is outside the configured library root, and opens nothing. As UC-38 AF-06. |
 
 ---
@@ -1244,7 +1126,7 @@ UC-36's externally issued JWT.
 | **Name** | Get a file thumbnail |
 | **Actors** | Owner, Local Filesystem |
 | **Description** | Return a downscaled JPEG thumbnail for a video, image, comic, or audio File, cached on disk keyed by the file's UUID, modification time, and target dimension. |
-| **Preconditions** | The caller is authenticated; the target file is `active`, present on disk, and of type video, image, comic, or audio. |
+| **Preconditions** | The target file is `active`, present on disk, and of type video, image, comic, or audio. |
 | **Postconditions** | The caller receives the thumbnail's bytes; on a cache miss, the generated thumbnail is written to the disk cache under that key. |
 | **Requirements** | FR-MP-05, FR-MP-06, FR-FC-26 |
 
@@ -1264,60 +1146,13 @@ UC-36's externally issued JWT.
 | AF-02 | The file UUID does not exist | The system responds with a not-found error. |
 | AF-03 | The file is soft-deleted | The system rejects with an invalid-state error (restore via UC-07 first). |
 | AF-04 | The file is marked missing on disk, or its bytes cannot be read or decoded | The system responds with a disk-error. |
-| AF-05 | The caller is not authenticated | The system denies with an unauthorized error. |
 | AF-06 | `filesystem.root` is configured and the file's recorded path resolves outside it (FR-FC-26) | The system rejects with an invalid-input error saying the file is outside the configured library root, and reads nothing. As UC-38 AF-06. |
 
 ---
 
 ### UC-41: Register the local account
 
-| Field | Value |
-| --- | --- |
-| **ID** | UC-41 |
-| **Name** | Register the local account |
-| **Actors** | Owner |
-| **Description** | Create the single owner's local-login account when none exists, and open a session for the caller. |
-| **Preconditions** | The active auth mode is local login; no local credentials exist. |
-| **Postconditions** | The credential row holds the submitted email and a salted Argon2 hash of the password, ten recovery codes exist with only their hashes stored, and a Session exists whose id is returned to the caller. The recovery codes' plaintext is returned in this response and never again. On a failure before the credential row is written, none of this is created; AF-06 is the one exception — the credential row and its recovery codes survive a failed session creation. |
-| **Requirements** | FR-AU-05, FR-AU-06, FR-AU-08, FR-AU-09, FR-AU-10, FR-AU-11, FR-AU-13, FR-AU-19 |
-
-**Main Flow**
-
-1. The caller submits an email, a password, and a password confirmation.
-2. The system confirms the active auth mode is local login.
-3. The system confirms no local credentials exist yet.
-4. The system validates the email format, the password against the strength
-   policy, and that the confirmation matches the password.
-5. The system salts and hashes the password (Argon2) and writes the credential
-   row. Only the hash is stored; the plaintext is never persisted or logged.
-6. The system generates ten recovery codes, stores only their hashes, and
-   returns the plaintext codes in this response — the owner's one chance to
-   record them.
-7. The system creates a Session with an expiry `sessionTtlHours` in the future
-   (configurable, default 24) and returns its id, exactly as UC-34 does.
-
-**Alternative Flows**
-
-| ID | Condition | Outcome |
-| --- | --- | --- |
-| AF-01 | The active auth mode is not local login | The system rejects with an invalid-operation error. |
-| AF-02 | Local credentials already exist | The system rejects with a conflict error; the stored credentials are left untouched. |
-| AF-03 | The email format is invalid | The system rejects with an invalid-input error. |
-| AF-04 | The password fails the strength policy | The system rejects with an invalid-input error naming the unmet rule; no plaintext is logged. |
-| AF-05 | The confirmation does not match the password | The system rejects with an invalid-input error. |
-| AF-06 | The credential row is written but the recovery codes or the session cannot be created | The system returns the underlying error; the account exists, and the caller obtains a session through UC-34. Recovery codes, if not yet written, can only be obtained afterwards through UC-44. |
-
-The checks run in the order listed — mode, then existence, then the three input
-checks. An unauthenticated caller therefore learns only whether an account
-exists, which the conflict error tells them anyway; they never learn anything
-about a stored password by varying the one they submit.
-
-AF-06 is deliberately not a rollback. The three writes go to the same SQLite
-database, but wrapping them in a transaction would require the credential,
-recovery-code, and session repository ports to share one, which no other
-command in the codebase does. The failure is a disk or database error, the
-account it leaves behind is exactly the account the caller asked for, and
-UC-34 or UC-44 completes the job.
+**Withdrawn (the core only runs locally for the person at the machine)**
 
 ---
 
@@ -1329,18 +1164,17 @@ UC-34 or UC-44 completes the job.
 | **Name** | Query an index or refresh run |
 | **Actors** | Owner |
 | **Description** | Report the status, live progress, and outcome of an index (UC-01) or re-index (UC-02) run — either one run by its id, or every outstanding run at once. |
-| **Preconditions** | The caller is authenticated; for the single-run form, a run was started and its id retained. |
+| **Preconditions** | For the single-run form, a run was started and its id retained. |
 | **Postconditions** | None — this is a query. The catalog is unchanged. |
-| **Requirements** | FR-FC-24, FR-FC-27, FR-FC-28, FR-FC-29, FR-FC-35 |
+| **Requirements** | FR-FC-27, FR-FC-28, FR-FC-29, FR-FC-35 |
 
 **Main Flow**
 
 1. The caller submits a run id.
-2. The system confirms the caller is authenticated as the owner.
-3. The system reads the run record for that id and overlays the progress the
+2. The system reads the run record for that id and overlays the progress the
    run is publishing right now, when a run by that id is executing in this
    process.
-4. The system returns the run's kind, status, start time, finish time when it
+3. The system returns the run's kind, status, start time, finish time when it
    has one, the outcome counts for its kind once it has them, and — while the
    run is in flight — its phase, total, processed count, active milliseconds,
    and the instant it was paused if it is paused (FR-FC-28).
@@ -1348,8 +1182,7 @@ UC-34 or UC-44 completes the job.
 **Alternate Main Flow — every outstanding run** (FR-FC-35)
 
 1. The caller asks for the outstanding runs, naming no id.
-2. The system confirms the caller is authenticated as the owner.
-3. The system returns every run whose status is `running` or `paused`, newest
+2. The system returns every run whose status is `running` or `paused`, newest
    first, each as the same body the single-run form returns. Nothing
    outstanding is an empty list, not an error.
 
@@ -1364,7 +1197,6 @@ client's own memory.
 | ID | Condition | Outcome |
 | --- | --- | --- |
 | AF-01 | No run exists with that id | The system responds with a not-found error. |
-| AF-02 | The caller is not authenticated | The system denies with an unauthorized error. |
 | AF-03 | The run is still executing | The system returns it with status `running` and its live progress; the outcome counts are absent, since no tally exists until the walk finishes. |
 | AF-04 | The run could not proceed at all (the catalog was unreadable, or the root could not be walked) | The system returns it with status `failed` and the underlying error message. |
 | AF-05 | The run was executing when the process stopped | The system returns it with status `paused` and the last progress it published, so the owner is shown how far it got and can resume it (UC-48, FR-FC-29). |
@@ -1392,105 +1224,19 @@ makes it a presentation decision rather than a catalog one.
 
 ### UC-43: Redeem a recovery code
 
-| Field | Value |
-| --- | --- |
-| **ID** | UC-43 |
-| **Name** | Redeem a recovery code |
-| **Actors** | Owner |
-| **Description** | Replace the local password using one of the account's recovery codes, for an owner who has forgotten their password and holds no session. |
-| **Preconditions** | The active auth mode is local login; an account exists; the caller holds one of its recovery codes. |
-| **Postconditions** | The password is replaced, that code is consumed, and every session is invalidated. |
-| **Requirements** | FR-AU-11, FR-AU-14, FR-AU-15, FR-AU-16 |
-
-**Main Flow**
-
-1. The caller submits a recovery code, a new password, and a confirmation.
-2. The system confirms the active mode is local login.
-3. The system confirms an account exists.
-4. The system validates the new password against the strength policy and its
-   confirmation.
-5. The system consumes the code.
-6. The system replaces the stored password hash and deletes every session.
-7. The system reports how many codes remain.
-
-**Alternative Flows**
-
-| ID | Condition | Outcome |
-| --- | --- | --- |
-| AF-01 | The active auth mode is not local login | The system rejects with an invalid-operation error. |
-| AF-02 | No local account exists | The system responds with a not-found error. |
-| AF-03 | The new password fails the strength policy | The system rejects naming the unmet rule; no code is consumed. |
-| AF-04 | The confirmation does not match the new password | The system rejects; no code is consumed. |
-| AF-05 | The code was already used | The system rejects with `recovery_code_used`; the password is unchanged. |
-| AF-06 | The code was never issued, or belongs to a regenerated-away set | The system rejects with `recovery_code_unknown`. |
-
-The checks run in the order listed, so a rejected password never reaches the
-code table — a typo in the new password must not spend a code the owner may
-have only one of.
+**Withdrawn (the core only runs locally for the person at the machine)**
 
 ---
 
 ### UC-44: Regenerate recovery codes
 
-| Field | Value |
-| --- | --- |
-| **ID** | UC-44 |
-| **Name** | Regenerate recovery codes |
-| **Actors** | Owner |
-| **Description** | Replace an authenticated owner's whole set of recovery codes, so a set that has run low or may have been exposed stops working in full. |
-| **Preconditions** | The active auth mode is local login; the caller is authenticated; an account exists. |
-| **Postconditions** | Every previous code is invalid and ten new ones exist, returned once. |
-| **Requirements** | FR-AU-17, FR-AU-19 |
-
-**Main Flow**
-
-1. The authenticated owner requests a new set.
-2. The system confirms the caller is authenticated.
-3. The system confirms the active mode is local login.
-4. The system confirms an account exists.
-5. The system replaces every code with ten new ones and returns them.
-
-**Alternative Flows**
-
-| ID | Condition | Outcome |
-| --- | --- | --- |
-| AF-01 | The caller is not authenticated | The system denies with an unauthorized error. |
-| AF-02 | The active auth mode is not local login | The system rejects with an invalid-operation error. |
-| AF-03 | No local account exists | The system responds with a not-found error. |
+**Withdrawn (the core only runs locally for the person at the machine)**
 
 ---
 
 ### UC-45: Log in with the Windows account
 
-| Field | Value |
-| --- | --- |
-| **ID** | UC-45 |
-| **Name** | Log in with the Windows account |
-| **Actors** | Owner, Operating System |
-| **Description** | Open a session on the strength of the Windows account the server process runs as. |
-| **Preconditions** | The active auth mode is the Windows account; the process passed its startup account check. |
-| **Postconditions** | A Session exists whose id is returned to the caller. |
-| **Requirements** | FR-AU-20, FR-AU-22 |
-
-**Main Flow**
-
-1. The caller requests a Windows login, submitting nothing.
-2. The system confirms the active auth mode is the Windows account.
-3. The system creates a Session with an expiry `sessionTtlHours` in the future and returns its id.
-
-**Alternative Flows**
-
-| ID | Condition | Outcome |
-| --- | --- | --- |
-| AF-01 | The active auth mode is local login or external JWT | The system rejects with an invalid-operation error. |
-| AF-02 | The session cannot be created | The system returns the underlying error; no session exists. |
-
-> This use case has no unauthorized flow, and that is the point of it rather
-> than an omission. The account check happens once at startup: a process running
-> as anyone but the configured owner does not reach the point of serving
-> requests. What that proves is that the process was launched by the owner —
-> never who is calling — so in this mode any caller that can reach the port is
-> authorized, and the loopback bind is the security boundary.
+**Withdrawn (the core only runs locally for the person at the machine)**
 
 ---
 
@@ -1502,9 +1248,9 @@ have only one of.
 | **Name** | Browse collections |
 | **Actors** | Owner |
 | **Description** | List the owner's collections, optionally narrowed to one `kind`, each with the number of items it currently holds. |
-| **Preconditions** | The caller is authenticated. |
+| **Preconditions** | None. |
 | **Postconditions** | None — this is a read. |
-| **Requirements** | FR-CO-08, FR-FC-24 |
+| **Requirements** | FR-CO-08 |
 
 **Main Flow**
 
@@ -1519,7 +1265,6 @@ have only one of.
 | --- | --- | --- |
 | AF-01 | No collection exists, or none of the requested kind | The system returns an empty list. This is a state, not an error. |
 | AF-02 | The `kind` filter is not one the system recognises | The system rejects it as invalid input and queries nothing. |
-| AF-03 | The caller is not authenticated | The system denies with an unauthorized error. |
 
 > The item count is derived by counting the rows that point at the collection,
 > never stored, so it cannot drift from the membership. It counts the same
@@ -1539,10 +1284,10 @@ have only one of.
 | **ID** | UC-47 |
 | **Name** | Report the retention window |
 | **Actors** | Owner |
-| **Description** | Report the configuration a client needs to render the catalog correctly — beginning with the soft-delete retention window this server enforces. |
-| **Preconditions** | The caller is authenticated. |
+| **Description** | Report the configuration a client needs to render the catalog correctly — beginning with the soft-delete retention window this core enforces. |
+| **Preconditions** | None. |
 | **Postconditions** | None — this is a read. |
-| **Requirements** | FR-FC-30, FR-FC-24 |
+| **Requirements** | FR-FC-30 |
 
 **Main Flow**
 
@@ -1553,7 +1298,6 @@ have only one of.
 
 | ID | Condition | Outcome |
 | --- | --- | --- |
-| AF-01 | The caller is not authenticated | The system denies with an unauthorized error. |
 
 > The window is enforced on every restore (UC-07) and every purge (UC-08,
 > UC-19), and until now was published nowhere. A client could not say how long
@@ -1561,7 +1305,7 @@ have only one of.
 > assumption is wrong the moment an operator configures something else.
 
 > An object rather than a bare number, so that the next client-relevant setting
-> is a field here rather than a second endpoint.
+> is a field here rather than a second call.
 
 ---
 
@@ -1573,21 +1317,21 @@ have only one of.
 | **Name** | Pause, resume, or cancel an index run |
 | **Actors** | Owner, Local Filesystem |
 | **Description** | Stop an index (UC-01) or re-index (UC-02) run where it stands and pick it up again later, or abandon it outright. |
-| **Preconditions** | The caller is authenticated as the owner; a run exists with the submitted id. |
+| **Preconditions** | A run exists with the submitted id. |
 | **Postconditions** | The run is recorded `paused` (resumable, with no finish time), `running` again under the same id, or `cancelled` (terminal, with a finish time and the tally it reached). The catalog holds whatever the run had already written; nothing is rolled back. |
-| **Requirements** | FR-FC-24, FR-FC-27, FR-FC-29, FR-FC-31, FR-FC-32, FR-FC-33, FR-FC-34 |
+| **Requirements** | FR-FC-27, FR-FC-29, FR-FC-31, FR-FC-32, FR-FC-33, FR-FC-34 |
 
 **Main Flow — pause** (FR-FC-32)
 
 1. The owner asks to pause a run, naming its id.
-2. The system confirms the caller is authenticated as the owner and that the run is `running`.
+2. The system confirms that the run is `running`.
 3. The system signals the run to stop. Entries already in flight finish; nothing further is started. Because per-file work is a stat and, at most, a metadata read rather than a read of the whole file (UC-01 step 4), that window drains in milliseconds however large the library's files are.
 4. The system records the run `paused`, with the instant the pause began and no finish time, keeping the phase and the progress it had reached.
 
 **Main Flow — resume** (FR-FC-33)
 
 1. The owner asks to resume a run, naming its id.
-2. The system confirms the caller is authenticated as the owner and that the run is `paused`.
+2. The system confirms that the run is `paused`.
 3. The system adds the length of the pause that is ending to the time the run has spent paused, so that pause never counts as work (FR-FC-28), and records the run `running` again under the **same id** — a resume continues a run, it does not start a new one.
 4. The owner may name a priority for the resumed segment (FR-FC-33). Naming one re-paces the run and is remembered, so it holds across a further pause; naming none keeps the priority the run already has, which is what an owner who only wants their run back is asking for. This is the whole answer to changing your mind about throttling mid-run: the priority is fixed while a segment walks, and a pause and a resume is what changes it (FR-FC-31).
 5. The system walks again at that priority, from the root for an index run or across every cataloged path for a re-index — a resume continues a run, recording into the same library it was started for. There is no cursor: the run rediscovers its total and counts from zero, and everything an earlier segment already cataloged falls out as `alreadyCataloged` in seconds.
@@ -1595,7 +1339,7 @@ have only one of.
 **Main Flow — cancel** (FR-FC-34)
 
 1. The owner asks to cancel a run, naming its id.
-2. The system confirms the caller is authenticated as the owner and that the run is `running` or `paused`.
+2. The system confirms that the run is `running` or `paused`.
 3. The system stops the run as a pause does, then records it `cancelled` with a finish time and with the progress it last published. A run a walk was executing also keeps the partial tally that walk had reached; a `paused` run, which no process is executing, is recorded without counts rather than with invented ones.
 4. The run is terminal. It will not resume, and cancelling it again is refused.
 
@@ -1604,7 +1348,6 @@ have only one of.
 | ID | Condition | Outcome |
 | --- | --- | --- |
 | AF-01 | No run exists with that id | The system responds with a not-found error. |
-| AF-02 | The caller is not authenticated | The system denies with an unauthorized error. |
 | AF-03 | A pause is asked of a run that is not `running` — it is already `paused`, or it is `complete`, `failed`, or `cancelled` | The system refuses with a conflict rather than silently accepting. A pause that appeared to succeed against a finished run would leave the owner waiting for a resume prompt that never comes. |
 | AF-04 | A resume is asked of a run that is not `paused` — it is already `running`, or it is terminal | The system refuses with a conflict, and leaves the run's stored priority alone even if the resume named one. A run that is already running has nothing to resume, and a terminal one has no run left at all; re-doing a completed scan is a fresh UC-01, not a resume. |
 | AF-05 | A cancel is asked of a run that is already terminal | The system refuses with a conflict: there is nothing left to abandon, and a run that closed itself is not one a later cancel may rewrite. |
@@ -1652,9 +1395,9 @@ have only one of.
 | **Name** | Add a library |
 | **Actors** | Owner, Local Filesystem |
 | **Description** | Add a folder as a *library* — the only way files enter the catalog — which indexes it (UC-01); browse it one level at a time in its own folder structure; re-index it; correct its root when the folder moves; and remove it with its catalog records. |
-| **Preconditions** | The caller is authenticated. For a read, a re-index, a correction or a removal, the library exists. |
+| **Preconditions** | For a read, a re-index, a correction or a removal, the library exists. |
 | **Postconditions** | The library exists, its first index run has been opened, and every file it holds belongs to it; or it no longer exists and neither do its catalog records. No file on disk is created, moved, or deleted by any of these operations. |
-| **Requirements** | FR-FC-36, FR-FC-37, FR-FC-38, FR-FC-39, FR-FC-40, FR-FC-41, FR-FC-43, FR-FC-01, FR-FC-24, FR-FC-26, FR-FC-31 |
+| **Requirements** | FR-FC-36, FR-FC-37, FR-FC-38, FR-FC-39, FR-FC-40, FR-FC-41, FR-FC-43, FR-FC-01, FR-FC-26, FR-FC-31 |
 
 **Main Flow**
 
@@ -1697,7 +1440,6 @@ have only one of.
 | AF-02 | The submitted folder contains, or sits inside, a library already added | The system responds with a conflict that names the existing library, because "that folder is already inside Photography" is something the owner can act on where a bare refusal is a puzzle. Nothing is stored. |
 | AF-03 | The addressed library does not exist | The system responds with a not-found error. |
 | AF-04 | The addressed folder holds no catalogued file at any depth | The system answers an empty level rather than a not-found: the tree is built from what the library's runs recorded, so a folder holding only files the system cannot read is empty, not missing. |
-| AF-05 | The caller is not authenticated | The system denies with an unauthorized error. |
 | AF-06 | A correction names a folder that overlaps another library | The system responds with a conflict naming it, as adding would. The library is not asked about itself: it always overlaps where it already is, so a folder that moved within its own root corrects normally. |
 | AF-07 | The submitted folder does not exist on disk, or is a file rather than a folder | Adding is refused with an invalid-input error and nothing is stored: adding walks the folder now, and a file would walk as a one-entry tree the library could never show. This is checked before overlap (AF-02), so the owner hears what is wrong with what they typed. A correction (step 5) is different — see AF-08. |
 | AF-08 | A correction's destination folder does not exist on disk | The correction is recorded anyway. Whether the path is there is answered by the next walk, and refusing here would also refuse a drive that is merely unplugged at the moment the owner fixes the record. When `filesystem.root` is configured the folder must still lie inside it (AF-09), which is judged without the folder existing: its longest existing ancestor is resolved and the rest of the path normalised. |
@@ -1740,9 +1482,9 @@ have only one of.
 | **Name** | Report which files a run could not record |
 | **Actors** | Owner |
 | **Description** | Read the files a walk gave up on, each with the reason, so that a count of failures can be acted on rather than only read. |
-| **Preconditions** | The caller is authenticated and the run exists. |
+| **Preconditions** | The run exists. |
 | **Postconditions** | None. Reading changes nothing; the files are still absent from the catalog. |
-| **Requirements** | FR-FC-42, FR-FC-24 |
+| **Requirements** | FR-FC-42 |
 
 **Main Flow**
 
@@ -1762,7 +1504,6 @@ have only one of.
 | AF-02 | The run does not exist | A not-found error, not an empty list — "failed on nothing" is a different fact from "no such run", and a client showing the first for the second would tell the owner their scan was clean. |
 | AF-03 | The run failed on more files than the bound | The list names the first of them and the run's own tally still reports the true count. The two disagreeing is the intended state: naming every file of a folder that failed entirely would write a table larger than the catalog. |
 | AF-04 | The system cannot record a failure it just met | The walk logs that and carries on. A note about one file is not worth the rest of the library. |
-| AF-05 | The caller is not authenticated | The system denies with an unauthorized error. |
 
 > **Why the paths are kept at all.** The tally has always said how many. A
 > client can do nothing with a number: those files are on disk, in no listing,
@@ -1776,76 +1517,221 @@ have only one of.
 
 ---
 
+### UC-53: Pin a library
+
+| Field | Value |
+| --- | --- |
+| **ID** | UC-53 |
+| **Name** | Pin a library |
+| **Actors** | Owner |
+| **Description** | Keep a library at the top of the client's menu, or take it off, by setting the library's `pinned` flag. |
+| **Preconditions** | The library exists. |
+| **Postconditions** | The library's `pinned` flag holds the value asked for, and every answer that carries the library reports it. Nothing else about the library changes. |
+| **Requirements** | FR-FC-44 |
+
+**Main Flow**
+
+1. The owner pins or unpins a library, naming it by its UUID.
+2. The system stores the flag on the library.
+3. The system answers success. From then on the library listing, a browse of
+   the library, and the answers to adding and renaming it (UC-51, UC-55)
+   report `pinned` with the stored value.
+
+**Alternative Flows**
+
+| ID | Condition | Outcome |
+| --- | --- | --- |
+| AF-01 | The submitted UUID is malformed | The system rejects with an invalid-input error and changes nothing. |
+| AF-02 | No library has that UUID | The system responds with a not-found error. |
+| AF-03 | The library already has the value asked for | The system answers success and changes nothing. |
+
+> **The core reports, the client orders.** Pinned libraries first, then the
+> rest by name, is how the desktop menu presents them; the core stores the
+> flag and reports it, and puts no order on the listing. Correcting a
+> library's root (UC-51), renaming it (UC-55) and re-indexing it keep the
+> flag; removing the library removes it.
+
+---
+
+### UC-54: Mark a library as a favorite
+
+| Field | Value |
+| --- | --- |
+| **ID** | UC-54 |
+| **Name** | Mark a library as a favorite |
+| **Actors** | Owner |
+| **Description** | Mark a library as one the owner comes back to, or clear the mark, by setting the library's `favorite` flag. |
+| **Preconditions** | The library exists. |
+| **Postconditions** | The library's `favorite` flag holds the value asked for, and every answer that carries the library reports it. Nothing else about the library changes. |
+| **Requirements** | FR-FC-45 |
+
+**Main Flow**
+
+1. The owner marks or unmarks a library as a favorite, naming it by its UUID.
+2. The system stores the flag on the library.
+3. The system answers success. From then on every answer that carries the
+   library reports `favorite` with the stored value.
+
+**Alternative Flows**
+
+| ID | Condition | Outcome |
+| --- | --- | --- |
+| AF-01 | The submitted UUID is malformed | The system rejects with an invalid-input error and changes nothing. |
+| AF-02 | No library has that UUID | The system responds with a not-found error. |
+| AF-03 | The library already has the value asked for | The system answers success and changes nothing. |
+
+> A favorite is independent of a pin (UC-53): a library may be either, both,
+> or neither, and setting one never touches the other. Like the pin, it is
+> kept through a correction, a rename and a re-index, and removed with the
+> library.
+
+---
+
+### UC-55: Rename a library
+
+| Field | Value |
+| --- | --- |
+| **ID** | UC-55 |
+| **Name** | Rename a library |
+| **Actors** | Owner |
+| **Description** | Change the owner's name for a library at any time. The name is a label the owner chose when adding the library (UC-51), not something derived from its folder. |
+| **Preconditions** | The library exists. |
+| **Postconditions** | The library carries the new name, trimmed. Its folder, its files, its runs and its pinned and favorite flags are unchanged. |
+| **Requirements** | FR-FC-46 |
+
+**Main Flow**
+
+1. The owner submits a library's UUID and a new name.
+2. The system checks the name by the rule adding a library uses (FR-FC-36): it
+   must not be blank. It trims the name.
+3. The system stores the name and answers the updated library.
+
+**Alternative Flows**
+
+| ID | Condition | Outcome |
+| --- | --- | --- |
+| AF-01 | The submitted name is blank or whitespace-only, or the request carries no name | The system rejects with an invalid-input error and stores nothing. |
+| AF-02 | The submitted UUID is malformed | The system rejects with an invalid-input error. |
+| AF-03 | No library has that UUID | The system responds with a not-found error. |
+| AF-04 | The library has a `running` or `paused` run | The rename succeeds and the run is untouched. A run reads the library's folder, never its name, so nothing waits for the run (unlike a correction of the root, UC-51 AF-10). |
+| AF-05 | The new name is the name the library already has | The system answers the library and changes nothing. |
+
+> Two libraries may share a name, as they may when they are added: the name is
+> what the owner reads, and the folder is what is unique.
+
+---
+
+### UC-56: Report catalog statistics
+
+| Field | Value |
+| --- | --- |
+| **ID** | UC-56 |
+| **Name** | Report catalog statistics |
+| **Actors** | Owner |
+| **Description** | Report the catalog's totals in one call: how many libraries it holds, and how many files of each type. |
+| **Preconditions** | None. |
+| **Postconditions** | None — this is a read. The catalog is unchanged. |
+| **Requirements** | FR-FC-47 |
+
+**Main Flow**
+
+1. The caller asks for the catalog's totals.
+2. The system counts the libraries, and counts the files by type. A file is
+   counted when the default file listing (UC-03) shows it: an `active` file,
+   including one marked missing on disk (FR-FC-11). A soft-deleted file is not
+   counted.
+3. The system returns the number of libraries and a count for every one of the
+   seven file types — `audio`, `video`, `html`, `text`, `document`, `comic`,
+   `image` — with `0` for a type the catalog holds none of.
+
+**Alternative Flows**
+
+| ID | Condition | Outcome |
+| --- | --- | --- |
+| AF-01 | The catalog holds no library | The system returns zero libraries and `0` for every type, not an error. |
+
+> **Every type, always.** A type with no files is present with `0` rather than
+> left out, so a client never has to tell "none" from "missing".
+>
+> **The whole catalog.** The totals are not broken down per library; a client
+> that wants one library's files lists them (UC-03, narrowed by library).
+
+---
+
 ---
 
 ## 3. Use Case — Requirements Traceability
 
 | Use Case | Requirements |
 | --- | --- |
-| UC-01: Index a library | FR-FC-01, FR-FC-02, FR-FC-03, FR-FC-04, FR-FC-05, FR-FC-06, FR-FC-07, FR-FC-08, FR-FC-09, FR-FC-14, FR-FC-24, FR-FC-25, FR-FC-26, FR-FC-27, FR-FC-31, FR-FC-37, FR-FC-43 |
-| UC-02: Re-index and refresh the catalog | FR-FC-08, FR-FC-10, FR-FC-11, FR-FC-24, FR-FC-27, FR-FC-31 |
-| UC-03: Browse and view file metadata | FR-FC-12, FR-FC-13, FR-FC-24, FR-FC-38 |
-| UC-04: Edit file metadata | FR-FC-14, FR-FC-15, FR-FC-16, FR-FC-17, FR-FC-18, FR-FC-24 |
-| UC-05: Rename a file | FR-FC-19, FR-FC-24, FR-FC-26 |
-| UC-06: Soft-delete a file | FR-FC-20, FR-FC-24 |
-| UC-07: Restore a soft-deleted file | FR-FC-21, FR-FC-24 |
-| UC-08: Hard-purge a file record | FR-FC-22, FR-FC-24, NFR-07 |
-| UC-09: Purge a file on disk | FR-FC-23, FR-FC-24, FR-FC-26 |
-| UC-10: Create a collection | FR-CO-01, FR-CO-02, FR-FC-24 |
-| UC-11: Rename a collection | FR-CO-03, FR-FC-24 |
-| UC-12: Delete a collection | FR-CO-04, FR-FC-24 |
-| UC-13: Add items to a collection | FR-CO-05, FR-FC-24 |
-| UC-14: Remove and list items in a collection | FR-CO-06, FR-CO-07, FR-FC-12 (collection filter), FR-FC-24 |
-| UC-15: Create a bookmark | FR-BM-01, FR-FC-24 |
-| UC-16: Update a bookmark | FR-BM-02, FR-FC-24 |
-| UC-17: Browse bookmarks | FR-BM-06, FR-FC-24 |
-| UC-18: Soft-delete and restore a bookmark | FR-BM-03, FR-BM-05, FR-FC-24 |
-| UC-19: Hard-purge a bookmark | FR-BM-04, FR-FC-24 |
-| UC-20: Create a watchlist | FR-WL-01, FR-FC-24 |
-| UC-21: Browse watchlists and progress | FR-WL-08, FR-FC-24 |
-| UC-22: Add a video to a watchlist | FR-WL-02, FR-WL-03, FR-FC-24 |
-| UC-23: Update watch progress | FR-WL-04, FR-WL-05, FR-FC-24 |
-| UC-24: Remove a video from a watchlist | FR-WL-06, FR-FC-24 |
-| UC-25: Delete a watchlist | FR-WL-07, FR-FC-24 |
-| UC-26: Create a reading list | FR-RL-01, FR-FC-24 |
-| UC-27: Browse reading lists and progress | FR-RL-08, FR-FC-24 |
-| UC-28: Add an item to a reading list | FR-RL-02, FR-RL-03, FR-FC-24 |
-| UC-29: Update reading progress | FR-RL-04, FR-RL-05, FR-FC-24 |
-| UC-30: Remove an item from a reading list | FR-RL-06, FR-FC-24 |
-| UC-31: Delete a reading list | FR-RL-07, FR-FC-24 |
-| UC-32: Read text file content | FR-TX-01, FR-FC-24, FR-FC-26 |
-| UC-33: Edit text file content | FR-TX-02, FR-TX-03, FR-FC-24, FR-FC-26 |
-| UC-34: Local login | FR-AU-01, FR-AU-04, FR-AU-07, FR-AU-08, FR-AU-09 |
-| UC-35: Set or change local login credentials | FR-AU-05, FR-AU-06, FR-AU-07, FR-AU-08, FR-AU-11 |
-| UC-36: Authenticate via external JWT | FR-AU-01, FR-AU-02, FR-AU-03, FR-AU-07, FR-AU-08 |
-| UC-38: Stream file content | FR-MP-01, FR-MP-02, FR-MP-03, FR-MP-06, FR-FC-26 |
+| UC-01: Index a library | FR-FC-01, FR-FC-02, FR-FC-03, FR-FC-04, FR-FC-05, FR-FC-06, FR-FC-07, FR-FC-08, FR-FC-09, FR-FC-14, FR-FC-25, FR-FC-26, FR-FC-27, FR-FC-31, FR-FC-37, FR-FC-43 |
+| UC-02: Re-index and refresh the catalog | FR-FC-08, FR-FC-10, FR-FC-11, FR-FC-27, FR-FC-31 |
+| UC-03: Browse and view file metadata | FR-FC-12, FR-FC-13, FR-FC-38 |
+| UC-04: Edit file metadata | FR-FC-14, FR-FC-15, FR-FC-16, FR-FC-17, FR-FC-18 |
+| UC-05: Rename a file | FR-FC-19, FR-FC-26 |
+| UC-06: Soft-delete a file | FR-FC-20 |
+| UC-07: Restore a soft-deleted file | FR-FC-21 |
+| UC-08: Hard-purge a file record | FR-FC-22, NFR-07 |
+| UC-09: Purge a file on disk | FR-FC-23, FR-FC-26 |
+| UC-10: Create a collection | FR-CO-01, FR-CO-02 |
+| UC-11: Rename a collection | FR-CO-03 |
+| UC-12: Delete a collection | FR-CO-04 |
+| UC-13: Add items to a collection | FR-CO-05 |
+| UC-14: Remove and list items in a collection | FR-CO-06, FR-CO-07, FR-FC-12 (collection filter) |
+| UC-15: Create a bookmark | FR-BM-01 |
+| UC-16: Update a bookmark | FR-BM-02 |
+| UC-17: Browse bookmarks | FR-BM-06 |
+| UC-18: Soft-delete and restore a bookmark | FR-BM-03, FR-BM-05 |
+| UC-19: Hard-purge a bookmark | FR-BM-04 |
+| UC-20: Create a watchlist | FR-WL-01 |
+| UC-21: Browse watchlists and progress | FR-WL-08 |
+| UC-22: Add a video to a watchlist | FR-WL-02, FR-WL-03 |
+| UC-23: Update watch progress | FR-WL-04, FR-WL-05 |
+| UC-24: Remove a video from a watchlist | FR-WL-06 |
+| UC-25: Delete a watchlist | FR-WL-07 |
+| UC-26: Create a reading list | FR-RL-01 |
+| UC-27: Browse reading lists and progress | FR-RL-08 |
+| UC-28: Add an item to a reading list | FR-RL-02, FR-RL-03 |
+| UC-29: Update reading progress | FR-RL-04, FR-RL-05 |
+| UC-30: Remove an item from a reading list | FR-RL-06 |
+| UC-31: Delete a reading list | FR-RL-07 |
+| UC-32: Read text file content | FR-TX-01, FR-FC-26 |
+| UC-33: Edit text file content | FR-TX-02, FR-TX-03, FR-FC-26 |
+| UC-34: Local login | Withdrawn (the core only runs locally for the person at the machine) |
+| UC-35: Set or change local login credentials | Withdrawn (the core only runs locally for the person at the machine) |
+| UC-36: Authenticate via external JWT | Withdrawn (the core only runs locally for the person at the machine) |
+| UC-38: Stream file content | FR-MP-01, FR-MP-03, FR-MP-06, FR-FC-26 |
 | UC-39: Read a comic book page | FR-MP-03, FR-MP-04, FR-MP-06, FR-FC-26 |
 | UC-40: Get a file thumbnail | FR-MP-05, FR-MP-06, FR-FC-26 |
-| UC-41: Register the local account | FR-AU-05, FR-AU-06, FR-AU-08, FR-AU-09, FR-AU-10, FR-AU-11, FR-AU-13, FR-AU-19 |
-| UC-42: Query an index or refresh run | FR-FC-24, FR-FC-27, FR-FC-28, FR-FC-29, FR-FC-35 |
-| UC-43: Redeem a recovery code | FR-AU-11, FR-AU-14, FR-AU-15, FR-AU-16 |
-| UC-44: Regenerate recovery codes | FR-AU-17, FR-AU-19 |
-| UC-45: Log in with the Windows account | FR-AU-20, FR-AU-22 |
-| UC-46: Browse collections | FR-CO-08, FR-FC-24 |
-| UC-47: Report the retention window | FR-FC-30, FR-FC-24 |
-| UC-48: Pause, resume, or cancel an index run | FR-FC-24, FR-FC-27, FR-FC-29, FR-FC-31, FR-FC-32, FR-FC-33, FR-FC-34 |
-| UC-52: Report which files a run could not record | FR-FC-42, FR-FC-24 |
+| UC-41: Register the local account | Withdrawn (the core only runs locally for the person at the machine) |
+| UC-42: Query an index or refresh run | FR-FC-27, FR-FC-28, FR-FC-29, FR-FC-35 |
+| UC-43: Redeem a recovery code | Withdrawn (the core only runs locally for the person at the machine) |
+| UC-44: Regenerate recovery codes | Withdrawn (the core only runs locally for the person at the machine) |
+| UC-45: Log in with the Windows account | Withdrawn (the core only runs locally for the person at the machine) |
+| UC-46: Browse collections | FR-CO-08 |
+| UC-47: Report the retention window | FR-FC-30 |
+| UC-48: Pause, resume, or cancel an index run | FR-FC-27, FR-FC-29, FR-FC-31, FR-FC-32, FR-FC-33, FR-FC-34 |
+| UC-52: Report which files a run could not record | FR-FC-42 |
 | UC-49: Manage a playlist | Removed (moved out of scope, see Orpheus) |
 | UC-50: Play a playlist | Removed (moved out of scope, see Orpheus) |
-| UC-51: Add a library | FR-FC-36, FR-FC-37, FR-FC-38, FR-FC-39, FR-FC-40, FR-FC-41, FR-FC-43, FR-FC-01, FR-FC-24, FR-FC-26, FR-FC-31 |
+| UC-51: Add a library | FR-FC-36, FR-FC-37, FR-FC-38, FR-FC-39, FR-FC-40, FR-FC-41, FR-FC-43, FR-FC-01, FR-FC-26, FR-FC-31 |
+| UC-53: Pin a library | FR-FC-44 |
+| UC-54: Mark a library as a favorite | FR-FC-45 |
+| UC-55: Rename a library | FR-FC-46 |
+| UC-56: Report catalog statistics | FR-FC-47 |
 
-Every functional requirement in [System Requirements Document](System%20Requirements%20Document.md)
-§3 appears in at least one row above except FR-AU-12, FR-AU-18, FR-AU-21,
-FR-AU-23, and FR-AU-24, which are cross-cutting (the error envelope shape,
-the account query, the Windows startup account check, the Windows-mode
-refusal of local-mode operations, and the loopback-bind warning,
-respectively) rather than tied to one use case: FR-FC-01..40, FR-CO-01..07,
-FR-BM-01..06, FR-WL-01..08, FR-RL-01..08, FR-TX-01..03, FR-AU-01..11,
-FR-AU-13..17, FR-AU-19, FR-AU-20, FR-AU-22, FR-MP-01..06. The requirements
-of the removed UC-49 and UC-50 are removed with them.
-UC-37 (Health check) is specified in the
+Every functional requirement still in force in
+[System Requirements Document](System%20Requirements%20Document.md) §3 appears
+in at least one row above: FR-FC-01..23, FR-FC-25..47, FR-CO-01..08,
+FR-BM-01..06, FR-WL-01..08, FR-RL-01..08, FR-TX-01..03, FR-MP-01, and
+FR-MP-03..06. The requirements of the removed UC-49 and UC-50 are removed with
+them. Every FR-AU requirement, FR-FC-24 and FR-MP-02 are removed, and UC-34,
+UC-35, UC-36, UC-41, UC-43, UC-44 and UC-45 are withdrawn: the core only runs
+locally for the person at the machine, who reaches it through its C ABI, so
+there is no login to make and no HTTP surface to keep at parity.
+UC-37 (Health check) was specified in the
 [Operations & Infrastructure Document](Operations%20%26%20Infrastructure%20Document.md)
-§5.3, not here, since it is an operational concern rather than a catalog use case.
+§5.3 and is withdrawn with the HTTP server it reported on.
 
 ---
 

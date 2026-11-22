@@ -8,9 +8,9 @@ each library's folder structure exactly as it is on disk, and lets a client
 browse that tree and read or play what is in it. A folder that is not a library
 is invisible to it. Audio is played as files; managing music (playlists, play
 history, lookups) lives in Orpheus, a separate project. It is written in Rust
-and exposes a JSON-over-HTTP API that any client in any language can call, while
-keeping its domain logic in a reusable core library that a Flutter desktop
-front-end can also consume directly via FFI.
+as a core library that the Flutter desktop front-end calls in process, through
+its C ABI. It only runs locally, for the person at the machine: there is no
+server and no login.
 
 ## The Problem
 
@@ -27,10 +27,8 @@ already on disk, without re-encoding, duplicating, or relocating the files.
 
 - **The owner** — a single user whose personal collection the library catalogs.
   There is no multi-tenant model; all data belongs to this one user.
-- **The Flutter desktop front-end** — the first-party client, calling the API
-  over HTTP and (optionally) the core library over FFI for tight integration.
-- **Other systems** — any external client in any language that talks the HTTP
-  API in JSON to read, organize, and edit the catalog.
+- **The Flutter desktop front-end** — the first-party client, and the only
+  one, calling the core library in process over FFI.
 
 ## What It Does
 
@@ -55,8 +53,8 @@ already on disk, without re-encoding, duplicating, or relocating the files.
   progress.
 - Edits the content of Markdown and text files, writing changes back to the file
   on disk.
-- Exposes the same domain operations over HTTP/REST-JSON and via a Rust core
-  library callable through Flutter FFI.
+- Exposes its domain operations through a Rust core library callable through
+  Flutter FFI.
 - Performs indexing and other heavy work asynchronously so responses stay fast.
 
 ## What It Doesn't Do
@@ -71,10 +69,9 @@ already on disk, without re-encoding, duplicating, or relocating the files.
   FR-FC-10); a content hash is recorded only where a text edit computes one.
 - No automatic removal of files from disk. Deletion of a catalog record never
   touches the on-disk file unless the user runs a separate, explicit purge.
-- No self-issued authentication for the external mode. When external auth is
-  configured, JWTs are issued by an external authentication service; Alexandria
-  validates them. As an alternative, a local-login mode validates credentials
-  against a salted password hash stored on the local machine. Only one mode is active at runtime.
+- No login and no network access. The core only runs locally, for the person
+  at the machine, so it has no accounts, passwords, sessions or tokens, and no
+  server for anything else to reach a catalog through.
 
 ## How Success Is Measured
 
@@ -86,9 +83,6 @@ already on disk, without re-encoding, duplicating, or relocating the files.
   what remains pending.
 - Reading lists accurately track which books and comic books the owner has read
   and what remains pending.
-- The HTTP API and the FFI core produce identical results for the same
-  operation, so the Flutter front-end can choose either transport without
-  behavioral drift.
 - Deletion is safe: removed items can be restored until their retention window
   expires, and on-disk files are only removed by an explicit, intentional
   command.

@@ -1,7 +1,6 @@
 //! Unit tests for the UC-42 GetRunStatusHandler against trait fakes — no
-//! database. Coverage: the main flow plus AF-01 (unknown id) and AF-02
-//! (unauthenticated), AF-03's "running runs carry no counts", and FR-FC-28's
-//! live progress overlay.
+//! database. Coverage: the main flow plus AF-01 (unknown id), AF-03's "running
+//! runs carry no counts", and FR-FC-28's live progress overlay.
 
 use chrono::{TimeZone, Utc};
 use uuid::Uuid;
@@ -13,9 +12,7 @@ use alexandria_core::catalog::run_registry::{RunPhase, RunProgress, RunRegistry}
 use alexandria_core::catalog::runs::{CatalogRunRepository, RunCounts, RunKind, RunStatus};
 use alexandria_core::errors::DomainError;
 
-use crate::common::{FakeAuth, FakeCatalogRunRepository};
-
-const TOKEN: &str = "owner-token";
+use crate::common::FakeCatalogRunRepository;
 
 fn t(hour: u32) -> chrono::DateTime<Utc> {
     Utc.with_ymd_and_hms(2026, 1, 1, hour, 0, 0).unwrap()
@@ -47,14 +44,9 @@ async fn given_a_completed_run_when_read_then_it_is_returned_with_its_counts() {
     )
     .await
     .unwrap();
-    let handler = GetRunStatusHandler::new(
-        FakeAuth::Allowing,
-        runs,
-        FixedClock(t(3)),
-        RunRegistry::new(),
-    );
+    let handler = GetRunStatusHandler::new(runs, FixedClock(t(3)), RunRegistry::new());
 
-    let run = handler.get(id, TOKEN).await.expect("get");
+    let run = handler.get(id).await.expect("get");
 
     assert_eq!(run.id, id);
     assert_eq!(run.kind, RunKind::Refresh);
@@ -78,14 +70,9 @@ async fn given_a_running_run_when_read_then_it_has_no_counts_yet() {
     runs.start(id, RunKind::Index, Some("/library"), t(1), 4, None)
         .await
         .unwrap();
-    let handler = GetRunStatusHandler::new(
-        FakeAuth::Allowing,
-        runs,
-        FixedClock(t(3)),
-        RunRegistry::new(),
-    );
+    let handler = GetRunStatusHandler::new(runs, FixedClock(t(3)), RunRegistry::new());
 
-    let run = handler.get(id, TOKEN).await.expect("get");
+    let run = handler.get(id).await.expect("get");
 
     assert_eq!(run.status, RunStatus::Running);
     assert!(run.counts.is_none());
@@ -96,67 +83,17 @@ async fn given_a_running_run_when_read_then_it_has_no_counts_yet() {
 async fn given_an_unknown_run_id_when_read_then_not_found() {
     // AF-01.
     let handler = GetRunStatusHandler::new(
-        FakeAuth::Allowing,
         FakeCatalogRunRepository::new(),
         FixedClock(t(3)),
         RunRegistry::new(),
     );
 
     let err = handler
-        .get(Uuid::new_v4(), TOKEN)
+        .get(Uuid::new_v4())
         .await
         .expect_err("must reject an unknown id");
 
     assert!(matches!(err, DomainError::NotFound), "got {err:?}");
-}
-
-#[tokio::test]
-async fn given_an_unauthenticated_caller_when_read_then_unauthorized() {
-    // AF-02.
-    let runs = FakeCatalogRunRepository::new();
-    let id = Uuid::new_v4();
-    runs.start(id, RunKind::Refresh, None, t(1), 4, None)
-        .await
-        .unwrap();
-    let handler = GetRunStatusHandler::new(
-        FakeAuth::Denying,
-        runs,
-        FixedClock(t(3)),
-        RunRegistry::new(),
-    );
-
-    let err = handler
-        .get(id, "")
-        .await
-        .expect_err("must reject an unauthenticated caller");
-
-    assert!(matches!(err, DomainError::Unauthorized), "got {err:?}");
-}
-
-#[tokio::test]
-async fn given_an_unauthenticated_caller_and_an_unknown_run_id_when_read_then_unauthorized_not_not_found(
-) {
-    // AF-02: a caller who never authenticated must not learn whether the id
-    // names a run at all — auth is checked before the repository, so an
-    // unknown id behind a denied token must still surface as Unauthorized,
-    // never NotFound.
-    let handler = GetRunStatusHandler::new(
-        FakeAuth::Denying,
-        FakeCatalogRunRepository::new(),
-        FixedClock(t(3)),
-        RunRegistry::new(),
-    );
-
-    let err = handler
-        .get(Uuid::new_v4(), "")
-        .await
-        .expect_err("must reject an unauthenticated caller");
-
-    assert!(matches!(err, DomainError::Unauthorized), "got {err:?}");
-    assert!(
-        !matches!(err, DomainError::NotFound),
-        "must not leak whether the id names a run to an unauthenticated caller"
-    );
 }
 
 #[tokio::test]
@@ -187,9 +124,9 @@ async fn given_a_running_run_with_a_live_cell_when_read_then_it_reports_live_pro
     for _ in 0..8_412 {
         cell.advance();
     }
-    let handler = GetRunStatusHandler::new(FakeAuth::Allowing, runs, FixedClock(t(3)), registry);
+    let handler = GetRunStatusHandler::new(runs, FixedClock(t(3)), registry);
 
-    let run = handler.get(id, TOKEN).await.expect("get");
+    let run = handler.get(id).await.expect("get");
 
     assert_eq!(run.phase, Some(RunPhase::Processing));
     assert_eq!(run.total, Some(12_264));
@@ -212,9 +149,9 @@ async fn given_a_discovering_run_with_a_live_cell_when_read_then_the_total_is_st
     let registry = RunRegistry::new();
     // Bound, not dropped: the guard is what keeps the run open.
     let _cell = registry.open(id);
-    let handler = GetRunStatusHandler::new(FakeAuth::Allowing, runs, FixedClock(t(3)), registry);
+    let handler = GetRunStatusHandler::new(runs, FixedClock(t(3)), registry);
 
-    let run = handler.get(id, TOKEN).await.expect("get");
+    let run = handler.get(id).await.expect("get");
 
     assert_eq!(run.phase, Some(RunPhase::Discovering));
     assert_eq!(run.total, None);
@@ -240,14 +177,9 @@ async fn given_a_run_with_no_live_cell_when_read_then_it_reports_the_persisted_p
     )
     .await
     .unwrap();
-    let handler = GetRunStatusHandler::new(
-        FakeAuth::Allowing,
-        runs,
-        FixedClock(t(3)),
-        RunRegistry::new(),
-    );
+    let handler = GetRunStatusHandler::new(runs, FixedClock(t(3)), RunRegistry::new());
 
-    let run = handler.get(id, TOKEN).await.expect("get");
+    let run = handler.get(id).await.expect("get");
 
     assert_eq!(run.phase, Some(RunPhase::Processing));
     assert_eq!(run.total, Some(12_264));
@@ -267,14 +199,9 @@ async fn given_a_run_that_never_flushed_when_read_then_it_reports_no_progress() 
     runs.start(id, RunKind::Index, Some("/library"), t(1), 4, None)
         .await
         .unwrap();
-    let handler = GetRunStatusHandler::new(
-        FakeAuth::Allowing,
-        runs,
-        FixedClock(t(3)),
-        RunRegistry::new(),
-    );
+    let handler = GetRunStatusHandler::new(runs, FixedClock(t(3)), RunRegistry::new());
 
-    let run = handler.get(id, TOKEN).await.expect("get");
+    let run = handler.get(id).await.expect("get");
 
     assert_eq!(run.phase, None);
     assert_eq!(run.total, None);
@@ -290,14 +217,9 @@ async fn given_a_running_run_when_read_then_active_millis_counts_up_to_now() {
     runs.start(id, RunKind::Index, Some("/library"), at(1, 0, 0), 4, None)
         .await
         .unwrap();
-    let handler = GetRunStatusHandler::new(
-        FakeAuth::Allowing,
-        runs,
-        FixedClock(at(1, 0, 30)),
-        RunRegistry::new(),
-    );
+    let handler = GetRunStatusHandler::new(runs, FixedClock(at(1, 0, 30)), RunRegistry::new());
 
-    let run = handler.get(id, TOKEN).await.expect("get");
+    let run = handler.get(id).await.expect("get");
 
     assert_eq!(run.active_millis, 30_000);
 }
@@ -322,7 +244,6 @@ async fn given_a_finished_run_when_read_then_active_millis_stops_at_finished_at(
     .await
     .unwrap();
     let handler = GetRunStatusHandler::new(
-        FakeAuth::Allowing,
         runs,
         // Far past the finish: a finished run's elapsed time must not keep
         // growing with the wall clock.
@@ -330,7 +251,7 @@ async fn given_a_finished_run_when_read_then_active_millis_stops_at_finished_at(
         RunRegistry::new(),
     );
 
-    let run = handler.get(id, TOKEN).await.expect("get");
+    let run = handler.get(id).await.expect("get");
 
     assert_eq!(run.active_millis, 10_000);
 }
@@ -346,14 +267,9 @@ async fn given_a_run_that_spent_time_paused_when_read_then_active_millis_exclude
         .await
         .unwrap();
     runs.set_paused_millis(id, 20_000);
-    let handler = GetRunStatusHandler::new(
-        FakeAuth::Allowing,
-        runs,
-        FixedClock(at(1, 0, 30)),
-        RunRegistry::new(),
-    );
+    let handler = GetRunStatusHandler::new(runs, FixedClock(at(1, 0, 30)), RunRegistry::new());
 
-    let run = handler.get(id, TOKEN).await.expect("get");
+    let run = handler.get(id).await.expect("get");
 
     assert_eq!(run.active_millis, 10_000);
     assert_eq!(run.paused_millis, 20_000);
@@ -379,14 +295,10 @@ async fn given_a_paused_run_when_read_later_then_active_millis_does_not_grow_wit
     // Ten minutes of work, then a pause of no particular length. Every read
     // must give the same answer, whenever it happens.
     for read_at in [at(1, 10, 0), at(1, 40, 0), at(5, 0, 0)] {
-        let handler = GetRunStatusHandler::new(
-            FakeAuth::Allowing,
-            runs.clone(),
-            FixedClock(read_at),
-            RunRegistry::new(),
-        );
+        let handler =
+            GetRunStatusHandler::new(runs.clone(), FixedClock(read_at), RunRegistry::new());
 
-        let run = handler.get(id, TOKEN).await.expect("get");
+        let run = handler.get(id).await.expect("get");
 
         assert_eq!(
             run.active_millis,
@@ -411,14 +323,10 @@ async fn given_a_run_cancelled_while_paused_when_read_then_its_clock_is_frozen()
         .cancel(id, None, at(1, 20, 0), None)
         .await
         .expect("cancel"));
-    let handler = GetRunStatusHandler::new(
-        FakeAuth::Allowing,
-        runs.clone(),
-        FixedClock(at(9, 0, 0)),
-        RunRegistry::new(),
-    );
+    let handler =
+        GetRunStatusHandler::new(runs.clone(), FixedClock(at(9, 0, 0)), RunRegistry::new());
 
-    let run = handler.get(id, TOKEN).await.expect("get");
+    let run = handler.get(id).await.expect("get");
 
     assert_eq!(
         run.active_millis,
@@ -432,7 +340,7 @@ async fn given_a_run_cancelled_while_paused_when_read_then_its_clock_is_frozen()
 /// The handler under test plus the repository and registry a test needs to
 /// seed runs into. Mirrors `run_control.rs`'s `ControlHarness`.
 struct ActiveRunsHarness {
-    handler: GetActiveRunsHandler<FakeAuth, FakeCatalogRunRepository, FixedClock>,
+    handler: GetActiveRunsHandler<FakeCatalogRunRepository, FixedClock>,
     runs: FakeCatalogRunRepository,
     registry: RunRegistry,
 }
@@ -442,12 +350,7 @@ impl ActiveRunsHarness {
         let runs = FakeCatalogRunRepository::new();
         let registry = RunRegistry::new();
         Self {
-            handler: GetActiveRunsHandler::new(
-                FakeAuth::Allowing,
-                runs.clone(),
-                FixedClock(t(9)),
-                registry.clone(),
-            ),
+            handler: GetActiveRunsHandler::new(runs.clone(), FixedClock(t(9)), registry.clone()),
             runs,
             registry,
         }
@@ -503,7 +406,7 @@ async fn given_runs_in_every_state_when_active_ones_are_listed_then_only_running
     harness.a_run(RunStatus::Failed).await;
     harness.a_run(RunStatus::Cancelled).await;
 
-    let active = harness.handler.list("token").await.unwrap();
+    let active = harness.handler.list().await.unwrap();
 
     let ids: Vec<_> = active.iter().map(|r| r.id).collect();
     assert_eq!(ids.len(), 2);
@@ -516,27 +419,9 @@ async fn given_no_outstanding_runs_when_listed_then_an_empty_list_is_returned_no
     let harness = ActiveRunsHarness::new().await;
     harness.a_run(RunStatus::Complete).await;
 
-    let active = harness.handler.list("token").await.expect("must not error");
+    let active = harness.handler.list().await.expect("must not error");
 
     assert!(active.is_empty());
-}
-
-#[tokio::test]
-async fn given_an_unauthenticated_caller_when_active_runs_are_listed_then_unauthorized() {
-    let runs = FakeCatalogRunRepository::new();
-    let handler = GetActiveRunsHandler::new(
-        FakeAuth::Denying,
-        runs,
-        FixedClock(t(9)),
-        RunRegistry::new(),
-    );
-
-    let err = handler
-        .list("")
-        .await
-        .expect_err("must reject an unauthenticated caller");
-
-    assert!(matches!(err, DomainError::Unauthorized), "got {err:?}");
 }
 
 #[tokio::test]
@@ -567,7 +452,7 @@ async fn given_a_live_run_in_the_list_when_read_then_it_reports_live_progress_no
         cell.advance();
     }
 
-    let active = harness.handler.list("token").await.unwrap();
+    let active = harness.handler.list().await.unwrap();
 
     let run = active.iter().find(|r| r.id == id).expect("run in list");
     assert_eq!(run.phase, Some(RunPhase::Processing));
@@ -595,7 +480,7 @@ async fn given_active_runs_when_listed_then_they_come_back_newest_first() {
         .await
         .unwrap();
 
-    let active = harness.handler.list("token").await.unwrap();
+    let active = harness.handler.list().await.unwrap();
 
     let ids: Vec<_> = active.iter().map(|r| r.id).collect();
     assert_eq!(ids, vec![newer, older], "newest started run first");

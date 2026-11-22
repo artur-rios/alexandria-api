@@ -12,11 +12,11 @@ A layered back-end:
 
 1. **Rust core library** — the domain logic (commands, queries, indexing,
    metadata, file references) in a reusable library crate.
-2. **HTTP/REST JSON API** — a server crate that exposes the core library over
-   an HTTP/JSON interface for any external caller in any language.
-3. **FFI surface** — the same core library consumable directly by the Flutter
-   desktop front-end via FFI, so the front-end can choose HTTP or FFI per
-   operation without behavioral drift.
+2. **FFI surface** — the core library's C ABI, consumed directly by the Flutter
+   desktop front-end in process.
+
+The HTTP/REST JSON server that once sat beside them is removed: the core only
+runs locally, for the person at the machine.
 
 Recommended patterns: SOLID, Command/Query (CQRS-style) as the baseline for the
 core library's operations.
@@ -40,19 +40,11 @@ decided in Phase 2 and recorded in the
 
 ## Authentication
 
-Three configurable modes, selected at startup; only one is active at runtime:
+**Removed (the core only runs locally for the person at the machine)**
 
-1. **External JWT** — JWTs issued by an external authentication microservice;
-   Alexandria validates them through a pluggable auth service module. The actual
-   provider integration is wired later.
-2. **Local login** — credentials (email and a salted/hashed password) stored in
-   a SQLite row on the local machine, verified by Alexandria. No plaintext
-   credentials are ever stored — only the one-way password hash.
-3. **Windows account** — the Windows account the server process runs as.
-   Nothing is typed and nothing is stored; the process reads its own account at
-   startup and compares it to the configured owner.
-
-All modes authorize the single owner; only the configured mode is accepted.
+There is no login. The core runs in process for the person at the machine, and
+the catalog has the protection the operating system gives that person's own
+folder.
 
 ## Testing
 
@@ -65,18 +57,15 @@ cargo test
 
 ## External Dependencies
 
-- **External authentication service** — issues and (via JWKS / shared secret)
-  validates the JWTs Alexandria accepts.
 - **The local filesystem** — indexing reads file metadata and content hashes;
   Markdown/text edits write back to the source path.
 
-No email, payments, identity providers beyond the auth service, message
-brokers, or object storage are involved.
+No email, payments, identity providers, message brokers, or object storage are
+involved.
 
 ## Deployment
 
 Bundled with the Flutter desktop application, running on the user's own
-machine. The HTTP server listens locally so the desktop client (and any other
-local consumer) can reach it; clients that link the FFI core call it in
-process. Concrete packaging specifics are recorded as undecided until the
+machine. The desktop client links the FFI core and calls it in process.
+Concrete packaging specifics are recorded as undecided until the
 desktop integration is built.

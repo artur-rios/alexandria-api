@@ -1,10 +1,12 @@
+use std::collections::BTreeMap;
+
 use serde::Serialize;
 use uuid::Uuid;
 
 use crate::catalog::model::FileView;
 
-/// A library about to be persisted. The `uuid` is minted by the handler so
-/// the value is decided by the same code on both transports.
+/// A library about to be persisted. The `uuid` is minted by the handler, not
+/// the repository.
 #[derive(Debug, Clone)]
 pub struct NewLibrary {
     pub uuid: Uuid,
@@ -23,6 +25,10 @@ pub struct Library {
     pub name: String,
     /// What every entry's position is relative to.
     pub root_path: String,
+    /// Kept at the top of the menu, above the libraries that are not.
+    pub pinned: bool,
+    /// Marked by the owner as one to come back to. Independent of `pinned`.
+    pub favorite: bool,
 }
 
 /// A library just registered, with the run that is indexing it.
@@ -70,4 +76,15 @@ pub struct LibraryListing {
     /// listing answers — so a client parses a library with what it already
     /// has for the catalog.
     pub files: Vec<FileView>,
+}
+
+/// What the catalog holds, for the home screen: how many libraries, and how
+/// many files of each type.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CatalogStats {
+    pub libraries: u64,
+    /// Every file type is present, `0` when there are none, so a client
+    /// never has to tell an absent key from a zero.
+    pub files_by_type: BTreeMap<String, u64>,
 }

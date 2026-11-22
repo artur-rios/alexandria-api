@@ -48,7 +48,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use alexandria_core::auth::BearerAuthService;
 use alexandria_core::catalog::audio_tags::LoftyAudioMetadataReader;
 use alexandria_core::catalog::clock::SystemClock;
 use alexandria_core::catalog::comic_tags::CbzComicMetadataReader;
@@ -64,10 +63,7 @@ use alexandria_core::catalog::video_tags::FfmpegVideoMetadataReader;
 use alexandria_core::migrate::migrate_database;
 use uuid::Uuid;
 
-const TOKEN: &str = "bench-token";
-
 type BenchIndexHandler = IndexHandler<
-    BearerAuthService,
     SqliteCatalogRepository,
     StdFilesystem,
     SystemClock,
@@ -367,7 +363,6 @@ async fn build(
     let repo = SqliteCatalogRepository::new(pool.clone());
     let run_repo = SqliteCatalogRunRepository::new(pool);
     let handler = IndexHandler::new(
-        BearerAuthService,
         repo.clone(),
         StdFilesystem,
         SystemClock,
@@ -594,7 +589,7 @@ async fn given_an_index_run_in_flight_when_reads_are_issued_then_they_are_not_bl
 
     let (handler, repo) = build(&dbdir.path().join("bench.sqlite"), concurrency).await;
     let handler = Arc::new(handler);
-    let browse = BrowseFilesHandler::new(BearerAuthService, repo);
+    let browse = BrowseFilesHandler::new(repo);
 
     let root = lib.path().to_str().expect("utf-8 lib path").to_string();
     let indexing = Arc::new(AtomicBool::new(true));
@@ -610,7 +605,7 @@ async fn given_an_index_run_in_flight_when_reads_are_issued_then_they_are_not_bl
     while indexing.load(Ordering::SeqCst) {
         let started = Instant::now();
         browse
-            .list(FileFilter::new(), TOKEN)
+            .list(FileFilter::new())
             .await
             .expect("read during indexing");
         latencies.push(started.elapsed());

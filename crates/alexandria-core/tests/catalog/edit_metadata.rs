@@ -1,28 +1,24 @@
 //! Unit tests for the UC-04 EditMetadataHandler (Testing Specification §6).
-//! Each test exercises exactly the handler against trait fakes — no real DB,
-//! filesystem, or auth service. Coverage follows §6.3: happy path per
-//! editable subtype, every `AF-xx` alternative flow, and the text/html
-//! non-editable subtype rejection (a form of AF-01).
+//! Each test exercises exactly the handler against trait fakes — no real DB or
+//! filesystem. Coverage follows §6.3: happy path per editable subtype, every
+//! `AF-xx` alternative flow, and the text/html non-editable subtype rejection
+//! (a form of AF-01).
 
 use uuid::Uuid;
 
-use alexandria_core::auth::AuthService;
 use alexandria_core::catalog::commands::edit_metadata::EditMetadataHandler;
 use alexandria_core::catalog::model::{
     FileState, FileType, FormatKind, MediaKind, SubtypeMetadata,
 };
 use alexandria_core::errors::DomainError;
 
-use crate::common::{deleted_file, existing_file_with_hash, FakeAuth, FakeCatalogRepository};
+use crate::common::{deleted_file, existing_file_with_hash, FakeCatalogRepository};
 
-const TOKEN: &str = "bearer-token";
-
-fn handler<A, R>(auth: A, repo: R) -> EditMetadataHandler<A, R>
+fn handler<R>(repo: R) -> EditMetadataHandler<R>
 where
-    A: AuthService,
     R: alexandria_core::catalog::repos::CatalogRepository,
 {
-    EditMetadataHandler::new(auth, repo)
+    EditMetadataHandler::new(repo)
 }
 
 /// Builds an active seeded file and returns (uuid, repo_handle, handler).
@@ -31,13 +27,13 @@ fn seeded(
 ) -> (
     Uuid,
     FakeCatalogRepository,
-    EditMetadataHandler<FakeAuth, FakeCatalogRepository>,
+    EditMetadataHandler<FakeCatalogRepository>,
 ) {
     let repo = FakeCatalogRepository::new();
     let file = existing_file_with_hash("/lib/seed", "seed", file_type, "h");
     let uuid = file.uuid;
     repo.seed(file);
-    let h = handler(FakeAuth::Allowing, repo.clone());
+    let h = handler(repo.clone());
     (uuid, repo, h)
 }
 
@@ -53,7 +49,7 @@ async fn given_active_video_file_when_edit_video_metadata_then_metadata_replaced
         media_kind: Some(MediaKind::Movie),
     };
 
-    h.edit(uuid, metadata.clone(), TOKEN).await.expect("edit");
+    h.edit(uuid, metadata.clone()).await.expect("edit");
 
     assert_eq!(repo.metadata_for(uuid), Some(metadata));
 }
@@ -68,7 +64,7 @@ async fn given_active_video_file_series_kind_when_edit_video_then_series_persist
         media_kind: Some(MediaKind::Series),
     };
 
-    h.edit(uuid, metadata.clone(), TOKEN).await.expect("edit");
+    h.edit(uuid, metadata.clone()).await.expect("edit");
 
     match repo.metadata_for(uuid) {
         Some(SubtypeMetadata::Video { media_kind, .. }) => {
@@ -90,7 +86,7 @@ async fn given_active_document_file_when_edit_document_metadata_then_metadata_re
         format_kind: Some(FormatKind::Ebook),
     };
 
-    h.edit(uuid, metadata.clone(), TOKEN).await.expect("edit");
+    h.edit(uuid, metadata.clone()).await.expect("edit");
 
     assert_eq!(repo.metadata_for(uuid), Some(metadata));
 }
@@ -106,7 +102,7 @@ async fn given_active_comic_file_when_edit_comic_metadata_then_metadata_replaced
         issue_number: Some(42),
     };
 
-    h.edit(uuid, metadata.clone(), TOKEN).await.expect("edit");
+    h.edit(uuid, metadata.clone()).await.expect("edit");
 
     assert_eq!(repo.metadata_for(uuid), Some(metadata));
 }
@@ -121,7 +117,7 @@ async fn given_active_image_file_when_edit_image_metadata_then_metadata_replaced
         caption: Some("A caption".into()),
     };
 
-    h.edit(uuid, metadata.clone(), TOKEN).await.expect("edit");
+    h.edit(uuid, metadata.clone()).await.expect("edit");
 
     assert_eq!(repo.metadata_for(uuid), Some(metadata));
 }
@@ -138,7 +134,7 @@ async fn given_document_file_when_edit_with_video_metadata_then_invalid_input() 
         media_kind: None,
     };
 
-    let result = h.edit(uuid, video, TOKEN).await;
+    let result = h.edit(uuid, video).await;
     assert!(
         matches!(result, Err(DomainError::InvalidInput(_))),
         "variant mismatch must be AF-01 invalid input"
@@ -155,7 +151,7 @@ async fn given_image_file_when_edit_with_document_metadata_then_invalid_input() 
         format_kind: None,
     };
 
-    let result = h.edit(uuid, doc, TOKEN).await;
+    let result = h.edit(uuid, doc).await;
     assert!(matches!(result, Err(DomainError::InvalidInput(_))));
 }
 
@@ -174,7 +170,7 @@ async fn given_text_file_when_edit_with_any_metadata_then_invalid_input() {
         media_kind: None,
     };
 
-    let result = h.edit(uuid, video, TOKEN).await;
+    let result = h.edit(uuid, video).await;
     assert!(
         matches!(result, Err(DomainError::InvalidInput(_))),
         "text has no editable subtype metadata"
@@ -189,7 +185,7 @@ async fn given_html_file_when_edit_with_any_metadata_then_invalid_input() {
         caption: None,
     };
 
-    let result = h.edit(uuid, image, TOKEN).await;
+    let result = h.edit(uuid, image).await;
     assert!(matches!(result, Err(DomainError::InvalidInput(_))));
 }
 
@@ -198,7 +194,7 @@ async fn given_html_file_when_edit_with_any_metadata_then_invalid_input() {
 #[tokio::test]
 async fn given_missing_uuid_when_edit_then_not_found() {
     let repo = FakeCatalogRepository::new();
-    let h = handler(FakeAuth::Allowing, repo);
+    let h = handler(repo);
     let uuid = Uuid::new_v4();
     let video = SubtypeMetadata::Video {
         title: Some("x".into()),
@@ -207,25 +203,8 @@ async fn given_missing_uuid_when_edit_then_not_found() {
         media_kind: None,
     };
 
-    let result = h.edit(uuid, video, TOKEN).await;
+    let result = h.edit(uuid, video).await;
     assert!(matches!(result, Err(DomainError::NotFound)));
-}
-
-// ---------- AF-03: caller not authenticated ----------
-
-#[tokio::test]
-async fn given_unauthenticated_when_edit_then_unauthorized() {
-    let repo = FakeCatalogRepository::new();
-    let h = handler(FakeAuth::Denying, repo);
-    let video = SubtypeMetadata::Video {
-        title: None,
-        year: None,
-        resolution: None,
-        media_kind: None,
-    };
-
-    let result = h.edit(Uuid::new_v4(), video, "").await;
-    assert!(matches!(result, Err(DomainError::Unauthorized)));
 }
 
 // ---------- AF-04: file is in `deleted` state ----------
@@ -236,7 +215,7 @@ async fn given_deleted_file_when_edit_then_invalid_state() {
     let file = deleted_file("/lib/d", "d", FileType::Video);
     let uuid = file.uuid;
     repo.seed(file);
-    let h = handler(FakeAuth::Allowing, repo);
+    let h = handler(repo);
 
     let video = SubtypeMetadata::Video {
         title: Some("x".into()),
@@ -245,7 +224,7 @@ async fn given_deleted_file_when_edit_then_invalid_state() {
         media_kind: None,
     };
 
-    let result = h.edit(uuid, video, TOKEN).await;
+    let result = h.edit(uuid, video).await;
     assert!(
         matches!(result, Err(DomainError::InvalidState)),
         "editing a deleted file's metadata must require restore (UC-07)"
@@ -263,7 +242,7 @@ async fn given_edit_succeeds_then_returned_file_is_the_cataloged_file() {
         issue_number: Some(1),
     };
 
-    let result = h.edit(uuid, metadata, TOKEN).await.expect("edit");
+    let result = h.edit(uuid, metadata).await.expect("edit");
 
     assert_eq!(result.file.uuid, uuid);
     assert_eq!(result.file.file_type, FileType::Comic);

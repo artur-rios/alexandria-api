@@ -1,6 +1,5 @@
 use uuid::Uuid;
 
-use crate::auth::AuthService;
 use crate::catalog::fs::Filesystem;
 use crate::catalog::library_root::LibraryRoot;
 use crate::catalog::model::{File, FileState};
@@ -8,10 +7,9 @@ use crate::catalog::repos::CatalogRepository;
 use crate::errors::DomainError;
 
 /// Validate a new file name as a host-OS file name (UC-05 / FR-FC-19, AF-01).
-/// Conservative enough to be valid on both Windows and POSIX so the HTTP and
-/// FFI surfaces — and the cross-platform embedder — stay at parity (NFR-09)
-/// without platform-specific rules leaking through one surface but not the
-/// other.
+/// Conservative enough to be valid on both Windows and POSIX, so the
+/// cross-platform embedder gets one rule on every host rather than
+/// platform-specific rules leaking through on one of them.
 ///
 /// Rejects: empty; leading/trailing whitespace (the trimmed form would differ
 /// from what the caller typed, silently coercing a typo to a real file name);
@@ -68,9 +66,8 @@ pub fn validate_file_name(name: &str) -> Result<String, DomainError> {
 /// Compute `parent(old_path).join(new_name)` as a string, preserving the
 /// separator the indexer already stored in `old_path`. Using `Path::parent` +
 /// `join` here would normalize to the OS separator (backslashes on Windows),
-/// which desyncs from the catalog's stored `path` string and the FFI's
-/// parity check; doing the slice entirely in `str` keeps the separator
-/// end-to-end identical over both transports (FR-FC-24 / NFR-09).
+/// which desyncs from the catalog's stored `path` string; doing the slice
+/// entirely in `str` keeps the separator the catalog already holds.
 fn sibling_path(old_path: &str, new_name: &str) -> String {
     match old_path.rfind(['/', '\\']) {
         Some(i) => {
@@ -86,26 +83,23 @@ fn sibling_path(old_path: &str, new_name: &str) -> String {
 /// Rename a file (UC-05 / FR-FC-19). Renames the on-disk file and updates the
 /// catalog's `name` and `path` atomically.
 ///
-/// The handler authenticates the caller (AF-04), looks the file up by its
-/// public UUID (AF-03), rejects renames on a soft-deleted record (restore via
-/// UC-07 first), validates the new name as a host-OS file name (AF-01), and
-/// then performs the on-disk rename before touching the catalog (AF-02 — if
-/// the disk rename fails, no catalog change is ever made). If the disk rename
-/// succeeds but the catalog write fails, the handler compensates by moving
-/// the on-disk file back to its old path, so the end state is catalog
-/// unchanged and on-disk file untouched (the same end state AF-02 calls for).
+/// The handler looks the file up by its public UUID (AF-03), rejects renames
+/// on a soft-deleted record (restore via UC-07 first), validates the new name
+/// as a host-OS file name (AF-01), and then performs the on-disk rename before
+/// touching the catalog (AF-02 — if the disk rename fails, no catalog change
+/// is ever made). If the disk rename succeeds but the catalog write fails, the
+/// handler compensates by moving the on-disk file back to its old path, so the
+/// end state is catalog unchanged and on-disk file untouched (the same end
+/// state AF-02 calls for).
 ///
 /// Target-exists is folded into AF-02: the handler rejects a rename onto a
 /// path another cataloged file owns, or one an on-disk entry already sits at,
 /// with a `Disk` error — before any on-disk move is attempted.
 ///
-/// Generic over auth, catalog repository, and filesystem so the same decision
-/// logic is unit-tested against trait fakes (no real DB, fs, or auth in unit
-/// tests), then wired with the concrete collaborators at runtime (services.rs).
-/// Both the HTTP and FFI surfaces call this handler so the two stay at parity
-/// (FR-FC-24 / NFR-09).
-pub struct RenameFileHandler<A, R, F> {
-    auth: A,
+/// Generic over the catalog repository and filesystem so the same decision
+/// logic is unit-tested against trait fakes (no real DB or fs in unit tests),
+/// then wired with the concrete collaborators at runtime (services.rs).
+pub struct RenameFileHandler<R, F> {
     repo: R,
     fs: F,
     /// `filesystem.root` (FR-FC-26): a row pointing outside it has its
@@ -113,15 +107,13 @@ pub struct RenameFileHandler<A, R, F> {
     library_root: LibraryRoot,
 }
 
-impl<A, R, F> RenameFileHandler<A, R, F>
+impl<R, F> RenameFileHandler<R, F>
 where
-    A: AuthService,
     R: CatalogRepository,
     F: Filesystem,
 {
-    pub fn new(auth: A, repo: R, fs: F, library_root: LibraryRoot) -> Self {
+    pub fn new(repo: R, fs: F, library_root: LibraryRoot) -> Self {
         Self {
-            auth,
             repo,
             fs,
             library_root,
@@ -129,15 +121,7 @@ where
     }
 
     /// Rename `uuid` to `new_name`. Returns the updated `File` on success.
-    pub async fn rename(
-        &self,
-        uuid: Uuid,
-        new_name: String,
-        token: &str,
-    ) -> Result<File, DomainError> {
-        // AF-04: the caller must be authenticated.
-        self.auth.authenticate(token).await?;
-
+    pub async fn rename(&self, uuid: Uuid, new_name: String) -> Result<File, DomainError> {
         // AF-03: the file must exist.
         let file = self
             .repo

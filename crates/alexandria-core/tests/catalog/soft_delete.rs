@@ -1,7 +1,7 @@
 //! Unit tests for the UC-06 SoftDeleteFileHandler (Testing Specification §6).
-//! Each test exercises exactly the handler against trait fakes — no real DB,
-//! filesystem, or auth service. Coverage follows §6.3: happy path, every
-//! `AF-xx` alternative flow, the already-deleted state precondition, and the
+//! Each test exercises exactly the handler against trait fakes — no real DB or
+//! filesystem. Coverage follows §6.3: happy path, every `AF-xx` alternative
+//! flow, the already-deleted state precondition, and the
 //! repository-write-failure branch.
 
 use chrono::DateTime;
@@ -12,18 +12,13 @@ use alexandria_core::catalog::commands::soft_delete::SoftDeleteFileHandler;
 use alexandria_core::catalog::model::FileState;
 use alexandria_core::errors::DomainError;
 
-use crate::common::{
-    deleted_file, existing_file, fixed_clock, now, FakeAuth, FakeCatalogRepository,
-};
-
-const TOKEN: &str = "bearer-token";
+use crate::common::{deleted_file, existing_file, fixed_clock, now, FakeCatalogRepository};
 
 fn handler(
-    auth: FakeAuth,
     repo: FakeCatalogRepository,
     clock: FixedClock,
-) -> SoftDeleteFileHandler<FakeAuth, FakeCatalogRepository, FixedClock> {
-    SoftDeleteFileHandler::new(auth, repo, clock)
+) -> SoftDeleteFileHandler<FakeCatalogRepository, FixedClock> {
+    SoftDeleteFileHandler::new(repo, clock)
 }
 
 /// Seed an active cataloged file and return (uuid, repo, clock, handler).
@@ -33,14 +28,14 @@ fn seeded(
     Uuid,
     FakeCatalogRepository,
     FixedClock,
-    SoftDeleteFileHandler<FakeAuth, FakeCatalogRepository, FixedClock>,
+    SoftDeleteFileHandler<FakeCatalogRepository, FixedClock>,
 ) {
     let repo = FakeCatalogRepository::new();
     let file = existing_file(path, alexandria_core::catalog::model::FileType::Text);
     let uuid = file.uuid;
     repo.seed(file);
     let clock = fixed_clock(now());
-    let h = handler(FakeAuth::Allowing, repo.clone(), clock);
+    let h = handler(repo.clone(), clock);
     (uuid, repo, clock, h)
 }
 
@@ -52,7 +47,7 @@ fn seeded_deleted(
     Uuid,
     FakeCatalogRepository,
     FixedClock,
-    SoftDeleteFileHandler<FakeAuth, FakeCatalogRepository, FixedClock>,
+    SoftDeleteFileHandler<FakeCatalogRepository, FixedClock>,
 ) {
     let repo = FakeCatalogRepository::new();
     let file = deleted_file(
@@ -63,7 +58,7 @@ fn seeded_deleted(
     let uuid = file.uuid;
     repo.seed(file);
     let clock = fixed_clock(now());
-    let h = handler(FakeAuth::Allowing, repo.clone(), clock);
+    let h = handler(repo.clone(), clock);
     (uuid, repo, clock, h)
 }
 
@@ -73,7 +68,7 @@ fn seeded_deleted(
 async fn given_active_file_when_soft_delete_then_state_deleted_deleted_at_set_and_returned() {
     let (uuid, repo, clock, h) = seeded("/lib/memo.txt");
 
-    let result = h.soft_delete(uuid, TOKEN).await.expect("soft_delete");
+    let result = h.soft_delete(uuid).await.expect("soft_delete");
 
     assert_eq!(result.uuid, uuid);
     assert_eq!(result.state, FileState::Deleted);
@@ -89,9 +84,9 @@ async fn given_active_file_when_soft_delete_then_clock_value_taken_as_deleted_at
     // clock rather than (e.g.) `Utc::now()` or the file's `indexed_at`.
     let stamp = DateTime::from_timestamp(1_700_000_500, 0).unwrap();
     let (uuid, repo, _clock, _h) = seeded("/lib/memo.txt");
-    let h = SoftDeleteFileHandler::new(FakeAuth::Allowing, repo.clone(), fixed_clock(stamp));
+    let h = SoftDeleteFileHandler::new(repo.clone(), fixed_clock(stamp));
 
-    let result = h.soft_delete(uuid, TOKEN).await.expect("soft_delete");
+    let result = h.soft_delete(uuid).await.expect("soft_delete");
 
     assert_eq!(result.deleted_at, Some(stamp));
     assert_eq!(repo.file_for_uuid(uuid).unwrap().deleted_at, Some(stamp));
@@ -104,24 +99,9 @@ async fn given_missing_uuid_when_soft_delete_then_not_found() {
     let (_uuid, _repo, _clock, h) = seeded("/lib/memo.txt");
     let other_uuid = uuid::Uuid::new_v4();
 
-    let result = h.soft_delete(other_uuid, TOKEN).await;
+    let result = h.soft_delete(other_uuid).await;
 
     assert!(matches!(result, Err(DomainError::NotFound)));
-}
-
-// ---------------- AF-02: unauthorized ----------------
-
-#[tokio::test]
-async fn given_unauthenticated_when_soft_delete_then_unauthorized_and_no_state_change() {
-    let (uuid, repo, _clock, _h) = seeded("/lib/memo.txt");
-    let h = handler(FakeAuth::Denying, repo.clone(), fixed_clock(now()));
-
-    let result = h.soft_delete(uuid, "").await;
-
-    assert!(matches!(result, Err(DomainError::Unauthorized)));
-    let persisted = repo.file_for_uuid(uuid).unwrap();
-    assert_eq!(persisted.state, FileState::Active);
-    assert_eq!(persisted.deleted_at, None);
 }
 
 // ---------------- Already-deleted precondition (InvalidState) ----------------
@@ -130,7 +110,7 @@ async fn given_unauthenticated_when_soft_delete_then_unauthorized_and_no_state_c
 async fn given_deleted_file_when_soft_delete_then_invalid_state() {
     let (uuid, repo, _clock, h) = seeded_deleted("/lib/memo.txt");
 
-    let result = h.soft_delete(uuid, TOKEN).await;
+    let result = h.soft_delete(uuid).await;
 
     assert!(matches!(result, Err(DomainError::InvalidState)));
     let persisted = repo.file_for_uuid(uuid).expect("file present");
@@ -150,9 +130,9 @@ async fn given_deleted_file_when_soft_delete_then_invalid_state() {
 async fn given_soft_delete_when_repo_write_fails_then_error_propagated_and_state_unchanged() {
     let (uuid, repo, _clock, _h) = seeded("/lib/memo.txt");
     repo.fail_soft_delete(uuid);
-    let h = handler(FakeAuth::Allowing, repo.clone(), fixed_clock(now()));
+    let h = handler(repo.clone(), fixed_clock(now()));
 
-    let result = h.soft_delete(uuid, TOKEN).await;
+    let result = h.soft_delete(uuid).await;
 
     assert!(matches!(result, Err(DomainError::Internal(_))));
     assert_eq!(repo.file_for_uuid(uuid).unwrap().state, FileState::Active);

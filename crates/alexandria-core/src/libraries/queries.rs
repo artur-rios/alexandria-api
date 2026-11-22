@@ -1,14 +1,15 @@
 //! Browsing a library, one level at a time.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
+use sqlx::sqlite::SqlitePool;
+use sqlx::Row;
 use uuid::Uuid;
 
-use crate::auth::AuthService;
-use crate::catalog::model::FileView;
+use crate::catalog::model::{FileType, FileView};
 use crate::catalog::repos::CatalogRepository;
 use crate::errors::DomainError;
-use crate::libraries::model::{Library, LibraryFolder, LibraryListing};
+use crate::libraries::model::{CatalogStats, Library, LibraryFolder, LibraryListing};
 use crate::libraries::repos::LibraryRepository;
 
 /// Splits a library's files into the folders and files at one level.
@@ -78,46 +79,36 @@ pub fn level_of(
 ///
 /// The read that makes the rest reachable: browsing addresses a uuid, and
 /// this is where those uuids come from.
-pub struct ListLibrariesHandler<A, L> {
-    auth: A,
+pub struct ListLibrariesHandler<L> {
     libraries: L,
 }
 
-impl<A, L> ListLibrariesHandler<A, L>
+impl<L> ListLibrariesHandler<L>
 where
-    A: AuthService,
     L: LibraryRepository,
 {
-    pub fn new(auth: A, libraries: L) -> Self {
-        Self { auth, libraries }
+    pub fn new(libraries: L) -> Self {
+        Self { libraries }
     }
 
-    pub async fn list(&self, token: &str) -> Result<Vec<Library>, DomainError> {
-        self.auth.authenticate(token).await?;
-
+    pub async fn list(&self) -> Result<Vec<Library>, DomainError> {
         self.libraries.list_all().await
     }
 }
 
 /// Read one level of a library's tree (libraries design section 4).
-pub struct BrowseLibraryHandler<A, L, C> {
-    auth: A,
+pub struct BrowseLibraryHandler<L, C> {
     libraries: L,
     catalog: C,
 }
 
-impl<A, L, C> BrowseLibraryHandler<A, L, C>
+impl<L, C> BrowseLibraryHandler<L, C>
 where
-    A: AuthService,
     L: LibraryRepository,
     C: CatalogRepository,
 {
-    pub fn new(auth: A, libraries: L, catalog: C) -> Self {
-        Self {
-            auth,
-            libraries,
-            catalog,
-        }
+    pub fn new(libraries: L, catalog: C) -> Self {
+        Self { libraries, catalog }
     }
 
     /// The folders and files directly inside `path` within the library
@@ -127,14 +118,7 @@ where
     /// rather than the whole tree: a course with two hundred classes is a
     /// large document to build, send and parse so the owner can look at the
     /// six things in one folder.
-    pub async fn browse(
-        &self,
-        uuid: Uuid,
-        path: &str,
-        token: &str,
-    ) -> Result<LibraryListing, DomainError> {
-        self.auth.authenticate(token).await?;
-
+    pub async fn browse(&self, uuid: Uuid, path: &str) -> Result<LibraryListing, DomainError> {
         let library = self
             .libraries
             .find_by_uuid(uuid)
@@ -181,4 +165,59 @@ where
 /// go because `a/b`, `/a/b` and `a/b/` are the same place.
 fn normalize(path: &str) -> String {
     path.replace('\\', "/").trim_matches('/').to_string()
+}
+
+/// The catalog's totals: libraries, and files per type.
+pub struct CatalogStatsQuery {
+    pool: SqlitePool,
+}
+
+impl CatalogStatsQuery {
+    pub fn new(pool: SqlitePool) -> Self {
+        Self { pool }
+    }
+
+    /// Counts the files the catalog lists: those whose `state` is `active`,
+    /// the condition the default file listing applies
+    /// (`list_filter_where_clause` in the catalog repository), so the
+    /// totals equal what that listing answers.
+    ///
+    /// Files marked missing (`missing_at` set) are still `active` and the
+    /// listing shows them, so they are counted. Soft-deleted files are not.
+    pub async fn stats(&self) -> Result<CatalogStats, DomainError> {
+        let libraries: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM libraries")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| DomainError::Disk(e.to_string()))?;
+
+        let rows = sqlx::query(
+            "SELECT type, COUNT(*) AS n FROM files WHERE state = 'active' GROUP BY type",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| DomainError::Disk(e.to_string()))?;
+
+        let mut files_by_type: BTreeMap<String, u64> = [
+            FileType::Audio,
+            FileType::Video,
+            FileType::Html,
+            FileType::Text,
+            FileType::Document,
+            FileType::Comic,
+            FileType::Image,
+        ]
+        .into_iter()
+        .map(|t| (t.as_str().to_string(), 0))
+        .collect();
+        for row in rows {
+            let name: String = row.get("type");
+            let n: i64 = row.get("n");
+            files_by_type.insert(name, n as u64);
+        }
+
+        Ok(CatalogStats {
+            libraries: libraries as u64,
+            files_by_type,
+        })
+    }
 }

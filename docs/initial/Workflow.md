@@ -51,7 +51,7 @@ specifics for this use case; do not work from memory:
   `AF-xx` alternative flow.
 - [System Requirements Document](../requirements/System%20Requirements%20Document.md)
   — the `FR-xx` requirements traced to it, plus the data model, interface
-  surface, and authorization matrix.
+  surface (the FFI calls).
 - [Development Workflow Document](../requirements/Development%20Workflow%20Document.md)
   — the normative delivery process.
 - [Testing Specification Document](../requirements/Testing%20Specification%20Document.md)
@@ -71,7 +71,7 @@ before coding.
    domain behavior, and entry points are needed, and how each alternative flow
    maps to an error or failure response. Ground it in the patterns already
    present in the repository — SOLID and Command/Query for the Rust core, with
-   both HTTP and FFI entry points kept consistent.
+   the FFI entry points a thin layer over its handlers.
 2. **Plan** — capture the result as a written, step-by-step implementation plan,
    sequenced test-first per the Testing Specification.
 

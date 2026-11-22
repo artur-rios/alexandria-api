@@ -1,6 +1,5 @@
 use uuid::Uuid;
 
-use crate::auth::AuthService;
 use crate::errors::DomainError;
 use crate::watchlists::model::Watchlist;
 use crate::watchlists::repos::WatchlistRepository;
@@ -12,28 +11,21 @@ use crate::watchlists::repos::WatchlistRepository;
 /// Like `DeleteCollectionHandler` the command is the handler itself: no
 /// `Clock` or `Filesystem` collaborator, since a watchlist carries no
 /// timestamps and nothing on disk to compensate on failure.
-pub struct DeleteWatchlistHandler<A, R> {
-    auth: A,
+pub struct DeleteWatchlistHandler<R> {
     repo: R,
 }
 
-impl<A, R> DeleteWatchlistHandler<A, R>
+impl<R> DeleteWatchlistHandler<R>
 where
-    A: AuthService,
     R: WatchlistRepository,
 {
-    pub fn new(auth: A, repo: R) -> Self {
-        Self { auth, repo }
+    pub fn new(repo: R) -> Self {
+        Self { repo }
     }
 
     /// Delete the watchlist identified by `uuid`, removing its WatchProgress
     /// entries, and return the pre-delete record as confirmation.
-    pub async fn delete(&self, uuid: Uuid, token: &str) -> Result<Watchlist, DomainError> {
-        // AF-02: the caller must be authenticated. Evaluated before the
-        // watchlist is looked up (FR-AU-07 / SRD §7), so an unauthenticated
-        // caller learns nothing about whether the uuid exists.
-        self.auth.authenticate(token).await?;
-
+    pub async fn delete(&self, uuid: Uuid) -> Result<Watchlist, DomainError> {
         // AF-01: the watchlist must exist.
         let watchlist = self
             .repo

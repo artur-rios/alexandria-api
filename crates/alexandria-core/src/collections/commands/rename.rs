@@ -1,6 +1,5 @@
 use uuid::Uuid;
 
-use crate::auth::AuthService;
 use crate::collections::commands::create::validate_collection_name;
 use crate::collections::model::Collection;
 use crate::collections::repos::CollectionRepository;
@@ -12,33 +11,21 @@ use crate::errors::DomainError;
 /// Like `CreateCollectionHandler`, the command is the handler itself: no
 /// `Clock` or `Filesystem` collaborator, since a collection carries no
 /// timestamps and nothing on disk to compensate on failure.
-pub struct RenameCollectionHandler<A, R> {
-    auth: A,
+pub struct RenameCollectionHandler<R> {
     repo: R,
 }
 
-impl<A, R> RenameCollectionHandler<A, R>
+impl<R> RenameCollectionHandler<R>
 where
-    A: AuthService,
     R: CollectionRepository,
 {
-    pub fn new(auth: A, repo: R) -> Self {
-        Self { auth, repo }
+    pub fn new(repo: R) -> Self {
+        Self { repo }
     }
 
     /// Rename the collection identified by `uuid` to `name`, and return the
     /// updated record.
-    pub async fn rename(
-        &self,
-        uuid: Uuid,
-        name: &str,
-        token: &str,
-    ) -> Result<Collection, DomainError> {
-        // AF-03: the caller must be authenticated. Evaluated before the
-        // collection is looked up or the name is validated (FR-AU-07 / SRD
-        // §7), so an unauthenticated caller learns nothing about either.
-        self.auth.authenticate(token).await?;
-
+    pub async fn rename(&self, uuid: Uuid, name: &str) -> Result<Collection, DomainError> {
         // AF-02: the collection must exist.
         self.repo
             .find_by_uuid(uuid)

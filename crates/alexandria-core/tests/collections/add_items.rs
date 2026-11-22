@@ -1,8 +1,7 @@
-//! Unit tests for the UC-13 AddItemsToCollectionHandler (Testing
-//! Specification §6). Each test exercises exactly the handler against trait
-//! fakes — no real DB or auth service. Coverage follows §6.3: happy path for
-//! each `kind`, every AF: AF-01 (wrong-kind item), AF-02 (unknown item),
-//! AF-03 (unknown collection), AF-04 (unauthorized).
+//! Unit tests for the UC-13 AddItemsToCollectionHandler (Testing Specification
+//! §6). Each test exercises exactly the handler against trait fakes — no real
+//! DB. Coverage follows §6.3: happy path for each `kind`, AF-01 (wrong-kind
+//! item), AF-02 (unknown item), and AF-03 (unknown collection).
 
 use uuid::Uuid;
 
@@ -14,26 +13,20 @@ use alexandria_core::collections::model::{
 };
 use alexandria_core::errors::DomainError;
 
-use crate::common::{
-    FakeAuth, FakeBookmarkRepository, FakeCatalogRepository, FakeCollectionRepository,
-};
-
-const TOKEN: &str = "bearer-token";
+use crate::common::{FakeBookmarkRepository, FakeCatalogRepository, FakeCollectionRepository};
 
 type Handler = AddItemsToCollectionHandler<
-    FakeAuth,
     FakeCollectionRepository,
     FakeCatalogRepository,
     FakeBookmarkRepository,
 >;
 
 fn handler(
-    auth: FakeAuth,
     collection_repo: FakeCollectionRepository,
     catalog_repo: FakeCatalogRepository,
     bookmark_repo: FakeBookmarkRepository,
 ) -> Handler {
-    AddItemsToCollectionHandler::new(auth, collection_repo, catalog_repo, bookmark_repo)
+    AddItemsToCollectionHandler::new(collection_repo, catalog_repo, bookmark_repo)
 }
 
 fn a_file(uuid: Uuid) -> File {
@@ -96,14 +89,13 @@ async fn given_file_collection_and_existing_files_when_add_then_linked_and_resul
     catalog_repo.seed(a_file(file_a));
     catalog_repo.seed(a_file(file_b));
     let h = handler(
-        FakeAuth::Allowing,
         collection_repo,
         catalog_repo.clone(),
         FakeBookmarkRepository::new(),
     );
 
     let result = h
-        .add(collection_uuid, vec![file_a, file_b], TOKEN)
+        .add(collection_uuid, vec![file_a, file_b])
         .await
         .expect("add");
 
@@ -136,14 +128,13 @@ async fn given_bookmark_collection_and_existing_bookmarks_when_add_then_linked()
     let bookmark_uuid = Uuid::new_v4();
     bookmark_repo.seed(a_bookmark(bookmark_uuid));
     let h = handler(
-        FakeAuth::Allowing,
         collection_repo,
         FakeCatalogRepository::new(),
         bookmark_repo.clone(),
     );
 
     let result = h
-        .add(collection_uuid, vec![bookmark_uuid], TOKEN)
+        .add(collection_uuid, vec![bookmark_uuid])
         .await
         .expect("add");
 
@@ -172,15 +163,10 @@ async fn given_bookmark_item_for_file_collection_when_add_then_invalid_input_and
     });
     let bookmark_uuid = Uuid::new_v4();
     bookmark_repo.seed(a_bookmark(bookmark_uuid));
-    let h = handler(
-        FakeAuth::Allowing,
-        collection_repo,
-        catalog_repo.clone(),
-        bookmark_repo,
-    );
+    let h = handler(collection_repo, catalog_repo.clone(), bookmark_repo);
 
     let result = h
-        .add(collection_uuid, vec![bookmark_uuid], TOKEN)
+        .add(collection_uuid, vec![bookmark_uuid])
         .await
         .expect("the request succeeds; the item is what was rejected");
 
@@ -203,15 +189,10 @@ async fn given_file_item_for_bookmark_collection_when_add_then_invalid_input() {
     });
     let file_uuid = Uuid::new_v4();
     catalog_repo.seed(a_file(file_uuid));
-    let h = handler(
-        FakeAuth::Allowing,
-        collection_repo,
-        catalog_repo,
-        bookmark_repo,
-    );
+    let h = handler(collection_repo, catalog_repo, bookmark_repo);
 
     let result = h
-        .add(collection_uuid, vec![file_uuid], TOKEN)
+        .add(collection_uuid, vec![file_uuid])
         .await
         .expect("the request succeeds; the item is what was rejected");
 
@@ -239,15 +220,10 @@ async fn given_one_valid_and_one_wrong_kind_item_when_add_then_the_valid_one_is_
     catalog_repo.seed(a_file(good_file));
     let bad_bookmark = Uuid::new_v4();
     bookmark_repo.seed(a_bookmark(bad_bookmark));
-    let h = handler(
-        FakeAuth::Allowing,
-        collection_repo,
-        catalog_repo.clone(),
-        bookmark_repo,
-    );
+    let h = handler(collection_repo, catalog_repo.clone(), bookmark_repo);
 
     let result = h
-        .add(collection_uuid, vec![good_file, bad_bookmark], TOKEN)
+        .add(collection_uuid, vec![good_file, bad_bookmark])
         .await
         .expect("add");
 
@@ -276,7 +252,6 @@ async fn given_unknown_item_uuid_when_add_then_reported_as_not_found() {
         kind: CollectionKind::File,
     });
     let h = handler(
-        FakeAuth::Allowing,
         collection_repo,
         catalog_repo.clone(),
         FakeBookmarkRepository::new(),
@@ -284,7 +259,7 @@ async fn given_unknown_item_uuid_when_add_then_reported_as_not_found() {
 
     let unknown = Uuid::new_v4();
     let result = h
-        .add(collection_uuid, vec![unknown], TOKEN)
+        .add(collection_uuid, vec![unknown])
         .await
         .expect("the request succeeds; the item is what was rejected");
 
@@ -314,15 +289,10 @@ async fn given_every_item_rejected_when_add_then_it_succeeds_with_a_full_report(
     let wrong_kind = Uuid::new_v4();
     bookmark_repo.seed(a_bookmark(wrong_kind));
     let unknown = Uuid::new_v4();
-    let h = handler(
-        FakeAuth::Allowing,
-        collection_repo,
-        catalog_repo,
-        bookmark_repo,
-    );
+    let h = handler(collection_repo, catalog_repo, bookmark_repo);
 
     let result = h
-        .add(collection_uuid, vec![wrong_kind, unknown], TOKEN)
+        .add(collection_uuid, vec![wrong_kind, unknown])
         .await
         .expect("reporting is what the call was asked for");
 
@@ -343,46 +313,12 @@ async fn given_every_item_rejected_when_add_then_it_succeeds_with_a_full_report(
 #[tokio::test]
 async fn given_unknown_collection_uuid_when_add_then_not_found() {
     let h = handler(
-        FakeAuth::Allowing,
         FakeCollectionRepository::new(),
         FakeCatalogRepository::new(),
         FakeBookmarkRepository::new(),
     );
 
-    let result = h.add(Uuid::new_v4(), vec![Uuid::new_v4()], TOKEN).await;
+    let result = h.add(Uuid::new_v4(), vec![Uuid::new_v4()]).await;
 
     assert!(matches!(result, Err(DomainError::NotFound)));
-}
-
-// ---------------- AF-04: unauthorized ----------------
-
-#[tokio::test]
-async fn given_unauthenticated_when_add_then_unauthorized() {
-    let h = handler(
-        FakeAuth::Denying,
-        FakeCollectionRepository::new(),
-        FakeCatalogRepository::new(),
-        FakeBookmarkRepository::new(),
-    );
-
-    let result = h.add(Uuid::new_v4(), vec![Uuid::new_v4()], "").await;
-
-    assert!(matches!(result, Err(DomainError::Unauthorized)));
-}
-
-#[tokio::test]
-async fn given_unauthenticated_and_unknown_collection_when_add_then_unauthorized_not_not_found() {
-    // Authentication is evaluated before the collection is looked up
-    // (FR-AU-07 / SRD §7): an unauthenticated caller must not learn whether
-    // the collection exists.
-    let h = handler(
-        FakeAuth::Denying,
-        FakeCollectionRepository::new(),
-        FakeCatalogRepository::new(),
-        FakeBookmarkRepository::new(),
-    );
-
-    let result = h.add(Uuid::new_v4(), vec![Uuid::new_v4()], "").await;
-
-    assert!(matches!(result, Err(DomainError::Unauthorized)));
 }

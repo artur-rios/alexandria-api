@@ -1,7 +1,6 @@
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
-use crate::auth::AuthService;
 use crate::bookmarks::model::{Bookmark, BookmarkState};
 use crate::bookmarks::repos::BookmarkRepository;
 use crate::catalog::clock::Clock;
@@ -17,27 +16,22 @@ use crate::errors::DomainError;
 /// reading `SystemClock` directly) so unit tests can stamp a deterministic
 /// `deleted_at` via `FixedClock`. There is no `Filesystem` collaborator — a
 /// bookmark is catalog-only metadata with nothing on disk.
-pub struct BookmarkLifecycleHandler<A, BR, C> {
-    auth: A,
+pub struct BookmarkLifecycleHandler<BR, C> {
     repo: BR,
     clock: C,
 }
 
-impl<A, BR, C> BookmarkLifecycleHandler<A, BR, C>
+impl<BR, C> BookmarkLifecycleHandler<BR, C>
 where
-    A: AuthService,
     BR: BookmarkRepository,
     C: Clock,
 {
-    pub fn new(auth: A, repo: BR, clock: C) -> Self {
-        Self { auth, repo, clock }
+    pub fn new(repo: BR, clock: C) -> Self {
+        Self { repo, clock }
     }
 
     /// Mark `uuid` soft-deleted and return the updated `Bookmark`.
-    pub async fn soft_delete(&self, uuid: Uuid, token: &str) -> Result<Bookmark, DomainError> {
-        // AF-02: the caller must be authenticated.
-        self.auth.authenticate(token).await?;
-
+    pub async fn soft_delete(&self, uuid: Uuid) -> Result<Bookmark, DomainError> {
         // AF-01: the bookmark must exist.
         let bookmark = self
             .repo
@@ -57,10 +51,7 @@ where
     }
 
     /// Restore `uuid` to `active` and return the updated `Bookmark`.
-    pub async fn restore(&self, uuid: Uuid, token: &str) -> Result<Bookmark, DomainError> {
-        // AF-02: the caller must be authenticated.
-        self.auth.authenticate(token).await?;
-
+    pub async fn restore(&self, uuid: Uuid) -> Result<Bookmark, DomainError> {
         // AF-01: the bookmark must exist.
         let bookmark = self
             .repo

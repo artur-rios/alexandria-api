@@ -15,12 +15,12 @@ rather than restating them.
 
 ### 1.2 Scope
 
-The requirements cover eight capability areas: file catalog and indexing (FC),
+The requirements cover seven capability areas: file catalog and indexing (FC),
 collections (CO), bookmarks (BM), watchlists (WL), reading lists (RL), text file
-content editing (TX), authentication and authorization (AU), and media playback
-(MP). Non-functional
-requirements apply across all areas. Operational platform concerns (logging,
-health, configuration, deployment) are specified in the
+content editing (TX), and media playback (MP). Authentication and authorization
+(AU) is removed: the core only runs locally for the person at the machine.
+Non-functional requirements apply across all areas. Operational platform
+concerns (logging, configuration, deployment) are specified in the
 [Operations & Infrastructure Document](Operations%20%26%20Infrastructure%20Document.md).
 
 ### 1.3 Definitions
@@ -37,7 +37,6 @@ health, configuration, deployment) are specified in the
 | **mediaKind** | VideoFile discriminator: `movie` or `series`. |
 | **formatKind** | Document discriminator: `book` or `ebook`. |
 | **Watch/Read state** | Progress state: `Pending`, `Watching`/`Reading`, `Watched`/`Read`. |
-| **Active auth mode** | The single authentication mode (external JWT, local login, or Windows account) selected at startup; the other modes are inactive and their credentials are rejected. |
 | **Playback descriptor** | The FFI answer to UC-38: the resolved absolute path, MIME type, and byte size of a File, from which a local client opens the file itself. The FFI surface cannot carry a byte stream. |
 
 ---
@@ -47,30 +46,23 @@ health, configuration, deployment) are specified in the
 ```mermaid
 graph LR
     subgraph Clients
-        FL["Flutter Front-end<br/>HTTP + FFI"]
-        OT["Other Clients<br/>HTTP"]
+        FL["Flutter Front-end<br/>in process"]
     end
 
     subgraph Alexandria
-        HTTP["alexandria-http<br/>REST-JSON server"]
-        FFI["alexandria-ffi<br/>FFI surface"]
-        CORE["alexandria-core<br/>Command/Query + repos + auth"]
+        FFI["alexandria-ffi<br/>C ABI"]
+        CORE["alexandria-core<br/>Command/Query + repos"]
     end
 
     subgraph Infrastructure
-        DB[("SQLite<br/>catalog + credentials")]
+        DB[("SQLite<br/>catalog")]
         FS["Local Filesystem"]
-        AUTH["External Auth Service<br/>(external mode)"]
     end
 
-    FL --> HTTP
     FL --> FFI
-    OT --> HTTP
-    HTTP --> CORE
     FFI --> CORE
     CORE --> DB
     CORE --> FS
-    CORE --> AUTH
 ```
 
 ---
@@ -104,18 +96,18 @@ graph LR
 | FR-FC-21 | The system shall restore a soft-deleted File to `active`. |
 | FR-FC-22 | The system shall hard-purge a File record permanently only after its soft-delete retention window has elapsed. |
 | FR-FC-23 | The system shall, on an explicit purge-on-disk operation, remove the File record and delete the underlying file on disk. |
-| FR-FC-24 | The system shall expose every catalog operation via both the HTTP/REST-JSON surface and the FFI surface with identical results. FR-MP-06 defines the single exception: byte transfer, where the FFI surface returns a playback descriptor instead of a stream. |
+| FR-FC-24 | **Removed (the core only runs locally for the person at the machine)** |
 | FR-FC-25 | The system shall prefill a file's subtype metadata from the metadata embedded in the file itself (audio tags, image EXIF, document and comic metadata, video container metadata) at first index, and shall record which extraction wrote the row. Extraction is best-effort: a failure leaves the fields empty and never fails the file's indexing. The row is stamped either way — the stamp records which extraction was applied, not which one succeeded — so a file nothing can be read from is opened once rather than on every later pass. On re-index (FR-FC-10) the system shall re-read a file whose row an older extraction wrote and shall **fill only the subtype fields the catalog is missing**, leaving every field that already holds a value — an owner's edit (FR-FC-15..18) or an earlier extraction's — exactly as it is, and shall then stamp the row so the file is read once rather than once per run. |
 | FR-FC-26 | The system shall bound what the catalog can reach by the configured `filesystem.root`, in three places. It shall reject adding a library (FR-FC-36) whose folder, an index run (FR-FC-01) whose root, and a library root correction (FR-FC-41) whose new root, is not the configured root or a descendant of it. And it shall refuse to read, stream, decode, write, rename, or delete the on-disk file of a catalog record whose path does not resolve inside it (UC-05, UC-09, UC-32, UC-33, UC-38 – UC-40), so that a record already pointing outside — catalogued before the bound was configured, or reached through a symbolic link swapped in since — is not served. Paths are compared after resolving each to its canonical form, so that traversal segments, trailing separators, and symbolic links cannot escape the bound. A path that does not exist yet — a library corrected to a folder on a drive that is not plugged in — is resolved through its longest existing ancestor, with the remaining segments normalised lexically, so such a folder inside the root is still accepted; a path that cannot be resolved at all (a dangling symbolic link, a folder the server may not look into) is treated as outside. When `filesystem.root` is set but cannot itself be resolved, all three are refused with a distinct error rather than left unconstrained. When `filesystem.root` is unset, none of this applies and any path is accepted — the constraint is opt-in by configuration. Re-index (FR-FC-10, FR-FC-11) takes no root and is unaffected. |
 | FR-FC-27 | The system shall record every index and re-index run: its id, kind, start time, status, finish time once it has one, and the outcome counts for its kind. A run's status shall be one of `running`, `paused`, `complete`, `failed`, or `cancelled`; `running` and `paused` are the non-terminal ones. Its counts shall be `scanned`, `indexed`, `skipped` (classified out), `alreadyCataloged` (a path the catalog already held), and `failed` for an index run, and `refreshed`, `markedMissing`, `unchanged`, and `failed` for a re-index. `skipped` and `alreadyCataloged` are counted apart so that a resumed run's tally describes what it actually did rather than reporting every entry an earlier segment cataloged as a skip. A run whose walk completes shall be recorded `complete` even when individual files failed — those are counted in the run's `failed` tally, and one file's failure shall not abandon the rest of the walk. A run that could not proceed at all shall be recorded `failed` with the underlying error. |
-| FR-FC-28 | The system shall expose a run's recorded status and outcome to an authenticated caller, given the run id returned when the run was started, over both the HTTP and FFI surfaces. While the run is in flight the answer shall also carry its live progress: `phase` (`discovering` while the entries are still being counted, `processing` once they are, and absent once the run is terminal), `total` (absent until discovery has finished counting), `processed` (entries the current segment has finished with), `activeMillis` (elapsed time with paused stretches subtracted), and `pausedAt` for a run that is paused right now. A run this process is no longer executing shall still report the last progress it published, so a run paused across a restart can still say how far it got. The system shall not report a remaining-time estimate: `processed`, `total`, and `activeMillis` are the inputs a client cannot derive for itself, and smoothing an estimate over them is a presentation decision. |
+| FR-FC-28 | The system shall expose a run's recorded status and outcome to a caller, given the run id returned when the run was started. While the run is in flight the answer shall also carry its live progress: `phase` (`discovering` while the entries are still being counted, `processing` once they are, and absent once the run is terminal), `total` (absent until discovery has finished counting), `processed` (entries the current segment has finished with), `activeMillis` (elapsed time with paused stretches subtracted), and `pausedAt` for a run that is paused right now. A run this process is no longer executing shall still report the last progress it published, so a run paused across a restart can still say how far it got. The system shall not report a remaining-time estimate: `processed`, `total`, and `activeMillis` are the inputs a client cannot derive for itself, and smoothing an estimate over them is a presentation decision. |
 | FR-FC-29 | The system shall, at startup, record every run still marked `running` as `paused` and offer it for resume (FR-FC-33); runs execute in-process, so such a run provably has no task behind it. Nothing shall resume by itself — resuming is an explicit act by the owner. |
 | FR-FC-30 | The system shall report the configuration a client needs to render the catalog correctly, beginning with the soft-delete retention window it enforces on every restore and purge. |
-| FR-FC-31 | The system shall accept a priority — `normal` or `low` — when an index or re-index run is started, treating an absent or unrecognised value as `normal` on both surfaces rather than rejecting the call, and shall resolve it to the concurrency bound FR-FC-08 applies. The priority shall be stored on the run and reused when the run is resumed, so a resumed run continues at the width it was last set to rather than at whatever configuration happens to say later. It is fixed for the length of one segment: it cannot be changed while a run is walking, but a resume may name a new one (FR-FC-33), so an owner who changes their mind pauses and resumes rather than losing the run. |
+| FR-FC-31 | The system shall accept a priority — `normal` or `low` — when an index or re-index run is started, treating an absent or unrecognised value as `normal` rather than rejecting the call, and shall resolve it to the concurrency bound FR-FC-08 applies. The priority shall be stored on the run and reused when the run is resumed, so a resumed run continues at the width it was last set to rather than at whatever configuration happens to say later. It is fixed for the length of one segment: it cannot be changed while a run is walking, but a resume may name a new one (FR-FC-33), so an owner who changes their mind pauses and resumes rather than losing the run. |
 | FR-FC-32 | The system shall pause a `running` index or re-index run on the owner's request, leaving it recorded `paused` with the point it reached and with no finish time, so that it can be resumed later. A pause requested against a run in any other status shall be refused as a conflict rather than silently accepted. |
-| FR-FC-33 | The system shall resume a `paused` index or re-index run on the owner's request, recording it `running` again and continuing it under the same run id, with the time it spent paused excluded from its `activeMillis`. A resumed index run re-walks its root and a resumed re-index re-visits every cataloged path; entries an earlier segment already cataloged are counted in `alreadyCataloged`. A resume shall accept a priority of its own — `normal` or `low`, spelled exactly as FR-FC-31 spells them — and shall walk the resumed segment at the concurrency that priority resolves to, storing it on the run so the new pacing survives a further pause. An absent or unrecognised priority shall keep the width the run already has rather than resetting it to `normal`, on both surfaces: sending nothing is not a request to speed up, and every caller predating the option sends nothing. This is how a large scan started at `normal` is throttled down once the owner wants the application back, without losing the work already done or the run's record. A resume requested against a run in any other status shall be refused as a conflict, and refusing it shall leave the run's stored priority untouched. |
+| FR-FC-33 | The system shall resume a `paused` index or re-index run on the owner's request, recording it `running` again and continuing it under the same run id, with the time it spent paused excluded from its `activeMillis`. A resumed index run re-walks its root and a resumed re-index re-visits every cataloged path; entries an earlier segment already cataloged are counted in `alreadyCataloged`. A resume shall accept a priority of its own — `normal` or `low`, spelled exactly as FR-FC-31 spells them — and shall walk the resumed segment at the concurrency that priority resolves to, storing it on the run so the new pacing survives a further pause. An absent or unrecognised priority shall keep the width the run already has rather than resetting it to `normal`: sending nothing is not a request to speed up, and every caller predating the option sends nothing. This is how a large scan started at `normal` is throttled down once the owner wants the application back, without losing the work already done or the run's record. A resume requested against a run in any other status shall be refused as a conflict, and refusing it shall leave the run's stored priority untouched. |
 | FR-FC-34 | The system shall cancel a `running` or `paused` index or re-index run on the owner's request, recording it `cancelled` with a finish time and with the progress it last published. Where a walk was executing, the partial tally it had reached is kept as well; a run no process is executing has none to offer, and is recorded without counts rather than with invented ones. `cancelled` is terminal: a cancelled run shall never be resumed. A cancel requested against an already-terminal run shall be refused as a conflict. |
-| FR-FC-35 | The system shall report every outstanding run — every run whose status is `running` or `paused` — to an authenticated caller in one call, newest first, each carrying the same body FR-FC-28 defines. A caller with nothing outstanding shall receive an empty list rather than an error. This is what lets a client show whether anything is indexing and offer a resume at launch without having to remember every run id it ever started. |
+| FR-FC-35 | The system shall report every outstanding run — every run whose status is `running` or `paused` — in one call, newest first, each carrying the same body FR-FC-28 defines. A caller with nothing outstanding shall receive an empty list rather than an error. This is what lets a client show whether anything is indexing and offer a resume at launch without having to remember every run id it ever started. |
 | FR-FC-36 | The system shall add a named folder as a *library* — the only way files enter the catalog — and start its first index run (FR-FC-01) in the same request, at an optional priority (FR-FC-31), answering the library with the run's id. Adding is refused, storing nothing, when the name or folder is blank, the folder does not exist or is not a folder, it lies outside the configured `filesystem.root` (FR-FC-26), or it contains or sits inside a library already added, in which case the refusal names the existing library. A library whose first run cannot be opened is not left behind. |
 | FR-FC-37 | The system shall keep every catalogued file in exactly one library: the library whose run recorded it. A file is never written without one, and libraries never nest or overlap, so no file has two answers to which library holds it. |
 | FR-FC-38 | The system shall answer a library's files everywhere a file can be listed or referenced — the file listing (FR-FC-12), a single-file read, and every collection, watchlist, and reading list that references them. Nothing is hidden from the listing; a caller narrows it to one library with a library filter. |
@@ -124,6 +116,10 @@ graph LR
 | FR-FC-41 | The system shall correct a library's root folder on request, moving the stored paths of the files it holds to match, so that a folder that moved on disk is one record to correct rather than a catalog to re-walk. The files keep their identity — a re-index at the new location would mint new records and leave every watchlist place, reading position, and collection membership pointing at records that had gone missing. The correction is refused when the destination overlaps another library, when the catalog already holds files there, or when it lies outside the configured `filesystem.root` (FR-FC-26), and while the library has an unfinished run (FR-FC-43), whose resume would walk the old folder. |
 | FR-FC-42 | The system shall record which files a run could not process, each with the reason it gave up, and answer that list for a run on request. The tally already says how many; without the paths a client can only tell the owner a number about files that are on disk, in no listing, and named nowhere they can reach. The list is bounded per run — a folder whose every file fails must not write a row per file — and the tally remains the authority on how many there were. Recording a failure is best-effort: a walk that cannot write the note carries on rather than abandoning the rest of the library. |
 | FR-FC-43 | The system shall allow a library at most one unfinished index run — `running` or `paused`, which is also what a run interrupted by a stop becomes. While one exists, a second index run of the library and a correction of its root are refused as a conflict naming the run, and removal is refused while that run is `running`. The owner cancels or finishes the run first (FR-FC-34). Refusing rather than waiting: a cancel only signals the walk, in whichever process it runs. The store itself holds the rule, so two requests that both pass the check still start only one run. |
+| FR-FC-44 | The system shall let the owner pin a library or unpin it, storing the choice as the library's `pinned` flag and reporting it on every answer that carries the library — the listing, a browse, and the answers to adding and renaming it. A library is unpinned when it is added, and so is every library a catalog held before the flag existed. Setting the value a library already has succeeds and changes nothing; a malformed identifier is invalid input and one naming no library is not found. Correcting the library's root (FR-FC-41), renaming it (FR-FC-46) and re-indexing it keep the flag; removing it (FR-FC-40) removes the flag with it. The system shall put no order on the listing: pinned libraries first is the client's presentation. |
+| FR-FC-45 | The system shall let the owner mark a library as a favorite or clear the mark, storing it as the library's `favorite` flag, independent of `pinned`, and reporting it wherever FR-FC-44 reports the pin. It is unset when a library is added and on every library a catalog held before the flag existed; setting the value it already has changes nothing; and it is kept and removed exactly as the pin is. |
+| FR-FC-46 | The system shall rename a library on request, at any time — including while the library has a `running` or `paused` run, since no run reads the name. The new name is checked by the rule adding a library uses (FR-FC-36): a blank name is refused and nothing is stored. The name is stored trimmed, two libraries may share one, and renaming to the current name succeeds and changes nothing. The answer is the updated library. |
+| FR-FC-47 | The system shall report the catalog's totals in one call: the number of libraries, and the number of files of each of the seven file types, every type present with `0` when the catalog holds none of it, so a client never has to tell "none" from "missing". A file is counted when the default file listing (FR-FC-12) shows it: an `active` file, including one marked missing (FR-FC-11); a soft-deleted file is not. The totals cover the whole catalog, not one library. |
 
 ### 3.2 Collections (CO)
 
@@ -185,44 +181,19 @@ graph LR
 
 ### 3.7 Authentication & Authorization (AU)
 
-| ID | Requirement |
-| --- | --- |
-| FR-AU-01 | The system shall read the active authentication mode from startup configuration; exactly one mode (external JWT, local login, or Windows account) shall be active at runtime. |
-| FR-AU-02 | In external mode, the system shall verify each caller's JWT against the public signing keys the external authentication service publishes (ES256, selected by the token's `kid`, with the algorithm pinned), and shall accept the caller as the owner only when the token names the configured scope. While a shared HS256 secret is still configured, tokens signed with it are accepted too. |
-| FR-AU-03 | The system shall accept only the active auth mode and shall reject credentials presented via the inactive mode. |
-| FR-AU-04 | In local mode, the system shall verify the caller's email and password against the salted Argon2 password hash stored in the SQLite credential row. |
-| FR-AU-05 | The system shall provide a local setup operation to set or change local-login credentials (email and password). |
-| FR-AU-06 | The system shall never store plaintext passwords and shall never log credentials. |
-| FR-AU-07 | The system shall authorize the single owner for every catalog operation and shall reject unauthenticated calls. |
-| FR-AU-08 | The system shall expose authentication operations via both the HTTP and FFI surfaces consistently. |
-| FR-AU-09 | In local mode, a successful login shall create a Session with a configurable expiry (default 24 hours); the caller shall present that session's id on every subsequent request, and the system shall reject an unknown or expired session id as unauthenticated. |
-| FR-AU-10 | In local mode, the system shall provide a registration operation that creates the single owner's credential row when none exists, opens a session for the caller, and rejects any subsequent registration as a conflict. |
-| FR-AU-11 | The system shall reject a local password that is shorter than 12 characters, longer than 128 characters, entirely whitespace, a single repeated character, equal to or containing the submitted email address, or one of a list of common passwords. |
-| FR-AU-12 | The system shall report a rejected authentication input with a stable machine-readable reason code and the parameters that reason interpolates, identically over the HTTP and FFI surfaces. A client shall be able to tell the individual FR-AU-11 rejections apart, and to render each in its own language, without parsing the English message. |
-| FR-AU-13 | On registration the system shall generate ten single-use recovery codes, return them to the caller exactly once, and store only their hashes. |
-| FR-AU-14 | The system shall replace the local password on presentation of an unconsumed recovery code together with a new password satisfying FR-AU-11, shall consume that code, and shall invalidate every existing session. |
-| FR-AU-15 | The system shall reject a presented recovery code with a reason that distinguishes an unrecognised code from one already consumed. |
-| FR-AU-16 | The system shall not consume a recovery code when the redemption fails for any other reason. |
-| FR-AU-17 | The system shall, for an authenticated owner, replace every recovery code with ten new ones and return them exactly once. |
-| FR-AU-18 | The system shall report to an authenticated owner how many recovery codes remain unconsumed. |
-| FR-AU-19 | The system shall store only a hash of every recovery code; the plaintext shall exist only in the response that issues it. |
-| FR-AU-20 | The system shall support a third authentication mode in which the operating system account running the server process is the credential; exactly one mode remains active at runtime. |
-| FR-AU-21 | In Windows mode, the system shall refuse to start unless it is running on Windows as the account named by the configured owner SID. |
-| FR-AU-22 | In Windows mode, a successful login shall create a Session with the same configurable expiry local mode uses, and the caller shall present that session's id on every subsequent request. |
-| FR-AU-23 | In Windows mode, the system shall refuse every local-mode credential and recovery operation, since no credential is stored. |
-| FR-AU-24 | The system shall warn at startup when Windows mode is active and the HTTP bind address is not a loopback address, because in that mode any caller that can reach the port is authorized. |
+**Removed (the core only runs locally for the person at the machine)**
 
 ### 3.8 Media Playback (MP)
 
 | ID | Requirement |
 | --- | --- |
-| FR-MP-01 | The system shall stream the bytes of an `active` File from its recorded path, with a MIME type derived from the file's extension. |
-| FR-MP-02 | The system shall support HTTP byte-range requests over that stream, so a client can seek without transferring the whole file. |
+| FR-MP-01 | The system shall give a local client what it needs to play an `active` File from its recorded path: a **playback descriptor** carrying the resolved absolute path, a MIME type derived from the file's extension, and the byte size (FR-MP-06). |
+| FR-MP-02 | **Removed (the core only runs locally for the person at the machine)** |
 | FR-MP-03 | The system shall never re-encode, transcode, or otherwise modify the bytes it serves. |
 | FR-MP-04 | The system shall return a single page of a CBZ ComicBook as an image, addressed by 1-based page index. |
 | FR-MP-05 | The system shall return a downscaled thumbnail image for a video, image, comic, or audio File. For audio, the thumbnail is the front-cover picture embedded in the file's own tag; a file with no embedded picture returns no thumbnail. |
 | FR-MP-07 | **Removed (moved out of scope, see Orpheus)** |
-| FR-MP-06 | The system shall expose playback operations via both the HTTP and FFI surfaces. Because the FFI surface cannot carry a byte stream, FR-MP-01 over FFI returns a **playback descriptor** — resolved absolute path, MIME type, and byte size — and parity for it is defined on that descriptor and on the authorization, state, and error decisions rather than on byte transfer. FR-MP-04 and FR-MP-05 return their bytes over both surfaces and are byte-exact across them. |
+| FR-MP-06 | The system shall expose playback operations over the FFI. Because the FFI cannot carry a byte stream, FR-MP-01 returns a **playback descriptor** — resolved absolute path, MIME type, and byte size — and the local client opens the path itself. FR-MP-04 and FR-MP-05 return their bytes in the answer, unmodified from what was read or rendered. |
 
 ### 3.9 Playlists (TR)
 
@@ -244,11 +215,10 @@ graph LR
 
 Every entity has an **internal integer primary key** used inside the database for
 joins and foreign keys, plus a **public UUID** (v4) that is the stable external
-identifier exposed to clients over HTTP and FFI. The `{id}` path parameters and
+identifier exposed to clients over the FFI. The `uuid` arguments and
 request/response bodies used throughout the
 [Use Case Specification Document](Use%20Case%20Specification%20Document.md) refer
-to this public UUID. Local-login credentials use a single-row table keyed by the
-owner; it has no public UUID surface beyond the set/change operation.
+to this public UUID.
 
 ### 4.1 Entity Relationship Diagram
 
@@ -287,7 +257,7 @@ erDiagram
 | indexedAt | timestamp | required | Last index/re-index time. |
 | missingAt | timestamp | nullable | Set by re-index when the on-disk file is gone (FR-FC-11); cleared when it returns. Orthogonal to `state`: a file may be `active` and missing. |
 | metadataVersion | integer | required, defaults to 0 | Which extraction wrote the row's subtype metadata (FR-FC-25). Zero is "an extraction that predates this column", which is what every row indexed by an earlier build is; a re-index re-reads anything behind the current version and stamps it. Internal only — nothing on the wire carries it. |
-| collectionId | integer | nullable, FK → Collection | Containing collection, if any. Internal only: it is never exposed on the `File` payload, because it is an internal key and its public counterpart is reachable the other way round — `GET /v1/collections/{uuid}/items` (FR-CO-07) lists a collection's members, and `GET /v1/files?collectionUuid=…` (FR-FC-12) filters by it. |
+| collectionId | integer | nullable, FK → Collection | Containing collection, if any. Internal only: it is never exposed on the `File` payload, because it is an internal key and its public counterpart is reachable the other way round — `alexandria_collection_list_items` (FR-CO-07) lists a collection's members, and `alexandria_files_list` with a `collectionUuid` filter (FR-FC-12) filters by it. |
 
 Type-specific subtype tables (AudioFile, VideoFile, HtmlPage, TextFile,
 Document, ComicBook, Image) share the File's `id` as a foreign key and carry only their
@@ -370,57 +340,17 @@ soft-deleted members — the same members `FR-CO-07` lists.
 
 ### 4.9 LocalLoginCredential Fields
 
-Single-row table (the owner). The row is created by registration (UC-41) and
-changed thereafter by the credentials operation (UC-35).
-
-| Field | Type | Constraints | Description |
-| --- | --- | --- | --- |
-| id | integer | PK, fixed to 1 | Singleton row. |
-| email | text | required, unique, valid email | Owner email. |
-| passwordHash | text | required | Argon2 salted hash; never plaintext. |
-| updatedAt | timestamp | required | Last credential change. |
-
-The password is stored only as a salted Argon2 hash, which is one-way — the row
-cannot be reversed back to the plaintext password (FR-AU-06, NFR-05). The row
-itself is not separately encrypted at rest.
-
-The e-mail address is the login identifier only. It is never verified and
-nothing in the system writes to it beyond registration and the credentials
-operation (UC-35).
+**Removed (the core only runs locally for the person at the machine)**
 
 ### 4.9.1 RecoveryCode Fields
 
-The single-use values that let an owner who has forgotten their password back
-into the account without e-mail (FR-AU-13 … FR-AU-19). Ten are generated at
-registration and ten replace the whole set on regeneration; there is no expiry
-column; a code is valid until it is consumed or the set it belongs to is
-replaced.
-
-| Field | Type | Constraints | Description |
-| --- | --- | --- | --- |
-| id | integer | PK | Row id. |
-| codeHash | text | required, unique | SHA-256 of the normalized code; the plaintext is never stored (FR-AU-19). |
-| createdAt | timestamp | required | When the code was issued. |
-| consumedAt | timestamp | nullable | When it was used, or null while it is still usable. |
-
-Only the hash is stored, so a database read cannot yield a working recovery
-code — the same reasoning that keeps FR-AU-06 from storing a plaintext
-password. Lookups normalize the presented value (case, hyphen, and whitespace
-are all irrelevant) and hash it before matching. Regeneration replaces every
-row, used and unused alike, so a printed list that has been superseded stops
-working in full rather than partially.
+**Removed (the core only runs locally for the person at the machine)**
 
 ### 4.10 Session Fields
 
-Created by a successful local login (UC-34 / FR-AU-09); local mode has no
-bearer token, so the session id is the credential every subsequent request
-presents. External mode creates no sessions — each request carries its own JWT.
+**Removed (the core only runs locally for the person at the machine)**
 
-| Field | Type | Constraints | Description |
-| --- | --- | --- | --- |
-| id | UUID | PK | The session id returned to the caller at login. |
-| createdAt | timestamp | required | When the login succeeded. |
-| expiresAt | timestamp | required | `createdAt` + the configured `auth.session_ttl_hours` (default 24). A request presenting a session at or past this instant is unauthenticated. |
+Migration 30 drops the three tables, and the stored credential, sessions and recovery codes with them.
 
 ### 4.11 CatalogRun Fields
 
@@ -477,169 +407,143 @@ from zero (FR-FC-33).
 
 **Removed (moved out of scope, see Orpheus)**
 
+### 4.14 Library Fields
+
+A folder the owner added (FR-FC-36). Every File belongs to exactly one
+(FR-FC-37).
+
+| Field | Type | Constraints | Description |
+| --- | --- | --- | --- |
+| id | integer | PK, autoincrement | Internal primary key. |
+| uuid | UUID | required, unique | Public identifier. |
+| name | text | required, non-blank, stored trimmed | The owner's name for the library, set when it is added and changed by a rename (FR-FC-46). Not unique. |
+| rootPath | text | required, unique | The library's folder. Corrected by FR-FC-41. |
+| pinned | boolean | required, defaults to false | Set by FR-FC-44. |
+| favorite | boolean | required, defaults to false | Set by FR-FC-45. Independent of `pinned`. |
+
 ---
 
-## 5. API Endpoints Overview
+## 5. FFI Calls Overview
 
-The HTTP surface is REST/JSON, versioned under `/v1`. The FFI surface exposes
-the same operations as C functions; the table below notes the HTTP form. Every
-endpoint requires authentication from the active mode (see §7).
+The core is used through its C ABI, `alexandria-ffi`. Every call is a C
+function; JSON goes in and out as NUL-terminated strings, and a call that
+answers JSON returns a `{status, json}` struct whose `json` the caller frees
+with `alexandria_free_string`. `status` is `0` on success or one of the call
+family's codes otherwise (`*_ERR_INVALID_INPUT` 1, `*_ERR_NOT_INITIALIZED` 3,
+and the family's own not-found, state, conflict and other codes); on a failure
+`json` is NULL. Code 2 was `*_ERR_UNAUTHORIZED` and is retired in every family,
+never reused. `alexandria_index_init(db_path)` opens and migrates the catalog
+and must be called first.
 
-### 5.1 Indexing
+### 5.1 Indexing and libraries
 
-| Method | Path | Description | Requirement |
-| --- | --- | --- | --- |
-| POST | /v1/index/refresh | Re-index existing records (compare size and mtime, mark missing), optionally at a `priority`. | FR-FC-10, FR-FC-11, FR-FC-31 |
-| GET | /v1/settings | Report the client-relevant configuration, beginning with the retention window. | FR-FC-30 |
-| GET | /v1/index/runs/{runId} | Report an index or re-index run's status, progress, and outcome. | FR-FC-27, FR-FC-28 |
-| GET | /v1/index/runs?status=active | List every outstanding (`running` or `paused`) run, newest first. | FR-FC-35 |
-| GET | /v1/index/runs/{runId}/failures | List the files that run could not record, oldest first, with the reason for each. | FR-FC-42 |
-| POST | /v1/index/runs/{runId}/pause | Pause a running run, leaving it resumable. | FR-FC-32 |
-| POST | /v1/index/runs/{runId}/resume | Resume a paused run under the same run id, optionally at a new `priority` of `normal` or `low`. | FR-FC-33, FR-FC-31 |
-| POST | /v1/index/runs/{runId}/cancel | Abandon a running or paused run. Terminal. | FR-FC-34 |
-| POST | /v1/libraries | Add a folder as a library, by `name` and `rootPath`, optionally at a `priority`, and start its first index run; answers the library with the run's `runId`. Answers a conflict when it overlaps one already added. | FR-FC-36, FR-FC-01..09, FR-FC-31 |
-| POST | /v1/libraries/{uuid}/index | Re-index one library, optionally at a `priority`; answers the run id. A conflict while the library has an unfinished run. | FR-FC-01..09, FR-FC-31, FR-FC-43 |
-| GET | /v1/libraries | List every registered library. | FR-FC-36 |
-| GET | /v1/libraries/{uuid} | Report one level of a library — the folders and files directly inside the optional `path`, which is relative to its root and defaults to the top. | FR-FC-39 |
-| PATCH | /v1/libraries/{uuid} | Correct the library's `rootPath` after its folder moved, taking its files with it. | FR-FC-41, FR-FC-43 |
-| DELETE | /v1/libraries/{uuid} | Remove the library and its catalog records; files on disk are untouched. | FR-FC-40, FR-FC-43 |
+| Call | Description | Requirement |
+| --- | --- | --- |
+| `alexandria_index_refresh_start(priority)` | Re-index existing records (compare size and mtime, mark missing), optionally at a `priority`. | FR-FC-10, FR-FC-11, FR-FC-31 |
+| `alexandria_settings_json()` | Report the client-relevant configuration, beginning with the retention window. | FR-FC-30 |
+| `alexandria_index_run_status_json(run_id)` | Report an index or re-index run's status, progress, and outcome. | FR-FC-27, FR-FC-28 |
+| `alexandria_index_runs_active_json()` | List every outstanding (`running` or `paused`) run, newest first. | FR-FC-35 |
+| `alexandria_index_run_failures_json(run_id)` | List the files that run could not record, oldest first, with the reason for each. | FR-FC-42 |
+| `alexandria_index_pause(run_id)` | Pause a running run, leaving it resumable. | FR-FC-32 |
+| `alexandria_index_resume(run_id, priority)` | Resume a paused run under the same run id, optionally at a new `priority` of `normal` or `low`. | FR-FC-33, FR-FC-31 |
+| `alexandria_index_cancel(run_id)` | Abandon a running or paused run. Terminal. | FR-FC-34 |
+| `alexandria_library_register(json_body)` | Add a folder as a library, by `name` and `rootPath`, optionally at a `priority`, and start its first index run; answers the library with the run's `runId`. A conflict when it overlaps one already added. | FR-FC-36, FR-FC-01..09, FR-FC-31 |
+| `alexandria_library_index_start(uuid, priority)` | Re-index one library, optionally at a `priority`; answers the run id. A conflict while the library has an unfinished run. | FR-FC-01..09, FR-FC-31, FR-FC-43 |
+| `alexandria_libraries_list()` | List every registered library, each with its `pinned` and `favorite` flags. | FR-FC-36, FR-FC-44, FR-FC-45 |
+| `alexandria_library_browse(uuid, path)` | Report one level of a library — the folders and files directly inside `path`, which is relative to its root and defaults to the top. | FR-FC-39 |
+| `alexandria_library_move(uuid, json_body)` | Correct the library's `rootPath` after its folder moved, taking its files with it. | FR-FC-41, FR-FC-43 |
+| `alexandria_library_rename(uuid, json_body)` | Rename the library to `{"name": …}`; answers the updated library. Allowed while a run is in progress or paused. | FR-FC-46 |
+| `alexandria_library_set_pinned(uuid, pinned)` | Pin or unpin the library. Answers a status code only. | FR-FC-44 |
+| `alexandria_library_set_favorite(uuid, favorite)` | Mark the library as a favorite, or clear the mark. Answers a status code only. | FR-FC-45 |
+| `alexandria_library_remove(uuid)` | Remove the library and its catalog records; files on disk are untouched. | FR-FC-40, FR-FC-43 |
+| `alexandria_catalog_stats_json()` | Report the catalog's totals: `{"libraries": n, "filesByType": {…}}`, every type present. | FR-FC-47 |
 
-`status` on the runs listing is optional and defaults to `active`, the only
-value it accepts; any other value is rejected as invalid input rather than
-quietly answered with the active set. The three control operations answer a
-conflict when the run is not in a status that permits the verb (FR-FC-32 …
-FR-FC-34) and a not-found for an id naming no run; over FFI they report the
-same two outcomes as distinct result codes. Resume answers with the run id it
-was given — a resume continues a run, it does not mint a new one.
+The runs listing answers only the outstanding set. The three control calls
+answer a conflict when the run is not in a status that permits the verb
+(FR-FC-32 … FR-FC-34) and a not-found for an id naming no run, as distinct
+result codes. Resume answers with the run id it was given — a resume continues
+a run, it does not mint a new one.
 
 ### 5.2 Files
 
-| Method | Path | Description | Requirement |
-| --- | --- | --- | --- |
-| GET | /v1/files | List/query files across every library by `type`, `state`, `collectionUuid`, and `libraryUuid`, each returned as the same record `GET /v1/files/{uuid}` answers for one file. An unrecognised filter value is rejected as invalid input. | FR-FC-12, FR-FC-38 |
-| GET | /v1/files/{uuid} | Get one file's metadata. | FR-FC-13 |
-| PATCH | /v1/files/{uuid}/metadata | Edit type-specific metadata. | FR-FC-15..18 |
-| POST | /v1/files/{uuid}/rename | Rename the file (and on-disk file). | FR-FC-19 |
-| DELETE | /v1/files/{uuid} | Soft-delete the record. | FR-FC-20 |
-| POST | /v1/files/{uuid}/restore | Restore a soft-deleted record. | FR-FC-21 |
-| DELETE | /v1/files/{uuid}?purge=true | Hard-purge the record (after retention). | FR-FC-22 |
-| DELETE | /v1/files/{uuid}?purge-on-disk=true | Remove the record and the on-disk file. | FR-FC-23 |
+| Call | Description | Requirement |
+| --- | --- | --- |
+| `alexandria_files_list(json_filters)` | List/query files across every library by `type`, `state`, `collectionUuid`, and `libraryUuid`, each returned as the same record `alexandria_file_get_by_uuid` answers for one file. An unrecognised filter value is rejected as invalid input. | FR-FC-12, FR-FC-38 |
+| `alexandria_file_get_by_uuid(uuid)` | Get one file's metadata. | FR-FC-13 |
+| `alexandria_file_edit_metadata(uuid, json_patch)` | Edit type-specific metadata. | FR-FC-15..18 |
+| `alexandria_file_rename(uuid, name)` | Rename the file (and on-disk file). | FR-FC-19 |
+| `alexandria_file_soft_delete(uuid)` | Soft-delete the record. | FR-FC-20 |
+| `alexandria_file_restore(uuid)` | Restore a soft-deleted record. | FR-FC-21 |
+| `alexandria_file_purge(uuid)` | Hard-purge the record (after retention). | FR-FC-22 |
+| `alexandria_file_purge_on_disk(uuid)` | Remove the record and the on-disk file. | FR-FC-23 |
 
 ### 5.3 Text File Content
 
-| Method | Path | Description | Requirement |
-| --- | --- | --- | --- |
-| GET | /v1/files/{uuid}/content | Read a TextFile's content from disk. | FR-TX-01 |
-| PUT | /v1/files/{uuid}/content | Write edited content back to disk. | FR-TX-02, FR-TX-03 |
+| Call | Description | Requirement |
+| --- | --- | --- |
+| `alexandria_file_read_content(uuid)` | Read a TextFile's content from disk. | FR-TX-01 |
+| `alexandria_file_edit_content(uuid, json_body)` | Write edited content back to disk. | FR-TX-02, FR-TX-03 |
 
 ### 5.4 Collections
 
-| Method | Path | Description | Requirement |
-| --- | --- | --- | --- |
-| GET | /v1/collections | List collections, optionally filtered by `kind`. | FR-CO-08 |
-| POST | /v1/collections | Create a collection (file or bookmark). | FR-CO-01, FR-CO-02 |
-| PATCH | /v1/collections/{uuid} | Rename a collection. | FR-CO-03 |
-| DELETE | /v1/collections/{uuid} | Delete a collection (preserves items). | FR-CO-04 |
-| POST | /v1/collections/{uuid}/items | Add items to a collection. | FR-CO-05 |
-| DELETE | /v1/collections/{uuid}/items/{itemUuid} | Remove an item. | FR-CO-06 |
-| GET | /v1/collections/{uuid}/items | List items in a collection. | FR-CO-07 |
+| Call | Description | Requirement |
+| --- | --- | --- |
+| `alexandria_collections_list(json_filters)` | List collections, optionally filtered by `kind`. | FR-CO-08 |
+| `alexandria_collection_create(json_body)` | Create a collection (file or bookmark). | FR-CO-01, FR-CO-02 |
+| `alexandria_collection_rename(uuid, json_body)` | Rename a collection. | FR-CO-03 |
+| `alexandria_collection_delete(uuid)` | Delete a collection (preserves items). | FR-CO-04 |
+| `alexandria_collection_add_items(uuid, json_body)` | Add items to a collection. | FR-CO-05 |
+| `alexandria_collection_remove_item(collection_uuid, item_uuid)` | Remove an item. | FR-CO-06 |
+| `alexandria_collection_list_items(uuid)` | List items in a collection. | FR-CO-07 |
 
 ### 5.5 Bookmarks
 
-| Method | Path | Description | Requirement |
-| --- | --- | --- | --- |
-| POST | /v1/bookmarks | Create a bookmark. | FR-BM-01 |
-| PATCH | /v1/bookmarks/{uuid} | Update a bookmark. | FR-BM-02 |
-| GET | /v1/bookmarks | List bookmarks by collection. | FR-BM-06 |
-| DELETE | /v1/bookmarks/{uuid} | Soft-delete a bookmark. | FR-BM-03 |
-| POST | /v1/bookmarks/{uuid}/restore | Restore a soft-deleted bookmark. | FR-BM-05 |
-| DELETE | /v1/bookmarks/{uuid}?purge=true | Hard-purge a bookmark. | FR-BM-04 |
+| Call | Description | Requirement |
+| --- | --- | --- |
+| `alexandria_bookmark_create(json_body)` | Create a bookmark. | FR-BM-01 |
+| `alexandria_bookmark_update(uuid, json_body)` | Update a bookmark. | FR-BM-02 |
+| `alexandria_bookmarks_list(json_filters)` | List bookmarks by collection. | FR-BM-06 |
+| `alexandria_bookmark_soft_delete(uuid)` | Soft-delete a bookmark. | FR-BM-03 |
+| `alexandria_bookmark_restore(uuid)` | Restore a soft-deleted bookmark. | FR-BM-05 |
+| `alexandria_bookmark_purge(uuid)` | Hard-purge a bookmark. | FR-BM-04 |
 
 ### 5.6 Watchlists
 
-| Method | Path | Description | Requirement |
-| --- | --- | --- | --- |
-| POST | /v1/watchlists | Create a watchlist. | FR-WL-01 |
-| GET | /v1/watchlists | List watchlists with progress. | FR-WL-08 |
-| DELETE | /v1/watchlists/{uuid} | Delete a watchlist (preserves videos). | FR-WL-07 |
-| POST | /v1/watchlists/{uuid}/items | Add a video (rejects non-video). | FR-WL-02, FR-WL-03 |
-| PATCH | /v1/watchlists/{uuid}/items/{videoUuid} | Update watch progress. | FR-WL-04, FR-WL-05 |
-| DELETE | /v1/watchlists/{uuid}/items/{videoUuid} | Remove a video. | FR-WL-06 |
+| Call | Description | Requirement |
+| --- | --- | --- |
+| `alexandria_watchlist_create(json_body)` | Create a watchlist. | FR-WL-01 |
+| `alexandria_watchlists_list(json_filters)` | List watchlists with progress. | FR-WL-08 |
+| `alexandria_watchlist_delete(uuid)` | Delete a watchlist (preserves videos). | FR-WL-07 |
+| `alexandria_watchlist_add_video(uuid, json_body)` | Add a video (rejects non-video). | FR-WL-02, FR-WL-03 |
+| `alexandria_watchlist_update_progress(watchlist_uuid, video_uuid, json_body)` | Update watch progress. | FR-WL-04, FR-WL-05 |
+| `alexandria_watchlist_remove_video(watchlist_uuid, video_uuid)` | Remove a video. | FR-WL-06 |
 
 ### 5.7 Reading Lists
 
-| Method | Path | Description | Requirement |
-| --- | --- | --- | --- |
-| POST | /v1/reading-lists | Create a reading list. | FR-RL-01 |
-| GET | /v1/reading-lists | List reading lists with progress. | FR-RL-08 |
-| DELETE | /v1/reading-lists/{uuid} | Delete a reading list (preserves items). | FR-RL-07 |
-| POST | /v1/reading-lists/{uuid}/items | Add a book/comic (rejects ineligible). | FR-RL-02, FR-RL-03 |
-| PATCH | /v1/reading-lists/{uuid}/items/{itemUuid} | Update read progress. | FR-RL-04, FR-RL-05 |
-| DELETE | /v1/reading-lists/{uuid}/items/{itemUuid} | Remove an item. | FR-RL-06 |
+| Call | Description | Requirement |
+| --- | --- | --- |
+| `alexandria_reading_list_create(json_body)` | Create a reading list. | FR-RL-01 |
+| `alexandria_reading_lists_list(json_filters)` | List reading lists with progress. | FR-RL-08 |
+| `alexandria_reading_list_delete(uuid)` | Delete a reading list (preserves items). | FR-RL-07 |
+| `alexandria_reading_list_add_item(uuid, json_body)` | Add a book/comic (rejects ineligible). | FR-RL-02, FR-RL-03 |
+| `alexandria_reading_list_update_progress(reading_list_uuid, item_uuid, json_body)` | Update read progress. | FR-RL-04, FR-RL-05 |
+| `alexandria_reading_list_remove_item(reading_list_uuid, item_uuid)` | Remove an item. | FR-RL-06 |
 
 ### 5.8 Authentication
 
-| Method | Path | Description | Requirement |
-| --- | --- | --- | --- |
-| POST | /v1/auth/local/register | Create the owner's local account and open a session (local mode). | FR-AU-10, FR-AU-11 |
-| POST | /v1/auth/local/login | Verify email + password and open a session (local mode). | FR-AU-04, FR-AU-09 |
-| POST | /v1/auth/local/credentials | Change existing local credentials (local mode). | FR-AU-05, FR-AU-06 |
-| GET | /v1/auth/local/account | Report the owner's address and how many recovery codes remain. | FR-AU-18 |
-| POST | /v1/auth/local/recovery/redeem | Replace the password using a recovery code (unauthenticated). | FR-AU-14, FR-AU-15, FR-AU-16 |
-| POST | /v1/auth/local/recovery/regenerate | Replace every recovery code with ten new ones. | FR-AU-17, FR-AU-19 |
-| POST | /v1/auth/windows/login | Open a session on the strength of the Windows account the server process runs as (Windows mode). | FR-AU-22 |
-
-External JWT verification (FR-AU-02) is enforced by HTTP middleware on every
-request, not by an endpoint. The same middleware validates the local-mode
-session id (FR-AU-09); both are presented as `Authorization: Bearer <value>`.
-
-#### Error envelope
-
-Every failure on both surfaces renders as one envelope:
-
-```json
-{ "error": "password must be at least 12 characters",
-  "code": "password_too_short",
-  "params": { "min": "12" } }
-```
-
-`error` is the human-readable English fallback and is always present. `code` is
-a stable `snake_case` identifier, never reused for a different meaning, and
-`params` carries the values the message interpolates — together they are what a
-client switches on and translates (FR-AU-12). Both are omitted for a failure
-that has no stable reason yet; the envelope is then `{"error": …}` alone.
-
-Over FFI the same bytes are returned in the result struct's `json` member,
-which is why the status code there stays a coarse class: the reason is the
-`code`, not the status.
-
-`/recovery/redeem` sits outside the authentication gate as well, and for a
-related reason: the recovery code it carries *is* its credential — requiring a
-session in addition would stop an owner who has forgotten their password from
-ever reaching the endpoint that replaces it. `/account` and
-`/recovery/regenerate` are routed alongside it but authenticate in their own
-handlers, since both require an existing session.
-
-The register, login, and credentials endpoints all sit outside the blanket
-authentication gate, for the reasons §7 gives: registration is how the
-owner's account first comes to exist, and login is how a caller obtains a
-session. The credentials endpoint is routed alongside them, but always
-requires an authenticated session — the handler enforces that itself rather
-than relying on the router-level gate (UC-35 is change-only; creating the
-account is UC-41).
+**Removed (the core only runs locally for the person at the machine)**
 
 ### 5.9 Media Playback
 
-| Method | Path | Description | Requirement |
-| --- | --- | --- | --- |
-| GET | /v1/files/{uuid}/stream | Stream an `active` File's bytes from disk, honouring `Range`. | FR-MP-01, FR-MP-02, FR-MP-03 |
-| GET | /v1/files/{uuid}/pages/{page} | Return one page of a CBZ ComicBook, 1-based. | FR-MP-04 |
-| GET | /v1/files/{uuid}/thumbnail | Return a downscaled JPEG thumbnail (video, image, comic, audio). | FR-MP-05 |
+| Call | Description | Requirement |
+| --- | --- | --- |
+| `alexandria_file_playback_source(uuid)` | Resolve an `active` File to its playback descriptor: resolved path, MIME type, and byte size. | FR-MP-01, FR-MP-03, FR-MP-06 |
+| `alexandria_comic_page(uuid, page)` | Return one page of a CBZ ComicBook, 1-based, base64 in the JSON answer. | FR-MP-04 |
+| `alexandria_file_thumbnail(uuid)` | Return a downscaled JPEG thumbnail (video, image, comic, audio), base64 in the JSON answer. | FR-MP-05 |
 
-`/stream` is deliberately not `/content`: that path is UC-32's text-content
-read and UC-33's editor, which exchange a JSON document rather than a seekable
-byte stream. Over FFI the same three operations exist, except that FR-MP-01
-returns a playback descriptor instead of bytes (FR-MP-06).
+No byte of the file itself crosses the FFI: the client, on the same machine,
+opens the path the descriptor names (FR-MP-06). A comic page and a thumbnail
+are bounded and have no path of their own, so their bytes travel in the answer.
 
 ### 5.10 Playlists
 
@@ -663,47 +567,22 @@ returns a playback descriptor instead of bytes (FR-MP-06).
 | NFR-02 | Performance | The system shall index at least 500 files per second on a personal machine, independent of the total size of the library, without blocking read/query operations. The rate is per **file**, not per byte: a library of large files shall index at substantially the same rate as a library of the same number of small ones, because nothing in the scan path reads a file's contents to identify it (FR-FC-09, FR-FC-10). |
 | NFR-03 | Maintainability | The core library shall be organized by Command/Query (CQRS-style) handlers depending on repository traits, following SOLID principles. |
 | NFR-04 | Maintainability | The core library shall contain no `unsafe` code; `#![deny(unsafe_code)]` is enforced workspace-wide. |
-| NFR-05 | Security | The system shall never store plaintext passwords and shall never log credentials or tokens. |
-| NFR-06 | Security | The system shall reject every operation that lacks valid authentication from the active auth mode. |
+| NFR-05 | Security | **Removed (the core only runs locally for the person at the machine)** |
+| NFR-06 | Security | **Removed (the core only runs locally for the person at the machine)** |
 | NFR-07 | Reliability | The system shall keep soft-deleted records restorable until their retention window elapses; a hard purge shall not remove the on-disk file. |
 | NFR-08 | Functional suitability | The system shall not perform video re-encoding, or image manipulation. |
-| NFR-09 | Compatibility | The HTTP/REST-JSON surface and the FFI surface shall return identical results for the same operation (parity). |
+| NFR-09 | Compatibility | **Removed (the core only runs locally for the person at the machine)** |
 | NFR-10 | Configurability | The soft-delete retention window shall be configurable; its default shall be 30 days. |
 
 ---
 
 ## 7. Authorization Matrix
 
-| Operation | Owner (authenticated) | Unauthenticated |
-| --- | --- | --- |
-| Index files / re-index; query, pause, resume, or cancel a run | ✅ | ❌ |
-| Browse and view file metadata | ✅ | ❌ |
-| Edit file metadata / rename / content | ✅ | ❌ |
-| Soft-delete / restore / hard-purge / purge-on-disk | ✅ | ❌ |
-| Create / rename / delete collection; manage items | ✅ | ❌ |
-| Create / update / delete / restore bookmark | ✅ | ❌ |
-| Create / update / delete watchlist and progress | ✅ | ❌ |
-| Create / update / delete reading list and progress | ✅ | ❌ |
-| Local login (local mode) | ✅ (open to verify) | ⚠️ only the login verification endpoint; all other operations denied |
-| Register the local account (local mode) | n/a — no account exists yet to authenticate as | ⚠️ only once, while no local account exists; a second attempt is denied with a conflict (UC-41) |
-| Set or change local credentials (local mode) | ✅ | ❌ |
-| External JWT validation | ✅ | ⚠️ only as the bearer of a valid JWT; invalid tokens denied |
-| Windows login (Windows mode) | ✅ (open to verify) | ⚠️ only the login endpoint; all other operations denied (UC-45) |
+**Removed (the core only runs locally for the person at the machine)**
 
-Legend: ✅ allowed · ⚠️ allowed under a stated condition · ❌ denied.
-
-Note: authentication is evaluated **before** a request's path or body is parsed.
-An unauthenticated call is denied outright and never learns whether its payload
-would have been accepted — a malformed body or an unparseable identifier does
-not turn a `401` into a `400`. Both the HTTP and FFI surfaces gate this way
-(FR-AU-07, FR-FC-24).
-
-Note: local-login verification and local-account registration are the two
-operations that accept unauthenticated input — the credentials being
-verified, and the owner's own new credentials, respectively. Login success
-grants owner status for every subsequent operation; registration succeeds
-at most once, after which every later attempt is a conflict, not a second
-bootstrap.
+Every operation is open to the caller. The core runs in process for the person
+at the machine, and the catalog file has the protection the operating system
+gives that person's own folder, and no other.
 
 ---
 
@@ -751,29 +630,29 @@ The feature identifiers are the milestones the
 | F-06 Bookmark management | FR-BM-01 through FR-BM-06 |
 | F-07 Watchlists | FR-WL-01 through FR-WL-08 |
 | F-08 Reading lists | FR-RL-01 through FR-RL-08 |
-| F-09 Pluggable authentication | FR-AU-01 through FR-AU-24 |
-| F-10 Media playback | FR-MP-01 through FR-MP-06 |
+| F-09 Pluggable authentication | **Removed (the core only runs locally for the person at the machine)** |
+| F-10 Media playback | FR-MP-01, FR-MP-03 through FR-MP-06 |
 | F-11 Playlists | **Removed (moved out of scope, see Orpheus)** |
-| F-12 Libraries | FR-FC-36 through FR-FC-41, FR-FC-43 |
+| F-12 Libraries | FR-FC-36 through FR-FC-41, FR-FC-43 through FR-FC-47 |
 | F-13 Music enrichment | **Removed (moved out of scope, see Orpheus)** |
 | F-14 Play history | **Removed (moved out of scope, see Orpheus)** |
 
-Dual-transport parity (FR-FC-24, FR-AU-08, FR-MP-06, NFR-09) is not a
-milestone of its own: it is a constraint every feature above satisfies as it
-ships, which is why each one lands on both surfaces at once.
+Dual-transport parity (FR-FC-24, NFR-09) is removed with the HTTP server: the
+core is used only through its C ABI. FR-MP-06 remains, and now says only how
+playback crosses the FFI.
 
 ### 9.2 Business Rule → Requirements
 
 | Business Rule | Realized by |
 | --- | --- |
-| BR-01 single owner | FR-AU-07, NFR-06 (all operations require owner auth) |
+| BR-01 single owner | No requirement of its own: the core runs in process for the person at the machine, and no entity carries a per-user key |
 | BR-02 metadata + path reference only, never file bytes | FR-FC-09, FR-FC-23, FR-TX-02 (writes to disk, not stored). The reference is the path plus the stat pair; the content hash the rule was originally written around is now informational and usually absent (FR-FC-09, FR-FC-10). |
 | BR-03 text edits write back to disk | FR-TX-02 |
 | BR-04 no complex media editing | NFR-08 |
 | BR-05 watchlists only videos | FR-WL-03 |
 | BR-06 per-episode series tracking | FR-WL-05 |
-| BR-07 dual transport parity | FR-FC-24, FR-AU-08, NFR-09 |
-| BR-08 pluggable auth, external + local + Windows | FR-AU-01, FR-AU-02, FR-AU-04, FR-AU-06, FR-AU-20 |
+| BR-07 core used through its C ABI | IR-01, IR-06 (Operations & Infrastructure Document §2) |
+| BR-08 pluggable auth, external + local + Windows | **Removed (the core only runs locally for the person at the machine)** |
 | BR-09 async non-blocking indexing | FR-FC-08, FR-FC-28, FR-FC-31, FR-FC-32, FR-FC-33, FR-FC-34, FR-FC-35, NFR-02 (a run the owner cannot see, throttle, or stop is only half non-blocking) |
 | BR-10 two-phase deletion | FR-FC-20, FR-FC-21, FR-FC-22, NFR-07, NFR-10 |
 | BR-11 hard purge no disk touch; separate purge-on-disk | FR-FC-22, FR-FC-23 |
@@ -782,6 +661,6 @@ ships, which is why each one lands on both surfaces at once.
 | BR-14 SOLID / Command-Query baseline | NFR-03, NFR-04 |
 | BR-15 reading lists only books/comics | FR-RL-03 |
 | BR-16 per-issue comic tracking | FR-RL-05 |
-| BR-17 exactly one active auth mode | FR-AU-01, FR-AU-03, FR-AU-20 |
-| BR-18 local credential storage | FR-AU-04, FR-AU-05, FR-AU-06, NFR-05 |
+| BR-17 exactly one active auth mode | **Removed (the core only runs locally for the person at the machine)** |
+| BR-18 local credential storage | **Removed (the core only runs locally for the person at the machine)** |
 | BR-19 delete reading list preserves items | FR-RL-07 |

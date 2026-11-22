@@ -2,7 +2,6 @@ use std::sync::Arc;
 
 use uuid::Uuid;
 
-use alexandria_core::auth::AuthService;
 use alexandria_core::catalog::classify::classify_by_extension;
 use alexandria_core::catalog::clock::{Clock, FixedClock};
 use alexandria_core::catalog::comic_tags::{ComicMetadataReader, ComicTags};
@@ -22,15 +21,13 @@ use alexandria_core::errors::DomainError;
 
 use crate::common::{
     existing_file, fixed_clock, interrupt, now, ConcurrencyTrackingVideoMetadataReader,
-    FailingCatalogRunRepository, FailingListFilesystem, FakeAudioMetadataReader, FakeAuth,
+    FailingCatalogRunRepository, FailingListFilesystem, FakeAudioMetadataReader,
     FakeCatalogRepository, FakeCatalogRunRepository, FakeComicMetadataReader,
     FakeDocumentMetadataReader, FakeFilesystem, FakeImageMetadataReader, FakeVideoMetadataReader,
     Interrupt, InterruptingFilesystem, InterruptingVideoMetadataReader, Seam, SteppingClock,
 };
 
 const ROOT: &str = "/library";
-const TOKEN: &str = "bearer-token";
-
 /// The concurrency these unit tests build handlers with. Deliberately > 1:
 /// the outcome tallies must not depend on how many entries are in flight, so
 /// exercising the concurrent path is what keeps that true. Tests that assert
@@ -43,8 +40,7 @@ const TEST_CONCURRENCY: u32 = 4;
 const TEST_LOW_PRIORITY_CONCURRENCY: u32 = 1;
 
 #[allow(clippy::too_many_arguments)]
-fn handler<A, R, F, C, N, O, P, Q, RR>(
-    auth: A,
+fn handler<R, F, C, N, O, P, Q, RR>(
     repo: R,
     fs: F,
     clock: C,
@@ -53,9 +49,8 @@ fn handler<A, R, F, C, N, O, P, Q, RR>(
     video_tags: P,
     comic_tags: Q,
     runs: RR,
-) -> IndexHandler<A, R, F, C, FakeAudioMetadataReader, N, O, P, Q, RR>
+) -> IndexHandler<R, F, C, FakeAudioMetadataReader, N, O, P, Q, RR>
 where
-    A: AuthService,
     R: CatalogRepository,
     F: Filesystem,
     C: Clock,
@@ -68,7 +63,6 @@ where
     // Empty library root: unconstrained indexing, which is what every test
     // predating FR-FC-26 assumes.
     handler_with_library_root(
-        auth,
         repo,
         fs,
         clock,
@@ -84,8 +78,7 @@ where
 /// Same as [`handler`], but with an explicit `filesystem.root` bound
 /// (FR-FC-26).
 #[allow(clippy::too_many_arguments)]
-fn handler_with_library_root<A, R, F, C, N, O, P, Q, RR>(
-    auth: A,
+fn handler_with_library_root<R, F, C, N, O, P, Q, RR>(
     repo: R,
     fs: F,
     clock: C,
@@ -95,9 +88,8 @@ fn handler_with_library_root<A, R, F, C, N, O, P, Q, RR>(
     comic_tags: Q,
     library_root: String,
     runs: RR,
-) -> IndexHandler<A, R, F, C, FakeAudioMetadataReader, N, O, P, Q, RR>
+) -> IndexHandler<R, F, C, FakeAudioMetadataReader, N, O, P, Q, RR>
 where
-    A: AuthService,
     R: CatalogRepository,
     F: Filesystem,
     C: Clock,
@@ -108,7 +100,6 @@ where
     RR: CatalogRunRepository,
 {
     IndexHandler::new(
-        auth,
         repo,
         fs,
         clock,
@@ -130,8 +121,7 @@ where
 /// Same as [`handler`], but sharing a registry the test can read live
 /// progress out of (FR-FC-28).
 #[allow(clippy::too_many_arguments)]
-fn handler_with_registry<A, R, F, C, N, O, P, Q, RR>(
-    auth: A,
+fn handler_with_registry<R, F, C, N, O, P, Q, RR>(
     repo: R,
     fs: F,
     clock: C,
@@ -141,9 +131,8 @@ fn handler_with_registry<A, R, F, C, N, O, P, Q, RR>(
     comic_tags: Q,
     runs: RR,
     registry: RunRegistry,
-) -> IndexHandler<A, R, F, C, FakeAudioMetadataReader, N, O, P, Q, RR>
+) -> IndexHandler<R, F, C, FakeAudioMetadataReader, N, O, P, Q, RR>
 where
-    A: AuthService,
     R: CatalogRepository,
     F: Filesystem,
     C: Clock,
@@ -154,7 +143,6 @@ where
     RR: CatalogRunRepository,
 {
     IndexHandler::new(
-        auth,
         repo,
         fs,
         clock,
@@ -182,10 +170,9 @@ fn given_supported_extensions_when_classify_then_returns_correct_type() {
 }
 
 #[tokio::test]
-async fn given_valid_root_and_authenticated_when_start_then_returns_run_id() {
+async fn given_valid_root_when_start_then_returns_run_id() {
     let fs = FakeFilesystem::builder().with_root(ROOT).build();
     let handler = handler(
-        FakeAuth::Allowing,
         FakeCatalogRepository::new(),
         fs,
         fixed_clock(now()),
@@ -197,14 +184,11 @@ async fn given_valid_root_and_authenticated_when_start_then_returns_run_id() {
     );
 
     let started = handler
-        .start(
-            IndexRequest {
-                root: ROOT.to_string(),
-                priority: RunPriority::Normal,
-                library_uuid: Uuid::new_v4(),
-            },
-            TOKEN,
-        )
+        .start(IndexRequest {
+            root: ROOT.to_string(),
+            priority: RunPriority::Normal,
+            library_uuid: Uuid::new_v4(),
+        })
         .await
         .expect("start");
 
@@ -216,7 +200,6 @@ async fn given_missing_root_when_start_then_invalid_input() {
     let fs = FakeFilesystem::builder().build();
     let runs = FakeCatalogRunRepository::new();
     let handler = handler(
-        FakeAuth::Allowing,
         FakeCatalogRepository::new(),
         fs,
         fixed_clock(now()),
@@ -228,14 +211,11 @@ async fn given_missing_root_when_start_then_invalid_input() {
     );
 
     let result = handler
-        .start(
-            IndexRequest {
-                root: "/nope".to_string(),
-                priority: RunPriority::Normal,
-                library_uuid: Uuid::new_v4(),
-            },
-            TOKEN,
-        )
+        .start(IndexRequest {
+            root: "/nope".to_string(),
+            priority: RunPriority::Normal,
+            library_uuid: Uuid::new_v4(),
+        })
         .await;
 
     assert!(matches!(result, Err(DomainError::InvalidInput(_))));
@@ -246,35 +226,6 @@ async fn given_missing_root_when_start_then_invalid_input() {
         0,
         "a rejected start must not open a run record"
     );
-}
-
-#[tokio::test]
-async fn given_unauthenticated_when_start_then_unauthorized() {
-    let fs = FakeFilesystem::builder().with_root(ROOT).build();
-    let handler = handler(
-        FakeAuth::Denying,
-        FakeCatalogRepository::new(),
-        fs,
-        fixed_clock(now()),
-        FakeImageMetadataReader::new(),
-        FakeDocumentMetadataReader::new(),
-        FakeVideoMetadataReader::new(),
-        FakeComicMetadataReader::new(),
-        FakeCatalogRunRepository::new(),
-    );
-
-    let result = handler
-        .start(
-            IndexRequest {
-                root: ROOT.to_string(),
-                priority: RunPriority::Normal,
-                library_uuid: Uuid::new_v4(),
-            },
-            "",
-        )
-        .await;
-
-    assert!(matches!(result, Err(DomainError::Unauthorized)));
 }
 
 #[tokio::test]
@@ -290,7 +241,6 @@ async fn given_already_cataloged_path_when_execute_then_already_cataloged_no_dup
     let repo = FakeCatalogRepository::with_existing(existing_file(existing_path, FileType::Text));
     let repo_handle = repo.clone();
     let handler = handler(
-        FakeAuth::Allowing,
         repo,
         fs,
         fixed_clock(now()),
@@ -334,7 +284,6 @@ async fn given_supported_files_when_execute_then_indexed_with_no_hash_and_indexe
     let repo = FakeCatalogRepository::new();
     let repo_handle = repo.clone();
     let handler = handler(
-        FakeAuth::Allowing,
         repo,
         fs,
         fixed_clock(now()),
@@ -377,7 +326,6 @@ async fn given_a_file_on_disk_when_indexed_then_its_size_and_mtime_are_recorded(
     let repo = FakeCatalogRepository::new();
     let repo_handle = repo.clone();
     let handler = handler(
-        FakeAuth::Allowing,
         repo,
         fs,
         fixed_clock(now()),
@@ -389,14 +337,11 @@ async fn given_a_file_on_disk_when_indexed_then_its_size_and_mtime_are_recorded(
     );
 
     let IndexStarted { run_id } = handler
-        .start(
-            IndexRequest {
-                root: ROOT.into(),
-                priority: RunPriority::Normal,
-                library_uuid: Uuid::new_v4(),
-            },
-            TOKEN,
-        )
+        .start(IndexRequest {
+            root: ROOT.into(),
+            priority: RunPriority::Normal,
+            library_uuid: Uuid::new_v4(),
+        })
         .await
         .unwrap();
     handler.execute(ROOT, run_id, Uuid::new_v4()).await.unwrap();
@@ -421,7 +366,6 @@ async fn given_a_file_when_indexed_then_no_content_hash_is_computed() {
     let repo = FakeCatalogRepository::new();
     let repo_handle = repo.clone();
     let handler = handler(
-        FakeAuth::Allowing,
         repo,
         fs,
         fixed_clock(now()),
@@ -433,14 +377,11 @@ async fn given_a_file_when_indexed_then_no_content_hash_is_computed() {
     );
 
     let IndexStarted { run_id } = handler
-        .start(
-            IndexRequest {
-                root: ROOT.into(),
-                priority: RunPriority::Normal,
-                library_uuid: Uuid::new_v4(),
-            },
-            TOKEN,
-        )
+        .start(IndexRequest {
+            root: ROOT.into(),
+            priority: RunPriority::Normal,
+            library_uuid: Uuid::new_v4(),
+        })
         .await
         .unwrap();
     handler.execute(ROOT, run_id, Uuid::new_v4()).await.unwrap();
@@ -490,7 +431,6 @@ async fn given_any_concurrency_when_execute_then_same_counts_and_same_catalog() 
         let repo = FakeCatalogRepository::new();
         let repo_handle = repo.clone();
         let handler = IndexHandler::new(
-            FakeAuth::Allowing,
             repo,
             fs,
             fixed_clock(now()),
@@ -538,7 +478,6 @@ async fn given_zero_concurrency_when_execute_then_runs_sequentially_rather_than_
         .with_file(ROOT, "/library/b.txt", "b.txt", "h-b")
         .build();
     let handler = IndexHandler::new(
-        FakeAuth::Allowing,
         FakeCatalogRepository::new(),
         fs,
         fixed_clock(now()),
@@ -575,7 +514,6 @@ async fn given_zero_low_priority_concurrency_when_a_low_priority_run_executes_th
         .build();
     let runs = FakeCatalogRunRepository::new();
     let handler = IndexHandler::new(
-        FakeAuth::Allowing,
         FakeCatalogRepository::new(),
         fs,
         fixed_clock(now()),
@@ -592,14 +530,11 @@ async fn given_zero_low_priority_concurrency_when_a_low_priority_run_executes_th
     );
 
     let IndexStarted { run_id } = handler
-        .start(
-            IndexRequest {
-                root: ROOT.into(),
-                priority: RunPriority::Low,
-                library_uuid: Uuid::new_v4(),
-            },
-            TOKEN,
-        )
+        .start(IndexRequest {
+            root: ROOT.into(),
+            priority: RunPriority::Low,
+            library_uuid: Uuid::new_v4(),
+        })
         .await
         .unwrap();
     let outcome = handler
@@ -618,7 +553,6 @@ async fn given_unsupported_extension_when_execute_then_skipped() {
         .build();
     let repo = FakeCatalogRepository::new();
     let handler = handler(
-        FakeAuth::Allowing,
         repo,
         fs,
         fixed_clock(now()),
@@ -654,7 +588,6 @@ async fn given_unreadable_file_when_execute_then_it_is_indexed_anyway() {
     let repo = FakeCatalogRepository::new();
     let repo_handle = repo.clone();
     let handler = handler(
-        FakeAuth::Allowing,
         repo,
         fs,
         fixed_clock(now()),
@@ -704,7 +637,6 @@ async fn given_failing_repository_write_when_execute_then_run_continues_and_coun
     let repo = FakeCatalogRepository::new().failing_for("/library/a.txt");
     let repo_handle = repo.clone();
     let handler = handler(
-        FakeAuth::Allowing,
         repo,
         fs,
         fixed_clock(now()),
@@ -739,7 +671,6 @@ async fn given_a_file_that_could_not_be_indexed_when_the_run_ends_then_it_is_nam
     let runs_handle = runs.clone();
     let run_id = Uuid::new_v4();
     let handler = handler(
-        FakeAuth::Allowing,
         FakeCatalogRepository::new().failing_for("/library/a.txt"),
         fs,
         fixed_clock(now()),
@@ -781,7 +712,6 @@ async fn given_a_file_that_failed_mid_run_when_it_is_named_then_it_carries_the_t
     let runs_handle = runs.clone();
     let run_id = Uuid::new_v4();
     let handler = handler(
-        FakeAuth::Allowing,
         FakeCatalogRepository::new().failing_for("/library/a.txt"),
         fs,
         SteppingClock::new(now(), 60),
@@ -816,7 +746,6 @@ async fn given_a_run_that_indexed_everything_when_it_ends_then_nothing_is_named(
     let runs_handle = runs.clone();
     let run_id = Uuid::new_v4();
     let handler = handler(
-        FakeAuth::Allowing,
         FakeCatalogRepository::new(),
         fs,
         fixed_clock(now()),
@@ -850,7 +779,6 @@ async fn given_a_folder_mixing_audio_video_and_text_when_indexed_then_all_are_ca
     let repo_handle = repo.clone();
     let runs = FakeCatalogRunRepository::new();
     let handler = handler(
-        FakeAuth::Allowing,
         repo,
         fs,
         fixed_clock(now()),
@@ -862,14 +790,11 @@ async fn given_a_folder_mixing_audio_video_and_text_when_indexed_then_all_are_ca
     );
 
     let started = handler
-        .start(
-            IndexRequest {
-                root: ROOT.to_string(),
-                priority: RunPriority::Normal,
-                library_uuid: Uuid::new_v4(),
-            },
-            TOKEN,
-        )
+        .start(IndexRequest {
+            root: ROOT.to_string(),
+            priority: RunPriority::Normal,
+            library_uuid: Uuid::new_v4(),
+        })
         .await
         .expect("start");
     let outcome = handler
@@ -912,23 +837,6 @@ async fn given_a_folder_mixing_audio_video_and_text_when_indexed_then_all_are_ca
     );
 }
 
-#[tokio::test]
-async fn given_bearer_auth_when_authenticated_then_principal_owner() {
-    let principal = alexandria_core::auth::BearerAuthService
-        .authenticate("some-bearer")
-        .await
-        .expect("auth");
-    assert_eq!(principal.user_id, "owner");
-}
-
-#[tokio::test]
-async fn given_bearer_auth_when_empty_token_then_unauthorized() {
-    let result = alexandria_core::auth::BearerAuthService
-        .authenticate("  ")
-        .await;
-    assert!(matches!(result, Err(DomainError::Unauthorized)));
-}
-
 #[test]
 fn given_fixed_clock_when_now_then_returns_seeded_time() {
     let clock = fixed_clock(now());
@@ -952,7 +860,6 @@ async fn given_tagged_image_file_when_execute_then_dimensions_and_title_written(
         },
     );
     let handler = handler(
-        FakeAuth::Allowing,
         repo,
         fs,
         fixed_clock(now()),
@@ -1000,7 +907,6 @@ async fn given_image_with_dimensions_but_no_title_when_execute_then_only_dimensi
         },
     );
     let handler = handler(
-        FakeAuth::Allowing,
         repo,
         fs,
         fixed_clock(now()),
@@ -1042,7 +948,6 @@ async fn given_image_with_title_but_no_dimensions_when_execute_then_only_title_w
         },
     );
     let handler = handler(
-        FakeAuth::Allowing,
         repo,
         fs,
         fixed_clock(now()),
@@ -1094,7 +999,6 @@ async fn given_image_with_partial_dimensions_when_execute_then_dimensions_write_
         },
     );
     let handler = handler(
-        FakeAuth::Allowing,
         repo,
         fs,
         fixed_clock(now()),
@@ -1131,7 +1035,6 @@ async fn given_untagged_image_file_when_execute_then_neither_write_happens() {
     let repo = FakeCatalogRepository::new();
     let repo_handle = repo.clone();
     let handler = handler(
-        FakeAuth::Allowing,
         repo,
         fs,
         fixed_clock(now()),
@@ -1162,7 +1065,6 @@ async fn given_non_image_file_when_execute_then_image_reader_never_consulted() {
     let image_tags = FakeImageMetadataReader::new();
     let image_tags_handle = image_tags.clone();
     let handler = handler(
-        FakeAuth::Allowing,
         repo,
         fs,
         fixed_clock(now()),
@@ -1205,7 +1107,6 @@ async fn given_tagged_pdf_when_execute_then_page_count_and_metadata_written() {
         },
     );
     let handler = handler(
-        FakeAuth::Allowing,
         repo,
         fs,
         fixed_clock(now()),
@@ -1257,7 +1158,6 @@ async fn given_tagged_epub_when_execute_then_metadata_written_no_page_count() {
         },
     );
     let handler = handler(
-        FakeAuth::Allowing,
         repo,
         fs,
         fixed_clock(now()),
@@ -1318,7 +1218,6 @@ async fn given_document_with_page_count_but_no_other_fields_when_execute_then_bo
         },
     );
     let handler = handler(
-        FakeAuth::Allowing,
         repo,
         fs,
         fixed_clock(now()),
@@ -1359,7 +1258,6 @@ async fn given_untagged_document_file_when_execute_then_neither_write_happens() 
     let repo = FakeCatalogRepository::new();
     let repo_handle = repo.clone();
     let handler = handler(
-        FakeAuth::Allowing,
         repo,
         fs,
         fixed_clock(now()),
@@ -1391,7 +1289,6 @@ async fn given_non_document_file_when_execute_then_document_reader_never_consult
     let document_tags = FakeDocumentMetadataReader::new();
     let document_tags_handle = document_tags.clone();
     let handler = handler(
-        FakeAuth::Allowing,
         repo,
         fs,
         fixed_clock(now()),
@@ -1433,7 +1330,6 @@ async fn given_tagged_video_when_execute_then_duration_and_metadata_written() {
         },
     );
     let handler = handler(
-        FakeAuth::Allowing,
         repo,
         fs,
         fixed_clock(now()),
@@ -1484,7 +1380,6 @@ async fn given_video_with_duration_but_no_other_fields_when_execute_then_only_du
         },
     );
     let handler = handler(
-        FakeAuth::Allowing,
         repo,
         fs,
         fixed_clock(now()),
@@ -1527,7 +1422,6 @@ async fn given_video_with_resolution_but_no_duration_when_execute_then_only_meta
         },
     );
     let handler = handler(
-        FakeAuth::Allowing,
         repo,
         fs,
         fixed_clock(now()),
@@ -1572,7 +1466,6 @@ async fn given_untagged_video_file_when_execute_then_neither_write_happens() {
     let repo = FakeCatalogRepository::new();
     let repo_handle = repo.clone();
     let handler = handler(
-        FakeAuth::Allowing,
         repo,
         fs,
         fixed_clock(now()),
@@ -1605,7 +1498,6 @@ async fn given_non_video_file_when_execute_then_video_reader_never_consulted() {
     let video_tags = FakeVideoMetadataReader::new();
     let video_tags_handle = video_tags.clone();
     let handler = handler(
-        FakeAuth::Allowing,
         repo,
         fs,
         fixed_clock(now()),
@@ -1647,7 +1539,6 @@ async fn given_tagged_comic_when_execute_then_page_count_and_metadata_written() 
         },
     );
     let handler = handler(
-        FakeAuth::Allowing,
         repo,
         fs,
         fixed_clock(now()),
@@ -1698,7 +1589,6 @@ async fn given_comic_with_page_count_but_no_other_fields_when_execute_then_only_
         },
     );
     let handler = handler(
-        FakeAuth::Allowing,
         repo,
         fs,
         fixed_clock(now()),
@@ -1741,7 +1631,6 @@ async fn given_comic_with_issue_number_but_no_page_count_when_execute_then_only_
         },
     );
     let handler = handler(
-        FakeAuth::Allowing,
         repo,
         fs,
         fixed_clock(now()),
@@ -1785,7 +1674,6 @@ async fn given_unopenable_comic_file_when_execute_then_neither_write_happens() {
     let repo = FakeCatalogRepository::new();
     let repo_handle = repo.clone();
     let handler = handler(
-        FakeAuth::Allowing,
         repo,
         fs,
         fixed_clock(now()),
@@ -1819,7 +1707,6 @@ async fn given_non_comic_file_when_execute_then_comic_reader_never_consulted() {
     let comic_tags = FakeComicMetadataReader::new();
     let comic_tags_handle = comic_tags.clone();
     let handler = handler(
-        FakeAuth::Allowing,
         repo,
         fs,
         fixed_clock(now()),
@@ -1869,7 +1756,6 @@ async fn start_bounded_with_runs(
     runs: FakeCatalogRunRepository,
 ) -> Result<IndexStarted, DomainError> {
     let handler = handler_with_library_root(
-        FakeAuth::Allowing,
         FakeCatalogRepository::new(),
         FakeFilesystem::builder().with_root(requested).build(),
         fixed_clock(now()),
@@ -1884,14 +1770,11 @@ async fn start_bounded_with_runs(
         runs,
     );
     handler
-        .start(
-            IndexRequest {
-                root: requested.to_string(),
-                priority: RunPriority::Normal,
-                library_uuid: Uuid::new_v4(),
-            },
-            TOKEN,
-        )
+        .start(IndexRequest {
+            root: requested.to_string(),
+            priority: RunPriority::Normal,
+            library_uuid: Uuid::new_v4(),
+        })
         .await
 }
 
@@ -2004,7 +1887,6 @@ async fn given_empty_configured_library_root_when_start_then_any_root_accepted()
     // removal instead of passing incidentally on a real tempdir.
     let requested = "/library".to_string();
     let handler = handler(
-        FakeAuth::Allowing,
         FakeCatalogRepository::new(),
         FakeFilesystem::builder().with_root(&requested).build(),
         fixed_clock(now()),
@@ -2017,14 +1899,11 @@ async fn given_empty_configured_library_root_when_start_then_any_root_accepted()
 
     // Act
     let started = handler
-        .start(
-            IndexRequest {
-                root: requested,
-                priority: RunPriority::Normal,
-                library_uuid: Uuid::new_v4(),
-            },
-            TOKEN,
-        )
+        .start(IndexRequest {
+            root: requested,
+            priority: RunPriority::Normal,
+            library_uuid: Uuid::new_v4(),
+        })
         .await;
 
     // Assert
@@ -2042,7 +1921,6 @@ async fn given_unresolvable_configured_library_root_when_start_then_invalid_inpu
     let requested_dir = tempfile::tempdir().expect("tempdir");
     let requested = requested_dir.path().to_str().expect("utf-8").to_string();
     let handler = handler_with_library_root(
-        FakeAuth::Allowing,
         FakeCatalogRepository::new(),
         FakeFilesystem::builder().with_root(&requested).build(),
         fixed_clock(now()),
@@ -2056,14 +1934,11 @@ async fn given_unresolvable_configured_library_root_when_start_then_invalid_inpu
 
     // Act
     let result = handler
-        .start(
-            IndexRequest {
-                root: requested,
-                priority: RunPriority::Normal,
-                library_uuid: Uuid::new_v4(),
-            },
-            TOKEN,
-        )
+        .start(IndexRequest {
+            root: requested,
+            priority: RunPriority::Normal,
+            library_uuid: Uuid::new_v4(),
+        })
         .await;
 
     // Assert
@@ -2077,7 +1952,6 @@ async fn given_a_started_index_when_started_then_the_run_is_recorded_running() {
     let runs = FakeCatalogRunRepository::new();
     let fs = FakeFilesystem::builder().with_root(ROOT).build();
     let handler = handler(
-        FakeAuth::Allowing,
         FakeCatalogRepository::new(),
         fs,
         fixed_clock(now()),
@@ -2089,14 +1963,11 @@ async fn given_a_started_index_when_started_then_the_run_is_recorded_running() {
     );
 
     let started = handler
-        .start(
-            IndexRequest {
-                root: ROOT.to_string(),
-                priority: RunPriority::Normal,
-                library_uuid: Uuid::new_v4(),
-            },
-            TOKEN,
-        )
+        .start(IndexRequest {
+            root: ROOT.to_string(),
+            priority: RunPriority::Normal,
+            library_uuid: Uuid::new_v4(),
+        })
         .await
         .expect("start");
 
@@ -2115,7 +1986,6 @@ async fn given_a_low_priority_index_when_started_then_the_run_records_the_low_co
     let runs = FakeCatalogRunRepository::new();
     let fs = FakeFilesystem::builder().with_root(ROOT).build();
     let handler = handler(
-        FakeAuth::Allowing,
         FakeCatalogRepository::new(),
         fs,
         fixed_clock(now()),
@@ -2127,14 +1997,11 @@ async fn given_a_low_priority_index_when_started_then_the_run_records_the_low_co
     );
 
     let IndexStarted { run_id } = handler
-        .start(
-            IndexRequest {
-                root: ROOT.into(),
-                priority: RunPriority::Low,
-                library_uuid: Uuid::new_v4(),
-            },
-            TOKEN,
-        )
+        .start(IndexRequest {
+            root: ROOT.into(),
+            priority: RunPriority::Low,
+            library_uuid: Uuid::new_v4(),
+        })
         .await
         .unwrap();
 
@@ -2152,7 +2019,6 @@ async fn given_a_normal_priority_index_when_started_then_the_run_records_the_nor
     let runs = FakeCatalogRunRepository::new();
     let fs = FakeFilesystem::builder().with_root(ROOT).build();
     let handler = handler(
-        FakeAuth::Allowing,
         FakeCatalogRepository::new(),
         fs,
         fixed_clock(now()),
@@ -2164,14 +2030,11 @@ async fn given_a_normal_priority_index_when_started_then_the_run_records_the_nor
     );
 
     let IndexStarted { run_id } = handler
-        .start(
-            IndexRequest {
-                root: ROOT.into(),
-                priority: RunPriority::Normal,
-                library_uuid: Uuid::new_v4(),
-            },
-            TOKEN,
-        )
+        .start(IndexRequest {
+            root: ROOT.into(),
+            priority: RunPriority::Normal,
+            library_uuid: Uuid::new_v4(),
+        })
         .await
         .unwrap();
 
@@ -2192,7 +2055,6 @@ async fn given_an_index_that_walks_when_executed_then_the_run_is_recorded_comple
         .build();
     let repo = FakeCatalogRepository::new();
     let handler = handler(
-        FakeAuth::Allowing,
         repo,
         fs,
         fixed_clock(now()),
@@ -2204,14 +2066,11 @@ async fn given_an_index_that_walks_when_executed_then_the_run_is_recorded_comple
     );
 
     let started = handler
-        .start(
-            IndexRequest {
-                root: ROOT.to_string(),
-                priority: RunPriority::Normal,
-                library_uuid: Uuid::new_v4(),
-            },
-            TOKEN,
-        )
+        .start(IndexRequest {
+            root: ROOT.to_string(),
+            priority: RunPriority::Normal,
+            library_uuid: Uuid::new_v4(),
+        })
         .await
         .expect("start");
     let outcome = handler
@@ -2240,7 +2099,6 @@ async fn given_a_root_that_cannot_be_listed_when_executed_then_the_run_is_record
     // could not proceed at all.
     let runs = FakeCatalogRunRepository::new();
     let handler = handler(
-        FakeAuth::Allowing,
         FakeCatalogRepository::new(),
         FailingListFilesystem,
         fixed_clock(now()),
@@ -2252,14 +2110,11 @@ async fn given_a_root_that_cannot_be_listed_when_executed_then_the_run_is_record
     );
 
     let started = handler
-        .start(
-            IndexRequest {
-                root: ROOT.to_string(),
-                priority: RunPriority::Normal,
-                library_uuid: Uuid::new_v4(),
-            },
-            TOKEN,
-        )
+        .start(IndexRequest {
+            root: ROOT.to_string(),
+            priority: RunPriority::Normal,
+            library_uuid: Uuid::new_v4(),
+        })
         .await
         .expect("start");
     let err = handler
@@ -2293,7 +2148,6 @@ async fn given_files_that_individually_fail_when_executed_then_the_run_is_comple
         .build();
     let repo = FakeCatalogRepository::new().failing_for("/library/a.txt");
     let handler = handler(
-        FakeAuth::Allowing,
         repo,
         fs,
         fixed_clock(now()),
@@ -2305,14 +2159,11 @@ async fn given_files_that_individually_fail_when_executed_then_the_run_is_comple
     );
 
     let started = handler
-        .start(
-            IndexRequest {
-                root: ROOT.to_string(),
-                priority: RunPriority::Normal,
-                library_uuid: Uuid::new_v4(),
-            },
-            TOKEN,
-        )
+        .start(IndexRequest {
+            root: ROOT.to_string(),
+            priority: RunPriority::Normal,
+            library_uuid: Uuid::new_v4(),
+        })
         .await
         .expect("start");
     let outcome = handler
@@ -2345,7 +2196,6 @@ async fn given_run_completion_cannot_be_recorded_when_executed_then_the_outcome_
         .with_file(ROOT, "/library/b.md", "b.md", "h-b")
         .build();
     let handler = handler(
-        FakeAuth::Allowing,
         FakeCatalogRepository::new(),
         fs,
         fixed_clock(now()),
@@ -2384,7 +2234,6 @@ async fn given_the_run_lookup_fails_when_executed_then_the_walk_still_completes_
         .with_file(ROOT, "/library/b.md", "b.md", "h-b")
         .build();
     let handler = handler(
-        FakeAuth::Allowing,
         FakeCatalogRepository::new(),
         fs,
         fixed_clock(now()),
@@ -2415,7 +2264,6 @@ async fn given_a_cataloged_file_and_an_unsupported_one_when_indexed_then_the_two
         .with_file(ROOT, "/library/notes.xyz", "notes.xyz", "hash-2")
         .build();
     let handler = handler(
-        FakeAuth::Allowing,
         FakeCatalogRepository::new(),
         fs,
         fixed_clock(now()),
@@ -2429,27 +2277,21 @@ async fn given_a_cataloged_file_and_an_unsupported_one_when_indexed_then_the_two
     // Index once so memo.txt is already cataloged, then again over the same
     // root — which is exactly what resume does.
     let IndexStarted { run_id } = handler
-        .start(
-            IndexRequest {
-                root: ROOT.into(),
-                priority: RunPriority::Normal,
-                library_uuid: Uuid::new_v4(),
-            },
-            TOKEN,
-        )
+        .start(IndexRequest {
+            root: ROOT.into(),
+            priority: RunPriority::Normal,
+            library_uuid: Uuid::new_v4(),
+        })
         .await
         .unwrap();
     handler.execute(ROOT, run_id, Uuid::new_v4()).await.unwrap();
 
     let IndexStarted { run_id } = handler
-        .start(
-            IndexRequest {
-                root: ROOT.into(),
-                priority: RunPriority::Normal,
-                library_uuid: Uuid::new_v4(),
-            },
-            TOKEN,
-        )
+        .start(IndexRequest {
+            root: ROOT.into(),
+            priority: RunPriority::Normal,
+            library_uuid: Uuid::new_v4(),
+        })
         .await
         .unwrap();
     let outcome = handler.execute(ROOT, run_id, Uuid::new_v4()).await.unwrap();
@@ -2476,7 +2318,6 @@ async fn given_a_completed_index_when_execute_then_the_final_progress_is_flushed
     let runs = FakeCatalogRunRepository::new();
     let registry = RunRegistry::new();
     let handler = handler_with_registry(
-        FakeAuth::Allowing,
         FakeCatalogRepository::new(),
         fs,
         fixed_clock(now()),
@@ -2535,7 +2376,6 @@ async fn given_a_progress_flush_that_fails_when_execute_then_the_run_still_compl
         .build();
     let runs = FakeCatalogRunRepository::with_failing_progress();
     let handler = handler(
-        FakeAuth::Allowing,
         FakeCatalogRepository::new(),
         fs,
         fixed_clock(now()),
@@ -2581,7 +2421,6 @@ async fn given_a_run_that_cannot_list_its_root_when_execute_then_the_cell_is_clo
     let runs = FakeCatalogRunRepository::new();
     let registry = RunRegistry::new();
     let handler = handler_with_registry(
-        FakeAuth::Allowing,
         FakeCatalogRepository::new(),
         FailingListFilesystem,
         fixed_clock(now()),
@@ -2635,7 +2474,6 @@ async fn given_a_walk_longer_than_the_flush_interval_when_execute_then_intermedi
     }
     let runs = FakeCatalogRunRepository::new();
     let handler = handler(
-        FakeAuth::Allowing,
         FakeCatalogRepository::new(),
         builder.build(),
         SteppingClock::new(now(), 1),
@@ -2728,7 +2566,7 @@ enum ControlVerb {
 fn control_handler(
     runs: FakeCatalogRunRepository,
     registry: RunRegistry,
-) -> Arc<RunControlHandler<FakeAuth, FakeCatalogRunRepository, FixedClock>> {
+) -> Arc<RunControlHandler<FakeCatalogRunRepository, FixedClock>> {
     control_handler_with_low_width(runs, registry, TEST_LOW_PRIORITY_CONCURRENCY)
 }
 
@@ -2740,9 +2578,8 @@ fn control_handler_with_low_width(
     runs: FakeCatalogRunRepository,
     registry: RunRegistry,
     low_priority_concurrency: u32,
-) -> Arc<RunControlHandler<FakeAuth, FakeCatalogRunRepository, FixedClock>> {
+) -> Arc<RunControlHandler<FakeCatalogRunRepository, FixedClock>> {
     Arc::new(RunControlHandler::new(
-        FakeAuth::Allowing,
         runs,
         fixed_clock(now()),
         registry,
@@ -2754,7 +2591,7 @@ fn control_handler_with_low_width(
 /// An [`Interrupt`] that calls the real `RunControlHandler` — so the walks
 /// below are stopped the way a client stops one, not by poking the registry.
 fn control_interrupt(
-    control: Arc<RunControlHandler<FakeAuth, FakeCatalogRunRepository, FixedClock>>,
+    control: Arc<RunControlHandler<FakeCatalogRunRepository, FixedClock>>,
     run_id: Uuid,
     verb: ControlVerb,
 ) -> Interrupt {
@@ -2762,8 +2599,8 @@ fn control_interrupt(
         let control = Arc::clone(&control);
         async move {
             match verb {
-                ControlVerb::Pause => control.pause(run_id, TOKEN).await.expect("pause"),
-                ControlVerb::Cancel => control.cancel(run_id, TOKEN).await.expect("cancel"),
+                ControlVerb::Pause => control.pause(run_id).await.expect("pause"),
+                ControlVerb::Cancel => control.cancel(run_id).await.expect("cancel"),
             }
         }
     })
@@ -2796,7 +2633,6 @@ async fn given_an_index_walk_in_flight_when_paused_then_it_stops_with_entries_un
         ControlVerb::Pause,
     );
     let handler = handler_with_registry(
-        FakeAuth::Allowing,
         catalog.clone(),
         video_library(),
         fixed_clock(now()),
@@ -2893,7 +2729,6 @@ async fn given_a_run_resumed_before_a_walks_pause_lands_when_it_lands_then_the_p
         ControlVerb::Pause,
     );
     let handler = handler_with_registry(
-        FakeAuth::Allowing,
         FakeCatalogRepository::new(),
         video_library(),
         fixed_clock(now()),
@@ -2954,7 +2789,6 @@ async fn given_a_run_resumed_before_a_walks_cancel_lands_when_it_lands_then_the_
         ControlVerb::Cancel,
     );
     let handler = handler_with_registry(
-        FakeAuth::Allowing,
         FakeCatalogRepository::new(),
         video_library(),
         fixed_clock(now()),
@@ -3011,7 +2845,6 @@ async fn given_an_index_walk_in_flight_when_cancelled_then_it_stops_and_is_termi
         ControlVerb::Cancel,
     );
     let handler = handler_with_registry(
-        FakeAuth::Allowing,
         FakeCatalogRepository::new(),
         video_library(),
         fixed_clock(now()),
@@ -3086,7 +2919,6 @@ async fn given_a_run_paused_during_discovery_when_execute_then_no_entry_is_proce
         ControlVerb::Pause,
     );
     let handler = handler_with_registry(
-        FakeAuth::Allowing,
         catalog.clone(),
         InterruptingFilesystem::new(video_library(), Seam::Discovery, pause_during_discovery),
         fixed_clock(now()),
@@ -3155,7 +2987,6 @@ async fn given_a_paused_index_run_when_resumed_then_it_re_walks_and_finishes_the
         ControlVerb::Pause,
     );
     let first_segment = handler_with_registry(
-        FakeAuth::Allowing,
         catalog.clone(),
         video_library(),
         fixed_clock(now()),
@@ -3181,7 +3012,7 @@ async fn given_a_paused_index_run_when_resumed_then_it_re_walks_and_finishes_the
     );
 
     let resumed = control_handler(runs.clone(), registry.clone())
-        .resume(run_id, TOKEN, None)
+        .resume(run_id, None)
         .await
         .expect("resume");
     assert_eq!(resumed.run_id, run_id);
@@ -3197,7 +3028,6 @@ async fn given_a_paused_index_run_when_resumed_then_it_re_walks_and_finishes_the
     );
 
     let second_segment = handler_with_registry(
-        FakeAuth::Allowing,
         catalog.clone(),
         video_library(),
         fixed_clock(now()),
@@ -3295,7 +3125,7 @@ async fn given_a_resumed_run_when_executed_then_it_walks_at_the_width_it_was_sta
     assert!(runs.pause(run_id, now(), None).await.expect("pause"));
 
     let resumed = control_handler(runs.clone(), registry.clone())
-        .resume(run_id, TOKEN, None)
+        .resume(run_id, None)
         .await
         .expect("resume");
     assert_eq!(
@@ -3305,7 +3135,6 @@ async fn given_a_resumed_run_when_executed_then_it_walks_at_the_width_it_was_sta
 
     let probe = ConcurrencyTrackingVideoMetadataReader::new();
     let second_segment = handler_with_registry(
-        FakeAuth::Allowing,
         catalog,
         video_library(),
         fixed_clock(now()),
@@ -3378,7 +3207,7 @@ async fn given_a_paused_run_when_resumed_at_low_priority_then_it_walks_at_the_ne
 
     let resumed =
         control_handler_with_low_width(runs.clone(), registry.clone(), RESUMED_AT_LOW_CONCURRENCY)
-            .resume(run_id, TOKEN, Some(RunPriority::Low))
+            .resume(run_id, Some(RunPriority::Low))
             .await
             .expect("resume");
 
@@ -3395,7 +3224,6 @@ async fn given_a_paused_run_when_resumed_at_low_priority_then_it_walks_at_the_ne
 
     let probe = ConcurrencyTrackingVideoMetadataReader::new();
     let second_segment = handler_with_registry(
-        FakeAuth::Allowing,
         catalog,
         video_library(),
         fixed_clock(now()),
@@ -3445,11 +3273,10 @@ async fn walk_stopped_before_it_began(
     .unwrap();
     let control = control_handler(runs.clone(), registry.clone());
     match verb {
-        ControlVerb::Pause => control.pause(run_id, TOKEN).await.expect("pause"),
-        ControlVerb::Cancel => control.cancel(run_id, TOKEN).await.expect("cancel"),
+        ControlVerb::Pause => control.pause(run_id).await.expect("pause"),
+        ControlVerb::Cancel => control.cancel(run_id).await.expect("cancel"),
     }
     let handler = handler_with_registry(
-        FakeAuth::Allowing,
         FakeCatalogRepository::new(),
         video_library(),
         fixed_clock(now()),
@@ -3498,7 +3325,6 @@ fn handler_reading_audio(
     fs: FakeFilesystem,
     audio: FakeAudioMetadataReader,
 ) -> IndexHandler<
-    FakeAuth,
     FakeCatalogRepository,
     FakeFilesystem,
     impl Clock,
@@ -3510,7 +3336,6 @@ fn handler_reading_audio(
     FakeCatalogRunRepository,
 > {
     IndexHandler::new(
-        FakeAuth::Allowing,
         repo,
         fs,
         fixed_clock(now()),

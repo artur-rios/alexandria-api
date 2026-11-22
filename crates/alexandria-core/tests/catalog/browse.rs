@@ -1,13 +1,11 @@
 //! Unit tests for the UC-03 BrowseFilesHandler (Testing Specification §6).
-//! Each test exercises exactly the handler against trait fakes — no real DB,
-//! filesystem, or auth service. Coverage follows §6.3: happy path for the
-//! list and single-file queries, every `AF-xx` alternative flow, and the
-//! default-excludes-deleted behavior required by the use case's main-flow
-//! step 2.
+//! Each test exercises exactly the handler against trait fakes — no real DB or
+//! filesystem. Coverage follows §6.3: happy path for the list and single-file
+//! queries, every `AF-xx` alternative flow, and the default-excludes-deleted
+//! behavior required by the use case's main-flow step 2.
 
 use uuid::Uuid;
 
-use alexandria_core::auth::AuthService;
 use alexandria_core::catalog::model::{
     FileState, FileType, FormatKind, MediaKind, StateFilter, SubtypeMetadata,
 };
@@ -15,16 +13,13 @@ use alexandria_core::catalog::queries::browse::{BrowseFilesHandler, FileFilter};
 use alexandria_core::catalog::repos::CatalogRepository;
 use alexandria_core::errors::DomainError;
 
-use crate::common::{deleted_file, existing_file_with_hash, FakeAuth, FakeCatalogRepository};
+use crate::common::{deleted_file, existing_file_with_hash, FakeCatalogRepository};
 
-const TOKEN: &str = "bearer-token";
-
-fn handler<A, R>(auth: A, repo: R) -> BrowseFilesHandler<A, R>
+fn handler<R>(repo: R) -> BrowseFilesHandler<R>
 where
-    A: AuthService,
     R: alexandria_core::catalog::repos::CatalogRepository,
 {
-    BrowseFilesHandler::new(auth, repo)
+    BrowseFilesHandler::new(repo)
 }
 
 // ---------------------------------------------------------------------------
@@ -48,8 +43,8 @@ async fn given_mixed_files_when_list_default_then_active_only_excludes_deleted()
     ));
     repo.seed(deleted_file("/lib/c.txt", "c", FileType::Text));
 
-    let h = handler(FakeAuth::Allowing, repo.clone());
-    let files = h.list(FileFilter::new(), TOKEN).await.expect("list");
+    let h = handler(repo.clone());
+    let files = h.list(FileFilter::new()).await.expect("list");
 
     // Default state filter is Active → c.txt (deleted) is excluded.
     let names: Vec<&str> = files.iter().map(|f| f.file.name.as_str()).collect();
@@ -83,9 +78,9 @@ async fn given_files_when_list_filtered_by_type_then_only_matching_type_returned
         "h",
     ));
 
-    let h = handler(FakeAuth::Allowing, repo);
+    let h = handler(repo);
     let filter = FileFilter::new().with_type(FileType::Image);
-    let files = h.list(filter, TOKEN).await.expect("list");
+    let files = h.list(filter).await.expect("list");
 
     assert_eq!(files.len(), 1);
     assert_eq!(files[0].file.file_type, FileType::Image);
@@ -122,9 +117,9 @@ async fn given_listing_of_one_type_when_list_then_each_row_carries_its_metadata(
         },
     );
 
-    let h = handler(FakeAuth::Allowing, repo);
+    let h = handler(repo);
     let filter = FileFilter::new().with_type(FileType::Document);
-    let files = h.list(filter, TOKEN).await.expect("list");
+    let files = h.list(filter).await.expect("list");
 
     assert_eq!(files.len(), 2);
     for view in &files {
@@ -164,9 +159,9 @@ async fn given_mixed_type_listing_when_list_then_each_row_carries_its_own_metada
         },
     );
 
-    let h = handler(FakeAuth::Allowing, repo);
+    let h = handler(repo);
     let files = h
-        .list(FileFilter::new().with_state(StateFilter::All), TOKEN)
+        .list(FileFilter::new().with_state(StateFilter::All))
         .await
         .expect("list");
 
@@ -199,8 +194,8 @@ async fn given_file_with_no_stored_metadata_when_list_then_metadata_is_none_not_
         "h",
     ));
 
-    let h = handler(FakeAuth::Allowing, repo);
-    let files = h.list(FileFilter::new(), TOKEN).await.expect("list");
+    let h = handler(repo);
+    let files = h.list(FileFilter::new()).await.expect("list");
 
     assert_eq!(files.len(), 1);
     assert!(
@@ -220,9 +215,9 @@ async fn given_mixed_files_when_list_state_deleted_then_only_deleted_returned() 
     ));
     repo.seed(deleted_file("/lib/b.txt", "b", FileType::Text));
 
-    let h = handler(FakeAuth::Allowing, repo);
+    let h = handler(repo);
     let filter = FileFilter::new().with_state(StateFilter::Deleted);
-    let files = h.list(filter, TOKEN).await.expect("list");
+    let files = h.list(filter).await.expect("list");
 
     assert_eq!(files.len(), 1);
     assert_eq!(files[0].file.name, "b");
@@ -240,9 +235,9 @@ async fn given_mixed_files_when_list_state_all_then_both_active_and_deleted_retu
     ));
     repo.seed(deleted_file("/lib/b.txt", "b", FileType::Text));
 
-    let h = handler(FakeAuth::Allowing, repo);
+    let h = handler(repo);
     let filter = FileFilter::new().with_state(StateFilter::All);
-    let files = h.list(filter, TOKEN).await.expect("list");
+    let files = h.list(filter).await.expect("list");
 
     assert_eq!(files.len(), 2, "All returns both active and deleted");
 }
@@ -259,11 +254,11 @@ async fn given_files_when_list_type_and_state_combined_then_filter_applied() {
     repo.seed(deleted_file("/lib/b.txt", "b", FileType::Text));
     repo.seed(deleted_file("/lib/c.mp4", "c", FileType::Video));
 
-    let h = handler(FakeAuth::Allowing, repo);
+    let h = handler(repo);
     let filter = FileFilter::new()
         .with_type(FileType::Text)
         .with_state(StateFilter::Deleted);
-    let files = h.list(filter, TOKEN).await.expect("list");
+    let files = h.list(filter).await.expect("list");
 
     assert_eq!(files.len(), 1);
     assert_eq!(files[0].file.name, "b");
@@ -286,9 +281,9 @@ async fn given_files_when_list_filtered_by_collection_then_only_linked_files_ret
         .await
         .expect("link a");
 
-    let h = handler(FakeAuth::Allowing, repo);
+    let h = handler(repo);
     let filter = FileFilter::new().with_collection(collection_uuid);
-    let files = h.list(filter, TOKEN).await.expect("list");
+    let files = h.list(filter).await.expect("list");
 
     assert_eq!(files.len(), 1);
     assert_eq!(files[0].file.uuid, a_uuid);
@@ -304,9 +299,9 @@ async fn given_unknown_collection_uuid_when_list_filtered_then_empty_list_not_er
         "h",
     ));
 
-    let h = handler(FakeAuth::Allowing, repo);
+    let h = handler(repo);
     let filter = FileFilter::new().with_collection(Uuid::new_v4());
-    let files = h.list(filter, TOKEN).await.expect("list");
+    let files = h.list(filter).await.expect("list");
 
     assert!(files.is_empty());
 }
@@ -314,19 +309,9 @@ async fn given_unknown_collection_uuid_when_list_filtered_then_empty_list_not_er
 #[tokio::test]
 async fn given_no_files_when_list_then_empty_list_returned() {
     let repo = FakeCatalogRepository::new();
-    let h = handler(FakeAuth::Allowing, repo);
-    let files = h.list(FileFilter::new(), TOKEN).await.expect("list");
+    let h = handler(repo);
+    let files = h.list(FileFilter::new()).await.expect("list");
     assert!(files.is_empty());
-}
-
-// AF-02: caller not authenticated (list)
-
-#[tokio::test]
-async fn given_unauthenticated_when_list_then_unauthorized() {
-    let repo = FakeCatalogRepository::new();
-    let h = handler(FakeAuth::Denying, repo);
-    let result = h.list(FileFilter::new(), "").await;
-    assert!(matches!(result, Err(DomainError::Unauthorized)));
 }
 
 // ---------------------------------------------------------------------------
@@ -340,8 +325,8 @@ async fn given_existing_file_when_get_by_uuid_then_file_view_returned() {
     let uuid = file.uuid;
     repo.seed(file);
 
-    let h = handler(FakeAuth::Allowing, repo);
-    let view = h.get_by_uuid(uuid, TOKEN).await.expect("get");
+    let h = handler(repo);
+    let view = h.get_by_uuid(uuid).await.expect("get");
 
     assert_eq!(view.file.uuid, uuid);
     assert_eq!(view.file.name, "memo");
@@ -365,8 +350,8 @@ async fn given_file_with_written_metadata_when_get_by_uuid_then_metadata_echoed(
     };
     repo.seed_metadata(uuid, metadata.clone());
 
-    let h = handler(FakeAuth::Allowing, repo);
-    let view = h.get_by_uuid(uuid, TOKEN).await.expect("get");
+    let h = handler(repo);
+    let view = h.get_by_uuid(uuid).await.expect("get");
 
     assert_eq!(view.metadata, Some(metadata));
 }
@@ -378,8 +363,8 @@ async fn given_text_file_when_get_by_uuid_then_metadata_is_none() {
     let uuid = file.uuid;
     repo.seed(file);
 
-    let h = handler(FakeAuth::Allowing, repo);
-    let view = h.get_by_uuid(uuid, TOKEN).await.expect("get");
+    let h = handler(repo);
+    let view = h.get_by_uuid(uuid).await.expect("get");
 
     assert_eq!(view.file.file_type, FileType::Text);
     assert!(view.metadata.is_none(), "Text has no SubtypeMetadata");
@@ -393,8 +378,8 @@ async fn given_image_with_extracted_dimensions_when_get_by_uuid_then_width_and_h
     repo.seed(file);
     repo.set_image_dimensions(uuid, 800, 600).await.unwrap();
 
-    let h = handler(FakeAuth::Allowing, repo);
-    let view = h.get_by_uuid(uuid, TOKEN).await.expect("get");
+    let h = handler(repo);
+    let view = h.get_by_uuid(uuid).await.expect("get");
 
     assert_eq!(view.width, Some(800));
     assert_eq!(view.height, Some(600));
@@ -407,8 +392,8 @@ async fn given_image_with_no_extracted_dimensions_when_get_by_uuid_then_width_an
     let uuid = file.uuid;
     repo.seed(file);
 
-    let h = handler(FakeAuth::Allowing, repo);
-    let view = h.get_by_uuid(uuid, TOKEN).await.expect("get");
+    let h = handler(repo);
+    let view = h.get_by_uuid(uuid).await.expect("get");
 
     assert_eq!(view.width, None);
     assert_eq!(view.height, None);
@@ -421,8 +406,8 @@ async fn given_non_image_file_when_get_by_uuid_then_width_and_height_none() {
     let uuid = file.uuid;
     repo.seed(file);
 
-    let h = handler(FakeAuth::Allowing, repo);
-    let view = h.get_by_uuid(uuid, TOKEN).await.expect("get");
+    let h = handler(repo);
+    let view = h.get_by_uuid(uuid).await.expect("get");
 
     assert_eq!(view.width, None);
     assert_eq!(view.height, None);
@@ -436,8 +421,8 @@ async fn given_document_with_extracted_page_count_when_get_by_uuid_then_page_cou
     repo.seed(file);
     repo.set_document_page_count(uuid, 42).await.unwrap();
 
-    let h = handler(FakeAuth::Allowing, repo);
-    let view = h.get_by_uuid(uuid, TOKEN).await.expect("get");
+    let h = handler(repo);
+    let view = h.get_by_uuid(uuid).await.expect("get");
 
     assert_eq!(view.page_count, Some(42));
 }
@@ -449,8 +434,8 @@ async fn given_document_with_no_extracted_page_count_when_get_by_uuid_then_page_
     let uuid = file.uuid;
     repo.seed(file);
 
-    let h = handler(FakeAuth::Allowing, repo);
-    let view = h.get_by_uuid(uuid, TOKEN).await.expect("get");
+    let h = handler(repo);
+    let view = h.get_by_uuid(uuid).await.expect("get");
 
     assert_eq!(view.page_count, None);
 }
@@ -462,8 +447,8 @@ async fn given_non_document_file_when_get_by_uuid_then_page_count_none() {
     let uuid = file.uuid;
     repo.seed(file);
 
-    let h = handler(FakeAuth::Allowing, repo);
-    let view = h.get_by_uuid(uuid, TOKEN).await.expect("get");
+    let h = handler(repo);
+    let view = h.get_by_uuid(uuid).await.expect("get");
 
     assert_eq!(view.page_count, None);
 }
@@ -476,8 +461,8 @@ async fn given_video_with_extracted_duration_when_get_by_uuid_then_duration_pres
     repo.seed(file);
     repo.set_video_duration(uuid, 125.5).await.unwrap();
 
-    let h = handler(FakeAuth::Allowing, repo);
-    let view = h.get_by_uuid(uuid, TOKEN).await.expect("get");
+    let h = handler(repo);
+    let view = h.get_by_uuid(uuid).await.expect("get");
 
     assert_eq!(view.duration_seconds, Some(125.5));
 }
@@ -489,8 +474,8 @@ async fn given_video_with_no_extracted_duration_when_get_by_uuid_then_duration_n
     let uuid = file.uuid;
     repo.seed(file);
 
-    let h = handler(FakeAuth::Allowing, repo);
-    let view = h.get_by_uuid(uuid, TOKEN).await.expect("get");
+    let h = handler(repo);
+    let view = h.get_by_uuid(uuid).await.expect("get");
 
     assert_eq!(view.duration_seconds, None);
 }
@@ -502,8 +487,8 @@ async fn given_non_video_file_when_get_by_uuid_then_duration_none() {
     let uuid = file.uuid;
     repo.seed(file);
 
-    let h = handler(FakeAuth::Allowing, repo);
-    let view = h.get_by_uuid(uuid, TOKEN).await.expect("get");
+    let h = handler(repo);
+    let view = h.get_by_uuid(uuid).await.expect("get");
 
     assert_eq!(view.duration_seconds, None);
 }
@@ -516,8 +501,8 @@ async fn given_comic_with_extracted_page_count_when_get_by_uuid_then_page_count_
     repo.seed(file);
     repo.set_comic_page_count(uuid, 24).await.unwrap();
 
-    let h = handler(FakeAuth::Allowing, repo);
-    let view = h.get_by_uuid(uuid, TOKEN).await.expect("get");
+    let h = handler(repo);
+    let view = h.get_by_uuid(uuid).await.expect("get");
 
     assert_eq!(view.comic_page_count, Some(24));
 }
@@ -529,8 +514,8 @@ async fn given_comic_with_no_extracted_page_count_when_get_by_uuid_then_page_cou
     let uuid = file.uuid;
     repo.seed(file);
 
-    let h = handler(FakeAuth::Allowing, repo);
-    let view = h.get_by_uuid(uuid, TOKEN).await.expect("get");
+    let h = handler(repo);
+    let view = h.get_by_uuid(uuid).await.expect("get");
 
     assert_eq!(view.comic_page_count, None);
 }
@@ -542,8 +527,8 @@ async fn given_non_comic_file_when_get_by_uuid_then_comic_page_count_none() {
     let uuid = file.uuid;
     repo.seed(file);
 
-    let h = handler(FakeAuth::Allowing, repo);
-    let view = h.get_by_uuid(uuid, TOKEN).await.expect("get");
+    let h = handler(repo);
+    let view = h.get_by_uuid(uuid).await.expect("get");
 
     assert_eq!(view.comic_page_count, None);
 }
@@ -553,21 +538,11 @@ async fn given_non_comic_file_when_get_by_uuid_then_comic_page_count_none() {
 #[tokio::test]
 async fn given_missing_uuid_when_get_by_uuid_then_not_found() {
     let repo = FakeCatalogRepository::new();
-    let h = handler(FakeAuth::Allowing, repo);
+    let h = handler(repo);
     let uuid = Uuid::new_v4();
 
-    let result = h.get_by_uuid(uuid, TOKEN).await;
+    let result = h.get_by_uuid(uuid).await;
     assert!(matches!(result, Err(DomainError::NotFound)));
-}
-
-// AF-02: caller not authenticated (get_by_uuid)
-
-#[tokio::test]
-async fn given_unauthenticated_when_get_by_uuid_then_unauthorized() {
-    let repo = FakeCatalogRepository::new();
-    let h = handler(FakeAuth::Denying, repo);
-    let result = h.get_by_uuid(Uuid::new_v4(), "").await;
-    assert!(matches!(result, Err(DomainError::Unauthorized)));
 }
 
 // Postcondition: get_by_uuid returns a deleted file when it exists
@@ -579,8 +554,8 @@ async fn given_deleted_file_when_get_by_uuid_then_file_returned() {
     let uuid = file.uuid;
     repo.seed(file);
 
-    let h = handler(FakeAuth::Allowing, repo);
-    let view = h.get_by_uuid(uuid, TOKEN).await.expect("get");
+    let h = handler(repo);
+    let view = h.get_by_uuid(uuid).await.expect("get");
 
     assert_eq!(view.file.uuid, uuid);
     assert_eq!(view.file.state, FileState::Deleted);
@@ -604,8 +579,8 @@ async fn given_video_file_with_series_kind_when_get_by_uuid_then_series_returned
     };
     repo.seed_metadata(uuid, metadata.clone());
 
-    let h = handler(FakeAuth::Allowing, repo);
-    let view = h.get_by_uuid(uuid, TOKEN).await.expect("get");
+    let h = handler(repo);
+    let view = h.get_by_uuid(uuid).await.expect("get");
 
     match &view.metadata {
         Some(SubtypeMetadata::Video { media_kind, .. }) => {
@@ -632,8 +607,8 @@ async fn given_document_file_with_ebook_kind_when_get_by_uuid_then_ebook_returne
     };
     repo.seed_metadata(uuid, metadata.clone());
 
-    let h = handler(FakeAuth::Allowing, repo);
-    let view = h.get_by_uuid(uuid, TOKEN).await.expect("get");
+    let h = handler(repo);
+    let view = h.get_by_uuid(uuid).await.expect("get");
 
     match &view.metadata {
         Some(SubtypeMetadata::Document { format_kind, .. }) => {

@@ -1,6 +1,5 @@
 use uuid::Uuid;
 
-use crate::auth::AuthService;
 use crate::catalog::model::FileType;
 use crate::catalog::repos::CatalogRepository;
 use crate::errors::DomainError;
@@ -16,21 +15,18 @@ use crate::watchlists::repos::WatchlistRepository;
 /// Generic over two repositories: `WatchlistRepository` to look up the
 /// target watchlist and perform the link, `CatalogRepository` to look up the
 /// video and confirm its type. No `Clock` or `Filesystem` collaborator.
-pub struct AddVideoToWatchlistHandler<A, WR, CATR> {
-    auth: A,
+pub struct AddVideoToWatchlistHandler<WR, CATR> {
     watchlist_repo: WR,
     catalog_repo: CATR,
 }
 
-impl<A, WR, CATR> AddVideoToWatchlistHandler<A, WR, CATR>
+impl<WR, CATR> AddVideoToWatchlistHandler<WR, CATR>
 where
-    A: AuthService,
     WR: WatchlistRepository,
     CATR: CatalogRepository,
 {
-    pub fn new(auth: A, watchlist_repo: WR, catalog_repo: CATR) -> Self {
+    pub fn new(watchlist_repo: WR, catalog_repo: CATR) -> Self {
         Self {
-            auth,
             watchlist_repo,
             catalog_repo,
         }
@@ -42,12 +38,7 @@ where
         &self,
         watchlist_uuid: Uuid,
         video_uuid: Uuid,
-        token: &str,
     ) -> Result<WatchProgress, DomainError> {
-        // AF-03: the caller must be authenticated. Evaluated before the
-        // watchlist or video is looked up (FR-AU-07 / SRD §7).
-        self.auth.authenticate(token).await?;
-
         // AF-02: the watchlist must exist.
         self.watchlist_repo
             .find_by_uuid(watchlist_uuid)

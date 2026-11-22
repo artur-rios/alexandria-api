@@ -22,7 +22,6 @@
 
 mod common;
 
-mod auth;
 mod bookmarks;
 mod catalog;
 mod collections;

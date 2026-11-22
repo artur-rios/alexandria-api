@@ -3,7 +3,6 @@ use futures_util::stream::{self, StreamExt};
 use serde::Serialize;
 use uuid::Uuid;
 
-use crate::auth::AuthService;
 use crate::catalog::audio_tags::AudioMetadataReader;
 use crate::catalog::clock::Clock;
 use crate::catalog::comic_tags::ComicMetadataReader;
@@ -53,9 +52,9 @@ pub struct RefreshOutcome {
 
 /// Re-index and refresh the catalog (UC-02).
 ///
-/// `start` authenticates the caller and returns a fresh run id immediately;
-/// `execute` iterates every cataloged path (no tree walk — discovery of *new*
-/// files is UC-01's job), stats each present file, and:
+/// `start` returns a fresh run id immediately; `execute` iterates every
+/// cataloged path (no tree walk — discovery of *new* files is UC-01's job),
+/// stats each present file, and:
 ///   * refreshes size/mtime + `indexed_at` (clearing `content_hash` and
 ///     `missing_at`) when the stat changed or the file returned to disk after
 ///     being marked missing (FR-FC-10), and
@@ -80,9 +79,8 @@ pub struct RefreshOutcome {
 /// `IndexHandler::execute` does.
 ///
 /// Generic over collaborators so the decision logic is unit-tested against
-/// trait fakes with no real DB / filesystem / auth service (Testing Spec §6.2).
-pub struct RefreshHandler<A, R, F, C, RR, M, N, O, P, Q> {
-    auth: A,
+/// trait fakes with no real DB / filesystem (Testing Spec §6.2).
+pub struct RefreshHandler<R, F, C, RR, M, N, O, P, Q> {
     repo: R,
     fs: F,
     clock: C,
@@ -102,9 +100,8 @@ pub struct RefreshHandler<A, R, F, C, RR, M, N, O, P, Q> {
     registry: RunRegistry,
 }
 
-impl<A, R, F, C, RR, M, N, O, P, Q> RefreshHandler<A, R, F, C, RR, M, N, O, P, Q>
+impl<R, F, C, RR, M, N, O, P, Q> RefreshHandler<R, F, C, RR, M, N, O, P, Q>
 where
-    A: AuthService,
     R: CatalogRepository,
     F: Filesystem,
     C: Clock,
@@ -121,7 +118,6 @@ where
     /// in `IndexHandler::new`.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        auth: A,
         repo: R,
         fs: F,
         clock: C,
@@ -136,7 +132,6 @@ where
         registry: RunRegistry,
     ) -> Self {
         Self {
-            auth,
             repo,
             fs,
             clock,
@@ -163,20 +158,15 @@ where
         }
     }
 
-    /// Authenticate and return a run id. No input to validate (re-index
-    /// touches every cataloged path), so the only failure is AF-02.
+    /// Return a run id. There is no input to validate: re-index touches every
+    /// cataloged path.
     ///
     /// FR-FC-27: a started run is always a recorded run — the record opens
     /// here, where the id is minted, so no caller can start one without it.
     /// Unlike `finish`/`fail`, this write's failure is not swallowed after
     /// retrying: if the record cannot be opened at all, the caller must not
     /// receive a run id it can never query.
-    pub async fn start(
-        &self,
-        priority: RunPriority,
-        token: &str,
-    ) -> Result<RefreshStarted, DomainError> {
-        self.auth.authenticate(token).await?;
+    pub async fn start(&self, priority: RunPriority) -> Result<RefreshStarted, DomainError> {
         let run_id = Uuid::new_v4();
         let started_at = self.clock.now();
         let concurrency = self.concurrency_for(priority) as u32;

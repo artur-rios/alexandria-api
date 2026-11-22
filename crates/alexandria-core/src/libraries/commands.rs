@@ -2,7 +2,6 @@
 
 use uuid::Uuid;
 
-use crate::auth::AuthService;
 use crate::catalog::commands::index::{IndexStarted, LibraryRunStarter};
 use crate::catalog::library_root::LibraryRoot;
 use crate::catalog::runs::{CatalogRunRepository, RunPriority, RunStatus};
@@ -47,8 +46,7 @@ pub(crate) fn unfinished_run_conflict(run_id: Uuid) -> DomainError {
 }
 
 /// Register a folder as a library and start indexing it (FR-FC-36).
-pub struct RegisterLibraryHandler<A, R, S> {
-    auth: A,
+pub struct RegisterLibraryHandler<R, S> {
     repo: R,
     starter: S,
     /// `filesystem.root` (FR-FC-26): a library's folder is now the only root
@@ -56,15 +54,13 @@ pub struct RegisterLibraryHandler<A, R, S> {
     library_root: LibraryRoot,
 }
 
-impl<A, R, S> RegisterLibraryHandler<A, R, S>
+impl<R, S> RegisterLibraryHandler<R, S>
 where
-    A: AuthService,
     R: LibraryRepository,
     S: LibraryRunStarter,
 {
-    pub fn new(auth: A, repo: R, starter: S, library_root: LibraryRoot) -> Self {
+    pub fn new(repo: R, starter: S, library_root: LibraryRoot) -> Self {
         Self {
-            auth,
             repo,
             starter,
             library_root,
@@ -85,10 +81,7 @@ where
         name: &str,
         root_path: &str,
         priority: RunPriority,
-        token: &str,
     ) -> Result<RegisteredLibrary, DomainError> {
-        self.auth.authenticate(token).await?;
-
         if let Some(reason) = validate_library_name(name) {
             return Err(DomainError::InvalidInput(reason.to_string()));
         }
@@ -127,11 +120,7 @@ where
             })
             .await?;
 
-        match self
-            .starter
-            .start_library_run(&library, priority, token)
-            .await
-        {
+        match self.starter.start_library_run(&library, priority).await {
             Ok(started) => Ok(RegisteredLibrary {
                 library,
                 run_id: started.run_id,
@@ -153,23 +142,20 @@ where
 }
 
 /// Re-index one library (UC-01).
-pub struct IndexLibraryHandler<A, R, S, RR> {
-    auth: A,
+pub struct IndexLibraryHandler<R, S, RR> {
     repo: R,
     starter: S,
     runs: RR,
 }
 
-impl<A, R, S, RR> IndexLibraryHandler<A, R, S, RR>
+impl<R, S, RR> IndexLibraryHandler<R, S, RR>
 where
-    A: AuthService,
     R: LibraryRepository,
     S: LibraryRunStarter,
     RR: CatalogRunRepository,
 {
-    pub fn new(auth: A, repo: R, starter: S, runs: RR) -> Self {
+    pub fn new(repo: R, starter: S, runs: RR) -> Self {
         Self {
-            auth,
             repo,
             starter,
             runs,
@@ -186,10 +172,7 @@ where
         &self,
         uuid: Uuid,
         priority: RunPriority,
-        token: &str,
     ) -> Result<(Library, IndexStarted), DomainError> {
-        self.auth.authenticate(token).await?;
-
         let library = self
             .repo
             .find_by_uuid(uuid)
@@ -200,17 +183,13 @@ where
             return Err(unfinished_run_conflict(run.id));
         }
 
-        let started = self
-            .starter
-            .start_library_run(&library, priority, token)
-            .await?;
+        let started = self.starter.start_library_run(&library, priority).await?;
         Ok((library, started))
     }
 }
 
 /// Point a library at the folder it moved to (design section 1).
-pub struct MoveLibraryHandler<A, R, RR> {
-    auth: A,
+pub struct MoveLibraryHandler<R, RR> {
     repo: R,
     /// A resume walks the root frozen on the run's row, so moving under an
     /// unfinished run would send it walking the old folder (FR-FC-43).
@@ -222,15 +201,13 @@ pub struct MoveLibraryHandler<A, R, RR> {
     library_root: LibraryRoot,
 }
 
-impl<A, R, RR> MoveLibraryHandler<A, R, RR>
+impl<R, RR> MoveLibraryHandler<R, RR>
 where
-    A: AuthService,
     R: LibraryRepository,
     RR: CatalogRunRepository,
 {
-    pub fn new(auth: A, repo: R, library_root: LibraryRoot, runs: RR) -> Self {
+    pub fn new(repo: R, library_root: LibraryRoot, runs: RR) -> Self {
         Self {
-            auth,
             repo,
             library_root,
             runs,
@@ -255,14 +232,7 @@ where
     /// longest part of the path that does exist and normalises the rest, so
     /// an unplugged drive mounted inside the root is still accepted while a
     /// `..` or a symbolic link that leads out of it is not.
-    pub async fn move_to(
-        &self,
-        uuid: Uuid,
-        new_root: &str,
-        token: &str,
-    ) -> Result<Library, DomainError> {
-        self.auth.authenticate(token).await?;
-
+    pub async fn move_to(&self, uuid: Uuid, new_root: &str) -> Result<Library, DomainError> {
         // Trimmed before it is either checked or stored, for the reason
         // `register` above trims: checking one spelling and writing another
         // lets a folder past the overlap rule it was meant to fail.
@@ -297,21 +267,101 @@ where
     }
 }
 
+/// Change a library's name, whenever the owner likes.
+pub struct RenameLibraryHandler<R> {
+    repo: R,
+}
+
+impl<R> RenameLibraryHandler<R>
+where
+    R: LibraryRepository,
+{
+    pub fn new(repo: R) -> Self {
+        Self { repo }
+    }
+
+    /// Store `name`, trimmed, as the name of the library `uuid` names, and
+    /// answer the library as stored.
+    ///
+    /// Allowed while the library's run is in progress or paused: the name is
+    /// not part of anything a run reads, so nothing here consults runs or
+    /// waits for one. Renaming to the current name succeeds and changes
+    /// nothing, and two libraries may share a name. `InvalidInput` for a
+    /// blank name, `NotFound` when no library has the uuid.
+    pub async fn rename(&self, uuid: Uuid, name: &str) -> Result<Library, DomainError> {
+        if let Some(reason) = validate_library_name(name) {
+            return Err(DomainError::InvalidInput(reason.to_string()));
+        }
+
+        self.repo
+            .rename(uuid, name.trim())
+            .await?
+            .ok_or(DomainError::NotFound)
+    }
+}
+
+/// Pin a library to the top of the menu, or unpin it.
+pub struct SetLibraryPinnedHandler<R> {
+    repo: R,
+}
+
+impl<R> SetLibraryPinnedHandler<R>
+where
+    R: LibraryRepository,
+{
+    pub fn new(repo: R) -> Self {
+        Self { repo }
+    }
+
+    /// Set whether the library `uuid` names is pinned. Idempotent: pinning a
+    /// pinned library is not an error. `NotFound` when no library has the
+    /// uuid.
+    pub async fn set(&self, uuid: Uuid, pinned: bool) -> Result<(), DomainError> {
+        if self.repo.set_pinned(uuid, pinned).await? {
+            Ok(())
+        } else {
+            Err(DomainError::NotFound)
+        }
+    }
+}
+
+/// Mark a library as a favorite, or unmark it.
+pub struct SetLibraryFavoriteHandler<R> {
+    repo: R,
+}
+
+impl<R> SetLibraryFavoriteHandler<R>
+where
+    R: LibraryRepository,
+{
+    pub fn new(repo: R) -> Self {
+        Self { repo }
+    }
+
+    /// Set whether the library `uuid` names is a favorite. Idempotent, and
+    /// independent of pinning. `NotFound` when no library has the uuid.
+    pub async fn set(&self, uuid: Uuid, favorite: bool) -> Result<(), DomainError> {
+        if self.repo.set_favorite(uuid, favorite).await? {
+            Ok(())
+        } else {
+            Err(DomainError::NotFound)
+        }
+    }
+}
+
 /// Remove a library and its catalog records (FR-FC-40).
-pub struct RemoveLibraryHandler<A, R, RR> {
-    auth: A,
+pub struct RemoveLibraryHandler<R, RR> {
     repo: R,
     runs: RR,
 }
 
-impl<A, R, RR> RemoveLibraryHandler<A, R, RR>
+impl<R, RR> RemoveLibraryHandler<R, RR>
 where
-    A: AuthService,
     R: LibraryRepository,
     RR: CatalogRunRepository,
 {
-    pub fn new(auth: A, repo: R, runs: RR) -> Self {
-        Self { auth, repo, runs }
+    pub fn new(repo: R, runs: RR) -> Self {
+        Self { repo, runs }
     }
 
     /// Remove the library `uuid` identifies, with every file record in it.
@@ -325,9 +375,7 @@ where
     /// is no waiting for it — a cancel only raises a signal, in whichever
     /// process the walk is in. A paused run is not writing, and goes with the
     /// library.
-    pub async fn remove(&self, uuid: Uuid, token: &str) -> Result<(), DomainError> {
-        self.auth.authenticate(token).await?;
-
+    pub async fn remove(&self, uuid: Uuid) -> Result<(), DomainError> {
         self.repo
             .find_by_uuid(uuid)
             .await?

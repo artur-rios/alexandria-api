@@ -1,6 +1,5 @@
 use uuid::Uuid;
 
-use crate::auth::AuthService;
 use crate::catalog::model::FileType;
 use crate::catalog::repos::CatalogRepository;
 use crate::errors::DomainError;
@@ -17,21 +16,18 @@ use crate::reading_lists::repos::ReadingListRepository;
 /// Generic over two repositories: `ReadingListRepository` to look up the
 /// target reading list and perform the link, `CatalogRepository` to look up
 /// the item and confirm its type. No `Clock` or `Filesystem` collaborator.
-pub struct AddItemToReadingListHandler<A, RLR, CATR> {
-    auth: A,
+pub struct AddItemToReadingListHandler<RLR, CATR> {
     reading_list_repo: RLR,
     catalog_repo: CATR,
 }
 
-impl<A, RLR, CATR> AddItemToReadingListHandler<A, RLR, CATR>
+impl<RLR, CATR> AddItemToReadingListHandler<RLR, CATR>
 where
-    A: AuthService,
     RLR: ReadingListRepository,
     CATR: CatalogRepository,
 {
-    pub fn new(auth: A, reading_list_repo: RLR, catalog_repo: CATR) -> Self {
+    pub fn new(reading_list_repo: RLR, catalog_repo: CATR) -> Self {
         Self {
-            auth,
             reading_list_repo,
             catalog_repo,
         }
@@ -43,12 +39,7 @@ where
         &self,
         reading_list_uuid: Uuid,
         item_uuid: Uuid,
-        token: &str,
     ) -> Result<ReadingProgress, DomainError> {
-        // AF-03: the caller must be authenticated. Evaluated before the
-        // reading list or item is looked up (FR-AU-07 / SRD §7).
-        self.auth.authenticate(token).await?;
-
         // AF-02: the reading list must exist.
         self.reading_list_repo
             .find_by_uuid(reading_list_uuid)
