@@ -6134,29 +6134,31 @@ fn given_a_running_run_when_its_library_is_removed_over_ffi_then_conflict_and_th
     let _g = serial();
     let db = init_temp_db();
     let token = c(TEST_TOKEN);
-    let root = folder(&db, "/library");
-    write_library(std::path::Path::new(&root), 500);
-    let body = c(&serde_json::json!({ "name": "Big", "rootPath": root }).to_string());
-    let registered = library_json_ok(alexandria_library_register(body.as_ptr(), token.as_ptr()));
+    let registered = register_library("Notes", &folder(&db, "/library/notes"), &token);
     let run_id = registered["runId"].as_str().unwrap().to_string();
-    wait_for_run_cell_live(&run_id, &token);
+    // Forced in the row, as the HTTP and parity tests did, rather than
+    // raced against a live walk that may finish first.
+    exec(
+        &db.1,
+        "UPDATE catalog_runs SET status = 'running' WHERE id = ?",
+        &[&run_id],
+    );
     let uuid = c(registered["uuid"].as_str().unwrap());
 
     let removed = alexandria_library_remove(uuid.as_ptr(), token.as_ptr());
 
     assert_eq!(removed.status, STATUS_LIBRARY_CONFLICT);
     assert!(removed.json.is_null());
-    let run_id_c = c(&run_id);
-    assert_eq!(
-        alexandria_index_cancel(run_id_c.as_ptr(), token.as_ptr()),
-        STATUS_RUN_OK
-    );
-    wait_for_run_terminal(&run_id, &token);
     let listed = library_json_ok(alexandria_libraries_list(token.as_ptr()));
     assert_eq!(
         listed.as_array().map(Vec::len),
         Some(1),
         "the library stays"
+    );
+    exec(
+        &db.1,
+        "UPDATE catalog_runs SET status = 'complete' WHERE id = ?",
+        &[&run_id],
     );
 }
 
