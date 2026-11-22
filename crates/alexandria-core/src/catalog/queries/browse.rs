@@ -1,6 +1,5 @@
 use uuid::Uuid;
 
-use crate::auth::AuthService;
 use crate::catalog::model::{FileType, FileView, StateFilter};
 use crate::catalog::repos::CatalogRepository;
 use crate::errors::DomainError;
@@ -57,48 +56,38 @@ impl FileFilter {
 
 /// Browse and view file metadata (UC-03 / FR-FC-12, FR-FC-13).
 ///
-/// `list` authenticates the caller (AF-02), applies the filter, and returns
-/// the matching files as `FileView` records — the same shape `get_by_uuid`
-/// answers for one file (issue #116), assembled by the repository's batched
-/// `list_filtered_view` rather than one `get_by_uuid`-equivalent call per
-/// row (`BrowseFilesHandler` itself does no per-row fan-out; see that
-/// method's doc comment for the batching). The default state filter is
-/// `Active` — soft-deleted records are excluded unless the owner explicitly
-/// requests them (main-flow step 2). `get_by_uuid` authenticates the caller,
-/// looks up a single file by its public UUID (AF-01 when absent), and
-/// returns the file plus its stored subtype metadata when the subtype has
-/// one.
+/// `list` applies the filter and returns the matching files as `FileView`
+/// records — the same shape `get_by_uuid` answers for one file (issue #116),
+/// assembled by the repository's batched `list_filtered_view` rather than one
+/// `get_by_uuid`-equivalent call per row (`BrowseFilesHandler` itself does no
+/// per-row fan-out; see that method's doc comment for the batching). The
+/// default state filter is `Active` — soft-deleted records are excluded unless
+/// the owner explicitly requests them (main-flow step 2). `get_by_uuid` looks
+/// up a single file by its public UUID (AF-01 when absent), and returns the
+/// file plus its stored subtype metadata when the subtype has one.
 ///
-/// Generic over the auth service and catalog repository so the same decision
-/// logic is unit-tested against trait fakes (no real DB or auth service in
-/// unit tests), then wired with the concrete Bearer/Sqlite collaborators at
-/// runtime (services.rs). Both the HTTP and FFI surfaces call this handler so
-/// the two stay at parity (FR-FC-24 / NFR-09).
-pub struct BrowseFilesHandler<A, R> {
-    auth: A,
+/// Generic over the catalog repository so the same decision logic is
+/// unit-tested against trait fakes (no real DB in unit tests), then wired with
+/// the concrete Sqlite collaborators at runtime (services.rs). Both the HTTP
+/// and FFI surfaces call this handler so the two stay at parity (FR-FC-24 /
+/// NFR-09).
+pub struct BrowseFilesHandler<R> {
     repo: R,
 }
 
-impl<A, R> BrowseFilesHandler<A, R>
+impl<R> BrowseFilesHandler<R>
 where
-    A: AuthService,
     R: CatalogRepository,
 {
-    pub fn new(auth: A, repo: R) -> Self {
-        Self { auth, repo }
+    pub fn new(repo: R) -> Self {
+        Self { repo }
     }
 
     /// List files matching `filter`, each answered as the full `FileView`
     /// record `get_by_uuid` would answer for it (issue #116 / FR-FC-12).
     /// The default filter excludes soft-deleted records (UC-03 main-flow
     /// step 2).
-    pub async fn list(
-        &self,
-        filter: FileFilter,
-        token: &str,
-    ) -> Result<Vec<FileView>, DomainError> {
-        // AF-02: the caller must be authenticated.
-        self.auth.authenticate(token).await?;
+    pub async fn list(&self, filter: FileFilter) -> Result<Vec<FileView>, DomainError> {
         self.repo
             .list_filtered_view(
                 filter.file_type,
@@ -112,10 +101,7 @@ where
     /// Get a single file by its public UUID, including its stored subtype
     /// metadata when the subtype has one (FR-FC-13). AF-01 when the UUID
     /// does not exist.
-    pub async fn get_by_uuid(&self, uuid: Uuid, token: &str) -> Result<FileView, DomainError> {
-        // AF-02: the caller must be authenticated.
-        self.auth.authenticate(token).await?;
-
+    pub async fn get_by_uuid(&self, uuid: Uuid) -> Result<FileView, DomainError> {
         // AF-01: the file must exist.
         let file = self
             .repo

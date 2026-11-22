@@ -30,7 +30,7 @@ use sqlx::sqlite::SqlitePool;
 use uuid::Uuid;
 
 use crate::common::{
-    FakeAudioMetadataReader, FakeAuth, FakeComicMetadataReader, FakeDocumentMetadataReader,
+    FakeAudioMetadataReader, FakeComicMetadataReader, FakeDocumentMetadataReader,
     FakeImageMetadataReader, FakeVideoMetadataReader,
 };
 
@@ -66,11 +66,10 @@ async fn migrated(dir: &std::path::Path) -> SqlitePool {
 
 async fn browse(pool: &SqlitePool, uuid: Uuid, path: &str) -> LibraryListing {
     BrowseLibraryHandler::new(
-        FakeAuth::Allowing,
         SqliteLibraryRepository::new(pool.clone()),
         SqliteCatalogRepository::new(pool.clone()),
     )
-    .browse(uuid, path, "token")
+    .browse(uuid, path)
     .await
     .expect("browse")
 }
@@ -78,7 +77,6 @@ async fn browse(pool: &SqlitePool, uuid: Uuid, path: &str) -> LibraryListing {
 /// The index handler a registration starts its run through, bounded by
 /// `filesystem_root` (empty is unbounded).
 type TestIndex = IndexHandler<
-    FakeAuth,
     SqliteCatalogRepository,
     StdFilesystem,
     SystemClock,
@@ -92,7 +90,6 @@ type TestIndex = IndexHandler<
 
 fn index_handler(pool: &SqlitePool, filesystem_root: &str) -> Arc<TestIndex> {
     Arc::new(IndexHandler::new(
-        FakeAuth::Allowing,
         SqliteCatalogRepository::new(pool.clone()),
         StdFilesystem,
         SystemClock,
@@ -112,9 +109,8 @@ fn index_handler(pool: &SqlitePool, filesystem_root: &str) -> Arc<TestIndex> {
 fn registrar(
     pool: &SqlitePool,
     filesystem_root: &str,
-) -> RegisterLibraryHandler<FakeAuth, SqliteLibraryRepository, Arc<TestIndex>> {
+) -> RegisterLibraryHandler<SqliteLibraryRepository, Arc<TestIndex>> {
     RegisterLibraryHandler::new(
-        FakeAuth::Allowing,
         SqliteLibraryRepository::new(pool.clone()),
         index_handler(pool, filesystem_root),
         LibraryRoot::new(filesystem_root),
@@ -123,14 +119,8 @@ fn registrar(
 
 fn indexer(
     pool: &SqlitePool,
-) -> IndexLibraryHandler<
-    FakeAuth,
-    SqliteLibraryRepository,
-    Arc<TestIndex>,
-    SqliteCatalogRunRepository,
-> {
+) -> IndexLibraryHandler<SqliteLibraryRepository, Arc<TestIndex>, SqliteCatalogRunRepository> {
     IndexLibraryHandler::new(
-        FakeAuth::Allowing,
         SqliteLibraryRepository::new(pool.clone()),
         index_handler(pool, ""),
         SqliteCatalogRunRepository::new(pool.clone()),
@@ -139,9 +129,8 @@ fn indexer(
 
 fn mover(
     pool: &SqlitePool,
-) -> MoveLibraryHandler<FakeAuth, SqliteLibraryRepository, SqliteCatalogRunRepository> {
+) -> MoveLibraryHandler<SqliteLibraryRepository, SqliteCatalogRunRepository> {
     MoveLibraryHandler::new(
-        FakeAuth::Allowing,
         SqliteLibraryRepository::new(pool.clone()),
         LibraryRoot::new(""),
         SqliteCatalogRunRepository::new(pool.clone()),
@@ -150,7 +139,7 @@ fn mover(
 
 async fn register(pool: &SqlitePool, root: &str) -> Uuid {
     registrar(pool, "")
-        .register("Course", root, RunPriority::Normal, "token")
+        .register("Course", root, RunPriority::Normal)
         .await
         .expect("register")
         .library
@@ -161,7 +150,7 @@ async fn register(pool: &SqlitePool, root: &str) -> Uuid {
 /// does by spawning it.
 async fn register_and_walk(pool: &SqlitePool, root: &str) -> (RegisteredLibrary, IndexOutcome) {
     let registered = registrar(pool, "")
-        .register("Course", root, RunPriority::Normal, "token")
+        .register("Course", root, RunPriority::Normal)
         .await
         .expect("register");
     let outcome = index_handler(pool, "")
@@ -333,12 +322,7 @@ async fn given_a_folder_that_does_not_exist_when_registered_then_invalid_input_a
     let missing = dir.path().join("nowhere");
 
     let result = registrar(&pool, "")
-        .register(
-            "Gone",
-            missing.to_str().unwrap(),
-            RunPriority::Normal,
-            "token",
-        )
+        .register("Gone", missing.to_str().unwrap(), RunPriority::Normal)
         .await;
 
     assert!(
@@ -358,12 +342,7 @@ async fn given_a_folder_outside_filesystem_root_when_registered_then_refused_and
     let pool = migrated(dir.path()).await;
 
     let result = registrar(&pool, bound.to_str().unwrap())
-        .register(
-            "Out",
-            outside.to_str().unwrap(),
-            RunPriority::Normal,
-            "token",
-        )
+        .register("Out", outside.to_str().unwrap(), RunPriority::Normal)
         .await;
 
     assert!(result.is_err(), "{result:?}");
@@ -382,7 +361,6 @@ async fn given_an_overlapping_folder_when_registered_then_conflict_naming_the_li
             "Inner",
             root.join("class-01").to_str().unwrap(),
             RunPriority::Normal,
-            "token",
         )
         .await;
 
@@ -405,7 +383,7 @@ async fn given_an_indexed_library_when_reindexed_then_existing_files_count_as_al
     let (registered, _) = register_and_walk(&pool, root.to_str().unwrap()).await;
 
     let (library, started) = indexer(&pool)
-        .index(registered.library.uuid, RunPriority::Normal, "token")
+        .index(registered.library.uuid, RunPriority::Normal)
         .await
         .expect("reindex");
     let outcome = index_handler(&pool, "")
@@ -424,18 +402,13 @@ async fn given_a_paused_run_when_the_library_is_reindexed_then_conflict_naming_t
     let root = mixed(dir.path());
     let pool = migrated(dir.path()).await;
     let registered = registrar(&pool, "")
-        .register(
-            "Mixed",
-            root.to_str().unwrap(),
-            RunPriority::Normal,
-            "token",
-        )
+        .register("Mixed", root.to_str().unwrap(), RunPriority::Normal)
         .await
         .expect("register");
     pause(&pool, registered.run_id).await;
 
     let result = indexer(&pool)
-        .index(registered.library.uuid, RunPriority::Normal, "token")
+        .index(registered.library.uuid, RunPriority::Normal)
         .await;
 
     match result {
@@ -455,7 +428,7 @@ async fn given_an_unknown_library_when_reindexed_then_not_found() {
     let pool = migrated(dir.path()).await;
 
     let result = indexer(&pool)
-        .index(Uuid::new_v4(), RunPriority::Normal, "token")
+        .index(Uuid::new_v4(), RunPriority::Normal)
         .await;
 
     assert!(matches!(result, Err(DomainError::NotFound)), "{result:?}");
@@ -467,12 +440,7 @@ async fn given_a_paused_run_when_the_library_is_moved_then_conflict_naming_the_r
     let root = mixed(dir.path());
     let pool = migrated(dir.path()).await;
     let registered = registrar(&pool, "")
-        .register(
-            "Mixed",
-            root.to_str().unwrap(),
-            RunPriority::Normal,
-            "token",
-        )
+        .register("Mixed", root.to_str().unwrap(), RunPriority::Normal)
         .await
         .expect("register");
     pause(&pool, registered.run_id).await;
@@ -481,7 +449,6 @@ async fn given_a_paused_run_when_the_library_is_moved_then_conflict_naming_the_r
         .move_to(
             registered.library.uuid,
             dir.path().join("elsewhere").to_str().unwrap(),
-            "token",
         )
         .await;
 
@@ -502,12 +469,7 @@ async fn given_a_library_run_when_its_status_is_read_then_it_carries_the_library
     let root = mixed(dir.path());
     let pool = migrated(dir.path()).await;
     let registered = registrar(&pool, "")
-        .register(
-            "Mixed",
-            root.to_str().unwrap(),
-            RunPriority::Normal,
-            "token",
-        )
+        .register("Mixed", root.to_str().unwrap(), RunPriority::Normal)
         .await
         .expect("register");
     let runs = SqliteCatalogRunRepository::new(pool.clone());
@@ -569,7 +531,6 @@ async fn given_a_file_instead_of_a_folder_when_registered_then_invalid_input_and
             "One file",
             root.join("a.md").to_str().unwrap(),
             RunPriority::Normal,
-            "token",
         )
         .await;
 
@@ -594,7 +555,6 @@ async fn given_a_missing_folder_inside_a_library_when_registered_then_invalid_in
             "Gone",
             root.join("nowhere").to_str().unwrap(),
             RunPriority::Normal,
-            "token",
         )
         .await;
 

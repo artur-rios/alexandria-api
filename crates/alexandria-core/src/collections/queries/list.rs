@@ -1,4 +1,3 @@
-use crate::auth::AuthService;
 use crate::collections::model::{CollectionKind, CollectionSummary};
 use crate::collections::repos::CollectionRepository;
 use crate::errors::DomainError;
@@ -12,21 +11,16 @@ use crate::errors::DomainError;
 /// Generic over the collection repository alone: the item counts come from the
 /// same query as the rows, so neither the catalog nor the bookmark repository
 /// is involved.
-pub struct ListCollectionsHandler<A, CR> {
-    auth: A,
+pub struct ListCollectionsHandler<CR> {
     collection_repo: CR,
 }
 
-impl<A, CR> ListCollectionsHandler<A, CR>
+impl<CR> ListCollectionsHandler<CR>
 where
-    A: AuthService,
     CR: CollectionRepository,
 {
-    pub fn new(auth: A, collection_repo: CR) -> Self {
-        Self {
-            auth,
-            collection_repo,
-        }
+    pub fn new(collection_repo: CR) -> Self {
+        Self { collection_repo }
     }
 
     /// List the collections, optionally narrowed to `kind`.
@@ -42,12 +36,7 @@ where
     pub async fn list(
         &self,
         kind: Option<CollectionKind>,
-        token: &str,
     ) -> Result<Vec<CollectionSummary>, DomainError> {
-        // AF-03: the caller must be authenticated. Evaluated before anything
-        // is read (FR-AU-07 / SRD §7).
-        self.auth.authenticate(token).await?;
-
         self.collection_repo.list_collections(kind).await
     }
 }

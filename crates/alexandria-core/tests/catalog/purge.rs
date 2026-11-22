@@ -1,9 +1,9 @@
-//! Unit tests for the UC-08 PurgeFileHandler (Testing Specification §6).
-//! Each test exercises exactly the handler against trait fakes — no real DB,
-//! filesystem, or auth service. Coverage follows §6.3: happy path, every
-//! `AF-xx` alternative flow, the not-deleted state precondition, the
-//! retention-window boundary (inclusive-restorable / strict-purgeable), and
-//! the repository-write-failure branch.
+//! Unit tests for the UC-08 PurgeFileHandler (Testing Specification §6). Each
+//! test exercises exactly the handler against trait fakes — no real DB or
+//! filesystem. Coverage follows §6.3: happy path, every `AF-xx` alternative
+//! flow, the not-deleted state precondition, the retention-window boundary
+//! (inclusive-restorable / strict-purgeable), and the repository-write-failure
+//! branch.
 
 use chrono::Duration;
 use uuid::Uuid;
@@ -13,21 +13,17 @@ use alexandria_core::catalog::commands::purge::PurgeFileHandler;
 use alexandria_core::catalog::model::FileState;
 use alexandria_core::errors::DomainError;
 
-use crate::common::{
-    deleted_file_at, existing_file, fixed_clock, now, FakeAuth, FakeCatalogRepository,
-};
+use crate::common::{deleted_file_at, existing_file, fixed_clock, now, FakeCatalogRepository};
 
-const TOKEN: &str = "bearer-token";
 const RETENTION_DAYS: u32 = 30;
 const RETENTION: Duration = Duration::seconds((RETENTION_DAYS as i64) * 86_400);
 
 fn handler(
-    auth: FakeAuth,
     repo: FakeCatalogRepository,
     clock: FixedClock,
     retention_days: u32,
-) -> PurgeFileHandler<FakeAuth, FakeCatalogRepository, FixedClock> {
-    PurgeFileHandler::new(auth, repo, clock, retention_days)
+) -> PurgeFileHandler<FakeCatalogRepository, FixedClock> {
+    PurgeFileHandler::new(repo, clock, retention_days)
 }
 
 /// Seed a `deleted` file whose `deleted_at` is `now - elapsed` and return
@@ -40,7 +36,7 @@ fn seeded_deleted_at(
     Uuid,
     FakeCatalogRepository,
     FixedClock,
-    PurgeFileHandler<FakeAuth, FakeCatalogRepository, FixedClock>,
+    PurgeFileHandler<FakeCatalogRepository, FixedClock>,
 ) {
     let deleted_at = now() - elapsed;
     let repo = FakeCatalogRepository::new();
@@ -53,7 +49,7 @@ fn seeded_deleted_at(
     let uuid = file.uuid;
     repo.seed(file);
     let clock = fixed_clock(now());
-    let h = handler(FakeAuth::Allowing, repo.clone(), clock, RETENTION_DAYS);
+    let h = handler(repo.clone(), clock, RETENTION_DAYS);
     (uuid, repo, clock, h)
 }
 
@@ -71,7 +67,7 @@ fn seeded_deleted_at(
 async fn given_deleted_file_past_retention_when_purge_then_record_removed_and_file_returned() {
     let (uuid, repo, _clock, h) = seeded_deleted_at("/lib/memo.txt", RETENTION * 2);
 
-    let result = h.purge(uuid, TOKEN).await.expect("purge");
+    let result = h.purge(uuid).await.expect("purge");
 
     assert_eq!(result.uuid, uuid);
     assert_eq!(result.state, FileState::Deleted);
@@ -87,7 +83,7 @@ async fn given_deleted_file_exactly_on_retention_boundary_when_purge_then_invali
     // restorable and not yet purgeable (the exact complement of UC-07).
     let (uuid, repo, _clock, h) = seeded_deleted_at("/lib/memo.txt", RETENTION);
 
-    let result = h.purge(uuid, TOKEN).await;
+    let result = h.purge(uuid).await;
 
     assert!(matches!(result, Err(DomainError::InvalidState)));
     let persisted = repo.file_for_uuid(uuid).unwrap();
@@ -100,7 +96,7 @@ async fn given_deleted_file_one_second_past_retention_when_purge_then_record_rem
     let (uuid, repo, _clock, h) =
         seeded_deleted_at("/lib/memo.txt", RETENTION + Duration::seconds(1));
 
-    let result = h.purge(uuid, TOKEN).await;
+    let result = h.purge(uuid).await;
 
     assert!(
         result.is_ok(),
@@ -115,7 +111,7 @@ async fn given_deleted_file_within_retention_when_purge_then_invalid_state_and_r
     let (uuid, repo, _clock, h) =
         seeded_deleted_at("/lib/memo.txt", RETENTION - Duration::seconds(1000));
 
-    let result = h.purge(uuid, TOKEN).await;
+    let result = h.purge(uuid).await;
 
     assert!(matches!(result, Err(DomainError::InvalidState)));
     let persisted = repo.file_for_uuid(uuid).unwrap();
@@ -134,14 +130,9 @@ async fn given_active_file_when_purge_then_invalid_state_and_record_kept() {
     );
     let uuid = file.uuid;
     repo.seed(file);
-    let h = handler(
-        FakeAuth::Allowing,
-        repo.clone(),
-        fixed_clock(now()),
-        RETENTION_DAYS,
-    );
+    let h = handler(repo.clone(), fixed_clock(now()), RETENTION_DAYS);
 
-    let result = h.purge(uuid, TOKEN).await;
+    let result = h.purge(uuid).await;
 
     assert!(matches!(result, Err(DomainError::InvalidState)));
     let persisted = repo.file_for_uuid(uuid).unwrap();
@@ -156,30 +147,9 @@ async fn given_missing_uuid_when_purge_then_not_found() {
         seeded_deleted_at("/lib/memo.txt", RETENTION + Duration::seconds(1));
     let other_uuid = uuid::Uuid::new_v4();
 
-    let result = h.purge(other_uuid, TOKEN).await;
+    let result = h.purge(other_uuid).await;
 
     assert!(matches!(result, Err(DomainError::NotFound)));
-}
-
-// ---------------- AF-03: unauthorized ----------------
-
-#[tokio::test]
-async fn given_unauthenticated_when_purge_then_unauthorized_and_record_kept() {
-    let (uuid, repo, _clock, _h) =
-        seeded_deleted_at("/lib/memo.txt", RETENTION + Duration::seconds(1));
-    let h = handler(
-        FakeAuth::Denying,
-        repo.clone(),
-        fixed_clock(now()),
-        RETENTION_DAYS,
-    );
-
-    let result = h.purge(uuid, "").await;
-
-    assert!(matches!(result, Err(DomainError::Unauthorized)));
-    let persisted = repo.file_for_uuid(uuid).unwrap();
-    assert_eq!(persisted.state, FileState::Deleted);
-    assert!(persisted.deleted_at.is_some());
 }
 
 // ---------------- Repository write failure ----------------
@@ -189,14 +159,9 @@ async fn given_purge_when_repo_write_fails_then_error_propagated_and_record_kept
     let (uuid, repo, _clock, _h) =
         seeded_deleted_at("/lib/memo.txt", RETENTION + Duration::seconds(1));
     repo.fail_purge(uuid);
-    let h = handler(
-        FakeAuth::Allowing,
-        repo.clone(),
-        fixed_clock(now()),
-        RETENTION_DAYS,
-    );
+    let h = handler(repo.clone(), fixed_clock(now()), RETENTION_DAYS);
 
-    let result = h.purge(uuid, TOKEN).await;
+    let result = h.purge(uuid).await;
 
     assert!(matches!(result, Err(DomainError::Internal(_))));
     let persisted = repo.file_for_uuid(uuid).unwrap();

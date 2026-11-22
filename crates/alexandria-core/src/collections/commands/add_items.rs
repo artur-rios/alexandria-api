@@ -1,6 +1,5 @@
 use uuid::Uuid;
 
-use crate::auth::AuthService;
 use crate::bookmarks::repos::BookmarkRepository;
 use crate::catalog::repos::CatalogRepository;
 use crate::collections::model::{
@@ -18,23 +17,20 @@ use crate::errors::DomainError;
 /// depending on whether the collection is `kind = file` or `kind = bookmark`.
 /// There is no `Clock` or `Filesystem` collaborator — linking touches no
 /// timestamps and nothing on disk.
-pub struct AddItemsToCollectionHandler<A, CR, CATR, BR> {
-    auth: A,
+pub struct AddItemsToCollectionHandler<CR, CATR, BR> {
     collection_repo: CR,
     catalog_repo: CATR,
     bookmark_repo: BR,
 }
 
-impl<A, CR, CATR, BR> AddItemsToCollectionHandler<A, CR, CATR, BR>
+impl<CR, CATR, BR> AddItemsToCollectionHandler<CR, CATR, BR>
 where
-    A: AuthService,
     CR: CollectionRepository,
     CATR: CatalogRepository,
     BR: BookmarkRepository,
 {
-    pub fn new(auth: A, collection_repo: CR, catalog_repo: CATR, bookmark_repo: BR) -> Self {
+    pub fn new(collection_repo: CR, catalog_repo: CATR, bookmark_repo: BR) -> Self {
         Self {
-            auth,
             collection_repo,
             catalog_repo,
             bookmark_repo,
@@ -56,12 +52,7 @@ where
         &self,
         collection_uuid: Uuid,
         item_uuids: Vec<Uuid>,
-        token: &str,
     ) -> Result<CollectionItemsResult, DomainError> {
-        // AF-04: the caller must be authenticated. Evaluated before the
-        // collection or items are looked up (FR-AU-07 / SRD §7).
-        self.auth.authenticate(token).await?;
-
         // AF-03: the collection must exist. Still an error — a request naming
         // no collection has nothing to report per item.
         let collection = self

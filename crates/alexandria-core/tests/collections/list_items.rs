@@ -1,8 +1,7 @@
-//! Unit tests for the UC-14 ListCollectionItemsHandler (Testing
-//! Specification §6). Each test exercises exactly the handler against trait
-//! fakes — no real DB or auth service. Coverage follows §6.3: happy path for
-//! each `kind` (including empty membership), AF-01 (unknown collection),
-//! AF-02 (unauthorized).
+//! Unit tests for the UC-14 ListCollectionItemsHandler (Testing Specification
+//! §6). Each test exercises exactly the handler against trait fakes — no real
+//! DB. Coverage follows §6.3: happy path for each `kind` (including empty
+//! membership), and AF-01 (unknown collection).
 
 use uuid::Uuid;
 
@@ -13,26 +12,20 @@ use alexandria_core::collections::model::{Collection, CollectionItems, Collectio
 use alexandria_core::collections::queries::list_items::ListCollectionItemsHandler;
 use alexandria_core::errors::DomainError;
 
-use crate::common::{
-    FakeAuth, FakeBookmarkRepository, FakeCatalogRepository, FakeCollectionRepository,
-};
-
-const TOKEN: &str = "bearer-token";
+use crate::common::{FakeBookmarkRepository, FakeCatalogRepository, FakeCollectionRepository};
 
 type Handler = ListCollectionItemsHandler<
-    FakeAuth,
     FakeCollectionRepository,
     FakeCatalogRepository,
     FakeBookmarkRepository,
 >;
 
 fn handler(
-    auth: FakeAuth,
     collection_repo: FakeCollectionRepository,
     catalog_repo: FakeCatalogRepository,
     bookmark_repo: FakeBookmarkRepository,
 ) -> Handler {
-    ListCollectionItemsHandler::new(auth, collection_repo, catalog_repo, bookmark_repo)
+    ListCollectionItemsHandler::new(collection_repo, catalog_repo, bookmark_repo)
 }
 
 fn a_file(uuid: Uuid) -> File {
@@ -81,14 +74,9 @@ async fn given_file_collection_with_members_when_list_then_files_returned() {
         .set_collection(file_uuid, collection_uuid)
         .await
         .expect("link");
-    let h = handler(
-        FakeAuth::Allowing,
-        collection_repo,
-        catalog_repo,
-        FakeBookmarkRepository::new(),
-    );
+    let h = handler(collection_repo, catalog_repo, FakeBookmarkRepository::new());
 
-    let result = h.list(collection_uuid, TOKEN).await.expect("list");
+    let result = h.list(collection_uuid).await.expect("list");
 
     assert_eq!(result.collection_uuid, collection_uuid);
     assert_eq!(result.kind, CollectionKind::File);
@@ -113,14 +101,9 @@ async fn given_bookmark_collection_with_members_when_list_then_bookmarks_returne
     });
     let bookmark_uuid = Uuid::new_v4();
     bookmark_repo.seed(a_bookmark(bookmark_uuid, Some(collection_uuid)));
-    let h = handler(
-        FakeAuth::Allowing,
-        collection_repo,
-        FakeCatalogRepository::new(),
-        bookmark_repo,
-    );
+    let h = handler(collection_repo, FakeCatalogRepository::new(), bookmark_repo);
 
-    let result = h.list(collection_uuid, TOKEN).await.expect("list");
+    let result = h.list(collection_uuid).await.expect("list");
 
     assert_eq!(result.kind, CollectionKind::Bookmark);
     match result.items {
@@ -142,13 +125,12 @@ async fn given_empty_collection_when_list_then_empty_array_returned() {
         kind: CollectionKind::File,
     });
     let h = handler(
-        FakeAuth::Allowing,
         collection_repo,
         FakeCatalogRepository::new(),
         FakeBookmarkRepository::new(),
     );
 
-    let result = h.list(collection_uuid, TOKEN).await.expect("list");
+    let result = h.list(collection_uuid).await.expect("list");
 
     match result.items {
         CollectionItems::Files(files) => assert!(files.is_empty()),
@@ -161,29 +143,12 @@ async fn given_empty_collection_when_list_then_empty_array_returned() {
 #[tokio::test]
 async fn given_unknown_collection_uuid_when_list_then_not_found() {
     let h = handler(
-        FakeAuth::Allowing,
         FakeCollectionRepository::new(),
         FakeCatalogRepository::new(),
         FakeBookmarkRepository::new(),
     );
 
-    let result = h.list(Uuid::new_v4(), TOKEN).await;
+    let result = h.list(Uuid::new_v4()).await;
 
     assert!(matches!(result, Err(DomainError::NotFound)));
-}
-
-// ---------------- AF-02: unauthorized ----------------
-
-#[tokio::test]
-async fn given_unauthenticated_when_list_then_unauthorized() {
-    let h = handler(
-        FakeAuth::Denying,
-        FakeCollectionRepository::new(),
-        FakeCatalogRepository::new(),
-        FakeBookmarkRepository::new(),
-    );
-
-    let result = h.list(Uuid::new_v4(), "").await;
-
-    assert!(matches!(result, Err(DomainError::Unauthorized)));
 }

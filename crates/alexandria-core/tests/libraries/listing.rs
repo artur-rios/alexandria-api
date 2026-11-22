@@ -9,7 +9,7 @@ use chrono::Utc;
 use sqlx::sqlite::SqlitePool;
 use uuid::Uuid;
 
-use crate::common::{seed_library, FakeAuth};
+use crate::common::seed_library;
 
 async fn migrated(dir: &tempfile::TempDir) -> SqlitePool {
     migrate_database(dir.path().join("a.sqlite").to_str().unwrap())
@@ -35,16 +35,14 @@ async fn file(pool: &SqlitePool, library: Uuid, path: &str) {
 }
 
 async fn listed(pool: &SqlitePool, filter: FileFilter) -> Vec<String> {
-    let mut paths: Vec<String> = BrowseFilesHandler::new(
-        FakeAuth::Allowing,
-        SqliteCatalogRepository::new(pool.clone()),
-    )
-    .list(filter, "token")
-    .await
-    .expect("list")
-    .into_iter()
-    .map(|view| view.file.path)
-    .collect();
+    let mut paths: Vec<String> =
+        BrowseFilesHandler::new(SqliteCatalogRepository::new(pool.clone()))
+            .list(filter)
+            .await
+            .expect("list")
+            .into_iter()
+            .map(|view| view.file.path)
+            .collect();
     paths.sort();
     paths
 }

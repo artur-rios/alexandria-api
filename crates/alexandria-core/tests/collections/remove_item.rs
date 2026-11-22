@@ -1,8 +1,8 @@
 //! Unit tests for the UC-14 RemoveItemFromCollectionHandler (Testing
 //! Specification §6). Each test exercises exactly the handler against trait
-//! fakes — no real DB or auth service. Coverage follows §6.3: happy path for
-//! each `kind`, AF-01 (item unknown or not in the collection), AF-02
-//! (unknown collection), AF-03 (unauthorized).
+//! fakes — no real DB. Coverage follows §6.3: happy path for each `kind`,
+//! AF-01 (item unknown or not in the collection), and AF-02 (unknown
+//! collection).
 
 use uuid::Uuid;
 
@@ -13,26 +13,20 @@ use alexandria_core::collections::commands::remove_item::RemoveItemFromCollectio
 use alexandria_core::collections::model::{Collection, CollectionKind};
 use alexandria_core::errors::DomainError;
 
-use crate::common::{
-    FakeAuth, FakeBookmarkRepository, FakeCatalogRepository, FakeCollectionRepository,
-};
-
-const TOKEN: &str = "bearer-token";
+use crate::common::{FakeBookmarkRepository, FakeCatalogRepository, FakeCollectionRepository};
 
 type Handler = RemoveItemFromCollectionHandler<
-    FakeAuth,
     FakeCollectionRepository,
     FakeCatalogRepository,
     FakeBookmarkRepository,
 >;
 
 fn handler(
-    auth: FakeAuth,
     collection_repo: FakeCollectionRepository,
     catalog_repo: FakeCatalogRepository,
     bookmark_repo: FakeBookmarkRepository,
 ) -> Handler {
-    RemoveItemFromCollectionHandler::new(auth, collection_repo, catalog_repo, bookmark_repo)
+    RemoveItemFromCollectionHandler::new(collection_repo, catalog_repo, bookmark_repo)
 }
 
 fn a_file(uuid: Uuid) -> File {
@@ -82,16 +76,12 @@ async fn given_linked_file_when_remove_then_unlinked_and_result_returned() {
         .await
         .expect("link");
     let h = handler(
-        FakeAuth::Allowing,
         collection_repo,
         catalog_repo.clone(),
         FakeBookmarkRepository::new(),
     );
 
-    let result = h
-        .remove(collection_uuid, file_uuid, TOKEN)
-        .await
-        .expect("remove");
+    let result = h.remove(collection_uuid, file_uuid).await.expect("remove");
 
     assert_eq!(result.collection_uuid, collection_uuid);
     assert_eq!(result.item_uuid, file_uuid);
@@ -111,13 +101,12 @@ async fn given_linked_bookmark_when_remove_then_unlinked() {
     let bookmark_uuid = Uuid::new_v4();
     bookmark_repo.seed(a_bookmark(bookmark_uuid, Some(collection_uuid)));
     let h = handler(
-        FakeAuth::Allowing,
         collection_repo,
         FakeCatalogRepository::new(),
         bookmark_repo.clone(),
     );
 
-    h.remove(collection_uuid, bookmark_uuid, TOKEN)
+    h.remove(collection_uuid, bookmark_uuid)
         .await
         .expect("remove");
 
@@ -142,13 +131,12 @@ async fn given_unknown_item_when_remove_then_not_found() {
         kind: CollectionKind::File,
     });
     let h = handler(
-        FakeAuth::Allowing,
         collection_repo,
         FakeCatalogRepository::new(),
         FakeBookmarkRepository::new(),
     );
 
-    let result = h.remove(collection_uuid, Uuid::new_v4(), TOKEN).await;
+    let result = h.remove(collection_uuid, Uuid::new_v4()).await;
 
     assert!(matches!(result, Err(DomainError::NotFound)));
 }
@@ -171,13 +159,12 @@ async fn given_item_not_in_this_collection_when_remove_then_not_found() {
         .await
         .expect("link elsewhere");
     let h = handler(
-        FakeAuth::Allowing,
         collection_repo,
         catalog_repo.clone(),
         FakeBookmarkRepository::new(),
     );
 
-    let result = h.remove(collection_uuid, file_uuid, TOKEN).await;
+    let result = h.remove(collection_uuid, file_uuid).await;
 
     assert!(matches!(result, Err(DomainError::NotFound)));
     assert_eq!(
@@ -192,29 +179,12 @@ async fn given_item_not_in_this_collection_when_remove_then_not_found() {
 #[tokio::test]
 async fn given_unknown_collection_uuid_when_remove_then_not_found() {
     let h = handler(
-        FakeAuth::Allowing,
         FakeCollectionRepository::new(),
         FakeCatalogRepository::new(),
         FakeBookmarkRepository::new(),
     );
 
-    let result = h.remove(Uuid::new_v4(), Uuid::new_v4(), TOKEN).await;
+    let result = h.remove(Uuid::new_v4(), Uuid::new_v4()).await;
 
     assert!(matches!(result, Err(DomainError::NotFound)));
-}
-
-// ---------------- AF-03: unauthorized ----------------
-
-#[tokio::test]
-async fn given_unauthenticated_when_remove_then_unauthorized() {
-    let h = handler(
-        FakeAuth::Denying,
-        FakeCollectionRepository::new(),
-        FakeCatalogRepository::new(),
-        FakeBookmarkRepository::new(),
-    );
-
-    let result = h.remove(Uuid::new_v4(), Uuid::new_v4(), "").await;
-
-    assert!(matches!(result, Err(DomainError::Unauthorized)));
 }

@@ -1,6 +1,5 @@
 use uuid::Uuid;
 
-use crate::auth::AuthService;
 use crate::catalog::fs::Filesystem;
 use crate::catalog::library_root::LibraryRoot;
 use crate::catalog::model::{FileContent, FileState, FileType};
@@ -10,13 +9,12 @@ use crate::errors::DomainError;
 /// UC-32 — Read text file content (FR-TX-01). Reads the current on-disk
 /// content of a TextFile.
 ///
-/// Generic over auth, catalog repository, and filesystem so the same
-/// decision logic is unit-tested against trait fakes (no real DB, fs, or
-/// auth in unit tests), then wired with the concrete collaborators at
-/// runtime (services.rs). Both the HTTP and FFI surfaces call this handler
-/// so the two stay at parity (FR-FC-24 / NFR-09).
-pub struct ReadTextFileContentHandler<A, R, F> {
-    auth: A,
+/// Generic over the catalog repository and filesystem so the same decision
+/// logic is unit-tested against trait fakes (no real DB or fs in unit tests),
+/// then wired with the concrete collaborators at runtime (services.rs). Both
+/// the HTTP and FFI surfaces call this handler so the two stay at parity
+/// (FR-FC-24 / NFR-09).
+pub struct ReadTextFileContentHandler<R, F> {
     repo: R,
     fs: F,
     /// `filesystem.root` (FR-FC-26): a row pointing outside it has its
@@ -24,15 +22,13 @@ pub struct ReadTextFileContentHandler<A, R, F> {
     library_root: LibraryRoot,
 }
 
-impl<A, R, F> ReadTextFileContentHandler<A, R, F>
+impl<R, F> ReadTextFileContentHandler<R, F>
 where
-    A: AuthService,
     R: CatalogRepository,
     F: Filesystem,
 {
-    pub fn new(auth: A, repo: R, fs: F, library_root: LibraryRoot) -> Self {
+    pub fn new(repo: R, fs: F, library_root: LibraryRoot) -> Self {
         Self {
-            auth,
             repo,
             fs,
             library_root,
@@ -40,10 +36,7 @@ where
     }
 
     /// Read the content of the TextFile identified by `uuid`.
-    pub async fn read(&self, uuid: Uuid, token: &str) -> Result<FileContent, DomainError> {
-        // AF-04: the caller must be authenticated.
-        self.auth.authenticate(token).await?;
-
+    pub async fn read(&self, uuid: Uuid) -> Result<FileContent, DomainError> {
         // AF-03: the file must exist.
         let file = self
             .repo

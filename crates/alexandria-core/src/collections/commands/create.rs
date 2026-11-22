@@ -1,6 +1,5 @@
 use uuid::Uuid;
 
-use crate::auth::AuthService;
 use crate::collections::model::{Collection, CollectionKind, NewCollection};
 use crate::collections::repos::CollectionRepository;
 use crate::errors::DomainError;
@@ -51,22 +50,20 @@ pub fn validate_collection_name(name: &str) -> Result<String, DomainError> {
 ///
 /// Like the catalog's lifecycle handlers the command is the handler itself (no
 /// separate `Command` struct): construction wires the collaborators
-/// (`AuthService`, `CollectionRepository`) and `create` is the domain entry
-/// point. There is no `Clock` collaborator — a collection carries no
-/// timestamps (SRD §4.3) — and no `Filesystem`: a collection is catalog-only
-/// metadata with nothing on disk to compensate on failure.
-pub struct CreateCollectionHandler<A, R> {
-    auth: A,
+/// (`CollectionRepository`) and `create` is the domain entry point. There is
+/// no `Clock` collaborator — a collection carries no timestamps (SRD §4.3) —
+/// and no `Filesystem`: a collection is catalog-only metadata with nothing on
+/// disk to compensate on failure.
+pub struct CreateCollectionHandler<R> {
     repo: R,
 }
 
-impl<A, R> CreateCollectionHandler<A, R>
+impl<R> CreateCollectionHandler<R>
 where
-    A: AuthService,
     R: CollectionRepository,
 {
-    pub fn new(auth: A, repo: R) -> Self {
-        Self { auth, repo }
+    pub fn new(repo: R) -> Self {
+        Self { repo }
     }
 
     /// Create a collection named `name` holding items of `kind`, and return
@@ -75,13 +72,7 @@ where
         &self,
         name: &str,
         kind: CollectionKind,
-        token: &str,
     ) -> Result<Collection, DomainError> {
-        // AF-02: the caller must be authenticated. Evaluation happens before
-        // the payload is consulted (FR-AU-07 / SRD §7), so an unauthenticated
-        // caller never learns whether its name would have been accepted.
-        self.auth.authenticate(token).await?;
-
         // AF-01: the name must be valid. An invalid `kind` cannot reach here —
         // it is a typed enum, so both transports reject an unrecognised value
         // while deserializing the request body.

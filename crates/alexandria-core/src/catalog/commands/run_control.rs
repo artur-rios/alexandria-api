@@ -1,6 +1,5 @@
 use uuid::Uuid;
 
-use crate::auth::AuthService;
 use crate::catalog::clock::Clock;
 use crate::catalog::run_registry::{RunRegistry, RunSignal};
 use crate::catalog::runs::{CatalogRunRepository, RunKind, RunPriority, RunStatus};
@@ -22,14 +21,12 @@ use crate::retry::{retry_on_busy, BUSY_ATTEMPTS};
 /// that records its own stopping point exactly once, in the same place it
 /// would have recorded its completion.
 ///
-/// Generic over the auth service, the run repository, and the clock, then
-/// wired with the concrete Runtime/Sqlite/System collaborators at runtime
-/// (services.rs). The clock is needed for the one case that writes the row
-/// from here — a run with no live cell, below. The registry is concrete: a
-/// process-local map of atomics with no I/O behind it, so there is nothing to
-/// fake.
-pub struct RunControlHandler<A, RR, C> {
-    auth: A,
+/// Generic over the run repository and the clock, then wired with the concrete
+/// Sqlite/System collaborators at runtime (services.rs). The clock is needed
+/// for the one case that writes the row from here — a run with no live cell,
+/// below. The registry is concrete: a process-local map of atomics with no I/O
+/// behind it, so there is nothing to fake.
+pub struct RunControlHandler<RR, C> {
     runs: RR,
     clock: C,
     registry: RunRegistry,
@@ -101,9 +98,8 @@ impl Verb {
     }
 }
 
-impl<A, RR, C> RunControlHandler<A, RR, C>
+impl<RR, C> RunControlHandler<RR, C>
 where
-    A: AuthService,
     RR: CatalogRunRepository,
     C: Clock,
 {
@@ -115,7 +111,6 @@ where
     /// meaningless for either: a walk that processes no files at a time is
     /// not a slower walk, it is no walk.
     pub fn new(
-        auth: A,
         runs: RR,
         clock: C,
         registry: RunRegistry,
@@ -123,7 +118,6 @@ where
         low_priority_concurrency: u32,
     ) -> Self {
         Self {
-            auth,
             runs,
             clock,
             registry,
@@ -144,13 +138,13 @@ where
     }
 
     /// Stop a running run where it is, leaving it resumable.
-    pub async fn pause(&self, run_id: Uuid, token: &str) -> Result<(), DomainError> {
-        self.control(run_id, token, Verb::Pause).await
+    pub async fn pause(&self, run_id: Uuid) -> Result<(), DomainError> {
+        self.control(run_id, Verb::Pause).await
     }
 
     /// Abandon a run. Terminal — a cancelled run is not resumed.
-    pub async fn cancel(&self, run_id: Uuid, token: &str) -> Result<(), DomainError> {
-        self.control(run_id, token, Verb::Cancel).await
+    pub async fn cancel(&self, run_id: Uuid) -> Result<(), DomainError> {
+        self.control(run_id, Verb::Cancel).await
     }
 
     /// Put a paused run back to work, and tell the caller what to spawn.
@@ -182,13 +176,8 @@ where
     pub async fn resume(
         &self,
         run_id: Uuid,
-        token: &str,
         priority: Option<RunPriority>,
     ) -> Result<RunResumed, DomainError> {
-        // Ahead of the lookup, for the reason `control` does it: a caller
-        // with a bad token must learn neither that the run exists nor what
-        // state it is in.
-        self.auth.authenticate(token).await?;
         let run = self.runs.get(run_id).await?.ok_or(DomainError::NotFound)?;
         if run.status != RunStatus::Paused {
             return Err(DomainError::InvalidState);
@@ -248,12 +237,7 @@ where
         })
     }
 
-    async fn control(&self, run_id: Uuid, token: &str, verb: Verb) -> Result<(), DomainError> {
-        // AF-02, and first: everything after this point discloses something
-        // about the run — whether it exists, and what state it is in. A
-        // caller with a bad token must learn neither, so authentication runs
-        // ahead of the lookup, not alongside it.
-        self.auth.authenticate(token).await?;
+    async fn control(&self, run_id: Uuid, verb: Verb) -> Result<(), DomainError> {
         // AF-01: an id naming no run.
         let run = self.runs.get(run_id).await?.ok_or(DomainError::NotFound)?;
         if !verb.permits(run.status) {

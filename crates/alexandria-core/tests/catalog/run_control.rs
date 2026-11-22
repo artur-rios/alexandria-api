@@ -1,11 +1,10 @@
 //! Unit tests for `RunControlHandler` against trait fakes — no database.
 //!
-//! Coverage: authentication ahead of everything else, the unknown id, every
-//! legal transition, every illegal one, and the two ways a legal call is
-//! carried out — raising the signal on a live cell, or writing the row
-//! directly for a run this process is not executing. Resume is here too: it
-//! is the third verb of the same state machine, and the only one that both
-//! writes the row and answers with something.
+//! Coverage: the unknown id, every legal transition, every illegal one, and
+//! the two ways a legal call is carried out — raising the signal on a live
+//! cell, or writing the row directly for a run this process is not executing.
+//! Resume is here too: it is the third verb of the same state machine, and the
+//! only one that both writes the row and answers with something.
 
 use chrono::{TimeZone, Utc};
 use uuid::Uuid;
@@ -21,9 +20,7 @@ use alexandria_core::catalog::runs::{
 };
 use alexandria_core::errors::DomainError;
 
-use crate::common::{FakeAuth, FakeCatalogRunRepository};
-
-const TOKEN: &str = "owner-token";
+use crate::common::FakeCatalogRunRepository;
 
 /// What the handler resumes a run at when the row itself records no width —
 /// `RunControlHandler`'s configured fallback. Also the width these tests seed
@@ -46,7 +43,7 @@ fn t(hour: u32) -> chrono::DateTime<Utc> {
 /// did: the repository row it may have written, and the registry cell it may
 /// have signalled.
 struct ControlHarness {
-    control: RunControlHandler<FakeAuth, FakeCatalogRunRepository, FixedClock>,
+    control: RunControlHandler<FakeCatalogRunRepository, FixedClock>,
     runs: FakeCatalogRunRepository,
     registry: RunRegistry,
     run_id: Uuid,
@@ -103,7 +100,6 @@ impl ControlHarness {
         let registry = RunRegistry::new();
         Self {
             control: RunControlHandler::new(
-                FakeAuth::Allowing,
                 runs.clone(),
                 FixedClock(t(3)),
                 registry.clone(),
@@ -173,7 +169,7 @@ async fn given_a_live_running_run_when_paused_then_the_signal_is_raised_and_the_
     // Writing the row from here too would race that write.
     let harness = ControlHarness::with_live_running_run().await;
 
-    harness.control.pause(harness.run_id, TOKEN).await.unwrap();
+    harness.control.pause(harness.run_id).await.unwrap();
 
     assert_eq!(harness.raised_signal(), RunSignal::Pause);
     assert_eq!(
@@ -188,7 +184,7 @@ async fn given_a_live_running_run_when_cancelled_then_the_signal_is_raised_and_t
 ) {
     let harness = ControlHarness::with_live_running_run().await;
 
-    harness.control.cancel(harness.run_id, TOKEN).await.unwrap();
+    harness.control.cancel(harness.run_id).await.unwrap();
 
     assert_eq!(harness.raised_signal(), RunSignal::Cancel);
     assert_eq!(harness.recorded_status(), RunStatus::Running);
@@ -203,7 +199,7 @@ async fn given_a_running_run_with_no_live_cell_when_paused_then_it_is_recorded_p
     // forever.
     let harness = ControlHarness::with_run(RunStatus::Running).await;
 
-    harness.control.pause(harness.run_id, TOKEN).await.unwrap();
+    harness.control.pause(harness.run_id).await.unwrap();
 
     let run = harness.runs.get_recorded(harness.run_id).expect("run");
     assert_eq!(run.status, RunStatus::Paused);
@@ -222,7 +218,7 @@ async fn given_a_running_run_with_no_live_cell_when_paused_then_it_is_recorded_p
 async fn given_a_running_run_with_no_live_cell_when_cancelled_then_it_is_recorded_cancelled() {
     let harness = ControlHarness::with_run(RunStatus::Running).await;
 
-    harness.control.cancel(harness.run_id, TOKEN).await.unwrap();
+    harness.control.cancel(harness.run_id).await.unwrap();
 
     let run = harness.runs.get_recorded(harness.run_id).expect("run");
     assert_eq!(run.status, RunStatus::Cancelled);
@@ -235,7 +231,7 @@ async fn given_a_paused_run_when_cancelled_then_it_is_recorded_cancelled() {
     // row itself. Without this a paused run could never be abandoned.
     let harness = ControlHarness::with_run(RunStatus::Paused).await;
 
-    harness.control.cancel(harness.run_id, TOKEN).await.unwrap();
+    harness.control.cancel(harness.run_id).await.unwrap();
 
     assert_eq!(harness.recorded_status(), RunStatus::Cancelled);
 }
@@ -244,7 +240,7 @@ async fn given_a_paused_run_when_cancelled_then_it_is_recorded_cancelled() {
 async fn given_a_paused_run_when_paused_again_then_invalid_state() {
     let harness = ControlHarness::with_run(RunStatus::Paused).await;
 
-    let result = harness.control.pause(harness.run_id, TOKEN).await;
+    let result = harness.control.pause(harness.run_id).await;
 
     assert!(matches!(result, Err(DomainError::InvalidState)));
 }
@@ -253,7 +249,7 @@ async fn given_a_paused_run_when_paused_again_then_invalid_state() {
 async fn given_a_completed_run_when_cancelled_then_invalid_state() {
     let harness = ControlHarness::with_run(RunStatus::Complete).await;
 
-    let result = harness.control.cancel(harness.run_id, TOKEN).await;
+    let result = harness.control.cancel(harness.run_id).await;
 
     assert!(matches!(result, Err(DomainError::InvalidState)));
 }
@@ -263,7 +259,7 @@ async fn given_an_unpausable_run_when_paused_then_invalid_state_and_the_row_is_u
     for status in UNPAUSABLE {
         let harness = ControlHarness::with_run(status).await;
 
-        let result = harness.control.pause(harness.run_id, TOKEN).await;
+        let result = harness.control.pause(harness.run_id).await;
 
         assert!(
             matches!(result, Err(DomainError::InvalidState)),
@@ -282,7 +278,7 @@ async fn given_an_uncancellable_run_when_cancelled_then_invalid_state_and_the_ro
     for status in UNCANCELLABLE {
         let harness = ControlHarness::with_run(status).await;
 
-        let result = harness.control.cancel(harness.run_id, TOKEN).await;
+        let result = harness.control.cancel(harness.run_id).await;
 
         assert!(
             matches!(result, Err(DomainError::InvalidState)),
@@ -300,7 +296,7 @@ async fn given_an_uncancellable_run_when_cancelled_then_invalid_state_and_the_ro
 async fn given_an_unknown_run_when_paused_then_not_found() {
     let harness = ControlHarness::with_run(RunStatus::Running).await;
 
-    let result = harness.control.pause(Uuid::new_v4(), TOKEN).await;
+    let result = harness.control.pause(Uuid::new_v4()).await;
 
     assert!(matches!(result, Err(DomainError::NotFound)));
 }
@@ -309,48 +305,9 @@ async fn given_an_unknown_run_when_paused_then_not_found() {
 async fn given_an_unknown_run_when_cancelled_then_not_found() {
     let harness = ControlHarness::with_run(RunStatus::Running).await;
 
-    let result = harness.control.cancel(Uuid::new_v4(), TOKEN).await;
+    let result = harness.control.cancel(Uuid::new_v4()).await;
 
     assert!(matches!(result, Err(DomainError::NotFound)));
-}
-
-#[tokio::test]
-async fn given_an_unauthenticated_caller_when_pausing_then_unauthorized_not_invalid_state() {
-    // Authentication runs before the state machine, so a bad token learns
-    // nothing about the run — not whether it exists, not what state it is in.
-    let mut harness = ControlHarness::with_run(RunStatus::Complete).await;
-    harness.control = RunControlHandler::new(
-        FakeAuth::Denying,
-        harness.runs.clone(),
-        FixedClock(t(3)),
-        harness.registry.clone(),
-        DEFAULT_CONCURRENCY,
-        LOW_PRIORITY_CONCURRENCY,
-    );
-
-    let result = harness.control.pause(harness.run_id, "bad-token").await;
-
-    assert!(matches!(result, Err(DomainError::Unauthorized)));
-}
-
-#[tokio::test]
-async fn given_an_unauthenticated_caller_when_cancelling_an_unknown_run_then_unauthorized_not_found(
-) {
-    // The same ordering seen from the other side: a bad token must not be
-    // able to probe which run ids exist.
-    let harness = ControlHarness::with_run(RunStatus::Running).await;
-    let control = RunControlHandler::new(
-        FakeAuth::Denying,
-        harness.runs.clone(),
-        FixedClock(t(3)),
-        harness.registry.clone(),
-        DEFAULT_CONCURRENCY,
-        LOW_PRIORITY_CONCURRENCY,
-    );
-
-    let result = control.cancel(Uuid::new_v4(), "bad-token").await;
-
-    assert!(matches!(result, Err(DomainError::Unauthorized)));
 }
 
 #[tokio::test]
@@ -393,7 +350,7 @@ async fn given_a_run_closed_between_the_lookup_and_the_write_when_paused_then_in
     let harness = ControlHarness::with_run(RunStatus::Running).await;
     harness.runs.cancel_after_next_get(harness.run_id);
 
-    let result = harness.control.pause(harness.run_id, TOKEN).await;
+    let result = harness.control.pause(harness.run_id).await;
 
     assert!(
         matches!(result, Err(DomainError::InvalidState)),
@@ -425,7 +382,7 @@ async fn paused_run(
     processed: usize,
     now: chrono::DateTime<Utc>,
 ) -> (
-    RunControlHandler<FakeAuth, FakeCatalogRunRepository, FixedClock>,
+    RunControlHandler<FakeCatalogRunRepository, FixedClock>,
     FakeCatalogRunRepository,
     Uuid,
 ) {
@@ -457,7 +414,6 @@ async fn paused_run(
     .expect("record progress");
     assert!(runs.pause(run_id, paused_at, None).await.expect("pause"));
     let control = RunControlHandler::new(
-        FakeAuth::Allowing,
         runs.clone(),
         FixedClock(now),
         RunRegistry::new(),
@@ -476,7 +432,7 @@ async fn given_a_paused_run_when_resumed_then_it_runs_again_from_zero_with_the_p
     // the half hour the owner was away is not later reported as work.
     let (control, runs, run_id) = paused_run(at(1, 10), 8_412, at(1, 40)).await;
 
-    let resumed = control.resume(run_id, TOKEN, None).await.expect("resume");
+    let resumed = control.resume(run_id, None).await.expect("resume");
 
     let run = runs.get_recorded(run_id).expect("recorded run");
     assert_eq!(run.status, RunStatus::Running);
@@ -509,7 +465,7 @@ async fn given_a_paused_run_when_resumed_then_it_runs_again_from_zero_with_the_p
 async fn paused_run_at_width(
     width: u32,
 ) -> (
-    RunControlHandler<FakeAuth, FakeCatalogRunRepository, FixedClock>,
+    RunControlHandler<FakeCatalogRunRepository, FixedClock>,
     FakeCatalogRunRepository,
     Uuid,
 ) {
@@ -520,7 +476,6 @@ async fn paused_run_at_width(
         .expect("start");
     assert!(runs.pause(run_id, t(2), None).await.expect("pause"));
     let control = RunControlHandler::new(
-        FakeAuth::Allowing,
         runs.clone(),
         FixedClock(t(3)),
         RunRegistry::new(),
@@ -543,7 +498,7 @@ async fn given_a_paused_run_when_resumed_at_low_priority_then_the_stored_width_i
     let (control, runs, run_id) = paused_run_at_width(DEFAULT_CONCURRENCY).await;
 
     let resumed = control
-        .resume(run_id, TOKEN, Some(RunPriority::Low))
+        .resume(run_id, Some(RunPriority::Low))
         .await
         .expect("resume");
 
@@ -569,7 +524,7 @@ async fn given_a_low_priority_run_when_resumed_at_normal_priority_then_the_store
     let (control, runs, run_id) = paused_run_at_width(LOW_PRIORITY_CONCURRENCY).await;
 
     let resumed = control
-        .resume(run_id, TOKEN, Some(RunPriority::Normal))
+        .resume(run_id, Some(RunPriority::Normal))
         .await
         .expect("resume");
 
@@ -588,7 +543,7 @@ async fn given_a_low_priority_run_when_resumed_at_normal_priority_then_the_store
 async fn given_a_low_priority_run_when_resumed_without_a_priority_then_it_keeps_its_stored_width() {
     let (control, runs, run_id) = paused_run_at_width(LOW_PRIORITY_CONCURRENCY).await;
 
-    let resumed = control.resume(run_id, TOKEN, None).await.expect("resume");
+    let resumed = control.resume(run_id, None).await.expect("resume");
 
     assert_eq!(
         resumed.concurrency, LOW_PRIORITY_CONCURRENCY,
@@ -611,7 +566,6 @@ async fn given_a_low_priority_run_when_resumed_without_a_priority_then_it_keeps_
 async fn given_a_zero_low_priority_width_when_resumed_at_low_then_the_run_is_paced_at_one() {
     let (_, runs, run_id) = paused_run_at_width(DEFAULT_CONCURRENCY).await;
     let control = RunControlHandler::new(
-        FakeAuth::Allowing,
         runs.clone(),
         FixedClock(t(3)),
         RunRegistry::new(),
@@ -620,7 +574,7 @@ async fn given_a_zero_low_priority_width_when_resumed_at_low_then_the_run_is_pac
     );
 
     let resumed = control
-        .resume(run_id, TOKEN, Some(RunPriority::Low))
+        .resume(run_id, Some(RunPriority::Low))
         .await
         .expect("resume");
 
@@ -642,7 +596,7 @@ async fn given_an_unresumable_run_when_resumed_at_a_priority_then_still_invalid_
 
         let result = harness
             .control
-            .resume(harness.run_id, TOKEN, Some(RunPriority::Low))
+            .resume(harness.run_id, Some(RunPriority::Low))
             .await;
 
         assert!(
@@ -669,7 +623,7 @@ async fn given_a_run_cancelled_before_the_write_when_resumed_at_a_priority_then_
     let (control, runs, run_id) = paused_run_at_width(DEFAULT_CONCURRENCY).await;
     runs.cancel_after_next_get(run_id);
 
-    let result = control.resume(run_id, TOKEN, Some(RunPriority::Low)).await;
+    let result = control.resume(run_id, Some(RunPriority::Low)).await;
 
     assert!(matches!(result, Err(DomainError::InvalidState)));
     assert_eq!(
@@ -685,16 +639,12 @@ async fn given_a_run_paused_twice_when_resumed_again_then_both_pauses_are_banked
     // last pause. Getting this wrong is invisible on the first resume and
     // wrong on every one after it.
     let (control, runs, run_id) = paused_run(at(1, 10), 8_412, at(1, 40)).await;
-    control
-        .resume(run_id, TOKEN, None)
-        .await
-        .expect("first resume");
+    control.resume(run_id, None).await.expect("first resume");
     assert!(runs
         .pause(run_id, at(2, 0), None)
         .await
         .expect("second pause"));
     let control = RunControlHandler::new(
-        FakeAuth::Allowing,
         runs.clone(),
         FixedClock(at(2, 15)),
         RunRegistry::new(),
@@ -702,10 +652,7 @@ async fn given_a_run_paused_twice_when_resumed_again_then_both_pauses_are_banked
         LOW_PRIORITY_CONCURRENCY,
     );
 
-    control
-        .resume(run_id, TOKEN, None)
-        .await
-        .expect("second resume");
+    control.resume(run_id, None).await.expect("second resume");
 
     assert_eq!(
         runs.get_recorded(run_id).expect("run").paused_millis,
@@ -720,15 +667,10 @@ async fn given_a_resumed_run_when_its_status_is_read_then_active_millis_excludes
     // time minus it, so a run that sat paused for half an hour must not report
     // that half hour as time spent working.
     let (control, runs, run_id) = paused_run(at(1, 10), 8_412, at(1, 40)).await;
-    control.resume(run_id, TOKEN, None).await.expect("resume");
-    let status = GetRunStatusHandler::new(
-        FakeAuth::Allowing,
-        runs.clone(),
-        FixedClock(at(1, 50)),
-        RunRegistry::new(),
-    );
+    control.resume(run_id, None).await.expect("resume");
+    let status = GetRunStatusHandler::new(runs.clone(), FixedClock(at(1, 50)), RunRegistry::new());
 
-    let run = status.get(run_id, TOKEN).await.expect("status");
+    let run = status.get(run_id).await.expect("status");
 
     assert_eq!(
         run.active_millis,
@@ -742,7 +684,7 @@ async fn given_an_unresumable_run_when_resumed_then_invalid_state_and_the_row_is
     for status in UNRESUMABLE {
         let harness = ControlHarness::with_run(status).await;
 
-        let result = harness.control.resume(harness.run_id, TOKEN, None).await;
+        let result = harness.control.resume(harness.run_id, None).await;
 
         assert!(
             matches!(result, Err(DomainError::InvalidState)),
@@ -761,32 +703,9 @@ async fn given_an_unresumable_run_when_resumed_then_invalid_state_and_the_row_is
 async fn given_an_unknown_run_when_resumed_then_not_found() {
     let harness = ControlHarness::with_run(RunStatus::Paused).await;
 
-    let result = harness.control.resume(Uuid::new_v4(), TOKEN, None).await;
+    let result = harness.control.resume(Uuid::new_v4(), None).await;
 
     assert!(matches!(result, Err(DomainError::NotFound)));
-}
-
-#[tokio::test]
-async fn given_an_unauthenticated_caller_when_resuming_then_unauthorized_not_invalid_state() {
-    // Authentication runs ahead of the lookup here for the reason it does on
-    // every other verb: a bad token must learn neither that the run exists nor
-    // what state it is in.
-    let mut harness = ControlHarness::with_run(RunStatus::Complete).await;
-    harness.control = RunControlHandler::new(
-        FakeAuth::Denying,
-        harness.runs.clone(),
-        FixedClock(t(3)),
-        harness.registry.clone(),
-        DEFAULT_CONCURRENCY,
-        LOW_PRIORITY_CONCURRENCY,
-    );
-
-    let result = harness
-        .control
-        .resume(harness.run_id, "bad-token", None)
-        .await;
-
-    assert!(matches!(result, Err(DomainError::Unauthorized)));
 }
 
 #[tokio::test]
@@ -798,7 +717,7 @@ async fn given_a_run_closed_between_the_lookup_and_the_write_when_resumed_then_i
     let harness = ControlHarness::with_run(RunStatus::Paused).await;
     harness.runs.cancel_after_next_get(harness.run_id);
 
-    let result = harness.control.resume(harness.run_id, TOKEN, None).await;
+    let result = harness.control.resume(harness.run_id, None).await;
 
     assert!(
         matches!(result, Err(DomainError::InvalidState)),
@@ -819,7 +738,7 @@ async fn given_a_run_completed_between_the_lookup_and_the_write_when_cancelled_t
     let harness = ControlHarness::with_run(RunStatus::Running).await;
     harness.runs.complete_after_next_get(harness.run_id);
 
-    let result = harness.control.cancel(harness.run_id, TOKEN).await;
+    let result = harness.control.cancel(harness.run_id).await;
 
     assert!(
         matches!(result, Err(DomainError::InvalidState)),

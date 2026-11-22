@@ -1,8 +1,7 @@
-//! Unit tests for the UC-32 ReadTextFileContentHandler (Testing
-//! Specification §6). Each test exercises exactly the handler against
-//! trait fakes — no real DB, filesystem, or auth service. Coverage follows
-//! §6.3: happy path, wrong file type (AF-01), disk read failure (AF-02),
-//! not-found (AF-03), the unauthorized branch (AF-04), and the
+//! Unit tests for the UC-32 ReadTextFileContentHandler (Testing Specification
+//! §6). Each test exercises exactly the handler against trait fakes — no real
+//! DB or filesystem. Coverage follows §6.3: happy path, wrong file type
+//! (AF-01), disk read failure (AF-02), not-found (AF-03), and the
 //! soft-deleted-record guard the use case's `active` precondition calls for.
 
 use uuid::Uuid;
@@ -11,17 +10,13 @@ use alexandria_core::catalog::model::FileType;
 use alexandria_core::catalog::queries::read_content::ReadTextFileContentHandler;
 use alexandria_core::errors::DomainError;
 
-use crate::common::{deleted_file, existing_file, FakeAuth, FakeCatalogRepository, FakeFilesystem};
-
-const TOKEN: &str = "bearer-token";
+use crate::common::{deleted_file, existing_file, FakeCatalogRepository, FakeFilesystem};
 
 fn handler(
-    auth: FakeAuth,
     repo: FakeCatalogRepository,
     fs: FakeFilesystem,
-) -> ReadTextFileContentHandler<FakeAuth, FakeCatalogRepository, FakeFilesystem> {
+) -> ReadTextFileContentHandler<FakeCatalogRepository, FakeFilesystem> {
     ReadTextFileContentHandler::new(
-        auth,
         repo,
         fs,
         alexandria_core::catalog::library_root::LibraryRoot::unconfigured(),
@@ -39,9 +34,9 @@ async fn given_text_file_when_read_then_content_returned() {
     let fs = FakeFilesystem::builder()
         .with_text_content("/lib/notes.txt", "hello world")
         .build();
-    let h = handler(FakeAuth::Allowing, repo, fs);
+    let h = handler(repo, fs);
 
-    let result = h.read(uuid, TOKEN).await.expect("read");
+    let result = h.read(uuid).await.expect("read");
 
     assert_eq!(result.uuid, uuid);
     assert_eq!(result.content, "hello world");
@@ -56,9 +51,9 @@ async fn given_non_text_file_when_read_then_invalid_input() {
     let uuid = file.uuid;
     repo.seed(file);
     let fs = FakeFilesystem::builder().build();
-    let h = handler(FakeAuth::Allowing, repo, fs);
+    let h = handler(repo, fs);
 
-    let result = h.read(uuid, TOKEN).await;
+    let result = h.read(uuid).await;
 
     assert!(matches!(result, Err(DomainError::InvalidInput(_))));
 }
@@ -74,9 +69,9 @@ async fn given_unreadable_file_when_read_then_disk_error() {
     let fs = FakeFilesystem::builder()
         .with_unreadable_file("/lib", "/lib/notes.txt", "notes.txt")
         .build();
-    let h = handler(FakeAuth::Allowing, repo, fs);
+    let h = handler(repo, fs);
 
-    let result = h.read(uuid, TOKEN).await;
+    let result = h.read(uuid).await;
 
     assert!(matches!(result, Err(DomainError::Disk(_))));
 }
@@ -87,9 +82,9 @@ async fn given_unreadable_file_when_read_then_disk_error() {
 async fn given_unknown_uuid_when_read_then_not_found() {
     let repo = FakeCatalogRepository::new();
     let fs = FakeFilesystem::builder().build();
-    let h = handler(FakeAuth::Allowing, repo, fs);
+    let h = handler(repo, fs);
 
-    let result = h.read(Uuid::new_v4(), TOKEN).await;
+    let result = h.read(Uuid::new_v4()).await;
 
     assert!(matches!(result, Err(DomainError::NotFound)));
 }
@@ -109,35 +104,11 @@ async fn given_deleted_file_when_read_then_invalid_state() {
     let fs = FakeFilesystem::builder()
         .with_text_content("/lib/notes.txt", "hello world")
         .build();
-    let h = handler(FakeAuth::Allowing, repo, fs);
+    let h = handler(repo, fs);
 
-    let result = h.read(uuid, TOKEN).await;
+    let result = h.read(uuid).await;
 
     assert!(matches!(result, Err(DomainError::InvalidState)));
-}
-
-// ---------------- AF-04: unauthorized ----------------
-
-#[tokio::test]
-async fn given_unauthenticated_when_read_then_unauthorized() {
-    let repo = FakeCatalogRepository::new();
-    let fs = FakeFilesystem::builder().build();
-    let h = handler(FakeAuth::Denying, repo, fs);
-
-    let result = h.read(Uuid::new_v4(), "").await;
-
-    assert!(matches!(result, Err(DomainError::Unauthorized)));
-}
-
-#[tokio::test]
-async fn given_unauthenticated_and_unknown_uuid_when_read_then_unauthorized_not_not_found() {
-    let repo = FakeCatalogRepository::new();
-    let fs = FakeFilesystem::builder().build();
-    let h = handler(FakeAuth::Denying, repo, fs);
-
-    let result = h.read(Uuid::new_v4(), "").await;
-
-    assert!(matches!(result, Err(DomainError::Unauthorized)));
 }
 
 // ---------------- FR-FC-26: the configured library root ----------------
@@ -156,13 +127,12 @@ async fn given_a_row_outside_the_configured_root_when_read_then_invalid_input_an
         .with_text_content("/lib/notes.txt", "the secret")
         .build();
     let h = ReadTextFileContentHandler::new(
-        FakeAuth::Allowing,
         repo,
         fs,
         alexandria_core::catalog::library_root::LibraryRoot::new(library.path().to_str().unwrap()),
     );
 
-    let result = h.read(uuid, TOKEN).await;
+    let result = h.read(uuid).await;
 
     assert!(
         matches!(result, Err(DomainError::InvalidInput(ref m)) if m == "file is outside the configured library root")

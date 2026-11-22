@@ -4,7 +4,6 @@ use std::collections::BTreeSet;
 
 use uuid::Uuid;
 
-use crate::auth::AuthService;
 use crate::catalog::model::FileView;
 use crate::catalog::repos::CatalogRepository;
 use crate::errors::DomainError;
@@ -78,46 +77,36 @@ pub fn level_of(
 ///
 /// The read that makes the rest reachable: browsing addresses a uuid, and
 /// this is where those uuids come from.
-pub struct ListLibrariesHandler<A, L> {
-    auth: A,
+pub struct ListLibrariesHandler<L> {
     libraries: L,
 }
 
-impl<A, L> ListLibrariesHandler<A, L>
+impl<L> ListLibrariesHandler<L>
 where
-    A: AuthService,
     L: LibraryRepository,
 {
-    pub fn new(auth: A, libraries: L) -> Self {
-        Self { auth, libraries }
+    pub fn new(libraries: L) -> Self {
+        Self { libraries }
     }
 
-    pub async fn list(&self, token: &str) -> Result<Vec<Library>, DomainError> {
-        self.auth.authenticate(token).await?;
-
+    pub async fn list(&self) -> Result<Vec<Library>, DomainError> {
         self.libraries.list_all().await
     }
 }
 
 /// Read one level of a library's tree (libraries design section 4).
-pub struct BrowseLibraryHandler<A, L, C> {
-    auth: A,
+pub struct BrowseLibraryHandler<L, C> {
     libraries: L,
     catalog: C,
 }
 
-impl<A, L, C> BrowseLibraryHandler<A, L, C>
+impl<L, C> BrowseLibraryHandler<L, C>
 where
-    A: AuthService,
     L: LibraryRepository,
     C: CatalogRepository,
 {
-    pub fn new(auth: A, libraries: L, catalog: C) -> Self {
-        Self {
-            auth,
-            libraries,
-            catalog,
-        }
+    pub fn new(libraries: L, catalog: C) -> Self {
+        Self { libraries, catalog }
     }
 
     /// The folders and files directly inside `path` within the library
@@ -127,14 +116,7 @@ where
     /// rather than the whole tree: a course with two hundred classes is a
     /// large document to build, send and parse so the owner can look at the
     /// six things in one folder.
-    pub async fn browse(
-        &self,
-        uuid: Uuid,
-        path: &str,
-        token: &str,
-    ) -> Result<LibraryListing, DomainError> {
-        self.auth.authenticate(token).await?;
-
+    pub async fn browse(&self, uuid: Uuid, path: &str) -> Result<LibraryListing, DomainError> {
         let library = self
             .libraries
             .find_by_uuid(uuid)

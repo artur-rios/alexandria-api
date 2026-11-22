@@ -45,8 +45,9 @@ use alexandria_core::reading_lists::repos::ReadingListRepository;
 use alexandria_core::watchlists::model::{NewWatchlist, WatchProgress, WatchState, Watchlist};
 use alexandria_core::watchlists::repos::WatchlistRepository;
 
-/// Fake auth service. `Denying` rejects every caller (AF-02); `Allowing`
-/// authenticates any token as the owner.
+/// Fake auth service. `Denying` rejects every caller; `Allowing`
+/// authenticates any token as the owner. Only the auth handlers take one:
+/// nothing else in the core authenticates.
 #[derive(Debug, Clone, Copy, Default)]
 pub enum FakeAuth {
     #[default]
@@ -3544,7 +3545,6 @@ impl alexandria_core::catalog::commands::index::LibraryRunStarter for AlwaysStar
         &self,
         _library: &alexandria_core::libraries::model::Library,
         _priority: alexandria_core::catalog::runs::RunPriority,
-        _token: &str,
     ) -> Result<alexandria_core::catalog::commands::index::IndexStarted, DomainError> {
         Ok(alexandria_core::catalog::commands::index::IndexStarted {
             run_id: Uuid::new_v4(),

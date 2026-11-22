@@ -230,18 +230,18 @@ pub enum CoverArtRead {
     Unreadable,
 }
 
-/// Read-only port over an audio file's embedded front-cover picture
-/// (issue #117). A sibling of [`AudioMetadataReader`] rather than an
-/// extension of it: the two are read at different times for different
-/// reasons — tags are extracted once, at first index, to prefill editable
-/// metadata (FR-FC-25); a cover picture is read fresh on every uncached
-/// thumbnail request (UC-40, FR-MP-05), because it is not a field an owner
-/// edits and there is nothing to prefill. Injected into `ThumbnailHandler`
-/// the way its other collaborators are, so "no picture", "unreadable",
-/// "wrong type", and the auth/state checks that run before it is even
-/// consulted stay unit-testable against a fake with no file I/O (Testing
-/// Specification §6.2); the real implementation is `lofty`-backed and
-/// wired in `services.rs`, beside [`LoftyAudioMetadataReader`].
+/// Read-only port over an audio file's embedded front-cover picture (issue
+/// #117). A sibling of [`AudioMetadataReader`] rather than an extension of it:
+/// the two are read at different times for different reasons — tags are
+/// extracted once, at first index, to prefill editable metadata (FR-FC-25); a
+/// cover picture is read fresh on every uncached thumbnail request (UC-40,
+/// FR-MP-05), because it is not a field an owner edits and there is nothing to
+/// prefill. Injected into `ThumbnailHandler` the way its other collaborators
+/// are, so "no picture", "unreadable", "wrong type", and the state checks that
+/// run before it is even consulted stay unit-testable against a fake with no
+/// file I/O (Testing Specification §6.2); the real implementation is
+/// `lofty`-backed and wired in `services.rs`, beside
+/// [`LoftyAudioMetadataReader`].
 #[allow(async_fn_in_trait)]
 pub trait CoverArtReader: Send + Sync {
     /// Best-effort read of the embedded front-cover picture. Extraction

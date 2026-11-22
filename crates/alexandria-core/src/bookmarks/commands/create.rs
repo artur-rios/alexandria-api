@@ -1,6 +1,5 @@
 use uuid::Uuid;
 
-use crate::auth::AuthService;
 use crate::bookmarks::model::{Bookmark, NewBookmark};
 use crate::bookmarks::repos::BookmarkRepository;
 use crate::collections::model::CollectionKind;
@@ -101,21 +100,18 @@ pub fn validate_title(title: &str) -> Result<String, DomainError> {
 /// Like `CreateCollectionHandler` there is no `Clock` collaborator (a
 /// bookmark's `deletedAt` is set only by UC-18) and no `Filesystem` (a
 /// bookmark is catalog-only metadata with nothing on disk).
-pub struct CreateBookmarkHandler<A, BR, CR> {
-    auth: A,
+pub struct CreateBookmarkHandler<BR, CR> {
     bookmark_repo: BR,
     collection_repo: CR,
 }
 
-impl<A, BR, CR> CreateBookmarkHandler<A, BR, CR>
+impl<BR, CR> CreateBookmarkHandler<BR, CR>
 where
-    A: AuthService,
     BR: BookmarkRepository,
     CR: CollectionRepository,
 {
-    pub fn new(auth: A, bookmark_repo: BR, collection_repo: CR) -> Self {
+    pub fn new(bookmark_repo: BR, collection_repo: CR) -> Self {
         Self {
-            auth,
             bookmark_repo,
             collection_repo,
         }
@@ -129,13 +125,7 @@ where
         url: &str,
         title: &str,
         collection_uuid: Option<Uuid>,
-        token: &str,
     ) -> Result<Bookmark, DomainError> {
-        // AF-03: the caller must be authenticated. Evaluated before any
-        // payload is consulted (FR-AU-07 / SRD §7), so an unauthenticated
-        // caller learns nothing about the request's validity.
-        self.auth.authenticate(token).await?;
-
         // AF-01: the url and title must be valid.
         let url = validate_url(url)?;
         let title = validate_title(title)?;

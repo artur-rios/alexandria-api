@@ -1,6 +1,5 @@
 use uuid::Uuid;
 
-use crate::auth::AuthService;
 use crate::catalog::fs::Filesystem;
 use crate::catalog::library_root::LibraryRoot;
 use crate::catalog::model::{File, FileState};
@@ -86,26 +85,25 @@ fn sibling_path(old_path: &str, new_name: &str) -> String {
 /// Rename a file (UC-05 / FR-FC-19). Renames the on-disk file and updates the
 /// catalog's `name` and `path` atomically.
 ///
-/// The handler authenticates the caller (AF-04), looks the file up by its
-/// public UUID (AF-03), rejects renames on a soft-deleted record (restore via
-/// UC-07 first), validates the new name as a host-OS file name (AF-01), and
-/// then performs the on-disk rename before touching the catalog (AF-02 — if
-/// the disk rename fails, no catalog change is ever made). If the disk rename
-/// succeeds but the catalog write fails, the handler compensates by moving
-/// the on-disk file back to its old path, so the end state is catalog
-/// unchanged and on-disk file untouched (the same end state AF-02 calls for).
+/// The handler looks the file up by its public UUID (AF-03), rejects renames
+/// on a soft-deleted record (restore via UC-07 first), validates the new name
+/// as a host-OS file name (AF-01), and then performs the on-disk rename before
+/// touching the catalog (AF-02 — if the disk rename fails, no catalog change
+/// is ever made). If the disk rename succeeds but the catalog write fails, the
+/// handler compensates by moving the on-disk file back to its old path, so the
+/// end state is catalog unchanged and on-disk file untouched (the same end
+/// state AF-02 calls for).
 ///
 /// Target-exists is folded into AF-02: the handler rejects a rename onto a
 /// path another cataloged file owns, or one an on-disk entry already sits at,
 /// with a `Disk` error — before any on-disk move is attempted.
 ///
-/// Generic over auth, catalog repository, and filesystem so the same decision
-/// logic is unit-tested against trait fakes (no real DB, fs, or auth in unit
-/// tests), then wired with the concrete collaborators at runtime (services.rs).
-/// Both the HTTP and FFI surfaces call this handler so the two stay at parity
+/// Generic over the catalog repository and filesystem so the same decision
+/// logic is unit-tested against trait fakes (no real DB or fs in unit tests),
+/// then wired with the concrete collaborators at runtime (services.rs). Both
+/// the HTTP and FFI surfaces call this handler so the two stay at parity
 /// (FR-FC-24 / NFR-09).
-pub struct RenameFileHandler<A, R, F> {
-    auth: A,
+pub struct RenameFileHandler<R, F> {
     repo: R,
     fs: F,
     /// `filesystem.root` (FR-FC-26): a row pointing outside it has its
@@ -113,15 +111,13 @@ pub struct RenameFileHandler<A, R, F> {
     library_root: LibraryRoot,
 }
 
-impl<A, R, F> RenameFileHandler<A, R, F>
+impl<R, F> RenameFileHandler<R, F>
 where
-    A: AuthService,
     R: CatalogRepository,
     F: Filesystem,
 {
-    pub fn new(auth: A, repo: R, fs: F, library_root: LibraryRoot) -> Self {
+    pub fn new(repo: R, fs: F, library_root: LibraryRoot) -> Self {
         Self {
-            auth,
             repo,
             fs,
             library_root,
@@ -129,15 +125,7 @@ where
     }
 
     /// Rename `uuid` to `new_name`. Returns the updated `File` on success.
-    pub async fn rename(
-        &self,
-        uuid: Uuid,
-        new_name: String,
-        token: &str,
-    ) -> Result<File, DomainError> {
-        // AF-04: the caller must be authenticated.
-        self.auth.authenticate(token).await?;
-
+    pub async fn rename(&self, uuid: Uuid, new_name: String) -> Result<File, DomainError> {
         // AF-03: the file must exist.
         let file = self
             .repo

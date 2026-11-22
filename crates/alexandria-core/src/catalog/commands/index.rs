@@ -3,7 +3,6 @@ use futures_util::stream::{self, StreamExt};
 use serde::Serialize;
 use uuid::Uuid;
 
-use crate::auth::AuthService;
 use crate::catalog::audio_tags::AudioMetadataReader;
 use crate::catalog::classify::classify_by_extension;
 use crate::catalog::clock::Clock;
@@ -79,7 +78,6 @@ pub trait LibraryRunStarter: Send + Sync {
         &self,
         library: &Library,
         priority: RunPriority,
-        token: &str,
     ) -> Result<IndexStarted, DomainError>;
 }
 
@@ -92,16 +90,13 @@ impl<T: LibraryRunStarter> LibraryRunStarter for std::sync::Arc<T> {
         &self,
         library: &Library,
         priority: RunPriority,
-        token: &str,
     ) -> Result<IndexStarted, DomainError> {
-        (**self).start_library_run(library, priority, token).await
+        (**self).start_library_run(library, priority).await
     }
 }
 
-impl<A, R, F, C, M, N, O, P, Q, RR> LibraryRunStarter
-    for IndexHandler<A, R, F, C, M, N, O, P, Q, RR>
+impl<R, F, C, M, N, O, P, Q, RR> LibraryRunStarter for IndexHandler<R, F, C, M, N, O, P, Q, RR>
 where
-    A: AuthService,
     R: CatalogRepository,
     F: Filesystem,
     C: Clock,
@@ -120,29 +115,25 @@ where
         &self,
         library: &Library,
         priority: RunPriority,
-        token: &str,
     ) -> Result<IndexStarted, DomainError> {
-        self.start(
-            IndexRequest {
-                library_uuid: library.uuid,
-                root: library.root_path.clone(),
-                priority,
-            },
-            token,
-        )
+        self.start(IndexRequest {
+            library_uuid: library.uuid,
+            root: library.root_path.clone(),
+            priority,
+        })
         .await
     }
 }
 
 /// Index library files (UC-01).
 ///
-/// `start` authenticates the caller, validates the root path — it must exist,
-/// and it must sit inside the configured `filesystem.root` when one is set
-/// (FR-FC-26) — and returns a fresh run id immediately. The heavy `execute`
-/// walk stats, classifies, and persists each supported file, skipping
-/// already-cataloged paths — no file bytes are read (FR-FC-09/FR-FC-10). `start` and `execute` are separated so the HTTP/FFI layer can spawn
-/// `execute` in the background (FR-FC-08) while `start` returns `202` right
-/// away.
+/// `start` validates the root path — it must exist, and it must sit inside the
+/// configured `filesystem.root` when one is set (FR-FC-26) — and returns a
+/// fresh run id immediately. The heavy `execute` walk stats, classifies, and
+/// persists each supported file, skipping already-cataloged paths — no file
+/// bytes are read (FR-FC-09/FR-FC-10). `start` and `execute` are separated so
+/// the HTTP/FFI layer can spawn `execute` in the background (FR-FC-08) while
+/// `start` returns `202` right away.
 ///
 /// `execute` processes up to `concurrency` files at a time, where
 /// `concurrency` is the width the run's own `RunPriority` resolved to at
@@ -166,11 +157,9 @@ where
 /// lengthens the queue in front of the writer.
 ///
 /// Generic over its collaborators so the same decision logic is unit-tested
-/// against trait fakes (no real DB, filesystem, or auth service in unit
-/// tests), then wired with the concrete Sqlite/StdFilesystem/Bearer/services
-/// at runtime.
-pub struct IndexHandler<A, R, F, C, M, N, O, P, Q, RR> {
-    auth: A,
+/// against trait fakes (no real DB or filesystem in unit tests), then wired
+/// with the concrete Sqlite/StdFilesystem/services at runtime.
+pub struct IndexHandler<R, F, C, M, N, O, P, Q, RR> {
     repo: R,
     fs: F,
     clock: C,
@@ -249,9 +238,8 @@ impl IndexTally {
     }
 }
 
-impl<A, R, F, C, M, N, O, P, Q, RR> IndexHandler<A, R, F, C, M, N, O, P, Q, RR>
+impl<R, F, C, M, N, O, P, Q, RR> IndexHandler<R, F, C, M, N, O, P, Q, RR>
 where
-    A: AuthService,
     R: CatalogRepository,
     F: Filesystem,
     C: Clock,
@@ -277,7 +265,6 @@ where
     /// on upgrade.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        auth: A,
         repo: R,
         fs: F,
         clock: C,
@@ -294,7 +281,6 @@ where
     ) -> Self {
         let library_root = LibraryRoot::new(&library_root);
         Self {
-            auth,
             repo,
             fs,
             clock,
@@ -344,12 +330,7 @@ where
     /// Unlike `finish`/`fail`, this write's failure is not swallowed after
     /// retrying: if the record cannot be opened at all, the caller must not
     /// receive a run id it can never query.
-    pub async fn start(
-        &self,
-        request: IndexRequest,
-        token: &str,
-    ) -> Result<IndexStarted, DomainError> {
-        self.auth.authenticate(token).await?;
+    pub async fn start(&self, request: IndexRequest) -> Result<IndexStarted, DomainError> {
         self.check_folder(&request.root).await?;
         // FR-FC-26 — see `LibraryRoot::contains` for how both sides are
         // resolved. The same check bounds a library move (UC-51), so the two

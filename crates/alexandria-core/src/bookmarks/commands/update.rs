@@ -1,6 +1,5 @@
 use uuid::Uuid;
 
-use crate::auth::AuthService;
 use crate::bookmarks::commands::create::{validate_title, validate_url};
 use crate::bookmarks::model::{Bookmark, BookmarkState};
 use crate::bookmarks::repos::BookmarkRepository;
@@ -17,21 +16,18 @@ use crate::errors::DomainError;
 /// untouched. Generic over the same two repositories `CreateBookmarkHandler`
 /// uses, for the same reason: a referenced collection must exist and be
 /// `kind = bookmark` before the write is attempted.
-pub struct UpdateBookmarkHandler<A, BR, CR> {
-    auth: A,
+pub struct UpdateBookmarkHandler<BR, CR> {
     bookmark_repo: BR,
     collection_repo: CR,
 }
 
-impl<A, BR, CR> UpdateBookmarkHandler<A, BR, CR>
+impl<BR, CR> UpdateBookmarkHandler<BR, CR>
 where
-    A: AuthService,
     BR: BookmarkRepository,
     CR: CollectionRepository,
 {
-    pub fn new(auth: A, bookmark_repo: BR, collection_repo: CR) -> Self {
+    pub fn new(bookmark_repo: BR, collection_repo: CR) -> Self {
         Self {
-            auth,
             bookmark_repo,
             collection_repo,
         }
@@ -45,13 +41,7 @@ where
         url: &str,
         title: &str,
         collection_uuid: Option<Uuid>,
-        token: &str,
     ) -> Result<Bookmark, DomainError> {
-        // AF-03: the caller must be authenticated. Evaluated before the
-        // bookmark is looked up or the payload validated (FR-AU-07 / SRD
-        // §7).
-        self.auth.authenticate(token).await?;
-
         // AF-02: the bookmark must exist.
         let bookmark = self
             .bookmark_repo

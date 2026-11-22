@@ -1,6 +1,5 @@
 use uuid::Uuid;
 
-use crate::auth::AuthService;
 use crate::errors::DomainError;
 use crate::reading_lists::model::{NewReadingList, ReadingList};
 use crate::reading_lists::repos::ReadingListRepository;
@@ -47,26 +46,20 @@ pub fn validate_reading_list_name(name: &str) -> Result<String, DomainError> {
 /// Like `CreateWatchlistHandler` the command is the handler itself: no
 /// `Clock` collaborator (a reading list carries no timestamps) and no
 /// `Filesystem` (catalog-only metadata with nothing on disk).
-pub struct CreateReadingListHandler<A, R> {
-    auth: A,
+pub struct CreateReadingListHandler<R> {
     repo: R,
 }
 
-impl<A, R> CreateReadingListHandler<A, R>
+impl<R> CreateReadingListHandler<R>
 where
-    A: AuthService,
     R: ReadingListRepository,
 {
-    pub fn new(auth: A, repo: R) -> Self {
-        Self { auth, repo }
+    pub fn new(repo: R) -> Self {
+        Self { repo }
     }
 
     /// Create a reading list named `name` and return the persisted record.
-    pub async fn create(&self, name: &str, token: &str) -> Result<ReadingList, DomainError> {
-        // AF-02: the caller must be authenticated. Evaluated before the
-        // payload is consulted (FR-AU-07 / SRD §7).
-        self.auth.authenticate(token).await?;
-
+    pub async fn create(&self, name: &str) -> Result<ReadingList, DomainError> {
         // AF-01: the name must be valid.
         let name = validate_reading_list_name(name)?;
 

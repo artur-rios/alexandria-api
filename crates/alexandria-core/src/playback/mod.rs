@@ -14,7 +14,6 @@ pub mod thumbnail;
 use serde::Serialize;
 use uuid::Uuid;
 
-use crate::auth::AuthService;
 use crate::catalog::library_root::LibraryRoot;
 use crate::catalog::model::{File, FileState};
 use crate::catalog::repos::CatalogRepository;
@@ -119,8 +118,8 @@ impl FileStat for StdFileStat {
     }
 }
 
-/// The guard every playback use case runs first: authenticate, resolve the
-/// UUID, and reject anything that is not playable.
+/// The guard every playback use case runs first: resolve the UUID, and
+/// reject anything that is not playable.
 ///
 /// "Playable" includes being inside the configured library root
 /// (`filesystem.root`, FR-FC-26) when one is set. Indexing and moving a
@@ -135,20 +134,14 @@ impl FileStat for StdFileStat {
 /// and is valid — re-index simply found the on-disk file gone (FR-FC-11) —
 /// so `NotFound` would tell the caller something false about its own
 /// catalog.
-pub async fn resolve_playable<A, R>(
-    auth: &A,
+pub async fn resolve_playable<R>(
     repo: &R,
     library_root: &LibraryRoot,
     uuid: Uuid,
-    token: &str,
 ) -> Result<File, DomainError>
 where
-    A: AuthService,
     R: CatalogRepository,
 {
-    // The caller must be authenticated before anything else is touched.
-    auth.authenticate(token).await?;
-
     let file = repo
         .find_by_uuid(uuid)
         .await?
@@ -173,43 +166,16 @@ where
 mod tests {
     use super::*;
     use crate::catalog::model::FileType;
-    use crate::playback::test_support::{a_file, FakeAuth, FakeRepo};
+    use crate::playback::test_support::{a_file, FakeRepo};
     use chrono::Utc;
-
-    #[tokio::test]
-    async fn given_wrong_token_when_resolved_then_unauthorized() {
-        // Arrange
-        let auth = FakeAuth { good: "t" };
-        let repo = FakeRepo::with_file(a_file(
-            "/lib/movie.mp4",
-            FileType::Video,
-            FileState::Active,
-            None,
-        ));
-
-        // Act
-        let result = resolve_playable(
-            &auth,
-            &repo,
-            &LibraryRoot::unconfigured(),
-            Uuid::nil(),
-            "bad",
-        )
-        .await;
-
-        // Assert
-        assert!(matches!(result, Err(DomainError::Unauthorized)));
-    }
 
     #[tokio::test]
     async fn given_unknown_uuid_when_resolved_then_not_found() {
         // Arrange
-        let auth = FakeAuth { good: "t" };
         let repo = FakeRepo::none();
 
         // Act
-        let result =
-            resolve_playable(&auth, &repo, &LibraryRoot::unconfigured(), Uuid::nil(), "t").await;
+        let result = resolve_playable(&repo, &LibraryRoot::unconfigured(), Uuid::nil()).await;
 
         // Assert
         assert!(matches!(result, Err(DomainError::NotFound)));
@@ -218,7 +184,6 @@ mod tests {
     #[tokio::test]
     async fn given_soft_deleted_file_when_resolved_then_invalid_state() {
         // Arrange — restore via UC-07 before playing, matching UC-32.
-        let auth = FakeAuth { good: "t" };
         let repo = FakeRepo::with_file(a_file(
             "/lib/movie.mp4",
             FileType::Video,
@@ -227,8 +192,7 @@ mod tests {
         ));
 
         // Act
-        let result =
-            resolve_playable(&auth, &repo, &LibraryRoot::unconfigured(), Uuid::nil(), "t").await;
+        let result = resolve_playable(&repo, &LibraryRoot::unconfigured(), Uuid::nil()).await;
 
         // Assert
         assert!(matches!(result, Err(DomainError::InvalidState)));
@@ -238,7 +202,6 @@ mod tests {
     async fn given_missing_at_set_when_resolved_then_disk_error() {
         // Arrange — re-index already found the file gone (FR-FC-11). This is
         // a disk condition, not a NotFound: the catalog record is valid.
-        let auth = FakeAuth { good: "t" };
         let repo = FakeRepo::with_file(a_file(
             "/lib/movie.mp4",
             FileType::Video,
@@ -247,8 +210,7 @@ mod tests {
         ));
 
         // Act
-        let result =
-            resolve_playable(&auth, &repo, &LibraryRoot::unconfigured(), Uuid::nil(), "t").await;
+        let result = resolve_playable(&repo, &LibraryRoot::unconfigured(), Uuid::nil()).await;
 
         // Assert
         assert!(matches!(result, Err(DomainError::Disk(_))));
@@ -292,7 +254,6 @@ mod tests {
         // Arrange — every playback route runs this guard, so a row already
         // pointing outside `filesystem.root` is refused for all of them.
         let library = tempfile::tempdir().expect("tempdir");
-        let auth = FakeAuth { good: "t" };
         let repo = FakeRepo::with_file(a_file(
             "/etc/passwd",
             FileType::Text,
@@ -302,7 +263,7 @@ mod tests {
         let root = LibraryRoot::new(library.path().to_str().expect("path"));
 
         // Act
-        let result = resolve_playable(&auth, &repo, &root, Uuid::nil(), "t").await;
+        let result = resolve_playable(&repo, &root, Uuid::nil()).await;
 
         // Assert
         assert!(matches!(result, Err(DomainError::InvalidInput(_))));
@@ -311,7 +272,6 @@ mod tests {
     #[tokio::test]
     async fn given_active_present_file_when_resolved_then_file_returned() {
         // Arrange
-        let auth = FakeAuth { good: "t" };
         let repo = FakeRepo::with_file(a_file(
             "/lib/movie.mp4",
             FileType::Video,
@@ -320,8 +280,7 @@ mod tests {
         ));
 
         // Act
-        let result =
-            resolve_playable(&auth, &repo, &LibraryRoot::unconfigured(), Uuid::nil(), "t").await;
+        let result = resolve_playable(&repo, &LibraryRoot::unconfigured(), Uuid::nil()).await;
 
         // Assert
         assert_eq!(result.expect("resolves").path, "/lib/movie.mp4");

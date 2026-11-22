@@ -5,7 +5,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use serde::Serialize;
 use uuid::Uuid;
 
-use crate::auth::AuthService;
 use crate::catalog::audio_tags::{CoverArtRead, CoverArtReader};
 use crate::catalog::library_root::LibraryRoot;
 use crate::catalog::model::FileType;
@@ -56,8 +55,7 @@ pub trait ThumbnailCache: Send + Sync {
 
 /// UC-40 — return a downscaled thumbnail for a video, image, comic, or audio
 /// File.
-pub struct ThumbnailHandler<A, R, C, T, K, V> {
-    auth: A,
+pub struct ThumbnailHandler<R, C, T, K, V> {
     repo: R,
     archive: C,
     renderer: T,
@@ -67,9 +65,8 @@ pub struct ThumbnailHandler<A, R, C, T, K, V> {
     library_root: LibraryRoot,
 }
 
-impl<A, R, C, T, K, V> ThumbnailHandler<A, R, C, T, K, V>
+impl<R, C, T, K, V> ThumbnailHandler<R, C, T, K, V>
 where
-    A: AuthService,
     R: CatalogRepository,
     C: ComicArchive,
     T: ThumbnailRenderer,
@@ -77,7 +74,6 @@ where
     V: CoverArtReader,
 {
     pub fn new(
-        auth: A,
         repo: R,
         archive: C,
         renderer: T,
@@ -87,7 +83,6 @@ where
     ) -> Self {
         Self {
             library_root,
-            auth,
             repo,
             archive,
             renderer,
@@ -96,9 +91,8 @@ where
         }
     }
 
-    pub async fn thumbnail(&self, uuid: Uuid, token: &str) -> Result<Thumbnail, DomainError> {
-        let file =
-            resolve_playable(&self.auth, &self.repo, &self.library_root, uuid, token).await?;
+    pub async fn thumbnail(&self, uuid: Uuid) -> Result<Thumbnail, DomainError> {
+        let file = resolve_playable(&self.repo, &self.library_root, uuid).await?;
 
         // Keyed on uuid and mtime rather than on the content hash. The hash is
         // computed on demand now (FR-FC-09), so keying on it would make the
@@ -484,7 +478,7 @@ impl ThumbnailCache for DiskThumbnailCache {
 mod tests {
     use super::*;
     use crate::catalog::model::FileState;
-    use crate::playback::test_support::{a_file, FakeAuth, FakeRepo};
+    use crate::playback::test_support::{a_file, FakeRepo};
     use chrono::{DateTime, Utc};
     use std::sync::{Arc, Mutex};
 
@@ -522,7 +516,7 @@ mod tests {
     /// Cover-art fake: hands back a fixed [`CoverArtRead`] and records every
     /// path it was asked to read, so a test can assert both what the
     /// handler did with the result *and* whether the reader was consulted
-    /// at all — the auth/state/type guards that run earlier must
+    /// at all — the state/type guards that run earlier must
     /// short-circuit before this is ever reached.
     #[derive(Clone)]
     struct FakeCoverArt {
@@ -660,7 +654,6 @@ mod tests {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let entries = Arc::new(Mutex::new(Vec::new()));
         let handler = ThumbnailHandler::new(
-            FakeAuth { good: "t" },
             repo,
             FakeArchive,
             FakeRenderer {
@@ -672,7 +665,7 @@ mod tests {
         );
 
         // Act
-        let thumb = handler.thumbnail(Uuid::nil(), "t").await.expect("thumb");
+        let thumb = handler.thumbnail(Uuid::nil()).await.expect("thumb");
 
         // Assert
         assert_eq!(thumb.bytes, b"JPEG".to_vec());
@@ -707,7 +700,6 @@ mod tests {
         let mut first_file = a_file("/lib/movie.mp4", FileType::Video, FileState::Active, None);
         first_file.mtime = Some(t(1));
         let handler_one = ThumbnailHandler::new(
-            FakeAuth { good: "t" },
             FakeRepo::with_file(first_file),
             FakeArchive,
             FakeRenderer {
@@ -719,16 +711,12 @@ mod tests {
         );
 
         // Act — first request: nothing is cached yet.
-        let first = handler_one
-            .thumbnail(Uuid::nil(), "t")
-            .await
-            .expect("thumb");
+        let first = handler_one.thumbnail(Uuid::nil()).await.expect("thumb");
         assert_eq!(cache.hits(), 0, "first request cannot be a hit");
 
         let mut second_file = a_file("/lib/movie.mp4", FileType::Video, FileState::Active, None);
         second_file.mtime = Some(t(2));
         let handler_two = ThumbnailHandler::new(
-            FakeAuth { good: "t" },
             FakeRepo::with_file(second_file),
             FakeArchive,
             FakeRenderer {
@@ -738,10 +726,7 @@ mod tests {
             FakeCoverArt::none(),
             crate::catalog::library_root::LibraryRoot::unconfigured(),
         );
-        let second = handler_two
-            .thumbnail(Uuid::nil(), "t")
-            .await
-            .expect("thumb");
+        let second = handler_two.thumbnail(Uuid::nil()).await.expect("thumb");
 
         // Assert
         assert_eq!(
@@ -763,7 +748,6 @@ mod tests {
         ));
         let calls = Arc::new(Mutex::new(Vec::new()));
         let handler = ThumbnailHandler::new(
-            FakeAuth { good: "t" },
             repo,
             FakeArchive,
             FakeRenderer {
@@ -775,7 +759,7 @@ mod tests {
         );
 
         // Act
-        handler.thumbnail(Uuid::nil(), "t").await.expect("thumb");
+        handler.thumbnail(Uuid::nil()).await.expect("thumb");
 
         // Assert
         assert_eq!(*calls.lock().unwrap(), vec!["image:p1.jpg".to_string()]);
@@ -807,7 +791,6 @@ mod tests {
             None,
         ));
         let handler = ThumbnailHandler::new(
-            FakeAuth { good: "t" },
             repo,
             FakeArchive,
             FakeRenderer {
@@ -819,7 +802,7 @@ mod tests {
         );
 
         // Act
-        let thumb = handler.thumbnail(Uuid::nil(), "t").await.expect("thumb");
+        let thumb = handler.thumbnail(Uuid::nil()).await.expect("thumb");
 
         // Assert
         assert_eq!(thumb.bytes, b"JPEG".to_vec());
@@ -840,7 +823,6 @@ mod tests {
             None,
         ));
         let handler = ThumbnailHandler::new(
-            FakeAuth { good: "t" },
             repo,
             FakeArchive,
             FakeRenderer {
@@ -852,7 +834,7 @@ mod tests {
         );
 
         // Act
-        let result = handler.thumbnail(Uuid::nil(), "t").await;
+        let result = handler.thumbnail(Uuid::nil()).await;
 
         // Assert
         assert!(matches!(result, Err(DomainError::InvalidInput(_))));
@@ -868,7 +850,6 @@ mod tests {
         let file = a_file("/lib/issue.cbz", FileType::Comic, FileState::Active, None);
         let calls = Arc::new(Mutex::new(Vec::new()));
         let thumbnails = ThumbnailHandler::new(
-            FakeAuth { good: "t" },
             FakeRepo::with_file(file.clone()),
             FakeArchive,
             FakeRenderer {
@@ -879,15 +860,14 @@ mod tests {
             crate::catalog::library_root::LibraryRoot::unconfigured(),
         );
         let pages = ComicPageHandler::new(
-            FakeAuth { good: "t" },
             FakeRepo::with_file(file),
             FakeArchive,
             crate::catalog::library_root::LibraryRoot::unconfigured(),
         );
 
         // Act
-        thumbnails.thumbnail(Uuid::nil(), "t").await.expect("thumb");
-        let page_one = pages.read_page(Uuid::nil(), 1, "t").await.expect("page 1");
+        thumbnails.thumbnail(Uuid::nil()).await.expect("thumb");
+        let page_one = pages.read_page(Uuid::nil(), 1).await.expect("page 1");
 
         // Assert — `FakeArchive::read_page` echoes the entry name, and
         // `FakeRenderer` logs the bytes it was handed, so both sides name
@@ -916,7 +896,6 @@ mod tests {
             b"CACHED".to_vec(),
         )])));
         let handler = ThumbnailHandler::new(
-            FakeAuth { good: "t" },
             repo,
             FakeArchive,
             FakeRenderer {
@@ -928,7 +907,7 @@ mod tests {
         );
 
         // Act
-        let thumb = handler.thumbnail(Uuid::nil(), "t").await.expect("thumb");
+        let thumb = handler.thumbnail(Uuid::nil()).await.expect("thumb");
 
         // Assert
         assert_eq!(thumb.bytes, b"CACHED".to_vec());
@@ -946,7 +925,6 @@ mod tests {
             None,
         ));
         let handler = ThumbnailHandler::new(
-            FakeAuth { good: "t" },
             repo,
             FakeArchive,
             FakeRenderer {
@@ -958,7 +936,7 @@ mod tests {
         );
 
         // Act
-        let result = handler.thumbnail(Uuid::nil(), "t").await;
+        let result = handler.thumbnail(Uuid::nil()).await;
 
         // Assert
         assert!(matches!(result, Err(DomainError::InvalidInput(_))));
@@ -977,7 +955,6 @@ mod tests {
         ));
         let calls = Arc::new(Mutex::new(Vec::new()));
         let handler = ThumbnailHandler::new(
-            FakeAuth { good: "t" },
             repo,
             FakeArchive,
             FakeRenderer {
@@ -989,7 +966,7 @@ mod tests {
         );
 
         // Act
-        let result = handler.thumbnail(Uuid::nil(), "t").await;
+        let result = handler.thumbnail(Uuid::nil()).await;
 
         // Assert
         assert!(matches!(result, Err(DomainError::InvalidInput(_))));
@@ -1038,7 +1015,6 @@ mod tests {
         ));
         let calls = Arc::new(Mutex::new(Vec::new()));
         let handler = ThumbnailHandler::new(
-            FakeAuth { good: "t" },
             repo,
             FakeArchive,
             FakeRenderer {
@@ -1050,7 +1026,7 @@ mod tests {
         );
 
         // Act
-        let thumb = handler.thumbnail(Uuid::nil(), "t").await.expect("thumb");
+        let thumb = handler.thumbnail(Uuid::nil()).await.expect("thumb");
 
         // Assert
         assert_eq!(thumb.bytes, b"JPEG".to_vec());
@@ -1068,7 +1044,6 @@ mod tests {
             None,
         ));
         let handler = ThumbnailHandler::new(
-            FakeAuth { good: "t" },
             repo,
             FakeArchive,
             FakeRenderer {
@@ -1080,7 +1055,7 @@ mod tests {
         );
 
         // Act
-        let result = handler.thumbnail(Uuid::nil(), "t").await;
+        let result = handler.thumbnail(Uuid::nil()).await;
 
         // Assert
         assert!(matches!(result, Err(DomainError::InvalidInput(_))));
@@ -1100,7 +1075,6 @@ mod tests {
             None,
         ));
         let handler = ThumbnailHandler::new(
-            FakeAuth { good: "t" },
             repo,
             FakeArchive,
             FakeRenderer {
@@ -1112,7 +1086,7 @@ mod tests {
         );
 
         // Act
-        let result = handler.thumbnail(Uuid::nil(), "t").await;
+        let result = handler.thumbnail(Uuid::nil()).await;
 
         // Assert
         assert!(matches!(result, Err(DomainError::Disk(_))));
@@ -1132,7 +1106,6 @@ mod tests {
         ));
         let cover = FakeCoverArt::with_picture(b"sleeve".to_vec());
         let handler = ThumbnailHandler::new(
-            FakeAuth { good: "t" },
             repo,
             FakeArchive,
             FakeRenderer {
@@ -1144,41 +1117,10 @@ mod tests {
         );
 
         // Act
-        let result = handler.thumbnail(Uuid::nil(), "t").await;
+        let result = handler.thumbnail(Uuid::nil()).await;
 
         // Assert
         assert!(matches!(result, Err(DomainError::InvalidState)));
-        assert!(cover.calls.lock().unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn given_unauthenticated_caller_when_audio_thumbnailed_then_reader_not_consulted() {
-        // Arrange — same shape as the deleted-file case, for the other guard
-        // `resolve_playable` runs first: authentication.
-        let repo = FakeRepo::with_file(a_file(
-            "/lib/song.mp3",
-            FileType::Audio,
-            FileState::Active,
-            None,
-        ));
-        let cover = FakeCoverArt::with_picture(b"sleeve".to_vec());
-        let handler = ThumbnailHandler::new(
-            FakeAuth { good: "t" },
-            repo,
-            FakeArchive,
-            FakeRenderer {
-                calls: Arc::new(Mutex::new(Vec::new())),
-            },
-            FakeCache::new(Arc::new(Mutex::new(Vec::new()))),
-            cover.clone(),
-            crate::catalog::library_root::LibraryRoot::unconfigured(),
-        );
-
-        // Act
-        let result = handler.thumbnail(Uuid::nil(), "wrong-token").await;
-
-        // Assert
-        assert!(matches!(result, Err(DomainError::Unauthorized)));
         assert!(cover.calls.lock().unwrap().is_empty());
     }
 
@@ -1214,7 +1156,6 @@ mod tests {
         ));
         let dims = Arc::new(Mutex::new(Vec::new()));
         let handler = ThumbnailHandler::new(
-            FakeAuth { good: "t" },
             repo,
             FakeArchive,
             DimRecordingRenderer {
@@ -1226,7 +1167,7 @@ mod tests {
         );
 
         // Act
-        handler.thumbnail(Uuid::nil(), "t").await.expect("thumb");
+        handler.thumbnail(Uuid::nil()).await.expect("thumb");
 
         // Assert — the one size every other arm asks for (see
         // `THUMBNAIL_MAX_DIM`'s own doc comment).

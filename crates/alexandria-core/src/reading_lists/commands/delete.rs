@@ -1,6 +1,5 @@
 use uuid::Uuid;
 
-use crate::auth::AuthService;
 use crate::errors::DomainError;
 use crate::reading_lists::model::ReadingList;
 use crate::reading_lists::repos::ReadingListRepository;
@@ -13,30 +12,22 @@ use crate::reading_lists::repos::ReadingListRepository;
 /// Like `DeleteWatchlistHandler` the command is the handler itself: no
 /// `Clock` or `Filesystem` collaborator, since a reading list carries no
 /// timestamps and nothing on disk to compensate on failure.
-pub struct DeleteReadingListHandler<A, R> {
-    auth: A,
+pub struct DeleteReadingListHandler<R> {
     repo: R,
 }
 
-impl<A, R> DeleteReadingListHandler<A, R>
+impl<R> DeleteReadingListHandler<R>
 where
-    A: AuthService,
     R: ReadingListRepository,
 {
-    pub fn new(auth: A, repo: R) -> Self {
-        Self { auth, repo }
+    pub fn new(repo: R) -> Self {
+        Self { repo }
     }
 
     /// Delete the reading list identified by `uuid`, removing its
     /// ReadingProgress entries, and return the pre-delete record as
     /// confirmation.
-    pub async fn delete(&self, uuid: Uuid, token: &str) -> Result<ReadingList, DomainError> {
-        // AF-02: the caller must be authenticated. Evaluated before the
-        // reading list is looked up (FR-AU-07 / SRD §7), so an
-        // unauthenticated caller learns nothing about whether the uuid
-        // exists.
-        self.auth.authenticate(token).await?;
-
+    pub async fn delete(&self, uuid: Uuid) -> Result<ReadingList, DomainError> {
         // AF-01: the reading list must exist.
         let reading_list = self
             .repo

@@ -1,6 +1,5 @@
 use uuid::Uuid;
 
-use crate::auth::AuthService;
 use crate::catalog::fs::Filesystem;
 use crate::catalog::library_root::LibraryRoot;
 use crate::catalog::model::PurgeOnDiskOutcome;
@@ -13,18 +12,17 @@ use crate::errors::DomainError;
 /// (BR-11: purge-on-disk is a distinct operation from the retention-gated
 /// hard purge and does not share its restriction).
 ///
-/// Order of operations follows the spec's main flow: authenticate, look up
-/// the record, delete the on-disk file, then remove the catalog row. Disk
-/// deletion happens *before* the catalog write so a disk failure (AF-02)
-/// leaves the record untouched — there is nothing to roll back because
-/// nothing was written yet. The inverse ordering is not available: if the
-/// disk delete succeeds and the subsequent catalog write fails, the file is
-/// already gone and cannot be un-deleted. That error is surfaced as-is and
-/// the row remains, now pointing at an absent path that a future UC-02
-/// re-index will mark `missing`. The spec does not name this residual case;
-/// this handler does not attempt a compensating write for it.
-pub struct PurgeFileOnDiskHandler<A, R, F> {
-    auth: A,
+/// Order of operations follows the spec's main flow: look up the record,
+/// delete the on-disk file, then remove the catalog row. Disk deletion happens
+/// *before* the catalog write so a disk failure (AF-02) leaves the record
+/// untouched — there is nothing to roll back because nothing was written yet.
+/// The inverse ordering is not available: if the disk delete succeeds and the
+/// subsequent catalog write fails, the file is already gone and cannot be
+/// un-deleted. That error is surfaced as-is and the row remains, now pointing
+/// at an absent path that a future UC-02 re-index will mark `missing`. The
+/// spec does not name this residual case; this handler does not attempt a
+/// compensating write for it.
+pub struct PurgeFileOnDiskHandler<R, F> {
     repo: R,
     fs: F,
     /// `filesystem.root` (FR-FC-26): a row pointing outside it has its
@@ -32,15 +30,13 @@ pub struct PurgeFileOnDiskHandler<A, R, F> {
     library_root: LibraryRoot,
 }
 
-impl<A, R, F> PurgeFileOnDiskHandler<A, R, F>
+impl<R, F> PurgeFileOnDiskHandler<R, F>
 where
-    A: AuthService,
     R: CatalogRepository,
     F: Filesystem,
 {
-    pub fn new(auth: A, repo: R, fs: F, library_root: LibraryRoot) -> Self {
+    pub fn new(repo: R, fs: F, library_root: LibraryRoot) -> Self {
         Self {
-            auth,
             repo,
             fs,
             library_root,
@@ -51,16 +47,7 @@ where
     /// [`PurgeOnDiskOutcome`] confirming both: the pre-delete `File`
     /// snapshot and whether the on-disk file was actually present
     /// (`disk_file_present == false` is AF-01, still a success).
-    pub async fn purge_on_disk(
-        &self,
-        uuid: Uuid,
-        token: &str,
-    ) -> Result<PurgeOnDiskOutcome, DomainError> {
-        // AF-04: the caller must be authenticated, evaluated before any
-        // payload is consulted (FR-AU-07 / SRD §7), matching the
-        // auth-before-payload ordering of the other file-lifecycle handlers.
-        self.auth.authenticate(token).await?;
-
+    pub async fn purge_on_disk(&self, uuid: Uuid) -> Result<PurgeOnDiskOutcome, DomainError> {
         // AF-03: the file must exist.
         let file = self
             .repo
