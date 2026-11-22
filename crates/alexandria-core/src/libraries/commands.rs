@@ -267,6 +267,55 @@ where
     }
 }
 
+/// Pin a library to the top of the menu, or unpin it.
+pub struct SetLibraryPinnedHandler<R> {
+    repo: R,
+}
+
+impl<R> SetLibraryPinnedHandler<R>
+where
+    R: LibraryRepository,
+{
+    pub fn new(repo: R) -> Self {
+        Self { repo }
+    }
+
+    /// Set whether the library `uuid` names is pinned. Idempotent: pinning a
+    /// pinned library is not an error. `NotFound` when no library has the
+    /// uuid.
+    pub async fn set(&self, uuid: Uuid, pinned: bool) -> Result<(), DomainError> {
+        if self.repo.set_pinned(uuid, pinned).await? {
+            Ok(())
+        } else {
+            Err(DomainError::NotFound)
+        }
+    }
+}
+
+/// Mark a library as a favorite, or unmark it.
+pub struct SetLibraryFavoriteHandler<R> {
+    repo: R,
+}
+
+impl<R> SetLibraryFavoriteHandler<R>
+where
+    R: LibraryRepository,
+{
+    pub fn new(repo: R) -> Self {
+        Self { repo }
+    }
+
+    /// Set whether the library `uuid` names is a favorite. Idempotent, and
+    /// independent of pinning. `NotFound` when no library has the uuid.
+    pub async fn set(&self, uuid: Uuid, favorite: bool) -> Result<(), DomainError> {
+        if self.repo.set_favorite(uuid, favorite).await? {
+            Ok(())
+        } else {
+            Err(DomainError::NotFound)
+        }
+    }
+}
+
 /// Remove a library and its catalog records (FR-FC-40).
 pub struct RemoveLibraryHandler<R, RR> {
     repo: R,

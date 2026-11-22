@@ -3906,6 +3906,65 @@ pub extern "C" fn alexandria_library_browse(
     })
 }
 
+/// Pin a library to the top of the menu, or unpin it. Answers `LIBRARY_OK`,
+/// `LIBRARY_ERR_INVALID_INPUT` when `uuid` is not a uuid,
+/// `LIBRARY_ERR_NOT_INITIALIZED` before init, and `LIBRARY_ERR_NOT_FOUND`
+/// for a uuid no library has. Setting the value a library already has is
+/// not an error.
+#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
+#[no_mangle]
+pub extern "C" fn alexandria_library_set_pinned(uuid: *const c_char, pinned: bool) -> c_int {
+    ffi_guard(LIBRARY_ERR_OTHER, || {
+        let services = match locked_services() {
+            Some(s) => s,
+            None => return LIBRARY_ERR_NOT_INITIALIZED,
+        };
+
+        let uuid = match cstr_lossy(uuid).and_then(|s| uuid::Uuid::parse_str(&s).ok()) {
+            Some(u) => u,
+            None => return LIBRARY_ERR_INVALID_INPUT,
+        };
+
+        let result = runtime()
+            .block_on(async { services.set_library_pinned_handler.set(uuid, pinned).await });
+
+        match result {
+            Ok(()) => LIBRARY_OK,
+            Err(err) => map_library_err(err).status,
+        }
+    })
+}
+
+/// Mark a library as a favorite, or unmark it, independently of pinning.
+/// Answers the same codes as `alexandria_library_set_pinned`.
+#[allow(unsafe_code)] // `#[no_mangle]` is itself gated by `deny(unsafe_code)`
+#[no_mangle]
+pub extern "C" fn alexandria_library_set_favorite(uuid: *const c_char, favorite: bool) -> c_int {
+    ffi_guard(LIBRARY_ERR_OTHER, || {
+        let services = match locked_services() {
+            Some(s) => s,
+            None => return LIBRARY_ERR_NOT_INITIALIZED,
+        };
+
+        let uuid = match cstr_lossy(uuid).and_then(|s| uuid::Uuid::parse_str(&s).ok()) {
+            Some(u) => u,
+            None => return LIBRARY_ERR_INVALID_INPUT,
+        };
+
+        let result = runtime().block_on(async {
+            services
+                .set_library_favorite_handler
+                .set(uuid, favorite)
+                .await
+        });
+
+        match result {
+            Ok(()) => LIBRARY_OK,
+            Err(err) => map_library_err(err).status,
+        }
+    })
+}
+
 /// Remove a library and its catalog records (FR-FC-40); nothing on disk is
 /// touched. `LIBRARY_ERR_CONFLICT` while one of its runs is running
 /// (FR-FC-43), as HTTP answers `409`. On success `json`

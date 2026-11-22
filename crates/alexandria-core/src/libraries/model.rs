@@ -23,6 +23,10 @@ pub struct Library {
     pub name: String,
     /// What every entry's position is relative to.
     pub root_path: String,
+    /// Kept at the top of the menu, above the libraries that are not.
+    pub pinned: bool,
+    /// Marked by the owner as one to come back to. Independent of `pinned`.
+    pub favorite: bool,
 }
 
 /// A library just registered, with the run that is indexing it.

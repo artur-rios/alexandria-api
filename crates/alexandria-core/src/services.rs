@@ -44,6 +44,7 @@ use crate::collections::repos::SqliteCollectionRepository;
 use crate::config::Settings;
 use crate::libraries::commands::{
     IndexLibraryHandler, MoveLibraryHandler, RegisterLibraryHandler, RemoveLibraryHandler,
+    SetLibraryFavoriteHandler, SetLibraryPinnedHandler,
 };
 use crate::libraries::queries::{BrowseLibraryHandler, ListLibrariesHandler};
 use crate::libraries::repos::SqliteLibraryRepository;
@@ -221,6 +222,10 @@ pub type DefaultRemoveLibraryHandler =
 pub type DefaultMoveLibraryHandler =
     MoveLibraryHandler<SqliteLibraryRepository, SqliteCatalogRunRepository>;
 
+pub type DefaultSetLibraryPinnedHandler = SetLibraryPinnedHandler<SqliteLibraryRepository>;
+
+pub type DefaultSetLibraryFavoriteHandler = SetLibraryFavoriteHandler<SqliteLibraryRepository>;
+
 pub type DefaultBrowseLibraryHandler =
     BrowseLibraryHandler<SqliteLibraryRepository, SqliteCatalogRepository>;
 
@@ -274,6 +279,8 @@ pub struct Services {
     pub index_library_handler: Arc<DefaultIndexLibraryHandler>,
     pub remove_library_handler: Arc<DefaultRemoveLibraryHandler>,
     pub move_library_handler: Arc<DefaultMoveLibraryHandler>,
+    pub set_library_pinned_handler: Arc<DefaultSetLibraryPinnedHandler>,
+    pub set_library_favorite_handler: Arc<DefaultSetLibraryFavoriteHandler>,
     pub browse_library_handler: Arc<DefaultBrowseLibraryHandler>,
     pub list_libraries_handler: Arc<DefaultListLibrariesHandler>,
     /// The same registry the two walks publish into, exposed so an embedder
@@ -559,6 +566,12 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         library_root.clone(),
         SqliteCatalogRunRepository::new(pool.clone()),
     ));
+    let set_library_pinned_handler = Arc::new(SetLibraryPinnedHandler::new(
+        SqliteLibraryRepository::new(pool.clone()),
+    ));
+    let set_library_favorite_handler = Arc::new(SetLibraryFavoriteHandler::new(
+        SqliteLibraryRepository::new(pool.clone()),
+    ));
     let browse_library_handler = Arc::new(BrowseLibraryHandler::new(
         SqliteLibraryRepository::new(pool.clone()),
         SqliteCatalogRepository::new(pool.clone()),
@@ -611,6 +624,8 @@ pub async fn build_services(settings: &Settings, pool: SqlitePool) -> Services {
         index_library_handler,
         remove_library_handler,
         move_library_handler,
+        set_library_pinned_handler,
+        set_library_favorite_handler,
         browse_library_handler,
         list_libraries_handler,
         run_registry,

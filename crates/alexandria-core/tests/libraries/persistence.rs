@@ -705,3 +705,201 @@ mod case {
         );
     }
 }
+
+/// The two flags the desktop menu keeps on a library: pinned to the top,
+/// and marked as a favorite.
+mod flags {
+    use super::*;
+    use alexandria_core::libraries::commands::{
+        IndexLibraryHandler, MoveLibraryHandler, SetLibraryFavoriteHandler, SetLibraryPinnedHandler,
+    };
+    use alexandria_core::libraries::model::Library;
+    use alexandria_core::libraries::repos::LibraryRepository;
+
+    async fn registered(pool: &sqlx::sqlite::SqlitePool) -> Uuid {
+        RegisterLibraryHandler::new(
+            SqliteLibraryRepository::new(pool.clone()),
+            AlwaysStartsRun,
+            LibraryRoot::unconfigured(),
+        )
+        .register("Course", ROOT, RunPriority::Normal)
+        .await
+        .expect("register")
+        .library
+        .uuid
+    }
+
+    async fn listed(pool: &sqlx::sqlite::SqlitePool) -> Library {
+        SqliteLibraryRepository::new(pool.clone())
+            .list_all()
+            .await
+            .expect("list")
+            .pop()
+            .expect("one library")
+    }
+
+    async fn set_pinned(
+        pool: &sqlx::sqlite::SqlitePool,
+        uuid: Uuid,
+        pinned: bool,
+    ) -> Result<(), DomainError> {
+        SetLibraryPinnedHandler::new(SqliteLibraryRepository::new(pool.clone()))
+            .set(uuid, pinned)
+            .await
+    }
+
+    async fn set_favorite(
+        pool: &sqlx::sqlite::SqlitePool,
+        uuid: Uuid,
+        favorite: bool,
+    ) -> Result<(), DomainError> {
+        SetLibraryFavoriteHandler::new(SqliteLibraryRepository::new(pool.clone()))
+            .set(uuid, favorite)
+            .await
+    }
+
+    #[tokio::test]
+    async fn given_a_new_library_when_registered_then_it_is_neither_pinned_nor_favorite() {
+        let (pool, _catalog, _dir) = fixtures().await;
+        registered(&pool).await;
+
+        let library = listed(&pool).await;
+
+        assert!(!library.pinned);
+        assert!(!library.favorite);
+    }
+
+    #[tokio::test]
+    async fn given_a_library_when_pinned_then_it_lists_as_pinned() {
+        let (pool, _catalog, _dir) = fixtures().await;
+        let uuid = registered(&pool).await;
+
+        set_pinned(&pool, uuid, true).await.expect("pin");
+
+        let library = listed(&pool).await;
+        assert!(library.pinned);
+        assert!(!library.favorite, "pinning touched the favorite flag");
+    }
+
+    #[tokio::test]
+    async fn given_a_pinned_library_when_unpinned_then_it_lists_as_not_pinned() {
+        let (pool, _catalog, _dir) = fixtures().await;
+        let uuid = registered(&pool).await;
+        set_pinned(&pool, uuid, true).await.expect("pin");
+
+        set_pinned(&pool, uuid, false).await.expect("unpin");
+
+        assert!(!listed(&pool).await.pinned);
+    }
+
+    #[tokio::test]
+    async fn given_a_pinned_library_when_pinned_again_then_it_stays_pinned() {
+        let (pool, _catalog, _dir) = fixtures().await;
+        let uuid = registered(&pool).await;
+        set_pinned(&pool, uuid, true).await.expect("pin");
+
+        set_pinned(&pool, uuid, true).await.expect("pin again");
+
+        assert!(listed(&pool).await.pinned);
+    }
+
+    #[tokio::test]
+    async fn given_an_unknown_uuid_when_pinned_then_not_found() {
+        let (pool, _catalog, _dir) = fixtures().await;
+
+        let result = set_pinned(&pool, Uuid::new_v4(), true).await;
+
+        assert!(matches!(result, Err(DomainError::NotFound)), "{result:?}");
+    }
+
+    #[tokio::test]
+    async fn given_a_library_when_marked_favorite_then_it_lists_as_favorite() {
+        let (pool, _catalog, _dir) = fixtures().await;
+        let uuid = registered(&pool).await;
+
+        set_favorite(&pool, uuid, true).await.expect("favorite");
+
+        let library = listed(&pool).await;
+        assert!(library.favorite);
+        assert!(!library.pinned, "favoriting touched the pinned flag");
+    }
+
+    #[tokio::test]
+    async fn given_a_favorite_library_when_unmarked_then_it_lists_as_not_favorite() {
+        let (pool, _catalog, _dir) = fixtures().await;
+        let uuid = registered(&pool).await;
+        set_favorite(&pool, uuid, true).await.expect("favorite");
+
+        set_favorite(&pool, uuid, false).await.expect("unmark");
+
+        assert!(!listed(&pool).await.favorite);
+    }
+
+    #[tokio::test]
+    async fn given_a_favorite_library_when_marked_again_then_it_stays_favorite() {
+        let (pool, _catalog, _dir) = fixtures().await;
+        let uuid = registered(&pool).await;
+        set_favorite(&pool, uuid, true).await.expect("favorite");
+
+        set_favorite(&pool, uuid, true).await.expect("again");
+
+        assert!(listed(&pool).await.favorite);
+    }
+
+    #[tokio::test]
+    async fn given_an_unknown_uuid_when_marked_favorite_then_not_found() {
+        let (pool, _catalog, _dir) = fixtures().await;
+
+        let result = set_favorite(&pool, Uuid::new_v4(), true).await;
+
+        assert!(matches!(result, Err(DomainError::NotFound)), "{result:?}");
+    }
+
+    #[tokio::test]
+    async fn given_a_pinned_favorite_library_when_moved_then_both_flags_stay() {
+        let (pool, _catalog, _dir) = fixtures().await;
+        let uuid = registered(&pool).await;
+        set_pinned(&pool, uuid, true).await.expect("pin");
+        set_favorite(&pool, uuid, true).await.expect("favorite");
+
+        let moved = MoveLibraryHandler::new(
+            SqliteLibraryRepository::new(pool.clone()),
+            LibraryRoot::unconfigured(),
+            SqliteCatalogRunRepository::new(pool.clone()),
+        )
+        .move_to(uuid, "/media/courses/rust")
+        .await
+        .expect("move");
+
+        assert!(
+            moved.pinned && moved.favorite,
+            "the move answered {moved:?}"
+        );
+        let library = listed(&pool).await;
+        assert!(
+            library.pinned && library.favorite,
+            "the move dropped a flag"
+        );
+    }
+
+    #[tokio::test]
+    async fn given_a_pinned_favorite_library_when_indexed_again_then_both_flags_stay() {
+        let (pool, _catalog, _dir) = fixtures().await;
+        let uuid = registered(&pool).await;
+        set_pinned(&pool, uuid, true).await.expect("pin");
+        set_favorite(&pool, uuid, true).await.expect("favorite");
+
+        let (library, _started) = IndexLibraryHandler::new(
+            SqliteLibraryRepository::new(pool.clone()),
+            AlwaysStartsRun,
+            SqliteCatalogRunRepository::new(pool.clone()),
+        )
+        .index(uuid, RunPriority::Normal)
+        .await
+        .expect("index");
+
+        assert!(library.pinned && library.favorite);
+        let library = listed(&pool).await;
+        assert!(library.pinned && library.favorite);
+    }
+}

@@ -61,7 +61,8 @@ use alexandria_ffi::{
     alexandria_index_resume, alexandria_index_run_failures_json, alexandria_index_run_status_json,
     alexandria_index_runs_active_json, alexandria_libraries_list, alexandria_library_browse,
     alexandria_library_index_start, alexandria_library_move, alexandria_library_register,
-    alexandria_library_remove, FileMetadataResult, IndexStartResult,
+    alexandria_library_remove, alexandria_library_set_favorite, alexandria_library_set_pinned,
+    FileMetadataResult, IndexStartResult,
 };
 
 const STATUS_RUN_OK: i32 = alexandria_ffi::RUN_OK;
@@ -5407,4 +5408,69 @@ fn given_the_default_settings_when_read_over_ffi_then_the_deletion_window_is_ans
 
     assert_eq!(status, alexandria_ffi::SETTINGS_OK);
     assert_eq!(value["deletion"]["retentionDays"], 30);
+}
+
+/// Pinning answers `0` and the list then says so, with the other flag
+/// untouched.
+#[test]
+fn given_a_registered_library_when_set_pinned_then_status_0_and_libraries_list_says_pinned_true() {
+    let _g = serial();
+    let _db = init_temp_db();
+    let library = register_library("Course", &folder(&_db, "/library/course"));
+    let uuid = c(library["uuid"].as_str().unwrap());
+
+    assert_eq!(
+        alexandria_library_set_pinned(uuid.as_ptr(), true),
+        STATUS_LIBRARY_OK
+    );
+
+    let listed = library_json_ok(alexandria_libraries_list());
+    assert_eq!(listed[0]["pinned"], true);
+    assert_eq!(listed[0]["favorite"], false);
+}
+
+/// A uuid that is not one is the caller's mistake.
+#[test]
+fn given_a_malformed_uuid_when_set_favorite_then_invalid_input() {
+    let _g = serial();
+    let _db = init_temp_db();
+
+    let uuid = c("not-a-uuid");
+
+    assert_eq!(
+        alexandria_library_set_favorite(uuid.as_ptr(), true),
+        STATUS_LIBRARY_INVALID_INPUT
+    );
+}
+
+/// A well formed uuid no library has is reported as not found.
+#[test]
+fn given_an_unknown_uuid_when_set_pinned_then_not_found() {
+    let _g = serial();
+    let _db = init_temp_db();
+
+    let uuid = c(&uuid::Uuid::new_v4().to_string());
+
+    assert_eq!(
+        alexandria_library_set_pinned(uuid.as_ptr(), true),
+        STATUS_LIBRARY_NOT_FOUND
+    );
+}
+
+/// The listing a browse answers carries the library's flags too.
+#[test]
+fn given_a_pinned_library_when_browsed_then_the_listing_library_says_pinned_true() {
+    let _g = serial();
+    let _db = init_temp_db();
+    let library = register_library("Course", &folder(&_db, "/library/course"));
+    let uuid = c(library["uuid"].as_str().unwrap());
+    assert_eq!(
+        alexandria_library_set_pinned(uuid.as_ptr(), true),
+        STATUS_LIBRARY_OK
+    );
+
+    let listing = library_json_ok(alexandria_library_browse(uuid.as_ptr(), std::ptr::null()));
+
+    assert_eq!(listing["library"]["pinned"], true);
+    assert_eq!(listing["library"]["favorite"], false);
 }

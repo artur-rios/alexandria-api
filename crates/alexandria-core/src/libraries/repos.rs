@@ -52,6 +52,14 @@ pub trait LibraryRepository: Send + Sync {
     /// Returns the moved library and how many files came with it.
     async fn move_root(&self, uuid: Uuid, new_root: &str) -> Result<(Library, u32), DomainError>;
 
+    /// Pin or unpin the library, answering whether a library matched. Setting
+    /// the value it already has still matches: the answer is about the row.
+    async fn set_pinned(&self, uuid: Uuid, pinned: bool) -> Result<bool, DomainError>;
+
+    /// Mark or unmark the library as a favorite, answering whether a library
+    /// matched. Independent of `set_pinned`.
+    async fn set_favorite(&self, uuid: Uuid, favorite: bool) -> Result<bool, DomainError>;
+
     /// Delete the library and its catalog records, answering how many files
     /// went (libraries-only design, section 3).
     ///
@@ -131,24 +139,30 @@ impl LibraryRepository for SqliteLibraryRepository {
             uuid: library.uuid,
             name: library.name,
             root_path: library.root_path,
+            pinned: false,
+            favorite: false,
         })
     }
 
     async fn find_by_uuid(&self, uuid: Uuid) -> Result<Option<Library>, DomainError> {
-        let row = sqlx::query("SELECT uuid, name, root_path FROM libraries WHERE uuid = ?")
-            .bind(uuid.to_string())
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|e| DomainError::Disk(e.to_string()))?;
+        let row = sqlx::query(
+            "SELECT uuid, name, root_path, pinned, favorite FROM libraries WHERE uuid = ?",
+        )
+        .bind(uuid.to_string())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| DomainError::Disk(e.to_string()))?;
 
         row.map(|row| parse_library(&row)).transpose()
     }
 
     async fn list_all(&self) -> Result<Vec<Library>, DomainError> {
-        let rows = sqlx::query("SELECT uuid, name, root_path FROM libraries ORDER BY name")
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|e| DomainError::Disk(e.to_string()))?;
+        let rows = sqlx::query(
+            "SELECT uuid, name, root_path, pinned, favorite FROM libraries ORDER BY name",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| DomainError::Disk(e.to_string()))?;
 
         rows.iter().map(parse_library).collect()
     }
@@ -185,7 +199,7 @@ impl LibraryRepository for SqliteLibraryRepository {
         // wildcard problem at the source: `%` and `_` are ordinary
         // characters to `=`, so nothing needs defusing.
         let row = sqlx::query(
-            "SELECT uuid, name, root_path FROM libraries
+            "SELECT uuid, name, root_path, pinned, favorite FROM libraries
              WHERE (substr(?, 1, length(rtrim(replace(root_path, '\\', '/'), '/') || '/'))
                         = (rtrim(replace(root_path, '\\', '/'), '/') || '/')
                  OR substr(rtrim(replace(root_path, '\\', '/'), '/') || '/', 1, length(?)) = ?)
@@ -211,13 +225,14 @@ impl LibraryRepository for SqliteLibraryRepository {
             .await
             .map_err(|e| DomainError::Disk(e.to_string()))?;
 
-        let library: Option<(String, String)> =
-            sqlx::query_as("SELECT name, root_path FROM libraries WHERE uuid = ?")
-                .bind(uuid.to_string())
-                .fetch_optional(&mut *tx)
-                .await
-                .map_err(|e| DomainError::Disk(e.to_string()))?;
-        let Some((name, old_root)) = library else {
+        let library: Option<(String, String, bool, bool)> = sqlx::query_as(
+            "SELECT name, root_path, pinned, favorite FROM libraries WHERE uuid = ?",
+        )
+        .bind(uuid.to_string())
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| DomainError::Disk(e.to_string()))?;
+        let Some((name, old_root, pinned, favorite)) = library else {
             return Err(DomainError::NotFound);
         };
 
@@ -286,9 +301,33 @@ impl LibraryRepository for SqliteLibraryRepository {
                 uuid,
                 name,
                 root_path: new_root,
+                pinned,
+                favorite,
             },
             u32::try_from(moved).unwrap_or(u32::MAX),
         ))
+    }
+
+    async fn set_pinned(&self, uuid: Uuid, pinned: bool) -> Result<bool, DomainError> {
+        let updated = sqlx::query("UPDATE libraries SET pinned = ? WHERE uuid = ?")
+            .bind(pinned)
+            .bind(uuid.to_string())
+            .execute(&self.pool)
+            .await
+            .map_err(|e| DomainError::Disk(e.to_string()))?;
+
+        Ok(updated.rows_affected() > 0)
+    }
+
+    async fn set_favorite(&self, uuid: Uuid, favorite: bool) -> Result<bool, DomainError> {
+        let updated = sqlx::query("UPDATE libraries SET favorite = ? WHERE uuid = ?")
+            .bind(favorite)
+            .bind(uuid.to_string())
+            .execute(&self.pool)
+            .await
+            .map_err(|e| DomainError::Disk(e.to_string()))?;
+
+        Ok(updated.rows_affected() > 0)
     }
 
     async fn delete(&self, uuid: Uuid) -> Result<u32, DomainError> {
@@ -381,6 +420,12 @@ fn parse_library(row: &sqlx::sqlite::SqliteRow) -> Result<Library, DomainError> 
             .map_err(|e| DomainError::Disk(e.to_string()))?,
         root_path: row
             .try_get("root_path")
+            .map_err(|e| DomainError::Disk(e.to_string()))?,
+        pinned: row
+            .try_get("pinned")
+            .map_err(|e| DomainError::Disk(e.to_string()))?,
+        favorite: row
+            .try_get("favorite")
             .map_err(|e| DomainError::Disk(e.to_string()))?,
     })
 }
