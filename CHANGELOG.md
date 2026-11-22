@@ -27,11 +27,9 @@ reached over a network.
 
 ### Changed
 
-- No FFI call takes a `token` any more. Every function that took one has lost it, and its other parameters keep their
-  order: `alexandria_files_list(json_filters, token)` is `alexandria_files_list(json_filters)`
-  (`alexandria-ffi`).
-- `alexandria_index_init` no longer checks the Windows account it runs as. Its remaining failures are invalid settings,
-  a failed migration and a panic (`alexandria-ffi`).
+- `alexandria_index_init` no longer checks the Windows account it runs as. It validates no settings any more; its
+  remaining failures are a NULL or non-UTF-8 database path (`INDEX_ERR_INVALID_INPUT`), `INDEX_ERR_BUSY`, and a failed
+  migration or a panic (both `INDEX_ERR_OTHER`) (`alexandria-ffi`).
 - A `config.toml` that still holds `[auth]` or `[http]` tables keeps loading; they are ignored, and so are the
   `ALEXANDRIA_AUTH_*` and `ALEXANDRIA_HTTP_*` environment variables (`alexandria-core`).
 - Breaking for clients: the FFI changes shape, so a client built against 0.6 cannot use this core.
@@ -44,6 +42,9 @@ progress, collections and bookmarks are untouched, and so are files on disk.
 
 ### Removed
 
+- The `token` parameter of every FFI call. Every function that took one has lost it, and its other parameters keep
+  their order: `alexandria_files_list(json_filters, token)` is `alexandria_files_list(json_filters)`
+  (`alexandria-ffi`).
 - Authentication, in all three modes: the local account with its recovery codes, external Heimdall JWTs, and the
   Windows account. The `alexandria_auth_*` FFI functions go with it (`local_login`, `windows_login`,
   `local_set_credentials`, `local_register`, `local_account`, `local_redeem_recovery_code`,

@@ -6,7 +6,7 @@
 //! AF-02 — an unrecognised `kind` — has no test here and cannot have one: the
 //! parameter is the domain enum, so an unknown value has no way to reach this
 //! handler. Both transports refuse it while parsing their own request, and
-//! that is where it is tested (`collections_api.rs` and the FFI parity suite).
+//! that is where it is tested (the FFI smoke suite, `crates/alexandria-ffi/tests/smoke.rs`).
 
 use uuid::Uuid;
 
